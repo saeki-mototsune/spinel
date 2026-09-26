@@ -486,6 +486,26 @@ make clean        # remove build artifacts
 
 Override install prefix: `make install PREFIX=$HOME/.local`
 
+### Docker image
+
+Every push to `master` also publishes the built toolchain as an image on
+GitHub Container Registry, for `linux/amd64` and `linux/arm64`
+(`.github/workflows/docker.yml` builds the `Dockerfile`). It carries
+`spinel`, `spin` and the `spinel-*` tools with the C toolchain a compiled
+program needs, on Ubuntu 24.04; CRuby is not in it.
+
+```bash
+docker pull ghcr.io/saeki-mototsune/spinel                 # the newest master build
+docker run --rm -v "$PWD:/work" ghcr.io/saeki-mototsune/spinel spinel app.rb
+docker run --rm -it -v "$PWD:/work" ghcr.io/saeki-mototsune/spinel   # a shell in the tree
+```
+
+The tags are `latest`; the version, `YYYY.MM.DD-N` (the commit's date and
+its position on `master`, e.g. `2026.09.26-10234`); `sha-<rev>` (the
+commit); and the release name when the commit is a release tag.
+`spinel --version` inside the image names the same release and revision a
+`make` of that commit prints.
+
 [Prism](https://github.com/ruby/prism) is the Ruby parser used by
 `spinel_parse`. `make deps` downloads the prism gem tarball from
 rubygems.org and extracts its C sources to `vendor/prism`. If you

@@ -1,0 +1,216 @@
+name: Docker image
+
+# Every push to master builds the image the Dockerfile describes (the compiler,
+# spin and the tools, plus the C toolchain a compiled program needs) for
+# linux/amd64 and linux/arm64, each on a native runner, and publishes the
+# manifest list as this repository's package on GitHub Container Registry:
+# ghcr.io/<owner>/spinel. It is tagged
+#
+#   latest          the newest master build
+#   YYYY.MM.DD-N    the version: the commit's date (UTC) and N, the number of
+#                   commits on master's first-parent line up to it, so a later
+#                   build sorts later and one commit always gets the same name.
+#                   Deliberately not the shape of a release tag (YYYY.MM.DD or
+#                   YYYY.MM.DD.N): a master build is not a release.
+#   sha-<rev>       the commit, for pinning
+#   YYYY.MM.DD[.N]  the release name too, when the commit is exactly a release tag
+#
+# `spinel --version` inside the image says what a `make` of the same commit
+# says: the release and revision come from the Makefile's own stamp rule here
+# and reach the Dockerfile as build args (the build context carries no .git).
+#
+# Each platform is built and pushed by digest, then one manifest list carrying
+# both digests gets the tags: the two builds never race for a tag. Re-runnable
+# by hand (workflow_dispatch) on any branch; only a default-branch build moves
+# `latest`.
+
+on:
+  push:
+    branches: [master, main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  packages: write
+
+# One publish at a time per branch, in push order and never cancelled midway,
+# so `latest` ends on the newest commit even when pushes land back to back.
+concurrency:
+  group: docker-${{ github.ref }}
+  cancel-in-progress: false
+
+env:
+  REGISTRY: ghcr.io
+
+jobs:
+  # The names this build goes by, computed once so the two platform builds
+  # and the manifest list agree.
+  version:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    outputs:
+      image: ${{ steps.stamp.outputs.image }}
+      release: ${{ steps.stamp.outputs.release }}
+      rev: ${{ steps.stamp.outputs.rev }}
+      version: ${{ steps.stamp.outputs.version }}
+      release_tag: ${{ steps.stamp.outputs.release_tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0   # the release stamp (git describe) and the commit count need the history and the tags
+
+      - name: Compute the release stamp and the image version
+        id: stamp
+        run: |
+          # The package is named after the repository; ghcr.io wants it in lower case.
+          image="$REGISTRY/${GITHUB_REPOSITORY,,}"
+          # The Makefile's rule, not a copy of it: the image's `spinel --version`
+          # is then exactly what a build of this commit from the tree prints.
+          make build/csrc/spinel_rev.h NO_CCACHE=1 >/dev/null
+          release=$(sed -n 's/^#define SPINEL_RELEASE "\(.*\)"/\1/p' build/csrc/spinel_rev.h)
+          rev=$(sed -n 's/^#define SPINEL_BUILD_REV "\(.*\)"/\1/p' build/csrc/spinel_rev.h)
+          date=$(TZ=UTC git log -1 --format=%cd --date=format-local:%Y.%m.%d)
+          count=$(git rev-list --count --first-parent HEAD)
+          # The release tag patterns are release.yml's and the Makefile's.
+          release_tag=$(git describe --tags --exact-match \
+                          --match '[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9]' \
+                          --match '[0-9][0-9][0-9][0-9].[0-9][0-9].[0-9][0-9].[0-9]*' 2>/dev/null || true)
+          {
+            echo "image=$image"
+            echo "release=$release"
+            echo "rev=$rev"
+            echo "version=$date-$count"
+            echo "release_tag=$release_tag"
+          } >> "$GITHUB_OUTPUT"
+          echo "spinel $release ($rev): $image version $date-$count${release_tag:+, release $release_tag}"
+
+  build:
+    name: build (${{ matrix.platform }})
+    needs: version
+    runs-on: ${{ matrix.runner }}
+    timeout-minutes: 45
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: linux/amd64
+            runner: ubuntu-latest
+          # Native arm64 (free on public repositories), so the compiler and the
+          # dogfooded tools are built and smoke-tested by a real arm64 gcc
+          # rather than under QEMU.
+          - platform: linux/arm64
+            runner: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Name the platform for the artifact (linux/amd64 -> linux-amd64)
+        env:
+          PLATFORM: ${{ matrix.platform }}
+        run: echo "PLATFORM_PAIR=${PLATFORM//\//-}" >> "$GITHUB_ENV"
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      # Labels only (source, revision, version, licence, ...): the tags go on
+      # the manifest list in the publish job.
+      - name: Image labels
+        id: meta
+        uses: docker/metadata-action@v6
+        with:
+          images: ${{ needs.version.outputs.image }}
+          tags: type=raw,value=${{ needs.version.outputs.version }}
+
+      - name: Build and push by digest
+        id: build
+        uses: docker/build-push-action@v7
+        with:
+          context: .
+          platforms: ${{ matrix.platform }}
+          build-args: |
+            SPINEL_RELEASE=${{ needs.version.outputs.release }}
+            SPINEL_BUILD_REV=${{ needs.version.outputs.rev }}
+          labels: ${{ steps.meta.outputs.labels }}
+          tags: ${{ needs.version.outputs.image }}
+          outputs: type=image,push-by-digest=true,name-canonical=true,push=true
+          # No attestation manifests: they show up as an "unknown/unknown"
+          # platform on the package page next to the two real ones.
+          provenance: false
+          cache-from: type=gha,scope=${{ env.PLATFORM_PAIR }}
+          cache-to: type=gha,mode=max,scope=${{ env.PLATFORM_PAIR }}
+
+      - name: Export the digest
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: |
+          mkdir -p "$RUNNER_TEMP/digests"
+          touch "$RUNNER_TEMP/digests/${DIGEST#sha256:}"
+
+      - uses: actions/upload-artifact@v7
+        with:
+          name: digest-${{ env.PLATFORM_PAIR }}
+          path: ${{ runner.temp }}/digests/*
+          if-no-files-found: error
+          retention-days: 1
+
+  publish:
+    needs: [version, build]
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/download-artifact@v8
+        with:
+          path: ${{ runner.temp }}/digests
+          pattern: digest-*
+          merge-multiple: true
+
+      - uses: docker/setup-buildx-action@v4
+
+      - name: Log in to GitHub Container Registry
+        uses: docker/login-action@v4
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Image tags
+        id: meta
+        uses: docker/metadata-action@v6
+        env:
+          # Annotations for the manifest list itself (the labels are on the
+          # per-platform images): the package page reads its source and
+          # description from there.
+          DOCKER_METADATA_ANNOTATIONS_LEVELS: index
+        with:
+          images: ${{ needs.version.outputs.image }}
+          # Priorities order the list; the first entry is what the version
+          # annotation names. The release line is disabled off a release tag;
+          # its placeholder value is there only because a raw tag needs one.
+          tags: |
+            type=raw,value=${{ needs.version.outputs.version }},priority=1000
+            type=raw,value=${{ needs.version.outputs.release_tag || 'unreleased' }},enable=${{ needs.version.outputs.release_tag != '' }},priority=900
+            type=sha,priority=800
+            type=raw,value=latest,enable={{is_default_branch}},priority=700
+
+      - name: Create the manifest list and push it
+        working-directory: ${{ runner.temp }}/digests
+        env:
+          IMAGE: ${{ needs.version.outputs.image }}
+          META_JSON: ${{ steps.meta.outputs.json }}
+        run: |
+          args=()
+          while IFS= read -r tag; do args+=(-t "$tag"); done < <(jq -r '.tags[]' <<< "$META_JSON")
+          while IFS= read -r ann; do args+=(--annotation "$ann"); done < <(jq -r '.annotations[]' <<< "$META_JSON")
+          for digest in *; do args+=("$IMAGE@sha256:$digest"); done
+          docker buildx imagetools create "${args[@]}"
+
+      - name: Inspect the published image
+        env:
+          IMAGE: ${{ needs.version.outputs.image }}
+          VERSION: ${{ needs.version.outputs.version }}
+        run: docker buildx imagetools inspect "$IMAGE:$VERSION"

@@ -1,0 +1,39 @@
+# What the image build (Dockerfile) never reads. Out of the context, these
+# keep the upload small and, since `COPY . .` is hashed by content, a commit
+# that touches only them leaves the build layers cached.
+.git
+.github
+.gitignore
+.gitattributes
+.dockerignore
+Dockerfile
+
+# Build artifacts (.gitignore lists the same); vendor/ is fetched inside the
+# build by `make deps`. A stale object from a host build must not ride in: a
+# `**/` prefix is what makes a pattern match below the root here, unlike in
+# .gitignore. (`spinel` alone is the root symlink only; lib/spinel/ stays.)
+build/
+bin/
+vendor/
+**/*.o
+**/*.a
+lib/wasm32-wasi/
+packages/*/build/
+spinel
+**/*.gem
+.sccache/
+tmp/
+
+# The test corpus, benchmarks, docs and examples: the build and the install
+# touch none of them, and test/ is most of the tree.
+test/
+benchmark/
+examples/
+docs/
+tools/rubyspec/
+
+# Local configuration
+.claude/
+CLAUDE.local.md
+local.mk
+config.mk
