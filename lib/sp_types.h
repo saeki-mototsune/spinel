@@ -27,10 +27,21 @@
 #define _DARWIN_C_SOURCE
 #endif
 
+#include "sp_compat.h"   /* the GNU extensions behind macros; first, it sets them all */
 #include <stdint.h>
 #include <stdbool.h>
 #include <stddef.h>
 #include <float.h>   /* DBL_MAX / DBL_MIN / DBL_EPSILON for Float::* constants */
+
+#include <setjmp.h>
+#ifdef __APPLE__
+/* Darwin's setjmp saves the signal mask, a sigprocmask syscall on every
+   begin/rescue. Nothing here needs the mask restored (glibc's longjmp doesn't
+   restore it either), so use the _ variants. Here so the generated TU and the
+   runtime agree on the pair. */
+#define setjmp(env) _setjmp(env)
+#define longjmp(env, val) _longjmp(env, val)
+#endif
 
 /* Per-worker storage under true parallelism. In the -DSP_THREADS runtime
    variant (and the generated TU when the program uses threads, compiled with
@@ -40,7 +51,10 @@
    to before. Both sides must agree on the storage class, so SP_TLS lives in
    this shared base header. */
 #ifdef SP_THREADS
-# define SP_TLS __thread
+# ifdef SP_NO_THREAD_LOCAL
+#  error "spinel: the threaded runtime (SP_THREADS) needs thread-local storage"
+# endif
+# define SP_TLS SP_THREAD_LOCAL
 #else
 # define SP_TLS
 #endif
@@ -56,24 +70,10 @@ extern SP_TLS int sp_worker_id;      /* this OS worker's slot (0 = main); sp_sch
 extern int sp_active_workers;        /* live worker count; sp_sched.c */
 #endif
 
-/* Branch-hint / hot-cold attributes. Static approximation of PGO: marking
-   rare paths (raise, dispatch fallbacks) cold lets the C compiler split
-   them out of the hot path's i-cache footprint. No-op on non-GCC/clang. */
-#if defined(__GNUC__) || defined(__clang__)
-# define SP_LIKELY(x)   __builtin_expect(!!(x), 1)
-# define SP_UNLIKELY(x) __builtin_expect(!!(x), 0)
-# define SP_COLD        __attribute__((cold))
-# define SP_NOINLINE    __attribute__((noinline))
-# define SP_INLINE      inline __attribute__((always_inline))
-# define SP_NORETURN    __attribute__((noreturn))
-#else
-# define SP_LIKELY(x)   (x)
-# define SP_UNLIKELY(x) (x)
-# define SP_COLD
-# define SP_NOINLINE
-# define SP_INLINE      inline
-# define SP_NORETURN
-#endif
+/* Branch-hint / hot-cold attributes (SP_LIKELY, SP_UNLIKELY, SP_COLD,
+   SP_NOINLINE, SP_INLINE, SP_NORETURN) live in sp_compat.h. Static
+   approximation of PGO: marking rare paths (raise, dispatch fallbacks) cold
+   lets the C compiler split them out of the hot path's i-cache footprint. */
 
 /* sp_int follows pointer width (decided at compile time via intptr_t):
    int64_t on 64-bit hosts -- PCs, no behavior change -- and int32_t on
@@ -90,6 +90,11 @@ extern int sp_active_workers;        /* live worker count; sp_sched.c */
 typedef intptr_t sp_int;
 typedef double sp_float;
 typedef bool sp_bool;
+
+/* CRuby's nil.object_id, false.object_id and true.object_id. */
+#define SP_NIL_OBJECT_ID 4
+#define SP_FALSE_OBJECT_ID 0
+#define SP_TRUE_OBJECT_ID 20
 
 /* Sentinel value reserved by the int? (scalar-nullable int) type. An
    int? slot is bit-compatible with sp_int; SP_INT_NIL marks the
@@ -150,7 +155,15 @@ typedef sp_int sp_sym;
    plain ascending range cannot express: n.downto(m) is {first:n,last:m,step:-1}.
    A zero step (every range built by the literal `a..b` / sp_range_new path) is
    treated as +1, so existing constructions need no change. */
-typedef struct{sp_int first;sp_int last;sp_int excl;sp_int step;}sp_Range;
+/* An Integer begin with a Float end, (1..2.5): CRuby iterates it from the
+   Integer, so first / last / excl are the bounds of that walk (1..2), and the
+   end as written is kept beside them -- fe 1 for an inclusive Float end, 2
+   for an excluded one, fend its value; fe 0 (every other range, and the
+   zero-initialized one) has none. Read through sp_range_end_* (sp_range.h).
+   All three Range kinds default to frozen; dup sets their unfrozen flag.
+   Store it beside a byte-sized flag (fe 0..2, omitted 0..63, excl 0..1)
+   in the existing trailing word, keeping the by-value layouts the same size. */
+typedef struct{sp_int first;sp_int last;sp_int excl;sp_int step;sp_float fend;unsigned char fe;unsigned char unfrozen;}sp_Range;
 /* A Float range (1.0..3.0): endpoints kept as sp_float so cover?/include?/begin/
    end are exact (an int-backed sp_Range truncated them). Iteration is a TypeError
    in Ruby (only #step traverses a Float range), so no step/iteration state here.
@@ -160,7 +173,7 @@ typedef struct{sp_int first;sp_int last;sp_int excl;sp_int step;}sp_Range;
    in the value, and only #inspect / #to_s tell them apart -- CRuby prints
    "1.0.." for the first and "1.0..Infinity" for the second (#3670).
    bit 1 = begin omitted, bit 2 = end omitted. */
-typedef struct{sp_float first;sp_float last;sp_int excl;sp_int omitted;}sp_FloatRange;
+typedef struct{sp_float first;sp_float last;sp_int excl;unsigned char omitted;unsigned char unfrozen;}sp_FloatRange;
 #define SP_FRANGE_NO_BEGIN 1
 #define SP_FRANGE_NO_END   2
 /* A mixed literal (1.5..5) is a Float range whose END was written as an
@@ -173,7 +186,7 @@ typedef struct{sp_float first;sp_float last;sp_int excl;sp_int omitted;}sp_Float
    include?/...) materializes the element array through
    sp_StrArray_from_string_range, which is how the range behaved before it was
    a value of its own. */
-typedef struct{const char *first;const char *last;sp_int excl;}sp_StrRange;
+typedef struct{const char *first;const char *last;unsigned char excl;unsigned char unfrozen;}sp_StrRange;
 /* A class value. `name`, when non-NULL, is a rodata class name carried by a
    class whose cls_id table entry may not exist (an exception's class -- the
    Errno:: family and many builtin error classes have no assigned cls_id). It
@@ -244,8 +257,18 @@ typedef struct sp_str_hdr { struct sp_str_hdr *next; uint32_t size; uint32_t len
 
 /* ---- Typed arrays ---- */
 #define SP_STRARR_INLINE 4
-typedef struct{sp_int*data;sp_int start;sp_int len;sp_int cap;sp_int frozen;}sp_IntArray;
-typedef struct{sp_float*data;sp_int len;sp_int cap;sp_int frozen;}sp_FloatArray;
+/* may_nil: the array may hold a nil analyze did not see, carried as the
+   slot's sentinel (SP_INT_NIL, the Float NaN payload). Set where the runtime
+   puts one -- a gap filled past the end, a converted boxed nil, an element a
+   builtin copies -- and carried to copies, so the whole-array reads of an
+   array analyze did not mark (sum, min, max, sort, include?(nil), the boxing
+   into a mixed array) ask one flag; a marked array scans, as its stores set
+   none. Only compact!, delete(nil) and replace drop it. It follows `frozen`,
+   which the push / [] / []= paths read, so their code is unchanged; the
+   IntArray block stays in its slab class. */
+typedef struct{sp_int*data;sp_int start;sp_int len;sp_int cap;sp_int frozen;int may_nil;}sp_IntArray;
+typedef struct{sp_float*data;sp_int len;sp_int cap;sp_int frozen;int may_nil;}sp_FloatArray;
+#define SP_MAY_NIL(a) ((a)->may_nil)
 /* elem_kind/elem_cls: what the pointers are, stamped when the array is boxed by
    reference (the one cls_id for pointer arrays is type-erased, #4486). 0 until
    then; a stamp never changes since a typed array holds one kind. */

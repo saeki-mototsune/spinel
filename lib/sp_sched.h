@@ -31,8 +31,12 @@ typedef struct sp_ev_waiter {
   struct sp_ev_waiter  *next;
 } sp_ev_waiter;
 
+typedef struct sp_sched_timer sp_sched_timer;
+
 typedef struct sp_thread {
   sp_Fiber         *fiber;       /* the green thread's coroutine; NULL for the main thread (root) */
+  sp_Fiber         *at;          /* the Fiber it resumed and stopped inside, or NULL when it
+                                    stopped in its own: run_thread_once switches back there */
   sp_RbVal          arg;         /* Thread.new(arg) -> the block's first param, on first run */
   sp_RbVal          retval;      /* block result (copied from fiber->yielded_value at death) */
   sp_RbVal          name;        /* #name / #name= (a string or nil) */
@@ -72,7 +76,9 @@ typedef struct sp_thread {
   struct sp_thread **wait_head;  /* head of that wait list, so #kill/#raise can unpark it */
   struct sp_thread *all_next, *all_prev;  /* registry of live threads (GC roots) */
   void             *tls;         /* thread-local storage (Thread#[] / #[]=); lazily allocated */
-  double            wake_deadline; /* CLOCK_MONOTONIC time to wake a sleeping thread (Kernel#sleep) */
+  sp_sched_timer   *timer;       /* active scheduler timer for this wait, if any */
+  unsigned char     timer_expired; /* set when a generic timed wait reaches its deadline */
+  unsigned char     woken;         /* Thread#wakeup ended its sleep early */
   int               io_fd;       /* fd this thread is parked on for I/O (-1 = none, scheduler-aware I/O) */
   short             io_events;   /* poll events it is waiting for (POLLIN/POLLOUT) */
   short             io_revents;  /* poll result the monitor delivered when the fd became ready */
@@ -98,6 +104,11 @@ sp_RbVal   sp_Thread_value(sp_thread *t);
 sp_thread *sp_Thread_kill(sp_thread *t);  /* #kill / #exit / #terminate */
 sp_thread *sp_Thread_raise(sp_thread *t, const char *cls, const char *msg, void *obj);  /* #raise */
 void       sp_Thread_pass(void);          /* Thread.pass: cooperative yield */
+void       sp_Thread_stop(void);          /* Thread.stop: sleep until #wakeup */
+sp_thread *sp_Thread_wakeup(sp_thread *t);  /* #wakeup */
+sp_thread *sp_Thread_run(sp_thread *t);     /* #run: #wakeup, then pass */
+sp_bool    sp_Thread_stop_p(sp_thread *t);  /* #stop?: dead or asleep */
+void       sp_sched_sleep_forever(void);  /* a bare Kernel#sleep */
 /* Kernel#sleep(seconds): park the calling thread and free its OS worker for other
    green threads; a monitor thread wakes it after the duration. Falls back to a
    plain blocking sleep only in the single-threaded build (spinel_rt.h). */
@@ -105,6 +116,7 @@ void       sp_sched_sleep(double seconds);
 int        sp_sched_other_threads_live(void);
 int        sp_sched_wait_child(int pid, int *status);
 void       sp_sleep(sp_float s);   /* Kernel#sleep; relocated from spinel_rt.h to lib/sp_cold.c */
+void       sp_sleep_forever(void);  /* a bare Kernel#sleep, until Thread#wakeup */
 /* Scheduler-aware blocking I/O: park the calling green thread until `fd` is ready
    for `events` (POLLIN/POLLOUT), freeing its OS worker for other threads; the
    monitor polls the fd and wakes it. Returns 1 to retry the syscall (fd ready or
@@ -179,8 +191,8 @@ void       sp_sched_drain(void);
    everything that matters. */
 extern volatile int sp_safepoint_flag;
 #ifdef SP_THREADS
-#define SP_SAFEPOINT_POLL() __atomic_load_n(&sp_safepoint_flag, __ATOMIC_RELAXED)
-#define SP_SAFEPOINT_SET(v) __atomic_store_n(&sp_safepoint_flag, (v), __ATOMIC_RELAXED)
+#define SP_SAFEPOINT_POLL() SP_ATOMIC_LOAD(&sp_safepoint_flag, __ATOMIC_RELAXED)
+#define SP_SAFEPOINT_SET(v) SP_ATOMIC_STORE(&sp_safepoint_flag, (v), __ATOMIC_RELAXED)
 #else
 #define SP_SAFEPOINT_POLL() (sp_safepoint_flag)
 #define SP_SAFEPOINT_SET(v) (sp_safepoint_flag = (v))
@@ -221,13 +233,18 @@ typedef struct sp_queue {
 sp_queue  *sp_Queue_new(void);
 sp_queue  *sp_SizedQueue_new(sp_int max);          /* SizedQueue.new(max) */
 void       sp_Queue_push(sp_queue *q, sp_RbVal v);  /* #push / #<< / #enq (blocks when full) */
+void       sp_Queue_push_nb(sp_queue *q, sp_RbVal v); /* SizedQueue#push(non_block: true) */
+void       sp_Queue_push_options_check(sp_queue *q, int has_non_block, int has_timeout);
+sp_bool    sp_Queue_push_timeout(sp_queue *q, sp_RbVal v, double seconds); /* false on timeout */
 sp_RbVal   sp_Queue_pop(sp_queue *q);               /* #pop / #shift / #deq (blocks when empty) */
 sp_RbVal   sp_Queue_pop_nb(sp_queue *q);            /* #pop(truthy): no_wait, raises ThreadError on empty */
+sp_RbVal   sp_Queue_pop_timeout(sp_queue *q, double seconds); /* nil on timeout */
 sp_int    sp_Queue_size(sp_queue *q);              /* #size / #length */
 sp_bool   sp_Queue_empty(sp_queue *q);             /* #empty? */
 sp_int    sp_Queue_max(sp_queue *q);               /* SizedQueue#max */
 void       sp_Queue_close(sp_queue *q);             /* #close */
 sp_bool   sp_Queue_closed(sp_queue *q);            /* #closed? */
+sp_int    sp_Queue_num_waiting(sp_queue *q);       /* #num_waiting */
 void       sp_Queue_clear(sp_queue *q);             /* #clear */
 
 /* ---- Mutex (non-recursive lock; owner + wait list) ----
@@ -256,6 +273,7 @@ const char *sp_Mutex_class_name(sp_mutex *m); /* "Monitor" or "Thread::Mutex" */
 const char *sp_Queue_class_name(sp_queue *q);  /* "Thread::SizedQueue" or "Thread::Queue" */
 void       sp_Mutex_lock(sp_mutex *m);
 void       sp_Mutex_unlock(sp_mutex *m);
+sp_RbVal   sp_Mutex_sleep(sp_mutex *m, int has_timeout, double timeout);  /* #sleep / #sleep(t) */
 sp_bool   sp_Mutex_try_lock(sp_mutex *m);   /* #try_lock: true if acquired */
 sp_bool   sp_Mutex_locked(sp_mutex *m);     /* #locked? */
 sp_bool   sp_Mutex_owned(sp_mutex *m);      /* #owned? */
@@ -266,8 +284,11 @@ typedef struct sp_condvar {
 } sp_condvar;
 
 sp_condvar *sp_CondVar_new(void);
-void        sp_CondVar_wait(sp_condvar *cv, sp_mutex *m);  /* release m, park, re-acquire m */
-void        sp_CondVar_wait_nb(sp_condvar *cv, sp_mutex *m);  /* release m, drain a pending signal, re-acquire m; the 2-arg #wait path */
+/* #wait answers what CRuby's Mutex#sleep answers: nil when a timeout ran out,
+   otherwise the whole seconds slept (time(2) after less time(2) before). */
+sp_RbVal    sp_CondVar_wait(sp_condvar *cv, sp_mutex *m);  /* release m, park, re-acquire m */
+sp_RbVal    sp_CondVar_wait_nb(sp_condvar *cv, sp_mutex *m);  /* release m, do not park, re-acquire m */
+sp_RbVal    sp_CondVar_wait_timeout(sp_condvar *cv, sp_mutex *m, double seconds); /* timed #wait */
 void        sp_CondVar_signal(sp_condvar *cv);             /* #signal */
 void        sp_CondVar_broadcast(sp_condvar *cv);          /* #broadcast */
 

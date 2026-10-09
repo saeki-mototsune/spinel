@@ -358,6 +358,13 @@ statement should fail the way an unresolvable dependency does -- quietly
 building something slower than what was asked for is how one machine's binary
 comes to differ from another's without anyone noticing.
 
+Installed but outside the linker's default directories is a different case:
+Homebrew on Apple Silicon puts jemalloc in `/opt/homebrew/lib`, which Apple's
+linker does not search. When `pkg-config` knows the library, `spin` puts the
+directories it reports on `LIBRARY_PATH` for the build, so such a library links
+without any setup. `spin pack` writes no host path into what it packs; the
+build host's own linker and `LIBRARY_PATH` find it there.
+
 On two Rails-derived applications compiled by spinel, `"jemalloc"` was worth
 +58% on one OS worker and +25% on twelve for a 420 KB page, and +22% and +59%
 for a 6 KB one. It is the same reason Rails ships jemalloc in its production
@@ -404,6 +411,11 @@ resolves against any `-I` root as `<root>/curses.rb` or
 `<root>/curses/curses.rb`, so `spinel -I spin/packages` finds a package sitting
 at `spin/packages/curses/`, and `--link` takes its compiled object. `spin
 flags` is the part that works out which roots and which objects.
+
+A dependency whose name is also a package bundled with the compiler shadows it: the
+`-I` roots are searched before the bundled `packages/`, so `openssl = { path =
+"packages/openssl" }` makes `require "openssl"` reach the project's own
+package.
 
 ## Shipping a build that does not need spinel
 
@@ -539,7 +551,9 @@ its own fallback (the generated loader `require`s the extension and falls
 back to the source) and its own test oracle (`spin ext test` runs each case
 through the pure kernel and the compiled one and diffs). The `if __FILE__ ==
 $0` block at the bottom is the manual test driver *and* how the exported
-methods get their types -- it never runs at extension load.
+methods get their types -- it never runs at extension load. Compiled as
+a plain binary (`spinel kernel.rb`) the guard is true, as under `ruby
+kernel.rb`, so the same file is also a standalone program.
 
 `spin.toml` names what crosses:
 

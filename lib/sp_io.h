@@ -18,6 +18,9 @@ typedef struct {
   unsigned char bin_flag;      /* #binmode was called (#3131) */
   unsigned char no_autoclose;  /* #autoclose = false (#3131) */
   unsigned char is_sock;       /* a socket handle: writes bypass stdio (#2922) */
+  unsigned char rev_lookup;    /* a socket's #do_not_reverse_lookup is false:
+                                  addr / peeraddr report the host name. Taken
+                                  from the class setting when it is made */
   unsigned char sync_on;       /* #sync is true for this handle: a write reaches
                                   the descriptor at once. A socket is always
                                   sync (its writes bypass stdio); IO.pipe's
@@ -135,11 +138,20 @@ sp_int sp_sock_connect_nb(sp_File *f, const char *host, sp_int port, sp_bool exc
 sp_int sp_sock_connect_nb_sa(sp_File *f, const char *sa, sp_int salen,
                                  sp_bool exc);
 sp_bool sp_io_is_a(sp_File *f, const char *cls);
+/* Of the reopened IO classes names[] (NULL-ended), the one nearest the
+   handle's kind up its class chain: its idx[] entry, or 0x7fffffff. */
+int sp_io_pick_class(sp_File *f, const char *const *names, const int *idx);
 sp_bool sp_io_instance_of(sp_File *f, const char *cls);
 sp_File *sp_sock_udp_new(sp_int family);
 const char *sp_sock_gethostname(void);
-sp_PolyArray *sp_sock_getaddrinfo(const char *host, sp_int port);
+sp_int sp_sock_addrinfo_hint(sp_RbVal v, sp_int is_family);
+sp_PolyArray *sp_sock_getaddrinfo(const char *host, sp_int port, sp_int family, sp_int socktype);
 sp_Addrinfo *sp_sock_address(sp_File *f, sp_int peer);
+/* BasicSocket.do_not_reverse_lookup (shared by every socket class) and the
+   per-socket flag a new socket takes from it */
+extern sp_bool sp_sock_dnrl_default;
+sp_bool sp_sock_dnrl(sp_File *f);
+void sp_sock_set_dnrl(sp_File *f, sp_bool on);
 /* Packed sockaddr strings: what Socket.sockaddr_in / Socket.pack_sockaddr_in,
    Socket.pack_sockaddr_un and Addrinfo#to_sockaddr answer, and what the 1-arg
    connect_nonblock takes. Byte strings -- they carry NUL. */
@@ -158,6 +170,7 @@ sp_int sp_sock_shutdown(sp_File *f, sp_int how);
 sp_int sp_sock_const(const char *n);
 const char *sp_sock_recv(sp_File *f, sp_int len);
 const char *sp_sock_recvfrom(sp_File *f, sp_int len, const char **ip_out, sp_int *port_out);
+sp_int sp_sock_optval(sp_RbVal v);
 sp_int sp_sock_setsockopt(sp_File *f, sp_int level, sp_int opt, sp_int value);
 sp_SockOpt *sp_sock_getsockopt(sp_File *f, sp_int level, sp_int opt);
 sp_int sp_sock_listen(sp_File *f, sp_int backlog);
@@ -186,6 +199,7 @@ sp_int sp_File_rewind(sp_File *f);     /* #rewind */
 sp_bool sp_File_tty_p(sp_File *f);     /* #tty? / #isatty -- isatty(fileno) */
 sp_int sp_File_fileno(sp_File *f);     /* #fileno */
 sp_IntArray *sp_File_winsize(sp_File *f); /* #winsize -> [rows, cols] (ioctl, or [0,0]) */
+sp_IntArray *sp_File_set_winsize(sp_File *f, sp_IntArray *size); /* #winsize= [rows, cols(, xpx, ypx)] (ioctl; Errno on a non-tty) */
 
 /* STDOUT / STDERR as shared IO handles wrapping the C stdout/stderr streams.
    The handle is a function-local static (stdout/stderr are not constant

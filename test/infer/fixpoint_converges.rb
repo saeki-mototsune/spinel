@@ -75,3 +75,39 @@ end
 fn = FcNamed.new
 fn.go
 p fn.out
+
+# A *rest parameter the body reassigns from itself (`args = args.first`, the
+# background job's perform(*args)), as a statement of the body and inside a
+# branch: the desugared copy must not keep the fold alternating (#6491)
+def fp_perform(*args)
+  args = args.first
+  args
+end
+def fp_maybe_first(*a)
+  if a.size > 0
+    a = a.first
+  end
+  a
+end
+p fp_perform(7), fp_maybe_first(7), fp_maybe_first
+
+# A Hash parameter its body reassigns from a boxed value and then writes
+# String keys into (ActionView's `html_options = (html_options || {})
+# .stringify_keys; html_options["href"] = ...`): the String-keyed writes
+# narrowed the poly parameter to the StrStr hash, and the body's own write
+# widened it back to poly, every round. A multiple assignment the same.
+def fp_norm(h)
+  return h if h.is_a?(Hash)
+  "x"
+end
+def fp_link(addr, opts = {})
+  opts = fp_norm(opts)
+  opts["href"] = "mailto:#{addr}"
+  opts
+end
+def fp_link2(addr, opts = {})
+  opts, n = fp_norm(opts), 1
+  opts["href"] = "tel:#{addr}#{n}"
+  opts
+end
+p fp_link("a@b"), fp_link2("5")

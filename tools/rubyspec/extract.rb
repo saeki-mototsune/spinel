@@ -24,16 +24,16 @@ Encoding.default_external = Encoding::UTF_8
 
 SPEC_DIR = ARGV[0] or abort "usage: extract.rb SPEC_DIR OUT_DIR [glob]"
 OUT_DIR  = ARGV[1] or abort "usage: extract.rb SPEC_DIR OUT_DIR [glob]"
-GLOB     = ARGV[2] || "*_spec.rb"
+GLOB     = ARGV[2] || "**/*_spec.rb"
 LITE     = File.read(File.join(__dir__, "mspec_lite.rb"))
 
-SPINEL_VERSION = [3, 4]   # the CRuby level spinel targets, for version guards
+SPINEL_VERSION = [4, 0]   # the CRuby level spinel targets, for version guards
 
 require "fileutils"
 FileUtils.mkdir_p(OUT_DIR)
 
 def version_guard_active?(kind, args)
-  # ruby_version_is "3.0" / "3.0"..."3.4" -- include body if 3.4 is in range.
+  # ruby_version_is "3.0" / "3.0"..."3.4" -- include body if 4.0 is in range.
   lo = args[/["']([\d.]+)["']/, 1]
   hi = args[/\.\.\.?\s*["']([\d.]+)["']/, 1]
   excl = args.include?("...")
@@ -42,21 +42,22 @@ def version_guard_active?(kind, args)
   ok = true
   ok &&= (cmp.(lo) <=> v) <= 0 if lo
   ok &&= excl ? (v <=> cmp.(hi)) < 0 : (v <=> cmp.(hi)) <= 0 if hi
-  kind == "ruby_version_is" ? ok : ok   # ruby_bug etc. default include
+  kind == "ruby_version_is" ? ok : hi ? !ok : !lo || (v <=> cmp.(lo)) > 0
 end
 
 def rewrite(line)
   line = line.gsub(/ScratchPad\.record\s+(.+)$/) { "scratch_pad = #{$1}" }
   line = line.gsub(/ScratchPad\.record\((.+)\)/) { "scratch_pad = #{$1}" }
-  line = line.gsub(/ScratchPad\s*<<\s*(.+)$/) { "scratch_pad.push(#{$1})" }
+  line = line.gsub(/ScratchPad\s*<</, "scratch_pad <<")
   line = line.gsub("ScratchPad.recorded", "scratch_pad")
   line = line.gsub("ScratchPad.clear", "scratch_pad = nil")
   line
 end
 
 total = 0
-Dir.glob(File.join(SPEC_DIR, GLOB)).sort.each do |path|
-  base = File.basename(path, ".rb")
+Dir.glob(GLOB, base: SPEC_DIR).sort.each do |rel|
+  path = File.join(SPEC_DIR, rel)
+  base = rel.delete_suffix(".rb").tr("/", "-")
   lines = File.readlines(path)
 
   prelude = []          # top-level lines outside any block
@@ -68,13 +69,13 @@ Dir.glob(File.join(SPEC_DIR, GLOB)).sort.each do |path|
   block_open = /\b(do|\{)\s*(\|[^|]*\|)?\s*$/
   lines.each_with_index do |raw, ln|
     line = raw.chomp
-    s = line.strip
+    s = line.strip.sub(/\A(?:"(?:\\.|[^"\\])*"|'(?:\\.|[^'\\])*'|[^"'])*?\bdo\K\s+#.*/, "")
     next if s.start_with?("require_relative", "require ")
 
     if example
       # inside an it block: track nesting depth via do/end pairs
       if s =~ /^(it|describe|context)\b/ && false; end
-      example[:depth] += 1 if line =~ block_open || s =~ /^(begin|def|class|module|case|if|unless|while|until|for)\b/ && s !~ /\bend\b/
+      example[:depth] += 1 if s =~ block_open || s =~ /^(begin|def|class|module|case|if|unless|while|until|for)\b/ && s !~ /\bend\b/
       if s == "end" || s =~ /^end\b/
         if example[:depth].zero?
           # emit
@@ -90,7 +91,7 @@ Dir.glob(File.join(SPEC_DIR, GLOB)).sort.each do |path|
           name = format("%s__%03d", base, n_in_file)
           desc = (stack.map { |b| b[:desc] } + [example[:desc]]).compact.join(" ")
           File.write(File.join(OUT_DIR, name + ".rb"),
-                     "# #{File.basename(path)}:#{example[:line]} -- #{desc}\n" + out)
+                     "# #{rel}:#{example[:line]} -- #{desc}\n" + out)
           total += 1
           example = nil
         else

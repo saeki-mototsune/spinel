@@ -86,9 +86,9 @@ Real, blocking primitives -- not busy-waits:
 | type | methods |
 |---|---|
 | `Mutex` | `#lock` / `#unlock` / `#try_lock` / `#locked?` / `#owned?` (non-recursive) |
-| `Queue` | `#push` / `#<<` / `#pop` / `#size` / `#empty?` / `#close` / `#closed?` / `#clear` (`#pop` blocks when empty) |
-| `SizedQueue` | `Queue` plus `#max`; `#push` blocks when full |
-| `ConditionVariable` | `#wait(mutex)` / `#signal` / `#broadcast` |
+| `Queue` | `#push` / `#<<` / `#pop` / `#size` / `#empty?` / `#close` / `#closed?` / `#clear` (`#pop(timeout:)` returns `nil` when its deadline expires) |
+| `SizedQueue` | `Queue` plus `#max`; `#push(timeout:)` returns `nil` if the queue stays full until its deadline |
+| `ConditionVariable` | `#wait(mutex[, timeout])` / `#signal` / `#broadcast`; nil timeout waits indefinitely |
 
 ## By design
 

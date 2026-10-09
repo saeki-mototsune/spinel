@@ -371,6 +371,77 @@ struct declarations and callbacks are covered. Not supported yet:
   a `poly_array` or a generic `Hash`; keep them as plain locals or
   wrap them in a class with a `ptr`-typed ivar.
 
+## The ffi gem (`require "ffi"`)
+
+The DSL above is compile-time: every name, type and library is written in
+the source, and each call is a direct C call. Gems written against CRuby's
+`ffi` gem often need more than that -- a library path computed at run
+time, `FFI::Struct` layouts, `MemoryPointer`s, callbacks stored and called
+later, functions attached under names that come from data. For those,
+`require "ffi"` loads the bundled package (`packages/ffi`): the gem's API
+in Ruby over `packages/ffi/sp_ffi.c`, which is the libffi and dlopen glue
+and nothing else.
+
+- A module that `extend`s `FFI::Library` is then the package's: `ffi_lib`,
+  `attach_function`, `callback`, `typedef` and `enum` run when the module
+  body runs, as in CRuby, and a symbol that is missing raises
+  `FFI::NotFoundError` there.
+- A literal `attach_function :name, ...` also gets a method `name` on the
+  module (and as an instance method, for a module that is included) at
+  compile time, since a method's name has to be known then.
+- A call to a function attached under a computed name
+  (`SDL.Init(...)`, or a bare `InitWindow(...)` in a class that includes the
+  module) goes through the table of attached functions at run time.
+- `FFI::Pointer` / `MemoryPointer` / `Buffer`, `FFI::Struct` / `Union`
+  (nested, by value and by reference, arrays in layouts), `FFI::Function`,
+  enums, typedefs, varargs and `FFI::AutoPointer` are provided.
+
+The package needs the system libffi where spinel is built (like openssl, it
+is probed for). Without it, `require "ffi"` stays a no-op and an `extend
+FFI::Library` module is read by the compile-time DSL, which accepts the
+gem's spellings for the literal cases.
+
+## Fiddle (`require "fiddle"`)
+
+The stdlib's `fiddle` is the other dynamic-FFI API a Ruby program meets, and
+`require "fiddle"` loads a bundled package (`packages/fiddle`) that provides
+it: `Fiddle::Handle` (and `Handle::DEFAULT` / `NEXT`), `Fiddle::Function`,
+`Fiddle::Pointer`, `Fiddle::Closure` / `Closure::BlockCaller`, the `TYPE_*`,
+`SIZEOF_*` and `ALIGN_*` constants, and `Fiddle.malloc` / `realloc` / `free`.
+
+```ruby
+require "fiddle"
+libc = Fiddle.dlopen(nil)
+strlen = Fiddle::Function.new(libc["strlen"], [Fiddle::TYPE_VOIDP], Fiddle::TYPE_SIZE_T)
+strlen.call("hello")   # => 5
+```
+
+It is the ffi package's native layer under Fiddle's API, so it carries no C of
+its own and exists where the ffi package does: it needs the system libffi. The
+library and the symbol are looked up when the program runs, and a function's
+signature is whatever it was made with.
+
+Behaviour that follows Fiddle rather than the ffi gem: a `Pointer` checks no
+bounds (`ptr[0, 9]` reads nine bytes whatever `ptr.size` says; size 0 means
+unknown), `ptr[i]` is a signed byte, `Pointer#free` is the free function (not
+a call of it: that is `call_free`), and a variadic function's types end with
+`TYPE_VARIADIC` and are called with a (type, value) pair per variadic argument.
+A pointer argument that is not a Pointer, String, Integer, nil or something with
+`to_ptr` raises `TypeError` (CRuby's Fiddle crashes there).
+
+`require "fiddle/import"` adds `Fiddle::Importer`: a module that `extend`s it
+loads libraries with `dlload`, aliases types with `typealias` and declares C
+functions from their prototypes with `extern` (the prototype parser is the
+gem's own), and calls them on the module -- `LibC.strlen("hello")`. As with an
+`extend FFI::Library` module, the compiler sends a call of a name the module has
+no method for to the declared function, and a class that includes the module
+(which CRuby's Importer does not support) may call them bare. Like the gem,
+`dlload nil` searches nothing; pass `Fiddle.dlopen(nil)` for the process.
+
+Not provided, and so refused when the program is compiled: `Importer#struct`,
+`union`, `value` and `bind` (they build classes and methods from data), and
+`CStruct`, `Pinned`, `MemoryView`, `Fiddle.dlwrap` / `dlunwrap`.
+
 ## Examples
 
 Runnable examples live under `examples/ffi/`:

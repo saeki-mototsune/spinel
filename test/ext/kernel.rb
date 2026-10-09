@@ -19,9 +19,24 @@ module ExtKernel
     t
   end
 
+  # Two array parameters: the host converts the second while the first is
+  # already built, so the first must stay rooted across that conversion.
+  def self.pair_sum(a, b)
+    raise ArgumentError, "needs a non-empty first array" if a.empty?
+    t = 0
+    a.each { |s| t += s.length }
+    b.each { |s| t += s.length }
+    t
+  end
+
   def self.must_pos(n)
     raise ArgumentError, "needs a positive number" if n <= 0
     n
+  end
+
+  def self.pause_total(arr, delay)
+    sleep(delay)
+    total(arr)
   end
 end
 
@@ -32,4 +47,6 @@ if __FILE__ == $0
   p ExtKernel.shout("hey")
   p ExtKernel.total([1, 2, 3])
   p ExtKernel.must_pos(9)
+  p ExtKernel.pair_sum(["ab", "c"], ["def"])
+  p ExtKernel.pause_total([1, 2, 3], 0.001)
 end

@@ -19,6 +19,63 @@ module URI
   class InvalidURIError < Error
   end
 
+  # The regexp sources CRuby's RFC 2396 parser builds itself from, which a
+  # server reads to match what a request carries -- webrick matches a Host
+  # header with `URI::RFC2396_Parser.new.pattern.fetch(:HOST)`. #pattern
+  # answers the table up to :USERINFO, each source spelled as CRuby spells
+  # it; the path and whole-URI patterns after it, the #regexp table, and
+  # the parser's own #parse/#split/#escape are absent.
+  class RFC2396_Parser
+    module PATTERN
+      ALPHA = "a-zA-Z"
+      ALNUM = "#{ALPHA}\\d"
+      HEX = "a-fA-F\\d"
+      ESCAPED = "%[#{HEX}]{2}"
+      UNRESERVED = "\\-_.!~*'()#{ALNUM}"
+      RESERVED = ";/?:@&=+$,\\[\\]"
+      DOMLABEL = "(?:[#{ALNUM}](?:[-#{ALNUM}]*[#{ALNUM}])?)"
+      TOPLABEL = "(?:[#{ALPHA}](?:[-#{ALNUM}]*[#{ALNUM}])?)"
+    end
+
+    attr_reader :pattern
+
+    def initialize
+      escaped = PATTERN::ESCAPED
+      unreserved = PATTERN::UNRESERVED
+      reserved = PATTERN::RESERVED
+      uric = "(?:[#{unreserved}#{reserved}]|#{escaped})"
+      hostname = "(?:[a-zA-Z0-9\\-.]|%\\h\\h)+"
+      ipv4addr = "\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}"
+      hex4 = "[#{PATTERN::HEX}]{1,4}"
+      lastpart = "(?:#{hex4}|#{ipv4addr})"
+      hexseq1 = "(?:#{hex4}:)*#{hex4}"
+      hexseq2 = "(?:#{hex4}:)*#{lastpart}"
+      ipv6addr = "(?:#{hexseq2}|(?:#{hexseq1})?::(?:#{hexseq2})?)"
+      ipv6ref = "\\[#{ipv6addr}\\]"
+      host = "(?:#{hostname}|#{ipv4addr}|#{ipv6ref})"
+      port = "\\d*"
+      @pattern = {
+        ESCAPED: escaped,
+        UNRESERVED: unreserved,
+        RESERVED: reserved,
+        DOMLABEL: PATTERN::DOMLABEL,
+        TOPLABEL: PATTERN::TOPLABEL,
+        HOSTNAME: hostname,
+        URIC: uric,
+        URIC_NO_SLASH: "(?:[#{unreserved};?:@&=+$,]|#{escaped})",
+        QUERY: "#{uric}*",
+        FRAGMENT: "#{uric}*",
+        IPV4ADDR: ipv4addr,
+        IPV6ADDR: ipv6addr,
+        IPV6REF: ipv6ref,
+        HOST: host,
+        PORT: port,
+        HOSTPORT: "#{host}(?::#{port})?",
+        USERINFO: "(?:[#{unreserved};:&=+$,]|#{escaped})*",
+      }
+    end
+  end
+
   class Generic
     attr_reader :scheme, :userinfo, :host, :port, :path, :query, :fragment
     # The component writers CRuby's Generic has: a parsed URI is edited
@@ -42,6 +99,12 @@ module URI
       @fragment = fragment
     end
 
+    # true when the URI names a scheme -- a full URL rather than a bare
+    # path such as a request line's "/hello"
+    def absolute?
+      !@scheme.nil? && !@scheme.empty?
+    end
+
     def default_port
       case @scheme
       when "https" then 443
@@ -57,8 +120,11 @@ module URI
       @query.nil? || @query.empty? ? p : "#{p}?#{@query}"
     end
 
+    # the host without the brackets an IPv6 address carries in a URI, as
+    # CRuby's URI::Generic#hostname answers it
     def hostname
-      @host
+      v = @host
+      v && v.start_with?("[") && v.end_with?("]") ? v[1..-2] : v
     end
 
     def to_s
@@ -118,7 +184,17 @@ module URI
     out
   end
 
-  def self.decode_www_form_component(str)
+  # The value of one hex digit character, or nil for anything else.
+  def self.hex_digit(c)
+    return nil unless c
+    o = c.ord
+    return o - 48 if o >= 48 && o <= 57
+    return o - 55 if o >= 65 && o <= 70
+    return o - 87 if o >= 97 && o <= 102
+    nil
+  end
+
+  def self.decode_www_form_component(str, enc = Encoding::UTF_8)
     out = String.new
     s = str.to_s
     i = 0
@@ -127,22 +203,95 @@ module URI
       if ch == "+"
         out << " "
         i += 1
-      elsif ch == "%" && i + 2 < s.length
-        out << s[i + 1, 2].to_i(16).chr
+      elsif ch == "%"
+        # a % not followed by two hex digits is CRuby's ArgumentError
+        h1 = hex_digit(s[i + 1])
+        h2 = hex_digit(s[i + 2])
+        raise ArgumentError, "invalid %-encoding (#{s})" unless h1 && h2
+        out << (h1 * 16 + h2).chr
         i += 3
       else
         out << ch
         i += 1
       end
     end
-    out
+    out.force_encoding(enc)
+  end
+
+  # The www-form decoding of one key or value: "+" is a space and a "%" with two
+  # hex digits is that byte. Unlike decode_www_form_component, a "%" that is not
+  # followed by two hex digits is left as it is, not an error.
+  def self.decode_www_form_lenient(s, enc = Encoding::UTF_8)
+    out = String.new
+    i = 0
+    while i < s.length
+      ch = s[i]
+      if ch == "+"
+        out << " "
+        i += 1
+      elsif ch == "%" && hex_digit(s[i + 1]) && hex_digit(s[i + 2])
+        out << (hex_digit(s[i + 1]) * 16 + hex_digit(s[i + 2])).chr
+        i += 3
+      else
+        out << ch
+        i += 1
+      end
+    end
+    out.force_encoding(enc).scrub
+  end
+
+  # `URI.decode_www_form("a=1&b=x+y")` -> [["a", "1"], ["b", "x y"]]. Keys and
+  # values take the encoding argument, UTF-8 by default. `use__charset_` is not
+  # supported.
+  def self.decode_www_form(str, enc = Encoding::UTF_8, separator: "&", use__charset_: false, isindex: false)
+    raise ArgumentError, "the input of URI.decode_www_form must be ASCII only string" unless str.ascii_only?
+    raise NotImplementedError, "URI.decode_www_form: use__charset_ is not supported" if use__charset_
+    raise NotImplementedError, "URI.decode_www_form: an empty separator is not supported" if separator.empty?
+    ary = []
+    return ary if str.empty?
+    pos = 0
+    n = str.length
+    sl = separator.length
+    while pos < n
+      e = str.index(separator, pos)
+      if e
+        piece = str[pos, e - pos]
+        pos = e + sl
+      else
+        piece = str[pos, n - pos]
+        pos = n
+      end
+      eq = piece.index("=")
+      key = eq ? piece[0, eq] : piece
+      val = eq ? piece[eq + 1, piece.length - eq - 1] : ""
+      if isindex
+        if eq.nil?
+          val = key
+          key = ""
+        end
+        isindex = false
+      end
+      ary << [decode_www_form_lenient(key, enc), decode_www_form_lenient(val, enc)]
+    end
+    ary
   end
 
   # `URI.encode_www_form({"a" => 1, "b" => "x y"})` -> "a=1&b=x+y"
   def self.encode_www_form(pairs)
     parts = []
     pairs.each do |k, v|
-      parts << "#{encode_www_form_component(k)}=#{encode_www_form_component(v)}"
+      key = encode_www_form_component(k)
+      if v.nil?
+        parts << key
+      elsif v.respond_to?(:to_ary)
+        values = []
+        v.to_ary.each do |item|
+          values << (item.nil? ? "" : "#{key}=#{encode_www_form_component(item)}")
+        end
+        parts << values.join("&")
+      else
+        parts << "#{key}=#{encode_www_form_component(v)}"
+      end
     end
     parts.join("&")
   end
@@ -290,10 +439,97 @@ module URI
     end
   end
 
+  # The RFC 2396 parser's #make_regexp, the pattern CRuby builds for an
+  # absolute URI. The rest of the parser (#split, #parse, #escape, the
+  # pattern and regexp tables) is not here.
+  class RFC2396_Parser
+    def make_regexp(schemes = nil)
+      x = x_abs_uri
+      return Regexp.new(x, Regexp::EXTENDED) unless schemes
+      Regexp.new("(?=(?i:#{Regexp.union(*schemes).source}):)#{x}", Regexp::EXTENDED)
+    end
+
+    private
+
+    # The pieces of CRuby's initialize_pattern the absolute-URI pattern uses.
+    def x_abs_uri
+      alpha = "a-zA-Z"
+      alnum = "#{alpha}\\d"
+      hex = "a-fA-F\\d"
+      escaped = "%[#{hex}]{2}"
+      unreserved = "\\-_.!~*'()#{alnum}"
+      reserved = ";/?:@&=+$,\\[\\]"
+      uric = "(?:[#{unreserved}#{reserved}]|#{escaped})"
+      uric_no_slash = "(?:[#{unreserved};?:@&=+$,]|#{escaped})"
+      query = "#{uric}*"
+      fragment = "#{uric}*"
+      hostname = "(?:[a-zA-Z0-9\\-.]|%\\h\\h)+"
+      ipv4addr = "\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}\\.\\d{1,3}"
+      hex4 = "[#{hex}]{1,4}"
+      lastpart = "(?:#{hex4}|#{ipv4addr})"
+      hexseq1 = "(?:#{hex4}:)*#{hex4}"
+      hexseq2 = "(?:#{hex4}:)*#{lastpart}"
+      ipv6addr = "(?:#{hexseq2}|(?:#{hexseq1})?::(?:#{hexseq2})?)"
+      ipv6ref = "\\[#{ipv6addr}\\]"
+      host = "(?:#{hostname}|#{ipv4addr}|#{ipv6ref})"
+      userinfo = "(?:[#{unreserved};:&=+$,]|#{escaped})*"
+      pchar = "(?:[#{unreserved}:@&=+$,]|#{escaped})"
+      param = "#{pchar}*"
+      segment = "#{pchar}*(?:;#{param})*"
+      path_segments = "#{segment}(?:/#{segment})*"
+      reg_name = "(?:[#{unreserved}$,;:@&=+]|#{escaped})+"
+      scheme = "[#{alpha}][\\-+.#{alpha}\\d]*"
+      abs_path = "/#{path_segments}"
+      opaque_part = "#{uric_no_slash}#{uric}*"
+      "
+        (#{scheme}):                           (?# 1: scheme)
+        (?:
+           (#{opaque_part})                    (?# 2: opaque)
+        |
+           (?:(?:
+             //(?:
+                 (?:(?:(#{userinfo})@)?        (?# 3: userinfo)
+                   (?:(#{host})(?::(\\d*))?))? (?# 4: host, 5: port)
+               |
+                 (#{reg_name})                 (?# 6: registry)
+               )
+             |
+             (?!//))                           (?# XXX: '//' is the mark for hostport)
+             (#{abs_path})?                    (?# 7: path)
+           )(?:\\?(#{query}))?                 (?# 8: query)
+        )
+        (?:\\#(#{fragment}))?                  (?# 9: fragment)
+      "
+    end
+  end
+
+  RFC2396_PARSER = RFC2396_Parser.new
+
+  def self.normalize_path(path)
+    trailing_slash = path.end_with?("/") || path.end_with?("/.") || path.end_with?("/..")
+    parts = []
+    path.split("/").each do |part|
+      if part == ".."
+        parts.pop if parts.length > 1
+      elsif part != "."
+        parts << part
+      end
+    end
+    normalized = parts.join("/")
+    normalized << "/" if trailing_slash && !normalized.end_with?("/")
+    normalized
+  end
+
   def self.join(base, rel)
     b = parse(base.to_s)
     r = rel.to_s
     return parse(r) if r.include?("://")
+    q = ""
+    qi = r.index("?")
+    if qi
+      q = r[(qi + 1)..-1].to_s
+      r = r[0, qi]
+    end
     if r.start_with?("/")
       path = r
     else
@@ -302,12 +538,7 @@ module URI
       dir = cut ? dir[0, cut + 1] : "/"
       path = dir + r
     end
-    q = ""
-    qi = path.index("?")
-    if qi
-      q = path[(qi + 1)..-1].to_s
-      path = path[0, qi]
-    end
+    path = normalize_path(path)
     if b.scheme == "https"
       HTTPS.new(b.scheme, b.userinfo, b.host, b.port, path, q, "")
     else

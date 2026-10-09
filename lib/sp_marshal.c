@@ -9,7 +9,9 @@
 #include "sp_marshal.h"   /* sp_gc.h: sp_RbVal, hooks, SP_GC_ROOT, cls_ids */
 #include "sp_alloc.h"     /* sp_str_alloc_raw, sp_str_set_len, sp_str_byte_len, sp_float_to_s */
 #include "sp_dtoa.h"      /* sp_format_float / sp_read_float (locale-independent) */
+#include "sp_string.h"    /* sp_String: a shared String handle in a box */
 #include <string.h>
+#include <setjmp.h>
 #include <math.h>
 
 /* Bignum codec lives in lib/sp_bigint.c. */
@@ -94,16 +96,41 @@ static int sp_mar_seen(sp_mar_buf *b, void *ptr) {
   }
   return 0;
 }
+/* A Hash: `{` and its pairs, or, with a default value, `}`, the pairs and
+   the default after them, as CRuby writes it; a default proc cannot be
+   written (CRuby's TypeError). */
 static void sp_mar_w_hash(sp_mar_buf *b, sp_RbVal v) {
-  sp_mar_b(b, '{');
+  int has_proc = 0;
+  sp_RbVal d = sp_marshal_v.hash_default ? sp_marshal_v.hash_default(v, &has_proc) : mk_nil();
+  if (has_proc) mar_raise("TypeError", "can't dump hash with default proc");
+  SP_GC_ROOT_RBVAL(d);
+  sp_mar_b(b, d.tag == SP_TAG_NIL ? '{' : '}');
   sp_int n = sp_json_len_fn(v);
   sp_mar_long(b, n);
   for (sp_int i = 0; i < n; i++) {
     sp_RbVal k, val; sp_json_hpair_fn(v, i, &k, &val);
     sp_mar_w(b, k); sp_mar_w(b, val);
   }
+  if (d.tag != SP_TAG_NIL) sp_mar_w(b, d);
+}
+void sp_mar_w_body(sp_mar_buf *b, sp_RbVal v) {
+  if (sp_json_kind_fn(v) == 2) { sp_mar_w_hash(b, v); return; }
+  sp_mar_b(b, '['); sp_int n = sp_json_len_fn(v); sp_mar_long(b, n);
+  for (sp_int i = 0; i < n; i++) sp_mar_w(b, sp_json_aref_fn(v, i));
 }
 void sp_mar_w(sp_mar_buf *b, sp_RbVal v) {
+  /* an Array or Hash subclass instance, boxed as its builtin (#7449): its
+     class's own record, `C` with the class, the builtin's body and the ivars
+     (sp_marshal_v.obj_dump), so it loads back as an instance of the class */
+  if (v.tag == SP_TAG_OBJ && sp_bsub_cls_fn) {
+    int k = sp_bsub_cls_fn(v);
+    if (k >= 0) {
+      if (sp_mar_seen(b, v.v.p)) return;
+      if (!sp_marshal_v.obj_dump || !sp_marshal_v.obj_dump(b, k, v.v.p))
+        mar_raise("TypeError", "no marshal_dump is defined for this object");
+      return;
+    }
+  }
   switch (v.tag) {
     case SP_TAG_NIL:  sp_mar_b(b, '0'); break;
     case SP_TAG_BOOL: sp_mar_b(b, v.v.b ? 'T' : 'F'); break;
@@ -123,8 +150,11 @@ void sp_mar_w(sp_mar_buf *b, sp_RbVal v) {
       const char *s = v.v.s ? v.v.s : "";
       if (sp_mar_seen(b, (void *)(uintptr_t)s)) break;
       /* CRuby wraps a String in an encoding ivar: I "<bytes>" 1 :E T. */
-      sp_mar_b(b, 'I'); sp_mar_b(b, '"'); sp_mar_bytes(b, s, sp_str_byte_len(s));
-      sp_mar_long(b, 1); sp_mar_sym(b, "E"); sp_mar_b(b, 'T');
+      /* A binary String has no encoding ivar. */
+      int binary = sp_str_is_binary(v.v.s);
+      if (!binary) sp_mar_b(b, 'I');
+      sp_mar_b(b, '"'); sp_mar_bytes(b, s, sp_str_byte_len(s));
+      if (!binary) { sp_mar_long(b, 1); sp_mar_sym(b, "E"); sp_mar_b(b, 'T'); }
       break;
     }
     case SP_TAG_OBJ:
@@ -148,12 +178,22 @@ void sp_mar_w(sp_mar_buf *b, sp_RbVal v) {
         int kind = sp_json_kind_fn ? sp_json_kind_fn(v) : 0;
         if (kind == 1) {  /* array */
           if (sp_mar_seen(b, v.v.p)) break;
-          sp_mar_b(b, '['); sp_int n = sp_json_len_fn(v); sp_mar_long(b, n);
-          for (sp_int i = 0; i < n; i++) sp_mar_w(b, sp_json_aref_fn(v, i));
+          sp_mar_w_body(b, v);
         }
         else if (kind == 2) {  /* hash */
           if (sp_mar_seen(b, v.v.p)) break;
           sp_mar_w_hash(b, v);
+        }
+        /* a shared String handle in a box (--share-strings, #6765): the
+           String it holds, with the handle as its identity */
+        else if (v.cls_id == SP_BUILTIN_STRBUF) {
+          if (sp_mar_seen(b, v.v.p)) break;
+          sp_String *h = (sp_String *)v.v.p;
+          int binary = h && h->binary;
+          if (!binary) sp_mar_b(b, 'I');
+          sp_mar_b(b, '"');
+          sp_mar_bytes(b, h && h->data ? h->data : "", h && h->data ? (size_t)h->len : 0);
+          if (!binary) { sp_mar_long(b, 1); sp_mar_sym(b, "E"); sp_mar_b(b, 'T'); }
         }
         else if (v.cls_id >= 0) {  /* user object */
           if (sp_mar_seen(b, v.v.p)) break;
@@ -252,6 +292,40 @@ static int sp_mar_reg(sp_mar_rd *r) {
   int id = r->nobj; r->objs[r->nobj++] = mk_nil(); return id;
 }
 static sp_sym mar_intern(const char *name) { return sp_marshal_v.sym_intern ? sp_marshal_v.sym_intern(name) : 0; }
+static sp_RbVal sp_mar_r(sp_mar_rd *r);
+/* `C`: an instance of a user subclass of Array or Hash (#7449), its class,
+   the builtin's record, and with `ivars` (an `I` around it) the ivars after
+   it. The class's generated loader (sp_marshal_v.obj_load, as for an `o`
+   object) makes the instance, which takes the record's link id before the
+   elements are read, so one that holds itself loads holding itself; the
+   elements go into its builtin through the kind's own push or store, and
+   the loader then sets the ivars by name. */
+static sp_RbVal sp_mar_r_bsub(sp_mar_rd *r, int ivars) {
+  sp_RbVal clssym = sp_mar_r(r);
+  const char *cn = (clssym.tag == SP_TAG_SYM && sp_sym_name_fn) ? sp_sym_name_fn((sp_sym)clssym.v.i) : "";
+  sp_RbVal iv = sp_marshal_v.arr_new(); SP_GC_ROOT_RBVAL(iv);
+  int ok = 0;
+  sp_RbVal v = sp_marshal_v.obj_load ? sp_marshal_v.obj_load(cn, mk_nil(), iv, &ok) : mk_nil();
+  if (!ok || !sp_bsub_cls_fn || sp_bsub_cls_fn(v) < 0) mar_raise("ArgumentError", "undefined class/module in Marshal.load");
+  SP_GC_ROOT_RBVAL(v);
+  int kind = sp_json_kind_fn ? sp_json_kind_fn(v) : 0;
+  unsigned char t = sp_mar_rb(r);
+  if (!((t == '[' && kind == 1) || (t == '{' && kind == 2))) mar_raise("ArgumentError", "dump format error (user class)");
+  int id = sp_mar_reg(r);
+  r->objs[id] = v;
+  long len = sp_mar_rlong(r);
+  for (long i = 0; i < len; i++) {
+    if (kind == 1) sp_marshal_v.any_push(v, sp_mar_r(r));
+    else { sp_RbVal k = sp_mar_r(r); SP_GC_ROOT_RBVAL(k); sp_marshal_v.hash_set(v, k, sp_mar_r(r)); }
+  }
+  long n = ivars ? sp_mar_rlong(r) : 0;
+  for (long i = 0; i < n; i++) {
+    sp_marshal_v.arr_push(iv, sp_mar_r(r));   /* ivar symbol */
+    sp_marshal_v.arr_push(iv, sp_mar_r(r));   /* ivar value  */
+  }
+  if (n) sp_marshal_v.obj_load(cn, v, iv, &ok);
+  return v;
+}
 static sp_RbVal sp_mar_r(sp_mar_rd *r) {
   unsigned char t = sp_mar_rb(r);
   switch (t) {
@@ -288,11 +362,13 @@ static sp_RbVal sp_mar_r(sp_mar_rd *r) {
       r->objs[id] = v; return v;
     }
     case 'I': {
+      if (r->pos < r->len && r->s[r->pos] == 'C') { r->pos++; return sp_mar_r_bsub(r, 1); }
       sp_RbVal inner = sp_mar_r(r);
       long nivar = sp_mar_rlong(r);
       for (long i = 0; i < nivar; i++) { sp_mar_r(r); sp_mar_r(r); }  /* encoding ivar: ignored */
       return inner;
     }
+    case 'C': return sp_mar_r_bsub(r, 0);
     case '@': {
       long id = sp_mar_rlong(r);
       return (id >= 0 && id < r->nobj) ? r->objs[id] : mk_nil();
@@ -311,19 +387,24 @@ static sp_RbVal sp_mar_r(sp_mar_rd *r) {
       r->objs[id] = v; return v;
     }
     case 'o': {
+      /* the object is made and registered first, so an ivar that links back
+         to it loads as the object itself; then its ivars are set */
       int id = sp_mar_reg(r);
       sp_RbVal clssym = sp_mar_r(r);
       const char *cn = (clssym.tag == SP_TAG_SYM && sp_sym_name_fn) ? sp_sym_name_fn((sp_sym)clssym.v.i) : "";
-      long n = sp_mar_rlong(r);
       sp_RbVal iv = sp_marshal_v.arr_new(); SP_GC_ROOT_RBVAL(iv);
+      int ok = 0;
+      sp_RbVal v = sp_marshal_v.obj_load(cn, mk_nil(), iv, &ok);
+      if (!ok) mar_raise("ArgumentError", "undefined class/module in Marshal.load");
+      SP_GC_ROOT_RBVAL(v);
+      r->objs[id] = v;
+      long n = sp_mar_rlong(r);
       for (long i = 0; i < n; i++) {
         sp_marshal_v.arr_push(iv, sp_mar_r(r));   /* ivar symbol */
         sp_marshal_v.arr_push(iv, sp_mar_r(r));   /* ivar value  */
       }
-      int ok = 0;
-      sp_RbVal v = sp_marshal_v.obj_load(cn, iv, &ok);
-      if (!ok) mar_raise("ArgumentError", "undefined class/module in Marshal.load");
-      r->objs[id] = v; return v;
+      if (n) sp_marshal_v.obj_load(cn, v, iv, &ok);
+      return v;
     }
     case 'l': {
       int id = sp_mar_reg(r);
@@ -344,30 +425,63 @@ static sp_RbVal sp_mar_r(sp_mar_rd *r) {
       for (long i = 0; i < n; i++) sp_marshal_v.arr_push(box, sp_mar_r(r));
       return box;
     }
-    case '{': {
+    case '{': case '}': {   /* `}`: the pairs, then the default value */
       int id = sp_mar_reg(r);
       long n = sp_mar_rlong(r);
       sp_RbVal box = sp_marshal_v.hash_new(); SP_GC_ROOT_RBVAL(box);
       r->objs[id] = box;
       for (long i = 0; i < n; i++) { sp_RbVal k = sp_mar_r(r); sp_RbVal val = sp_mar_r(r); sp_marshal_v.hash_set(box, k, val); }
+      if (t == '}') {
+        sp_RbVal d = sp_mar_r(r);
+        if (sp_marshal_v.hash_set_default) sp_marshal_v.hash_set_default(box, d);
+      }
       return box;
     }
     default: mar_raise("ArgumentError", "unsupported type in Marshal.load"); return mk_nil();
   }
 }
+/* The exception hooks the generated unit defines (lib/spinel_rt.h). */
+void sp_exc_arm(jmp_buf b);
+void sp_exc_disarm(void);
+const char *sp_exc_cur_cls(void);
+const char *sp_exc_cur_msg(void);
+void *sp_exc_cur_obj(void);
+void sp_fiber_reraise(const char *cls, const char *msg, void *obj);
+/* A reader leaves the active chain and frees its tables. */
+static void sp_mar_rd_done(sp_mar_rd *r) {
+  sp_mar_active = r->prev;
+  for (int i = 0; i < r->nsym; i++) free(r->syms[i]);
+  free(r->syms); free(r->objs); free(r);
+}
 sp_RbVal sp_marshal_load(const char *s, sp_int len) {
   /* The whole parse reads out of this buffer, and every object it builds
      allocates -- so the source string has to stay rooted for the duration.
-     r.s is a plain field, not a root slot; the collector walks registered
+     r->s is a plain field, not a root slot; the collector walks registered
      slots, so the parameter is what has to be registered. */
   SP_GC_ROOT_STR(s);
-  sp_mar_rd r; memset(&r, 0, sizeof r);
-  r.s = s ? s : ""; r.len = s ? (size_t)len : 0;
-  r.prev = sp_mar_active; sp_mar_active = &r;
-  if (r.len >= 2) r.pos = 2;  /* skip the 4.8 version header */
-  sp_RbVal v = sp_mar_r(&r);
-  sp_mar_active = r.prev;
-  for (int i = 0; i < r.nsym; i++) free(r.syms[i]);
-  free(r.syms); free(r.objs);
-  return v;
+  sp_mar_rd *r = (sp_mar_rd *)calloc(1, sizeof *r);
+  r->s = s ? s : ""; r->len = s ? (size_t)len : 0;
+  r->prev = sp_mar_active; sp_mar_active = r;
+  if (r->len >= 2) r->pos = 2;  /* skip the 4.8 version header */
+  /* A raise inside the parse (an unknown class, a format error, a value a
+     loader cannot convert) longjmps past the return below, and the reader
+     stayed on the active chain: the next collection walked its freed
+     frame. It is caught here, the reader taken off the chain, and raised
+     on to the program's own handler. */
+  int nroots = sp_gc_nroots;
+  jmp_buf jb;
+  if (setjmp(jb) == 0) {
+    sp_exc_arm(jb);
+    sp_RbVal v = sp_mar_r(r);
+    sp_exc_disarm();
+    sp_mar_rd_done(r);
+    return v;
+  }
+  const char *cls = sp_exc_cur_cls(), *msg = sp_exc_cur_msg();
+  void *obj = sp_exc_cur_obj();
+  sp_exc_disarm();
+  sp_gc_nroots = nroots;   /* the parse's own roots unwound with it */
+  sp_mar_rd_done(r);
+  sp_fiber_reraise(cls, msg, obj);
+  return mk_nil();
 }

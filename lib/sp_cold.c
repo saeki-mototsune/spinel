@@ -15,12 +15,17 @@
 #endif
 #include <stddef.h>
 #include <string.h>
+#include <strings.h>
 #include <stdio.h>
 #include <stdlib.h>
+#include <stdarg.h>   /* sp_sprintf */
 #include <unistd.h>
 #include "sp_alloc.h"   /* sp_str_alloc / sp_str_set_len / sp_raise_cls */
 #include "sp_array.h"   /* sp_StrArray for Dir.glob */
 #include <dirent.h>
+#if defined(_WIN32)
+#include <spawn.h>
+#endif
 #include <fnmatch.h>
 #include <sys/stat.h>
 #include <sys/types.h>
@@ -53,6 +58,11 @@ extern int sp_gc_rem_peak;   /* lib/sp_gc.c: high-water mark of the remembered s
 #elif defined(__GLIBC__) || defined(__APPLE__) || defined(__FreeBSD__)
 #  define HAVE_EXECINFO_H 1
 #endif
+
+/* printf into a fresh heap string: the error-message and interpolation
+   formatter every runtime TU and the generated program call. */
+const char*sp_sprintf(const char*fmt,...){char _sp_tmp[4096];va_list ap;va_start(ap,fmt);int _sp_n=vsnprintf(_sp_tmp,sizeof(_sp_tmp),fmt,ap);va_end(ap);if(_sp_n<0)_sp_n=0;char*b=sp_str_alloc((size_t)_sp_n);if(_sp_n<(int)sizeof(_sp_tmp)){memcpy(b,_sp_tmp,(size_t)_sp_n);}
+else{/* result didn't fit the stack temp; re-render at full width (sp_str_alloc gives _sp_n bytes + NUL) so long string interpolations aren't truncated. re-arm the va_list rather than va_copy so the common fast path pays nothing */va_start(ap,fmt);vsnprintf(b,(size_t)_sp_n+1,fmt,ap);va_end(ap);}return b;}
 
 /* Integer#% / Kernel#format "%b"/"%B"/"%o"/"%x"/"%X": non-decimal formatting
    with Ruby's flag, width, precision, and two's-complement-for-negative rules.
@@ -174,6 +184,15 @@ const char *sp_file_expand_path(const char *path, const char *base) {
   char raw[8192];
   char cwd[4096];
   const char *home = getenv("HOME");
+#if defined(_WIN32)
+  /* Windows: a backslash separates too, and the answer spells it as a
+     slash, as CRuby's does; the home is %USERPROFILE% when HOME is unset */
+  char pbuf[4096], bbuf[4096], hbuf[4096];
+  if (!home) home = getenv("USERPROFILE");
+  if (home) { snprintf(hbuf, sizeof hbuf, "%s", home); for (char *c = hbuf; *c; c++) if (*c == '\\') *c = '/'; home = hbuf; }
+  if (path) { snprintf(pbuf, sizeof pbuf, "%s", path); for (char *c = pbuf; *c; c++) if (*c == '\\') *c = '/'; path = pbuf; }
+  if (base) { snprintf(bbuf, sizeof bbuf, "%s", base); for (char *c = bbuf; *c; c++) if (*c == '\\') *c = '/'; base = bbuf; }
+#endif
   if (!home) home = "";
   if (!path) path = "";
 
@@ -185,7 +204,11 @@ const char *sp_file_expand_path(const char *path, const char *base) {
   if (path[0] == '~' && (path[1] == '\0' || path[1] == '/')) {
     snprintf(raw, sizeof(raw), "%.4000s%.4000s", home, path + 1);
   }
+#if defined(_WIN32)
+  else if (sp_file_path_root_len(path)) {   /* "/", or a drive's "C:/" */
+#else
   else if (path[0] == '/') {
+#endif
     snprintf(raw, sizeof(raw), "%.4000s", path);
   }
   else {
@@ -196,7 +219,11 @@ const char *sp_file_expand_path(const char *path, const char *base) {
         snprintf(basebuf, sizeof(basebuf), "%.4000s%.4000s", home, base + 1);
         b = basebuf;
       }
+#if defined(_WIN32)
+      else if (sp_file_path_root_len(base)) {
+#else
       else if (base[0] == '/') {
+#endif
         b = base;
       }
       else {
@@ -215,13 +242,33 @@ const char *sp_file_expand_path(const char *path, const char *base) {
   /* Normalize: walk segments, collapsing `.`/`..`/`//`. seg_start[k]
      records the output length to roll back to when a `..` pops the
      k-th kept segment. */
+#if defined(_WIN32)
+  /* "/x" is the current drive's: Windows has no root above the drives */
+  if (raw[0] == '/' && raw[1] != '/') {
+    char drv[4096];
+    if (getcwd(drv, sizeof drv) && sp_file_path_root_len(drv) == 3) {
+      char t[8192];
+      snprintf(t, sizeof t, "%c:%.8000s", drv[0], raw);
+      snprintf(raw, sizeof raw, "%s", t);
+    }
+  }
+#endif
   size_t rawlen = strlen(raw);
   char *out = sp_str_alloc(rawlen + 1);
   size_t seg_start[1024];
   int nseg = 0;
   size_t olen = 0;
+#if defined(_WIN32)
+  /* a drive's root ("C:/") as it is, then the segments */
+  size_t rootn = sp_file_path_root_len(raw);
+  if (rootn > 1) { memcpy(out, raw, rootn - 1); olen = rootn - 1; }
+  out[olen++] = '/';
+  size_t root_end = olen;
+  const char *p = raw + rootn;
+#else
   out[olen++] = '/';
   const char *p = raw;
+#endif
   while (*p) {
     if (*p == '/') { p++; continue; }
     const char *q = p;
@@ -235,7 +282,11 @@ const char *sp_file_expand_path(const char *path, const char *base) {
     }
     else {
       size_t mark = olen;
+#if defined(_WIN32)
+      if (olen > root_end) out[olen++] = '/';
+#else
       if (olen > 1) out[olen++] = '/';
+#endif
       memcpy(out + olen, p, slen);
       olen += slen;
       if (nseg < 1024) seg_start[nseg++] = mark;
@@ -271,6 +322,16 @@ const char *sp_file_readlink(const char *path) {SP_GC_ROOT_STR(path);
    raising while it is on; the caller reads it back and answers nil (#3893). */
 sp_bool sp_convert_soft = 0;
 sp_bool sp_convert_failed = 0;
+/* A rational-syntax denominator written as digits that reads zero raises
+   ZeroDivisionError, as CRuby's does, with `exception: false` too. The raise
+   leaves the parse before its caller clears sp_convert_soft, so it is
+   cleared here first. */
+static void sp_str_to_c_zero_den(const char *dp, double d) {
+  if (d == 0.0 && *dp >= '0' && *dp <= '9') {
+    sp_convert_soft = 0;
+    sp_raise_cls("ZeroDivisionError", "divided by 0");
+  }
+}
 static sp_Complex sp_str_to_c_impl(const char *s, int strict) {
   double re = 0, im = 0;
   int parsed = 0;
@@ -283,14 +344,14 @@ static sp_Complex sp_str_to_c_impl(const char *s, int strict) {
     if (end != p) {
       parsed = 1;
       /* rational-syntax component "n/d" */
-      if (*end == '/') { const char *dp = end + 1; char *de = NULL; double d = strtod(dp, &de); if (de != dp) { a /= d; end = de; } }
+      if (*end == '/') { const char *dp = end + 1; char *de = NULL; double d = strtod(dp, &de); if (de != dp) { sp_str_to_c_zero_den(dp, d); a /= d; end = de; } }
       if (*end == 'i') { im = a; fin = end + 1; }
       else {
         re = a;
         const char *q = end;
         double b2 = strtod(q, &end);
         if (end != q) {
-          if (*end == '/') { const char *dp = end + 1; char *de = NULL; double d = strtod(dp, &de); if (de != dp) { b2 /= d; end = de; } }
+          if (*end == '/') { const char *dp = end + 1; char *de = NULL; double d = strtod(dp, &de); if (de != dp) { sp_str_to_c_zero_den(dp, d); b2 /= d; end = de; } }
           if (*end == 'i') { im = b2; fin = end + 1; }
           else fin = q;   /* an imaginary number without the 'i' suffix ("1+2") is invalid */
         }
@@ -312,7 +373,7 @@ static sp_Complex sp_str_to_c_impl(const char *s, int strict) {
   if (!parsed) {
     if (!strict) return (sp_Complex){ 0.0, 0.0 };
     if (sp_convert_soft) { sp_convert_failed = 1; return (sp_Complex){ 0.0, 0.0 }; }
-    sp_raise_cls("ArgumentError", "invalid value for convert(): ");
+    sp_raise_cls("ArgumentError", sp_sprintf("invalid value for convert(): \"%s\"", s ? s : ""));
   }
   return (sp_Complex){ (sp_float)re, (sp_float)im };
 }
@@ -386,6 +447,23 @@ static int sp_glob_exists(const char *path) {
    walk split the pattern at its LAST slash and opendir'd the part before it, so
    a wildcard middle component opened a directory literally named with it,
    and found nothing. */
+/* The separator between a directory the walk is in and a name under it, and
+   the root an absolute pattern's walk starts from. On Windows a root is "/"
+   or a drive's "C:/", and one that already ends in a separator takes none
+   (the shim reads "//tmp" as a UNC name, not as /tmp). Elsewhere they spell
+   exactly what the walk always wrote. */
+#if defined(_WIN32)
+static const char *sp_glob_sep(const char *fsdir) {
+  size_t n = strlen(fsdir);
+  return (n == 0 || fsdir[n - 1] == '/') ? "" : "/";
+}
+#define SP_GLOB_SEP(fsdir) sp_glob_sep(fsdir)
+#define SP_GLOB_ROOT root
+#else
+#define SP_GLOB_SEP(fsdir) fsdir[0] ? "/" : ""
+#define SP_GLOB_ROOT "/"
+#endif
+
 static void sp_glob_walk(const char *fsdir, const char *outprefix,
                          char **comps, int ncomp, int ci, sp_StrArray *a) {
   if (ci >= ncomp) return;
@@ -410,7 +488,7 @@ static void sp_glob_walk(const char *fsdir, const char *outprefix,
       const char *name = e->d_name;
       if (name[0] == '.' && (name[1] == 0 || (name[1] == '.' && name[2] == 0))) continue;
       if (name[0] == '.' && !sp_glob_dotmatch) continue;
-      snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, fsdir[0] ? "/" : "", name);
+      snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, SP_GLOB_SEP(fsdir), name);
       snprintf(outpath, sizeof outpath, "%s%s", outprefix, name);
       /* A trailing ** answers every entry beneath it, directories included --
          `Dir.glob("a/**")` is ["a/b", "a/top.rs"] in CRuby. */
@@ -432,7 +510,7 @@ static void sp_glob_walk(const char *fsdir, const char *outprefix,
 
   if (!sp_glob_has_meta(comp)) {
     /* A literal component needs no readdir: ask the filesystem directly. */
-    snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, fsdir[0] ? "/" : "", comp);
+    snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, SP_GLOB_SEP(fsdir), comp);
     snprintf(outpath, sizeof outpath, "%s%s", outprefix, comp);
     if (last) { if (sp_glob_exists(fspath)) sp_glob_push(a, outpath); return; }
     if (sp_glob_is_dir(fspath)) {
@@ -453,7 +531,7 @@ static void sp_glob_walk(const char *fsdir, const char *outprefix,
     if (name[0] == '.' && name[1] == '.' && name[2] == 0) continue;
     if (name[0] == '.' && name[1] == 0 && !sp_glob_dotmatch) continue;
     if (!sp_glob_comp_match(comp, name)) continue;
-    snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, fsdir[0] ? "/" : "", name);
+    snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, SP_GLOB_SEP(fsdir), name);
     snprintf(outpath, sizeof outpath, "%s%s", outprefix, name);
     if (last) { sp_glob_push(a, outpath); continue; }
     if (sp_glob_is_dir(fspath)) {
@@ -500,8 +578,17 @@ static void sp_dir_glob_one(const char *pattern, sp_StrArray *a) {
   size_t blen = strlen(buf);
   int dir_only = blen > 1 && buf[blen - 1] == '/';
   if (dir_only) buf[blen - 1] = 0;
+#if defined(_WIN32)
+  size_t rootn = sp_file_path_root_len(buf);
+  int absolute = rootn > 0;
+  /* the root a walk starts from: "/", or a drive's "C:/" */
+  char root[4] = "/";
+  if (rootn > 1) { memcpy(root, buf, rootn); root[rootn] = 0; root[rootn - 1] = '/'; }
+  char *p = buf + rootn;
+#else
   int absolute = (buf[0] == '/');
   char *p = buf + (absolute ? 1 : 0);
+#endif
   for (char *tok = p; ncomp < 64; ) {
     char *sl = strchr(tok, '/');
     if (sl) *sl = 0;
@@ -517,7 +604,7 @@ static void sp_dir_glob_one(const char *pattern, sp_StrArray *a) {
   if (dir_only && ncomp > 0 && strcmp(comps[ncomp - 1], "**") == 0 && ncomp < 64) {
     comps[ncomp++] = dstar;   /* ** + / + *  -- every entry at every depth */
   }
-  if (!dir_only) { sp_glob_walk(absolute ? "/" : "", absolute ? "/" : "", comps, ncomp, 0, a); return; }
+  if (!dir_only) { sp_glob_walk(absolute ? SP_GLOB_ROOT : "", absolute ? SP_GLOB_ROOT : "", comps, ncomp, 0, a); return; }
   /* A symlink to a directory IS one of the answers for a non-recursive form
      ("*" + SEP lists it) and is not for the recursive one, which does not
      follow links at all -- the same split the walk itself makes. */
@@ -525,7 +612,7 @@ static void sp_dir_glob_one(const char *pattern, sp_StrArray *a) {
     for (int i = 0; i < ncomp; i++) if (strcmp(comps[i], "**") == 0) recursive = 1;
     sp_StrArray *tmp = sp_StrArray_new();
     SP_GC_ROOT(tmp);
-    sp_glob_walk(absolute ? "/" : "", absolute ? "/" : "", comps, ncomp, 0, tmp);
+    sp_glob_walk(absolute ? SP_GLOB_ROOT : "", absolute ? SP_GLOB_ROOT : "", comps, ncomp, 0, tmp);
     for (sp_int i = 0; i < tmp->len; i++) {
       const char *e = tmp->data[i];
       /* lstat, for the reason the recursive walk uses it: a symlink to a
@@ -640,14 +727,20 @@ sp_StrArray *sp_file_readlines(const char *path) {SP_GC_ROOT_STR(path);
   sp_StrArray *a = sp_StrArray_new();
   SP_GC_ROOT(a);
   FILE *_fp = fopen(path ? path : "", "r");
-  if (!_fp) return a;
-  char _buf[4096];
-  while (fgets(_buf, (int)sizeof(_buf), _fp)) {
-    size_t _l = strlen(_buf);
+  /* a file that can't be opened raises, as CRuby's (Errno::ENOENT, ...) */
+  if (!_fp) sp_file_raise_errno("rb_sysopen", path);
+  /* getline answers each line whole, however long, as ARGF's gets reads it */
+  char *_buf = NULL;
+  size_t _cap = 0;
+  ssize_t _n;
+  while ((_n = getline(&_buf, &_cap, _fp)) >= 0) {
+    size_t _l = (size_t)_n;
     char *_r = sp_str_alloc_raw(_l + 1);
-    memcpy(_r, _buf, _l + 1);
+    memcpy(_r, _buf, _l); _r[_l] = '\0';
+    sp_str_set_len(_r, _l);
     sp_StrArray_push(a, _r);
   }
+  free(_buf);
   fclose(_fp);
   return a;
 }
@@ -656,16 +749,21 @@ sp_StrArray *sp_file_readlines_chomp(const char *path) {SP_GC_ROOT_STR(path);
   sp_StrArray *a = sp_StrArray_new();
   SP_GC_ROOT(a);
   FILE *_fp = fopen(path ? path : "", "r");
-  if (!_fp) return a;
-  char _buf[4096];
-  while (fgets(_buf, (int)sizeof(_buf), _fp)) {
-    size_t _l = strlen(_buf);
+  /* a file that can't be opened raises, as CRuby's (Errno::ENOENT, ...) */
+  if (!_fp) sp_file_raise_errno("rb_sysopen", path);
+  char *_buf = NULL;
+  size_t _cap = 0;
+  ssize_t _n;
+  while ((_n = getline(&_buf, &_cap, _fp)) >= 0) {
+    size_t _l = (size_t)_n;
     if (_l > 0 && _buf[_l-1] == '\n') { _buf[--_l] = '\0'; }
     if (_l > 0 && _buf[_l-1] == '\r') { _buf[--_l] = '\0'; }
     char *_r = sp_str_alloc_raw(_l + 1);
-    memcpy(_r, _buf, _l + 1);
+    memcpy(_r, _buf, _l); _r[_l] = '\0';
+    sp_str_set_len(_r, _l);
     sp_StrArray_push(a, _r);
   }
+  free(_buf);
   fclose(_fp);
   return a;
 }
@@ -866,6 +964,11 @@ sp_Time sp_file_birthtime(const char *path) {SP_GC_ROOT_STR(path);  /* (#2985) *
     return (sp_Time){(int64_t)stx.stx_btime.tv_sec, (int32_t)stx.stx_btime.tv_nsec, 0};
   sp_raise_cls("NotImplementedError", "birthtime() function is unimplemented on this filesystem");
   return (sp_Time){0, 0, 0};
+#elif defined(_WIN32)
+  /* the creation time Windows keeps (lib/win32's struct stat) */
+  struct stat st;
+  if (stat(path, &st) == -1) sp_file_raise_errno("rb_file_s_birthtime", path);
+  return (sp_Time){(int64_t)st.st_birthtim.tv_sec, (int32_t)st.st_birthtim.tv_nsec, 0};
 #else
   sp_raise_cls("NotImplementedError", "birthtime() function is unimplemented");
   return (sp_Time){0, 0, 0};
@@ -978,23 +1081,6 @@ const char *sp_str_splice_at(const char *s, sp_int from, sp_int n, const char *v
   return sp_str_concat(pre, tail);
 }
 
-sp_FloatArray *sp_frange_step(sp_FloatRange r, sp_float st) {
-  sp_FloatArray *a = sp_FloatArray_new(); SP_GC_ROOT(a);
-  if (st == 0) sp_raise_cls("ArgumentError", "step can't be 0");
-  sp_float span = r.last - r.first;
-  if (span == span && st == st) {   /* not NaN */
-    if ((span > 0 && st < 0) || (span < 0 && st > 0)) return a;   /* wrong direction */
-  }
-  sp_int n = (sp_int)(span / st + (r.excl ? -1e-9 : 1e-9));
-  for (sp_int i = 0; i <= n; i++) {
-    sp_float v = r.first + (sp_float)i * st;
-    if (st > 0) { if (r.excl ? v >= r.last : v > r.last + 1e-9) break; }
-    else        { if (r.excl ? v <= r.last : v < r.last - 1e-9) break; }
-    sp_FloatArray_push(a, v);
-  }
-  return a;
-}
-
 sp_int sp_poly_cmp_int_arrays(sp_RbVal a, sp_RbVal b, sp_bool *comparable) {
   if (a.tag != SP_TAG_OBJ || b.tag != SP_TAG_OBJ ||
       a.cls_id != SP_BUILTIN_INT_ARRAY || b.cls_id != SP_BUILTIN_INT_ARRAY) { *comparable = FALSE; return 0; }
@@ -1022,6 +1108,99 @@ sp_int sp_int_round_half(sp_int v, sp_int nd, int mode) {
   else up = mode == 1 ? 1 : mode == 2 ? 0 : (q % 2 != 0);  /* :even ties to even */
   if (up) q += (v < 0 ? -1 : 1);
   return q * f;
+}
+
+sp_RbVal sp_poly_replace(sp_RbVal recv, sp_RbVal src);
+
+static const char *sp_typed_elem_class(sp_RbVal v) {
+  switch (v.tag) {
+    case SP_TAG_INT: case SP_TAG_BIGINT: return "Integer";
+    case SP_TAG_FLT: return "Float";
+    case SP_TAG_STR: return "String";
+    case SP_TAG_SYM: return "Symbol";
+    case SP_TAG_BOOL: return v.v.i ? "true" : "false";
+    default: return "Object";
+  }
+}
+
+SP_NORETURN static void sp_typed_replace_elem_error(sp_RbVal v, const char *kind) {
+  char msg[160];
+  snprintf(msg, sizeof msg, "cannot store %s into an Array[%s]: a typed array holds one kind of element",
+           sp_typed_elem_class(v), kind);
+  sp_raise_cls("TypeError", msg);
+  abort();
+}
+
+/* the contents of a shared String buffer as a String of their own, embedded
+   NULs and a binary encoding included */
+static const char *sp_strbuf_copy(sp_String *b) {
+  size_t n = (size_t)b->len;
+  char *c = sp_str_alloc(n);
+  memcpy(c, b->data, n);
+  c[n] = '\0';
+  sp_str_set_len(c, n);
+  if (b->binary) sp_str_mark_binary(c);
+  return c;
+}
+
+/* A typed array replaced from an array of another kind takes each element as
+   the boxed []= stores one: its own kind, nil as its nil, an Integer into a
+   Float array; any other element raises before the receiver changes. */
+static void sp_typed_array_replace_boxed(sp_RbVal recv, sp_RbVal src) {
+  SP_GC_ROOT_RBVAL(recv); SP_GC_ROOT_RBVAL(src);
+  sp_int frozen = recv.cls_id == SP_BUILTIN_INT_ARRAY ? ((sp_IntArray *)recv.v.p)->frozen
+                : recv.cls_id == SP_BUILTIN_FLT_ARRAY ? ((sp_FloatArray *)recv.v.p)->frozen
+                : recv.cls_id == SP_BUILTIN_STR_ARRAY ? ((sp_StrArray *)recv.v.p)->frozen
+                : ((sp_PtrArray *)recv.v.p)->frozen;
+  if (frozen) { sp_raise_frozen_array_at(recv.v.p, recv.cls_id); return; }
+  sp_PolyArray *els = sp_PolyArray_new(); SP_GC_ROOT(els);
+  sp_poly_replace(sp_box_poly_array(els), src);
+  switch (recv.cls_id) {
+    case SP_BUILTIN_INT_ARRAY: {
+      sp_IntArray *st = sp_IntArray_new(); SP_GC_ROOT(st);
+      for (sp_int i = 0; i < els->len; i++) {
+        sp_RbVal e = els->data[i];
+        if (e.tag == SP_TAG_INT) sp_IntArray_push(st, e.v.i);
+        else if (e.tag == SP_TAG_NIL) { sp_IntArray_push(st, SP_INT_NIL); sp_IntArray_note_nil(st); }
+        else sp_typed_replace_elem_error(e, "Integer");
+      }
+      sp_IntArray_replace((sp_IntArray *)recv.v.p, st);
+      break;
+    }
+    case SP_BUILTIN_FLT_ARRAY: {
+      sp_FloatArray *st = sp_FloatArray_new(); SP_GC_ROOT(st);
+      for (sp_int i = 0; i < els->len; i++) {
+        sp_RbVal e = els->data[i];
+        if (e.tag == SP_TAG_FLT) sp_FloatArray_push(st, e.v.f);
+        else if (e.tag == SP_TAG_INT) sp_FloatArray_push(st, (sp_float)e.v.i);
+        else if (e.tag == SP_TAG_NIL) { sp_FloatArray_push(st, sp_float_nil()); sp_FloatArray_note_nil(st); }
+        else sp_typed_replace_elem_error(e, "Float");
+      }
+      sp_FloatArray_replace((sp_FloatArray *)recv.v.p, st);
+      break;
+    }
+    case SP_BUILTIN_STR_ARRAY: {
+      sp_StrArray *st = sp_StrArray_new(); SP_GC_ROOT(st);
+      for (sp_int i = 0; i < els->len; i++) {
+        sp_RbVal e = els->data[i];
+        if (e.tag == SP_TAG_STR) sp_StrArray_push(st, e.v.s);
+        else if (e.tag == SP_TAG_OBJ && e.cls_id == SP_BUILTIN_STRBUF)
+          sp_StrArray_push(st, sp_strbuf_copy((sp_String *)e.v.p));
+        else if (e.tag == SP_TAG_NIL) sp_StrArray_push(st, NULL);
+        else sp_typed_replace_elem_error(e, "String");
+      }
+      sp_StrArray_replace((sp_StrArray *)recv.v.p, st);
+      break;
+    }
+    case SP_BUILTIN_PTR_ARRAY: {
+      sp_PtrArray *d = (sp_PtrArray *)recv.v.p;
+      for (sp_int i = 0; i < els->len; i++) (void)sp_PtrArray_elem_unbox(d, els->data[i]);
+      sp_gc_wb((void *)d);
+      d->len = 0;
+      for (sp_int i = 0; i < els->len; i++) sp_PtrArray_push(d, sp_PtrArray_elem_unbox(d, els->data[i]));
+      break;
+    }
+  }
 }
 
 sp_RbVal sp_poly_replace(sp_RbVal recv, sp_RbVal src) {SP_GC_ROOT_RBVAL(recv);SP_GC_ROOT_RBVAL(src);
@@ -1054,12 +1233,18 @@ sp_RbVal sp_poly_replace(sp_RbVal recv, sp_RbVal src) {SP_GC_ROOT_RBVAL(recv);SP
     d->len = 0;
     for (sp_int i = 0; i < sa->len; i++) sp_PtrArray_push(d, sa->data[i]);
   }
+  else if ((recv.cls_id == SP_BUILTIN_INT_ARRAY || recv.cls_id == SP_BUILTIN_FLT_ARRAY ||
+            recv.cls_id == SP_BUILTIN_STR_ARRAY || recv.cls_id == SP_BUILTIN_PTR_ARRAY) &&
+           (src.cls_id == SP_BUILTIN_INT_ARRAY || src.cls_id == SP_BUILTIN_FLT_ARRAY ||
+            src.cls_id == SP_BUILTIN_STR_ARRAY || src.cls_id == SP_BUILTIN_PTR_ARRAY ||
+            src.cls_id == SP_BUILTIN_POLY_ARRAY))
+    sp_typed_array_replace_boxed(recv, src);
   else if (recv.cls_id == SP_BUILTIN_POLY_ARRAY) {
     sp_PolyArray *d = (sp_PolyArray *)recv.v.p;
     d->len = 0;
     switch (src.cls_id) {
-      case SP_BUILTIN_INT_ARRAY: { sp_IntArray *s = (sp_IntArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_box_int(s->data[s->start + i])); break; }
-      case SP_BUILTIN_FLT_ARRAY: { sp_FloatArray *s = (sp_FloatArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_box_float(s->data[i])); break; }
+      case SP_BUILTIN_INT_ARRAY: { sp_IntArray *s = (sp_IntArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_box_int_or_nil(s->data[s->start + i])); break; }
+      case SP_BUILTIN_FLT_ARRAY: { sp_FloatArray *s = (sp_FloatArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_box_float_or_nil(s->data[i])); break; }
       case SP_BUILTIN_STR_ARRAY: { sp_StrArray *s = (sp_StrArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_box_str(s->data[i])); break; }
       case SP_BUILTIN_POLY_ARRAY: { sp_PolyArray *s = (sp_PolyArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, s->data[i]); break; }
       case SP_BUILTIN_PTR_ARRAY: { sp_PtrArray *s = (sp_PtrArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_PtrArray_elem_box(s, s->data[i])); break; }
@@ -1199,6 +1384,20 @@ const char *sp_backtick(const char *cmd) {SP_GC_ROOT_STR(cmd);
   int fds[2];
   if (pipe(fds) != 0) { sp_last_status = -1; return sp_str_empty; }
   fflush(NULL);
+#if defined(_WIN32)
+  /* posix_spawn where there is no fork (see sp_process.c) */
+  pid_t pid = 0;
+  {
+    posix_spawn_file_actions_t fa;
+    posix_spawn_file_actions_init(&fa);
+    posix_spawn_file_actions_addclose(&fa, fds[0]);
+    if (fds[1] != 1) { posix_spawn_file_actions_adddup2(&fa, fds[1], 1); posix_spawn_file_actions_addclose(&fa, fds[1]); }
+    char *av[] = { (char *)"sh", (char *)"-c", (char *)cmd, NULL };
+    int rc = posix_spawn(&pid, "/bin/sh", &fa, NULL, av, environ);
+    posix_spawn_file_actions_destroy(&fa);
+    if (rc != 0) { close(fds[0]); close(fds[1]); sp_last_status = 127 << 8; return sp_str_empty; }
+  }
+#else
   pid_t pid = fork();
   if (pid < 0) { close(fds[0]); close(fds[1]); sp_last_status = -1; return sp_str_empty; }
   if (pid == 0) {
@@ -1207,6 +1406,7 @@ const char *sp_backtick(const char *cmd) {SP_GC_ROOT_STR(cmd);
     execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
     _exit(127);
   }
+#endif
   close(fds[1]);
   size_t cap = 4096, len = 0;
   char *buf = (char *)malloc(cap);
@@ -1228,6 +1428,7 @@ const char *sp_backtick(const char *cmd) {SP_GC_ROOT_STR(cmd);
     if (sp_sched_wait_child((int)pid, &st) < 0) st = -1; }
   /* the same wait-status layout sp_system_args leaves in $? */
   sp_last_status = st;
+  sp_last_pid = (int)pid;
   char *r = sp_str_alloc(len);
   if (len) memcpy(r, buf, len);
   r[len] = 0;
@@ -1334,20 +1535,26 @@ sp_PolyArray *sp_poly_array_transpose(sp_PolyArray *rows) {
   SP_GC_ROOT(rows);
   if (!rows || rows->len == 0) return sp_PolyArray_new();
   sp_int nrows = rows->len;
-  /* Determine column count and element kind from first non-empty row. */
+  /* Keep typed columns only when all rows have the same representation. */
   sp_int ncols = -1;   /* -1 until the first row fixes it; ragged rows raise (#2979) */
   int16_t kind = 0; /* 0=unknown, SP_BUILTIN_INT_ARRAY, SP_BUILTIN_FLT_ARRAY, SP_BUILTIN_STR_ARRAY */
+  /* an Integer column holds nil where a row may (its may_nil) or where a row
+     of another kind leaves the slot's nil: decided once per call */
+  unsigned int_col_nil = 0;
+  unsigned flt_col_nil = 0;   /* the same for a Float column, from its Float rows */
   for (sp_int r = 0; r < nrows; r++) {
     sp_RbVal rv = rows->data[r];
     /* a row that is no Array is CRuby's TypeError, not a row of nothing */
     if (!sp_transpose_row_p(rv))
       sp_raise_cls("TypeError", sp_sprintf("no implicit conversion of %s into Array", sp_transpose_row_class(rv)));
     sp_int rlen = 0;
-    if (rv.cls_id == SP_BUILTIN_INT_ARRAY)  { rlen = ((sp_IntArray *)rv.v.p)->len; if(!kind) kind = SP_BUILTIN_INT_ARRAY; }
-    else if (rv.cls_id == SP_BUILTIN_FLT_ARRAY) { rlen = ((sp_FloatArray *)rv.v.p)->len; if(!kind) kind = SP_BUILTIN_FLT_ARRAY; }
-    else if (rv.cls_id == SP_BUILTIN_STR_ARRAY) { rlen = ((sp_StrArray *)rv.v.p)->len; if(!kind) kind = SP_BUILTIN_STR_ARRAY; }
-    else if (rv.cls_id == SP_BUILTIN_POLY_ARRAY) { rlen = ((sp_PolyArray *)rv.v.p)->len; if(!kind) kind = SP_BUILTIN_POLY_ARRAY; }
-    else if (rv.cls_id == SP_BUILTIN_PTR_ARRAY) { rlen = ((sp_PtrArray *)rv.v.p)->len; if(!kind) kind = SP_BUILTIN_POLY_ARRAY; }   /* a row of rows or objects reads generically (#4486) */
+    if (rv.cls_id == SP_BUILTIN_INT_ARRAY)  { rlen = ((sp_IntArray *)rv.v.p)->len; if(!kind) kind = SP_BUILTIN_INT_ARRAY; int_col_nil |= SP_MAY_NIL((sp_IntArray *)rv.v.p); }
+    else if (rv.cls_id == SP_BUILTIN_FLT_ARRAY) { rlen = ((sp_FloatArray *)rv.v.p)->len; if(!kind) kind = SP_BUILTIN_FLT_ARRAY; int_col_nil = 1; flt_col_nil |= SP_MAY_NIL((sp_FloatArray *)rv.v.p); }
+    else if (rv.cls_id == SP_BUILTIN_STR_ARRAY) { rlen = ((sp_StrArray *)rv.v.p)->len; if(!kind) kind = SP_BUILTIN_STR_ARRAY; int_col_nil = 1; }
+    else if (rv.cls_id == SP_BUILTIN_POLY_ARRAY) { rlen = ((sp_PolyArray *)rv.v.p)->len; if(!kind) kind = SP_BUILTIN_POLY_ARRAY; int_col_nil = 1; }
+    else if (rv.cls_id == SP_BUILTIN_PTR_ARRAY) { rlen = ((sp_PtrArray *)rv.v.p)->len; if(!kind) kind = SP_BUILTIN_POLY_ARRAY; int_col_nil = 1; }   /* a row of rows or objects reads generically (#4486) */
+    else if (rv.cls_id == SP_BUILTIN_SYM_ARRAY) { rlen = ((sp_IntArray *)rv.v.p)->len; if(!kind) kind = SP_BUILTIN_POLY_ARRAY; }
+    if (kind != rv.cls_id) kind = SP_BUILTIN_POLY_ARRAY;
     if (ncols < 0) ncols = rlen;
     else if (rlen != ncols)
       sp_raise_cls("IndexError", sp_sprintf("element size differs (%lld should be %lld)",
@@ -1366,7 +1573,7 @@ sp_PolyArray *sp_poly_array_transpose(sp_PolyArray *rows) {
         sp_int val = SP_INT_NIL;
         if (rv.tag == SP_TAG_OBJ && rv.cls_id == SP_BUILTIN_INT_ARRAY) {
           sp_IntArray *row = (sp_IntArray *)rv.v.p;
-          if (c < row->len) val = row->data[c];
+          if (c < row->len) val = sp_IntArray_get(row, c);
         }
         sp_IntArray_push(col, val);
       }
@@ -1401,8 +1608,8 @@ else if (kind == SP_BUILTIN_STR_ARRAY) {
       cv.tag = SP_TAG_OBJ; cv.cls_id = SP_BUILTIN_STR_ARRAY; cv.v.p = col;
     }
     else if (kind == SP_BUILTIN_POLY_ARRAY) {
-      /* rows are poly arrays (e.g. `map(&:reverse)` yields boxed poly arrays):
-         read each element generically, one column a fresh poly array (#2921). */
+      /* Mixed row kinds need boxed columns; read each row in its own
+         representation, preserving nils and pointer-array elements. */
       sp_PolyArray *col = sp_PolyArray_new();
       SP_GC_ROOT(col);
       for (sp_int r = 0; r < nrows; r++) {
@@ -1412,6 +1619,14 @@ else if (kind == SP_BUILTIN_STR_ARRAY) {
           sp_PolyArray *row = (sp_PolyArray *)rv.v.p;
           if (c < row->len) val = row->data[c];
         }
+        else if (rv.cls_id == SP_BUILTIN_INT_ARRAY)
+          val = sp_box_int_or_nil(sp_IntArray_get((sp_IntArray *)rv.v.p, c));
+        else if (rv.cls_id == SP_BUILTIN_SYM_ARRAY)
+          val = sp_box_sym((sp_sym)sp_IntArray_get((sp_IntArray *)rv.v.p, c));
+        else if (rv.cls_id == SP_BUILTIN_FLT_ARRAY)
+          val = sp_box_float_or_nil(sp_FloatArray_get((sp_FloatArray *)rv.v.p, c));
+        else if (rv.cls_id == SP_BUILTIN_STR_ARRAY)
+          val = sp_box_str(sp_StrArray_get((sp_StrArray *)rv.v.p, c));
         else if (rv.tag == SP_TAG_OBJ && rv.cls_id == SP_BUILTIN_PTR_ARRAY)
           val = sp_PtrArray_get_box((sp_PtrArray *)rv.v.p, c);
         sp_PolyArray_push(col, val);
@@ -1420,6 +1635,12 @@ else if (kind == SP_BUILTIN_STR_ARRAY) {
     }
     sp_PolyArray_push(result, cv);
   }
+  /* the columns take the rows' nils: marked after the build, so the column
+     loop (65,536 of them in optcarrot's tile table) pays nothing */
+  if (SP_UNLIKELY(int_col_nil) && kind == SP_BUILTIN_INT_ARRAY)
+    for (sp_int c = 0; c < result->len; c++) SP_MAY_NIL((sp_IntArray *)result->data[c].v.p) = 1;
+  if (SP_UNLIKELY(flt_col_nil) && kind == SP_BUILTIN_FLT_ARRAY)
+    for (sp_int c = 0; c < result->len; c++) SP_MAY_NIL((sp_FloatArray *)result->data[c].v.p) = 1;
   return result;
 }
 
@@ -1456,6 +1677,7 @@ sp_PolyArray *sp_str_chars_poly(const char *s) {SP_GC_ROOT_STR(s);
 #endif
 int sp_bt_enabled = 0;          /* set to 1 by debug-build main() */
 const char *sp_bt_srcfile = ""; /* toplevel .rb path, set by debug main() */
+const char *const *sp_bt_files = 0;
 static int sp_bt_is_runtime(const char *n) {
   static const char *pfx[] = {
     "int_", "str_", "float_", "sym_", "gc_", "bigint", "sprintf", "raise",
@@ -1483,7 +1705,7 @@ static int sp_bt_is_runtime(const char *n) {
      - macOS:       "<idx> <image> <addr> <symbol> + <off>".
    Returns NULL if it isn't a keepable user frame. Detect Linux by the '('
    that delimits the symbol (the macOS format has none). */
-static const char *sp_bt_symbol(const char *line) {
+static const char *sp_bt_symbol(const char *line, char *raw, size_t rawcap) {
   char sym[256];
   const char *lp = strchr(line, '(');
   if (lp) {                                       /* glibc/Linux paren form */
@@ -1508,6 +1730,7 @@ else {                                        /* macOS: "<idx> <image> <addr> <s
     if (len == 0 || len > 250) return 0;
     memcpy(sym, p, len); sym[len] = 0;
   }
+  if (raw && rawcap) snprintf(raw, rawcap, "%s", sym);
   /* The top level runs in the emitted body function, which the compiler
      hands to sp_main_stack_run (see lib/sp_fiber.c). That frame IS `<main>`;
      the C `main` beside it is the trampoline, on the other stack, and an
@@ -1555,6 +1778,42 @@ else {                                        /* macOS: "<idx> <image> <addr> <s
   return strdup(out);
 }
 
+#if defined(__linux__) && defined(HAVE_EXECINFO_H)
+#include <dlfcn.h>
+#include <elf.h>
+#include <link.h>
+/* The source line of each return address, from the DWARF the debug build
+   carries: addr2line reads the program's own file, and the generated C's #line
+   directives make the line one of the .rb source. Run once per backtrace, for
+   every frame, only under --debug; a build without addr2line, or an address
+   without a line, leaves the frame without one (lines[i] stays 0). A return
+   address is one past the call, so the call's own line is asked at addr - 1. */
+static void sp_bt_lines(void **buf, int n, int *lines) {
+  char exe[1024];
+  ssize_t el = readlink("/proc/self/exe", exe, sizeof exe - 1);
+  if (el <= 0 || strchr(exe, '\'')) return;
+  exe[el] = 0;
+  Dl_info di;
+  if (!dladdr(buf[0], &di) || !di.dli_fbase) return;
+  const ElfW(Ehdr) *eh = (const ElfW(Ehdr) *)di.dli_fbase;
+  uintptr_t bias = eh->e_type == ET_DYN ? (uintptr_t)di.dli_fbase : 0;
+  char cmd[4096];
+  int o = snprintf(cmd, sizeof cmd, "addr2line -e '%s'", exe);
+  for (int i = 0; i < n && o < (int)sizeof cmd - 32; i++)
+    o += snprintf(cmd + o, sizeof cmd - (size_t)o, " 0x%lx", (unsigned long)((uintptr_t)buf[i] - 1 - bias));
+  FILE *p = popen(cmd, "r");
+  if (!p) return;
+  char line[2048];
+  for (int i = 0; i < n && fgets(line, sizeof line, p); i++) {
+    char *c = strrchr(line, ':');
+    if (c && c[1] >= '1' && c[1] <= '9') lines[i] = atoi(c + 1);
+  }
+  pclose(p);
+}
+#else
+static void sp_bt_lines(void **buf, int n, int *lines) { (void)buf; (void)n; (void)lines; }
+#endif
+
 sp_StrArray *sp_bt_format(void **buf, int n) {
   sp_StrArray *a = sp_StrArray_new();
   SP_GC_ROOT(a);
@@ -1562,12 +1821,22 @@ sp_StrArray *sp_bt_format(void **buf, int n) {
   char **syms = backtrace_symbols(buf, n);
   if (!syms) return a;
   const char *src = (sp_bt_srcfile && sp_bt_srcfile[0]) ? sp_bt_srcfile : "(spinel)";
+  int *lines = (int *)calloc((size_t)n, sizeof *lines);
+  if (lines) sp_bt_lines(buf, n, lines);
   for (int i = 0; i < n; i++) {
-    char *name = (char *)sp_bt_symbol(syms[i]);  /* always strdup'd; free after use */
+    char raw[256]; raw[0] = 0;
+    char *name = (char *)sp_bt_symbol(syms[i], raw, sizeof raw);  /* always strdup'd; free after use */
     if (!name) continue;
-    sp_StrArray_push(a, sp_sprintf("%s:in `%s'", src, name));
+    /* a method of a required file names that file, not the entry script */
+    const char *file = src;
+    if (sp_bt_files)
+      for (const char *const *f = sp_bt_files; f[0]; f += 2)
+        if (strcmp(f[0], raw) == 0) { file = f[1]; break; }
+    if (lines && lines[i] > 0) sp_StrArray_push(a, sp_sprintf("%s:%d:in `%s'", file, lines[i], name));
+    else sp_StrArray_push(a, sp_sprintf("%s:in `%s'", file, name));
     free(name);
   }
+  free(lines);
   free(syms);
   return a;
 }
@@ -1575,6 +1844,7 @@ sp_StrArray *sp_bt_format(void **buf, int n) {
 #include <fcntl.h>
 #include <sys/file.h>
 #include <pwd.h>
+#include "sp_sched.h"   /* sp_native_enter / sp_native_leave for a waiting flock */
 #include <sys/wait.h>
 
 /* ---- File / Dir surface ops moved from spinel_rt.h ----
@@ -1592,9 +1862,10 @@ sp_int sp_File_getbyte(sp_File *f);
 sp_RbVal sp_File_ungetc(sp_File *f, sp_RbVal v);
 const char *sp_File_readpartial(sp_File *f, sp_int n);
 sp_int sp_File_sysseek(sp_File *f, sp_int off, sp_int whence);
-sp_int sp_File_flock(sp_File *f, sp_int op);
+sp_RbVal sp_File_flock(sp_File *f, sp_int op);
 sp_int sp_File_fsync(sp_File *f);
 sp_RbVal sp_File_putc(sp_File *f, sp_RbVal v);
+SP_NORETURN void sp_raise_nil_to_int(int of_wording);
 const char *sp_file_ftype(const char *path);
 sp_bool sp_file_readable(const char *path);
 sp_bool sp_file_writable(const char *path);
@@ -1651,20 +1922,51 @@ sp_bool sp_dir_empty(const char *path);
 const char *sp_dir_home_user(const char *user);
 sp_StrArray *sp_dir_children(const char *path);
 
+/* Does the UTF-8 text s[0..len) end inside a valid character, one that more
+   bytes could complete? A lead byte that can start no character (C0, C1, F5
+   and up), or a second byte out of the range its lead allows, is invalid at
+   once and is not waited for. */
+static int sp_File_tail_incomplete(const unsigned char *s, size_t len) {
+  size_t i = len;
+  int back = 0;
+  while (i > 0 && back < 3 && (s[i - 1] & 0xC0) == 0x80) { i--; back++; }
+  if (i == 0) return 0;
+  unsigned char lead = s[i - 1];
+  if (lead < 0xC2 || lead > 0xF4) return 0;
+  if (back >= 1) {
+    unsigned char lo = 0x80, hi = 0xBF, c1 = s[i];
+    if (lead == 0xE0) lo = 0xA0;
+    else if (lead == 0xED) hi = 0x9F;
+    else if (lead == 0xF0) lo = 0x90;
+    else if (lead == 0xF4) hi = 0x8F;
+    if (c1 < lo || c1 > hi) return 0;
+  }
+  int need = lead >= 0xF0 ? 4 : lead >= 0xE0 ? 3 : 2;
+  return need > back + 1;
+}
+
 const char *sp_File_gets_sep(sp_File *f, const char *sep, sp_int limit, sp_bool chomp) {SP_GC_ROOT(f);SP_GC_ROOT_STR(sep);
   SP_IO_OPEN(f);
   sp_io_wait_readable(f);
   SP_IO_OPEN(f);   /* the park can return after another thread closed the handle */
+  /* an empty separator is paragraph mode, a nil one (NULL) reads to the end;
+     a separator that starts with a NUL byte is not empty (strlen cannot tell) */
+  int para = sep && sep[0] == '\0' && sp_str_byte_len(sep) == 0;
+  if (para) sep = "\n\n";
   size_t sl = sep ? strlen(sep) : 0;
-  /* fast path: the default "\n" separator with no limit reads via fgets
-     (the byte-wise loop below costs a call per character) */
+  /* fast path: the default "\n" separator with no limit reads via getline
+     (the byte-wise loop below costs a call per character). getline answers
+     the line whole, however long, with its byte count, so a NUL inside it
+     neither ends the line nor drops what follows, and its buffer is on the
+     heap, off the 64KB fiber stack. */
   if (sl == 1 && sep[0] == '\n' && limit <= 0) {
-    /* heap scratch: a 64KB stack local overruns the 64KB fiber stack */
-    char *buf = (char *)malloc(65536);
-    if (!buf) return NULL;
-    if (!fgets(buf, 65536, f->fp)) { free(buf); return NULL; }
-    size_t n = strlen(buf);
-    if (chomp && n && buf[n - 1] == '\n') n--;
+    char *buf = NULL;
+    size_t bcap = 0;
+    ssize_t got = getline(&buf, &bcap, f->fp);
+    if (got < 0) { free(buf); return NULL; }
+    size_t n = (size_t)got;
+    /* chomp takes the "\r\n" of a line as well as its "\n" */
+    if (chomp && n && buf[n - 1] == '\n') { n--; if (n && buf[n - 1] == '\r') n--; }
     char *r = sp_str_alloc(n);
     memcpy(r, buf, n); r[n] = 0;
     free(buf);
@@ -1676,14 +1978,42 @@ const char *sp_File_gets_sep(sp_File *f, const char *sep, sp_int limit, sp_bool 
   char *buf = (char *)malloc(cap);
   if (!buf) return NULL;
   int ch;
+  /* a paragraph does not start with blank lines */
+  if (para) {
+    while ((ch = fgetc(f->fp)) == '\n') { }
+    if (ch != EOF) ungetc(ch, f->fp);
+  }
+  int ended = 0, extra = 16;
+  sp_int lim = limit;
   while ((ch = fgetc(f->fp)) != EOF) {
     if (len + 2 > cap) { cap *= 2; char *nb = (char *)realloc(buf, cap); if (!nb) { free(buf); return NULL; } buf = nb; }
     buf[len++] = (char)ch;
-    if (sl && len >= sl && memcmp(buf + len - sl, sep, sl) == 0) break;
-    if (limit > 0 && (sp_int)len >= limit) break;
+    /* as CRuby's getline: a byte that ends the separator is not checked
+       against the limit while fewer bytes than the separator are read, or
+       while the separator would start inside a character, and a limit
+       passed unchecked never stops that line */
+    if (sl && (unsigned char)ch == (unsigned char)sep[sl - 1]) {
+      if (len < sl) continue;
+      if (((unsigned char)buf[len - sl] & 0xC0) == 0x80 && len > sl) continue;
+      if (memcmp(buf + len - sl, sep, sl) == 0) { ended = 1; break; }
+    }
+    if (lim > 0 && (sp_int)len == lim) {
+      /* as CRuby's getline: a limit that falls inside a character reads on to
+         its end (by up to 16 bytes) */
+      if (extra > 0 && sp_File_tail_incomplete((const unsigned char *)buf, len)) { lim = (sp_int)len + 1; extra--; continue; }
+      break;
+    }
+  }
+  /* and the blank lines after one are not part of the next */
+  if (para && ended) {
+    while ((ch = fgetc(f->fp)) == '\n') { }
+    if (ch != EOF) ungetc(ch, f->fp);
   }
   if (len == 0) { free(buf); return NULL; }
-  if (chomp && sl && len >= sl && memcmp(buf + len - sl, sep, sl) == 0) len -= sl;
+  if (chomp && ended && sl && len >= sl && memcmp(buf + len - sl, sep, sl) == 0) {
+    len -= sl;
+    if (sl == 1 && sep[0] == '\n' && len && buf[len - 1] == '\r') len--;
+  }
   char *r = sp_str_alloc(len);
   memcpy(r, buf, len); r[len] = 0;
   sp_str_set_len(r, len);
@@ -1715,7 +2045,12 @@ const char *sp_File_getc(sp_File *f) {SP_GC_ROOT(f);
   sp_io_wait_readable(f);
   int ch = fgetc(f->fp);
   if (ch == EOF) return NULL;
-  int extra = ((ch & 0xE0) == 0xC0) ? 1 : ((ch & 0xF0) == 0xE0) ? 2 : ((ch & 0xF8) == 0xF0) ? 3 : 0;
+  /* A binary handle (a socket, a File opened "rb", one put in binmode) has
+     one-byte characters: reading on after a byte that looks like a UTF-8
+     lead took the next bytes with it, and on a socket waited for bytes the
+     peer had not sent (#7312). */
+  int bin = sp_File_binmode_p(f);
+  int extra = bin ? 0 : ((ch & 0xE0) == 0xC0) ? 1 : ((ch & 0xF0) == 0xE0) ? 2 : ((ch & 0xF8) == 0xF0) ? 3 : 0;
   char *r = sp_str_alloc((size_t)(1 + extra));
   size_t n = 0;
   r[n++] = (char)ch;
@@ -1726,6 +2061,7 @@ const char *sp_File_getc(sp_File *f) {SP_GC_ROOT(f);
   }
   r[n] = 0;
   sp_str_set_len(r, n);
+  if (bin) sp_str_mark_binary(r);
   return r;
 }
 const char *sp_File_readchar(sp_File *f) {SP_GC_ROOT(f);
@@ -1753,9 +2089,28 @@ sp_int sp_File_sysseek(sp_File *f, sp_int off, sp_int whence) {
   fseek(f->fp, (long)off, whence == 1 ? SEEK_CUR : whence == 2 ? SEEK_END : SEEK_SET);
   return (sp_int)ftell(f->fp);
 }
-sp_int sp_File_flock(sp_File *f, sp_int op) {
+/* A blocking flock may be waiting on another thread of this program,
+   and that thread may need a GC before it can unlock. So we leave the
+   world while we wait, like a `blocking: true` FFI call, and the GC
+   doesn't wait for us. EINTR retries instead of failing. */
+sp_RbVal sp_File_flock(sp_File *f, sp_int op) {
   SP_IO_OPEN(f);
-  return flock(fileno(f->fp), (int)op) == 0 ? 0 : 1;
+  int fd = fileno(f->fp);
+  int r;
+  if (op & LOCK_NB) {
+    r = flock(fd, (int)op);
+  }
+  else {
+    sp_native_enter();
+    while ((r = flock(fd, (int)op)) != 0 && errno == EINTR) {}
+    int e = errno;   /* sp_native_leave may run GC work that changes it */
+    sp_native_leave();
+    errno = e;
+  }
+  if (r == 0) return sp_box_int(0);
+  /* a LOCK_NB request on a held lock answers false, as CRuby's does */
+  if ((op & LOCK_NB) && (errno == EWOULDBLOCK || errno == EAGAIN)) return sp_box_bool(0);
+  sp_file_raise_errno("rb_file_flock", f->path);
 }
 sp_int sp_File_fsync(sp_File *f) {
   SP_IO_OPEN(f);
@@ -1766,7 +2121,13 @@ sp_int sp_File_fsync(sp_File *f) {
 sp_RbVal sp_File_putc(sp_File *f, sp_RbVal v) {
   SP_IO_OPEN(f);
   if (v.tag == SP_TAG_INT) fputc((int)(v.v.i & 0xff), f->fp);
-  else if (v.tag == SP_TAG_STR && v.v.s && v.v.s[0]) fputc(v.v.s[0], f->fp);
+  else if (v.tag == SP_TAG_STR) { if (v.v.s && v.v.s[0]) fputc(v.v.s[0], f->fp); }
+  /* anything else is no character: CRuby converts it as an Integer and
+     raises for nil (the boxed nil wrote nothing and answered nil) */
+  else if (v.tag == SP_TAG_NIL) sp_raise_nil_to_int(0);
+  else if (v.tag == SP_TAG_FLT && v.v.f > -9.0e18 && v.v.f < 9.0e18) fputc((int)((sp_int)v.v.f & 0xff), f->fp);
+  else if (v.tag == SP_TAG_BOOL)
+    sp_raise_cls("TypeError", v.v.b ? "no implicit conversion of true into Integer" : "no implicit conversion of false into Integer");
   return v;
 }
 const char *sp_file_ftype(const char *path) {SP_GC_ROOT_STR(path);
@@ -1838,7 +2199,11 @@ const char *sp_file_realdirpath(const char *path) {
   if (strcmp(buf, "/") == 0) return sp_sprintf("/%s", base);
   return sp_sprintf("%s/%s", buf, base);
 }
+#if defined(_WIN32)
+sp_bool sp_file_absolute_path_p(const char *path) { return sp_file_path_root_len(path) > 0; }  /* "/", "C:/" */
+#else
 sp_bool sp_file_absolute_path_p(const char *path) { return path && path[0] == '/'; }  /* (#2988) */
+#endif
 sp_int sp_file_chown(const char *path, sp_int uid, sp_int gid) {SP_GC_ROOT_STR(path);  /* -1 leaves that id unchanged; returns the path count (#2987) */
   if (chown(path ? path : "", (uid_t)uid, (gid_t)gid) != 0)
     sp_raise_cls("Errno::ENOENT", sp_sprintf("No such file or directory - %s", path ? path : ""));
@@ -2002,9 +2367,8 @@ void sp_file_stat_scan(void *p) {
 }
 sp_File *sp_file_stat_handle(const char *path) {SP_GC_ROOT_STR(path);
   struct stat st;
-  if (stat(path ? path : "", &st) != 0)
-    sp_raise_cls("Errno::ENOENT",
-                 sp_sprintf("No such file or directory @ rb_file_s_stat - %s", path ? path : ""));
+  /* the errno's own class and message, as File.atime and File.mtime raise */
+  if (stat(path ? path : "", &st) != 0) sp_file_raise_errno("rb_file_s_stat", path ? path : "");
   sp_File *f = (sp_File *)sp_gc_alloc(sizeof(sp_File), NULL, sp_file_stat_scan);
   SP_GC_ROOT(f);   /* the sprintf below allocates, and nothing else holds the fresh handle */
   f->fp = NULL;
@@ -2019,9 +2383,7 @@ sp_File *sp_file_stat_handle(const char *path) {SP_GC_ROOT_STR(path);
    accessors below read it with lstat(2). (#2986) */
 sp_File *sp_file_lstat_handle(const char *path) {SP_GC_ROOT_STR(path);
   struct stat st;
-  if (lstat(path ? path : "", &st) != 0)
-    sp_raise_cls("Errno::ENOENT",
-                 sp_sprintf("No such file or directory @ rb_file_s_lstat - %s", path ? path : ""));
+  if (lstat(path ? path : "", &st) != 0) sp_file_raise_errno("rb_file_s_lstat", path ? path : "");
   sp_File *f = (sp_File *)sp_gc_alloc(sizeof(sp_File), NULL, sp_file_stat_scan);
   SP_GC_ROOT(f);
   f->fp = NULL;
@@ -2097,7 +2459,10 @@ static int sp_stat_pathless(sp_File *f) {
 }
 sp_File *sp_io_stat_handle(sp_File *f) {SP_GC_ROOT(f);
   SP_IO_OPEN(f);
-  if (f->path && f->path[0]) return sp_file_stat_handle(f->path);
+  /* a standard stream's "<STDOUT>" is a placeholder, not a path: fstat it,
+     as a handle opened from a descriptor is; a File opened by a name that
+     starts with '<' still goes by its path */
+  if (f->path && f->path[0] && (f->path[0] != '<' || f->is_file)) return sp_file_stat_handle(f->path);
   struct stat st;
   if (fstat(fileno(f->fp), &st) != 0)
     sp_raise_cls("Errno::EBADF", "Bad file descriptor");
@@ -2292,6 +2657,11 @@ const char *sp_file_dirname(const char *path) {SP_GC_ROOT_STR(path);
   const char *s = strrchr(path, '/');
   if (!s) { char *r = sp_str_alloc(1); r[0] = '.'; r[1] = 0; return r; }
   if (s == path) { char *r = sp_str_alloc(1); r[0] = '/'; r[1] = 0; return r; }
+#if defined(_WIN32)
+  /* the separator of a drive's root ("C:/x") stays: the dirname is the root */
+  { size_t rn = sp_file_path_root_len(path);
+    if (rn > 1 && (size_t)(s - path) < rn) { char *r = sp_str_alloc((sp_int)rn); memcpy(r, path, rn); r[rn] = 0; return r; } }
+#endif
   size_t n = (size_t)(s - path);
   char *buf = sp_str_alloc(n);
   memcpy(buf, path, n); buf[n] = 0;
@@ -2435,6 +2805,22 @@ const char *sp_dir_home_user(const char *user) {SP_GC_ROOT_STR(user);
   return sp_str_dup_external(pw->pw_dir);
 }
 sp_StrArray *sp_dir_children(const char *path) {SP_GC_ROOT_STR(path); return sp_dir_entries_impl(path, 1); }
+/* Dir.entries / Dir.children with an encoding: keyword, the form Find.find
+   lists a directory with. The name is checked first, as Encoding.find checks
+   it (CRuby raises before it opens the directory), and nil keeps the
+   default. A String tells only binary from text, so ASCII-8BIT marks the
+   names binary and any other encoding leaves them as they are. */
+sp_StrArray *sp_dir_entries_enc(const char *path, int children, sp_RbVal enc) {SP_GC_ROOT_STR(path);
+  int binary = 0;
+  if (enc.tag != SP_TAG_NIL) {
+    sp_RbVal e = sp_encoding_find(enc);
+    binary = e.tag == SP_TAG_ENCODING && e.v.s && strcmp(e.v.s, "ASCII-8BIT") == 0;
+  }
+  sp_StrArray *a = sp_dir_entries_impl(path, children);
+  if (binary)
+    for (sp_int i = 0; i < a->len; i++) sp_str_as_binary(a->data[i]);
+  return a;
+}
 
 /* ---- Signal trap machinery + Enumerator cursor/generator ops moved from
    spinel_rt.h ----
@@ -2454,6 +2840,7 @@ extern SP_NORETURN void sp_raise_stop_iteration(sp_RbVal result);
 extern SP_TLS sp_RbVal _sp_proc_poly_ret;
 extern SP_TLS sp_RbVal _sp_proc_poly_args[];
 extern sp_int sp_proc_call(sp_Proc *p, sp_int argc, sp_int *args);
+extern void sp_trap_call(sp_Proc *p, int no);
 extern const char *sp_signal_signame(sp_int no);
 extern SP_COLD int sp_signal_resolve(sp_RbVal sig);
 
@@ -2477,6 +2864,7 @@ sp_RbVal sp_Enumerator_feed(sp_Enumerator *e, sp_RbVal v);
 sp_PolyArray *sp_Enumerator_take(sp_Enumerator *e, sp_int n);
 sp_PolyArray *sp_Enumerator_to_a(sp_Enumerator *e);
 void sp_sig_c_handler(int no);
+void sp_exc_resignal(const char *cls, const char *msg);
 void sp_sig_exit_dispatch(void);
 sp_RbVal sp_signal_trap(sp_RbVal sig, sp_RbVal handler);
 sp_int sp_process_kill1(sp_RbVal sig, sp_int pid);
@@ -2488,17 +2876,30 @@ sp_Enumerator *sp_Enumerator_dup(sp_Enumerator *e) {SP_GC_ROOT(e);
   *d = *e;
   return d;
 }
+void sp_PolyArray_pack_scan(void *p) {
+  sp_PolyArray *a = (sp_PolyArray *)p;
+  for (sp_int i = 0; i < a->len; i++) sp_mark_rbval(a->data[i]);
+}
+/* never pooled: a recycled pack would come back as an ordinary array still
+   carrying the pack's scan function */
+sp_PolyArray *sp_PolyArray_new_pack(void) {
+  sp_PolyArray *a = (sp_PolyArray *)sp_gc_alloc(sizeof(sp_PolyArray), NULL, sp_PolyArray_pack_scan);
+  a->data = a->inl; a->cap = SP_POLYARR_INLINE; a->len = 0;
+  return a;
+}
 void sp_Enumerator_scan(void *p) {
   sp_Enumerator *e = (sp_Enumerator *)p;
   if (e->items) sp_gc_mark(e->items);
   if (e->fib) sp_gc_mark(e->fib);
   if (e->gen_cap) sp_gc_mark(e->gen_cap);
   if (e->peeked) sp_mark_rbval(e->peek_val);
+  if (e->is_bsearch) sp_mark_rbval(e->bsearch_result);
   sp_mark_rbval(e->size);
   if (e->has_feed) sp_mark_rbval(e->feed);
   sp_mark_rbval(e->gen_result);
   sp_mark_rbval(e->source);
   sp_mark_string(e->meth);
+  if (e->walk_buf) sp_gc_mark(e->walk_buf);
 }
 sp_Enumerator *sp_enum_with_src(sp_Enumerator *e, sp_RbVal src, const char *meth) { sp_gc_wb((void*)e);
   e->source = src;
@@ -2510,8 +2911,18 @@ sp_Enumerator *sp_enum_as_gen(sp_Enumerator *e) {
   e->gen_label = TRUE;
   return e;
 }
+/* Recognize the annotated materialized walks in the existing return
+   dispatch; an inspect label must not turn a supported walk into an error. */
+static int sp_enum_returns_source(sp_Enumerator *e) {
+  const char *m = e->meth;
+  return m && (strcmp(m, "each") == 0 || strcmp(m, "each_with_index") == 0 ||
+               strncmp(m, "cycle(", 6) == 0 || strncmp(m, "combination(", 12) == 0 ||
+               strcmp(m, "permutation") == 0 || strncmp(m, "permutation(", 12) == 0 ||
+               strncmp(m, "repeated_combination(", 21) == 0 ||
+               strncmp(m, "repeated_permutation(", 21) == 0);
+}
 sp_RbVal sp_enum_with_index_value(sp_Enumerator *e) {SP_GC_ROOT(e);
-  if (e->meth && (strcmp(e->meth, "each") == 0 || strcmp(e->meth, "each_with_index") == 0))
+  if (sp_enum_returns_source(e))
     return e->source;
   sp_raise_cls("NotImplementedError",
                sp_sprintf("Enumerator#with_index return value for a stored %s enumerator",
@@ -2521,7 +2932,7 @@ sp_RbVal sp_enum_with_index_value(sp_Enumerator *e) {SP_GC_ROOT(e);
 sp_RbVal sp_enum_with_index_result(sp_Enumerator *e, sp_PolyArray *mapped) {SP_GC_ROOT(e);
   if (e->meth && (strcmp(e->meth, "map") == 0 || strcmp(e->meth, "collect") == 0))
     return sp_box_poly_array(mapped);
-  if (e->meth && (strcmp(e->meth, "each") == 0 || strcmp(e->meth, "each_with_index") == 0))
+  if (sp_enum_returns_source(e))
     return e->source;
   sp_raise_cls("NotImplementedError",
                sp_sprintf("Enumerator#with_index return value for a stored %s enumerator",
@@ -2552,37 +2963,133 @@ sp_Enumerator *sp_Enumerator_new_from_items(sp_PolyArray *items) {
 /* The walk is the pair's own: a fiber of its own over a generator source and
    an index of its own over a materialized one, so the source's #next cursor
    is neither read nor moved (`g.with_index.first(4)` then `g.next` answered
-   the fifth element), and an endless cycle's round starts over. */
-typedef struct { sp_Enumerator *src; sp_int off; sp_Fiber *fib; } sp_WiCap;
+   the fifth element), and an endless cycle's round starts over. The source
+   fiber belongs to this run of the pairing fiber, not to the capture every
+   run shares: #next, to_a, first(n) and a walk each run it separately, and
+   one run starting over replaced the fiber another was reading. */
+typedef struct { sp_Enumerator *src; sp_int off; } sp_WiCap;
 static void sp_wi_cap_scan(void *p) {
   sp_WiCap *cap = (sp_WiCap *)p;
   if (cap->src) sp_gc_mark(cap->src);
-  if (cap->fib) sp_gc_mark(cap->fib);
+}
+/* The next item of a run over source `s` that owns its fiber `*sf` (rooted
+   by the caller) and its cursor `*j`; FALSE once the source is spent. */
+static sp_bool sp_src_run_pull(sp_Enumerator *s, sp_Fiber **sf, sp_int *j, sp_RbVal *out) {
+  if (s->gen) {
+    if (!*sf) { *sf = sp_Fiber_new(s->gen); if (s->gen_cap) { sp_gc_wb((void*)*sf); (*sf)->user_data = s->gen_cap; } }
+    if (!sp_Fiber_alive(*sf)) return FALSE;
+    *out = sp_Fiber_resume(*sf, sp_box_nil());
+    return sp_Fiber_alive(*sf);
+  }
+  if (s->endless && s->items && s->items->len > 0 && *j >= s->items->len) *j = 0;
+  if (!s->items || *j >= s->items->len) return FALSE;
+  *out = s->items->data[(*j)++];
+  return TRUE;
 }
 static void sp_with_index_gen(sp_Fiber *f) {
   sp_WiCap *cap = (sp_WiCap *)f->user_data;
   sp_Enumerator *s = cap->src;
   sp_int i = cap->off, j = 0;
-  sp_gc_wb((void*)cap); cap->fib = NULL;   /* a rewind starts the walk over */
+  sp_Fiber *sf = NULL;
+  SP_GC_ROOT(sf);
   for (;;) {
     sp_RbVal v;
-    if (s->gen) {
-      if (!cap->fib) { sp_Fiber *nf = sp_Fiber_new(s->gen); sp_gc_wb((void*)cap); cap->fib = nf; if (s->gen_cap) { sp_gc_wb((void*)nf); nf->user_data = s->gen_cap; } }
-      if (!sp_Fiber_alive(cap->fib)) break;
-      v = sp_Fiber_resume(cap->fib, sp_box_nil());
-      if (!sp_Fiber_alive(cap->fib)) break;
-    }
-    else {
-      if (s->endless && s->items && s->items->len > 0 && j >= s->items->len) j = 0;
-      if (!s->items || j >= s->items->len) break;
-      v = s->items->data[j++];
-    }
+    if (!sp_src_run_pull(s, &sf, &j, &v)) break;
     sp_PolyArray *pair = sp_PolyArray_new();
     SP_GC_ROOT(pair);
     sp_PolyArray_push(pair, v);
     sp_PolyArray_push(pair, sp_box_int(i++));
     sp_Fiber_yield(sp_box_poly_array(pair));
   }
+}
+/* A countless cycle over a generator or endless Enumerator: a run pulls the
+   source on a fiber of its own and yields each item as it arrives, keeping
+   them; when the source ends it goes round the kept items forever. The
+   source is never drained up front, so an endless one answers first(n). */
+typedef struct { sp_Enumerator *src; } sp_CyCap;
+static void sp_cy_cap_scan(void *p) {
+  sp_CyCap *cap = (sp_CyCap *)p;
+  if (cap->src) sp_gc_mark(cap->src);
+}
+static void sp_cycle_gen(sp_Fiber *f) {
+  sp_CyCap *cap = (sp_CyCap *)f->user_data;
+  sp_Enumerator *s = cap->src;
+  sp_int j = 0;
+  sp_Fiber *sf = NULL;
+  SP_GC_ROOT(sf);
+  sp_PolyArray *seen = sp_PolyArray_new();
+  SP_GC_ROOT(seen);
+  for (;;) {
+    sp_RbVal v;
+    if (s->gen) {
+      if (!sf) { sf = sp_Fiber_new(s->gen); if (s->gen_cap) { sp_gc_wb((void*)sf); sf->user_data = s->gen_cap; } }
+      if (!sp_Fiber_alive(sf)) break;
+      v = sp_Fiber_resume(sf, sp_box_nil());
+      if (!sp_Fiber_alive(sf)) break;
+    }
+    else {
+      if (s->endless && s->items && s->items->len > 0 && j >= s->items->len) j = 0;
+      if (!s->items || j >= s->items->len) break;
+      v = s->items->data[j++];
+    }
+    sp_PolyArray_push(seen, v);
+    sp_Fiber_yield(v);
+  }
+  if (seen->len == 0) return;
+  for (sp_int i = 0;; i = (i + 1) % seen->len) sp_Fiber_yield(seen->data[i]);
+}
+sp_Enumerator *sp_Enumerator_cycle_gen(sp_Enumerator *e) {
+  SP_GC_ROOT(e);
+  sp_CyCap *cap = (sp_CyCap *)sp_gc_alloc(sizeof(sp_CyCap), NULL, sp_cy_cap_scan);
+  SP_GC_ROOT(cap);
+  cap->src = e;
+  sp_Enumerator *r = sp_Enumerator_new_gen(sp_cycle_gen, cap, sp_box_nil());
+  r->yields_pair = e->yields_pair;
+  r->source = e->source;
+  return r;
+}
+/* Blockless each_slice(n) / each_cons(n) over a generator or an endless
+   source: the groups are made as a run pulls the source, one group per
+   step, so an endless source answers first(n) (materializing it never
+   returned). A run owns its source fiber, as with_index's does. */
+typedef struct { sp_Enumerator *src; sp_int n; sp_bool cons; } sp_RgCap;
+static void sp_rg_cap_scan(void *p) {
+  sp_RgCap *cap = (sp_RgCap *)p;
+  if (cap->src) sp_gc_mark(cap->src);
+}
+static void sp_regroup_gen(sp_Fiber *f) {
+  sp_RgCap *cap = (sp_RgCap *)f->user_data;
+  sp_Enumerator *s = cap->src;
+  sp_int j = 0;
+  sp_Fiber *sf = NULL;
+  SP_GC_ROOT(sf);
+  sp_PolyArray *win = sp_PolyArray_new();
+  SP_GC_ROOT(win);
+  for (;;) {
+    sp_RbVal v;
+    if (!sp_src_run_pull(s, &sf, &j, &v)) break;
+    sp_PolyArray_push(win, v);
+    if (win->len < cap->n) continue;
+    sp_PolyArray *g = sp_PolyArray_new();
+    SP_GC_ROOT(g);
+    for (sp_int k = 0; k < win->len; k++) sp_PolyArray_push(g, win->data[k]);
+    if (cap->cons) { memmove(win->data, win->data + 1, (size_t)(win->len - 1) * sizeof(sp_RbVal)); win->len--; }
+    else win->len = 0;
+    sp_Fiber_yield(sp_box_poly_array(g));
+  }
+  /* a slice run ends on its short last group, as each_slice's does */
+  if (!cap->cons && win->len > 0) sp_Fiber_yield(sp_box_poly_array(win));
+}
+sp_Enumerator *sp_Enumerator_regroup_gen(sp_Enumerator *e, sp_int n, sp_bool cons) {
+  SP_GC_ROOT(e);
+  sp_RgCap *cap = (sp_RgCap *)sp_gc_alloc(sizeof(sp_RgCap), NULL, sp_rg_cap_scan);
+  SP_GC_ROOT(cap);
+  cap->src = e; cap->n = n; cap->cons = cons;
+  sp_Enumerator *r = sp_Enumerator_new_gen(sp_regroup_gen, cap, sp_box_nil());
+  SP_GC_ROOT(r);
+  r->source = e->source;
+  r->meth = sp_sprintf(cons ? "each_cons(%lld)" : "each_slice(%lld)", (long long)n);
+  return r;
 }
 sp_Enumerator *sp_Enumerator_with_index(sp_Enumerator *e, sp_int off) {
   /* an endless source pairs lazily too: its pairs never run out */
@@ -2601,6 +3108,7 @@ sp_Enumerator *sp_Enumerator_with_index(sp_Enumerator *e, sp_int off) {
     cap->src = e; cap->off = off;
     sp_Enumerator *r = sp_Enumerator_new_gen(sp_with_index_gen, cap, e->size);
     r->source = e->source;
+    r->yields_pair = TRUE;
     return r;
   }
   sp_PolyArray *src = e ? e->items : NULL;
@@ -2618,7 +3126,7 @@ sp_Enumerator *sp_Enumerator_with_index(sp_Enumerator *e, sp_int off) {
     sp_PolyArray_push(out, sp_box_poly_array(pair));
   }
   { sp_RbVal src_recv = e ? e->source : sp_box_nil();
-    sp_Enumerator *r = sp_Enumerator_new_from_items(out); r->source = src_recv; return r; }
+    sp_Enumerator *r = sp_Enumerator_new_from_items(out); r->source = src_recv; r->yields_pair = TRUE; return r; }
 }
 sp_Enumerator *sp_Enumerator_new_gen(void (*gen)(sp_Fiber *), void *cap, sp_RbVal size) {SP_GC_ROOT_RBVAL(size);
   sp_Enumerator *e = (sp_Enumerator *)sp_gc_alloc(sizeof(sp_Enumerator), NULL, sp_Enumerator_scan);
@@ -2654,12 +3162,12 @@ sp_int sp_io_copy_stream(const char *src, const char *dst) {SP_GC_ROOT_STR(src);
 
 /* Array#combination / permutation over an int array (lib-only; the recursion
    helpers stay file-static, the four entry points are declared in spinel_rt.h). */
-static void sp_int_combination_recur(sp_IntArray*src,sp_int start,sp_int k,sp_IntArray*acc,sp_PtrArray*out){SP_GC_ROOT(src);SP_GC_ROOT(acc);SP_GC_ROOT(out);if(k==0){sp_IntArray*cp=sp_IntArray_new();for(sp_int i=0;i<acc->len;i++)sp_IntArray_push(cp,acc->data[acc->start+i]);sp_PtrArray_push(out,cp);return;}for(sp_int i=start;i<=src->len-k;i++){sp_IntArray_push(acc,src->data[src->start+i]);sp_int_combination_recur(src,i+1,k-1,acc,out);acc->len--;}}
+static void sp_int_combination_recur(sp_IntArray*src,sp_int start,sp_int k,sp_IntArray*acc,sp_PtrArray*out){SP_GC_ROOT(src);SP_GC_ROOT(acc);SP_GC_ROOT(out);if(k==0){sp_IntArray*cp=sp_IntArray_new();SP_MAY_NIL(cp)=SP_MAY_NIL(src);for(sp_int i=0;i<acc->len;i++)sp_IntArray_push(cp,acc->data[acc->start+i]);sp_PtrArray_push(out,cp);return;}for(sp_int i=start;i<=src->len-k;i++){sp_IntArray_push(acc,src->data[src->start+i]);sp_int_combination_recur(src,i+1,k-1,acc,out);acc->len--;}}
 sp_PtrArray*sp_IntArray_combination(sp_IntArray*a,sp_int k){SP_GC_ROOT(a);sp_PtrArray*out=sp_PtrArray_new();SP_GC_ROOT(out);if(!a||k<0||k>a->len)return out;sp_IntArray*acc=sp_IntArray_new();SP_GC_ROOT(acc);sp_int_combination_recur(a,0,k,acc,out);return out;}
-static void sp_int_repeated_combination_recur(sp_IntArray*src,sp_int start,sp_int k,sp_IntArray*acc,sp_PtrArray*out){SP_GC_ROOT(src);SP_GC_ROOT(acc);SP_GC_ROOT(out);if(k==0){sp_IntArray*cp=sp_IntArray_new();for(sp_int i=0;i<acc->len;i++)sp_IntArray_push(cp,acc->data[acc->start+i]);sp_PtrArray_push(out,cp);return;}for(sp_int i=start;i<src->len;i++){sp_IntArray_push(acc,src->data[src->start+i]);sp_int_repeated_combination_recur(src,i,k-1,acc,out);acc->len--;}}
+static void sp_int_repeated_combination_recur(sp_IntArray*src,sp_int start,sp_int k,sp_IntArray*acc,sp_PtrArray*out){SP_GC_ROOT(src);SP_GC_ROOT(acc);SP_GC_ROOT(out);if(k==0){sp_IntArray*cp=sp_IntArray_new();SP_MAY_NIL(cp)=SP_MAY_NIL(src);for(sp_int i=0;i<acc->len;i++)sp_IntArray_push(cp,acc->data[acc->start+i]);sp_PtrArray_push(out,cp);return;}for(sp_int i=start;i<src->len;i++){sp_IntArray_push(acc,src->data[src->start+i]);sp_int_repeated_combination_recur(src,i,k-1,acc,out);acc->len--;}}
 sp_PtrArray*sp_IntArray_repeated_combination(sp_IntArray*a,sp_int k){SP_GC_ROOT(a);sp_PtrArray*out=sp_PtrArray_new();SP_GC_ROOT(out);if(!a||k<0)return out;sp_IntArray*acc=sp_IntArray_new();SP_GC_ROOT(acc);sp_int_repeated_combination_recur(a,0,k,acc,out);return out;}
-static void sp_int_permutation_recur(sp_IntArray*src,sp_int k,sp_IntArray*used,sp_IntArray*acc,sp_PtrArray*out){SP_GC_ROOT(src);SP_GC_ROOT(used);SP_GC_ROOT(acc);SP_GC_ROOT(out);if(k==0){sp_IntArray*cp=sp_IntArray_new();for(sp_int i=0;i<acc->len;i++)sp_IntArray_push(cp,acc->data[acc->start+i]);sp_PtrArray_push(out,cp);return;}for(sp_int i=0;i<src->len;i++){if(used->data[used->start+i])continue;used->data[used->start+i]=1;sp_IntArray_push(acc,src->data[src->start+i]);sp_int_permutation_recur(src,k-1,used,acc,out);acc->len--;used->data[used->start+i]=0;}}
-static void sp_int_repeated_permutation_recur(sp_IntArray*src,sp_int k,sp_IntArray*acc,sp_PtrArray*out){SP_GC_ROOT(src);SP_GC_ROOT(acc);SP_GC_ROOT(out);if(k==0){sp_IntArray*cp=sp_IntArray_new();SP_GC_ROOT(cp);for(sp_int i=0;i<acc->len;i++)sp_IntArray_push(cp,acc->data[acc->start+i]);sp_PtrArray_push(out,cp);return;}for(sp_int i=0;i<src->len;i++){sp_IntArray_push(acc,src->data[src->start+i]);sp_int_repeated_permutation_recur(src,k-1,acc,out);acc->len--;}}
+static void sp_int_permutation_recur(sp_IntArray*src,sp_int k,sp_IntArray*used,sp_IntArray*acc,sp_PtrArray*out){SP_GC_ROOT(src);SP_GC_ROOT(used);SP_GC_ROOT(acc);SP_GC_ROOT(out);if(k==0){sp_IntArray*cp=sp_IntArray_new();SP_MAY_NIL(cp)=SP_MAY_NIL(src);for(sp_int i=0;i<acc->len;i++)sp_IntArray_push(cp,acc->data[acc->start+i]);sp_PtrArray_push(out,cp);return;}for(sp_int i=0;i<src->len;i++){if(used->data[used->start+i])continue;used->data[used->start+i]=1;sp_IntArray_push(acc,src->data[src->start+i]);sp_int_permutation_recur(src,k-1,used,acc,out);acc->len--;used->data[used->start+i]=0;}}
+static void sp_int_repeated_permutation_recur(sp_IntArray*src,sp_int k,sp_IntArray*acc,sp_PtrArray*out){SP_GC_ROOT(src);SP_GC_ROOT(acc);SP_GC_ROOT(out);if(k==0){sp_IntArray*cp=sp_IntArray_new();SP_MAY_NIL(cp)=SP_MAY_NIL(src);SP_GC_ROOT(cp);for(sp_int i=0;i<acc->len;i++)sp_IntArray_push(cp,acc->data[acc->start+i]);sp_PtrArray_push(out,cp);return;}for(sp_int i=0;i<src->len;i++){sp_IntArray_push(acc,src->data[src->start+i]);sp_int_repeated_permutation_recur(src,k-1,acc,out);acc->len--;}}
 sp_PtrArray*sp_IntArray_repeated_permutation(sp_IntArray*a,sp_int k){SP_GC_ROOT(a);sp_PtrArray*out=sp_PtrArray_new();SP_GC_ROOT(out);if(!a||k<0)return out;sp_IntArray*acc=sp_IntArray_new();SP_GC_ROOT(acc);sp_int_repeated_permutation_recur(a,k,acc,out);return out;}
 sp_PtrArray*sp_IntArray_permutation(sp_IntArray*a,sp_int k){SP_GC_ROOT(a);sp_PtrArray*out=sp_PtrArray_new();SP_GC_ROOT(out);if(!a||k<0||k>a->len)return out;sp_IntArray*used=sp_IntArray_new();SP_GC_ROOT(used);for(sp_int i=0;i<a->len;i++)sp_IntArray_push(used,0);sp_IntArray*acc=sp_IntArray_new();SP_GC_ROOT(acc);sp_int_permutation_recur(a,k,used,acc,out);return out;}
 sp_RbVal sp_enum_gen_pull(sp_Enumerator *e) {SP_GC_ROOT(e); sp_gc_wb((void*)e);
@@ -2675,7 +3183,40 @@ sp_RbVal sp_enum_gen_pull(sp_Enumerator *e) {SP_GC_ROOT(e); sp_gc_wb((void*)e);
   if (!sp_Fiber_alive(e->fib)) { e->gen_result = v; sp_gc_wb((void*)e); sp_raise_stop_iteration(v); }
   return v;
 }
+static void sp_enum_bsearch_advance(sp_Enumerator *e) {
+  if (!e->bsearch_waiting) return;
+  sp_RbVal v = e->has_feed ? e->feed : sp_box_nil();
+  e->has_feed = FALSE; e->feed = sp_box_nil();
+  if (v.tag == SP_TAG_INT) {
+    if (v.v.i == 0) { e->bsearch_result = e->items->data[e->bsearch_mid]; e->bsearch_hi = e->bsearch_mid - 1; }
+    else if (v.v.i < 0) e->bsearch_hi = e->bsearch_mid - 1;
+    else e->bsearch_lo = e->bsearch_mid + 1;
+  }
+  else if (v.tag == SP_TAG_FLT) {
+    if (v.v.f == 0.0) { e->bsearch_result = e->items->data[e->bsearch_mid]; e->bsearch_hi = e->bsearch_mid - 1; }
+    else if (v.v.f < 0.0) e->bsearch_hi = e->bsearch_mid - 1;
+    else e->bsearch_lo = e->bsearch_mid + 1;
+  }
+  else if (v.tag != SP_TAG_NIL && !(v.tag == SP_TAG_BOOL && !v.v.b)) {
+    e->bsearch_result = e->items->data[e->bsearch_mid];
+    e->bsearch_hi = e->bsearch_mid - 1;
+  }
+  else e->bsearch_lo = e->bsearch_mid + 1;
+  e->bsearch_waiting = FALSE;
+}
+static sp_RbVal sp_enum_bsearch_next(sp_Enumerator *e) {
+  SP_GC_ROOT(e);
+  sp_enum_bsearch_advance(e);
+  if (e->bsearch_lo > e->bsearch_hi) sp_raise_stop_iteration(e->bsearch_result);
+  e->bsearch_mid = e->bsearch_lo + (e->bsearch_hi - e->bsearch_lo + 1) / 2;
+  e->bsearch_waiting = TRUE;
+  return e->items->data[e->bsearch_mid];
+}
 sp_RbVal sp_Enumerator_next(sp_Enumerator *e) {SP_GC_ROOT(e);
+  if (e->is_bsearch) {
+    if (e->peeked) { e->peeked = FALSE; e->bsearch_waiting = TRUE; return e->peek_val; }
+    return sp_enum_bsearch_next(e);
+  }
   if (e->gen) {
     if (e->peeked) { e->peeked = FALSE; return e->peek_val; }
     return sp_enum_gen_pull(e);
@@ -2685,6 +3226,15 @@ sp_RbVal sp_Enumerator_next(sp_Enumerator *e) {SP_GC_ROOT(e);
   return e->items->data[e->cursor++];
 }
 sp_RbVal sp_Enumerator_peek(sp_Enumerator *e) {SP_GC_ROOT(e); sp_gc_wb((void*)e);
+  if (e->is_bsearch) {
+    if (!e->peeked) {
+      sp_enum_bsearch_advance(e);
+      if (e->bsearch_lo > e->bsearch_hi) sp_raise_stop_iteration(e->bsearch_result);
+      e->bsearch_mid = e->bsearch_lo + (e->bsearch_hi - e->bsearch_lo + 1) / 2;
+      e->peek_val = e->items->data[e->bsearch_mid]; e->peeked = TRUE;
+    }
+    return e->peek_val;
+  }
   if (e->gen) {
     if (!e->peeked) { e->peek_val = sp_enum_gen_pull(e); sp_gc_wb((void*)e); e->peeked = TRUE; }
     return e->peek_val;
@@ -2705,6 +3255,7 @@ sp_Enumerator *sp_Enumerator_rewind(sp_Enumerator *e) { sp_gc_wb((void*)e);
   if (!e) return NULL;
   if (e->gen) { e->fib = NULL; e->peeked = FALSE; e->gen_result = sp_box_nil(); }
   else e->cursor = 0;
+  if (e->is_bsearch) { e->bsearch_lo = 0; e->bsearch_hi = e->items ? e->items->len - 1 : -1; e->bsearch_mid = -1; e->bsearch_waiting = FALSE; e->bsearch_result = sp_box_nil(); e->peeked = FALSE; }
   e->feed = sp_box_nil(); e->has_feed = FALSE;
   return e;
 }
@@ -2761,11 +3312,7 @@ sp_PolyArray *sp_Enumerator_to_a(sp_Enumerator *e) {
 }
 void sp_sig_c_handler(int no) {
   sp_Proc *p = (no >= 0 && no < SP_SIG_MAX) ? (sp_Proc *)sp_trap_proc[no] : NULL;
-  if (p) {
-    sp_int slot = (sp_int)no;
-    _sp_proc_poly_args[0] = sp_box_int((sp_int)no);
-    sp_proc_call(p, 1, &slot);
-  }
+  if (p) sp_trap_call(p, no);
 }
 void sp_sig_exit_dispatch(void) {
   sp_Proc *p = (sp_Proc *)sp_trap_proc[0];
@@ -2787,7 +3334,15 @@ sp_RbVal sp_signal_trap(sp_RbVal sig, sp_RbVal handler) {SP_GC_ROOT_RBVAL(sig);S
     sp_trap_proc[no] = (sp_Proc *)handler.v.p;
     sp_trap_state[no] = NULL;
     if (no == 0) { static int armed = 0; if (!armed) { armed = 1; atexit(sp_sig_exit_dispatch); } }
-    else signal(no, sp_sig_c_handler);
+    else {
+      /* no SA_NODEFER: the signal stays blocked while its proc runs, so a
+         second delivery waits instead of nesting (sp_trap_call) */
+      struct sigaction sa; memset(&sa, 0, sizeof sa);
+      sa.sa_handler = sp_sig_c_handler;
+      sigemptyset(&sa.sa_mask);
+      sa.sa_flags = SA_RESTART;
+      sigaction(no, &sa, NULL);
+    }
   }
   else {
     const char *hs = (handler.tag == SP_TAG_STR && handler.v.s) ? handler.v.s : "DEFAULT";
@@ -2820,6 +3375,13 @@ sp_RbVal sp_Enumerator_size(sp_Enumerator *e) {SP_GC_ROOT(e);
   if (e->gen_label) return sp_box_nil();
   /* an argless cycle is endless unless there is nothing to repeat */
   if (e->endless) return (e->items && e->items->len > 0) ? sp_box_float(1.0 / 0.0) : sp_box_int(0);
+  /* These searches can stop at their first hit, so CRuby gives their
+     Enumerator no size; neither gsub's nor gsub!'s Enumerator has one. */
+  if (e->meth && (strcmp(e->meth, "bsearch") == 0 ||
+                  strcmp(e->meth, "index") == 0 || strcmp(e->meth, "rindex") == 0 ||
+                  strcmp(e->meth, "find_index") == 0 ||
+                  strncmp(e->meth, "gsub(", 5) == 0 || strncmp(e->meth, "gsub!(", 6) == 0))
+    return sp_box_nil();
   if (e->items) return sp_box_int(e->items->len);
   if (e->size.tag == SP_TAG_OBJ && e->size.cls_id == SP_BUILTIN_PROC) {
     (void)sp_proc_call((sp_Proc *)e->size.v.p, 0, NULL);
@@ -2828,6 +3390,31 @@ sp_RbVal sp_Enumerator_size(sp_Enumerator *e) {SP_GC_ROOT(e);
   return e->size;
 }
 sp_RbVal sp_Enumerator_size_p(void *e) { return sp_Enumerator_size((sp_Enumerator *)e); }
+/* A boxed index search's or substitution's Enumerator (`a.index`,
+   `s.gsub!(re)` reached through a branch): its each block picks an index
+   or is the replacement, which the generic element walk does not compute,
+   so say so rather than answer the receiver. One read straight off its
+   call is rewritten to the block form before it gets here. */
+/* The blockless collectors' Enumerators: each with a block answers what the
+   collector answers (`[1, 2].map.each { |v| v * 10 }` is [10, 20]), which
+   the generic walk, answering its receiver, does not compute either. */
+static const char *const sp_enum_collector_meths[] = {
+  "map", "collect", "flat_map", "collect_concat", "select", "filter", "filter_map",
+  "reject", "find", "detect", "find_all", "sort_by", "min_by", "max_by", "minmax_by",
+  "group_by", "partition", "sum", "count", "each_with_object", "inject", "reduce",
+  "uniq", "chunk_while", "slice_when", "take_while", "drop_while", "tally_by",
+  "map!", "collect!", "select!", "filter!", "reject!", "keep_if", "delete_if", "sort_by!",
+  NULL };
+void sp_enum_index_search_each_raise(void *p) {
+  const char *em = ((sp_Enumerator *)p)->meth;
+  int coll = 0;
+  for (int i = 0; em && sp_enum_collector_meths[i]; i++)
+    if (strcmp(em, sp_enum_collector_meths[i]) == 0) { coll = 1; break; }
+  if (em && (coll || strcmp(em, "index") == 0 || strcmp(em, "rindex") == 0 || strcmp(em, "find_index") == 0 ||
+             strncmp(em, "gsub(", 5) == 0 || strncmp(em, "gsub!(", 6) == 0))
+    sp_raise_cls("NotImplementedError",
+                 sp_sprintf("spinel: each on a boxed %s Enumerator is not supported", em));
+}
 
 /* ---- ENV core (StrStrHash-backed, #2832/#2842) + GC.stat + String#setbyte
    COW -- relocated from spinel_rt.h. All reach only lib-visible helpers
@@ -2992,6 +3579,43 @@ const char *sp_str_setbyte_cow(const char *s, sp_int i, sp_int v) {SP_GC_ROOT_ST
    (resolved at final link against the generated TU). ---- */
 #include "sp_range.h"
 
+/* The caller has checked the boxed Range kind and its non-NULL payload. */
+sp_RbVal sp_range_dup(sp_RbVal v, int keep_frozen) {
+  switch (v.cls_id) {
+    case SP_BUILTIN_RANGE: {
+      sp_Range r = *(sp_Range *)v.v.p;
+      if (!keep_frozen) r.unfrozen = 1;
+      return sp_box_range(r);
+    }
+    case SP_BUILTIN_FLOAT_RANGE: {
+      sp_FloatRange r = *(sp_FloatRange *)v.v.p;
+      if (!keep_frozen) r.unfrozen = 1;
+      return sp_box_frange(r);
+    }
+    case SP_BUILTIN_STR_RANGE: {
+      sp_StrRange r = *(sp_StrRange *)v.v.p;
+      if (!keep_frozen) r.unfrozen = 1;
+      return sp_box_srange(r);
+    }
+  }
+  return v;
+}
+void sp_range_freeze(sp_RbVal v) {
+  switch (v.cls_id) {
+    case SP_BUILTIN_RANGE: ((sp_Range *)v.v.p)->unfrozen = 0; break;
+    case SP_BUILTIN_FLOAT_RANGE: ((sp_FloatRange *)v.v.p)->unfrozen = 0; break;
+    case SP_BUILTIN_STR_RANGE: ((sp_StrRange *)v.v.p)->unfrozen = 0; break;
+  }
+}
+sp_bool sp_range_frozen(sp_RbVal v) {
+  switch (v.cls_id) {
+    case SP_BUILTIN_RANGE: return !((sp_Range *)v.v.p)->unfrozen;
+    case SP_BUILTIN_FLOAT_RANGE: return !((sp_FloatRange *)v.v.p)->unfrozen;
+    case SP_BUILTIN_STR_RANGE: return !((sp_StrRange *)v.v.p)->unfrozen;
+  }
+  return TRUE;
+}
+
 /* `Range#include?`/`#cover?` on the boxed (SP_TAG_OBJ cls_id
    SP_BUILTIN_RANGE) Range value. The direct sp_Range typed path
    inlines this same check via compile_range_method_expr; poly-recv
@@ -3006,8 +3630,41 @@ sp_bool sp_range_include(sp_Range *r, sp_int x){SP_GC_ROOT(r);
     if (r->last != INTPTR_MAX && (r->excl ? x >= r->last : x > r->last)) return 0;
     return 1;
   }
+  /* a Float end: an Integer is in it when the walk reaches it */
+  if (r->fe) return x >= r->first && (r->excl ? x < r->last : x <= r->last);
   sp_int lo=sp_range_min_v(*r),hi=sp_range_max_v(*r);
   return sp_range_count(*r)>0 && lo<=x && x<=hi;
+}
+/* A Float is compared against the bounds as a Float, never truncated: 2.5 is
+   not in 1..2. The sentinels leave their side open, as in sp_range_include. */
+sp_bool sp_range_cover_f(sp_Range *r, sp_float x){
+  if (x != x) return 0;   /* NaN is in no range */
+  /* an Integer bound against x exactly (#7505): a double past 2^53 rounds */
+  if (r->first!=INTPTR_MIN && sp_int_flt_cmp(r->first, x) > 0) return 0;
+  if (r->fe) return r->fe==2?x<r->fend:x<=r->fend;
+  if (r->last==INTPTR_MAX) return 1;
+  int c = sp_int_flt_cmp(r->last, x);
+  return r->excl ? c > 0 : c >= 0;}
+sp_Range sp_range_new_fend(sp_int f, sp_float e, sp_int x) {
+  sp_Range r = sp_range_new(f, 0, 0);
+  r.fend = e; r.fe = x ? 2 : 1;
+  sp_float fl = floor(e);
+  if (e != e) sp_raise_cls("ArgumentError", "bad value for range");   /* NaN compares with nothing */
+  if (fl >= 9.2e18) { r.last = INTPTR_MAX; return r; }  /* past sp_int: no end to walk to */
+  if (fl <= -9.2e18) { r.last = f - 1; return r; }
+  r.last = (sp_int)fl;
+  if (x && fl == e) r.excl = 1;                         /* 1...3.0 stops before 3 */
+  return r;
+}
+/* Range#max of an Integer range whose end is a Float (and not empty): an
+   excluded Float end has no greatest member, as CRuby says; an included
+   one is the maximum, a Float an Integer slot cannot hold. */
+void sp_range_fend_unsupported(const char *m) {
+  sp_raise_cls("NotImplementedError", sp_sprintf("%s: this Range's end is a Float, which spinel answers here only in Integers", m));
+}
+void sp_range_fend_max_raise(sp_Range r) {
+  if (r.fe == 2) sp_raise_cls("TypeError", "cannot exclude non Integer end value");
+  sp_raise_cls("NotImplementedError", "Range#max: this Range's end is a Float, which spinel reads here as an Integer");
 }
 /* Render a Range for a RangeError message ("-10..1", "1...3", "-10..", "..2"). */
 /* Range#inspect: as #to_s, except that a range with NO bound at either end
@@ -3018,6 +3675,7 @@ const char *sp_range_inspect(sp_Range r) {
   return sp_range_str(r);
 }
 const char *sp_range_str(sp_Range r) {
+  if (r.fe) return sp_sprintf("%lld%s%s", (long long)r.first, r.fe == 2 ? "..." : "..", sp_float_to_s(r.fend));
   const char *dots = r.excl ? "..." : "..";
   if (r.first == INTPTR_MIN && r.last == INTPTR_MAX) return dots;
   if (r.first == INTPTR_MIN) return sp_sprintf("%s%lld", dots, (long long)r.last);
@@ -3070,6 +3728,16 @@ const char *sp_int_codepoint_to_str(sp_int n) {
   sp_str_set_len(s, (size_t)len);  /* byte_len must be the encoded length, not the alloc */
   return s;
 }
+/* The same appended to `recv`: a BINARY receiver takes the Integer as one
+   byte, 0..255, and raises RangeError past it, as CRuby's ASCII-8BIT String
+   does; `"".b << 231` is [231], not the UTF-8 [195, 167] (#5538). */
+const char *sp_int_codepoint_to_str_in(const char *recv, sp_int n) {
+  if (recv && sp_str_is_binary(recv)) {
+    if (n < 0 || n > 255) sp_raise_cls("RangeError", sp_sprintf("%lld out of char range", (long long)n));
+    return sp_bin_char((unsigned char)n);
+  }
+  return sp_int_codepoint_to_str(n);
+}
 /* sp_IntArray lives in sp_array.h (hot core inline) + lib/sp_array.c
    (cold ops). The Integer methods that happen to build an IntArray stay
    here; they call the inline sp_IntArray_new / _push from sp_array.h. */
@@ -3100,7 +3768,13 @@ else{while(u>0){sp_int d=u%base;tmp[i++]=d<10?'0'+d:'a'+d-10;u/=base;}}int j=0;i
    form). Two wrappers keep call-site emit local. */
 const char *sp_int_opt_inspect(sp_int v) { return sp_int_is_nil(v) ? "nil" : sp_int_to_s(v); }
 const char *sp_int_opt_to_s(sp_int v)    { return sp_int_is_nil(v) ? "" : sp_int_to_s(v); }
+SP_NORETURN void sp_raise_nil_int_op(sp_int a, sp_int b, const char *op);
 sp_int sp_int_pow(sp_int base, sp_int exp) {
+  /* A nil operand (the SP_INT_NIL sentinel, INTPTR_MIN) raises as it does for
+     the other operators (SP_INT_NIL_CK, which sp_idiv and sp_imod run): ahead
+     of the exponent's sign, since the sentinel is negative, so `3 ** nil`
+     answered RangeError "negative exponent" and `nil ** 2` an overflow. */
+  if (SP_UNLIKELY(base == SP_INT_NIL || exp == SP_INT_NIL)) sp_raise_nil_int_op(base, exp, "**");
   if (exp < 0) sp_raise_cls("RangeError", "negative exponent");
   /* Exact square-and-multiply (the old pow(double) round-trip lost precision
      above 2^53 and saturated on overflow). Overflow follows the +/-/* mode:
@@ -3128,10 +3802,10 @@ sp_StrArray *sp_argv_array_cache = NULL;
 
 void *sp_main_obj = NULL;
 sp_RbVal sp_main_self(void) {
-  void *m = __atomic_load_n(&sp_main_obj, __ATOMIC_ACQUIRE);
+  void *m = SP_ATOMIC_LOAD(&sp_main_obj, __ATOMIC_ACQUIRE);
   if (!m) {
     void *fresh = sp_gc_alloc(1, NULL, NULL);   /* sizeof(sp_Object) */
-    if (__atomic_compare_exchange_n(&sp_main_obj, &m, fresh, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
+    if (SP_ATOMIC_CAS(&sp_main_obj, &m, fresh, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
       m = fresh;   /* else another thread won; m holds its object */
   }
   return sp_box_obj(m, SP_BUILTIN_OBJECT);
@@ -3208,16 +3882,38 @@ sp_bool sp_argf_eof(void) { return !sp_argf_ensure(); }
 
 /* Float range (1.0..3.0). Endpoints stay sp_float, so cover?/include?/begin/end
    are exact. -HUGE_VAL / +HUGE_VAL are the beginless / endless sentinels. */
+/* A NaN bound compares with nothing, so CRuby refuses a range that has one
+   and another bound to compare it with; a beginless or endless one is kept. */
+static void sp_frange_check(sp_float f, sp_float l, sp_int om) {
+  if (!(om & SP_FRANGE_NO_BEGIN) && !(om & SP_FRANGE_NO_END) && (f != f || l != l))
+    sp_raise_cls("ArgumentError", "bad value for range");
+}
 sp_FloatRange sp_frange_new(sp_float f, sp_float l, sp_int e) {
-  sp_FloatRange r; r.first = f; r.last = l; r.excl = e; r.omitted = 0; return r;
+  sp_frange_check(f, l, 0);
+  sp_FloatRange r; r.first = f; r.last = l; r.excl = e; r.omitted = 0; r.unfrozen = 0; return r;
 }
 /* Same, recording which bound was written as absent rather than infinite. */
 sp_FloatRange sp_frange_new_o(sp_float f, sp_float l, sp_int e, sp_int om) {
-  sp_FloatRange r; r.first = f; r.last = l; r.excl = e; r.omitted = om; return r;
+  sp_frange_check(f, l, om);
+  sp_FloatRange r; r.first = f; r.last = l; r.excl = e; r.omitted = om; r.unfrozen = 0; return r;
 }
 sp_bool sp_frange_cover(sp_FloatRange r, sp_float x) {
+  /* a NaN compares with no bound (Float#<=> answers nil), so CRuby's
+     cover? finds it in no Range, an endless or beginless one included;
+     both tests below are false for it and let it through */
+  if (isnan(x)) return 0;
   if (r.first != -HUGE_VAL && x < r.first) return 0;
   if (r.last != HUGE_VAL && (r.excl ? x >= r.last : x > r.last)) return 0;
+  return 1;
+}
+/* ...and an Integer x, compared with the bounds exactly (#7505): converted to
+   a double first, an Integer past 2^53 rounded onto a bound */
+sp_bool sp_frange_cover_i(sp_FloatRange r, sp_int x) {
+  if (r.first != -HUGE_VAL && sp_int_flt_cmp(x, r.first) < 0) return 0;
+  if (r.last != HUGE_VAL) {
+    int c = sp_int_flt_cmp(x, r.last);
+    if (r.excl ? c >= 0 : c > 0) return 0;
+  }
   return 1;
 }
 sp_bool sp_frange_eq(sp_FloatRange a, sp_FloatRange b) {
@@ -3245,17 +3941,36 @@ sp_float sp_frange_max(sp_FloatRange r) {
 }
 /* String range ("a".."e"). The endpoints are the value; every traversal
    materializes the element array, which is how a string range behaved before
-   it became a value of its own (#3064). */
+   it became a value of its own (#3064). A NULL endpoint is a nil bound: the
+   range is beginless or endless. */
 sp_StrRange sp_srange_new(const char *f, const char *l, sp_int e) {
-  sp_StrRange r; r.first = f; r.last = l; r.excl = e; return r;
+  sp_StrRange r; r.first = f; r.last = l; r.excl = e; r.unfrozen = 0; return r;
 }
 sp_StrArray *sp_srange_to_a(sp_StrRange r) {
-  return sp_StrArray_from_string_range(r.first ? r.first : sp_str_empty,
-                                       r.last ? r.last : sp_str_empty, r.excl);
+  if (!r.first) sp_raise_cls("TypeError", "can't iterate from NilClass");
+  if (!r.last) sp_raise_cls("RangeError", "cannot convert endless range to an array");
+  return sp_StrArray_from_string_range(r.first, r.last, r.excl);
 }
 sp_bool sp_srange_eq(sp_StrRange a, sp_StrRange b) {
-  return a.excl == b.excl && sp_str_eq(a.first ? a.first : sp_str_empty, b.first ? b.first : sp_str_empty) &&
-         sp_str_eq(a.last ? a.last : sp_str_empty, b.last ? b.last : sp_str_empty);
+  return a.excl == b.excl && sp_str_eq(a.first, b.first) && sp_str_eq(a.last, b.last);
+}
+/* #include? / #member?: whether the walk String#upto takes meets x, as
+   CRuby's rb_str_include_range_p, stopping at the first equal member;
+   CRuby refuses to answer for a beginless or endless range. */
+static int sp_srange_include_i(const char *m, void *arg) {
+  const char **v = (const char **)arg;
+  if (!sp_str_eq(m, *v)) return 0;
+  *v = NULL;
+  return 1;
+}
+sp_bool sp_srange_include(sp_StrRange r, const char *x) {
+  if (!r.first || !r.last)
+    sp_raise_cls("TypeError", "cannot determine inclusion in beginless/endless ranges");
+  if (!x) return 0;
+  const char *v = x;
+  SP_GC_ROOT_STR(v);
+  sp_str_upto_each(r.first, r.last, r.excl, sp_srange_include_i, &v);
+  return v == NULL;
 }
 /* #cover? / #=== compare lexicographically, no materialization. */
 sp_bool sp_srange_cover(sp_StrRange r, const char *x) {
@@ -3264,17 +3979,61 @@ sp_bool sp_srange_cover(sp_StrRange r, const char *x) {
   if (r.last) { int d = strcmp(x, r.last); if (r.excl ? d >= 0 : d > 0) return 0; }
   return 1;
 }
+/* #min / #max with no block, as CRuby's range_min / range_max: an open
+   side raises, an empty range (the begin past the end, or at it with the
+   end excluded) is nil, and an excluded end walks the members for the
+   least or greatest, since a String end cannot be stepped back from. NULL
+   is nil. */
+static const char *sp_srange_walk_extreme(sp_StrRange r, int greatest) {
+  sp_StrArray *a = sp_srange_to_a(r); SP_GC_ROOT(a);
+  const char *best = NULL; SP_GC_ROOT_STR(best);
+  for (sp_int i = 0; i < sp_StrArray_length(a); i++) {
+    const char *s = sp_StrArray_get(a, i);
+    if (!best || (greatest ? strcmp(s, best) > 0 : strcmp(s, best) < 0)) best = s;
+  }
+  return best;
+}
+const char *sp_srange_min_v(sp_StrRange r) {
+  if (!r.first) sp_raise_cls("RangeError", "cannot get the minimum of beginless range");
+  if (r.excl) {
+    if (!r.last) sp_raise_cls("RangeError", "cannot get the minimum of endless range with custom comparison method");
+    return sp_srange_walk_extreme(r, 0);
+  }
+  if (r.last && strcmp(r.first, r.last) > 0) return NULL;
+  return r.first;
+}
+const char *sp_srange_max_v(sp_StrRange r) {
+  if (!r.last) sp_raise_cls("RangeError", "cannot get the maximum of endless range");
+  if (r.excl) {
+    if (!r.first) sp_raise_cls("RangeError", "cannot get the maximum of beginless range with custom comparison method");
+    return sp_srange_walk_extreme(r, 1);
+  }
+  if (r.first && strcmp(r.first, r.last) > 0) return NULL;
+  return r.last;
+}
 const char *sp_srange_to_s(sp_StrRange r) {
   return sp_sprintf("%s%s%s", r.first ? r.first : sp_str_empty,
                     r.excl ? "..." : "..", r.last ? r.last : sp_str_empty);
 }
 const char *sp_srange_inspect(sp_StrRange r) {
-  const char *lo = sp_str_inspect(r.first ? r.first : sp_str_empty);
-  const char *hi = sp_str_inspect(r.last ? r.last : sp_str_empty);
+  const char *lo = r.first ? sp_str_inspect(r.first) : sp_str_empty;
+  const char *hi = r.last ? sp_str_inspect(r.last) : sp_str_empty;
   return sp_sprintf("%s%s%s", lo, r.excl ? "..." : "..", hi);
 }
+/* A boxed String range holds its two endpoint strings: the box marks them,
+   and they are rooted while it is allocated. With no scanner the endpoints
+   were swept under a live range, and a `("a1".."z1")` read back as
+   `"".."t1"` once a collection had reused them (kw_splat_struct_data_arg_order
+   on the 32-bit target). */
+static void sp_srange_scan(void *p) {
+  sp_StrRange *r = (sp_StrRange *)p;
+  if (r->first) sp_mark_string(r->first);
+  if (r->last) sp_mark_string(r->last);
+}
 sp_RbVal sp_box_srange(sp_StrRange v) {
-  sp_StrRange *p = (sp_StrRange *)sp_gc_alloc(sizeof(sp_StrRange), NULL, NULL);
+  const char *f = v.first, *l = v.last;
+  SP_GC_ROOT_STR(f); SP_GC_ROOT_STR(l);
+  sp_StrRange *p = (sp_StrRange *)sp_gc_alloc(sizeof(sp_StrRange), NULL, sp_srange_scan);
   *p = v;
   return sp_box_obj(p, SP_BUILTIN_STR_RANGE);
 }
@@ -3302,7 +4061,7 @@ sp_RbVal sp_float_numerator(sp_float f) {
 /* Float#to_i whose integer value escapes int64: CRuby promotes to Bignum;
    until the promotion plan covers statically-int results (#2024), raise
    loudly instead of saturating silently. NaN/Inf raise FloatDomainError. */
-sp_int sp_float_to_i_checked(sp_float f) {
+sp_int sp_float_to_i_checked_slow(sp_float f) {
   if (isnan(f) || isinf(f)) sp_raise_cls("FloatDomainError", sp_sprintf("%g", f));
   if (f >= -(sp_float)INTPTR_MIN || f < (sp_float)INTPTR_MIN)  /* exact at either sp_int width */
     sp_raise_cls("RangeError", "float out of Integer range (Bignum promotion pending)");
@@ -3352,6 +4111,41 @@ sp_RbVal sp_box_i64(int64_t v) {
   return sp_box_bigint(sp_bigint_new_int(v));
 }
 sp_RbVal sp_box_encoding(sp_Encoding e) { sp_RbVal r; r.tag = SP_TAG_ENCODING; r.cls_id = 0; r.v.s = sp_encoding_name(e); return r; }
+/* Encoding.find(name) with a name known at run time: an Encoding answers
+   itself, a name or alias the encoding it names (case-insensitively, as
+   CRuby), "external" / "locale" / "filesystem" UTF-8 and "internal" nil;
+   anything else is CRuby's ArgumentError. */
+static const char *const sp_encoding_names[][2] = {
+#include "sp_encoding_names.h"
+  { NULL, NULL } };
+sp_RbVal sp_encoding_find(sp_RbVal v) {
+  if (v.tag == SP_TAG_ENCODING) return v;
+  if (v.tag != SP_TAG_STR) {
+    const char *cn = v.tag == SP_TAG_NIL ? "nil" : v.tag == SP_TAG_INT ? "Integer"
+                   : v.tag == SP_TAG_FLT ? "Float" : v.tag == SP_TAG_SYM ? "Symbol"
+                   : v.tag == SP_TAG_BOOL ? (v.v.b ? "true" : "false") : "Object";
+    sp_raise_cls("TypeError", sp_sprintf("no implicit conversion of %s into String", cn));
+  }
+  const char *n = v.v.s;
+  if (!strcasecmp(n, "external") || !strcasecmp(n, "locale") || !strcasecmp(n, "filesystem"))
+    return sp_box_encoding((sp_Encoding){ "UTF-8" });
+  if (!strcasecmp(n, "internal")) return sp_box_nil();
+  for (int i = 0; sp_encoding_names[i][0]; i++)
+    if (!strcasecmp(n, sp_encoding_names[i][0])) return sp_box_encoding((sp_Encoding){ sp_encoding_names[i][1] });
+  sp_raise_cls("ArgumentError", sp_sprintf("unknown encoding name - %s", n));
+  return sp_box_nil();
+}
+/* force_encoding with an Encoding or a name known only at run time: 1 for
+   ASCII-8BIT, 0 for UTF-8 or US-ASCII, -1 for an encoding spinel has no tag
+   for. A bad argument raises as CRuby's does. */
+int sp_force_encoding_mode(sp_RbVal enc) {
+  sp_RbVal e = sp_encoding_find(enc);
+  const char *n = e.tag == SP_TAG_ENCODING ? e.v.s : NULL;
+  if (!n) return -1;
+  if (!strcmp(n, "ASCII-8BIT")) return 1;
+  if (!strcmp(n, "UTF-8") || !strcmp(n, "US-ASCII")) return 0;
+  return -1;
+}
 sp_RbVal sp_box_nullable_str(const char *v) { return v ? sp_box_str(v) : sp_box_nil(); }
 /* An opaque foreign/FFI pointer: boxed with SP_BUILTIN_FOREIGN_PTR so the
    collector skips it (it is not a sp_gc_alloc allocation). NULL -> nil. */
@@ -3434,18 +4228,21 @@ sp_bool sp_str_re_match_p_at(mrb_regexp_pattern *pat, const char *str, sp_int cp
   if (cpos < 0) cpos += cl;
   if (cpos < 0 || cpos > cl) return FALSE;
   size_t boff = sp_utf8_byte_offset(str, cpos);
-  int64_t slen = (int64_t)strlen(str);
+  /* the subject's own length and mode, as sp_re_match_p reads them: strlen
+     stopped at an embedded NUL, and a binary subject matched as UTF-8 */
+  int64_t slen = (int64_t)sp_str_byte_len(str);
   int caps[2];
-  return re_exec(pat, str, slen, (sp_int)boff, caps, 2, 0) > 0;
+  return re_exec(pat, str, slen, (sp_int)boff, caps, 2, sp_str_is_binary(str)) > 0;
 }
 /* Issue #910: sub(string, hash) -- literal-substring pattern
    with a hash replacement. Replaces only the first match. */
 const char *sp_str_sub_str_str_hash(const char *str, const char *pat, sp_StrStrHash *h) {SP_GC_ROOT_STR(pat);SP_GC_ROOT(h);SP_GC_ROOT_STR(str);
   if (!str || !pat) return str;
   const char *found = strstr(str, pat);
-  if (!found) return str;
+  if (!found) { if (sp_re_track_last) sp_re_clear_last_match(); return str; }
   size_t before = (size_t)(found - str);
   size_t plen = strlen(pat);
+  if (sp_re_track_last) sp_re_set_lit_match(str, (sp_int)before, (sp_int)(before + plen));
   const char *rep = (h && sp_StrStrHash_has_key(h, pat)) ? sp_StrStrHash_get(h, pat) : "";
   size_t rlen = strlen(rep);
   size_t rest = strlen(str) - before - plen;
@@ -3455,6 +4252,45 @@ const char *sp_str_sub_str_str_hash(const char *str, const char *pat, sp_StrStrH
   memcpy(out + before, rep, rlen);
   memcpy(out + before + rlen, found + plen, rest);
   out[total] = 0;
+  return out;
+}
+/* gsub(string, hash): every occurrence of the literal pattern replaced by
+   the hash's value for it ("" when absent or nil), $~ the last occurrence.
+   An empty pattern matches at every character boundary -- every byte of a
+   binary String -- as CRuby's does. */
+const char *sp_str_gsub_str_str_hash(const char *str, const char *pat, sp_StrStrHash *h) {SP_GC_ROOT_STR(pat);SP_GC_ROOT(h);SP_GC_ROOT_STR(str);
+  if (!str || !pat) return str;
+  size_t slen = strlen(str), plen = strlen(pat);
+  const char *rep = (h && sp_StrStrHash_has_key(h, pat)) ? sp_StrStrHash_get(h, pat) : "";
+  if (!rep) rep = "";
+  SP_GC_ROOT_STR(rep);
+  size_t rlen = strlen(rep), n = 0;
+  int bin = sp_str_is_binary(str);
+  if (plen == 0) { for (size_t i = 0; i < slen; i++) if (bin || ((unsigned char)str[i] & 0xC0) != 0x80) n++; n++; }
+  else for (const char *q = strstr(str, pat); q; q = strstr(q + plen, pat)) n++;
+  if (n == 0) { if (sp_re_track_last) sp_re_clear_last_match(); return str; }
+  size_t total = slen + n * rlen - (plen ? n * plen : 0);
+  char *out = sp_str_alloc_raw(total + 1);
+  size_t o = 0, last = 0;
+  if (plen == 0) {
+    for (size_t i = 0; i < slen; i++) {
+      if (bin || ((unsigned char)str[i] & 0xC0) != 0x80) { memcpy(out + o, rep, rlen); o += rlen; last = i; }
+      out[o++] = str[i];
+    }
+    memcpy(out + o, rep, rlen); o += rlen; last = slen;
+  }
+  else {
+    const char *p = str;
+    for (const char *q = strstr(p, pat); q; q = strstr(p, pat)) {
+      memcpy(out + o, p, (size_t)(q - p)); o += (size_t)(q - p);
+      memcpy(out + o, rep, rlen); o += rlen;
+      last = (size_t)(q - str);
+      p = q + plen;
+    }
+    memcpy(out + o, p, slen - (size_t)(p - str)); o += slen - (size_t)(p - str);
+  }
+  out[o] = 0;
+  if (sp_re_track_last) sp_re_set_lit_match(str, (sp_int)last, (sp_int)(last + plen));
   return out;
 }
 /* Array#sum with a String initial value: concatenation fold ("abc" from
@@ -3873,6 +4709,16 @@ void sp_sleep(sp_float s) {
 #endif
 }
 
+/* A bare Kernel#sleep: until Thread#wakeup. With no threads nothing can
+   wake it, so it sleeps for good, as CRuby's does. */
+void sp_sleep_forever(void) {
+#ifdef SP_THREADS
+  sp_sched_sleep_forever();
+#else
+  for (;;) pause();
+#endif
+}
+
 /* ---- BigRational box/scan/format ops -- relocated from spinel_rt.h.
    0 optcarrot uses. ---- */
 #include "sp_str.h"   /* sp_str_concat for brat_to_s/inspect */
@@ -4042,10 +4888,15 @@ const char *sp_re_gsub_str_str_hash(mrb_regexp_pattern *pat, const char *str, sp
   char out_sb[512];
   size_t cap = (slen * 2) + 64; char *out = cap <= sizeof out_sb ? out_sb : (char *)malloc(cap); size_t olen = 0;
   int64_t pos = 0; int caps[64];
-  #define GSH_GROW(need) do { size_t _nc = (need); if (out == out_sb) { char *_o = (char *)malloc(_nc); memcpy(_o, out, olen); out = _o; } else out = (char *)realloc(out, _nc); cap = _nc; } while (0)
+  int lastcaps[64], lastn = 0;   /* the last match, for `$~` */
+  #define GSH_GROW(need) do { size_t _nc = (need); \
+    if (out == out_sb) { char *_o = (char *)malloc(_nc); memcpy(_o, out, olen); out = _o; } \
+    else out = (char *)realloc(out, _nc); \
+    cap = _nc; } while (0)
   while (pos <= slen) {
     int n = re_exec(pat, str, slen, pos, caps, 64, 0);
     if (n <= 0 || caps[0] < 0) break;
+    if (sp_re_track_last) { lastn = n > 64 ? 64 : n; memcpy(lastcaps, caps, sizeof(int) * (size_t)lastn); }
     size_t before = caps[0] - pos;
     int mlen = caps[1] - caps[0];
     /* Lay a 0xff (rodata-literal) marker byte right before the transient key
@@ -4086,6 +4937,7 @@ else {
     memcpy(out + olen, str + pos, rest); olen += rest;
   }
   #undef GSH_GROW
+  if (sp_re_track_last) sp_re_set_last_match(pat, str, lastcaps, lastn);
   char *res = sp_str_alloc(olen);
   memcpy(res, out, olen);
   if (out != out_sb) free(out);
@@ -4097,7 +4949,7 @@ const char *sp_re_sub_str_str_hash(mrb_regexp_pattern *pat, const char *str, sp_
   int64_t slen = (int64_t)strlen(str);
   int caps[64];
   int n = re_exec(pat, str, slen, 0, caps, 64, 0);
-  if (n <= 0 || caps[0] < 0) return str;
+  if (n <= 0 || caps[0] < 0) { if (sp_re_track_last) sp_re_clear_last_match(); return str; }
   int mlen = caps[1] - caps[0];
   /* 0xff marker before the transient key: keeps sp_str_hash's s[-1] read
      in-bounds and on the non-caching path (no sp_str_hdr behind this buffer). */
@@ -4114,6 +4966,7 @@ const char *sp_re_sub_str_str_hash(mrb_regexp_pattern *pat, const char *str, sp_
   size_t rlen = strlen(rep);
   size_t rest = slen - caps[1];
   size_t total = caps[0] + rlen + rest;
+  if (sp_re_track_last) sp_re_set_last_match(pat, str, caps, n);
   char *out = sp_str_alloc_raw(total + 1);
   memcpy(out, str, caps[0]);
   memcpy(out + caps[0], rep, rlen);
@@ -4137,6 +4990,16 @@ sp_Exception *sp_signal_exc_new_m(sp_RbVal sig, const char *msg) {SP_GC_ROOT_RBV
 }
 sp_Exception *sp_signal_exc_new(sp_RbVal sig) {SP_GC_ROOT_RBVAL(sig);
   return sp_signal_exc_new_m(sig, NULL);
+}
+/* An exception nothing rescued that is a signal's: the process ends by that
+   signal, as CRuby's does, so its parent reads 130 for an Interrupt. */
+void sp_exc_resignal(const char *cls, const char *msg) {
+  int no = !strcmp(cls, "Interrupt") ? SIGINT
+         : (!strcmp(cls, "SignalException") && msg && !strcmp(msg, "SIGTERM")) ? SIGTERM : 0;
+  if (!no) return;
+  fflush(NULL);   /* the buffered output exit() would have written */
+  signal(no, SIG_DFL);
+  raise(no);
 }
 sp_Exception *sp_interrupt_new(const char *msg) {SP_GC_ROOT_STR(msg);
   sp_Exception *e = sp_exc_new("Interrupt", (msg && msg[0]) ? msg : "Interrupt");
@@ -4235,10 +5098,21 @@ SP_NORETURN void sp_raise_nil_cmp(int left_nil, const char *op, const char *cls)
 
 /* A nil that reached a strict Integer argument slot through an `Integer?`
    variable. The literal `s[nil]` already raised this from the emitter; the
-   slot's nil is the same nil, so it gets the same message (#4896). */
+   slot's nil is the same nil, so it gets the same message (#4896). CRuby
+   words it by the conversion the slot makes: 0 rb_num2long's, 1
+   rb_convert_type's (and NUM2SIZET's), 2 NUM2OFFT's, an IO offset (rb_num2long's wording where off_t is a long, rb_num2ll's
+   where it is wider: a 32-bit build, macOS). */
 SP_NORETURN void sp_raise_nil_to_int(int of_wording) {
-  sp_raise_cls("TypeError", of_wording ? "no implicit conversion of nil into Integer"
-                                       : "no implicit conversion from nil to integer");
+  sp_raise_cls("TypeError", of_wording == 2 ? (sizeof(off_t) == sizeof(long) ? "no implicit conversion from nil to integer"
+                                                                              : "no implicit conversion from nil")
+                            : of_wording ? "no implicit conversion of nil into Integer"
+                                         : "no implicit conversion from nil to integer");
+}
+
+/* A real -2^63 headed for a slot that can also hold nil: the slot's nil is
+   that very word (SP_INT_NIL), so the store would read back as nil. */
+SP_NORETURN void sp_raise_int_min_slot(void) {
+  sp_raise_cls("RangeError", "integer -9223372036854775808 collides with the nil of a nullable Integer slot");
 }
 
 SP_NORETURN void sp_raise_nil_float_op(int left_nil, const char *op) {SP_GC_ROOT_STR(op);
@@ -4285,12 +5159,13 @@ const char *sp_str_encode(const char *s, sp_RbVal dst, sp_RbVal src,
   if (!s) sp_nil_recv("encode");
   int from = sp_enc_kind(src, sp_str_is_binary(s) ? 2 : 1);
   int to = sp_enc_kind(dst, 1);
-  if (!from || !to) return s;
+  /* encode answers a new String even where nothing changes, as CRuby's */
+  if (!from || !to) return sp_str_dup(s);
   const char *repl = (replace.tag == SP_TAG_STR && replace.v.s) ? replace.v.s : NULL;
   SP_GC_ROOT_STR(repl);
   if (from == to) {
-    if (from == 1 && sp_enc_kw_replace(invalid)) return sp_str_scrub(s, repl);
-    return s;
+    if (from == 1 && sp_enc_kw_replace(invalid)) return sp_str_scrub_utf8(s, repl);
+    return sp_str_dup(s);
   }
   /* binary <-> UTF-8: the ASCII bytes carry over, nothing else does */
   size_t bl = sp_str_byte_len(s);

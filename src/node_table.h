@@ -111,6 +111,7 @@ typedef struct {
   X(FalseNode) \
   X(FloatNode) \
   X(ForNode) \
+  X(ForwardingArgumentsNode) \
   X(ForwardingSuperNode) \
   X(GlobalVariableAndWriteNode) \
   X(GlobalVariableOperatorWriteNode) \
@@ -273,6 +274,9 @@ void nt_free(NodeTable *nt);
    Appends nodes and grows nt->count -- parallel per-node arrays must be
    resized to match afterward. */
 int nt_clone_subtree(NodeTable *nt, int root);
+void nt_swap_nodes(NodeTable *nt, int a, int b);
+/* Copy the subtree at root of src into dst; the new root's id, or -1. */
+int nt_import_subtree(NodeTable *dst, const NodeTable *src, int root);
 /* Are a call's arguments all positional -- no splat, no block argument? (A
    braceless trailing hash is one positional argument to the builtin surface.)
    The face table's rows describe positional calls, and the two halves that
@@ -292,6 +296,7 @@ void nt_node_set_str(NodeTable *nt, int id, const char *key, const char *val);
 void nt_node_set_int(NodeTable *nt, int id, const char *key, long long val);
 void nt_node_set_ref(NodeTable *nt, int id, const char *key, int child);
 void nt_node_set_arr(NodeTable *nt, int id, const char *key, const int *ids, int n);
+int  nt_new_int(NodeTable *nt, long long v);                     /* a new IntegerNode */
 
 /* Accessors. id must be in [0, nt->count). Out-of-range ids return the
    given defaults so callers can walk freely without bounds checks. */
@@ -351,7 +356,7 @@ static inline const int *nt_arr(const NodeTable *nt, int id, const char *key, in
     }
   return NULL;
 }
-const char *nt_content(const NodeTable *nt, int id);       /* NULL */
+const char *nt_content(const NodeTable *nt, int id);
 
 /* Generic child iteration (for structural walks that don't know field
    names). Ref fields and array-field elements are the node's children. */

@@ -20,7 +20,7 @@
 #include <stdio.h>      /* snprintf for the int/float formatters below */
 #include <math.h>       /* HUGE_VAL / signbit for sp_float_to_s */
 
-const char *sp_sprintf(const char *fmt, ...) __attribute__((format(printf, 1, 2)));  /* defined in the generated TU */
+const char *sp_sprintf(const char *fmt, ...) SP_PRINTF_FORMAT(1, 2);  /* defined in the generated TU */
 
 /* Global heap lock (Phase 1, design 6.1). Under SP_THREADS one mutex serializes
    the object- and string-heap mutations -- the trigger+collect, the calloc/
@@ -119,6 +119,44 @@ void sp_alloc_worker_tune(int workers); /* size the collection budget for N work
 
 extern const char sp_str_empty_data[];
 #define sp_str_empty (sp_str_empty_data + 1)
+/* nil.to_s / true.to_s / false.to_s: frozen, as in CRuby (lib/sp_alloc.c) */
+extern const char *const sp_str_frozen_empty;
+extern const char *const sp_str_frozen_true;
+extern const char *const sp_str_frozen_false;
+/* A chilled String is what CRuby's Symbol#to_s answers: not frozen (frozen?
+   is false, and a mutation goes through), but +@ copies it as it copies a
+   frozen one. Spinel keeps one per symbol (sp_sym_to_s_chilled): static
+   storage with a header, the 0xfb marker, whose `next` link names
+   sp_str_chilled_tag. A static string is on no sweep list, so the link is
+   free to carry the mark, and no marker test -- the collector's included --
+   has to learn a new byte. The symbol rides ahead of the header, so a String
+   handle made from one can name it (sp_String.chilled). */
+extern const sp_str_hdr sp_str_chilled_tag;
+typedef struct { sp_int sym; sp_str_hdr h; unsigned char m; char d[]; } sp_str_chilled_obj;
+static inline int sp_str_is_chilled(const char *s) {
+  return s && ((const unsigned char *)s)[-1] == 0xfb &&
+         (((const sp_str_hdr *)(s - 1)) - 1)->next == &sp_str_chilled_tag;
+}
+static inline sp_int sp_str_chilled_sym(const char *s) {
+  return ((const sp_str_chilled_obj *)(s - offsetof(sp_str_chilled_obj, d)))->sym;
+}
+/* a nullable string (NULL) as the empty string, the standard C spelling of
+   GNU's `s ?: sp_str_empty` */
+static inline const char *sp_str_or_empty(const char *s) { return s ? s : sp_str_empty; }
+
+#if defined(_WIN32)
+/* The length of a path's root on Windows, 0 for a relative path: "/", or a
+   drive's "C:/" (or "C:\\"), the root CRuby there answers paths under. The
+   lexical path helpers (File.expand_path, Dir.glob, File.absolute_path?,
+   File.dirname, the tmpdir package) keep a root as it is and work on what
+   follows; on POSIX they test for "/" as they always have. */
+static inline size_t sp_file_path_root_len(const char *p) {
+  if (!p) return 0;
+  if (((p[0] >= 'A' && p[0] <= 'Z') || (p[0] >= 'a' && p[0] <= 'z')) && p[1] == ':' && (p[2] == '/' || p[2] == '\\'))
+    return 3;
+  return p[0] == '/' ? 1 : 0;
+}
+#endif
 
 /* UTF-8 char-length cache. Shared (extern) so sp_str_sweep flushes the same
    table the length helpers in spinel_rt.h populate: a per-TU split would leave
@@ -159,7 +197,7 @@ static inline unsigned sp_str_lcache_slot(const char *s) {
    0xff is kept by not being added anywhere. */
 static inline int sp_str_has_hdr(const char *s) {
   unsigned char m = ((const unsigned char *)s)[-1];
-  return m == 0xfe || m == 0xfc || m == 0xfd || m == 0xf1 || m == 0xfb;
+  return m == 0xfe || m == 0xfc || m == 0xfd || m == 0xf1 || m == 0xfb || m == 0xfa || m == 0xf8;
 }
 /* "Every byte of this string is below 0x80", verified once and remembered.
    A 7-bit string indexes at fixed width, so #length is its byte length and
@@ -347,9 +385,37 @@ static inline char *sp_str_alloc_nogc(size_t len) {
 /* Copy a message onto the string heap so it can be held by a string root.
    The source is a bare literal (every raise the runtime and the generated
    code issue passes one) or an unrooted heap string; neither can be rooted
-   across an allocation, so the copy runs with no collection in between. */
+   across an allocation, so the copy runs with no collection in between.
+   The length is strlen's, not sp_str_byte_len's: a bare literal or a static
+   buffer (Process.spawn's sp_err_buf) has no header, and sp_str_byte_len reads
+   the byte before it for one, which for some neighbouring byte looks like a
+   header's marker and answers a made-up length (#7556 did, and a copied
+   message gained NUL bytes in some builds). */
+/* A "counted" message: a raise message that is a Spinel String with a NUL inside it
+   (sp_exc_msg_given builds it, #7556). The one place a message's length survives the
+   const char * the exception path carries it as, and only for a message the generated
+   code gave: it starts with six bytes no C string of ours starts with (a raw buffer's
+   neighbour bytes are never read; these are compared from the pointer on, stopping
+   at the first mismatch, and a NUL ends any shorter string), then the payload's
+   length, then the payload. A bare C string, whose length is strlen's, never matches.
+   The sixth byte is 0x02 for a frozen String's message (a literal's), so the
+   exception's copy is frozen too and `e.message << x` raises FrozenError, as
+   CRuby's message is the literal itself (sp_cmsg_frozen). */
+#define SP_CMSG_HDR 10
+static inline int sp_cmsg_p(const char *m) {
+  return m && (unsigned char)m[0] == 0xff && (unsigned char)m[1] == 0xfe && m[2] == 'C' &&
+         m[3] == 'M' && (unsigned char)m[4] == 0xfd && ((unsigned char)m[5] == 0x01 || (unsigned char)m[5] == 0x02);
+}
+static inline int sp_cmsg_frozen(const char *m) { return (unsigned char)m[5] == 0x02; }
+static inline size_t sp_cmsg_len(const char *m) { uint32_t n; memcpy(&n, m + 6, sizeof n); return n; }
 static inline const char *sp_msg_heapify(const char *m) {
   if (!m) return NULL;
+  if (sp_cmsg_p(m)) {   /* stays counted: a later stage decodes it */
+    size_t total = SP_CMSG_HDR + sp_cmsg_len(m);
+    char *c = sp_str_alloc_nogc(total);
+    memcpy(c, m, total);
+    return c;
+  }
   size_t n = strlen(m);
   char *r = sp_str_alloc_nogc(n);
   memcpy(r, m, n);
@@ -385,7 +451,7 @@ static inline void sp_str_mark_binary(char *s) {
 static inline int sp_str_fixed_width(const char *s, size_t *out) {
   if (!s) { *out = 0; return 0; }
   unsigned char m = ((const unsigned char *)s)[-1];
-  if (m == 0xfe || m == 0xfc || m == 0xfd || m == 0xf1 || m == 0xfb) {
+  if (m == 0xfe || m == 0xfc || m == 0xfd || m == 0xf1 || m == 0xfb || m == 0xfa || m == 0xf8) {
     const sp_str_hdr *h = ((const sp_str_hdr *)(s - 1)) - 1;
     if (h->len != SP_STR_LEN_UNSET &&
         (h->size & (SP_STR_SIZE_BINARY | SP_STR_SIZE_ASCII7))) { *out = h->len; return 1; }
@@ -418,7 +484,7 @@ static inline size_t sp_str_byte_len(const char *s) {
   /* 0xf1 (frozen heap string / frozen literal) also carries a real sp_str_hdr
      whose len is the true byte length, so an embedded NUL survives freezing
      (#2462 dedup, .freeze). */
-  if (marker == 0xfe || marker == 0xfc || marker == 0xfd || marker == 0xf1 || marker == 0xfb) {
+  if (marker == 0xfe || marker == 0xfc || marker == 0xfd || marker == 0xf1 || marker == 0xfb || marker == 0xfa || marker == 0xf8) {
     uint32_t l = (((const sp_str_hdr *)(s - 1)) - 1)->len;
     if (l != SP_STR_LEN_UNSET) return l;
   }
@@ -428,7 +494,7 @@ static inline size_t sp_str_byte_len(const char *s) {
 static inline void sp_str_set_len(char *s, size_t len) {
   if (!s) return;
   unsigned char marker = ((unsigned char *)s)[-1];
-  if (marker == 0xfe || marker == 0xfc || marker == 0xfd || marker == 0xf1 || marker == 0xfb) {
+  if (marker == 0xfe || marker == 0xfc || marker == 0xfd || marker == 0xf1 || marker == 0xfb || marker == 0xfa || marker == 0xf8) {
     sp_str_hdr *hd = ((sp_str_hdr *)(s - 1)) - 1;
     hd->len = (uint32_t)len;
     hd->hash = 0;  /* length change implies content change: invalidate cached hash */
@@ -485,14 +551,49 @@ static inline const char *sp_str_dup_external(const char *s) {
    pre-evaluated dynamic parts, so one sp_str_alloc_raw serves the whole
    string (previously: one heap string per part + an sp_sprintf pass). */
 #define SP_W_INT_MAX 21  /* -9223372036854775808 */
+/* Decimal digits of u, counted up front so the digits can be written in place
+   at their final position -- no scratch buffer and no second copy. */
+static inline int sp_u64_ndigits(uint64_t u) {
+  int d = 1;
+  for (;;) {
+    if (u < 10) return d;
+    if (u < 100) return d + 1;
+    if (u < 1000) return d + 2;
+    if (u < 10000) return d + 3;
+    u /= 10000; d += 4;
+  }
+}
+/* Write u's digits so the last one lands just before `end`, two at a time from
+   a pair table: half the divisions of the digit-at-a-time loop. */
+static inline void sp_u64_write_back(char *end, uint64_t u) {
+  static const char d2[] =
+    "00010203040506070809101112131415161718192021222324252627282930313233343536373839"
+    "40414243444546474849505152535455565758596061626364656667686970717273747576777879"
+    "8081828384858687888990919293949596979899";
+  while (u >= 100) {
+    unsigned r = (unsigned)(u % 100); u /= 100;
+    end -= 2; end[0] = d2[2 * r]; end[1] = d2[2 * r + 1];
+  }
+  if (u >= 10) { end -= 2; end[0] = d2[2 * u]; end[1] = d2[2 * u + 1]; }
+  else *--end = (char)('0' + u);
+}
+/* An Integer the program knows is never the nil sentinel (the analysis says
+   no nil reaches it): INTPTR_MIN is that number here, not "" (#7612). */
+static inline char *sp_w_int_plain(char *p, sp_int n) {
+  uint64_t u;
+  if (n < 0) { *p++ = '-'; u = (uint64_t)(-(n + 1)) + 1; }
+  else u = (uint64_t)n;
+  p += sp_u64_ndigits(u);
+  sp_u64_write_back(p, u);
+  return p;
+}
 static inline char *sp_w_int(char *p, sp_int n) {
   if (n == SP_INT_NIL) return p;  /* a nil int slot interpolates as "" */
   uint64_t u;
   if (n < 0) { *p++ = '-'; u = (uint64_t)(-(n + 1)) + 1; }
   else u = (uint64_t)n;
-  char tmp[SP_W_INT_MAX]; int i = 0;
-  do { tmp[i++] = (char)('0' + (u % 10)); u /= 10; } while (u > 0);
-  while (i > 0) *p++ = tmp[--i];
+  p += sp_u64_ndigits(u);
+  sp_u64_write_back(p, u);
   return p;
 }
 /* NOTE: s must be a marked spinel string (heap or codegen literal) --
@@ -518,22 +619,18 @@ static inline char *sp_w_bool(char *p, sp_bool v) {
    fixed 32, which is less string-heap pressure per call and so fewer
    collections. */
 static inline const char *sp_int_to_s(sp_int n) {
-  char tmp[24];   /* -9223372036854775808 is 20 characters */
-  int i = (int)sizeof tmp;
   uint64_t u;
   /* negate in unsigned space: -INT64_MIN does not fit in sp_int */
   if (n < 0) u = (uint64_t)(-(n + 1)) + 1; else u = (uint64_t)n;
-  do { tmp[--i] = (char)('0' + (int)(u % 10)); u /= 10; } while (u);
-  if (n < 0) tmp[--i] = '-';
-  size_t len = sizeof tmp - (size_t)i;
-  char *b = sp_str_alloc_raw(len + 1);
-  memcpy(b, tmp + i, len);
-  b[len] = 0;
-  sp_str_set_len(b, len);
-  /* digits and the sign are 7-bit by construction, and set_len clears the
-     flag, so re-assert it: the length and index paths then answer without
-     scanning. */
-  sp_str_mark_ascii7(b);
+  size_t len = (size_t)sp_u64_ndigits(u) + (n < 0);
+  /* sp_str_alloc records the exact length and terminates it, so the digits go
+     straight into the result. */
+  char *b = sp_str_alloc(len);
+  sp_u64_write_back(b + len, u);
+  if (n < 0) b[0] = '-';
+  /* digits and the sign are 7-bit by construction: the length and index paths
+     then answer without scanning. The header is a fresh heap one. */
+  (((sp_str_hdr *)(b - 1)) - 1)->size |= SP_STR_SIZE_ASCII7;
   return b;
 }
 /* Float#to_s (Ruby semantics): the shortest decimal that round-trips, fixed
@@ -634,6 +731,10 @@ void *sp_pl_realloc(void *p, size_t newn);   /* lib/sp_slab.c: a slab block know
                                            that asserts every id is distinct will
                                            flag any future collision at compile
                                            time. */
+#define SP_BUILTIN_RANDOM        (-50)  /* Random (sp_Random *): boxed so a
+                                           generator in an Array or a poly slot
+                                           keeps its identity; it read as nil */
+/* SP_BUILTIN_ARGF (-51) is in sp_gc.h: the collector must not trace it */
 #define SP_BUILTIN_YIELDER       (-49)  /* Enumerator::Yielder: the generator's
                                           block parameter as a VALUE, for a
                                           proc inside the body that captures
@@ -647,6 +748,10 @@ static inline sp_RbVal sp_box_int(sp_int v)    { sp_RbVal r; r.tag = SP_TAG_INT;
    carries SP_TAG_STR and fails tag-keyed comparisons -- `defined?(x).should
    == nil` compared STR(NULL) against NIL and answered false. */
 static inline sp_RbVal sp_box_str(const char *v){ sp_RbVal r; if (!v) { r.tag = SP_TAG_NIL; r.cls_id = 0; r.v.s = NULL; return r; } r.tag = SP_TAG_STR;  r.cls_id = 0; r.v.s = v; return r; }
+/* A String mutator's value from a poly arm, which answers the box or the
+   unboxed String by mutator: boxed either way (a NULL String is nil). */
+static inline sp_RbVal sp_box_same(sp_RbVal v){ return v; }
+#define SP_BOX_STR_OR_POLY(x) _Generic((x), sp_RbVal: sp_box_same, default: sp_box_str)(x)
 static inline sp_RbVal sp_box_float(sp_float v){ sp_RbVal r; r.tag = SP_TAG_FLT;  r.cls_id = 0; r.v.f = v; return r; }
 /* Write the full union word, not just the narrow `b` member: hash keys and
    poly equality compare bool values through `v.i`, so bytes left
@@ -688,14 +793,53 @@ extern size_t sp_gc_threshold;
 extern size_t sp_gc_threshold_init;
 extern int sp_gc_stress_checked;
 void *sp_gc_alloc(size_t sz, void (*fin)(void *), void (*scn)(void *));
+/* sp_gc_alloc(sz, NULL, scn) for a size that is a constant where it is
+   called: the switch folds to one call, of the front lib/sp_slab.c keeps for
+   that size class (16 bytes apart from 32 to 256, the header included). */
+void *sp_gc_alloc_32(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_48(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_64(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_80(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_96(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_112(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_128(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_144(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_160(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_176(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_192(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_208(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_224(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_240(size_t need, void (*scn)(void *));
+void *sp_gc_alloc_256(size_t need, void (*scn)(void *));
+static inline void *sp_gc_alloc_sized(size_t sz, void (*scn)(void *)) {
+  size_t need = sizeof(sp_gc_hdr) + sz;
+  switch (need <= 32 ? 0 : need > 256 ? -1 : (int)((need + 15) >> 4) - 2) {
+  case 0: return sp_gc_alloc_32(need, scn);
+  case 1: return sp_gc_alloc_48(need, scn);
+  case 2: return sp_gc_alloc_64(need, scn);
+  case 3: return sp_gc_alloc_80(need, scn);
+  case 4: return sp_gc_alloc_96(need, scn);
+  case 5: return sp_gc_alloc_112(need, scn);
+  case 6: return sp_gc_alloc_128(need, scn);
+  case 7: return sp_gc_alloc_144(need, scn);
+  case 8: return sp_gc_alloc_160(need, scn);
+  case 9: return sp_gc_alloc_176(need, scn);
+  case 10: return sp_gc_alloc_192(need, scn);
+  case 11: return sp_gc_alloc_208(need, scn);
+  case 12: return sp_gc_alloc_224(need, scn);
+  case 13: return sp_gc_alloc_240(need, scn);
+  case 14: return sp_gc_alloc_256(need, scn);
+  default: return sp_gc_alloc(sz, NULL, scn);
+  }
+}
 void *sp_gc_alloc_nogc(size_t sz, void (*fin)(void *), void (*scn)(void *));
 
-__attribute__((noreturn)) void sp_raise_cls(const char *cls, const char *msg);  /* lib/sp_core.c */
-__attribute__((noreturn)) void sp_raise_frozen_str(const char *s);              /* lib/sp_str.c */
+SP_NORETURN void sp_raise_cls(const char *cls, const char *msg);  /* lib/sp_core.c */
+SP_NORETURN void sp_raise_frozen_str(const char *s);              /* lib/sp_str.c */
 /* The message carries the rodata marker byte: an in-flight exception's msg is
    marked by the GC (sp_mark_string reads s[-1]), so a bare literal -- whose
    [-1] is out of bounds -- would be UB when it lands at a section edge. */
-static void __attribute__((noinline, cold)) sp_raise_frozen_array(void) { sp_raise_cls("FrozenError", (&("\xff" "can't modify frozen Array")[1])); }
+static SP_NOINLINE SP_COLD void sp_raise_frozen_array(void) { sp_raise_cls("FrozenError", (&("\xff" "can't modify frozen Array")[1])); }
 /* Same, but stages the receiver so FrozenError#receiver answers the frozen
    object itself (identity-preserving boxing of the mutation target) (#3002).
    sp_exc_stage_recv lives in the generated TU; the ctor transfers the staged
@@ -703,12 +847,12 @@ static void __attribute__((noinline, cold)) sp_raise_frozen_array(void) { sp_rai
 void sp_exc_stage_recv(sp_RbVal v);
 /* the raise itself, in lib/sp_cold.c: the message carries the receiver's
    inspect, as CRuby's does ("can't modify frozen Array: [1, 2]") */
-__attribute__((noreturn)) void sp_raise_frozen_array_rv(sp_RbVal v);
-static void __attribute__((noinline, cold)) sp_raise_frozen_array_at(void *a, int cls_id) {
+SP_NORETURN void sp_raise_frozen_array_rv(sp_RbVal v);
+static SP_NOINLINE SP_COLD void sp_raise_frozen_array_at(void *a, int cls_id) {
   sp_raise_frozen_array_rv(sp_box_obj(a, cls_id));
 }
 /* boxed-receiver variant (the mutator holds an sp_RbVal, not the raw ptr) */
-static void __attribute__((noinline, cold)) sp_raise_frozen_array_v(sp_RbVal v) {
+static SP_NOINLINE SP_COLD void sp_raise_frozen_array_v(sp_RbVal v) {
   sp_raise_frozen_array_rv(v);
 }
 
@@ -740,6 +884,12 @@ static inline void sp_PolyArray_fin(void *p) { sp_PolyArray *a = (sp_PolyArray *
 extern SP_TLS sp_gc_hdr *sp_polyarr_pool_head;
 extern SP_TLS long sp_polyarr_pool_count;
 void sp_PolyArray_pool_recycle(sp_gc_hdr *h);
+/* An Array subclass instance's embedded Array (#7449, see
+   sp_IntArray_init_embedded): its elements start inline, and the first growth
+   installs the finalizer that frees the payload, as an unpooled one's does. */
+static inline void sp_PolyArray_init_embedded(sp_PolyArray *a) {
+  a->data = a->inl; a->cap = SP_POLYARR_INLINE; a->len = 0;
+}
 static inline sp_PolyArray *sp_PolyArray_new(void) {
   if (sp_slab_on > 0) {
     sp_PolyArray *a = (sp_PolyArray *)sp_gc_alloc(sizeof(sp_PolyArray), NULL, sp_PolyArray_scan);
@@ -795,76 +945,52 @@ static inline sp_RbVal sp_PolyArray_get(sp_PolyArray *a, sp_int i) { if (!a) ret
    Unlike 0xff (rodata literal) this marker lives in a malloc'd buffer
    so sp_str_freeze_val can set it.  The frozen? predicate and mutation
    guards check for 0xf1; plain rodata 0xff literals are NOT reported
-   as frozen (they behave as immutable value-semantics objects). */
+   as frozen (they behave as immutable value-semantics objects).
+   0xfa is a frozen heap string that is collected like any other where 0xf1
+   is kept for good; 0xf8 is its marked state on a malloc'd string, as 0xfc
+   is 0xfe's (a slab string's mark is a bit in its chunk). */
 static inline sp_bool sp_str_is_frozen_val(const char *s) {
   if (!s) return TRUE;
-  return ((const unsigned char *)s)[-1] == 0xf1;
+  unsigned char m = ((const unsigned char *)s)[-1];
+  return m == 0xf1 || m == 0xfa || m == 0xf8;
 }
 static inline void sp_str_check_mutable(const char *s) {
   if (sp_str_is_frozen_val(s)) sp_raise_frozen_str(s);
+}
+/* A String key as a Hash stores it: a mutable string is copied into a frozen
+   0xfa, so a later `<<` or setbyte on the caller's string cannot move the key
+   (CRuby's rb_hash_key_str). A frozen or literal key is stored as is. The
+   copy can collect, which clears the write barrier's record of the hash:
+   the caller issues its barrier again before storing. */
+static inline const char *sp_hash_key_str(const char *s) {
+  unsigned char m = ((const unsigned char *)s)[-1];
+  if (m != 0xfe && m != 0xfc && m != 0xfd) return s;
+  char *r = (char *)sp_str_from_bytes(s, sp_str_byte_len(s));
+  if (sp_str_is_binary(s)) sp_str_mark_binary(r);
+  ((unsigned char *)r)[-1] = 0xfa;
+  return r;
 }
 
 /* ---- relocated from spinel_rt.h: integer add/sub/mul overflow-check
    helpers (still static inline, pure textual move) used by lib/sp_cold.c's
    sp_int_pow. ---- */
-#ifndef __has_builtin
-#  define __has_builtin(x) 0
-#endif
-#if (defined(__GNUC__) && __GNUC__ >= 5) || \
-    (__has_builtin(__builtin_add_overflow) && \
-     __has_builtin(__builtin_sub_overflow) && \
-     __has_builtin(__builtin_mul_overflow))
-#  define SP_HAVE_OVERFLOW_BUILTINS 1
-#endif
-
-#ifdef SP_HAVE_OVERFLOW_BUILTINS
+/* the builtin, C23 <stdckdint.h> or a range check, per sp_compat.h */
 static inline sp_bool sp_int_add_overflow_p(sp_int a, sp_int b, sp_int *r) {
-  return __builtin_add_overflow(a, b, r);
+  return sp_ckd_add_iptr(a, b, r);
 }
 static inline sp_bool sp_int_sub_overflow_p(sp_int a, sp_int b, sp_int *r) {
-  return __builtin_sub_overflow(a, b, r);
+  return sp_ckd_sub_iptr(a, b, r);
 }
 static inline sp_bool sp_int_mul_overflow_p(sp_int a, sp_int b, sp_int *r) {
-  return __builtin_mul_overflow(a, b, r);
+  return sp_ckd_mul_iptr(a, b, r);
 }
-#else
-/* Portable fallback for compilers lacking __builtin_*_overflow.
-   sp_int is pointer-width (intptr_t), so compute in uintptr_t --
-   unsigned overflow is well-defined wrap-around in C -- and detect
-   signed overflow via the sign-bit XOR trick at the *correct* width
-   (the sign bit is sp_int's top bit: 63 on 64-bit, 31 on 32-bit).
-   Bounds use INTPTR_MAX/MIN, not the int64 MRB_INT_* macros, so this
-   path is self-contained and width-correct. Mul checks bounds before
-   multiplying because a 2x-width intermediate isn't portable. */
-#define SP_INT_OVF_SIGN ((uintptr_t)1 << (sizeof(sp_int) * 8 - 1))
-static inline sp_bool sp_int_add_overflow_p(sp_int a, sp_int b, sp_int *r) {
-  uintptr_t x = (uintptr_t)a, y = (uintptr_t)b, z = x + y;
-  *r = (sp_int)z;
-  return !!(((x ^ z) & (y ^ z)) & SP_INT_OVF_SIGN);
-}
-static inline sp_bool sp_int_sub_overflow_p(sp_int a, sp_int b, sp_int *r) {
-  uintptr_t x = (uintptr_t)a, y = (uintptr_t)b, z = x - y;
-  *r = (sp_int)z;
-  return !!(((x ^ z) & (~y ^ z)) & SP_INT_OVF_SIGN);
-}
-static inline sp_bool sp_int_mul_overflow_p(sp_int a, sp_int b, sp_int *r) {
-  if (a > 0 && b > 0 && a > INTPTR_MAX / b) { *r = a * b; return TRUE; }
-  if (a < 0 && b > 0 && a < INTPTR_MIN / b) { *r = a * b; return TRUE; }
-  if (a > 0 && b < 0 && b < INTPTR_MIN / a) { *r = a * b; return TRUE; }
-  if (a < 0 && b < 0 && (a <= INTPTR_MIN || b <= INTPTR_MIN || -a > INTPTR_MAX / -b)) {
-    *r = a * b; return TRUE;
-  }
-  *r = a * b;
-  return FALSE;
-}
-#undef SP_INT_OVF_SIGN
-#endif
 
 /* ---- Integer leaf-op prototypes (bodies relocated to lib/sp_cold.c):
    chr/digits/bit_length/bit_range/to_s_base/opt variants/pow. ---- */
 const char *sp_int_chr(sp_int n);
 const char *sp_int_chr_utf8(sp_int n);
 const char *sp_int_codepoint_to_str(sp_int n);
+const char *sp_int_codepoint_to_str_in(const char *recv, sp_int n);
 sp_IntArray *sp_int_digits(sp_int n, sp_int base);
 sp_int sp_int_bit_length(sp_int n);
 sp_int sp_int_bit_range(sp_int n, sp_int start, sp_int len);
@@ -879,7 +1005,14 @@ const char *sp_float_opt_inspect(sp_float v);
 const char *sp_float_opt_to_s(sp_float v);
 sp_int sp_float_denominator(sp_float f);
 sp_RbVal sp_float_numerator(sp_float f);
-sp_int sp_float_to_i_checked(sp_float f);
+/* Float#to_i: an in-range, non-NaN value is a C truncation, done inline;
+   NaN (which fails both tests), Infinity and an out-of-range value go to the
+   raising body in sp_cold.c. The range is exactly the one that body checks. */
+sp_int sp_float_to_i_checked_slow(sp_float f);
+static inline sp_int sp_float_to_i_checked(sp_float f) {
+  if (SP_LIKELY(f >= (sp_float)INTPTR_MIN && f < -(sp_float)INTPTR_MIN)) return (sp_int)f;
+  return sp_float_to_i_checked_slow(f);
+}
 
 /* ---- forward declarations for pointer-only box params (full types stay
    opaque to lib/sp_alloc.h -- these box functions only store the pointer). ---- */
@@ -942,7 +1075,9 @@ static inline sp_RbVal sp_box_range(sp_Range v) {
   return sp_box_obj(p, SP_BUILTIN_RANGE);
 }
 static inline const char*sp_encoding_name(sp_Encoding e){return e.name?e.name:sp_str_empty;}
-static inline const char*sp_encoding_inspect(sp_Encoding e){return sp_sprintf("#<Encoding:%s>",sp_encoding_name(e));}
+/* Encoding#inspect: the binary encoding reads "BINARY (ASCII-8BIT)" since Ruby 3.4 */
+static inline const char*sp_encoding_inspect_name(const char*n){return !strcmp(n,"ASCII-8BIT")?sp_sprintf("#<Encoding:BINARY (ASCII-8BIT)>"):sp_sprintf("#<Encoding:%s>",n);}
+static inline const char*sp_encoding_inspect(sp_Encoding e){return sp_encoding_inspect_name(sp_encoding_name(e));}
 static inline sp_bool sp_encoding_eq(sp_Encoding a,sp_Encoding b){const char*an=sp_encoding_name(a);const char*bn=sp_encoding_name(b);return strcmp(an,bn)==0;}
 
 /* ---- Box helper prototypes (0 optcarrot uses; bodies in lib/sp_cold.c). ---- */
@@ -950,6 +1085,11 @@ static inline sp_bool sp_encoding_eq(sp_Encoding a,sp_Encoding b){const char*an=
    a number. Inline because every boxed element read goes through here. */
 static inline sp_RbVal sp_box_int_or_nil(sp_int v) { return v == SP_INT_NIL ? sp_box_nil() : sp_box_int(v); }
 static inline sp_RbVal sp_box_float_or_nil(sp_float v) { return sp_float_is_nil(v) ? sp_box_nil() : sp_box_float(v); }
+/* An element of an Integer or Float array boxed for a poly container: `nf` is
+   the array's may_nil, read once ahead of the loop, so an array that cannot
+   hold nil boxes its elements as they are. */
+#define sp_box_int_nf(nf, v) ((nf) ? sp_box_int_or_nil(v) : sp_box_int(v))
+#define sp_box_float_nf(nf, v) ((nf) ? sp_box_float_or_nil(v) : sp_box_float(v))
 sp_RbVal sp_unsentinel(sp_RbVal v);
 sp_RbVal sp_box_bigint(sp_Bigint *b);
 /* A bigint slot's nil is NULL (the compiler's nil_value for TY_BIGINT), so a
@@ -963,6 +1103,9 @@ sp_RbVal sp_box_i64(int64_t v);
    its low 64 bits, for a package parameter that may be wider than sp_int */
 int64_t sp_unbox_i64(sp_RbVal v);
 sp_RbVal sp_box_encoding(sp_Encoding e);
+sp_RbVal sp_encoding_find(sp_RbVal v);
+/* force_encoding's tag for an Encoding or a name known at run time */
+int sp_force_encoding_mode(sp_RbVal enc);
 sp_RbVal sp_box_nullable_str(const char *v);
 sp_RbVal sp_box_foreign_ptr(void *p);
 sp_RbVal sp_box_regexp(void *p);

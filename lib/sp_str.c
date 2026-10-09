@@ -3,7 +3,7 @@
  * Leaf `const char*` operations moved out of spinel_rt.h so they compile
  * once into libspinel_rt.a instead of into every generated TU. They reach
  * the GC string heap via sp_alloc.h and the typed arrays via sp_array.h;
- * sp_str_crypt calls into lib/sp_crypto.c; sp_sprintf / sp_raise_* resolve
+ * sp_str_crypt is in lib/sp_str_crypt.c; sp_sprintf / sp_raise_* resolve
  * at the final link against the generated TU. */
 #include <string.h>
 #include <stdlib.h>
@@ -11,7 +11,39 @@
 #include <ctype.h>
 #include <stdint.h>
 #include "sp_str.h"
-#include "sp_crypto.h"   /* sp_crypto_hmac_sha256_b64url for sp_str_crypt */
+extern SP_TLS int sp_re_sub_matched;   /* sp_re.h: the bang forms' "a substitution happened" */
+/* sp_re.h: what gsub / sub / scan with a String pattern leave in `$~`, when
+   the program reads it (sp_re_track_last) */
+extern int sp_re_track_last;
+void sp_re_clear_last_match(void);
+void sp_re_set_lit_match(const char *str, sp_int beg, sp_int end);
+/* general categories, for what inspect escapes; `spin ext build` vendors
+   the runtime flat, lib/regexp/ beside lib/ */
+#if defined(__has_include)
+#  if __has_include("regexp/re_prop.h")
+#    include "regexp/re_prop.h"
+#  else
+#    include "re_prop.h"
+#  endif
+#else
+#  include "regexp/re_prop.h"
+#endif
+
+/* Does String#inspect spell codepoint cp as \uXXXX? CRuby escapes what
+   rb_enc_isprint refuses: a C1 control (Cc), a line or paragraph separator
+   (Zl, Zp), a surrogate (Cs) and an unassigned codepoint (Cn). A format
+   character (Cf) and a space (Zs) print as they are. */
+static int sp_cp_inspect_escapes(uint32_t cp) {
+  size_t lo = 0, hi = RE_PROP_GC_RUN_COUNT;
+  while (hi - lo > 1) {
+    size_t mid = (lo + hi) / 2;
+    if ((re_prop_gc_runs[mid] >> RE_PROP_GC_BITS) <= cp) lo = mid;
+    else hi = mid;
+  }
+  const char *gc = re_prop_gc_names[re_prop_gc_runs[lo] & ((1u << RE_PROP_GC_BITS) - 1)];
+  return !strcmp(gc, "Cc") || !strcmp(gc, "Zl") || !strcmp(gc, "Zp") ||
+         !strcmp(gc, "Cs") || !strcmp(gc, "Cn");
+}
 
 /* Single-char substring cache (sub_range fast path); per-process, only
    used by the sub_range helpers that live in this file. */
@@ -123,13 +155,52 @@ static inline char *sp_str_bin_from(char *r, const char *a) {
   return r;
 }
 
-const char*sp_str_concat(const char*a,const char*b){SP_GC_ROOT_STR(a);SP_GC_ROOT_STR(b);if(!a)a=sp_str_empty;if(!b)b=sp_str_empty;size_t la=sp_str_byte_len(a),lb=sp_str_byte_len(b);char*r=sp_str_alloc(la+lb);memcpy(r,a,la);memcpy(r+la,b,lb);sp_str_bin_from(r,a);sp_str_bin_from(r,b);return r;}
+/* One step of CRuby's encoding rule over a string built part by part (an
+   interpolation, Array#join): `state` is the encoding so far, -1 while only
+   US-ASCII parts (an Integer's to_s, nothing yet) have gone in, 0 UTF-8, 1
+   binary; `acc` holds the `acc_len` bytes already joined. A part in the same
+   encoding, or an ASCII-only one, keeps it; one whose high bytes meet an
+   ASCII-only run so far takes the run over; two runs with high bytes in
+   different encodings stay binary (see above). */
+int sp_str_enc_step(int state, const char *acc, size_t acc_len, const char *part, size_t part_len, int part_bin) {
+  if (state < 0) return part_len ? part_bin : -1;
+  if (part_bin == state || part_len == 0) return state;
+  for (size_t i = 0; i < part_len; i++)
+    if ((unsigned char)part[i] >= 0x80) {
+      for (size_t j = 0; j < acc_len; j++) if ((unsigned char)acc[j] >= 0x80) return 1;
+      return part_bin;
+    }
+  return state;
+}
+/* Whether a + b is binary, as CRuby's compatibility rule picks it: the
+   operands' shared encoding, else the one an ASCII-only operand gives way
+   to -- `String.new + "\u00e9"` is UTF-8 -- else binary (see above). */
+static int sp_str_cat_binary(const char *a, const char *b) {
+  int ab = sp_str_is_binary(a), bb = sp_str_is_binary(b);
+  if (ab == bb) return ab;
+  if (sp_str_ascii_only(b)) return ab;
+  if (sp_str_ascii_only(a)) return bb;
+  return 1;
+}
+/* The same rule folded over a run of parts: `bin` is the encoding of the
+   `pl` bytes of r already joined, s the next part. The prefix is scanned only
+   when the two encodings differ. */
+static int sp_str_bin_fold(const char *r, size_t pl, int bin, const char *s) {
+  int sb = sp_str_is_binary(s);
+  if (sb == bin || sp_str_ascii_only(s)) return bin;
+  for (size_t i = 0; i < pl; i++) if ((unsigned char)r[i] >= 0x80) return 1;
+  return sb;
+}
+const char*sp_str_concat(const char*a,const char*b){SP_GC_ROOT_STR(a);SP_GC_ROOT_STR(b);if(!a)a=sp_str_empty;if(!b)b=sp_str_empty;size_t la=sp_str_byte_len(a),lb=sp_str_byte_len(b);char*r=sp_str_alloc(la+lb);memcpy(r,a,la);memcpy(r+la,b,lb);if(sp_str_cat_binary(a,b))sp_str_mark_binary(r);return r;}
+/* append_as_bytes keeps the receiver's encoding, regardless of the bytes or
+   encoding of the appended String. */
+const char*sp_str_append_bytes(const char*a,const char*b){SP_GC_ROOT_STR(a);SP_GC_ROOT_STR(b);if(!a)a=sp_str_empty;if(!b)b=sp_str_empty;size_t la=sp_str_byte_len(a),lb=sp_str_byte_len(b);char*r=sp_str_alloc(la+lb);memcpy(r,a,la);memcpy(r+la,b,lb);return sp_str_bin_from(r,a);}
 /* Issue #760: NULL src to memcpy is UB. Treat NULL as empty string. */
-const char*sp_str_concat3(const char*a,const char*b,const char*c){SP_GC_ROOT_STR(a);SP_GC_ROOT_STR(b);SP_GC_ROOT_STR(c);if(!a)a=sp_str_empty;if(!b)b=sp_str_empty;if(!c)c=sp_str_empty;size_t la=sp_str_byte_len(a),lb=sp_str_byte_len(b),lc=sp_str_byte_len(c);char*r=sp_str_alloc(la+lb+lc);memcpy(r,a,la);memcpy(r+la,b,lb);memcpy(r+la+lb,c,lc);sp_str_bin_from(r,a);sp_str_bin_from(r,b);sp_str_bin_from(r,c);return r;}
-const char*sp_str_concat4(const char*a,const char*b,const char*c,const char*d){SP_GC_ROOT_STR(a);SP_GC_ROOT_STR(b);SP_GC_ROOT_STR(c);SP_GC_ROOT_STR(d);if(!a)a=sp_str_empty;if(!b)b=sp_str_empty;if(!c)c=sp_str_empty;if(!d)d=sp_str_empty;size_t la=sp_str_byte_len(a),lb=sp_str_byte_len(b),lc=sp_str_byte_len(c),ld=sp_str_byte_len(d);char*r=sp_str_alloc(la+lb+lc+ld);memcpy(r,a,la);memcpy(r+la,b,lb);memcpy(r+la+lb,c,lc);memcpy(r+la+lb+lc,d,ld);sp_str_bin_from(r,a);sp_str_bin_from(r,b);sp_str_bin_from(r,c);sp_str_bin_from(r,d);return r;}
+const char*sp_str_concat3(const char*a,const char*b,const char*c){SP_GC_ROOT_STR(a);SP_GC_ROOT_STR(b);SP_GC_ROOT_STR(c);if(!a)a=sp_str_empty;if(!b)b=sp_str_empty;if(!c)c=sp_str_empty;size_t la=sp_str_byte_len(a),lb=sp_str_byte_len(b),lc=sp_str_byte_len(c);char*r=sp_str_alloc(la+lb+lc);memcpy(r,a,la);memcpy(r+la,b,lb);memcpy(r+la+lb,c,lc);{int ab=sp_str_cat_binary(a,b);int rb=ab==sp_str_is_binary(c)?ab:sp_str_ascii_only(c)?ab:(sp_str_ascii_only(a)&&sp_str_ascii_only(b))?sp_str_is_binary(c):1;if(rb)sp_str_mark_binary(r);}return r;}
+const char*sp_str_concat4(const char*a,const char*b,const char*c,const char*d){SP_GC_ROOT_STR(a);SP_GC_ROOT_STR(b);SP_GC_ROOT_STR(c);SP_GC_ROOT_STR(d);if(!a)a=sp_str_empty;if(!b)b=sp_str_empty;if(!c)c=sp_str_empty;if(!d)d=sp_str_empty;size_t la=sp_str_byte_len(a),lb=sp_str_byte_len(b),lc=sp_str_byte_len(c),ld=sp_str_byte_len(d);char*r=sp_str_alloc(la+lb+lc+ld);memcpy(r,a,la);memcpy(r+la,b,lb);memcpy(r+la+lb,c,lc);memcpy(r+la+lb+lc,d,ld);{int rb=sp_str_is_binary(a);rb=sp_str_bin_fold(r,la,rb,b);rb=sp_str_bin_fold(r,la+lb,rb,c);rb=sp_str_bin_fold(r,la+lb+lc,rb,d);if(rb)sp_str_mark_binary(r);}return r;}
 /* Concatenate N strings into a single GC-managed buffer. */
 /* Issue #760: NULL entries treated as empty strings. */
-const char*sp_str_concat_arr(const char *const *parts,int n){size_t total=0;for(int i=0;i<n;i++)total+=sp_str_byte_len(parts[i]?parts[i]:sp_str_empty);char*r=sp_str_alloc(total);char*p=r;for(int i=0;i<n;i++){const char*s=parts[i]?parts[i]:sp_str_empty;size_t sl=sp_str_byte_len(s);memcpy(p,s,sl);p+=sl;sp_str_bin_from(r,s);}return r;}
+const char*sp_str_concat_arr(const char *const *parts,int n){size_t total=0;for(int i=0;i<n;i++)total+=sp_str_byte_len(parts[i]?parts[i]:sp_str_empty);char*r=sp_str_alloc(total);char*p=r;int rb=-1;for(int i=0;i<n;i++){const char*s=parts[i]?parts[i]:sp_str_empty;size_t sl=sp_str_byte_len(s);rb=rb<0?sp_str_is_binary(s):sp_str_bin_fold(r,(size_t)(p-r),rb,s);memcpy(p,s,sl);p+=sl;}if(rb>0)sp_str_mark_binary(r);return r;}
 /* The unresolved-call gate's raise. Deliberately NOT declared noreturn
    (spinel_rt.h): gate arms sit inside hot dispatch functions and a noreturn
    call restructures their CFG; as a plain value-returning extern call the
@@ -160,6 +231,26 @@ const char*sp_str_plus(const char*a,const char*b){SP_GC_ROOT_STR(a);SP_GC_ROOT_S
   if(!b)sp_raise_cls("TypeError","no implicit conversion of nil into String");
   return sp_str_concat(a,b);
 }
+/* `str + "lit"`: the codegen knows the literal's byte length, and a source
+   literal is never BINARY, so this skips the literal's header decode and
+   encoding check, the nil-to-empty fixups, and the second call frame
+   sp_str_plus spends before sp_str_concat. */
+const char *sp_str_plus_lit(const char *a, const char *lit, size_t ll) {
+  if (!a) sp_nil_recv("+");
+  SP_GC_ROOT_STR(a);
+  size_t la = sp_str_byte_len(a);
+  char *r = sp_str_alloc(la + ll);
+  memcpy(r, a, la);
+  memcpy(r + la, lit, ll);
+  /* a binary receiver keeps its encoding unless it is ASCII-only and the
+     literal is not: then the result is the literal's UTF-8, as CRuby picks */
+  if (sp_str_is_binary(a)) {
+    int lit_ascii = 1;
+    for (size_t i = 0; i < ll && lit_ascii; i++) lit_ascii = (unsigned char)lit[i] < 0x80;
+    if (lit_ascii || !sp_str_ascii_only(a)) sp_str_mark_binary(r);
+  }
+  return r;
+}
 /* FrozenError naming the receiver, matching CRuby's
    "can't modify frozen String: \"abc\"" message shape. */
 void sp_exc_stage_recv(sp_RbVal v);   /* generated TU: stages FrozenError#receiver */
@@ -189,7 +280,17 @@ else if(c>=0x80){
   int ok=extra>0&&!sp_str_is_binary(s)&&i+(size_t)extra<sl;
   for(int k=1;ok&&k<=extra;k++)if(((unsigned char)s[i+(size_t)k]&0xC0)!=0x80)ok=0;
   if(!ok){snprintf(r+o,5,"\\x%02X",c);o+=4;}
-  else{for(int k=0;k<=extra;k++)r[o++]=s[i+(size_t)k];i+=(size_t)extra;}
+  else{
+    /* a valid character that does not print is spelled by its codepoint,
+       as CRuby does: "\u0080", "\u2028", "\u{E0080}" */
+    uint32_t cp=(uint32_t)(c&(extra==1?0x1F:extra==2?0x0F:0x07));
+    for(int k=1;k<=extra;k++)cp=(cp<<6)|((unsigned char)s[i+(size_t)k]&0x3F);
+    if(sp_cp_inspect_escapes(cp)){
+      if(cp>0xFFFF){int w=snprintf(r+o,12,"\\u{%X}",(unsigned)cp);o+=(size_t)w;}
+      else{snprintf(r+o,7,"\\u%04X",(unsigned)cp);o+=6;}
+    }
+    else for(int k=0;k<=extra;k++)r[o++]=s[i+(size_t)k];
+    i+=(size_t)extra;}
 }
 else{r[o++]=(char)c;}}r[o++]='"';r[o]=0;sp_str_set_len(r,o);return r;}
 /* A symbol prints without quotes when its name is a plain identifier (an
@@ -278,6 +379,32 @@ static const char*sp_str_case_map(const char*s,uint32_t(*fn)(uint32_t),int up){S
     oi+=(size_t)sp_utf8_encode(fn(cp),r+oi);}
   r[oi]=0;sp_str_set_len(r,oi);return r;
 }
+/* casecmp? compares the Unicode case FOLDING of both sides, not bytes under
+   ASCII tolower: "\u00c9".casecmp?("\u00e9") is true. Folding here is the
+   lowercase mapping above over the same ranges, plus the few sources in them
+   whose folding is not their lowercase: sharp s (and capital sharp s) fold to
+   "ss", long s to "s", micro sign to Greek mu, and dotted capital I to "i"
+   and a combining dot. */
+static size_t sp_uc_fold_into(uint32_t cp,char*o){
+  if(cp==0xDF||cp==0x1E9E){o[0]='s';o[1]='s';return 2;}
+  if(cp==0x17F){o[0]='s';return 1;}
+  if(cp==0xB5)return (size_t)sp_utf8_encode(0x3BC,o);
+  if(cp==0x130){o[0]='i';return 1+(size_t)sp_utf8_encode(0x307,o+1);}
+  return (size_t)sp_utf8_encode(sp_uc_tolower(cp),o);
+}
+static char*sp_str_fold_buf(const char*s,size_t*out){
+  size_t l=sp_str_byte_len(s);char*r=(char*)malloc(l*3+1);if(!r){perror("malloc");exit(1);}size_t oi=0;
+  for(size_t i=0;i<l;){uint32_t cp;int n=sp_utf8_decode(s+i,&cp);i+=(size_t)n;oi+=sp_uc_fold_into(cp,r+oi);}
+  *out=oi;return r;
+}
+sp_bool sp_str_casecmp_p(const char*a,const char*b){if(!a)sp_nil_recv("casecmp?");if(!b)return FALSE;
+  size_t la=sp_str_byte_len(a),lb=sp_str_byte_len(b);int ascii=1;
+  for(size_t i=0;i<la&&ascii;i++)if((unsigned char)a[i]>=0x80)ascii=0;
+  for(size_t i=0;i<lb&&ascii;i++)if((unsigned char)b[i]>=0x80)ascii=0;
+  if(ascii)return sp_str_casecmp(a,b)==0;
+  size_t fa,fb;char*x=sp_str_fold_buf(a,&fa);char*y=sp_str_fold_buf(b,&fb);
+  sp_bool eq=fa==fb&&memcmp(x,y,fa)==0;free(x);free(y);return eq;
+}
 const char*sp_str_upcase(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("upcase");return sp_str_case_map(s,sp_uc_toupper,1);}
 const char*sp_str_downcase(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("downcase");return sp_str_case_map(s,sp_uc_tolower,0);}
 const char*sp_str_swapcase(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("swapcase");size_t l=sp_str_byte_len(s);char*r=sp_str_alloc_raw(l*3+1);size_t oi=0;for(size_t i=0;i<l;){uint32_t cp;int n=sp_utf8_decode(s+i,&cp);i+=(size_t)n;uint32_t up=sp_uc_toupper(cp),lo=sp_uc_tolower(cp);if(up!=cp){/* cp is lowercase -> uppercase */if(cp==0xDF){r[oi++]='S';r[oi++]='S';}
@@ -345,6 +472,8 @@ const char *sp_str_append_grow(const char *s, const char *t) {SP_GC_ROOT_STR(s);
   if (!t) return s;
   size_t la = sp_str_byte_len(s), lb = sp_str_byte_len(t);
   if (lb == 0) return s;
+  int text_append = sp_str_is_binary(s) && !sp_str_is_binary(t) &&
+                    !sp_str_ascii_only(t) && sp_str_ascii_only(s);
   unsigned char m = ((const unsigned char *)s)[-1];
   if (m == 0xfe || m == 0xfc) {
     sp_str_hdr *h = ((sp_str_hdr *)(s - 1)) - 1;
@@ -355,6 +484,7 @@ const char *sp_str_append_grow(const char *s, const char *t) {SP_GC_ROOT_STR(s);
       ((char *)s)[la + lb] = 0;
       sp_str_lcache_drop(s);
       sp_str_set_len((char *)s, la + lb);
+      if (text_append) sp_str_as_text((char *)s);
       return s;
     }
   }
@@ -364,11 +494,10 @@ const char *sp_str_append_grow(const char *s, const char *t) {SP_GC_ROOT_STR(s);
   memcpy(r + la, t, lb);
   r[la + lb] = 0;
   sp_str_set_len(r, la + lb);
-  /* the receiver's encoding survives the append: the in-place path keeps the
-     header (and its BINARY bit) but the grow path allocates a fresh one, so a
-     `s << x` that outgrew its buffer silently turned a pack / String#b result
-     back into UTF-8 */
-  if (sp_str_is_binary(s)) sp_str_mark_binary(r);
+  /* Preserve BINARY when growing the receiver. A compatible text append to
+     an ASCII-only binary receiver is the exception: text_append has already
+     selected UTF-8, so do not mark the replacement buffer binary. */
+  if (sp_str_is_binary(s) && !text_append) sp_str_mark_binary(r);
   return r;
 }
 /* The same append for the first `lb` bytes of `t`, for the append form of an
@@ -419,6 +548,8 @@ const char*sp_str_chomp(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("chomp
 const char *sp_str_chomp_sep(const char *s, const char *sep) {SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(sep);
   if (!s) sp_nil_recv("chomp");
   size_t l = sp_str_byte_len(s);   /* byte-exact (#4527) */
+  /* "\n" is the record separator's own case: it also takes a trailing "\r\n" or "\r" */
+  if (sep && sep[0] == '\n' && sp_str_byte_len(sep) == 1) return sp_str_chomp(s);
   if (!sep || !*sep) {
     /* Empty sep = paragraph mode: strip trailing \r\n pairs and
        standalone \n's, but NOT standalone \r's. A trailing \r that
@@ -460,7 +591,7 @@ sp_StrArray *sp_str_partition(const char *s, const char *sep) {
      subject, so partitioning on one found nothing and answered ["", "", s] */
   sp_int bl = (sp_int)sp_str_byte_len(s), sl = (sp_int)sp_str_byte_len(sep);
   const char *f = sl > 0 ? sp_bytestr(s, (size_t)bl, sep, (size_t)sl) : s;
-  if (!f) { sp_StrArray_push(r, s); sp_StrArray_push(r, sp_str_empty); sp_StrArray_push(r, sp_str_empty); return r; }
+  if (!f) { sp_StrArray_push(r, sp_str_dup(s)); sp_StrArray_push(r, sp_str_dup(sp_str_empty)); sp_StrArray_push(r, sp_str_dup(sp_str_empty)); return r; }
   sp_int pre = (sp_int)(f - s);
   sp_StrArray_push(r, sp_str_byteslice(s, 0, pre));
   sp_StrArray_push(r, sp_str_byteslice(s, pre, sl));
@@ -474,10 +605,10 @@ sp_StrArray *sp_str_rpartition(const char *s, const char *sep) {
   sp_StrArray *r = sp_StrArray_new();
   SP_GC_ROOT(r);   /* keep r (and its pushed slices) live across the byteslice allocs */
   sp_int bl = (sp_int)sp_str_byte_len(s), sl = (sp_int)sp_str_byte_len(sep);
-  const char *last = NULL;
+  const char *last = sl == 0 ? s + bl : NULL;   /* an empty sep matches at the end: [s, "", ""] */
   if (sl > 0) { const char *p = s, *e = s + bl;
     while (p < e) { const char *f2 = sp_bytestr(p, (size_t)(e - p), sep, (size_t)sl); if (!f2) break; last = f2; p = f2 + 1; } }
-  if (!last) { sp_StrArray_push(r, sp_str_empty); sp_StrArray_push(r, sp_str_empty); sp_StrArray_push(r, s); return r; }
+  if (!last) { sp_StrArray_push(r, sp_str_dup(sp_str_empty)); sp_StrArray_push(r, sp_str_dup(sp_str_empty)); sp_StrArray_push(r, sp_str_dup(s)); return r; }
   sp_int pre = (sp_int)(last - s);
   sp_StrArray_push(r, sp_str_byteslice(s, 0, pre));
   sp_StrArray_push(r, sp_str_byteslice(s, pre, sl));
@@ -539,10 +670,47 @@ else{if(out+1>=cap){size_t nc=cap*2;char*nb=(char*)realloc(buf,nc);if(!nb){free(
 /* byte-exact search and lengths: strstr/strlen stop at an embedded NUL, so a
    pattern or subject holding one matched the wrong place or not at all (the
    opportunistic NUL policy -- fix what is met). */
-const char*sp_str_sub(const char*s,const char*pat,const char*rep){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(pat);SP_GC_ROOT_STR(rep);if(!s)sp_nil_recv("sub");if(!pat||!rep)return s;size_t pl0=sp_str_byte_len(pat),sl0=sp_str_byte_len(s);const char*f=sp_bytestr(s,sl0,pat,pl0);if(!f)return s;char*rep_exp=sp_str_rep_expand(rep,pat,pl0);if(rep_exp)rep=rep_exp;size_t pl=pl0,rl=rep_exp?strlen(rep):sp_str_byte_len(rep),sl=sl0;char*r=sp_str_alloc_raw(sl-pl+rl+1);size_t n=f-s;memcpy(r,s,n);memcpy(r+n,rep,rl);memcpy(r+n+rl,f+pl,sl-n-pl);r[sl-pl+rl]=0;sp_str_set_len(r,sl-pl+rl);if(rep_exp)free(rep_exp);return r;}
+/* slice!(str): s without the first occurrence of pat, or s itself when there
+   is none. Unlike sub it sets no `$~`, as CRuby's slice! sets none. */
+const char*sp_str_remove_first(const char*s,const char*pat){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(pat);if(!s||!pat)return s;size_t pl=sp_str_byte_len(pat),sl=sp_str_byte_len(s);const char*f=sp_bytestr(s,sl,pat,pl);if(!f)return s;size_t n=(size_t)(f-s);char*r=sp_str_alloc_raw(sl-pl+1);memcpy(r,s,n);memcpy(r+n,f+pl,sl-n-pl);r[sl-pl]=0;sp_str_set_len(r,sl-pl);return r;}
+const char*sp_str_sub(const char*s,const char*pat,const char*rep){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(pat);SP_GC_ROOT_STR(rep);if(!s)sp_nil_recv("sub");if(!pat||!rep)return s;size_t pl0=sp_str_byte_len(pat),sl0=sp_str_byte_len(s);const char*f=sp_bytestr(s,sl0,pat,pl0);if(!f){if(sp_re_track_last)sp_re_clear_last_match();return sp_str_dup(s);}sp_re_sub_matched=1;if(sp_re_track_last)sp_re_set_lit_match(s,(sp_int)(f-s),(sp_int)(f-s+pl0));char*rep_exp=sp_str_rep_expand(rep,pat,pl0);if(rep_exp)rep=rep_exp;size_t pl=pl0,rl=rep_exp?strlen(rep):sp_str_byte_len(rep),sl=sl0;char*r=sp_str_alloc_raw(sl-pl+rl+1);size_t n=f-s;memcpy(r,s,n);memcpy(r+n,rep,rl);memcpy(r+n+rl,f+pl,sl-n-pl);r[sl-pl+rl]=0;sp_str_set_len(r,sl-pl+rl);if(rep_exp)free(rep_exp);return r;}
 const char*sp_str_capitalize(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("capitalize");size_t l=sp_str_byte_len(s);char*r=sp_str_alloc_raw(l*3+1);size_t oi=0;int first=1;for(size_t i=0;i<l;){uint32_t cp;int n=sp_utf8_decode(s+i,&cp);i+=(size_t)n;if(first){uint32_t u=sp_uc_toupper(cp);if(cp==0xDF){r[oi++]='S';r[oi++]='S';}
 else oi+=(size_t)sp_utf8_encode(u,r+oi);first=0;}
 else oi+=(size_t)sp_utf8_encode(sp_uc_tolower(cp),r+oi);}r[oi]=0;sp_str_set_len(r,oi);return r;}
+/* The longest string a caller-sized operation builds: String#*, and the
+   center/ljust/rjust family. Past it the request raises ArgumentError, which a
+   program can rescue, instead of reaching the allocator -- a failed
+   allocation ends the process (sp_oom_die) -- and sp_str_hdr's 32-bit length
+   fields never see a value they would truncate. `have` is what the result
+   already holds, `add` what the operation appends. */
+static const size_t sp_str_max_bytes=(size_t)1<<30;
+static void sp_str_check_size(size_t have, size_t add){if(have>sp_str_max_bytes||add>sp_str_max_bytes-have)sp_raise_cls("ArgumentError","string size too big");}
+/* The justify family's size rule, in 64 bits on every target, as CRuby
+   answers it: a byte total past a long is ArgumentError ("argument too big");
+   one past what this runtime builds (sp_str_max_bytes) is the NoMemoryError
+   CRuby raises when the allocation fails -- raised here, so it can be rescued
+   and the allocator never sees the request. UINT64_MAX stands for a total
+   that overflowed. Answers the class to raise, NULL when the result fits. */
+static const char *sp_justify_size_err(uint64_t have, uint64_t add) {
+  if (add == UINT64_MAX || add >= (uint64_t)INT64_MAX - have) return "ArgumentError";
+  if (have + add > (uint64_t)sp_str_max_bytes) return "NoMemoryError";
+  return NULL;
+}
+static void sp_justify_size_raise(const char *cls) {
+  sp_raise_cls(cls, cls[0] == 'A' ? "argument too big" : "failed to allocate memory");
+}
+/* The bytes `need` characters of a cycling pad take, counted per cycle
+   rather than per character; UINT64_MAX on overflow. */
+static uint64_t sp_pad_bytes(const uint32_t *cps, size_t pn, uint64_t need) {
+  char tmp[4]; uint64_t cyc = 0, part = 0, rem = need % pn;
+  for (size_t i = 0; i < pn; i++) {
+    uint64_t b = (uint64_t)sp_utf8_encode(cps[i], tmp);
+    cyc += b; if (i < rem) part += b;
+  }
+  uint64_t full = need / pn;
+  if (cyc && full > (UINT64_MAX - part) / cyc) return UINT64_MAX;
+  return full * cyc + part;
+}
 const char*sp_str_repeat(const char*s,sp_int n){SP_GC_ROOT_STR(s);
   if(n<0) sp_raise_cls("ArgumentError","negative argument");
   if(!s)sp_nil_recv("*");if(n<=0)return sp_str_is_binary(s)?sp_str_empty_binary():sp_str_empty;
@@ -552,7 +720,7 @@ const char*sp_str_repeat(const char*s,sp_int n){SP_GC_ROOT_STR(s);
   if(l==0) return sp_str_is_binary(s)?sp_str_empty_binary():sp_str_empty;
   if((size_t)n>SIZE_MAX/l) sp_raise_cls("ArgumentError","string size too big");
   size_t total=(size_t)n*l;
-  if(total>(size_t)(1u<<30)) sp_raise_cls("ArgumentError","string size too big");
+  sp_str_check_size(0,total);
   char*r=sp_str_alloc_raw(total+1);
   for(sp_int i=0;i<n;i++)memcpy(r+(l*i),s,l);
   r[total]=0;
@@ -564,19 +732,6 @@ const char*sp_str_repeat(const char*s,sp_int n){SP_GC_ROOT_STR(s);
    Colormap.load), and a collection triggered by the alloc freed it mid-call,
    yielding an empty result exactly on GC-boundary iterations. */
 sp_IntArray*sp_str_bytes(const char*s){SP_GC_ROOT_STR(s);sp_IntArray*a=sp_IntArray_new();if(!s)sp_nil_recv("bytes");size_t n=sp_str_byte_len(s);for(size_t i=0;i<n;i++)sp_IntArray_push(a,(sp_int)(unsigned char)s[i]);return a;}
-const char *sp_str_crypt(const char *s, const char *salt) {SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(salt);
-  /* the real libc crypt(3) -- DES with a 2-char salt (or the platform's
-     extended schemes), byte-identical to CRuby's String#crypt (#2398).
-     Declared by hand: glibc hides it behind crypt.h/_XOPEN_SOURCE while
-     macOS ships it in unistd.h. */
-  extern char *crypt(const char *key, const char *slt);
-  if (!s) sp_nil_recv("crypt");
-  if (!salt || !salt[0] || !salt[1])
-    sp_raise_cls("ArgumentError", "salt too short (need >=2 bytes)");
-  char *d = crypt(s, salt);
-  if (!d) sp_raise_cls("ArgumentError", "invalid salt");
-  return sp_str_dup_external(d);
-}
 const char*sp_str_lstrip(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("lstrip");size_t len=sp_str_byte_len(s);size_t a=0;while(a<len&&(isspace((unsigned char)s[a])||s[a]=='\0'))a++;size_t n=len-a;char*r=sp_str_alloc(n);memcpy(r,s+a,n);r[n]=0;return r;}
 const char*sp_str_rstrip(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("rstrip");size_t len=sp_str_byte_len(s);size_t b=len;while(b>0&&(isspace((unsigned char)s[b-1])||s[b-1]=='\0'))b--;char*r=sp_str_alloc(b);memcpy(r,s,b);r[b]=0;return r;}
 /* String#b: a fresh, unfrozen copy tagged BINARY (ASCII-8BIT). The dup alone
@@ -860,6 +1015,9 @@ for(;;){
 /* succ_impl records the real length on every path now, so the old strlen
    normalisation here would UNDO it for a source holding a NUL. */
 const char*sp_str_succ(const char*s){SP_GC_ROOT_STR(s);return sp_str_succ_impl(s);}
+/* succ applied n times (n < 1: the string itself): the next member of an
+   endless String range walked by step(n) */
+const char*sp_str_succ_n(const char*s,sp_int n){SP_GC_ROOT_STR(s);for(sp_int i=0;i<n;i++)s=sp_str_succ_impl(s);return s;}
 sp_StrArray*sp_str_split(const char*s,const char*sep){if(!s)sp_nil_recv("split");
   SP_GC_ROOT_STR(s);
   SP_GC_ROOT_STR(sep);
@@ -870,20 +1028,22 @@ sp_StrArray*sp_str_split(const char*s,const char*sep){if(!s)sp_nil_recv("split")
 /* Same as sp_str_split but removes trailing empty strings
    (CRuby default limit behavior: split without limit drops
    trailing empties; split(sep, -1) keeps them). */
-sp_StrArray*sp_str_split_drop_trailing(const char*s,const char*sep){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(sep);if(!sep||(sep[0]==' '&&sep[1]==0))return sp_str_split_ws(s);sp_StrArray*a=sp_str_split(s,sep);/* an EMPTY tail, not one that merely starts with NUL: `"\0x\0".split("x")`
+sp_StrArray*sp_str_split_drop_trailing(const char*s,const char*sep){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(sep);if(!sep||(sep[0]==' '&&sp_str_byte_len(sep)==1))return sp_str_split_ws(s);sp_StrArray*a=sp_str_split(s,sep);/* an EMPTY tail, not one that merely starts with NUL: `"\0x\0".split("x")`
      dropped both halves when the test was s[0]==0. */
   while(a->len>0&&sp_str_byte_len(a->data[a->len-1])==0)a->len--;return a;}
 /* `s.split(sep, n)` with explicit limit. Positive n caps the result
    at n elements: the last element holds the unsplit remainder.
    n == 0 means "no limit" and drops trailing empty strings (same as
    the no-arg default); n < 0 means "no limit" but keeps trailing
-   empties. Empty separator works the same as the no-limit path --
-   splits into Unicode characters; the limit caps the array.
+   empties. Empty separator splits into Unicode characters, then keeps
+   one empty field after them if the limit leaves room for it.
    Issue #619 puzzle 2. */
 sp_StrArray*sp_str_split_limit(const char*s,const char*sep,sp_int n){if(!s)sp_nil_recv("split");
-  if(!sep||(sep[0]==' '&&sep[1]==0))return sp_str_split_ws_limit(s,n);
+  if(!sep||(sep[0]==' '&&sp_str_byte_len(sep)==1))return sp_str_split_ws_limit(s,n);
   if(n==0)return sp_str_split_drop_trailing(s,sep);
-  if(n<0)return sp_str_split(s,sep);
+  if(n<0){sp_StrArray*a=sp_str_split(s,sep);SP_GC_ROOT(a);
+    /* a non-empty String split at an empty separator ends in one empty field, as with `n` positive below */
+    if(sp_str_byte_len(s)&&!sp_str_byte_len(sep))sp_str_split_push(a,"",0);return a;}
   SP_GC_ROOT_STR(s);
   SP_GC_ROOT_STR(sep);
   sp_StrArray*a=sp_StrArray_new();
@@ -899,9 +1059,8 @@ sp_StrArray*sp_str_split_limit(const char*s,const char*sep,sp_int n){if(!s)sp_ni
       p+=cn;
       k++;
     }
-    if(*p){
-      sp_str_split_push(a,p,strlen(p));
-    }
+    if(*p)sp_str_split_push(a,p,strlen(p));
+    else if(!sp_str_byte_len(sep)&&p==s+sp_str_byte_len(s))sp_str_split_push(a,"",0);   /* every character is out: the limit leaves room for the empty field after them */
     return a;
   }
   const char*p=s;
@@ -917,6 +1076,7 @@ sp_StrArray*sp_str_split_limit(const char*s,const char*sep,sp_int n){if(!s)sp_ni
   sp_str_split_push(a,p,strlen(p));
   return a;
 }
+#define SP_SPLIT_WS(c) ((c)==' '||(c)=='\t'||(c)=='\n'||(c)=='\r'||(c)=='\f'||(c)=='\v')
 /* `s.split` / `s.split(nil)` -- whitespace mode: split on runs of
    ASCII whitespace, skip leading whitespace. Issue #507: the no-arg
    form previously emitted `sp_str_split(s, 0)` and segfaulted at
@@ -925,14 +1085,15 @@ sp_StrArray*sp_str_split_ws(const char*s){if(!s)sp_nil_recv("split");
   SP_GC_ROOT_STR(s);
   sp_StrArray*a=sp_StrArray_new();
   SP_GC_ROOT(a);
-  const char*p=s;
-  while(*p==' '||*p=='\t'||*p=='\n'||*p=='\r'||*p=='\f'||*p=='\v')p++;
-  while(*p){
+  /* by byte length, not strlen: a NUL is an ordinary character here */
+  const char*p=s,*e=s+sp_str_byte_len(s);
+  while(p<e&&SP_SPLIT_WS(*p))p++;
+  while(p<e){
     const char*start=p;
-    while(*p&&!(*p==' '||*p=='\t'||*p=='\n'||*p=='\r'||*p=='\f'||*p=='\v'))p++;
+    while(p<e&&!SP_SPLIT_WS(*p))p++;
     size_t n=p-start;
     sp_str_split_push(a,start,n);
-    while(*p==' '||*p=='\t'||*p=='\n'||*p=='\r'||*p=='\f'||*p=='\v')p++;
+    while(p<e&&SP_SPLIT_WS(*p))p++;
   }
   return a;
 }
@@ -946,26 +1107,26 @@ sp_StrArray*sp_str_split_ws_limit(const char*s,sp_int n){if(!s)sp_nil_recv("spli
   SP_GC_ROOT_STR(s);
   sp_StrArray*a=sp_StrArray_new();
   SP_GC_ROOT(a);
-  if(*s==0)return a;
-  if(n==1){sp_str_split_push(a,s,strlen(s));return a;}
+  const char*e=s+sp_str_byte_len(s);
+  if(e==s)return a;
+  if(n==1){sp_str_split_push(a,s,(size_t)(e-s));return a;}
   const char*p=s;
-#define SP_SPLIT_WS(c) ((c)==' '||(c)=='\t'||(c)=='\n'||(c)=='\r'||(c)=='\f'||(c)=='\v')
-  while(SP_SPLIT_WS(*p))p++;
-  if(!*p){sp_str_split_push(a,p,0);return a;}
+  while(p<e&&SP_SPLIT_WS(*p))p++;
+  if(p==e){sp_str_split_push(a,p,0);return a;}
   sp_int k=0;
-  while(*p){
+  while(p<e){
     const char*start=p;
-    while(*p&&!SP_SPLIT_WS(*p))p++;
+    while(p<e&&!SP_SPLIT_WS(*p))p++;
     sp_str_split_push(a,start,(size_t)(p-start));
     k++;
     const char*sep_start=p;
-    while(SP_SPLIT_WS(*p))p++;
-    if(!*p){if(p>sep_start&&(n<0||(n>0&&k<n)))sp_str_split_push(a,p,0);break;}
-    if(n>0&&k==n-1){sp_str_split_push(a,p,strlen(p));break;}
+    while(p<e&&SP_SPLIT_WS(*p))p++;
+    if(p==e){if(p>sep_start&&(n<0||(n>0&&k<n)))sp_str_split_push(a,p,0);break;}
+    if(n>0&&k==n-1){sp_str_split_push(a,p,(size_t)(e-p));break;}
   }
-#undef SP_SPLIT_WS
   return a;
 }
+#undef SP_SPLIT_WS
 /* String-pattern String#scan. Regexp scans use sp_re_scan; this path handles
    a String argument, returning non-overlapping literal matches. The empty
    pattern matches at every UTF-8 character boundary, including both ends. */
@@ -974,14 +1135,29 @@ sp_StrArray*sp_str_scan(const char*s,const char*pat){if(!s)sp_nil_recv("scan");
   sp_StrArray*a=sp_StrArray_new();SP_GC_ROOT(a);
   if(!pat)sp_raise_cls("TypeError","wrong argument type nil (expected Regexp)");
   size_t pl=strlen(pat);
+  /* `$~` is the last match, or nil when there was none */
   if(pl==0){
     const char*p=s;
     for(;;){sp_str_split_push(a,p,0);if(!*p)break;p+=sp_utf8_advance(p);}
+    if(sp_re_track_last)sp_re_set_lit_match(s,(sp_int)(p-s),(sp_int)(p-s));
     return a;
   }
-  const char*p=s,*f;
-  while((f=strstr(p,pat))!=NULL){sp_str_split_push(a,f,pl);p=f+pl;}
+  const char*p=s,*f,*last=NULL;
+  while((f=strstr(p,pat))!=NULL){sp_str_split_push(a,f,pl);last=f;p=f+pl;}
+  if(sp_re_track_last){if(last)sp_re_set_lit_match(s,(sp_int)(last-s),(sp_int)(last-s+pl));else sp_re_clear_last_match();}
   return a;
+}
+/* One turn of `s.scan(pat) { }` whose block reads `$~`: sp_str_scan builds
+   the rows up front, so each turn finds its own match again from byte `pos`
+   and sets the registers to it (#3601). Answers where the next turn looks. */
+sp_int sp_str_scan_at(const char*s,const char*pat,sp_int pos){SP_GC_ROOT_STR(s);
+  size_t pl=strlen(pat);
+  const char*f=pl?strstr(s+pos,pat):s+pos;
+  if(!f)return pos;
+  sp_int at=(sp_int)(f-s);
+  sp_re_set_lit_match(s,at,at+(sp_int)pl);
+  if(pl)return at+(sp_int)pl;
+  return *f?at+sp_utf8_advance(f):at+1;
 }
 /* String#gsub(pat, rep) for literal (non-regex) patterns. Issue #827: the
    result must come from sp_str_alloc, not a raw malloc buffer, because the
@@ -1025,6 +1201,7 @@ const char*sp_str_gsub(const char*s,const char*pat,const char*rep){SP_GC_ROOT_ST
   if(rep_exp)rep=rep_exp;
   size_t pl=pl0,rl=rep_exp?strlen(rep):sp_str_byte_len(rep),sl=sp_str_byte_len(s);
   if(pl==0){
+    sp_re_sub_matched=1;
     /* Empty pattern: insert rep between every codepoint + at start/end.
        Result size: (chars+1) * rl + sl. */
     size_t cap=sl+(rl*(sl+1))+1;
@@ -1038,35 +1215,52 @@ const char*sp_str_gsub(const char*s,const char*pat,const char*rep){SP_GC_ROOT_ST
       i+=(size_t)n;
     }
     out[ol]=0;
+    if(sp_re_track_last)sp_re_set_lit_match(s,(sp_int)sl,(sp_int)sl);   /* `$~`: the last, empty, match at the end */
     char*r=sp_str_alloc(ol); memcpy(r,out,ol); sp_str_set_len(r,ol); free(out); if(rep_exp)free(rep_exp); return r;
   }
   size_t cap=(sl*2)+1;
   char*out=(char*)malloc(cap);
   size_t ol=0;
-  const char*p=s;const char*se=s+sl;
+  const char*p=s;const char*se=s+sl;const char*last=NULL;
   while(p<se){
     const char*f=sp_bytestr(p,(size_t)(se-p),pat,pl);
     if(!f){size_t n=(size_t)(se-p);if(ol+n>=cap){cap=((ol+n)*2)+1;out=(char*)realloc(out,cap);}memcpy(out+ol,p,n);ol+=n;break;}
+    sp_re_sub_matched=1;
+    last=f;
     size_t n=(size_t)(f-p);
     if(ol+n+rl>=cap){cap=((ol+n+rl)*2)+1;out=(char*)realloc(out,cap);}
     memcpy(out+ol,p,n);ol+=n;
     memcpy(out+ol,rep,rl);ol+=rl;
     p=f+pl;
   }
+  /* `$~` is the last match, or nil when there was none */
+  if(sp_re_track_last){if(last)sp_re_set_lit_match(s,(sp_int)(last-s),(sp_int)(last-s+pl));else sp_re_clear_last_match();}
   out[ol]=0;char*r=sp_str_alloc(ol);memcpy(r,out,ol);sp_str_set_len(r,ol);free(out);if(rep_exp)free(rep_exp);return r;
 }
 /* `s.index(sub)` -- leftmost occurrence; returns a codepoint offset (not a
    byte offset), or -1 if not found. */
-sp_int sp_str_index(const char*s,const char*sub){if(!s)sp_nil_recv("index");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");const char*f=sp_bytestr(s,sp_str_byte_len(s),sub,sp_str_byte_len(sub));if(!f)return -1;sp_int n=0;const char*p=s;while(p<f){p+=sp_utf8_advance(p);n++;}return n;}
+/* The characters from `from` up to `to` inside s, and the byte offset of
+   character n: one unit per byte for a BINARY string, whatever its bytes
+   spell in UTF-8, so `"\xC3\xA9\xFF".b.index("\xFF".b)` is 2 (#5535). */
+static sp_int sp_str_units_between(const char *s, const char *from, const char *to) {
+  if (sp_str_is_binary(s)) return (sp_int)(to - from);
+  sp_int n = 0;
+  while (from < to) { from += sp_utf8_advance(from); n++; }
+  return n;
+}
+static size_t sp_str_unit_offset(const char *s, sp_int n) {
+  return sp_str_is_binary(s) ? (size_t)n : sp_utf8_byte_offset(s, n);
+}
+sp_int sp_str_index(const char*s,const char*sub){if(!s)sp_nil_recv("index");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");const char*f=sp_bytestr(s,sp_str_byte_len(s),sub,sp_str_byte_len(sub));if(!f)return -1;return sp_str_units_between(s,s,f);}
 /* Issue #758: NULL guard + bound the start so a negative result from
    sp_str_index doesn't underflow the source pointer. */
-sp_int sp_str_index_from(const char*s,const char*sub,sp_int start){if(!s)sp_nil_recv("index");sp_int cl=sp_str_length(s);if(start<0)start+=cl;if(start<0)start=0;if(start>cl)return -1;size_t boff=sp_utf8_byte_offset(s,start);const char*f=sp_bytestr(s+boff,sp_str_byte_len(s)-boff,sub,sp_str_byte_len(sub));if(!f)return -1;sp_int n=start;const char*p=s+boff;while(p<f){p+=sp_utf8_advance(p);n++;}return n;}
+sp_int sp_str_index_from(const char*s,const char*sub,sp_int start){if(!s)sp_nil_recv("index");sp_int cl=sp_str_length(s);if(start<0)start+=cl;if(start<0)return -1;if(start>cl)return -1;size_t boff=sp_str_unit_offset(s,start);const char*f=sp_bytestr(s+boff,sp_str_byte_len(s)-boff,sub,sp_str_byte_len(sub));if(!f)return -1;return start+sp_str_units_between(s,s+boff,f);}
 /* `s.rindex(sub)` -- rightmost occurrence of sub; returns a codepoint
    offset, or -1 if not found. Empty sub matches at the end. */
-sp_int sp_str_rindex(const char*s,const char*sub){if(!s)sp_nil_recv("rindex");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");size_t sl=sp_str_byte_len(sub);if(sl==0)return sp_str_length(s);size_t hn=sp_str_byte_len(s);const char*end=s+hn;const char*last=NULL;const char*p=s;while(p<end){const char*f=sp_bytestr(p,(size_t)(end-p),sub,sl);if(!f)break;last=f;p=f+1;}if(!last)return -1;sp_int n=0;const char*q=s;while(q<last){q+=sp_utf8_advance(q);n++;}return n;}
+sp_int sp_str_rindex(const char*s,const char*sub){if(!s)sp_nil_recv("rindex");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");size_t sl=sp_str_byte_len(sub);if(sl==0)return sp_str_length(s);size_t hn=sp_str_byte_len(s);const char*end=s+hn;const char*last=NULL;const char*p=s;while(p<end){const char*f=sp_bytestr(p,(size_t)(end-p),sub,sl);if(!f)break;last=f;p=f+1;}if(!last)return -1;return sp_str_units_between(s,s,last);}
 /* `s.rindex(sub, pos)` -- rightmost occurrence at or before codepoint pos.
    Negative pos counts back from the char length; nil (SP_INT_NIL) on miss. */
-sp_int sp_str_rindex_from(const char*s,const char*sub,sp_int pos){if(!s)sp_nil_recv("rindex");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");sp_int cl=sp_str_length(s);if(pos<0)pos=cl+pos;if(pos<0)return SP_INT_NIL;size_t sl=sp_str_byte_len(sub);if(sl==0){if(pos>=cl)return cl;return pos;}size_t hn=sp_str_byte_len(s);const char*end=s+hn;const char*p=s;sp_int best=-1;const char*r=s;sp_int cur_n=0;while(p<end){const char*f=sp_bytestr(p,(size_t)(end-p),sub,sl);if(!f)break;while(r<f){r+=sp_utf8_advance(r);cur_n++;}if(cur_n>pos)break;best=cur_n;p=f+1;}return best<0?SP_INT_NIL:best;}
+sp_int sp_str_rindex_from(const char*s,const char*sub,sp_int pos){if(!s)sp_nil_recv("rindex");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");sp_int cl=sp_str_length(s);if(pos<0)pos=cl+pos;if(pos<0)return SP_INT_NIL;size_t sl=sp_str_byte_len(sub);if(sl==0){if(pos>=cl)return cl;return pos;}size_t hn=sp_str_byte_len(s);const char*end=s+hn;const char*p=s;sp_int best=-1;const char*r=s;sp_int cur_n=0;while(p<end){const char*f=sp_bytestr(p,(size_t)(end-p),sub,sl);if(!f)break;cur_n+=sp_str_units_between(s,r,f);r=f;if(cur_n>pos)break;best=cur_n;p=f+1;}return best<0?SP_INT_NIL:best;}
 /* byteindex/byterindex: like index/rindex but the result and the start/pos
    arguments are BYTE offsets, not codepoint indices. Byte-oriented throughout
    (sp_bytestr), so no utf8 walk is needed. nil (SP_INT_NIL) on miss. */
@@ -1085,13 +1279,17 @@ const char*sp_str_sub_range(const char*s,sp_int start,sp_int len){SP_GC_ROOT_STR
    yield CRuby's `"hello"[20] -> nil`. */
 const char*sp_str_char_at_or_nil(const char*s,sp_int i){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("[]");sp_int cl=sp_str_length(s);if(i<0)i+=cl;if(i<0||i>=cl)return NULL;return sp_str_sub_range(s,i,1);}
 const char*sp_str_sub_range_len(const char*s,sp_int cl,sp_int start,sp_int len){SP_GC_ROOT_STR(s);if(start<0)start+=cl;if(start<0||start>cl||len<0)return NULL;if(start==cl||len==0){return sp_str_is_binary(s)?sp_str_empty_binary():&("\xff" "")[1];}if(len>cl-start)len=cl-start;size_t _fb;int fixed=sp_str_fixed_width(s,&_fb);int bin=fixed?sp_str_is_binary(s):0;size_t boff=fixed?(size_t)start:sp_utf8_byte_offset(s,start);size_t blen_total=fixed?_fb:sp_str_byte_len(s);size_t bp=boff;sp_int rem=len;while(rem>0&&bp<blen_total){bp+=fixed?1:sp_utf8_advance(s+bp);rem--;}if(bp>blen_total)bp=blen_total;size_t bend=bp;size_t blen=bend-boff;if(bin&&len==1&&blen==1)return sp_bin_char((unsigned char)s[boff]);if(!bin&&len==1&&blen==1){unsigned char c=(unsigned char)s[boff];if(c!=0){if(!sp_char_cache_init){for(int i=0;i<256;i++){sp_char_cache[i][0]=(char)0xff;sp_char_cache[i][1]=(char)i;sp_char_cache[i][2]=0;}sp_char_cache_init=1;}return &sp_char_cache[c][1];}}char*r=sp_str_alloc_raw(blen+1);memcpy(r,s+boff,blen);r[blen]=0;sp_str_set_len(r,blen);if(bin)sp_str_mark_binary(r);return r;}
-const char*sp_str_sub_range_r(const char*s,sp_int start,sp_int end_,sp_int excl){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("[]");sp_int cl=sp_str_length(s);if(end_<0)end_+=cl;if(start<0)start+=cl;sp_int n=end_-start+(excl?0:1);if(n<0||start<0)n=0;return sp_str_sub_range_len(s,cl,start,n);}
-const char*sp_str_sub_range_len_r(const char*s,sp_int cl,sp_int start,sp_int end_,sp_int excl){SP_GC_ROOT_STR(s);if(end_<0)end_+=cl;if(start<0)start+=cl;sp_int n=end_-start+(excl?0:1);if(n<0||start<0)n=0;return sp_str_sub_range_len(s,cl,start,n);}
+const char*sp_str_sub_range_r(const char*s,sp_int start,sp_int end_,sp_int excl){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("[]");sp_int cl=sp_str_length(s);if(end_<0)end_+=cl;if(start<0)start+=cl;if(start<0)return NULL;if(end_>=cl){end_=cl;excl=1;}sp_int n=end_-start+(excl?0:1);if(n<0)n=0;return sp_str_sub_range_len(s,cl,start,n);}
+const char*sp_str_sub_range_len_r(const char*s,sp_int cl,sp_int start,sp_int end_,sp_int excl){SP_GC_ROOT_STR(s);if(end_<0)end_+=cl;if(start<0)start+=cl;if(start<0)return NULL;if(end_>=cl){end_=cl;excl=1;}sp_int n=end_-start+(excl?0:1);if(n<0)n=0;return sp_str_sub_range_len(s,cl,start,n);}
 /* walks by INDEX to the header length: `while(*p)` stopped at an embedded NUL
    and reversed only the prefix */
 const char*sp_str_reverse(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("reverse");size_t bl=sp_str_byte_len(s);char*r=sp_str_alloc_raw(bl+1);size_t end=bl;for(size_t i=0;i<bl;){int cn=sp_utf8_advance(s+i);if(cn<1)cn=1;if((size_t)cn>bl-i)cn=(int)(bl-i);end-=(size_t)cn;memcpy(r+end,s+i,(size_t)cn);i+=(size_t)cn;}r[bl]=0;sp_str_set_len(r,bl);return r;}
 sp_int sp_str_count(const char*s,const char*chars){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(chars);if(!chars)sp_raise_cls("TypeError","no implicit conversion of nil into String");int negate=0;const char*csp=chars;if(*csp=='^'&&*(csp+1)){negate=1;csp++;}size_t setn;uint32_t*set=sp_utf8_decode_charset_n(csp,sp_str_byte_len(chars)-(size_t)(csp-chars),&setn);sp_int c=0;const char*p=s;const char*end=s+sp_str_byte_len(s);while(p<end){uint32_t cp;p+=sp_utf8_decode(p,&cp);int in_set=sp_utf8_set_has(set,setn,cp);if(negate)in_set=!in_set;if(in_set)c++;}free(set);return c;}
 sp_int sp_str_count_n(const char*s,const char**chars,sp_int n){SP_GC_ROOT_STR(s);if(n<=0)return 0;size_t*setns=(size_t*)malloc(n*sizeof(size_t));uint32_t**sets=(uint32_t**)malloc(n*sizeof(uint32_t*));int*negs=(int*)malloc(n*sizeof(int));for(sp_int i=0;i<n;i++){if(!chars[i])sp_raise_cls("TypeError","no implicit conversion of nil into String");const char*cs=chars[i];negs[i]=0;if(*cs=='^'&&*(cs+1)){negs[i]=1;cs++;}sets[i]=sp_utf8_decode_charset_n(cs,sp_str_byte_len(chars[i])-(size_t)(cs-chars[i]),&setns[i]);}sp_int c=0;const char*p=s;const char*end=s+sp_str_byte_len(s);while(p<end){uint32_t cp;p+=sp_utf8_decode(p,&cp);int all=1;for(sp_int i=0;i<n;i++){int in_set=sp_utf8_set_has(sets[i],setns[i],cp);if(negs[i])in_set=!in_set;if(!in_set){all=0;break;}}if(all)c++;}for(sp_int i=0;i<n;i++)free(sets[i]);free(sets);free(setns);free(negs);return c;}
+/* The codepoints walked to the recorded byte length, as sp_str_chars walks:
+   a BINARY String's are its bytes, and a NUL is a character like any other.
+   String#codepoints with a block yields these. */
+sp_IntArray*sp_str_codepoints_all(const char*s){SP_GC_ROOT_STR(s);sp_IntArray*a=sp_IntArray_new();if(!s)sp_nil_recv("codepoints");SP_GC_ROOT(a);int bin=sp_str_is_binary(s);const char*end=s+sp_str_byte_len(s);const char*p=s;while(p<end){uint32_t cp;int n=1;if(bin)cp=(unsigned char)*p;else n=sp_utf8_decode(p,&cp);if(p+n>end)n=(int)(end-p);sp_IntArray_push(a,(sp_int)cp);p+=n;}return a;}
 sp_IntArray*sp_str_codepoints(const char*s){SP_GC_ROOT_STR(s);sp_IntArray*a=sp_IntArray_new();if(!s)sp_nil_recv("codepoints");const char*p=s;while(*p){uint32_t cp;int n=sp_utf8_decode(p,&cp);sp_IntArray_push(a,(sp_int)cp);p+=n;}return a;}
 /* walk to the recorded byte length rather than to the first NUL: a NUL is an
    ordinary one-byte character and the characters after it are real (#3473) */
@@ -1156,7 +1354,7 @@ else {
 }
 const char*sp_str_delete(const char*s,const char*chars){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(chars);if(!s)sp_nil_recv("delete");if(!chars)return s;int negate=0;const char*csp=chars;if(*csp=='^'&&*(csp+1)){negate=1;csp++;}size_t setn;uint32_t*set=sp_utf8_decode_charset_n(csp,sp_str_byte_len(chars)-(size_t)(csp-chars),&setn);size_t bl=sp_str_byte_len(s);char*buf=(char*)malloc(bl+1);if(!buf)sp_oom_die();size_t n=0;const char*p=s,*pe=s+bl;while(p<pe){uint32_t cp;int cn=sp_utf8_decode(p,&cp);int in_set=sp_utf8_set_has(set,setn,cp);if(negate)in_set=!in_set;if(!in_set){memcpy(buf+n,p,cn);n+=cn;}p+=cn;}buf[n]=0;free(set);char*r=sp_str_alloc(n);memcpy(r,buf,n+1);free(buf);return r;}
 const char*sp_str_squeeze(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("squeeze");size_t bl=sp_str_byte_len(s);char*r=sp_str_alloc_raw(bl+1);size_t n=0;uint32_t prev=0xFFFFFFFFu;const char*p=s,*pe=s+bl;while(p<pe){uint32_t cp;int cn=sp_utf8_decode(p,&cp);if(cp!=prev){memcpy(r+n,p,cn);n+=cn;prev=cp;}p+=cn;}r[n]=0;sp_str_set_len(r,n);return r;}
-const char*sp_str_squeeze_chars(const char*s,const char*cs){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(cs);if(!s)sp_nil_recv("squeeze");if(!cs||!*cs)return sp_str_squeeze(s);int negate=0;const char*csp=cs;if(*csp=='^'&&*(csp+1)){negate=1;csp++;}size_t fn;uint32_t*fcps=sp_utf8_decode_charset_n(csp,sp_str_byte_len(cs)-(size_t)(csp-cs),&fn);size_t bl=sp_str_byte_len(s);char*r=sp_str_alloc_raw(bl+1);size_t n=0;uint32_t prev=0xFFFFFFFFu;const char*p=s,*pe=s+bl;while(p<pe){uint32_t cp;int cn=sp_utf8_decode(p,&cp);int in_set=0;for(size_t j=0;j<fn;j++)if(fcps[j]==cp){in_set=1;break;}if(negate)in_set=!in_set;if(!in_set){memcpy(r+n,p,cn);n+=cn;prev=0xFFFFFFFFu;}
+const char*sp_str_squeeze_chars(const char*s,const char*cs){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(cs);if(!s)sp_nil_recv("squeeze");if(!cs)return sp_str_squeeze(s);int negate=0;const char*csp=cs;if(*csp=='^'&&*(csp+1)){negate=1;csp++;}size_t fn;uint32_t*fcps=sp_utf8_decode_charset_n(csp,sp_str_byte_len(cs)-(size_t)(csp-cs),&fn);size_t bl=sp_str_byte_len(s);char*r=sp_str_alloc_raw(bl+1);size_t n=0;uint32_t prev=0xFFFFFFFFu;const char*p=s,*pe=s+bl;while(p<pe){uint32_t cp;int cn=sp_utf8_decode(p,&cp);int in_set=0;for(size_t j=0;j<fn;j++)if(fcps[j]==cp){in_set=1;break;}if(negate)in_set=!in_set;if(!in_set){memcpy(r+n,p,cn);n+=cn;prev=0xFFFFFFFFu;}
 else if(cp!=prev){memcpy(r+n,p,cn);n+=cn;prev=cp;}p+=cn;}r[n]=0;sp_str_set_len(r,n);free(fcps);return r;}
 const char*sp_str_delete_n(const char*s,const char**chars,sp_int n){SP_GC_ROOT_STR(s);if(!s)return sp_str_empty;if(n<=0)return s;size_t*setns=(size_t*)malloc(n*sizeof(size_t));uint32_t**sets=(uint32_t**)malloc(n*sizeof(uint32_t*));int*negs=(int*)malloc(n*sizeof(int));for(sp_int i=0;i<n;i++){if(!chars[i])sp_raise_cls("TypeError","no implicit conversion of nil into String");const char*cs=chars[i];negs[i]=0;if(*cs=='^'&&*(cs+1)){negs[i]=1;cs++;}sets[i]=sp_utf8_decode_charset_n(cs,sp_str_byte_len(chars[i])-(size_t)(cs-chars[i]),&setns[i]);}size_t bl=sp_str_byte_len(s);char*buf=(char*)malloc(bl+1);if(!buf)sp_oom_die();size_t m=0;const char*p=s,*pe=s+bl;while(p<pe){uint32_t cp;int cn=sp_utf8_decode(p,&cp);int all=1;for(sp_int i=0;i<n;i++){int in_set=sp_utf8_set_has(sets[i],setns[i],cp);if(negs[i])in_set=!in_set;if(!in_set){all=0;break;}}if(!all){memcpy(buf+m,p,cn);m+=cn;}p+=cn;}buf[m]=0;for(sp_int i=0;i<n;i++)free(sets[i]);free(sets);free(setns);free(negs);char*r=sp_str_alloc(m);memcpy(r,buf,m+1);free(buf);return r;}
 const char*sp_str_squeeze_n(const char*s,const char**chars,sp_int n){SP_GC_ROOT_STR(s);if(!s)return sp_str_empty;if(n<=0)return sp_str_squeeze(s);size_t*setns=(size_t*)malloc(n*sizeof(size_t));uint32_t**sets=(uint32_t**)malloc(n*sizeof(uint32_t*));int*negs=(int*)malloc(n*sizeof(int));for(sp_int i=0;i<n;i++){if(!chars[i])sp_raise_cls("TypeError","no implicit conversion of nil into String");const char*cs=chars[i];negs[i]=0;if(*cs=='^'&&*(cs+1)){negs[i]=1;cs++;}sets[i]=sp_utf8_decode_charset_n(cs,sp_str_byte_len(chars[i])-(size_t)(cs-chars[i]),&setns[i]);}size_t bl=sp_str_byte_len(s);char*r=sp_str_alloc_raw(bl+1);size_t m=0;uint32_t prev=0xFFFFFFFFu;const char*p=s,*pe=s+bl;while(p<pe){uint32_t cp;int cn=sp_utf8_decode(p,&cp);int all=1;for(sp_int i=0;i<n;i++){int in_set=sp_utf8_set_has(sets[i],setns[i],cp);if(negs[i])in_set=!in_set;if(!in_set){all=0;break;}}if(!all){memcpy(r+m,p,cn);m+=cn;prev=0xFFFFFFFFu;}
@@ -1172,57 +1370,93 @@ const char *sp_str_scrub_bang(const char *s, const char *repl) {
   sp_str_check_mutable(s);
   return r;
 }
-const char *sp_str_scrub(const char *s, const char *repl) {SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(repl);
+/* The length of the UTF-8 character at p (n bytes left), or of the invalid
+   sequence there, *bad set: a lead byte and the continuation bytes that fit
+   it before one that does not, as CRuby takes them (Unicode's maximal
+   subpart), so a truncated "\xE3\x81" is one sequence and an overlong
+   "\xC0\xAF" or a surrogate "\xED\xA0\x80" is one per byte. */
+static size_t sp_utf8_scan1(const unsigned char *p, size_t n, int *bad) {
+  unsigned char c = p[0], lo = 0x80, hi = 0xBF;
+  int need;
+  *bad = 0;
+  if (c < 0x80) return 1;
+  if (c >= 0xC2 && c <= 0xDF) need = 1;
+  else if (c >= 0xE0 && c <= 0xEF) { need = 2; if (c == 0xE0) lo = 0xA0; else if (c == 0xED) hi = 0x9F; }
+  else if (c >= 0xF0 && c <= 0xF4) { need = 3; if (c == 0xF0) lo = 0x90; else if (c == 0xF4) hi = 0x8F; }
+  else { *bad = 1; return 1; }
+  size_t k = 1;
+  for (; k <= (size_t)need; k++) {
+    if (k >= n || p[k] < lo || p[k] > hi) { *bad = 1; return k; }
+    lo = 0x80; hi = 0xBF;
+  }
+  return k;
+}
+/* String#scrub's walk: the offset of the first invalid sequence of s (bl
+   bytes) at or after `from`, its length in *len; bl when there is none. */
+sp_int sp_str_scrub_bad(const char *s, sp_int bl, sp_int from, sp_int *len) {
+  sp_int i = from;
+  while (i < bl) {
+    int bad;
+    size_t k = sp_utf8_scan1((const unsigned char *)s + i, (size_t)(bl - i), &bad);
+    if (bad) { *len = (sp_int)k; return i; }
+    i += (sp_int)k;
+  }
+  *len = 0;
+  return bl;
+}
+/* A replacement scrub's block answered: valid UTF-8, or CRuby's
+   ArgumentError naming it. */
+const char *sp_str_scrub_repl(const char *r) {
+  sp_int len, bl = (sp_int)sp_str_byte_len(r);
+  if (sp_str_scrub_bad(r, bl, 0, &len) < bl)
+    sp_raise_cls("ArgumentError", sp_sprintf("replacement must be valid byte sequence '%s'", sp_str_inspect(r)));
+  return r;
+}
+/* String#scrub: an ASCII-8BIT receiver has no invalid sequence, so CRuby
+   answers a copy of it, still ASCII-8BIT, without looking at the
+   replacement; any other receiver is walked as UTF-8 (sp_str_scrub_utf8). */
+const char *sp_str_scrub(const char *s, const char *repl) {
+  if (s && sp_str_is_binary(s)) return sp_str_dup(s);
+  return sp_str_scrub_utf8(s, repl);
+}
+/* each invalid UTF-8 sequence (sp_str_scrub_bad) is replaced; a NULL
+   replacement is U+FFFD (3 UTF-8 bytes: EF BF BD), as in CRuby. encode's
+   UTF-8 to UTF-8 conversion calls it whatever the receiver's flag. */
+const char *sp_str_scrub_utf8(const char *s, const char *repl) {SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(repl);
   if(!s)sp_nil_recv("scrub");
   static const char fffd[] = "\xEF\xBF\xBD";
   const char *r = repl ? repl : fffd;
   size_t rlen = strlen(r);
-  size_t bl = sp_str_byte_len(s);
-  size_t cap = bl + 64;
+  sp_int bl = (sp_int)sp_str_byte_len(s);
+  size_t cap = (size_t)bl + 64;
  /* malloc scratch (grown with realloc on invalid-byte runs); the final
     string is emitted at the exact length below. */
   char *out = (char *)malloc(cap);
   size_t olen = 0;
-  size_t i = 0;
+  sp_int i = 0;
   while (i < bl) {
-    unsigned char c = (unsigned char)s[i];
-    int expected = sp_utf8_char_len(c);
-    int valid = 1;
-    if (expected == 1) {
-      if (c >= 0x80) valid = 0;
-    }
-else {
-      if (i + (size_t)expected > bl) valid = 0;
-      else {
-        for (int k = 1; k < expected; k++) {
-          if (((unsigned char)s[i + k] & 0xC0) != 0x80) { valid = 0; break; }
-        }
-      }
-    }
-    if (valid) {
-      if (olen + (size_t)expected + 1 >= cap) { cap = ((olen + expected) * 2) + 64; out = (char*)realloc(out, cap); }
-      memcpy(out + olen, s + i, (size_t)expected);
-      olen += (size_t)expected;
-      i += (size_t)expected;
-    }
-else {
-      if (olen + rlen + 1 >= cap) { cap = ((olen + rlen) * 2) + 64; out = (char*)realloc(out, cap); }
-      memcpy(out + olen, r, rlen);
-      olen += rlen;
-      i += 1;
-    }
+    sp_int len, at = sp_str_scrub_bad(s, bl, i, &len);
+    if (at < bl && repl && i == 0) sp_str_scrub_repl(repl);   /* checked once, where it is used */
+    size_t keep = (size_t)(at - i), add = at < bl ? rlen : 0;
+    if (olen + keep + add + 1 >= cap) { cap = (olen + keep + add) * 2 + 64; out = (char *)realloc(out, cap); }
+    memcpy(out + olen, s + i, keep);
+    olen += keep;
+    memcpy(out + olen, r, add);
+    olen += add;
+    i = at + len;
+    if (at >= bl) break;
   }
   char *res = sp_str_alloc(olen);
   memcpy(res, out, olen);
   free(out);
   return res;
 }
-const char*sp_str_ljust(const char*s,sp_int w){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("ljust");sp_int cl=sp_str_length(s);if(cl>=w)return s;size_t bl=sp_str_byte_len(s);size_t pad=(size_t)(w-cl);char*r=sp_str_alloc_raw(bl+pad+1);memcpy(r,s,bl);memset(r+bl,' ',pad);r[bl+pad]=0;sp_str_set_len(r,bl+pad);return r;}
-const char*sp_str_rjust(const char*s,sp_int w){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("rjust");sp_int cl=sp_str_length(s);if(cl>=w)return s;size_t bl=sp_str_byte_len(s);size_t pad=(size_t)(w-cl);char*r=sp_str_alloc_raw(bl+pad+1);memset(r,' ',pad);memcpy(r+pad,s,bl);r[bl+pad]=0;sp_str_set_len(r,bl+pad);return r;}
-const char*sp_str_center(const char*s,sp_int w){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("center");sp_int cl=sp_str_length(s);if(cl>=w)return s;size_t bl=sp_str_byte_len(s);sp_int pad=w-cl;sp_int left=pad/2;sp_int right=pad-left;char*r=sp_str_alloc_raw(bl+pad+1);memset(r,' ',left);memcpy(r+left,s,bl);memset(r+left+bl,' ',right);r[bl+pad]=0;sp_str_set_len(r,bl+(size_t)pad);return r;}
-const char*sp_str_ljust2(const char*s,sp_int w,const char*pad){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(pad);if(!s)sp_nil_recv("ljust");/* an empty pad is rejected whatever the width, before the no-op case */if(!pad||sp_str_byte_len(pad)==0)sp_raise_cls("ArgumentError","zero width padding");sp_int cl=sp_str_length(s);if(cl>=w)return s;size_t bl=sp_str_byte_len(s);size_t pn;uint32_t*pcps=sp_utf8_decode_all(pad,&pn);if(pn==0){free(pcps);char*r=sp_str_alloc_raw(bl+1);memcpy(r,s,bl+1);sp_str_set_len(r,bl);return r;}sp_int need=w-cl;size_t padb=0;for(sp_int i=0;i<need;i++){char tmp[4];padb+=sp_utf8_encode(pcps[i%pn],tmp);}char*r=sp_str_alloc_raw(bl+padb+1);memcpy(r,s,bl);size_t n=bl;for(sp_int i=0;i<need;i++)n+=sp_utf8_encode(pcps[i%pn],r+n);r[n]=0;sp_str_set_len(r,n);free(pcps);return r;}
-const char*sp_str_rjust2(const char*s,sp_int w,const char*pad){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(pad);if(!s)sp_nil_recv("rjust");/* an empty pad is rejected whatever the width, before the no-op case */if(!pad||sp_str_byte_len(pad)==0)sp_raise_cls("ArgumentError","zero width padding");sp_int cl=sp_str_length(s);if(cl>=w)return s;size_t bl=sp_str_byte_len(s);size_t pn;uint32_t*pcps=sp_utf8_decode_all(pad,&pn);if(pn==0){free(pcps);char*r=sp_str_alloc_raw(bl+1);memcpy(r,s,bl+1);sp_str_set_len(r,bl);return r;}sp_int need=w-cl;size_t padb=0;for(sp_int i=0;i<need;i++){char tmp[4];padb+=sp_utf8_encode(pcps[i%pn],tmp);}char*r=sp_str_alloc_raw(bl+padb+1);size_t n=0;for(sp_int i=0;i<need;i++)n+=sp_utf8_encode(pcps[i%pn],r+n);memcpy(r+n,s,bl);r[n+bl]=0;sp_str_set_len(r,n+bl);free(pcps);return r;}
-const char*sp_str_center2(const char*s,sp_int w,const char*pad){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(pad);if(!s)sp_nil_recv("center");/* an empty pad is rejected whatever the width, before the no-op case */if(!pad||sp_str_byte_len(pad)==0)sp_raise_cls("ArgumentError","zero width padding");sp_int cl=sp_str_length(s);if(cl>=w)return s;size_t bl=sp_str_byte_len(s);size_t pn;uint32_t*pcps=sp_utf8_decode_all(pad,&pn);if(pn==0){free(pcps);char*r=sp_str_alloc_raw(bl+1);memcpy(r,s,bl+1);sp_str_set_len(r,bl);return r;}sp_int pd=w-cl;sp_int left=pd/2;sp_int right=pd-left;size_t leftb=0,rightb=0;{char tmp[4];for(sp_int i=0;i<left;i++)leftb+=sp_utf8_encode(pcps[i%pn],tmp);for(sp_int i=0;i<right;i++)rightb+=sp_utf8_encode(pcps[i%pn],tmp);}char*r=sp_str_alloc_raw(leftb+bl+rightb+1);size_t n=0;for(sp_int i=0;i<left;i++)n+=sp_utf8_encode(pcps[i%pn],r+n);memcpy(r+n,s,bl);n+=bl;for(sp_int i=0;i<right;i++)n+=sp_utf8_encode(pcps[i%pn],r+n);r[n]=0;sp_str_set_len(r,n);free(pcps);return r;}
+const char*sp_str_ljust(const char*s,sp_int w){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("ljust");sp_int cl=sp_str_length(s);if(cl>=w)return sp_str_dup(s);size_t bl=sp_str_byte_len(s);const char*e=sp_justify_size_err(bl,(uint64_t)(w-cl));if(e)sp_justify_size_raise(e);size_t pad=(size_t)(w-cl);char*r=sp_str_alloc_raw(bl+pad+1);memcpy(r,s,bl);memset(r+bl,' ',pad);r[bl+pad]=0;sp_str_set_len(r,bl+pad);return r;}
+const char*sp_str_rjust(const char*s,sp_int w){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("rjust");sp_int cl=sp_str_length(s);if(cl>=w)return sp_str_dup(s);size_t bl=sp_str_byte_len(s);const char*e=sp_justify_size_err(bl,(uint64_t)(w-cl));if(e)sp_justify_size_raise(e);size_t pad=(size_t)(w-cl);char*r=sp_str_alloc_raw(bl+pad+1);memset(r,' ',pad);memcpy(r+pad,s,bl);r[bl+pad]=0;sp_str_set_len(r,bl+pad);return r;}
+const char*sp_str_center(const char*s,sp_int w){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("center");sp_int cl=sp_str_length(s);if(cl>=w)return sp_str_dup(s);size_t bl=sp_str_byte_len(s);const char*e=sp_justify_size_err(bl,(uint64_t)(w-cl));if(e)sp_justify_size_raise(e);sp_int pad=w-cl;sp_int left=pad/2;sp_int right=pad-left;char*r=sp_str_alloc_raw(bl+pad+1);memset(r,' ',left);memcpy(r+left,s,bl);memset(r+left+bl,' ',right);r[bl+pad]=0;sp_str_set_len(r,bl+(size_t)pad);return r;}
+const char*sp_str_ljust2(const char*s,sp_int w,const char*pad){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(pad);if(!s)sp_nil_recv("ljust");/* an empty pad is rejected whatever the width, before the no-op case */if(!pad||sp_str_byte_len(pad)==0)sp_raise_cls("ArgumentError","zero width padding");sp_int cl=sp_str_length(s);if(cl>=w)return sp_str_dup(s);size_t bl=sp_str_byte_len(s);size_t pn;uint32_t*pcps=sp_utf8_decode_all(pad,&pn);if(pn==0){free(pcps);char*r=sp_str_alloc_raw(bl+1);memcpy(r,s,bl+1);sp_str_set_len(r,bl);return r;}sp_int need=w-cl;const char*e=sp_justify_size_err(bl,sp_pad_bytes(pcps,pn,(uint64_t)need));if(e){free(pcps);sp_justify_size_raise(e);}size_t padb=(size_t)sp_pad_bytes(pcps,pn,(uint64_t)need);char*r=sp_str_alloc_raw(bl+padb+1);memcpy(r,s,bl);size_t n=bl;for(sp_int i=0;i<need;i++)n+=sp_utf8_encode(pcps[i%pn],r+n);r[n]=0;sp_str_set_len(r,n);free(pcps);return r;}
+const char*sp_str_rjust2(const char*s,sp_int w,const char*pad){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(pad);if(!s)sp_nil_recv("rjust");/* an empty pad is rejected whatever the width, before the no-op case */if(!pad||sp_str_byte_len(pad)==0)sp_raise_cls("ArgumentError","zero width padding");sp_int cl=sp_str_length(s);if(cl>=w)return sp_str_dup(s);size_t bl=sp_str_byte_len(s);size_t pn;uint32_t*pcps=sp_utf8_decode_all(pad,&pn);if(pn==0){free(pcps);char*r=sp_str_alloc_raw(bl+1);memcpy(r,s,bl+1);sp_str_set_len(r,bl);return r;}sp_int need=w-cl;const char*e=sp_justify_size_err(bl,sp_pad_bytes(pcps,pn,(uint64_t)need));if(e){free(pcps);sp_justify_size_raise(e);}size_t padb=(size_t)sp_pad_bytes(pcps,pn,(uint64_t)need);char*r=sp_str_alloc_raw(bl+padb+1);size_t n=0;for(sp_int i=0;i<need;i++)n+=sp_utf8_encode(pcps[i%pn],r+n);memcpy(r+n,s,bl);r[n+bl]=0;sp_str_set_len(r,n+bl);free(pcps);return r;}
+const char*sp_str_center2(const char*s,sp_int w,const char*pad){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(pad);if(!s)sp_nil_recv("center");/* an empty pad is rejected whatever the width, before the no-op case */if(!pad||sp_str_byte_len(pad)==0)sp_raise_cls("ArgumentError","zero width padding");sp_int cl=sp_str_length(s);if(cl>=w)return sp_str_dup(s);size_t bl=sp_str_byte_len(s);size_t pn;uint32_t*pcps=sp_utf8_decode_all(pad,&pn);if(pn==0){free(pcps);char*r=sp_str_alloc_raw(bl+1);memcpy(r,s,bl+1);sp_str_set_len(r,bl);return r;}sp_int pd=w-cl;sp_int left=pd/2;sp_int right=pd-left;uint64_t lb64=sp_pad_bytes(pcps,pn,(uint64_t)left),rb64=sp_pad_bytes(pcps,pn,(uint64_t)right);const char*e=sp_justify_size_err(bl,(lb64==UINT64_MAX||rb64==UINT64_MAX||lb64>UINT64_MAX-rb64)?UINT64_MAX:lb64+rb64);if(e){free(pcps);sp_justify_size_raise(e);}size_t leftb=(size_t)lb64,rightb=(size_t)rb64;char*r=sp_str_alloc_raw(leftb+bl+rightb+1);size_t n=0;for(sp_int i=0;i<left;i++)n+=sp_utf8_encode(pcps[i%pn],r+n);memcpy(r+n,s,bl);n+=bl;for(sp_int i=0;i<right;i++)n+=sp_utf8_encode(pcps[i%pn],r+n);r[n]=0;sp_str_set_len(r,n);free(pcps);return r;}
 sp_int sp_str_index_opt(const char *s, const char *sub)                          {SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(sub); sp_int n = sp_str_index(s, sub);              return n < 0 ? SP_INT_NIL : n; }
 sp_int sp_str_index_from_opt(const char *s, const char *sub, sp_int start)      {SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(sub); sp_int n = sp_str_index_from(s, sub, start);  return n < 0 ? SP_INT_NIL : n; }
 sp_int sp_str_rindex_opt(const char *s, const char *sub)                         {SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(sub); sp_int n = sp_str_rindex(s, sub);             return n < 0 ? SP_INT_NIL : n; }

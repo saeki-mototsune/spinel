@@ -35,6 +35,9 @@
  *                      its copies, and on every raise this file makes
  *                      before the fork.
  *                      A caller's IO or Integer fd is never in the mask.
+ *   [8] env          - optional: the Hash a call gave before the command,
+ *                      or nil. The codegen adds the slot only where the
+ *                      first argument can be a Hash.
  *
  * An IO value in opts[0..2] is resolved to its fd by the codegen (which
  * has access to sp_File_fileno); a String value reaches the runtime
@@ -57,9 +60,31 @@
 #include <errno.h>
 #include <limits.h>
 
+#if defined(_WIN32)
+#include <spawn.h>
+#include <sys/stat.h>
+#endif
+
 #include "sp_alloc.h"   /* sp_PolyArray, sp_RbVal, sp_box_*, sp_raise_cls */
 #include "sp_process_status.h"   /* sp_ProcessStatus, sp_box_process_status */
 #include "sp_system.h"   /* sp_last_status: $? */
+#include "sp_string.h"   /* sp_String: a shared String's handle */
+
+#if !defined(_WIN32)
+extern char **environ;
+#endif
+
+/* A String the program holds as the shared handle (--share-strings) arrives
+   boxed as that handle: the spawn reads its bytes as it reads a String's. */
+static sp_RbVal sp_spawn_str(sp_RbVal v) {
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF && v.v.p) {
+    sp_RbVal s = v;
+    s.tag = SP_TAG_STR;
+    s.v.s = ((sp_String *)v.v.p)->data;
+    return s;
+  }
+  return v;
+}
 
 /* Local error-message builder. Returns a static buffer; copy the
    result before another call. Avoids sp_sprintf which would pull
@@ -73,6 +98,15 @@ static const char *sp_errf_errno(const char *prefix, int err) {
    then the path that failed, as `No such file or directory - /bin/nope`. */
 static const char *sp_errf_path(int err, const char *path) {
   snprintf(sp_err_buf, sizeof sp_err_buf, "%s - %s", strerror(err), path);
+  return sp_err_buf;
+}
+
+/* CRuby's TypeError for a [program, argv0] element that is no String */
+static const char *sp_errf_conv(sp_RbVal v) {
+  const char *k = v.tag == SP_TAG_INT ? "Integer" : v.tag == SP_TAG_FLT ? "Float"
+                : v.tag == SP_TAG_NIL ? "nil" : v.tag == SP_TAG_SYM ? "Symbol"
+                : v.tag == SP_TAG_BOOL ? (v.v.i ? "true" : "false") : "Object";
+  snprintf(sp_err_buf, sizeof sp_err_buf, "no implicit conversion of %s into String", k);
   return sp_err_buf;
 }
 
@@ -159,6 +193,65 @@ int sp_process_open_redirect(const char *path, int slot, int *owned) {
   return fd;
 }
 
+/* An environment Hash's names and values are Strings, a value may be nil,
+   and a name holds no '=', as CRuby checks them before it starts a child. */
+static void sp_spawn_env_check(sp_RbVal env, int *owned) {
+  sp_int n = sp_json_len_fn(env);
+  for (sp_int i = 0; i < n; i++) {
+    sp_RbVal key, val;
+    sp_json_hpair_fn(env, i, &key, &val);
+    key = sp_spawn_str(key);
+    val = sp_spawn_str(val);
+    if (key.tag != SP_TAG_STR) sp_process_spawn_fail(owned, "TypeError", sp_errf_conv(key));
+    if (val.tag != SP_TAG_STR && val.tag != SP_TAG_NIL) sp_process_spawn_fail(owned, "TypeError", sp_errf_conv(val));
+    if (strchr(key.v.s, '=')) {
+      snprintf(sp_err_buf, sizeof sp_err_buf, "environment name contains a equal : %s", key.v.s);
+      sp_process_spawn_fail(owned, "ArgumentError", sp_err_buf);
+    }
+  }
+}
+
+/* The child's environment for a checked Hash, built as CRuby builds it: this
+   process's environment less every name the Hash mentions, then each name
+   whose value is a String. One block, the entries after the pointers; NULL
+   when out of memory. */
+static char **sp_spawn_envp(sp_RbVal env) {
+  sp_int n = sp_json_len_fn(env);
+  size_t nenv = 0, bytes = 0;
+  while (environ && environ[nenv]) nenv++;
+  for (sp_int i = 0; i < n; i++) {
+    sp_RbVal key, val;
+    sp_json_hpair_fn(env, i, &key, &val);
+    val = sp_spawn_str(val);
+    if (val.tag == SP_TAG_STR) bytes += strlen(sp_spawn_str(key).v.s) + strlen(val.v.s) + 2;
+  }
+  char **envp = (char **)malloc(sizeof(char *) * (nenv + (size_t)n + 1) + bytes);
+  if (!envp) return NULL;
+  char *entry = (char *)(envp + nenv + (size_t)n + 1);
+  size_t at = 0;
+  for (size_t e = 0; e < nenv; e++) {
+    int named = 0;
+    for (sp_int i = 0; i < n && !named; i++) {
+      sp_RbVal key, val;
+      sp_json_hpair_fn(env, i, &key, &val);
+      const char *name = sp_spawn_str(key).v.s;
+      size_t len = strlen(name);
+      named = strncmp(environ[e], name, len) == 0 && environ[e][len] == '=';
+    }
+    if (!named) envp[at++] = environ[e];
+  }
+  for (sp_int i = 0; i < n; i++) {
+    sp_RbVal key, val;
+    sp_json_hpair_fn(env, i, &key, &val);
+    val = sp_spawn_str(val);
+    if (val.tag != SP_TAG_STR) continue;
+    envp[at++] = entry;
+    entry += sprintf(entry, "%s=%s", sp_spawn_str(key).v.s, val.v.s) + 1;
+  }
+  envp[at] = NULL;
+  return envp;
+}
+
 /* Extract a resolved Integer fd from a pre-resolved opts slot. The
    codegen turns IO/false into Integer before passing, and a String
    path arrives as the fd sp_process_open_redirect returned; we just
@@ -215,9 +308,13 @@ sp_int sp_process_spawn(sp_RbVal cmd, sp_RbVal args_box,
     sp_process_spawn_fail(owned, "TypeError", "rlimit_as must be Integer");
 
   const char *chdir_to = NULL;
-  if (opts->data[6].tag == SP_TAG_STR) chdir_to = opts->data[6].v.s;
+  sp_RbVal chdir_v = sp_spawn_str(opts->data[6]);
+  if (chdir_v.tag == SP_TAG_STR) chdir_to = chdir_v.v.s;
   else if (opts->data[6].tag != SP_TAG_NIL)
     sp_process_spawn_fail(owned, "TypeError", "chdir must be a String");
+
+  sp_RbVal env = opts->len > 8 ? opts->data[8] : sp_box_nil();
+  if (env.tag != SP_TAG_NIL) sp_spawn_env_check(env, owned);
 
   /* Resolve cmd + args into argv. */
   const char *prog = NULL;
@@ -228,12 +325,14 @@ sp_int sp_process_spawn(sp_RbVal cmd, sp_RbVal args_box,
   int extra_from_args = 0;
 
   int via_shell = 0;
+  cmd = sp_spawn_str(cmd);
   if (cmd.tag == SP_TAG_STR) {
     prog = cmd.v.s;
     if (args_box.tag == SP_TAG_OBJ &&
         args_box.cls_id == SP_BUILTIN_POLY_ARRAY) {
       args_arr = (sp_PolyArray *)args_box.v.p;
-    } else if (args_box.tag != SP_TAG_NIL) {
+    }
+    else if (args_box.tag != SP_TAG_NIL) {
       sp_process_spawn_fail(owned, "TypeError", "args must be a PolyArray of extra args");
     }
     /* One string and no arguments is a command LINE, as for Kernel#system:
@@ -242,19 +341,23 @@ sp_int sp_process_spawn(sp_RbVal cmd, sp_RbVal args_box,
        exec'd as a program name, so `spawn("sleep 2")` was ENOENT. */
     if (!args_arr || args_arr->len == 0)
       via_shell = strpbrk(prog, " \t\n*?{}[]<>()~&|\\$;'`\"#=%") != NULL;
-  } else if (cmd.tag == SP_TAG_OBJ &&
+  }
+  else if (cmd.tag == SP_TAG_OBJ &&
              cmd.cls_id == SP_BUILTIN_POLY_ARRAY) {
+    /* [program, argv0]: run program with argv0 as its argv[0], exactly two
+       Strings, as CRuby takes them */
     cmd_arr = (sp_PolyArray *)cmd.v.p;
-    if (cmd_arr->len < 1) sp_process_spawn_fail(owned, "ArgumentError", "empty command array");
-    if (cmd_arr->data[0].tag != SP_TAG_STR)
-      sp_process_spawn_fail(owned, "ArgumentError", "command[0] must be a String");
-    prog = cmd_arr->data[0].v.s;
-    extra_from_cmd = cmd_arr->len - 1;
+    if (cmd_arr->len != 2) sp_process_spawn_fail(owned, "ArgumentError", "wrong first argument");
+    for (int i = 0; i < 2; i++)
+      if (sp_spawn_str(cmd_arr->data[i]).tag != SP_TAG_STR)
+        sp_process_spawn_fail(owned, "TypeError", sp_errf_conv(cmd_arr->data[i]));
+    prog = sp_spawn_str(cmd_arr->data[0]).v.s;
     if (args_box.tag == SP_TAG_OBJ &&
         args_box.cls_id == SP_BUILTIN_POLY_ARRAY) {
       args_arr = (sp_PolyArray *)args_box.v.p;
     }
-  } else {
+  }
+  else {
     sp_process_spawn_fail(owned, "TypeError",
                           "wrong first argument type (expected String or Array)");
   }
@@ -265,24 +368,83 @@ sp_int sp_process_spawn(sp_RbVal cmd, sp_RbVal args_box,
   if (!argv) sp_process_spawn_fail(owned, "NoMemoryError", "out of memory");
   int ai = 0;
   if (via_shell) { argv[ai++] = (char *)"/bin/sh"; argv[ai++] = (char *)"-c"; }
-  argv[ai++] = (char *)prog;
+  argv[ai++] = cmd_arr ? (char *)sp_spawn_str(cmd_arr->data[1]).v.s : (char *)prog;
   if (via_shell) prog = "/bin/sh";
-  if (cmd_arr) {
-    for (int i = 1; i < cmd_arr->len; i++) {
-      if (cmd_arr->data[i].tag != SP_TAG_STR)
-        sp_process_spawn_fail(owned, "ArgumentError", "command array element must be a String");
-      argv[ai++] = (char *)cmd_arr->data[i].v.s;
-    }
-  }
   if (args_arr) {
     for (int i = 0; i < args_arr->len; i++) {
-      if (args_arr->data[i].tag != SP_TAG_STR)
+      if (sp_spawn_str(args_arr->data[i]).tag != SP_TAG_STR)
         sp_process_spawn_fail(owned, "ArgumentError", "spawn args must be Strings");
-      argv[ai++] = (char *)args_arr->data[i].v.s;
+      argv[ai++] = (char *)sp_spawn_str(args_arr->data[i]).v.s;
     }
   }
   argv[ai] = NULL;
 
+  char **envp = NULL;
+  if (env.tag != SP_TAG_NIL && !(envp = sp_spawn_envp(env))) {
+    free(argv);
+    sp_process_spawn_fail(owned, "NoMemoryError", "out of memory");
+  }
+
+#if defined(_WIN32)
+  /* posix_spawn, where there is no fork (lib/win32 answers it over
+     CreateProcess). The child's setup is the file actions -- the same dup2s and closes the fork
+     path makes, in the same order -- and the attributes: chdir, and a new
+     process group. There is no posix_spawn counterpart for the rlimits;
+     they are not applied on this path. The directory is checked here, so a
+     missing one raises naming it, as the fork path's chdir failure does;
+     posix_spawn reports an exec failure as its return value. */
+  {
+    posix_spawn_file_actions_t fa;
+    posix_spawnattr_t at;
+    (void)rlimit_cpu_set; (void)rlimit_cpu_val; (void)rlimit_as_set; (void)rlimit_as_val;
+    if (chdir_to) {
+      struct stat cst;
+      int sr = stat(chdir_to, &cst);
+      if (sr != 0 || !S_ISDIR(cst.st_mode)) {
+        int e = sr != 0 ? errno : ENOTDIR;
+        free(argv);
+        free(envp);
+        sp_last_status = 127 << 8;   /* as after the fork path's child fails its chdir */
+        errno = e;
+        sp_process_spawn_fail(owned, e == ENOENT ? "Errno::ENOENT" : e == ENOTDIR ? "Errno::ENOTDIR" :
+                              e == EACCES ? "Errno::EACCES" : "SystemCallError", sp_errf_path(e, chdir_to));
+      }
+    }
+    posix_spawn_file_actions_init(&fa);
+    posix_spawnattr_init(&at);
+    if (chdir_to) posix_spawn_file_actions_addchdir_np(&fa, chdir_to);
+    if (in_fd  >= 0 && in_fd  != 0) posix_spawn_file_actions_adddup2(&fa, in_fd, 0);
+    if (out_fd >= 0 && out_fd != 1) posix_spawn_file_actions_adddup2(&fa, out_fd, 1);
+    if (err_fd >= 0 && err_fd != 2) posix_spawn_file_actions_adddup2(&fa, err_fd, 2);
+    { int srcs[3] = { in_fd, out_fd, err_fd };
+      for (int i = 0; i < 3; i++) {
+        if (srcs[i] <= 2) continue;
+        int dup = 0;
+        for (int j = 0; j < i; j++) if (srcs[j] == srcs[i]) dup = 1;
+        if (!dup) posix_spawn_file_actions_addclose(&fa, srcs[i]);
+      } }
+    if (pgroup) {
+      posix_spawnattr_setflags(&at, POSIX_SPAWN_SETPGROUP);
+      posix_spawnattr_setpgroup(&at, pgroup == 1 ? 0 : (pid_t)pgroup);
+    }
+    fflush(NULL);
+    pid_t pid = 0;
+    int rc = posix_spawnp(&pid, prog, &fa, &at, argv, envp ? envp : environ);
+    posix_spawn_file_actions_destroy(&fa);
+    posix_spawnattr_destroy(&at);
+    close_owned(owned);
+    free(argv);
+    free(envp);
+    if (rc != 0) {
+      /* $? reads the 127 a failed exec exits with under the fork path */
+      sp_last_status = 127 << 8;
+      errno = rc;
+      sp_raise_cls(rc == ENOENT ? "Errno::ENOENT" : rc == EACCES ? "Errno::EACCES" : "SystemCallError",
+                   sp_errf_path(rc, prog));
+    }
+    return (sp_int)pid;
+  }
+#else
   /* Pre-exec error pipe: the child writes the exec errno here if execve
      fails, so the parent can raise the matching Errno (CRuby raises
      Errno::ENOENT for "no such file or directory" instead of returning
@@ -291,6 +453,7 @@ sp_int sp_process_spawn(sp_RbVal cmd, sp_RbVal args_box,
   int err_pipe[2];
   if (pipe(err_pipe) < 0) {
     free(argv);
+    free(envp);
     sp_process_spawn_fail(owned, "SystemCallError", sp_errf_errno("pipe failed", errno));
   }
 
@@ -298,6 +461,7 @@ sp_int sp_process_spawn(sp_RbVal cmd, sp_RbVal args_box,
      child can write to the same descriptors, as CRuby flushes them */
   fflush(NULL);
   pid_t pid = fork();
+  if (pid != 0) free(envp);
   if (pid < 0) {
     free(argv);
     sp_process_spawn_fail(owned, "SystemCallError", sp_errf_errno("fork failed", errno));
@@ -329,13 +493,17 @@ sp_int sp_process_spawn(sp_RbVal cmd, sp_RbVal args_box,
     }
     if (pgroup == 1) {
       setpgid(0, 0);
-    } else if (pgroup > 1) {
+    }
+    else if (pgroup > 1) {
       setpgid(0, pgroup);
     }
     apply_redirect(0, in_fd);
     apply_redirect(1, out_fd);
     apply_redirect(2, err_fd);
     close_redirect_srcs(in_fd, out_fd, err_fd);
+    /* execvp searches the PATH of the environment it passes on, as CRuby
+       searches the child's */
+    if (envp) environ = envp;
     execvp(prog, argv);
     /* exec returned: failure. Send the errno to the parent. */
     int fail[2] = { errno, 0 };
@@ -366,7 +534,7 @@ sp_int sp_process_spawn(sp_RbVal cmd, sp_RbVal args_box,
       do { r = waitpid(pid, &st, 0); } while (r < 0 && errno == EINTR);
       /* the reaped child is the last one waited for, so $? reads its
          exit 127, as it does under CRuby */
-      if (r == pid) sp_last_status = st; }
+      if (r == pid) { sp_last_status = st; sp_last_pid = (int)pid; } }
     errno = fail[0];
     sp_raise_cls(errno == ENOENT ? "Errno::ENOENT" :
                  errno == EACCES ? "Errno::EACCES" :
@@ -374,12 +542,69 @@ sp_int sp_process_spawn(sp_RbVal cmd, sp_RbVal args_box,
                  sp_errf_path(errno, fail[1] == 1 && chdir_to ? chdir_to : prog));
   }
   return (sp_int)pid;
+#endif
+}
+
+/* Kernel#exec / Process.exec: replace the process with the command, read
+   as spawn reads it -- one String a command line, through the shell when it
+   carries a shell character; [program, argv0]; the arguments Strings. What
+   the program has buffered for its streams is not written, as under CRuby.
+   Returns only by raising the Errno the exec failed with. */
+void sp_process_exec(sp_RbVal cmd, sp_RbVal args_box) {
+  sp_PolyArray *args = (args_box.tag == SP_TAG_OBJ && args_box.cls_id == SP_BUILTIN_POLY_ARRAY)
+                       ? (sp_PolyArray *)args_box.v.p : NULL;
+  int na = args ? (int)args->len : 0;
+  const char *prog = NULL, *argv0 = NULL;
+  cmd = sp_spawn_str(cmd);
+  if (cmd.tag == SP_TAG_STR) prog = argv0 = cmd.v.s;
+  else if (cmd.tag == SP_TAG_OBJ && cmd.cls_id == SP_BUILTIN_POLY_ARRAY) {
+    sp_PolyArray *pa = (sp_PolyArray *)cmd.v.p;
+    if (pa->len != 2) sp_raise_cls("ArgumentError", "wrong first argument");
+    for (int i = 0; i < 2; i++)
+      if (sp_spawn_str(pa->data[i]).tag != SP_TAG_STR) sp_raise_cls("TypeError", sp_errf_conv(pa->data[i]));
+    prog = sp_spawn_str(pa->data[0]).v.s; argv0 = sp_spawn_str(pa->data[1]).v.s;
+  }
+  else sp_raise_cls("TypeError", "wrong first argument type (expected String or Array)");
+  for (int i = 0; i < na; i++)
+    if (sp_spawn_str(args->data[i]).tag != SP_TAG_STR) sp_raise_cls("TypeError", sp_errf_conv(args->data[i]));
+  int via_shell = cmd.tag == SP_TAG_STR && na == 0 &&
+                  strpbrk(prog, " \t\n*?{}[]<>()~&|\\$;'`\"#=%") != NULL;
+  char **argv = (char **)malloc(sizeof(char *) * (size_t)(na + 4));
+  if (!argv) sp_raise_cls("NoMemoryError", "out of memory");
+  int ai = 0;
+  if (via_shell) { argv[ai++] = (char *)"/bin/sh"; argv[ai++] = (char *)"-c"; }
+  argv[ai++] = (char *)argv0;
+  for (int i = 0; i < na; i++) argv[ai++] = (char *)sp_spawn_str(args->data[i]).v.s;
+  argv[ai] = NULL;
+  execvp(via_shell ? "/bin/sh" : prog, argv);
+  int e = errno;
+  free(argv);
+  errno = e;
+  sp_raise_cls(e == ENOENT ? "Errno::ENOENT" : e == EACCES ? "Errno::EACCES" : "SystemCallError",
+               sp_errf_path(e, prog));
 }
 
 /* The wait itself lives in the scheduler (sp_sched_wait_child): a blocking
    waitpid answers for the OS worker, and a started green thread is pinned to
    its worker, so blocking here stalls the thread that may have to drain this
    child's output before it can exit (#4381). */
+/* Process.wait / waitpid: the same wait as waitpid2, answering only the
+   pid; the status goes to $? */
+sp_int sp_process_waitpid(sp_int pid) {
+  extern int sp_sched_wait_child(int pid, int *status);
+  int status = 0;
+  pid_t r = (pid_t)sp_sched_wait_child((int)pid, &status);
+  if (r < 0) {
+    if (errno == ECHILD) {
+      sp_raise_cls("Errno::ECHILD", "No child processes");
+    }
+    sp_raise_cls("SystemCallError", sp_errf_errno("waitpid failed", errno));
+  }
+  sp_last_status = status;
+  sp_last_pid = (int)r;
+  return (sp_int)r;
+}
+
 sp_PolyArray *sp_process_waitpid2(sp_int pid) {
   extern int sp_sched_wait_child(int pid, int *status);   /* see the note at the top on this TU's includes */
   int status = 0;
@@ -394,6 +619,7 @@ sp_PolyArray *sp_process_waitpid2(sp_int pid) {
      and a backtick; before this a waitpid2 left $? at whatever the last
      system call or backtick stored. */
   sp_last_status = status;
+  sp_last_pid = (int)r;
   sp_PolyArray *pa = sp_PolyArray_new(); SP_GC_ROOT(pa);   /* the status object below is an allocation */
   sp_PolyArray_push(pa, sp_box_int((sp_int)r));
   /* Second element is a Process::Status instance wrapping (pid, status),

@@ -27,8 +27,16 @@ const char *sp_sprintf(const char *fmt, ...);  /* defined in the generated TU */
    it, so constructors need no change. Issue #918. */
 static void sp_IntArray_fin(void*p){sp_pl_free(((sp_IntArray*)p)->data);}
 static sp_IntArray*sp_IntArray_new(void){sp_IntArray*a=(sp_IntArray*)sp_gc_alloc(sizeof(sp_IntArray),sp_IntArray_fin,NULL);a->cap=16;a->data=(sp_int*)sp_pl_alloc(sizeof(sp_int)*a->cap);if(!a->data)sp_oom_die();a->start=0;a->len=0;{sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));h->size+=sizeof(sp_int)*a->cap;sp_gc_bytes_add(sizeof(sp_int)*a->cap);}return a;}
-static void __attribute__((noinline)) sp_IntArray_push_grow(sp_IntArray*a){if(a->start>0){memmove(a->data,a->data+a->start,sizeof(sp_int)*a->len);a->start=0;if(a->len<a->cap)return;}{sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));sp_gc_bytes_sub(sizeof(sp_int)*a->cap);h->size-=sizeof(sp_int)*a->cap;a->cap=((((((a->cap*2))))))+1;void*nd=sp_pl_realloc(a->data,sizeof(sp_int)*a->cap);if(!nd)sp_oom_die();a->data=(sp_int*)nd;h->size+=sizeof(sp_int)*a->cap;sp_gc_bytes_add(sizeof(sp_int)*a->cap);}}
+/* An Array set up inside a bigger object that starts with it -- an Array
+   subclass instance, whose struct embeds its Array (#7449) -- as _new sets a
+   fresh one up; the payload is counted to the enclosing object's header. */
+static void sp_IntArray_init_embedded(sp_IntArray*a){a->cap=16;a->data=(sp_int*)sp_pl_alloc(sizeof(sp_int)*a->cap);if(!a->data)sp_oom_die();a->start=0;a->len=0;{sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));h->size+=sizeof(sp_int)*a->cap;sp_gc_bytes_add(sizeof(sp_int)*a->cap);}}
+static SP_NOINLINE void sp_IntArray_push_grow(sp_IntArray*a){if(a->start>0){memmove(a->data,a->data+a->start,sizeof(sp_int)*a->len);a->start=0;if(a->len<a->cap)return;}{sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));sp_gc_bytes_sub(sizeof(sp_int)*a->cap);h->size-=sizeof(sp_int)*a->cap;a->cap=((((((a->cap*2))))))+1;void*nd=sp_pl_realloc(a->data,sizeof(sp_int)*a->cap);if(!nd)sp_oom_die();a->data=(sp_int*)nd;h->size+=sizeof(sp_int)*a->cap;sp_gc_bytes_add(sizeof(sp_int)*a->cap);}}
 static inline void sp_IntArray_push(sp_IntArray*a,sp_int v){if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_INT_ARRAY);return;}if(a->start+a->len>=a->cap)sp_IntArray_push_grow(a);a->data[a->start+a->len]=v;a->len++;}
+/* Array.new(n, v): the buffer is allocated at its final size and filled in
+   place, where n pushes grew it from 16 by doubling -- a realloc and a copy
+   at every step, and a frozen and a capacity test per element. */
+static sp_IntArray*sp_IntArray_new_fill(sp_int n,sp_int v){sp_IntArray*a=(sp_IntArray*)sp_gc_alloc(sizeof(sp_IntArray),sp_IntArray_fin,NULL);if((uintmax_t)n>SIZE_MAX/sizeof(sp_int))sp_oom_die();a->cap=n>16?n:16;a->data=(sp_int*)sp_pl_alloc(sizeof(sp_int)*a->cap);if(!a->data)sp_oom_die();a->start=0;for(sp_int i=0;i<n;i++)a->data[i]=v;a->len=n;{sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));h->size+=sizeof(sp_int)*a->cap;sp_gc_bytes_add(sizeof(sp_int)*a->cap);}return a;}
 /* Issue #826/#832: empty pop/shift return SP_INT_NIL (nullable int
    sentinel) to match MRI's nil; callers treat as int?. Without the
    guard, `--a->len` wraps to -1 and reads past the buffer start. */
@@ -37,15 +45,32 @@ static inline sp_int sp_IntArray_shift(sp_IntArray*a){if(!a||a->len<=0)return SP
 static inline sp_int sp_IntArray_length(sp_IntArray*a){return a->len;}
 static inline sp_bool sp_IntArray_empty(sp_IntArray*a){return a->len==0;}
 static inline sp_int sp_IntArray_get(sp_IntArray*a,sp_int i){if(!a)return SP_INT_NIL;if((unsigned long long)i<(unsigned long long)a->len)return a->data[a->start+i];if(i<0)i+=a->len;if(i<0||i>=a->len)return SP_INT_NIL;return a->data[a->start+i];}
+/* A nil lands where analyze cannot see it: the array's may_nil (SP_MAY_NIL),
+   set out of line so the stores that test for it keep their fast path. */
+static SP_NOINLINE SP_COLD void sp_IntArray_note_nil(sp_IntArray*a){if(a)SP_MAY_NIL(a)=1;}
+static SP_NOINLINE SP_COLD void sp_FloatArray_note_nil(sp_FloatArray*a){if(a)SP_MAY_NIL(a)=1;}
 /* Issue #769: a very-negative i leaves i negative after the `i += a->len`
    adjustment. CRuby raises IndexError; spinel no-ops as the safest
    fallback (raising from a typed-array set would need setjmp plumbing
    throughout the call chain). */
-static void sp_IntArray_set_slow(sp_IntArray*a,sp_int i,sp_int v){if(i<0)return;while(a->start+i>=a->cap){sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));sp_gc_bytes_sub(sizeof(sp_int)*a->cap);h->size-=sizeof(sp_int)*a->cap;a->cap=((((((a->cap*2))))))+1;a->data=(sp_int*)sp_pl_realloc(a->data,sizeof(sp_int)*a->cap);h->size+=sizeof(sp_int)*a->cap;sp_gc_bytes_add(sizeof(sp_int)*a->cap);}while(i>=a->len){a->data[a->start+a->len]=SP_INT_NIL;a->len++;}  /* gap slots read as nil */a->data[a->start+i]=v;}
+static void sp_IntArray_set_slow(sp_IntArray*a,sp_int i,sp_int v){if(i<0)return;while(a->start+i>=a->cap){sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));sp_gc_bytes_sub(sizeof(sp_int)*a->cap);h->size-=sizeof(sp_int)*a->cap;a->cap=((((((a->cap*2))))))+1;a->data=(sp_int*)sp_pl_realloc(a->data,sizeof(sp_int)*a->cap);h->size+=sizeof(sp_int)*a->cap;sp_gc_bytes_add(sizeof(sp_int)*a->cap);}while(i>a->len){a->data[a->start+a->len]=SP_INT_NIL;a->len++;SP_MAY_NIL(a)=1;}  /* gap slots read as nil, and the array may hold one */if(i==a->len)a->len++;a->data[a->start+i]=v;}
 /* Issue #839: an extreme negative index (still negative after `i += len`)
    raises IndexError per MRI. */
-static void __attribute__((noinline, cold)) sp_IntArray_set_cold(sp_IntArray*a,sp_int i,sp_int v){if(!a)return;if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_INT_ARRAY);return;}sp_int orig=i;if(i<0)i+=a->len;if(i<0)sp_raise_cls("IndexError",sp_sprintf("index %lld too small for array; minimum: %lld",(long long)orig,(long long)-a->len));if(i<a->len){a->data[a->start+i]=v;return;}sp_IntArray_set_slow(a,i,v);}
+static SP_NOINLINE SP_COLD void sp_IntArray_set_cold(sp_IntArray*a,sp_int i,sp_int v){if(!a)return;if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_INT_ARRAY);return;}sp_int orig=i;if(i<0)i+=a->len;if(i<0)sp_raise_cls("IndexError",sp_sprintf("index %lld too small for array; minimum: %lld",(long long)orig,(long long)-a->len));if(i<a->len){a->data[a->start+i]=v;return;}sp_IntArray_set_slow(a,i,v);}
 static inline void sp_IntArray_set(sp_IntArray*a,sp_int i,sp_int v){if(SP_LIKELY(a&&!a->frozen&&i>=0&&i<a->len)){a->data[a->start+i]=v;return;}sp_IntArray_set_cold(a,i,v);}
+/* The stores for a value that may be a nil no static mark covers (a boxed
+   value converted to the slot, an element a builtin copies): the sentinel
+   sets may_nil on its way in, through a cold call off the store's path. The
+   plain stores above stay as they were. These and the other may_nil helpers
+   are macros, not inline functions: a large generated unit sits at gcc's
+   inlining budget, and a wrapper the inliner had to spend it on pushed the
+   hot accessors of an unrelated loop out of line (optcarrot's PPU loop). As
+   macros, the inliner sees only the plain push / set it always saw. */
+#define sp_IntArray_push_nilable(a, v) ({ sp_IntArray *_pn_a = (a); sp_int _pn_v = (v); if (SP_UNLIKELY(_pn_v == SP_INT_NIL)) sp_IntArray_note_nil(_pn_a); sp_IntArray_push(_pn_a, _pn_v); })
+#define sp_IntArray_set_nilable(a, i, v) ({ sp_IntArray *_sn_a = (a); sp_int _sn_i = (i); sp_int _sn_v = (v); if (SP_UNLIKELY(_sn_v == SP_INT_NIL)) sp_IntArray_note_nil(_sn_a); sp_IntArray_set(_sn_a, _sn_i, _sn_v); })
+/* An array built from another inherits its flag: a copy, a slice, a sort. */
+#define sp_IntArray_nil_from(d, s) ({ sp_IntArray *_nf_d = (d); const sp_IntArray *_nf_s = (s); if (SP_UNLIKELY(_nf_s && SP_MAY_NIL(_nf_s))) sp_IntArray_note_nil(_nf_d); })
+#define sp_IntArray_may_nil(a) ({ const sp_IntArray *_mn_a = (a); (sp_bool)(_mn_a && SP_MAY_NIL(_mn_a)); })
 
 /* ---- sp_IntArray cold ops (compiled in lib/sp_array.c) ---- */
 sp_IntArray *sp_IntArray_from_range(sp_int s, sp_int e);
@@ -90,7 +115,10 @@ sp_int sp_IntArray_cmp(sp_IntArray *a, sp_IntArray *b);
 /* =========================== sp_FloatArray =========================== */
 static void sp_FloatArray_fin(void*p){sp_FloatArray*a=(sp_FloatArray*)p;sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));sp_gc_bytes_sub(sizeof(sp_float)*a->cap);h->size-=sizeof(sp_float)*a->cap;sp_pl_free(a->data);}
 static sp_FloatArray*sp_FloatArray_new(void){sp_FloatArray*a=(sp_FloatArray*)sp_gc_alloc(sizeof(sp_FloatArray),sp_FloatArray_fin,NULL);a->cap=16;a->data=(sp_float*)sp_pl_alloc(sizeof(sp_float)*a->cap);if(!a->data)sp_oom_die();a->len=0;{sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));h->size+=sizeof(sp_float)*a->cap;sp_gc_bytes_add(sizeof(sp_float)*a->cap);}return a;}
+static void sp_FloatArray_init_embedded(sp_FloatArray*a){a->cap=16;a->data=(sp_float*)sp_pl_alloc(sizeof(sp_float)*a->cap);if(!a->data)sp_oom_die();a->len=0;{sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));h->size+=sizeof(sp_float)*a->cap;sp_gc_bytes_add(sizeof(sp_float)*a->cap);}}  /* see sp_IntArray_init_embedded */
 static inline void sp_FloatArray_push(sp_FloatArray*a,sp_float v){if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_FLT_ARRAY);return;}if(a->len>=a->cap){sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));sp_gc_bytes_sub(sizeof(sp_float)*a->cap);h->size-=sizeof(sp_float)*a->cap;a->cap=((((((a->cap*2))))))+1;a->data=(sp_float*)sp_pl_realloc(a->data,sizeof(sp_float)*a->cap);h->size+=sizeof(sp_float)*a->cap;sp_gc_bytes_add(sizeof(sp_float)*a->cap);}a->data[a->len++]=v;}
+/* Array.new(n, v): see sp_IntArray_new_fill */
+static sp_FloatArray*sp_FloatArray_new_fill(sp_int n,sp_float v){sp_FloatArray*a=(sp_FloatArray*)sp_gc_alloc(sizeof(sp_FloatArray),sp_FloatArray_fin,NULL);if((uintmax_t)n>SIZE_MAX/sizeof(sp_float))sp_oom_die();a->cap=n>16?n:16;a->data=(sp_float*)sp_pl_alloc(sizeof(sp_float)*a->cap);if(!a->data)sp_oom_die();for(sp_int i=0;i<n;i++)a->data[i]=v;a->len=n;{sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));h->size+=sizeof(sp_float)*a->cap;sp_gc_bytes_add(sizeof(sp_float)*a->cap);}return a;}
 /* CRuby answers nil for pop/shift on an empty array; the int side already
    returns SP_INT_NIL and the float side answered 0.0, so a drained float
    array read back as a real zero (#4288). sp_float_nil() is the float slot's
@@ -98,8 +126,10 @@ static inline void sp_FloatArray_push(sp_FloatArray*a,sp_float v){if(a->frozen){
 static inline sp_float sp_FloatArray_pop(sp_FloatArray*a){if(!a||a->len<=0)return sp_float_nil();if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_FLT_ARRAY);return sp_float_nil();}return a->data[--a->len];}
 static inline sp_float sp_FloatArray_shift(sp_FloatArray*a){if(!a||a->len==0)return sp_float_nil();if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_FLT_ARRAY);return sp_float_nil();}sp_float v=a->data[0];for(sp_int i=0;i+1<a->len;i++)a->data[i]=a->data[i+1];a->len--;return v;}
 /* FloatArray is 0-based (no `start` offset, unlike IntArray). delete_at
-   returns 0.0 on out-of-range (delete_at's nil there). */
-static inline sp_float sp_FloatArray_delete_at(sp_FloatArray*a,sp_int i){if(!a)return 0.0;if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_FLT_ARRAY);return 0.0;}if(i<0)i+=a->len;if(i<0||i>=a->len)return 0.0;sp_float v=a->data[i];for(sp_int j=i;j+1<a->len;j++)a->data[j]=a->data[j+1];a->len--;return v;}
+   (and slice!(i), which shares it) answers nil out of range, as pop and
+   shift do: the float slot's sentinel, not a 0.0 nothing could tell from a
+   real zero (#4288). */
+static inline sp_float sp_FloatArray_delete_at(sp_FloatArray*a,sp_int i){if(!a)return sp_float_nil();if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_FLT_ARRAY);return sp_float_nil();}if(i<0)i+=a->len;if(i<0||i>=a->len)return sp_float_nil();sp_float v=a->data[i];for(sp_int j=i;j+1<a->len;j++)a->data[j]=a->data[j+1];a->len--;return v;}
 static inline sp_int sp_FloatArray_length(sp_FloatArray*a){return a->len;}
 static inline sp_bool sp_FloatArray_empty(sp_FloatArray*a){return a->len==0;}
 static inline sp_float sp_FloatArray_get(sp_FloatArray*a,sp_int i){if(!a)return sp_float_nil();if(i<0)i+=a->len;if(i<0||i>=a->len)return sp_float_nil();return a->data[i];}
@@ -107,8 +137,17 @@ static inline sp_float sp_FloatArray_get(sp_FloatArray*a,sp_int i){if(!a)return 
    `[i]` stays non-nullable (0.0 for OOB) -- only first/last produce nil. */
 static inline sp_float sp_FloatArray_first_opt(sp_FloatArray*a){return (!a||a->len<=0)?sp_float_nil():sp_FloatArray_get(a,0);}
 static inline sp_float sp_FloatArray_last_opt(sp_FloatArray*a){return (!a||a->len<=0)?sp_float_nil():sp_FloatArray_get(a,a->len-1);}
+/* The write at or past the end: slots up to `i` read as nil (the sentinel)
+   and a gap sets may_nil. Out of line and cold, as the Integer set_slow is,
+   so the in-range store stays small. */
+static SP_NOINLINE SP_COLD void sp_FloatArray_fill_to(sp_FloatArray*a,sp_int i){if(i>a->len)SP_MAY_NIL(a)=1;while(i>=a->len){a->data[a->len]=sp_float_nil();a->len++;}}
 /* Issue #769: no-op for negative index after adjustment. */
-static inline void sp_FloatArray_set(sp_FloatArray*a,sp_int i,sp_float v){if(!a)return;if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_FLT_ARRAY);return;}sp_int orig=i;if(i<0)i+=a->len;if(i<0)sp_raise_cls("IndexError",sp_sprintf("index %lld too small for array; minimum: %lld",(long long)orig,(long long)-a->len));while(i>=a->cap){a->cap=((((((a->cap*2))))))+1;a->data=(sp_float*)sp_pl_realloc(a->data,sizeof(sp_float)*a->cap);}while(i>=a->len){a->data[a->len]=sp_float_nil();a->len++;}a->data[i]=v;}  /* the gap is nil, not 0.0 (#3836) */
+static inline void sp_FloatArray_set(sp_FloatArray*a,sp_int i,sp_float v){if(!a)return;if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_FLT_ARRAY);return;}sp_int orig=i;if(i<0)i+=a->len;if(i<0)sp_raise_cls("IndexError",sp_sprintf("index %lld too small for array; minimum: %lld",(long long)orig,(long long)-a->len));while(i>=a->cap){a->cap=((((((a->cap*2))))))+1;a->data=(sp_float*)sp_pl_realloc(a->data,sizeof(sp_float)*a->cap);}if(i>=a->len)sp_FloatArray_fill_to(a,i);a->data[i]=v;}  /* the gap is nil, not 0.0 (#3836) */
+/* The Float twins of the IntArray may_nil helpers above. */
+#define sp_FloatArray_push_nilable(a, v) ({ sp_FloatArray *_pn_a = (a); sp_float _pn_v = (v); if (SP_UNLIKELY(sp_float_is_nil(_pn_v))) sp_FloatArray_note_nil(_pn_a); sp_FloatArray_push(_pn_a, _pn_v); })
+#define sp_FloatArray_set_nilable(a, i, v) ({ sp_FloatArray *_sn_a = (a); sp_int _sn_i = (i); sp_float _sn_v = (v); if (SP_UNLIKELY(sp_float_is_nil(_sn_v))) sp_FloatArray_note_nil(_sn_a); sp_FloatArray_set(_sn_a, _sn_i, _sn_v); })
+#define sp_FloatArray_nil_from(d, s) ({ sp_FloatArray *_nf_d = (d); const sp_FloatArray *_nf_s = (s); if (SP_UNLIKELY(_nf_s && SP_MAY_NIL(_nf_s))) sp_FloatArray_note_nil(_nf_d); })
+#define sp_FloatArray_may_nil(a) ({ const sp_FloatArray *_mn_a = (a); (sp_bool)(_mn_a && SP_MAY_NIL(_mn_a)); })
 
 /* One step of CRuby's compensated summation (array.c ary_sum): Kahan-Babuska-
    Neumaier, where `comp` collects the low-order bits each add drops and is
@@ -139,10 +178,13 @@ static inline void sp_float_sum_step(sp_float *sum, sp_float *comp, sp_float x) 
 /* ---- sp_FloatArray cold ops (compiled in lib/sp_array.c) ---- */
 void sp_FloatArray_unshift(sp_FloatArray *a, sp_float v);
 sp_FloatArray *sp_FloatArray_from_step(sp_float beg, sp_float end, sp_float step, sp_int excl);
+sp_float sp_float_step_size(sp_float beg, sp_float end, sp_float unit, sp_int excl);
+/* The i-th value of CRuby's ruby_float_step: computed rather than accumulated,
+   clamped to end on overshoot; an infinite unit only ever yields beg. */
+static inline sp_float sp_float_step_at(sp_float beg, sp_float end, sp_float unit, sp_int i){if(isinf(unit))return beg;sp_float d=(sp_float)i*unit+beg;if(unit>=0?end<d:d<end)d=end;return d;}
 sp_float sp_FloatArray_min(sp_FloatArray *a);
 sp_float sp_FloatArray_max(sp_FloatArray *a);
 sp_float sp_FloatArray_sum(sp_FloatArray *a, sp_float init);
-sp_float sp_FloatArray_sum_plain(sp_FloatArray *a, sp_float init);
 void sp_FloatArray_replace(sp_FloatArray *dst, sp_FloatArray *src);
 sp_FloatArray *sp_FloatArray_slice(sp_FloatArray *a, sp_int start, sp_int len);
 sp_FloatArray *sp_FloatArray_slice_range(sp_FloatArray *a, sp_int start, sp_int end_, sp_int excl);
@@ -163,6 +205,8 @@ sp_bool sp_FloatArray_intersect_p(sp_FloatArray *a, sp_FloatArray *b);
 sp_FloatArray *sp_FloatArray_union(sp_FloatArray *a, sp_FloatArray *b);
 sp_FloatArray *sp_FloatArray_difference(sp_FloatArray *a, sp_FloatArray *b);
 sp_FloatArray *sp_FloatArray_uniq(sp_FloatArray *a);
+void sp_FloatArray_uniq_bang(sp_FloatArray *a);
+void sp_FloatArray_insert(sp_FloatArray *a, sp_int i, sp_float v);
 
 /* ============================= sp_PtrArray ============================ */
 /* Array of void* pointers (user-class arrays, FFI pointer arrays). */
@@ -218,6 +262,7 @@ static inline const char *sp_PtrArray_val_class(sp_RbVal v) {
     case SP_TAG_OBJ:
       if (v.cls_id >= 0) return sp_obj_cls_name_fn ? sp_obj_cls_name_fn(v.cls_id) : "Object";
       switch (v.cls_id) {
+        case SP_BUILTIN_STRBUF: return "String";
         case SP_BUILTIN_INT_ARRAY: case SP_BUILTIN_FLT_ARRAY: case SP_BUILTIN_STR_ARRAY:
         case SP_BUILTIN_SYM_ARRAY: case SP_BUILTIN_POLY_ARRAY: case SP_BUILTIN_PTR_ARRAY: return "Array";
         default: return "Object";
@@ -292,6 +337,7 @@ void *sp_PtrArray_sample(sp_PtrArray *a);
 static void sp_StrArray_fin(void*p){sp_StrArray*a=(sp_StrArray*)p;if(a->data!=a->inline_data){sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));sp_gc_bytes_sub(sizeof(const char*)*a->cap);h->size-=sizeof(const char*)*a->cap;sp_pl_free(a->data);}}
 static void sp_StrArray_scan(void*p){sp_StrArray*a=(sp_StrArray*)p;for(sp_int i=0;i<a->len;i++)sp_mark_string(a->data[i]);}
 static sp_StrArray*sp_StrArray_new(void){sp_StrArray*a=(sp_StrArray*)sp_gc_alloc(sizeof(sp_StrArray),sp_StrArray_fin,sp_StrArray_scan);a->cap=SP_STRARR_INLINE;a->data=a->inline_data;a->len=0;return a;}
+static void sp_StrArray_init_embedded(sp_StrArray*a){a->cap=SP_STRARR_INLINE;a->data=a->inline_data;a->len=0;}  /* see sp_IntArray_init_embedded */
 static inline void sp_StrArray_push(sp_StrArray*a,const char*v){sp_gc_wb((void*)a); if(a->frozen){sp_raise_frozen_array_at(a, SP_BUILTIN_STR_ARRAY);return;}if(a->len>=a->cap){sp_gc_hdr*h=(sp_gc_hdr*)((char*)a-sizeof(sp_gc_hdr));sp_int nc=((((((a->cap*2))))))+1;if(a->data==a->inline_data){const char**nd=(const char**)sp_pl_alloc(sizeof(const char*)*nc);if(!nd)sp_oom_die();memcpy(nd,a->data,sizeof(const char*)*a->len);a->data=nd;}
 else{sp_gc_bytes_sub(sizeof(const char*)*a->cap);h->size-=sizeof(const char*)*a->cap;void*nd=sp_pl_realloc(a->data,sizeof(const char*)*nc);if(!nd)sp_oom_die();a->data=(const char**)nd;}a->cap=nc;h->size+=sizeof(const char*)*a->cap;sp_gc_bytes_add(sizeof(const char*)*a->cap);}a->data[a->len++]=v;}
 static inline sp_int sp_StrArray_length(sp_StrArray*a){return a ? a->len : 0;}
@@ -321,6 +367,33 @@ sp_int sp_StrArray_rindex(sp_StrArray *a, const char *v);
 sp_StrArray *sp_StrArray_compact(sp_StrArray *a);
 sp_IntArray *sp_IntArray_compact(sp_IntArray *a);
 sp_FloatArray *sp_FloatArray_compact(sp_FloatArray *a);
+sp_bool sp_IntArray_compact_bang(sp_IntArray *a);
+sp_bool sp_FloatArray_compact_bang(sp_FloatArray *a);
+sp_IntArray *sp_IntArray_nil_cmp_ck(sp_IntArray *a);
+sp_FloatArray *sp_FloatArray_nil_cmp_ck(sp_FloatArray *a);
+sp_IntArray *sp_IntArray_nil_sum_ck(sp_IntArray *a, int float_seed);
+sp_FloatArray *sp_FloatArray_nil_sum_ck(sp_FloatArray *a, int float_seed);
+/* unshift / insert of a value that may be nil (see sp_IntArray_push_nilable) */
+#define sp_IntArray_unshift_nilable(a, v) ({ sp_IntArray *_un_a = (a); sp_int _un_v = (v); if (SP_UNLIKELY(_un_v == SP_INT_NIL)) sp_IntArray_note_nil(_un_a); sp_IntArray_unshift(_un_a, _un_v); })
+#define sp_IntArray_insert_nilable(a, i, v) ({ sp_IntArray *_in_a = (a); sp_int _in_i = (i); sp_int _in_v = (v); if (SP_UNLIKELY(_in_v == SP_INT_NIL)) sp_IntArray_note_nil(_in_a); sp_IntArray_insert(_in_a, _in_i, _in_v); })
+#define sp_FloatArray_insert_nilable(a, i, v) ({ sp_FloatArray *_in_a = (a); sp_int _in_i = (i); sp_float _in_v = (v); if (SP_UNLIKELY(sp_float_is_nil(_in_v))) sp_FloatArray_note_nil(_in_a); sp_FloatArray_insert(_in_a, _in_i, _in_v); })
+#define sp_FloatArray_unshift_nilable(a, v) ({ sp_FloatArray *_un_a = (a); sp_float _un_v = (v); if (SP_UNLIKELY(sp_float_is_nil(_un_v))) sp_FloatArray_note_nil(_un_a); sp_FloatArray_unshift(_un_a, _un_v); })
+/* The elements that are not nil, for all? / any? / none? / one?: the length,
+   unless the array is `marked` (analyze saw a nil stored) or may_nil is set. */
+void sp_IntArray_note_nils(sp_IntArray *a);
+void sp_FloatArray_note_nils(sp_FloatArray *a);
+sp_int sp_IntArray_truthy_scan(sp_IntArray *a);
+sp_int sp_FloatArray_truthy_scan(sp_FloatArray *a);
+#define sp_IntArray_truthy_count(a, marked) ({ sp_IntArray *_tc_a = (a); !_tc_a ? (sp_int)0 : ((marked) || SP_MAY_NIL(_tc_a)) ? sp_IntArray_truthy_scan(_tc_a) : _tc_a->len; })
+#define sp_FloatArray_truthy_count(a, marked) ({ sp_FloatArray *_tc_a = (a); !_tc_a ? (sp_int)0 : ((marked) || SP_MAY_NIL(_tc_a)) ? sp_FloatArray_truthy_scan(_tc_a) : _tc_a->len; })
+/* The receiver of min, max, minmax, sort (cmp) or a blockless sum of an array
+   analyze did not mark, checked for a nil element: one flag test, and the
+   scan (the _ck above, which a marked array takes directly) only where the
+   runtime put a nil. */
+#define sp_IntArray_nil_cmp_if_flagged(a) ({ sp_IntArray *_ff_a = (a); (_ff_a && SP_MAY_NIL(_ff_a)) ? sp_IntArray_nil_cmp_ck(_ff_a) : _ff_a; })
+#define sp_FloatArray_nil_cmp_if_flagged(a) ({ sp_FloatArray *_ff_a = (a); (_ff_a && SP_MAY_NIL(_ff_a)) ? sp_FloatArray_nil_cmp_ck(_ff_a) : _ff_a; })
+#define sp_IntArray_nil_sum_if_flagged(a, fs) ({ sp_IntArray *_ff_a = (a); (_ff_a && SP_MAY_NIL(_ff_a)) ? sp_IntArray_nil_sum_ck(_ff_a, (fs)) : _ff_a; })
+#define sp_FloatArray_nil_sum_if_flagged(a, fs) ({ sp_FloatArray *_ff_a = (a); (_ff_a && SP_MAY_NIL(_ff_a)) ? sp_FloatArray_nil_sum_ck(_ff_a, (fs)) : _ff_a; })
 const char *sp_StrArray_delete_at(sp_StrArray *a, sp_int i);
 const char *sp_StrArray_delete(sp_StrArray *a, const char *v);
 void sp_StrArray_insert(sp_StrArray *a, sp_int i, const char *v);
@@ -331,6 +404,7 @@ sp_StrArray *sp_StrArray_shuffle(sp_StrArray *a);
 const char *sp_StrArray_sample(sp_StrArray *a);
 
 /* ---- poly/inspect-dependent ops (lib/sp_array.c; need sp_inspect.h/sp_str.h) ---- */
+void sp_str_upto_each(const char *s, const char *e, sp_int excl, int (*fn)(const char *, void *), void *arg);
 sp_StrArray *sp_StrArray_from_string_range(const char *s, const char *e, sp_int excl);
 const char*sp_IntArray_inspect(sp_IntArray*a);
 const char*sp_FloatArray_inspect(sp_FloatArray*a);

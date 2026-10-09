@@ -76,6 +76,7 @@ module IOBufferPackage
   native_method :__get_x,   [:int, :int], :any, "sp_IOBuffer_get_x"
   native_method :__set_i,   [:int, :int, :int], :int, "sp_IOBuffer_set_i"
   native_method :__set_f,   [:int, :int, :float], :int, "sp_IOBuffer_set_f"
+  native_method :__set_v,   [:int, :int, :any], :int, "sp_IOBuffer_set_v"
   native_method :__lock,    [], :self, "sp_IOBuffer_lock"
   native_method :__unlock,  [], :self, "sp_IOBuffer_unlock"
   native_method :__become_for, [:string], :self, "sp_IOBuffer_become_for"
@@ -149,15 +150,18 @@ class IO::Buffer
     end
   end
 
-  # The BLOCK form only: without a block CRuby answers LocalJumpError (after
-  # taking the lock -- observable, so mirrored). NO ensure: in CRuby an
-  # exception out of the block leaves the buffer locked.
+  # The BLOCK form only: without a block CRuby answers LocalJumpError. The
+  # lock is taken first (an already locked buffer raises LockedError), and
+  # released on the way out, by an exception or a missing block too, as
+  # Ruby 4.0.7 does; 4.0.4 left it locked.
   def locked
     __lock
-    raise LocalJumpError, "no block given" unless block_given?
-    result = yield self
-    __unlock
-    result
+    begin
+      raise LocalJumpError, "no block given" unless block_given?
+      yield self
+    ensure
+      __unlock
+    end
   end
 
   # One read(2) / write(2) / pread(2) / pwrite(2) against `io`, answering

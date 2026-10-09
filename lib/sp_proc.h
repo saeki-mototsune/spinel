@@ -22,7 +22,7 @@
 #include "sp_gc.h"      /* sp_RbVal, sp_gc_alloc, sp_gc_mark */
 #include "sp_alloc.h"   /* sp_PolyArray, sp_box_sym, sp_box_poly_array, sp_raise_cls */
 
-typedef struct sp_Proc { void *fn; void *cap; void (*cap_scan)(void *); sp_int arity; sp_bool lambda_p; sp_int param_count; const sp_sym *param_kinds; const sp_sym *param_names; sp_bool frozen; /* Object#freeze observed (sp_gc_alloc zero-fills) */ void *origin; /* dup/clone lineage root for Proc#== (NULL: self is the root) */ } sp_Proc;
+typedef struct sp_Proc { void *fn; void *cap; void (*cap_scan)(void *); sp_int arity; sp_bool lambda_p; sp_int param_count; const sp_sym *param_kinds; const sp_sym *param_names; sp_bool frozen; /* Object#freeze observed (sp_gc_alloc zero-fills) */ void *origin; /* dup/clone lineage root for Proc#== (NULL: self is the root) */ sp_int ie_cls; } sp_Proc;
 /* arity: the count this accumulator realizes at -- Proc#curry(n)'s n, else
    the target's required-parameter count (CRuby's min arity, so a variadic
    base realizes on its first call). Carried here so a curry that travels
@@ -51,7 +51,6 @@ sp_Proc *sp_proc_new(void *fn, void *cap, void (*cap_scan)(void *));
 sp_int sp_proc_arity(sp_Proc *p);
 sp_bool sp_proc_lambda_p(sp_Proc *p);
 const char *sp_proc_inspect(sp_Proc *p);
-void sp_proc_lambda_arity_check(sp_int argc, sp_int req, sp_int opt, sp_bool has_rest, sp_bool has_kw);
 sp_PolyArray *sp_proc_parameters_ids(sp_Proc *p, int mode, sp_sym req_id, sp_sym opt_id);
 sp_PolyArray *sp_proc_parameters(sp_Proc *p);
 void sp_curry_scan(void *p);

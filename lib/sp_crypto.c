@@ -90,6 +90,15 @@ static void sp_crypto_sha256_block(uint32_t H[8], const uint8_t b[64]) {
     H[4]+=se; H[5]+=sf; H[6]+=sg; H[7]+=sh;
 }
 
+static void sp_crypto_store_be32(uint8_t *out, const uint32_t *H, int n) {
+    for (int i = 0; i < n; i++) {
+        out[i*4]   = (uint8_t)(H[i] >> 24);
+        out[i*4+1] = (uint8_t)(H[i] >> 16);
+        out[i*4+2] = (uint8_t)(H[i] >> 8);
+        out[i*4+3] = (uint8_t)(H[i]);
+    }
+}
+
 static void sp_crypto_sha256(const uint8_t *msg, size_t len, uint8_t out[32]) {
     uint32_t H[8] = {
         0x6a09e667,0xbb67ae85,0x3c6ef372,0xa54ff53a,
@@ -112,12 +121,7 @@ else {
     uint64_t bits = (uint64_t)len * 8;
     for (i = 0; i < 8; i++) buf[56 + i] = (uint8_t)(bits >> (56 - 8*i));
     sp_crypto_sha256_block(H, buf);
-    for (i = 0; i < 8; i++) {
-        out[i*4]   = (uint8_t)(H[i] >> 24);
-        out[i*4+1] = (uint8_t)(H[i] >> 16);
-        out[i*4+2] = (uint8_t)(H[i] >> 8);
-        out[i*4+3] = (uint8_t)(H[i]);
-    }
+    sp_crypto_store_be32(out, H, 8);
 }
 
 /* ---------- SHA-1 ----------
@@ -171,12 +175,7 @@ else {
     uint64_t bits = (uint64_t)len * 8;
     for (i = 0; i < 8; i++) buf[56 + i] = (uint8_t)(bits >> (56 - 8*i));
     sp_crypto_sha1_block(H, buf);
-    for (i = 0; i < 5; i++) {
-        out[i*4]   = (uint8_t)(H[i] >> 24);
-        out[i*4+1] = (uint8_t)(H[i] >> 16);
-        out[i*4+2] = (uint8_t)(H[i] >> 8);
-        out[i*4+3] = (uint8_t)(H[i]);
-    }
+    sp_crypto_store_be32(out, H, 5);
 }
 
 static SP_TLS char sp_crypto_sha256_hex_buf[65];
@@ -341,6 +340,7 @@ static const char SPC_B64[64] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
 static SP_TLS char sp_crypto_websocket_accept_buf[29];
+static void sp_crypto_b64_strict(const uint8_t *d, size_t n, char *out);
 
 const char *sp_crypto_websocket_accept(const char *client_key) {
     /* client_key is the 24-char base64 from the request header;
@@ -356,23 +356,7 @@ const char *sp_crypto_websocket_accept(const char *client_key) {
     sp_crypto_sha1((const uint8_t *)in, klen + 36, digest);
     /* base64(20 bytes) = 28 chars: 6 full triplets + 2 leftover bytes
      * -> 3 chars + 1 padding `=`. */
-    int j = 0;
-    for (i = 0; i + 3 <= 20; i += 3) {
-        uint32_t v = ((uint32_t)digest[i] << 16)
-                   | ((uint32_t)digest[i+1] << 8)
-                   |  (uint32_t)digest[i+2];
-        sp_crypto_websocket_accept_buf[j++] = SPC_B64[(v >> 18) & 0x3f];
-        sp_crypto_websocket_accept_buf[j++] = SPC_B64[(v >> 12) & 0x3f];
-        sp_crypto_websocket_accept_buf[j++] = SPC_B64[(v >>  6) & 0x3f];
-        sp_crypto_websocket_accept_buf[j++] = SPC_B64[ v        & 0x3f];
-    }
-    /* 2 leftover bytes -> 3 b64 chars + 1 pad */
-    uint32_t v = ((uint32_t)digest[18] << 16) | ((uint32_t)digest[19] << 8);
-    sp_crypto_websocket_accept_buf[j++] = SPC_B64[(v >> 18) & 0x3f];
-    sp_crypto_websocket_accept_buf[j++] = SPC_B64[(v >> 12) & 0x3f];
-    sp_crypto_websocket_accept_buf[j++] = SPC_B64[(v >>  6) & 0x3f];
-    sp_crypto_websocket_accept_buf[j++] = '=';
-    sp_crypto_websocket_accept_buf[j]   = '\0';
+    sp_crypto_b64_strict(digest, 20, sp_crypto_websocket_accept_buf);
     return sp_crypto_websocket_accept_buf;
 }
 
@@ -493,12 +477,7 @@ else {
         uint64_t bits = (uint64_t)(64 + 32) * 8;
         for (i = 0; i < 8; i++) buf[56 + i] = (uint8_t)(bits >> (56 - 8*i));
         sp_crypto_sha256_block(H, buf);
-        for (i = 0; i < 8; i++) {
-            out[i*4]   = (uint8_t)(H[i] >> 24);
-            out[i*4+1] = (uint8_t)(H[i] >> 16);
-            out[i*4+2] = (uint8_t)(H[i] >> 8);
-            out[i*4+3] = (uint8_t)(H[i]);
-        }
+        sp_crypto_store_be32(out, H, 8);
     }
 }
 
@@ -600,12 +579,7 @@ else {
         uint64_t bits = (uint64_t)(64 + 20) * 8;
         for (i = 0; i < 8; i++) buf[56 + i] = (uint8_t)(bits >> (56 - 8*i));
         sp_crypto_sha1_block(H, buf);
-        for (i = 0; i < 5; i++) {
-            out[i*4]   = (uint8_t)(H[i] >> 24);
-            out[i*4+1] = (uint8_t)(H[i] >> 16);
-            out[i*4+2] = (uint8_t)(H[i] >> 8);
-            out[i*4+3] = (uint8_t)(H[i]);
-        }
+        sp_crypto_store_be32(out, H, 5);
     }
 }
 
@@ -643,32 +617,14 @@ static const char SPC_B64U[64] =
     "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789-_";
 
 static SP_TLS char sp_crypto_hmac_b64url_buf[44];
+static void sp_crypto_b64url_bytes(const uint8_t *src, int n, char *out);
 
 const char *sp_crypto_hmac_sha256_b64url(const char *key, const char *msg) {SP_GC_ROOT_STR(key);SP_GC_ROOT_STR(msg);
     uint8_t out[32];
     sp_crypto_hmac_sha256((const uint8_t *)key, sp_str_byte_len(key),
                           (const uint8_t *)msg, sp_str_byte_len(msg),
                           out);
-    int i, j = 0;
-    for (i = 0; i + 3 <= 32; i += 3) {
-        uint32_t v = ((uint32_t)out[i] << 16)
-                   | ((uint32_t)out[i+1] << 8)
-                   | (uint32_t)out[i+2];
-        sp_crypto_hmac_b64url_buf[j++] = SPC_B64U[(v >> 18) & 0x3f];
-        sp_crypto_hmac_b64url_buf[j++] = SPC_B64U[(v >> 12) & 0x3f];
-        sp_crypto_hmac_b64url_buf[j++] = SPC_B64U[(v >> 6)  & 0x3f];
-        sp_crypto_hmac_b64url_buf[j++] = SPC_B64U[v & 0x3f];
-    }
-    if (i < 32) {
-        uint32_t v = ((uint32_t)out[i] << 16)
-                   | (i + 1 < 32 ? ((uint32_t)out[i+1] << 8) : 0);
-        sp_crypto_hmac_b64url_buf[j++] = SPC_B64U[(v >> 18) & 0x3f];
-        sp_crypto_hmac_b64url_buf[j++] = SPC_B64U[(v >> 12) & 0x3f];
-        if (i + 1 < 32) {
-            sp_crypto_hmac_b64url_buf[j++] = SPC_B64U[(v >> 6) & 0x3f];
-        }
-    }
-    sp_crypto_hmac_b64url_buf[j] = '\0';
+    sp_crypto_b64url_bytes(out, 32, sp_crypto_hmac_b64url_buf);
     return sp_crypto_hmac_b64url_buf;
 }
 
@@ -725,7 +681,7 @@ const char *sp_crypto_b64url_decode(const char *src) {SP_GC_ROOT_STR(src);
     while (n > 0 && src[n - 1] == '=') n--;  /* tolerate padded input */
     size_t i = 0, j = 0;
     if (n / 4 * 3 + 3 > SPC_B64U_BUFSIZE) {
-        sp_crypto_b64u_dec_buf[0] = '\0';
+        sp_crypto_b64u_dec_buf[0] = '\0'; sp_ffi_bin_len = 0;
         return sp_crypto_b64u_dec_buf;
     }
     while (i + 4 <= n) {
@@ -734,7 +690,7 @@ const char *sp_crypto_b64url_decode(const char *src) {SP_GC_ROOT_STR(src);
         int c = sp_crypto_b64u_val(src[i+2]);
         int d = sp_crypto_b64u_val(src[i+3]);
         if (a < 0 || b < 0 || c < 0 || d < 0) {
-            sp_crypto_b64u_dec_buf[0] = '\0';
+            sp_crypto_b64u_dec_buf[0] = '\0'; sp_ffi_bin_len = 0;
             return sp_crypto_b64u_dec_buf;
         }
         uint32_t v = (uint32_t)a << 18 | (uint32_t)b << 12
@@ -748,18 +704,19 @@ const char *sp_crypto_b64url_decode(const char *src) {SP_GC_ROOT_STR(src);
     if (rem == 2) {
         int a = sp_crypto_b64u_val(src[i]);
         int b = sp_crypto_b64u_val(src[i+1]);
-        if (a < 0 || b < 0) { sp_crypto_b64u_dec_buf[0] = '\0'; return sp_crypto_b64u_dec_buf; }
+        if (a < 0 || b < 0) { sp_crypto_b64u_dec_buf[0] = '\0'; sp_ffi_bin_len = 0; return sp_crypto_b64u_dec_buf; }
         sp_crypto_b64u_dec_buf[j++] = (a << 2) | (b >> 4);
     }
 else if (rem == 3) {
         int a = sp_crypto_b64u_val(src[i]);
         int b = sp_crypto_b64u_val(src[i+1]);
         int c = sp_crypto_b64u_val(src[i+2]);
-        if (a < 0 || b < 0 || c < 0) { sp_crypto_b64u_dec_buf[0] = '\0'; return sp_crypto_b64u_dec_buf; }
+        if (a < 0 || b < 0 || c < 0) { sp_crypto_b64u_dec_buf[0] = '\0'; sp_ffi_bin_len = 0; return sp_crypto_b64u_dec_buf; }
         sp_crypto_b64u_dec_buf[j++] = (a << 2) | (b >> 4);
         sp_crypto_b64u_dec_buf[j++] = ((b & 0xf) << 4) | (c >> 2);
     }
     sp_crypto_b64u_dec_buf[j] = '\0';
+    sp_ffi_bin_len = (int)j;   /* the decoded bytes may hold a NUL: bind it `:binstr` */
     return sp_crypto_b64u_dec_buf;
 }
 
@@ -850,8 +807,9 @@ int sp_crypto_entropy(uint8_t *out, int nbytes) {
 #if defined(__APPLE__) || defined(__FreeBSD__) || defined(__OpenBSD__) || defined(__NetBSD__)
     arc4random_buf(out, nbytes);
     return 1;
-#elif defined(__wasi__)
-    /* the host's entropy through WASI's random_get; there is no device */
+#elif defined(__wasi__) || defined(_WIN32)
+    /* the host's entropy, through WASI's random_get or (Windows, lib/win32)
+       BCryptGenRandom; there is no device */
     return getentropy(out, (size_t)nbytes) == 0;
 #else
     /* getrandom(2) first: kernel-sourced, works where /dev/urandom is not
@@ -914,29 +872,6 @@ const char *sp_crypto_random_b64url(int nbytes) {
     if (nbytes > 64) nbytes = 64;
     uint8_t r[64];
     if (!sp_crypto_entropy(r, nbytes)) return NULL;
-    int i, j = 0;
-    for (i = 0; i + 3 <= nbytes; i += 3) {
-        uint32_t v = ((uint32_t)r[i] << 16)
-                   | ((uint32_t)r[i+1] << 8)
-                   | (uint32_t)r[i+2];
-        sp_crypto_random_b64url_buf[j++] = SPC_B64U[(v >> 18) & 0x3f];
-        sp_crypto_random_b64url_buf[j++] = SPC_B64U[(v >> 12) & 0x3f];
-        sp_crypto_random_b64url_buf[j++] = SPC_B64U[(v >> 6)  & 0x3f];
-        sp_crypto_random_b64url_buf[j++] = SPC_B64U[v & 0x3f];
-    }
-    int rem = nbytes - i;
-    if (rem == 1) {
-        uint32_t v = (uint32_t)r[i] << 16;
-        sp_crypto_random_b64url_buf[j++] = SPC_B64U[(v >> 18) & 0x3f];
-        sp_crypto_random_b64url_buf[j++] = SPC_B64U[(v >> 12) & 0x3f];
-    }
-else if (rem == 2) {
-        uint32_t v = ((uint32_t)r[i] << 16)
-                   | ((uint32_t)r[i+1] << 8);
-        sp_crypto_random_b64url_buf[j++] = SPC_B64U[(v >> 18) & 0x3f];
-        sp_crypto_random_b64url_buf[j++] = SPC_B64U[(v >> 12) & 0x3f];
-        sp_crypto_random_b64url_buf[j++] = SPC_B64U[(v >> 6) & 0x3f];
-    }
-    sp_crypto_random_b64url_buf[j] = '\0';
+    sp_crypto_b64url_bytes(r, nbytes, sp_crypto_random_b64url_buf);
     return sp_crypto_random_b64url_buf;
 }

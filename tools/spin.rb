@@ -125,9 +125,15 @@ def mkdir_p_path(path)
   nil
 end
 
+# Searches PATH the way the shell does, so the answer is the file the shell
+# ran. An empty component -- a leading or trailing ":", or "::" -- names the
+# current directory. The search used to skip it, so with PATH=":/usr/local/bin"
+# the shell ran ./spin while which("spin") answered /usr/local/bin/spin, and
+# spinel_bin took the compiler beside the wrong spin. The -1 keeps a trailing
+# empty component, which split drops otherwise.
 def which(name)
-  ENV["PATH"].to_s.split(":").each do |dir|
-    next if dir == ""
+  ENV["PATH"].to_s.split(":", -1).each do |dir|
+    dir = "." if dir == ""
     cand = File.join(dir, name)
     return cand if File.file?(cand) && File.executable?(cand)
   end
@@ -140,7 +146,20 @@ def spinel_bin
   # is a DIRECTORY of that name, and File.exist? said yes to it -- spin then
   # tried to run the directory ("Permission denied", or "is a directory" on
   # macOS) instead of falling through to the installed binary (#3407).
-  me = File.expand_path($0)
+  #
+  # Run through PATH, $0 is the bare name "spin" with no directory, and
+  # expand_path read it as a file in the current directory: the sibling was
+  # never found, and the "spinel" fallback below is a name, not a file, so
+  # File.exist?/File.mtime on it answered nothing. The freshness bound of
+  # `spin test` (#3202) then left the compiler out, and after a compiler
+  # upgrade every test binary the old compiler built was reused as "(cached)":
+  # a green run that tested nothing new. Look $0 up on PATH as the shell did.
+  me = $0
+  if !me.include?("/")
+    found = which(me)
+    me = found if found != ""
+  end
+  me = File.expand_path(me)
   cand = File.join(File.expand_path("..", me), "spinel")
   if File.file?(cand) && File.executable?(cand)
     # Realpath: a symlinked install (e.g. /home/user/bin/spin ->
@@ -1138,6 +1157,12 @@ class Project
     # being built -- and a process has one allocator, which is not a decision
     # a library makes for its dependents.
     @allocator = toml.get("package", "allocator")
+    # It reaches the link line as -l<name> and the pkg-config lookup as an
+    # argument, both through the shell, so it has to be a library name.
+    if @allocator != "" && @allocator != "system" && !library_name?(@allocator)
+      $stderr.puts "spin: [package] allocator \"#{@allocator}\" is not a library name (letters, digits and _ . + -)"
+      exit 1
+    end
     # per-dependency feature enablement from THIS manifest's [dependencies]
     # inline specs (dep = { ..., features = ["cuda"] }); root-level only --
     # transitive feature unification is out of scope
@@ -1262,6 +1287,8 @@ end
 
 # --- staleness (newest input mtime vs output mtime) --------------------------
 
+# Return the newest source/configuration mtime, excluding generated, vendored,
+# and hidden directories from the recursive project scan.
 def newest_mtime(dir, newest)
   Dir.children(dir).each do |e|
     next if e.start_with?(".")   # .git and friends
@@ -1277,11 +1304,35 @@ def newest_mtime(dir, newest)
   newest
 end
 
+# Resolve the compiler and available runtime archives in driver search order.
+# These are shared prerequisites for cached outputs and external build systems.
+def toolchain_deps
+  sb = spinel_bin
+  found = which(sb)
+  sb = File.realpath(found) if found != ""
+  deps = [sb]
+  # Match the compiler driver's installed and checkout layouts, in that
+  # order: <compiler-dir>/lib, then <compiler-dir>/../lib.
+  dir = File.expand_path("..", sb)
+  rt = File.join(dir, "lib")
+  rt = File.expand_path("../lib", dir) unless File.file?(File.join(rt, "libspinel_rt.a"))
+  ["libspinel_rt.a", "libspinel_rt_mt.a"].each do |name|
+    path = File.join(rt, name)
+    deps << path if File.file?(path)
+  end
+  deps
+end
+
+# Return the newest project, dependency, compiler, or runtime archive mtime
+# so build and test caches invalidate after runtime-only toolchain updates.
 def inputs_mtime(prj)
   newest = newest_mtime(prj.root, 0)
   prj.dep_paths.each { |d| newest = newest_mtime(d, newest) }
-  sb = spinel_bin
-  newest = File.mtime(sb).to_i if File.exist?(sb) && File.mtime(sb).to_i > newest
+  # Runtime-only changes relink the archives without changing the compiler.
+  # Use the same prerequisites we hand external builds through flags --deps.
+  toolchain_deps.each do |path|
+    newest = File.mtime(path).to_i if File.file?(path) && File.mtime(path).to_i > newest
+  end
   newest
 end
 
@@ -1338,7 +1389,92 @@ def compile_cmd(prj, entry, out, extra)
   # spin (it always compiles release).
   cmd += " --debug" if ENV["SPIN_DEBUG"].to_s != ""
   cmd += " -o #{out}"
-  cmd
+  allocator_library_path(prj) + cmd
+end
+
+# The allocator links as a bare -l<name> (spin_flags), which the linker looks
+# for only in its default directories -- and a package manager's are not
+# always among them: Homebrew on Apple Silicon installs jemalloc under
+# /opt/homebrew/lib, which Apple's ld does not search, so a manifest naming a
+# library that IS installed failed with "library 'jemalloc' not found".
+# pkg-config knows where it is; its -L directories go on LIBRARY_PATH, which
+# gcc and clang both read, for the compile. "" when the manifest names no
+# allocator, pkg-config is not installed, or it does not know the library --
+# the link then fails as before, which is still the intended answer for an
+# allocator that is genuinely missing. Only the build's own link sees it:
+# `spin pack` writes no host path into what it packs.
+def allocator_library_path(prj)
+  lib = prj.allocator
+  return "" if lib == "" || lib == "system"
+  return "" if which("pkg-config") == ""
+  tmp = ENV["TMPDIR"].to_s
+  tmp = "/tmp" if tmp == ""
+  out = File.join(tmp, "spin-pkg-config-#{Process.pid}.out")
+  # An argument vector, no shell: neither the name nor $TMPDIR is parsed.
+  pid = Process.spawn("pkg-config", "--libs-only-L", lib, out: out, err: File::NULL)
+  _, status = Process.waitpid2(pid)
+  flags = File.exist?(out) ? File.read(out) : ""
+  File.unlink(out) if File.exist?(out)
+  return "" unless status.success?
+  dirs = []
+  pkg_config_words(flags).each { |f| dirs.push(f[2, f.length - 2]) if f.start_with?("-L") && f.length > 2 }
+  return "" if dirs.empty?
+  prev = ENV["LIBRARY_PATH"].to_s
+  dirs.push(prev) if prev != ""
+  "LIBRARY_PATH=" + sh_single_quote(dirs.join(":")) + " "
+end
+
+# A name -l takes: letters, digits and _ . + -. Anything else in
+# `[package] allocator` would reach the shell as syntax rather than a name.
+def library_name?(s)
+  return false if s == ""
+  s.each_char do |c|
+    ok = (c >= "a" && c <= "z") || (c >= "A" && c <= "Z") || (c >= "0" && c <= "9") ||
+         c == "_" || c == "." || c == "+" || c == "-"
+    return false unless ok
+  end
+  true
+end
+
+# pkg-config's output split the way it writes it: a space inside a path is
+# escaped as "\ ", so a backslash takes the next character literally and only
+# unescaped whitespace separates words. A plain split(" ") cut
+# -L/opt/custom\ libs in two, and the allocator then failed to link.
+def pkg_config_words(s)
+  words = []
+  cur = String.new   # appended below; a "" literal is frozen under spinel
+  esc = false
+  s.each_char do |c|
+    if esc
+      cur << c
+      esc = false
+    elsif c == "\\"
+      esc = true
+    elsif c == " " || c == "\t" || c == "\n"
+      words.push(cur) if cur != ""
+      cur = String.new
+    else
+      cur << c
+    end
+  end
+  words.push(cur) if cur != ""
+  words
+end
+
+# One shell word whatever s holds: single-quoted, with each ' written as '\''.
+# An inherited LIBRARY_PATH such as /opt/John's libs closed the quote early.
+def sh_single_quote(s)
+  q = String.new
+  q << "'"
+  s.each_char do |c|
+    if c == "'"
+      q << "'\\''"
+    else
+      q << c
+    end
+  end
+  q << "'"
+  q
 end
 
 # The hint belongs to ONE failure -- a require nothing provides, which
@@ -2217,7 +2353,11 @@ end
 
 # The spinel installation's runtime sources (bin/spinel -> ../lib).
 def ext_runtime_dir
-  File.expand_path(File.join(File.dirname(spinel_bin), "..", "lib"))
+  rt = spinel_hdr_dir
+  if rt == "" || Dir.glob(File.join(rt, "*.c")).empty?
+    spin_die("spin ext build: can't find the Spinel runtime sources; set SPINEL_HDR_DIR to the runtime's lib directory")
+  end
+  rt
 end
 
 def cmd_ext_new(name)
@@ -2274,7 +2414,9 @@ RB
 so_dir = ENV["SPIN_EXT_SO_DIR"].to_s
 raise "run this via `spin ext test`" if so_dir.empty?
 $LOAD_PATH.unshift(so_dir)
-require "#{name}"
+# The compiled extension itself, not the loader: the loader falls back to the
+# kernel, and the kernel against itself always matches.
+require "#{name}/#{name}"
 
 pure = Module.new
 src = File.read(File.expand_path("../lib/#{name}/kernel.rb", __dir__))
@@ -2348,6 +2490,9 @@ def cmd_ext_build(root)
     File.write(File.join(mdir, File.basename(f)), File.read(f))
     n += 1
   end
+  unless File.exist?(File.join(extdir, "spinel_rt.h")) && File.exist?(File.join(extdir, "sp_gc.c"))
+    spin_die("spin ext build: no runtime sources in #{rt}")
+  end
   puts "built ext/#{pkg}/ (#{pkg}.c, #{pkg}.h, #{pkg}_ext.c + #{n} runtime files)"
 end
 
@@ -2362,14 +2507,17 @@ def cmd_ext_test(root)
   so_dir = File.join(root, "build", "ext")
   Dir.mkdir(File.join(root, "build")) unless File.exist?(File.join(root, "build"))
   Dir.mkdir(so_dir) unless File.exist?(so_dir)
+  pkg_dir = File.join(so_dir, pkg)
+  Dir.mkdir(pkg_dir) unless File.exist?(pkg_dir)
   soflags = sh_read("uname -s").strip == "Darwin" ? "-bundle -Wl,-undefined,dynamic_lookup" : "-shared"
   cc = ENV["CC"].to_s == "" ? "cc" : ENV["CC"]
   cmd = cc + " " + soflags + " -fPIC -O2 -Wno-all" +
         " -I" + rh + " -I" + ra + " -I" + extdir +
         " " + Dir.glob(File.join(extdir, "*.c")).join(" ") +
-        " -lm -o " + File.join(so_dir, pkg + "." + dlext)
+        " -lm -o " + File.join(pkg_dir, pkg + "." + dlext)
   spin_die("spin ext test: extension did not compile") unless run_command(cmd)
-  # require "#{pkg}" finds the .so; the loader in lib/ finds the kernel.
+  # The .so sits where extconf.rb installs it (<pkg>/<pkg>), so the loader in
+  # lib/ requires it as it would from the installed gem.
   ok = system("SPIN_EXT_SO_DIR=" + so_dir + " ruby -I " + File.join(root, "lib") +
               " " + File.join(root, "test", "differential.rb"))
   spin_die("spin ext test: differential failed") unless ok
@@ -2501,13 +2649,7 @@ when "flags"
   root = find_root(Dir.pwd)
   spin_die("no spin.toml found") if root == ""
   if rest.include?("--deps")
-    out = spinel_bin
-    dir = File.expand_path("..", File.expand_path("..", spinel_bin))
-    ["lib/libspinel_rt.a", "lib/libspinel_rt_mt.a"].each do |rel|
-      p2 = File.join(dir, rel)
-      out += " " + p2 if File.exist?(p2)
-    end
-    puts out
+    puts toolchain_deps.join(" ")
   else
     puts spin_flags(Project.new(root))
   end

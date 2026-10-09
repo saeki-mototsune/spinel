@@ -170,6 +170,16 @@ size_t sp_str_threshold_init = 256 * 1024;
 int sp_str_stress_checked = 0;
 
 const char sp_str_empty_data[] = "\xff";
+/* nil.to_s, true.to_s and false.to_s answer FROZEN Strings in CRuby: a
+   header-carrying static object marked 0xf1, as a frozen literal is */
+static struct { sp_str_hdr h; unsigned char m; char d[1]; } sp_fz_empty_s = { { NULL, 1 | SP_STR_SIZE_ASCII7, 0, 0 }, 0xf1, "" };
+static struct { sp_str_hdr h; unsigned char m; char d[5]; } sp_fz_true_s = { { NULL, 5 | SP_STR_SIZE_ASCII7, 4, 0 }, 0xf1, "true" };
+static struct { sp_str_hdr h; unsigned char m; char d[6]; } sp_fz_false_s = { { NULL, 6 | SP_STR_SIZE_ASCII7, 5, 0 }, 0xf1, "false" };
+const char *const sp_str_frozen_empty = sp_fz_empty_s.d;
+const char *const sp_str_frozen_true = sp_fz_true_s.d;
+const char *const sp_str_frozen_false = sp_fz_false_s.d;
+/* the link a chilled String's header carries (sp_str_is_chilled) */
+const sp_str_hdr sp_str_chilled_tag = { NULL, 0, 0, 0 };
 
 SP_TLS int sp_ffi_bin_len = 0;   /* see sp_alloc.h: byte count for :binstr / :cbinstr */
 
@@ -274,6 +284,18 @@ void sp_alloc_floors_from_env(void) {
      the string old list (#4407). This sets the floor under the growth backstop,
      and is the control that lets the cadence be measured against a pinned one. */
   sp_alloc_floor_from_env("SPINEL_GC_STR_MAJOR_KB", &sp_str_old_threshold, &sp_str_old_threshold_init);
+  /* SPINEL_GC_STRESS=2 last, over any floor above: the two thresholds are
+     pinned at zero, so every allocation that can collect does. Here because
+     both callers must end on it -- a floor read after it put the trigger
+     back, and the level then collected as seldom as the floor said -- and
+     marked as checked, so the allocators' own one-shot (2048) does not run
+     after it. */
+  { const char *st = getenv("SPINEL_GC_STRESS");
+    if (st && atoi(st) >= 2) {
+      SP_GC_CTR_SET(sp_gc_threshold, 0); sp_gc_threshold_init = 0;
+      SP_GC_CTR_SET(sp_str_threshold, 0); sp_str_threshold_init = 0;
+      sp_gc_stress_pin = 1; sp_gc_stress_checked = 1; sp_str_stress_checked = 1;
+    } }
 }
 #ifdef SP_THREADS
 void sp_alloc_worker_tune(int workers) {
@@ -660,7 +682,8 @@ void sp_str_lcache_clear(void) {
 /* sp_mark_string (sp_gc.h) flips a live string's marker 0xfe->0xfc during the
    mark phase; sweep keeps the marked ones and frees the rest. A frozen heap
    string (0xf1) is kept across sweeps (a live frozen global must survive, and
-   frozen literals are immortal). */
+   frozen literals are immortal). A collectable frozen one goes 0xfa->0xf8 and
+   is swept like 0xfe. */
 /* Sweep one worker's list head (or the single st list). Runs under stop-the-
    world (threaded) or the held heap lock (st), so no concurrent push races it.
    `bytes` is decremented per freed string to keep the live-byte count in step. */
@@ -685,15 +708,19 @@ static void sp_str_sweep_young(sp_str_hdr **head, sp_str_hdr **keep_head, sp_str
   size_t moved = 0, held = 0;
   while (h) {
     sp_str_hdr *next = h->next;
-    __builtin_prefetch(next);
+    SP_PREFETCH(next);
     char *body = (char *)(h + 1);
     unsigned char m = (unsigned char)body[0];
     held += h->size & SP_STR_SIZE_MASK;
-    if (m == 0xfc || m == 0xf1) {
+    if (m == 0xfc || m == 0xf1 || m == 0xf8) {
       /* Beside the mutators (a sweeper thread) the reset is a compare-and-
          swap: a `freeze` that lands on the same byte in the same moment wins,
          where a plain store could put its 0xfe over the 0xf1. */
-      if (m == 0xfc) { if (sp_gc_in_sweeper) { unsigned char ex = 0xfc; __atomic_compare_exchange_n((unsigned char *)body, &ex, (unsigned char)0xfe, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); } else body[0] = (char)0xfe; }
+      if (m == 0xfc) {
+        if (sp_gc_in_sweeper) { unsigned char ex = 0xfc; SP_ATOMIC_CAS((unsigned char *)body, &ex, (unsigned char)0xfe, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); }
+        else body[0] = (char)0xfe;
+      }
+      else if (m == 0xf8) SP_ATOMIC_STORE((unsigned char *)body, (unsigned char)0xfa, __ATOMIC_RELAXED);
       h->next = keep;
       if (!keep) tail = h;
       keep = h;
@@ -804,11 +831,16 @@ static void sp_str_sweep_old(sp_str_hdr **head, size_t *bytes) {
   sp_str_hdr **pp = head;
   while (*pp) {
     sp_str_hdr *h = *pp;
-    __builtin_prefetch(h->next);
+    SP_PREFETCH(h->next);
     char *body = (char *)(h + 1);
     unsigned char m = (unsigned char)body[0];
-    if (m == 0xfc) { if (sp_gc_in_sweeper) { unsigned char ex = 0xfc; __atomic_compare_exchange_n((unsigned char *)body, &ex, (unsigned char)0xfe, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); } else body[0] = (char)0xfe; pp = &h->next; }
+    if (m == 0xfc) {
+      if (sp_gc_in_sweeper) { unsigned char ex = 0xfc; SP_ATOMIC_CAS((unsigned char *)body, &ex, (unsigned char)0xfe, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE); }
+      else body[0] = (char)0xfe;
+      pp = &h->next;
+    }
     else if (m == 0xf1) { pp = &h->next; }
+    else if (m == 0xf8) { SP_ATOMIC_STORE((unsigned char *)body, (unsigned char)0xfa, __ATOMIC_RELAXED); pp = &h->next; }
     else {
       *pp = h->next;
       *bytes -= h->size & SP_STR_SIZE_MASK;
@@ -1074,7 +1106,7 @@ char *sp_str_alloc_ext(size_t len) { return sp_str_alloc(len); }
 
 /* Wire string sweep into the object collector. Runs before main, so the hook is
    set before the first allocation can trigger a collection. */
-__attribute__((constructor)) static void sp_alloc_install_hooks(void) {
+SP_CONSTRUCTOR static void sp_alloc_install_hooks(void) {
   sp_gc_str_sweep_hook = sp_str_sweep_gated;
   sp_gc_str_major_due_hook = sp_str_major_due;
   sp_gc_obj_retune_hook = sp_gc_retune_object;
@@ -1349,7 +1381,7 @@ static int sp_resolve_report_signal(void) {
 static void sp_alloc_report_poll(void) {
   if (!sp_alloc_report_pending) return;
 #ifdef SP_THREADS
-  if (!__atomic_exchange_n(&sp_alloc_report_pending, 0, __ATOMIC_SEQ_CST)) return;
+  if (!SP_ATOMIC_EXCHANGE(&sp_alloc_report_pending, 0, __ATOMIC_SEQ_CST)) return;
 #else
   sp_alloc_report_pending = 0;
 #endif
@@ -1394,7 +1426,7 @@ static void sp_alloc_report_start_reader(void) {
 }
 #endif
 
-__attribute__((constructor)) static void sp_alloc_report_boot(void) {
+SP_CONSTRUCTOR static void sp_alloc_report_boot(void) {
   const char *e = getenv("SPINEL_ALLOC_REPORT");
   if (e && *e && strcmp(e, "0") != 0) {
     sp_alloc_report_on = 1; sp_gc_alloc_fast_ok = 0;
