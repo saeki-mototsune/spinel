@@ -247,9 +247,38 @@ static void sp_sysmon_wake(void) {
   if (g_sysmon_idle) pthread_cond_signal(&g_sysmon_cv);
   else if (g_sysmon_pipe[1] >= 0) { char c = 1; ssize_t r = write(g_sysmon_pipe[1], &c, 1); (void)r; }
 }
+/* When the monitor, now in a TIMED wait (its condvar or its poll), comes back
+   on its own; 0 while it waits with no deadline or is not waiting at all.
+   Written by the monitor under the lock before it waits.
 
-/* The monitor's cached next wake time. Timer insertions lower it; canceling its
-   current minimum clears it so the monitor recomputes from the heap. With the
+   A wake that only asks the monitor to "look soon" -- a worker that started a
+   green thread and wants its timeslice enforced -- has nothing to do when the
+   monitor is coming back by then anyway. Waking it regardless was a condvar
+   signal, a monitor turn and a scheduler-lock round trip for EVERY run of a
+   green thread: on a keep-alive server, one per request and per park, most
+   of the futex calls an I/O-bound server made per request went to a monitor
+   that had nothing to do. */
+static double g_sysmon_wake_at = 0.0;
+/* Last time a worker started running a green thread: the monitor keeps its
+   timed waits within a quantum while this is recent, so the run's own nudge
+   (below) can be skipped. */
+static double g_last_run_at = 0.0;
+/* How long after the last run the monitor stays on that leash: a server
+   under load runs a thread far more often than this and never wakes the
+   monitor; an isolated run (a once-a-second timer, an idle accept loop's poll)
+   costs at most two short monitor turns besides its nudge. Measured on a
+   keep-alive echo server: 1.0 s kept a 0.5 s accept poll warm forever, a
+   hundred monitor turns a second at idle. */
+#define SP_SYSMON_WARM (2 * SP_PREEMPT_QUANTUM)
+static void sp_sysmon_nudge_by(double by) {   /* PRE: lock held */
+  if (g_sysmon_wake_at != 0.0 && g_sysmon_wake_at <= by) return;   /* it looks by then on its own */
+  sp_sysmon_wake();
+}
+
+/* The monitor's cached next wake time, a lower bound on the earliest live
+   deadline. Timer insertions lower it; a cancel leaves it (see
+   sp_timer_cancel), and the monitor re-derives it from the heap when it
+   comes due. With the
    event backend, the monitor can skip rebuilding the I/O poll set until a
    deadline is due. */
 static double g_nearest = 0.0;   /* 0 = nothing timed */
@@ -382,10 +411,12 @@ static void sp_timer_cancel(sp_thread *thread) {
     timer->active = 0;
     if (g_timer_pending) g_timer_pending--;
     if (timer->in_heap) g_timer_cancelled++;
-    if (timer->deadline == g_nearest) {
-      g_nearest = 0.0;
-      sp_sysmon_wake();
-    }
+    /* g_nearest is left as it is: a deadline that no longer exists is still
+       a lower bound on the next real one, and all it costs is one monitor
+       turn at that moment, which re-derives g_nearest from the heap. Clearing
+       it woke the monitor for nothing, and the next park then woke it again
+       to set it (sp_deadline_added sees 0) -- two monitor turns each time a
+       connection whose read deadline was the nearest got its bytes. */
   }
 }
 
@@ -2111,11 +2142,14 @@ static void run_thread_once(sp_thread *t) { sp_gc_wb((void*)t);   /* PRE/POST: s
   }
 #ifdef SP_THREADS
   /* Publish to the monitor that this worker is now running t, and when -- it uses
-     this to enforce the timeslice. Nudge the monitor if it is idle so it starts
-     ticking. */
+     this to enforce the timeslice. Nudge the monitor so it starts ticking --
+     unless it comes back within a quantum anyway, sees `cur` then and starts
+     ticking: the preemption lands by since + quantum + tick either way, and a
+     busy server pays no monitor turn per run (sp_sysmon_nudge_by). */
   g_wslot[sp_worker_id].cur = t;
   g_wslot[sp_worker_id].since = sp_monotonic_now();
-  sp_sysmon_wake();
+  g_last_run_at = g_wslot[sp_worker_id].since;
+  sp_sysmon_nudge_by(g_last_run_at + SP_PREEMPT_QUANTUM);
 #endif
   int raised = 0;
   const char *ec = NULL, *em = NULL;
@@ -2798,6 +2832,13 @@ static void *sp_sysmon_main(void *arg) {
       double dt = busy ? SP_PREEMPT_TICK : (nearest != 0.0 ? nearest - now : 0.05);
       if (nearest != 0.0 && nearest - now < dt) dt = nearest - now;
       if (dt > 0.05) dt = 0.05;
+      /* A green thread ran recently: come back within a quantum, so the next
+         run finds the monitor due soon enough and need not wake it (see
+         sp_sysmon_nudge_by) -- a hundred turns a second under load in place
+         of one per run, and back to the 50 ms backstop once runs stop
+         (SP_SYSMON_WARM). */
+      if (!busy && dt > SP_PREEMPT_QUANTUM && g_last_run_at != 0.0 && now - g_last_run_at < SP_SYSMON_WARM)
+        dt = SP_PREEMPT_QUANTUM;
       if (dt < 0.0005) dt = 0.0005;
       int tmo = (int)(dt * 1000.0); if (tmo < 1) tmo = 1;
 #ifdef SP_EV_BACKEND
@@ -2818,7 +2859,9 @@ static void *sp_sysmon_main(void *arg) {
         if (ts.tv_nsec >= 1000000000L) { ts.tv_sec++; ts.tv_nsec -= 1000000000L; }
         SP_STAT_ADD(g_mon_polls, 1);
         g_sysmon_idle = 1;
+        g_sysmon_wake_at = sp_monotonic_now() + dt;
         pthread_cond_timedwait(&g_sysmon_cv, &g_sched_lock, &ts);
+        g_sysmon_wake_at = 0.0;
         g_sysmon_idle = 0;
         continue;
       }
@@ -2837,9 +2880,11 @@ static void *sp_sysmon_main(void *arg) {
         continue;
       }
       g_pfds[0].fd = g_sysmon_pipe[0]; g_pfds[0].events = POLLIN; g_pfds[0].revents = 0;
+      g_sysmon_wake_at = sp_monotonic_now() + tmo / 1000.0;
       SCHED_UNLOCK();
       int pr = poll(g_pfds, (nfds_t)npf, tmo);
       SCHED_LOCK();
+      g_sysmon_wake_at = 0.0;
       SP_STAT_ADD(g_mon_polls, 1); SP_STAT_ADD(g_mon_pollfds, npf);
       if (g_pfds[0].revents & POLLIN) {   /* drain the wake pipe */
         char buf[64]; while (read(g_sysmon_pipe[0], buf, sizeof buf) > 0) {}
@@ -3064,7 +3109,11 @@ static int sp_sched_wait_io_impl(int fd, short events, struct pollfd *set, int n
        it sleeps through every event that follows. That is a whole-scheduler
        stall, and it is what the first cut of this did -- 16 of 16 threads
        waiting out their select timeout, about one run in twenty. */
-    if (g_sysmon_idle) sp_sysmon_wake();
+    /* Only a monitor asleep WITHOUT a deadline: one in a timed wait comes
+       back within 50 ms and re-derives its deadline from the timer heap, and
+       a deadline earlier than the one it sleeps toward woke it already
+       (sp_deadline_added). Signalling it anyway was a monitor turn per park. */
+    if (g_sysmon_idle && g_sysmon_wake_at == 0.0) sp_sysmon_wake();
   }
   else
 #endif
