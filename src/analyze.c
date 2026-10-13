@@ -12135,6 +12135,10 @@ static int oa_ignores_block_value(Compiler *c, int call) {
   return ty_is_array(rt) || ty_is_ptr_array(rt) || ty_is_hash(rt) ||
          rt == TY_RANGE || rt == TY_INT;
 }
+static const char **oa_tail_names;   /* qsort context for oa_tail_name_cmp */
+static int oa_tail_name_cmp(const void *a, const void *b) {
+  return strcmp(oa_tail_names[*(const int *)a], oa_tail_names[*(const int *)b]);
+}
 static void oa_mark_unused_method_tails(Compiler *c, char *walk_disc, int nc) {
   const NodeTable *nt = c->nt;
   int ncand = 0, ccap = 0;
@@ -12158,6 +12162,14 @@ static void oa_mark_unused_method_tails(Compiler *c, char *walk_disc, int nc) {
     ctail[ncand] = t; cname[ncand] = sc->name; ncand++;
   }
   if (ncand == 0) { free(ctail); free(cname); return; }
+  /* candidates in name order, so a name met in the scan below finds its
+     methods by binary search: every unit of a program repeats the same method
+     names, and comparing each name with every candidate was O(nodes x methods) */
+  int *cord = (int *)malloc(sizeof(int) * (size_t)ncand);
+  if (!cord) { fprintf(stderr, "oom\n"); exit(1); }
+  for (int k = 0; k < ncand; k++) cord[k] = k;
+  oa_tail_names = cname;
+  qsort(cord, (size_t)ncand, sizeof *cord, oa_tail_name_cmp);
   /* positions whose value is thrown away: the statements walk_disc already
      names, plus the tail of a loop body and of a value-ignoring walk's block */
   char *disc = (char *)malloc((size_t)nc);
@@ -12210,11 +12222,16 @@ static void oa_mark_unused_method_tails(Compiler *c, char *walk_disc, int nc) {
       mn = ssc ? ssc->name : NULL;
     }
     if (!mn) continue;
-    for (int k = 0; k < ncand; k++) if (sp_streq(cname[k], mn)) used[k] = 1;
+    int lo = 0, hi = ncand;   /* the first candidate whose name is >= mn */
+    while (lo < hi) {
+      int mid = lo + (hi - lo) / 2;
+      if (strcmp(cname[cord[mid]], mn) < 0) lo = mid + 1; else hi = mid;
+    }
+    for (int k = lo; k < ncand && sp_streq(cname[cord[k]], mn); k++) used[cord[k]] = 1;
   }
   if (!dyn)
     for (int k = 0; k < ncand; k++) if (!used[k]) walk_disc[ctail[k]] = 1;
-  free(disc); free(used); free(ctail); free(cname);
+  free(disc); free(used); free(ctail); free(cname); free(cord);
 }
 
 static void oa_mark_subtree(const NodeTable *nt, int id, unsigned char *dead) {
