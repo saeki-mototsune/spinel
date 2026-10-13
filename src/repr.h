@@ -3,9 +3,9 @@
    The type of a node or a local says what Ruby value it holds; how that
    value is laid out in C is decided by a handful of flags the analysis sets
    beside the type: a shared-mutable String read as its handle, a nilable
-   Integer carried in its sentinel, a value-type object held by value, a
-   read narrowed past a nil guard. repr_of gathers those flags into one
-   answer, so the boxers and the readers can ask one question instead of
+   Integer holding its nil beside the value, a value-type object held by
+   value, a read narrowed past a nil guard. repr_of gathers those flags into
+   one answer, so the boxers and the readers can ask one question instead of
    each consulting the flags they know about.
 
    R0: the answer is computed purely from the live flags and nothing reads
@@ -18,7 +18,8 @@
 typedef enum {
   RK_NONE,      /* no value: unknown or void */
   RK_SCALAR,    /* an immediate: Integer, Float, true/false, Symbol, nil */
-  RK_SENTINEL,  /* an Integer or Float slot that can hold nil as its sentinel */
+  RK_OPT,       /* an Integer or Float that can hold nil beside its value: an
+                   sp_oint / sp_ofloat, or an ivar with a byte in iv__nilb */
   RK_STRUCT,    /* a by-value builtin struct: Range, Time, Complex, Rational,
                    Process::Tms, a Class */
   RK_VOBJ,      /* a user object of a value-type class, held by value */
@@ -45,7 +46,8 @@ typedef struct {
                              sp_StrRange's String); else TY_UNKNOWN */
   unsigned char kind;     /* ReprKind */
   unsigned may_nil:1;     /* the value can be nil in this representation:
-                             a nil-sentinel scalar; a user object or a
+                             an Integer or Float that holds its nil (an
+                             oint, a nil byte); a user object or a
                              String, Array, Hash or IO the nil fact
                              (analyze_nil.c, #7444) says may be; any other
                              pointer whose NULL is its nil */
@@ -55,9 +57,8 @@ typedef struct {
   unsigned poly_lift:1;   /* a poly read lifted to the shared handle */
   unsigned dyn_cls:1;     /* an object of a class with subclasses: its box
                              reads the class id from the object */
-  unsigned nil_scalar:1;  /* an Integer or Float whose box tests for the nil
-                             sentinel (with RK_SENTINEL, for a node and a
-                             slot alike) */
+  unsigned nil_scalar:1;  /* an Integer or Float whose box reads its nil
+                             (sp_box_oint / sp_box_ofloat) */
   unsigned nil_tested:1;  /* a call's nil arm has tested this receiver for
                              nil (VR_NIL_TESTED, a view around the call) */
   unsigned nil_cold:1;    /* ... in the out-of-range branch of a cached
@@ -87,11 +88,11 @@ typedef struct {
                              switch on the kind changes */
   unsigned elem_nil_marked:1; /* an Array the analysis saw a nil stored
                              into. An Integer or Float one
-                             (nullable_int_elem): its elements can be the
-                             sentinel, its stores set no run-time may_nil
-                             flag, and its whole-array reads scan for one;
-                             an unmarked one can still hold one its
-                             run-time flag answers for. A pointer one (an
+                             (nullable_int_elem): its elements can be nil
+                             (their nil bits), so a loop's cached read of
+                             it takes the element with its nil; an unmarked
+                             one can still hold one, which its nil bitmap
+                             answers for. A pointer one (an
                              object's, a String's, an Array's: the nil
                              fact's obj_elem_may_nil): a nil stored, or a
                              gap a write past the end leaves; an element
@@ -139,6 +140,8 @@ typedef enum {
 int repr_call_returns_handle(Compiler *c, int v);
 /* A builtin receiver conversion's String operand, or -1. */
 int repr_string_conversion_operand(Compiler *c, int v);
+/* An ENV store's value operand whose identity the result can keep, or -1. */
+int repr_env_store_operand(Compiler *c, int v);
 /* A boxed to_s that keeps its String receiver beside fresh user returns. */
 int repr_boxed_to_s_operand(Compiler *c, int v);
 /* A boxed call whose reader arms all hold shared String handles. */
@@ -165,8 +168,8 @@ int repr_hash_is(Repr r, TyKind key, TyKind val);
 /* Called once the analysis is final (the end of analyze_program): from here
    on the flags repr_of reads no longer change. */
 void repr_seal(Compiler *c);
-/* Whether an Integer or Float node's box has to test for the nil sentinel
-   (emit_boxed's sp_box_int_or_nil / sp_box_float_or_nil). */
+/* Whether an Integer or Float node's box has to read its nil (emit_boxed's
+   sp_box_oint / sp_box_ofloat): the node has an sp_oint form of its own. */
 int repr_nil_scalar(const Compiler *c, int node, TyKind t);
 /* Does a user object of kind t box with the class id it carries
    (sp_box_nullable_obj_dyn)? Its class has a subclass, and it is neither a
@@ -196,9 +199,9 @@ typedef enum {
   RF_PASS,          /* already an sp_RbVal */
   RF_NIL_EFFECT,    /* evaluated for its effect, then nil */
   RF_INT,           /* sp_box_int */
-  RF_INT_NIL,       /* an Integer whose sentinel boxes as nil */
+  RF_INT_NIL,       /* an Integer boxed with its nil: sp_box_oint */
   RF_FLT,           /* sp_box_float */
-  RF_FLT_NIL,       /* a Float whose sentinel boxes as nil */
+  RF_FLT_NIL,       /* a Float boxed with its nil: sp_box_ofloat */
   RF_BIGINT,        /* a Bignum, NULL as nil */
   RF_STR,           /* sp_box_str */
   RF_BOOL,
@@ -226,6 +229,20 @@ extern int g_repr_check;
 /* --repr-check: ask repr_of of a node codegen is about to emit, whose
    answer is dropped; the C must not change (repr_of changes nothing) */
 void repr_check_ask(const Compiler *c, int node);
+/* The settled return walk's leaf decisions and the emitter's observations.
+   All callers guard these with g_repr_check; no shadow exists otherwise. */
+enum { RCH_NONE, RCH_PUBLISH, RCH_CLEAR, RCH_NIL, RCH_HANDLE, RCH_BYTES, RCH_BOXED };
+void repr_channel_predict(Compiler *c, int node, int mi, int form);
+void repr_channel_clearing(Compiler *c, int delta);
+int repr_channel_begin(Compiler *c, int node);
+int repr_channel_ensure(Compiler *c, int node);
+void repr_channel_note(Compiler *c, int node, int form);
+void repr_channel_end(Compiler *c, int frame);
+void repr_channel_boxed(Compiler *c, int node, int frame);
+void repr_channel_call(Compiler *c, int node, int mi);
+void repr_channel_pickup(Compiler *c, int node, int nil_guard);
+void repr_channel_report(Compiler *c);
+void repr_channel_free(Compiler *c);
 /* --dump-repr is on (#7501) */
 extern int g_dump_repr;
 /* --dump-repr: each slot's representation, one sorted line per slot, as
@@ -248,12 +265,16 @@ typedef enum {
   CF_FIT,           /* written as it is */
   CF_BOX,           /* boxed into a poly slot */
   CF_EMPTY_LIT,     /* an empty [] / {} / Array.new / Hash.new built at the slot's kind */
-  CF_NIL_SENT,      /* the slot's nil: a nil literal, or a value with no C type
-                       evaluated for its effect */
+  CF_NIL_SENT,      /* the slot's nil (sp_oint_nil(), NULL, a boxed nil): a nil
+                       literal, or a value with no C type evaluated for its
+                       effect */
   CF_INT2BIG,       /* an Integer widened into a Bignum slot */
   CF_POLY_RHS,      /* a boxed value through its scalar conversion
                        (emit_poly_rhs_coerced) */
   CF_CHECKED_UNBOX, /* a boxed value through the checked unbox */
+  CF_STRBUF_HANDLE, /* --share-strings: a String into a shared String handle
+                       slot, as the handle it is or a fresh one
+                       (emit_strbuf_ivar_store) */
   CF_CONVERT,       /* a conversion Ruby makes itself: truthiness, a Bignum
                        or Rational to a Float */
   CF_REFUSE,        /* no conversion keeps the value: refused */

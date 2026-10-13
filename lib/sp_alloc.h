@@ -507,6 +507,10 @@ static inline void sp_str_set_len(char *s, size_t len) {
    `io.read(0)` the binary encoding, and the shared empty string cannot carry
    it -- marking that would tag it for every other holder of the same pointer.
    So these allocate, and only on that path. */
+static inline char *sp_str_bin_like(const char *s, char *r) {
+  if (sp_str_is_binary(s)) sp_str_mark_binary(r);
+  return r;
+}
 static inline char *sp_str_empty_binary(void) {
   char *r = sp_str_alloc_raw(1);
   r[0] = 0;
@@ -540,6 +544,13 @@ static inline const char *sp_str_dup_external(const char *s) {
   size_t n = strlen(s);
   char *r = sp_str_alloc(n);
   memcpy(r, s, n);
+  return r;
+}
+
+/* ENV copies are frozen but remain collectible, like frozen Hash keys. */
+static inline const char *sp_env_str(const char *s) {
+  char *r = (char *)sp_str_dup_external(s);
+  if (r) ((unsigned char *)r)[-1] = 0xfa;
   return r;
 }
 
@@ -577,8 +588,9 @@ static inline void sp_u64_write_back(char *end, uint64_t u) {
   if (u >= 10) { end -= 2; end[0] = d2[2 * u]; end[1] = d2[2 * u + 1]; }
   else *--end = (char)('0' + u);
 }
-/* An Integer the program knows is never the nil sentinel (the analysis says
-   no nil reaches it): INTPTR_MIN is that number here, not "" (#7612). */
+/* An Integer the program knows is never nil (the analysis says no nil
+   reaches it). A nil is written through sp_w_oint, so this is sp_w_int:
+   INTPTR_MIN is that number here, not "" (#7612). */
 static inline char *sp_w_int_plain(char *p, sp_int n) {
   uint64_t u;
   if (n < 0) { *p++ = '-'; u = (uint64_t)(-(n + 1)) + 1; }
@@ -588,7 +600,6 @@ static inline char *sp_w_int_plain(char *p, sp_int n) {
   return p;
 }
 static inline char *sp_w_int(char *p, sp_int n) {
-  if (n == SP_INT_NIL) return p;  /* a nil int slot interpolates as "" */
   uint64_t u;
   if (n < 0) { *p++ = '-'; u = (uint64_t)(-(n + 1)) + 1; }
   else u = (uint64_t)n;
@@ -762,18 +773,55 @@ static inline sp_RbVal sp_box_obj(void *p, int cls_id) { sp_RbVal r; r.tag = SP_
 static inline sp_RbVal sp_box_sym(sp_sym v)     { if (v == (sp_sym)-1) { sp_RbVal n; n.tag = SP_TAG_NIL; n.cls_id = 0; n.v.i = 0; return n; } sp_RbVal r; r.tag = SP_TAG_SYM;  r.cls_id = 0; r.v.i = (sp_int)v; return r; }  /* (sp_sym)-1 is the nilable-symbol sentinel: box it as nil, never as :"" */
 static inline sp_RbVal sp_box_poly_array(void *p) { return sp_box_obj(p, SP_BUILTIN_POLY_ARRAY); }
 
-/* The inverse of sp_box_int_or_nil / the float sentinel: unbox a poly into a
-   flat int / float slot that may hold nil. Reading `.v.i` straight off a
-   nil-tagged value yields the payload underneath the tag -- 0, an ordinary
-   Integer -- so nil silently becomes 0 (or 0.0). These map the nil tag to the
-   slot's reserved sentinel instead, which is what every nil? / to_s / boxing
-   site on a nullable int or float already tests for. */
-static inline sp_int sp_poly_as_int_or_nil(sp_RbVal v) {
-  return v.tag == SP_TAG_NIL ? SP_INT_NIL : v.v.i;
+/* ---- Nullable Integer / Float in flight (sp_oint / sp_ofloat, sp_types.h) ---- */
+/* A boxed value into a nullable slot, unchecked: the nil tag is the slot's
+   nil, any other tag reads its payload as the slot's kind (the caller has
+   settled the tag). Reading `.v.i` straight off a nil-tagged value would
+   yield the payload underneath the tag -- 0, an ordinary Integer. */
+static inline sp_oint sp_poly_as_int_or_nil(sp_RbVal v) {
+  return v.tag == SP_TAG_NIL ? sp_oint_nil() : sp_oint_of(v.v.i);
 }
-static inline sp_float sp_poly_as_float_or_nil(sp_RbVal v) {
-  return v.tag == SP_TAG_NIL ? sp_float_nil() : v.v.f;
+static inline sp_ofloat sp_poly_as_float_or_nil(sp_RbVal v) {
+  return v.tag == SP_TAG_NIL ? sp_ofloat_nil() : sp_ofloat_of(v.v.f);
 }
+/* ... and out: nil boxes as nil, a value as itself. Inline because every
+   boxed element read goes through here. */
+static inline sp_RbVal sp_box_oint(sp_oint o)     { return o.nil ? sp_box_nil() : sp_box_int(o.v); }
+static inline sp_RbVal sp_box_ofloat(sp_ofloat o) { return o.nil ? sp_box_nil() : sp_box_float(o.v); }
+/* The value of a nullable slot used where CRuby's nil would raise. The three
+   raisers live in lib/sp_str.c and lib/sp_cold.c; SP_COLD, so a check in a
+   hot function keeps its raise path out of the way (optcarrot's CPU#fetch
+   lost 40% of its frame rate to a warm one). */
+SP_NORETURN SP_COLD void sp_nil_recv(const char *meth);          /* NoMethodError "undefined method 'meth' for nil" */
+SP_NORETURN SP_COLD void sp_raise_nil_to_int(int of_wording);    /* TypeError "no implicit conversion from nil to integer" (1: "of nil into Integer") */
+SP_NORETURN SP_COLD void sp_raise_nil_opnd(const char *cls);     /* TypeError "nil can't be coerced into <cls>" */
+SP_NORETURN SP_COLD void sp_raise_nil_cmp(int left_nil, const char *op, const char *cls);  /* ArgumentError "comparison of <cls> with nil failed" (left_nil: NoMethodError) */
+/* the RECEIVER of `op` (`x + 1`, `x.abs`, `x < y`): NoMethodError for nil */
+static inline sp_int    sp_oint_val(sp_oint o, const char *op)     { if (SP_UNLIKELY(o.nil)) sp_nil_recv(op); return o.v; }
+static inline sp_float  sp_ofloat_val(sp_ofloat o, const char *op) { if (SP_UNLIKELY(o.nil)) sp_nil_recv(op); return o.v; }
+/* a strict Integer ARGUMENT (an index, a count, a width): the conversion TypeError */
+static inline sp_int    sp_oint_arg(sp_oint o)                     { if (SP_UNLIKELY(o.nil)) sp_raise_nil_to_int(0); return o.v; }
+static inline sp_int    sp_oint_arg_of(sp_oint o)                  { if (SP_UNLIKELY(o.nil)) sp_raise_nil_to_int(1); return o.v; }
+static inline sp_int    sp_oint_arg_offt(sp_oint o)                { if (SP_UNLIKELY(o.nil)) sp_raise_nil_to_int(2); return o.v; }   /* an off_t argument's wording */
+/* a strict Float argument: TypeError "can't convert nil into Float" */
+SP_NORETURN SP_COLD void sp_raise_nil_to_float(void);
+static inline sp_float  sp_ofloat_arg(sp_ofloat o)                 { if (SP_UNLIKELY(o.nil)) sp_raise_nil_to_float(); return o.v; }
+/* the RIGHT operand of an arithmetic operator (`1 + x`): the coercion TypeError */
+static inline sp_int    sp_oint_opnd(sp_oint o)                    { if (SP_UNLIKELY(o.nil)) sp_raise_nil_opnd("Integer"); return o.v; }
+static inline sp_float  sp_ofloat_opnd(sp_ofloat o)                { if (SP_UNLIKELY(o.nil)) sp_raise_nil_opnd("Float"); return o.v; }
+/* ...whose LEFT operand is of class lcls (`1 + f`: "nil can't be coerced into Integer") */
+static inline sp_float  sp_ofloat_opnd_in(sp_ofloat o, const char *lcls) { if (SP_UNLIKELY(o.nil)) sp_raise_nil_opnd(lcls); return o.v; }
+static inline sp_int    sp_oint_opnd_in(sp_oint o, const char *lcls)     { if (SP_UNLIKELY(o.nil)) sp_raise_nil_opnd(lcls); return o.v; }   /* `1.0 * b`: "into Float" */
+/* the RIGHT operand of a comparison (`1 < x`, `x.clamp(0, y)`): Comparable's
+   ArgumentError, naming the LEFT operand's class */
+static inline sp_int    sp_oint_cmp_opnd(sp_oint o, const char *op, const char *lcls)     { if (SP_UNLIKELY(o.nil)) sp_raise_nil_cmp(0, op, lcls); return o.v; }
+static inline sp_float  sp_ofloat_cmp_opnd(sp_ofloat o, const char *op, const char *lcls) { if (SP_UNLIKELY(o.nil)) sp_raise_nil_cmp(0, op, lcls); return o.v; }
+/* `x == y` / `x.eql?(y)` / `x <=> y` with a nullable side: nil equals only
+   nil, and <=> against nil is nil */
+static inline sp_bool sp_oint_eq(sp_oint a, sp_oint b)     { return a.nil ? b.nil : (!b.nil && a.v == b.v); }
+static inline sp_bool sp_ofloat_eq(sp_ofloat a, sp_ofloat b) { return a.nil ? b.nil : (!b.nil && a.v == b.v); }
+/* interpolation: nil is "" */
+static inline char *sp_w_oint(char *p, sp_oint o) { return o.nil ? p : sp_w_int(p, o.v); }
 
 /* GC object allocator. The threshold/stress state is extern (defined in
    sp_alloc.c) so every TU shares it -- the same model as sp_gc_heap/bytes.
@@ -789,6 +837,7 @@ extern int sp_gc_str_major_sched;
 extern size_t sp_gc_str_majors;
 extern int sp_gc_obj_budget_fixed;
 extern int sp_gc_str_budget_fixed;
+extern int sp_gc_str_budget_mode;
 extern size_t sp_gc_threshold;
 extern size_t sp_gc_threshold_init;
 extern int sp_gc_stress_checked;
@@ -840,6 +889,14 @@ SP_NORETURN void sp_raise_frozen_str(const char *s);              /* lib/sp_str.
    marked by the GC (sp_mark_string reads s[-1]), so a bare literal -- whose
    [-1] is out of bounds -- would be UB when it lands at a section edge. */
 static SP_NOINLINE SP_COLD void sp_raise_frozen_array(void) { sp_raise_cls("FrozenError", (&("\xff" "can't modify frozen Array")[1])); }
+/* An ENV name or value (value != 0) with an embedded NUL cannot reach the
+   C environment: CRuby raises ArgumentError rather than cut it short. */
+static inline const char *sp_env_chk(const char *s, int value) {
+  if (s && memchr(s, 0, sp_str_byte_len(s)))
+    sp_raise_cls("ArgumentError", value ? (&("\xff" "bad environment variable value: contains null byte")[1])
+                                        : (&("\xff" "bad environment variable name: contains null byte")[1]));
+  return s;
+}
 /* Same, but stages the receiver so FrozenError#receiver answers the frozen
    object itself (identity-preserving boxing of the mutation target) (#3002).
    sp_exc_stage_recv lives in the generated TU; the ctor transfers the staged
@@ -934,13 +991,20 @@ static SP_NOINLINE void sp_PolyArray_grow(sp_PolyArray *a) {
   a->cap = nc;
   h->size += sizeof(sp_RbVal) * a->cap; sp_gc_bytes_add(sizeof(sp_RbVal) * a->cap);
 }
-static inline void sp_PolyArray_push(sp_PolyArray *a, sp_RbVal v) { if (!a) return; sp_gc_wb((void*)a); if (a->frozen) { sp_raise_frozen_array(); return; } if (a->len >= a->cap) sp_PolyArray_grow(a); a->data[a->len++] = v; }
+static inline void sp_PolyArray_push(sp_PolyArray *a, sp_RbVal v) { if (!a) return; sp_gc_wb((void*)a); if (a->frozen) { sp_raise_frozen_array_at(a, SP_BUILTIN_POLY_ARRAY); return; } if (a->len >= a->cap) sp_PolyArray_grow(a); a->data[a->len++] = v; }
 static inline sp_RbVal sp_PolyArray_get(sp_PolyArray *a, sp_int i) { if (!a) return sp_box_nil(); if ((unsigned long long)i < (unsigned long long)a->len) return a->data[i]; if (i < 0) i += a->len; if (i < 0 || i >= a->len) return sp_box_nil(); return a->data[i]; }
 /* ---- relocated from spinel_rt.h: frozen-string check primitives used
    by lib/sp_cold.c's sp_str_setbyte_cow, and the SPL frozen-literal macro
    used by lib/sp_cold.c's sp_gc_stat. Pure textual move (still static
    inline / object-like macro), no codegen change. ---- */
 #define SPL(s) (&("\xff" s)[1])
+/* A String handle's payload (0xfd) is frozen when its owning handle is: the
+   header's `next` is that handle (sp_fd_own), whose GC header has the bit.
+   A Hash keeps a frozen handle's payload as its key (sp_hash_key_str). */
+static inline sp_bool sp_str_fd_owner_frozen(const char *s) {
+  void *owner = (void *)(((const sp_str_hdr *)(s - 1)) - 1)->next;
+  return owner && ((sp_gc_hdr *)((char *)owner - sizeof(sp_gc_hdr)))->frozen;
+}
 /* 0xf1 = heap string frozen by an explicit .freeze call.
    Unlike 0xff (rodata literal) this marker lives in a malloc'd buffer
    so sp_str_freeze_val can set it.  The frozen? predicate and mutation
@@ -952,19 +1016,29 @@ static inline sp_RbVal sp_PolyArray_get(sp_PolyArray *a, sp_int i) { if (!a) ret
 static inline sp_bool sp_str_is_frozen_val(const char *s) {
   if (!s) return TRUE;
   unsigned char m = ((const unsigned char *)s)[-1];
-  return m == 0xf1 || m == 0xfa || m == 0xf8;
+  /* one test of the frozen marks and 0xfd at once (bits 0, 7, 9 and 12 of
+     m - 0xf1): an unfrozen string pays nothing for the handle's payload */
+  unsigned d = (unsigned)m - 0xf1u;
+  if (d > 12u || !((0x1281u >> d) & 1u)) return FALSE;
+  if (SP_UNLIKELY(m == 0xfd)) return sp_str_fd_owner_frozen(s);
+  return TRUE;
 }
 static inline void sp_str_check_mutable(const char *s) {
   if (sp_str_is_frozen_val(s)) sp_raise_frozen_str(s);
 }
 /* A String key as a Hash stores it: a mutable string is copied into a frozen
    0xfa, so a later `<<` or setbyte on the caller's string cannot move the key
-   (CRuby's rb_hash_key_str). A frozen or literal key is stored as is. The
-   copy can collect, which clears the write barrier's record of the hash:
-   the caller issues its barrier again before storing. */
+   (CRuby's rb_hash_key_str). A frozen or literal key is stored as is, and so
+   is the payload of a frozen String handle (0xfd, whose header's `next` is
+   the owning handle, sp_fd_own): nothing can change or move it any more,
+   the mark of the key reaches the handle, and the key is that String itself,
+   as CRuby keys a frozen String. The copy can collect, which clears the
+   write barrier's record of the hash: the caller issues its barrier again
+   before storing. */
 static inline const char *sp_hash_key_str(const char *s) {
   unsigned char m = ((const unsigned char *)s)[-1];
   if (m != 0xfe && m != 0xfc && m != 0xfd) return s;
+  if (m == 0xfd && sp_str_fd_owner_frozen(s)) return s;
   char *r = (char *)sp_str_from_bytes(s, sp_str_byte_len(s));
   if (sp_str_is_binary(s)) sp_str_mark_binary(r);
   ((unsigned char *)r)[-1] = 0xfa;
@@ -994,15 +1068,15 @@ const char *sp_int_codepoint_to_str_in(const char *recv, sp_int n);
 sp_IntArray *sp_int_digits(sp_int n, sp_int base);
 sp_int sp_int_bit_length(sp_int n);
 sp_int sp_int_bit_range(sp_int n, sp_int start, sp_int len);
-const char *sp_int_interp(sp_int n);
+const char *sp_int_interp(sp_oint n);   /* interpolation: nil is "" */
 const char *sp_int_to_s_base(sp_int n, sp_int base);
-const char *sp_int_opt_inspect(sp_int v);
-const char *sp_int_opt_to_s(sp_int v);
+const char *sp_int_opt_inspect(sp_oint v);   /* "nil" for nil */
+const char *sp_int_opt_to_s(sp_oint v);      /* "" for nil */
 sp_int sp_int_pow(sp_int base, sp_int exp);
 
 /* ---- Float leaf-op prototypes (bodies relocated to lib/sp_cold.c). ---- */
-const char *sp_float_opt_inspect(sp_float v);
-const char *sp_float_opt_to_s(sp_float v);
+const char *sp_float_opt_inspect(sp_ofloat v);
+const char *sp_float_opt_to_s(sp_ofloat v);
 sp_int sp_float_denominator(sp_float f);
 sp_RbVal sp_float_numerator(sp_float f);
 /* Float#to_i: an in-range, non-NaN value is a C truncation, done inline;
@@ -1012,6 +1086,17 @@ sp_int sp_float_to_i_checked_slow(sp_float f);
 static inline sp_int sp_float_to_i_checked(sp_float f) {
   if (SP_LIKELY(f >= (sp_float)INTPTR_MIN && f < -(sp_float)INTPTR_MIN)) return (sp_int)f;
   return sp_float_to_i_checked_slow(f);
+}
+
+/* Machine-integer arguments use NUM2LONG's RangeError, unlike Float#to_i. */
+SP_NORETURN SP_COLD void sp_float_arg_range_error(sp_float f);
+static inline void sp_float_arg_check(sp_float f) {
+  if (SP_UNLIKELY(!(f >= (sp_float)INTPTR_MIN && f < -(sp_float)INTPTR_MIN)))
+    sp_float_arg_range_error(f);
+}
+static inline sp_int sp_float_arg_i(sp_float f) {
+  sp_float_arg_check(f);
+  return (sp_int)f;
 }
 
 /* ---- forward declarations for pointer-only box params (full types stay
@@ -1081,16 +1166,13 @@ static inline const char*sp_encoding_inspect(sp_Encoding e){return sp_encoding_i
 static inline sp_bool sp_encoding_eq(sp_Encoding a,sp_Encoding b){const char*an=sp_encoding_name(a);const char*bn=sp_encoding_name(b);return strcmp(an,bn)==0;}
 
 /* ---- Box helper prototypes (0 optcarrot uses; bodies in lib/sp_cold.c). ---- */
-/* An int? / float? value crossing into a poly slot: the sentinel is nil, never
-   a number. Inline because every boxed element read goes through here. */
-static inline sp_RbVal sp_box_int_or_nil(sp_int v) { return v == SP_INT_NIL ? sp_box_nil() : sp_box_int(v); }
-static inline sp_RbVal sp_box_float_or_nil(sp_float v) { return sp_float_is_nil(v) ? sp_box_nil() : sp_box_float(v); }
-/* An element of an Integer or Float array boxed for a poly container: `nf` is
-   the array's may_nil, read once ahead of the loop, so an array that cannot
-   hold nil boxes its elements as they are. */
-#define sp_box_int_nf(nf, v) ((nf) ? sp_box_int_or_nil(v) : sp_box_int(v))
-#define sp_box_float_nf(nf, v) ((nf) ? sp_box_float_or_nil(v) : sp_box_float(v))
-sp_RbVal sp_unsentinel(sp_RbVal v);
+/* An element of an Integer or Float array boxed for a poly container: the
+   element, or nil where the array's bitmap says so. `nf` is the array's
+   nilbits pointer read once ahead of the loop (SP_MAY_NIL), so an array that
+   never held a nil boxes its elements as they are; `pi` is the PHYSICAL slot
+   (start + i for an IntArray). */
+#define sp_box_int_nf(nf, pi, v) ((nf) && sp_nilbit_get((nf), (pi)) ? sp_box_nil() : sp_box_int(v))
+#define sp_box_float_nf(nf, pi, v) ((nf) && sp_nilbit_get((nf), (pi)) ? sp_box_nil() : sp_box_float(v))
 sp_RbVal sp_box_bigint(sp_Bigint *b);
 /* A bigint slot's nil is NULL (the compiler's nil_value for TY_BIGINT), so a
    nilable bigint boxes as nil rather than as a truthy Integer printing 0. */
@@ -1099,11 +1181,15 @@ static inline sp_RbVal sp_box_bigint_or_nil(sp_Bigint *b) { return b ? sp_box_bi
    it does not (a checksum, an unpacked quad, a parsed literal on a 32-bit
    sp_int). What a package answers as :any for a value that may be wide. */
 sp_RbVal sp_box_i64(int64_t v);
+/* A proven Integer: its own box. A nil is out of band (sp_oint), so no word
+   of an sp_int is reserved for it and the minimum word boxes as any other. */
+static inline sp_RbVal sp_box_int_nn(sp_int v) { return sp_box_int(v); }
 /* the inverse: a boxed Integer (or Float) as a 64-bit value, a Bignum through
    its low 64 bits, for a package parameter that may be wider than sp_int */
 int64_t sp_unbox_i64(sp_RbVal v);
 sp_RbVal sp_box_encoding(sp_Encoding e);
 sp_RbVal sp_encoding_find(sp_RbVal v);
+sp_PolyArray *sp_encoding_list(void);
 /* force_encoding's tag for an Encoding or a name known at run time */
 int sp_force_encoding_mode(sp_RbVal enc);
 sp_RbVal sp_box_nullable_str(const char *v);

@@ -9,7 +9,16 @@
 #include "builtin_ops.h"
 #include "repr.h"
 #include "call_plan.h"
+#include "share.h"
 #include "codegen_call_arms.h"
+
+/* ---- nil out of band: an emitter whose C result is an sp_oint / sp_ofloat
+   leaves it bare when the node is one (node_is_oint: the dispatcher's
+   consumer takes the oint) and otherwise reads it as the plain scalar through
+   sp_oint_arg (TypeError for nil) -- the same wrap the dispatcher applies to an
+   oint producer, applied here because this emitter decides the form. */
+static void oint_open(Compiler *c, int id, TyKind t, Buf *b) { if (!node_is_oint(c, id)) buf_printf(b, "%s(", oint_arg(t)); }
+static void oint_close(Compiler *c, int id, Buf *b) { if (!node_is_oint(c, id)) buf_puts(b, ")"); }
 
 /* the Kernel calls without a receiver: __dir__, at_exit, attr_* declarations, block_given?,
    the conversion functions (Integer, Float, String, Array, Hash, Rational, Complex), sleep,
@@ -294,33 +303,42 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       TyKind at0 = comp_ntype(c, av[0]);
       if (at0 == TY_STRING) {
         int promo = repr_of(c, id).kind == RK_BOXED;   /* promote mode: a Bignum past sp_int */
+        if (!promo) oint_open(c, id, TY_INT, b);
         buf_puts(b, promo ? "sp_str_to_i_promote(" : "sp_str_to_i_lenient_base("); emit_expr(c, av[0], b); buf_puts(b, ", ");
         if (ac == 2) emit_int_expr(c, av[1], b); else buf_puts(b, "0");
         buf_puts(b, promo ? ", 2)" : ")");
+        if (!promo) oint_close(c, id, b);
         return 1;
       }
       /* with a base only a String converts, so a number is nil here */
-      if (at0 == TY_INT && ac == 1) { emit_expr(c, av[0], b); return 1; }
+      /* (an Integer that can be nil hands its nil on: Integer(nil, exception: false) is nil) */
+      if (at0 == TY_INT && ac == 1) { oint_open(c, id, TY_INT, b); emit_oint_expr(c, av[0], TY_INT, b); oint_close(c, id, b); return 1; }
       /* a user object, a boxed value that may hold one, or a Float (NaN and
          Infinity are nil, CRuby's FloatDomainError swallowed) converts
          through the runtime's Kernel#Integer path, nil for every failure */
       if (ty_is_object(at0) || at0 == TY_POLY || (at0 == TY_FLOAT && ac == 1)) {
+        /* the runtime answers an sp_oint for an Integer-typed call */
+        int ko = comp_ntype(c, id) == TY_INT;
+        if (ko) oint_open(c, id, TY_INT, b);
         emit_kconv_call(c, id, av, ac, 0, b);
+        if (ko) oint_close(c, id, b);
         return 1;
       }
-      buf_puts(b, "((void)("); emit_expr(c, av[0], b); buf_puts(b, "), SP_INT_NIL)");
+      oint_open(c, id, TY_INT, b); buf_puts(b, "((void)("); emit_expr(c, av[0], b); buf_puts(b, "), sp_oint_nil())"); oint_close(c, id, b);
       return 1;
     }
     if (kconv_noraise && sp_streq(name, "Float") && ac == 1) {
       TyKind at0 = comp_ntype(c, av[0]);
-      if (at0 == TY_STRING) { buf_puts(b, "sp_str_to_f_lenient("); emit_expr(c, av[0], b); buf_puts(b, ")"); return 1; }
-      if (at0 == TY_INT) { buf_puts(b, "((sp_float)("); emit_expr(c, av[0], b); buf_puts(b, "))"); return 1; }
-      if (at0 == TY_FLOAT) { emit_expr(c, av[0], b); return 1; }
-      if (ty_is_object(at0) || at0 == TY_POLY) {
+      /* every arm answers an sp_ofloat: nil for a rejected value */
+      oint_open(c, id, TY_FLOAT, b);
+      if (at0 == TY_STRING) { buf_puts(b, "sp_str_to_f_lenient("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      else if (at0 == TY_INT) { buf_puts(b, "sp_ofloat_of((sp_float)("); emit_expr(c, av[0], b); buf_puts(b, "))"); }
+      else if (at0 == TY_FLOAT) { buf_puts(b, "sp_ofloat_of("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      else if (ty_is_object(at0) || at0 == TY_POLY) {
         buf_puts(b, "sp_poly_Float_ex("); emit_boxed(c, av[0], b); buf_puts(b, ", 0)");
-        return 1;
       }
-      buf_puts(b, "((void)("); emit_expr(c, av[0], b); buf_puts(b, "), sp_float_nil())");
+      else { buf_puts(b, "((void)("); emit_expr(c, av[0], b); buf_puts(b, "), sp_ofloat_nil())"); }
+      oint_close(c, id, b);
       return 1;
     }
     if (sp_streq(name, "Integer") && ac == 1) {
@@ -331,9 +349,10 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       { NodeKind ek = nt_kind(nt, av[0]);
         if (at == TY_UNKNOWN && (ek == NK_HashNode || ek == NK_KeywordHashNode || ek == NK_ArrayNode))
           at = TY_POLY_ARRAY; }
-      /* A nullable Integer or Float holding its sentinel is nil, and nil does
-         not convert: CRuby's TypeError, where the sentinel passed through as
-         a number (or, as a Float, raised FloatDomainError on its NaN). */
+      /* A nullable Integer or Float whose nil flag is set is nil, and nil
+         does not convert: CRuby's TypeError, where the nil passed through as
+         a number (or, as a Float, raised FloatDomainError on the NaN that
+         held it). */
       /* Under --int-overflow=promote the call answers a box (a Float past
          sp_int is a Bignum), and the guard boxes its answer the same way. */
       TyKind rt9 = repr_of(c, id).as_ty;
@@ -343,9 +362,9 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
         buf_puts(b, "({ "); emit_sentinel_bind(c, at, av[0], ref, sizeof ref, b);
         buf_puts(b, "if (!"); emit_slot_truthy(at, ref, b);
         buf_puts(b, ") sp_raise_cls(\"TypeError\", \"can't convert nil into Integer\"); ");
-        if (at == TY_INT) buf_printf(b, rt9 == TY_POLY ? "sp_box_int(%s); })" : "%s; })", ref);
-        else buf_printf(b, rt9 == TY_POLY ? "sp_poly_flo_domain_ck(%s); sp_box_f_to_int(%s); })"
-                                          : "sp_poly_flo_domain_ck(%s); sp_float_fit_i(%s); })", ref, ref);
+        if (at == TY_INT) buf_printf(b, rt9 == TY_POLY ? "sp_box_int(%s.v); })" : "%s.v; })", ref);
+        else buf_printf(b, rt9 == TY_POLY ? "sp_poly_flo_domain_ck(%s.v); sp_box_f_to_int(%s.v); })"
+                                          : "sp_poly_flo_domain_ck(%s.v); sp_float_fit_i(%s.v); })", ref, ref);
       }
       else if (at == TY_STRING && repr_of(c, id).kind == RK_BOXED) {   /* promote mode: a Bignum past sp_int */
         buf_puts(b, "sp_str_to_i_promote("); emit_expr(c, av[0], b); buf_puts(b, ", 0, 1)");
@@ -372,7 +391,11 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
          each answer judged by the runtime as CRuby judges it; a class whose
          #to_int or #to_i answers a Bignum types the call as one */
       else if (ty_is_object(at)) {
+        /* the strict form never answers nil: its sp_oint unwrapped */
+        int ko = comp_ntype(c, id) == TY_INT;
+        if (ko) buf_puts(b, "sp_oint_arg(");
         emit_kconv_call(c, id, av, ac, 1, b);
+        if (ko) buf_puts(b, ")");
       }
       else {
         /* an Array, Hash, Range or Symbol has no to_int: CRuby's TypeError,
@@ -398,7 +421,12 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
          user object is one -- a plain String, a shared handle, an object's
          #to_str -- the runtime decides, raising CRuby's ArgumentError for
          anything else (#2515) */
-      else emit_kconv_call(c, id, av, ac, 1, b);
+      else {
+        int ko = comp_ntype(c, id) == TY_INT;
+        if (ko) buf_puts(b, "sp_oint_arg(");
+        emit_kconv_call(c, id, av, ac, 1, b);
+        if (ko) buf_puts(b, ")");
+      }
       return 1;
     }
     if (sp_streq(name, "Float") && ac == 1) {
@@ -411,7 +439,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
         char ref[24];
         buf_puts(b, "({ "); emit_sentinel_bind(c, at, av[0], ref, sizeof ref, b);
         buf_puts(b, "if (!"); emit_slot_truthy(at, ref, b);
-        buf_printf(b, ") sp_raise_cls(\"TypeError\", \"can't convert nil into Float\"); (sp_float)%s; })", ref);
+        buf_printf(b, ") sp_raise_cls(\"TypeError\", \"can't convert nil into Float\"); (sp_float)%s.v; })", ref);
       }
       else if (at == TY_STRING) { buf_puts(b, "sp_str_to_f_strict("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
       else if (at == TY_INT) { buf_puts(b, "((sp_float)("); emit_expr(c, av[0], b); buf_puts(b, "))"); }
@@ -432,7 +460,11 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       /* a user object converts through its own #to_f, the answer judged by
          the runtime as CRuby judges it */
       else if (ty_is_object(at)) {
+        /* the strict form never answers nil: its sp_ofloat unwrapped */
+        int fo = comp_ntype(c, id) == TY_FLOAT;
+        if (fo) buf_puts(b, "sp_ofloat_arg(");
         buf_puts(b, "sp_poly_Float_ex("); emit_boxed(c, av[0], b); buf_puts(b, ", 1)");
+        if (fo) buf_puts(b, ")");
       }
       else {
         /* a Boolean, Symbol, Array or Hash has no #to_f: CRuby's TypeError,
@@ -452,7 +484,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
         buf_printf(b, "({ const char *_t%d = ", ts); emit_expr(c, av[0], b);
         buf_printf(b, "; _t%d ? _t%d : sp_str_frozen_empty; })", ts, ts);
       }
-      /* a nullable Integer or Float holding its sentinel is nil, whose
+      /* a nullable Integer or Float whose nil flag is set is nil, whose
          String is "": box it, as nil where it is one */
       else if ((at == TY_INT || at == TY_FLOAT) && call_returns_nullable_int(c, av[0])) {
         buf_puts(b, "sp_poly_to_s("); emit_boxed(c, av[0], b); buf_puts(b, ")");
@@ -515,17 +547,23 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
         emit_boxed(c, av[0], b);
         buf_puts(b, ")");
       }
+      else if (repr_share_rule(c) && at == TY_STRING && repr_of(c, id).as_ty == TY_POLY_ARRAY) {
+        /* The inferred boxed element keeps its shared String handle. */
+        int t = ++g_tmp;
+        buf_printf(b, "({ sp_String *_t%d = ", t); emit_strbuf_handle_of(c, av[0], b);
+        buf_printf(b, "; SP_GC_ROOT(_t%d); sp_kernel_array(sp_box_nullable_obj(_t%d, SP_BUILTIN_STRBUF)); })", t, t);
+      }
       else if (at == TY_INT || at == TY_FLOAT || at == TY_STRING) {
         const char *ak = at == TY_INT ? "Int" : at == TY_FLOAT ? "Float" : "Str";
         int t = ++g_tmp;
-        /* a nullable Integer or Float holding its sentinel is nil, and
+        /* a nullable Integer or Float whose nil flag is set is nil, and
            Array(nil) is empty: the element goes in only when it is one */
         if (at != TY_STRING && call_returns_nullable_int(c, av[0])) {
           char ref[24];
           buf_puts(b, "({ "); emit_sentinel_bind(c, at, av[0], ref, sizeof ref, b);
           buf_printf(b, "sp_%sArray *_t%d = sp_%sArray_new(); SP_GC_ROOT(_t%d); if (", ak, t, ak, t);
           emit_slot_truthy(at, ref, b);
-          buf_printf(b, ") sp_%sArray_push(_t%d, %s); _t%d; })", ak, t, ref, t);
+          buf_printf(b, ") sp_%sArray_push(_t%d, %s.v); _t%d; })", ak, t, ref, t);
           return 1;
         }
         buf_printf(b, "({ sp_%sArray *_t%d = sp_%sArray_new(); SP_GC_ROOT(_t%d); sp_%sArray_push(_t%d, ", ak, t, ak, t, ak, t);
@@ -729,7 +767,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     if (sp_streq(name, "srand")) {
       /* srand returns the PREVIOUS seed (#2517). */
       if (ac == 0) { buf_puts(b, "sp_kernel_srand((sp_int)time(NULL))"); return 1; }
-      buf_puts(b, "sp_kernel_srand("); emit_int_expr_conv(c, av[0], b); buf_puts(b, ")");
+      buf_puts(b, "sp_kernel_srand("); emit_to_int_expr(c, av[0], b); buf_puts(b, ")");
       return 1;
     }
     /* Kernel#gets reads the next line of ARGF, as `ARGF.gets` does; nil at
@@ -827,6 +865,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     return 1;
   }
 
+  if (recv < 0 && nt_ref(nt, id, "block") < 0) refuse_unredirected_output(c, id);
   /* Kernel#puts / #print as an expression: run the statement emitters inside
      a statement-expression and yield nil (their Ruby value). */
   if (recv < 0 && !bare_call_class_owned(c, id) && (is_text_print(name)) &&
@@ -856,7 +895,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     buf_printf(b, "({ sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d); ", t, t);
     for (int k = 0; k < argc; k++) {
       buf_printf(b, "sp_PolyArray_push(_t%d, ", t);
-      emit_boxed(c, argv[k], b);
+      emit_boxed_operand(c, argv, argc, k, b);
       buf_puts(b, "); ");
     }
     buf_printf(b, "for (sp_int _i%d = 0; _i%d < _t%d->len; _i%d++) { "
@@ -871,8 +910,28 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     buf_printf(b, "sp_puts_line(sp_poly_inspect(_t%d)); %s", t,
                sp_streq(name, "p") ? "fflush(stdout); " : "");   /* p flushes, as CRuby's does */
     char tv[16]; snprintf(tv, sizeof tv, "_t%d", t);
-    emit_unbox_text(c, at, tv, b);
+    /* a nullable number printed and handed on answers its oint */
+    if (oint_kind(at) && node_is_oint(c, id)) buf_printf(b, "%s(%s)", oint_unbox(at), tv);
+    else emit_unbox_text(c, at, tv, b);
     buf_puts(b, "; })");
+    return 1;
+  }
+  /* a warn's messages rendered as one String, each as puts writes it, for
+     the write desugar_std_stream_bare_warn sends it to */
+  if (recv < 0 && sp_streq(name, "warn") && nt_int(nt, id, "warn_text", 0)) {
+    int ta = ++g_tmp;
+    buf_printf(b, "({ const char *_t%d = sp_str_empty; SP_GC_ROOT_STR(_t%d); ", ta, ta);
+    for (int k = 0; k < argc; k++) {
+      buf_printf(b, "_t%d = sp_str_concat(_t%d, sp_poly_warn_text(", ta, ta);
+      emit_boxed(c, argv[k], b);
+      buf_puts(b, ")); ");
+    }
+    /* nil while $VERBOSE is nil (warn_text 2: the program assigns it),
+       once the messages have run */
+    LocalVar *verb = nt_int(nt, id, "warn_text", 0) == 2 ? comp_gvar(c, "VERBOSE") : NULL;
+    if (verb && verb->type == TY_POLY) buf_printf(b, "if (sp_poly_nil_p(gv_VERBOSE)) _t%d = NULL; ", ta);
+    else if (verb && verb->type == TY_NIL) buf_printf(b, "_t%d = NULL; ", ta);
+    buf_printf(b, "_t%d; })", ta);
     return 1;
   }
   /* Kernel#warn / #printf / #putc / p() as an expression: run the statement
@@ -890,6 +949,36 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     return 1;
   }
   return 0;
+}
+
+/* Does ENV name or value node v need CRuby's run-time check for an
+   embedded NUL? A String literal without one, or nil, does not. */
+static int env_str_checked(const Compiler *c, int v) {
+  if (nt_kind(c->nt, v) == NK_NilNode) return 0;
+  const char *s = nt_kind(c->nt, v) == NK_StringNode ? nt_str(c->nt, v, "content") : NULL;
+  return !s || strlen(s) != nt_str_len(c->nt, v, "content");
+}
+/* ENV name or value (value != 0) node v as a C string, checked */
+static void emit_env_str(Compiler *c, int v, int value, Buf *b) {
+  if (env_str_checked(c, v)) buf_puts(b, "sp_env_chk(");
+  emit_str_expr(c, v, b);
+  if (env_str_checked(c, v)) buf_printf(b, ", %d)", value);
+}
+/* The value ENV.delete(k)'s literal block answers when k is unset: its
+   last statement (codegen_internal.h; repr_call_returns_handle asks it) */
+int env_delete_block_value(Compiler *c, int v) {
+  const NodeTable *nt = c->nt;
+  const char *nm = v >= 0 && nt_kind(nt, v) == NK_CallNode ? nt_str(nt, v, "name") : NULL;
+  int recv = is_delete_name(nm) ? nt_ref(nt, v, "receiver") : -1;
+  int blk = recv >= 0 ? nt_ref(nt, v, "block") : -1, argc = 0;
+  if (blk < 0 || nt_kind(nt, blk) != NK_BlockNode || nt_kind(nt, recv) != NK_ConstantReadNode ||
+      !is_env_const(nt_str(nt, recv, "name")) || comp_const(c, "ENV"))
+    return -1;
+  call_args(nt, v, &argc);
+  if (argc != 1) return -1;
+  int body = nt_ref(nt, blk, "body"), n = 0;
+  const int *bb = body >= 0 && nt_kind(nt, body) == NK_StatementsNode ? nt_arr(nt, body, "body", &n) : NULL;
+  return n > 0 ? bb[n - 1] : -1;
 }
 
 /* control flow and the process: caller, eval, caller_locations, loop, catch / throw, system, trap, Fiber storage reads, and ENV */
@@ -988,9 +1077,9 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
            inside must pop it (see the statement-form loop). The break base is
            taken AFTER the bump -- a `break` leaves through the code below the
            loop, which pops that frame itself. */
-        int sv_lexc = g_loop_exc_base;
+        int sv_lexc = g_loop_exc_base, sv_lexc_rb = g_loop_rescue_base;
         g_exc_frame_depth++;
-        g_loop_exc_base = g_exc_frame_depth;
+        g_loop_exc_base = g_exc_frame_depth; g_loop_rescue_base = g_rescue_save_depth;
         /* a C loop like the statement form's (emit_loop_body): a break or
            next crossing an ensure opened in the body runs it, then leaves */
         int sv_lens = g_loop_ensure_base; g_loop_ensure_base = g_ensure_depth;
@@ -1006,7 +1095,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         g_c_loop_depth--;
         g_loop_ensure_base = sv_lens;
         g_loop_break_var = sv_lb;
-        g_loop_exc_base = sv_lexc;
+        g_loop_exc_base = sv_lexc; g_loop_rescue_base = sv_lexc_rb;
         g_ie_res_poly = sv_iep;
         g_brk_ser_var = sv_bj;
         emit_indent(g_pre, g_indent + 1); buf_puts(g_pre, "}\n");
@@ -1042,11 +1131,23 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     if (blk >= 0) {
       TyKind bt = repr_of(c, id).as_ty;
       /* NIL: a body whose tail is a break-less loop; ride the int slot (0). */
-      if (bt == TY_UNKNOWN || bt == TY_VOID || bt == TY_NIL) bt = TY_INT;
+      int was_nil_typed = bt == TY_UNKNOWN || bt == TY_VOID || bt == TY_NIL;
+      if (was_nil_typed) bt = TY_INT;
       int ptr = proc_slot_is_ptr(bt);
       int t = ++g_tmp;
-      emit_indent(g_pre, g_indent); emit_ctype(c, bt, g_pre);
-      buf_printf(g_pre, " _t%d = %s;\n", t, default_value_from_compiler(c, bt));
+      /* a number answer that can be nil (a thrown nil, a nullable tail, a
+         bare `throw` into a nil-typed catch riding the int slot) is held
+         with its nil beside the value */
+      int c_oint = oint_kind(bt) && (was_nil_typed || node_is_oint(c, id));
+      emit_indent(g_pre, g_indent);
+      if (c_oint) buf_printf(g_pre, "%s _t%d = %s;\n", oint_ctype(bt), t, oint_nil(bt));
+      else { emit_ctype(c, bt, g_pre); buf_printf(g_pre, " _t%d = %s;\n", t, default_value_from_compiler(c, bt)); }
+      /* the temp holds the value until the surrounding expression reads it,
+         past whatever an operand after this one hoists (the begin value's
+         temp, emit_expr); in front of the catch, so the landing's watermark
+         restore keeps the root. A catch that is its statement, all that a write
+         stores or a return's one value is read at once and takes none. */
+      if (ty_gc_holds_refs(c, bt) && !hoisted_value_is_stmt(c, id)) { emit_indent(g_pre, g_indent); emit_gc_root_tmp_refs(c, bt, t, g_pre); buf_puts(g_pre, "\n"); }
       emit_indent(g_pre, g_indent); buf_puts(g_pre, "sp_catch_check_depth();\n");
       int tag_kind = 0;
       if (argc == 1) {
@@ -1104,6 +1205,11 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
       emit_indent(g_pre, g_indent); buf_puts(g_pre, "sp_catch_exc_top[sp_catch_top] = sp_exc_top;\n");
       emit_indent(g_pre, g_indent); buf_puts(g_pre, "sp_catch_rootmark[sp_catch_top] = sp_gc_nroots;\n");
       emit_indent(g_pre, g_indent); buf_puts(g_pre, "sp_catch_top++;\n");
+      /* a throw out of an ensure body drops the exception that body had in
+         flight: the landing gives back the one in flight here */
+      int cic = g_uses_ensure ? ++g_tmp : 0;
+      /* ...and the handler stack, which such a body pushed it on as $! */
+      if (cic) { emit_indent(g_pre, g_indent); buf_printf(g_pre, "void *_cic%d = sp_inflight_cause; int _cicr%d = sp_rescue_sp;\n", cic, cic); }
       emit_indent(g_pre, g_indent);
       buf_puts(g_pre, "if (setjmp(sp_catch_stack[sp_catch_top-1]) == 0) {\n");
       /* a bare break in a catch body keeps today's C-break behavior */
@@ -1131,6 +1237,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
           Buf cvb; memset(&cvb, 0, sizeof cvb);
           int sv_ind = g_indent; g_indent = g_indent + 1;
           if (bt == TY_POLY && lr.kind != RK_BOXED) emit_boxed(c, last, &cvb);
+          else if (c_oint) emit_oint_expr(c, last, bt, &cvb);
           else emit_expr(c, last, &cvb);
           g_indent = sv_ind;
           emit_indent(g_pre, g_indent + 1);
@@ -1144,6 +1251,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
       emit_indent(g_pre, g_indent); buf_puts(g_pre, "else {\n");
       emit_indent(g_pre, g_indent + 1); buf_puts(g_pre, "sp_catch_top--;\n");
       emit_indent(g_pre, g_indent + 1); buf_puts(g_pre, "sp_gc_nroots = sp_catch_rootmark[sp_catch_top];\n");
+      if (cic) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "sp_inflight_cause = _cic%d; sp_rescue_sp = _cicr%d;\n", cic, cic); }
       emit_indent(g_pre, g_indent + 1);
       /* a kind with an unbox of its own reads through it (emit_unbox_text): a
          String thrown as a mutable String's box carries the handle, not the
@@ -1155,13 +1263,19 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
       else if (bt == TY_POLY) {
         buf_printf(g_pre, "_t%d = sp_catch_val[sp_catch_top];\n", t);
       }
+      else if (c_oint) {
+        buf_printf(g_pre, "_t%d = %s(sp_catch_val[sp_catch_top]);\n", t, oint_unbox(bt));
+      }
       else {
         buf_printf(g_pre, "_t%d = ", t);
         emit_unbox_text(c, bt, "sp_catch_val[sp_catch_top]", g_pre);
         buf_puts(g_pre, ";\n");
       }
       emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
-      buf_printf(b, "_t%d", t);
+      /* a nil-typed catch held its slot as the oint only to take a bare
+         throw's nil: its consumer reads the int slot as before */
+      if (c_oint && !node_is_oint(c, id)) buf_printf(b, "_t%d.v", t);
+      else buf_printf(b, "_t%d", t);
       return 1;
     }
   }
@@ -1183,7 +1297,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
 
   /* system(cmd, ...) expr: run and return bool */
   if (recv < 0 && sp_streq(name, "system") && argc >= 1 && !bare_call_class_owned(c, id)) {
-    if (emit_system_splat(c, argv, argc, b)) return 1;
+    if (emit_system_splat(c, id, argv, argc, b)) return 1;
     system_refuse_unsupported(c, id, argv, argc);
     /* each argument converts and is rooted before the next converts: a
        #to_str's answer is a heap String the following conversion may collect */
@@ -1370,12 +1484,33 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
       if (enm && sp_streq(enm, "delete") && eac == 1) {
         int t1 = ++g_tmp, t2 = ++g_tmp;
         int dblk = nt_ref(nt, id, "block");
-        buf_printf(b, "({ const char *_t%d = ", t1); emit_str_expr(c, eav[0], b);
+        int dpoly = repr_of(c, id).kind == RK_BOXED;
+        int result = dpoly ? ++g_tmp : t2;
+        /* --share-strings: a block value that is a handle is published, as
+           fetch's default is; a present key clears the return channel */
+        int dhandle = repr_call_returns_handle(c, id);
+        /* --share-strings: a variable's handle is read as a copy of its
+           bytes, which reach unsetenv past sp_env_str's allocation */
+        char kref[1024];
+        int key_handle = repr_share_rule(c) && strbuf_slot_ref(c, eav[0], kref, sizeof kref);
+        buf_printf(b, "({ const char *_t%d = ", t1); emit_env_str(c, eav[0], 0, b);
+        if (key_handle) buf_printf(b, "; SP_GC_ROOT(_t%d)", t1);
         buf_printf(b, "; const char *_t%d = getenv(_t%d);"
-                      " _t%d = _t%d ? sp_str_dup_external(_t%d) : NULL;"
+                      " _t%d = _t%d ? sp_env_str(_t%d) : NULL;"
                       " unsetenv(_t%d); ", t2, t1, t2, t2, t2, t1);
+        if (dhandle) buf_puts(b, "_sp_ret_strbuf = NULL; ");
+        if (dpoly) buf_printf(b, "sp_RbVal _t%d = sp_box_str(_t%d); ", result, t2);
         if (dblk >= 0) {
           const char *dp0 = block_param_name(c, dblk, 0);
+          if (repr_share_rule(c) && dp0 && share_node_shares(c, eav[0])) {
+            ShareRoute q = share_route(id, eav[0], 0);
+            /* a key no other name can see a copy of (a new String) takes
+               a new handle of its own */
+            q.to = dblk; q.to_name = dp0;
+            q.carry = key_handle ? eav[0] : strbuf_flow_unseen(c, eav[0]) ? SHARE_CARRY_NONE : SHARE_CARRY_COPY;
+            const char *msg = "ENV.delete is not supported: its block would receive a copy of a shared String key; see docs/limitations.md";
+            if (!share_route_defer(c, &q, msg)) unsupported_feature(c, id, msg);
+          }
           int dbody = nt_ref(nt, dblk, "body");
           int dbn = 0; const int *dbb = dbody >= 0 ? nt_arr(nt, dbody, "body", &dbn) : NULL;
           int dval = dbn > 0 ? dbb[dbn - 1] : -1;
@@ -1385,7 +1520,19 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
                analyzed type (it may not be a declared local here) */
             LocalVar *dlv = scope_local(comp_scope_of(c, id), dp0);
             TyKind dpt = dlv ? dlv->type : TY_STRING;
-            if (dpt == TY_POLY)
+            if (repr_share_rule(c) && dpt != TY_STRING && dpt != TY_STRBUF && dpt != TY_POLY)
+              unsupported_feature(c, id, "ENV.delete is not supported: its block parameter cannot carry the String key; see docs/limitations.md");
+            if (repr_share_rule(c) && repr_of_slot(c, dlv).handle) {
+              if (!key_handle && nt_kind(nt, eav[0]) != NK_StringNode) buf_printf(b, "SP_GC_ROOT(_t%d); ", t1);
+              buf_printf(b, "sp_String *lv_%s = ", rename_local(dp0));
+              if (key_handle) buf_puts(b, kref);
+              else buf_printf(b, "sp_String_new_shared(_t%d)", t1);
+              buf_printf(b, "; SP_GC_ROOT(lv_%s); ", rename_local(dp0));
+            }
+            else if (dpt == TY_POLY && key_handle)
+              buf_printf(b, "sp_RbVal lv_%s = sp_box_nullable_obj(%s, SP_BUILTIN_STRBUF); SP_GC_ROOT_RBVAL(lv_%s); ",
+                         rename_local(dp0), kref, rename_local(dp0));
+            else if (dpt == TY_POLY)
               buf_printf(b, "sp_RbVal lv_%s = sp_box_str(_t%d); (void)lv_%s; ",
                          rename_local(dp0), t1, rename_local(dp0));
             else
@@ -1393,21 +1540,19 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
                          rename_local(dp0), t1, rename_local(dp0));
           }
           for (int k = 0; k < dbn - 1; k++) emit_stmt(c, dbb[k], b, 0);
-          if (dval >= 0) {
-            Repr dvr = repr_of(c, dval);
-            TyKind dvt = dvr.as_ty;
-            buf_printf(b, "_t%d = ", t2);
-            if (dvt == TY_STRING) emit_expr(c, dval, b);
-            else if (dvr.kind == RK_BOXED) {
-              buf_puts(b, "({ sp_RbVal _dv = "); emit_expr(c, dval, b);
-              buf_puts(b, "; _dv.tag == SP_TAG_NIL ? NULL : sp_poly_to_s(_dv); })");
-            }
-            else { buf_puts(b, "sp_poly_to_s("); emit_boxed(c, dval, b); buf_puts(b, ")"); }
+          if (dval >= 0 && dhandle) {
+            buf_printf(b, "_t%d = sp_strbuf_read_pub(", result);
+            emit_strbuf_handle_of(c, dval, b);
+            buf_puts(b, "); ");
+          }
+          else if (dval >= 0) {
+            buf_printf(b, "_t%d = ", result);
+            emit_coerce(c, dval, dpoly ? TY_POLY : TY_STRING, CO_HOLD, "an ENV.delete block result", b);
             buf_puts(b, "; ");
           }
           buf_puts(b, "} ");
         }
-        buf_printf(b, "_t%d; })", t2);
+        buf_printf(b, "_t%d; })", result);
         return 1;
       }
       /* ENV.store(k, v) is []= */
@@ -1425,7 +1570,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     if (rty2 && sp_streq(rty2, "ConstantReadNode")) {
       const char *rn = nt_str(nt, recv, "name");
       if (rn && sp_streq(rn, "ENV")) {
-        buf_puts(b, "sp_str_dup_external(getenv("); emit_str_expr(c, argv[0], b); buf_puts(b, "))");
+        buf_puts(b, "sp_env_str(getenv("); emit_env_str(c, argv[0], 0, b); buf_puts(b, "))");
         return 1;
       }
     }
@@ -1444,8 +1589,9 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
           buf_printf(b, "({ const char *_t%d = ", tk); emit_str_expr(c, argv[0], b);
           /* a nil VALUE unsets the variable; only the key is strict */
           buf_printf(b, "; const char *_t%d = ", tv); emit_str_expr_nilable(c, argv[1], b);
-          buf_printf(b, "; if (_t%d) setenv(_t%d, _t%d, 1); else unsetenv(_t%d); _t%d; })",
-                     tv, tk, tv, tk, tv);
+          if (env_str_checked(c, argv[0])) buf_printf(b, "; sp_env_chk(_t%d, 0)", tk);
+          buf_printf(b, "; if (_t%d) setenv(_t%d, %s_t%d%s, 1); else unsetenv(_t%d); _t%d; })", tv, tk,
+                     env_str_checked(c, argv[1]) ? "sp_env_chk(" : "", tv, env_str_checked(c, argv[1]) ? ", 1)" : "", tk, tv);
         }
         else {
           /* runtime-typed RHS: nil deletes, a String sets, anything else
@@ -1479,7 +1625,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     if (rty2 && sp_streq(rty2, "ConstantReadNode")) {
       const char *rn = nt_str(nt, recv, "name");
       if (rn && sp_streq(rn, "ENV")) {
-        buf_puts(b, "(getenv("); emit_str_expr(c, argv[0], b); buf_puts(b, ") != NULL)");
+        buf_puts(b, "(getenv("); emit_env_str(c, argv[0], 0, b); buf_puts(b, ") != NULL)");
         return 1;
       }
     }
@@ -1494,22 +1640,29 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
            nil default keeps the nullable string, any other default boxes both
            arms. (The block form is the ENV snapshot's Hash#fetch, #2742.) */
         int fpoly = repr_of(c, id).kind == RK_BOXED;
+        int fhandle = repr_call_returns_handle(c, id);
         int tk = ++g_tmp, tky = ++g_tmp, tv = ++g_tmp, td = ++g_tmp;
         buf_printf(b, "({ const char *_t%d = ", tky); emit_str_expr(c, argv[0], b);
         /* the default is an argument: it evaluates whether or not the
            variable is set, before the lookup */
         if (argc >= 2) {
-          buf_puts(b, "; "); emit_ctype(c, fpoly ? TY_POLY : TY_STRING, b);
+          buf_puts(b, "; "); emit_ctype(c, fhandle ? TY_STRBUF : fpoly ? TY_POLY : TY_STRING, b);
           buf_printf(b, " _t%d = ", td);
-          if (fpoly) emit_boxed(c, argv[1], b);
+          if (fhandle) emit_strbuf_handle_of(c, argv[1], b);
+          else if (fpoly) emit_boxed(c, argv[1], b);
           else emit_expr(c, argv[1], b);
+          if (fhandle) buf_printf(b, "; SP_GC_ROOT(_t%d)", td);
         }
-        buf_printf(b, "; const char *_t%d = getenv(_t%d); ", tk, tky);
+        /* the name is checked after the default evaluates, as CRuby does */
+        buf_printf(b, "; const char *_t%d = getenv(%s_t%d%s); ", tk, env_str_checked(c, argv[0]) ? "sp_env_chk(" : "",
+                   tky, env_str_checked(c, argv[0]) ? ", 0)" : "");
         emit_ctype(c, fpoly ? TY_POLY : TY_STRING, b);
         buf_printf(b, " _t%d = _t%d ? ", tv, tk);
-        if (fpoly) buf_printf(b, "sp_box_str(sp_str_dup_external(_t%d)) : ", tk);
-        else buf_printf(b, "sp_str_dup_external(_t%d) : ", tk);
-        if (argc >= 2) buf_printf(b, "_t%d", td);
+        if (fhandle) buf_printf(b, "(_sp_ret_strbuf = NULL, sp_env_str(_t%d)) : ", tk);
+        else if (fpoly) buf_printf(b, "sp_box_str(sp_env_str(_t%d)) : ", tk);
+        else buf_printf(b, "sp_env_str(_t%d) : ", tk);
+        if (fhandle) buf_printf(b, "sp_strbuf_read_pub(_t%d)", td);
+        else if (argc >= 2) buf_printf(b, "_t%d", td);
         else
           /* no default: CRuby raises KeyError naming the key. Route it through
              sp_raise_key_not_found so the key is staged for #key (#3027). */

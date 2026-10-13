@@ -84,7 +84,10 @@ int holder_of_node_in(const Compiler *c, int node, int body, HolderRef *out) {
     int cid = strbuf_ivar_owner(mc, node);
     if (cid < 0) return 0;
     Scope *s = comp_scope_of(mc, node);
-    holder_ivar(c, node, cid, s->class_id < 0 || s->is_cmethod, out);
+    /* (--share-strings: an instance_eval/exec splice's ivar is its
+       receiver object's slot, whatever scope the block sits in) */
+    int ie = repr_share_rule(c) && (ie_class_of(mc, node) >= 0 || g_ie_class_id >= 0);
+    holder_ivar(c, node, cid, !ie && (s->class_id < 0 || s->is_cmethod), out);
     return 1;
   }
   out->kind = (unsigned char)hk;
@@ -157,9 +160,16 @@ int holder_slot_text(Compiler *c, const HolderRef *h, char *out, size_t cap) {
   case HK_GVAR:
     snprintf(out, cap, "gv_%s", h->lv->name);
     return 1;
-  case HK_CONST:
-    snprintf(out, cap, "cst_%s", h->lv->name);
+  case HK_CONST: {
+    /* a constant not assigned yet is a NameError at the read; the text stays an lvalue */
+    Buf rb; memset(&rb, 0, sizeof rb);
+    int cptr = (int)nt_int(c->nt, h->node, "const_ptr", 0);   /* its slot, held by emit_const_recv_wrap */
+    if (cptr) buf_printf(&rb, "(*_p%d)", cptr);
+    else emit_const_slot_read(c, h->node, h->lv, h->lv->name, 0, 0, &rb);
+    snprintf(out, cap, "%s", rb.p ? rb.p : "");
+    free(rb.p);
     return 1;
+  }
   case HK_CVAR:
     snprintf(out, cap, "cvar_%s_%s", c->classes[h->cid].name, h->name + 2);
     return 1;

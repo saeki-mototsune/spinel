@@ -111,3 +111,30 @@ def fp_link2(addr, opts = {})
   opts
 end
 p fp_link("a@b"), fp_link2("5")
+
+# A send whose name is interpolated around a fixed part, where the only
+# methods of that shape cannot take the call's arguments (activerecord's
+# `public_send(:"clear_#{attribute}_change")` beside activemodel's
+# clear_attribute_change(attr_name)): the lowering found no arm for it and
+# reported a change all the same, every round. (Nothing calls it here: a
+# call reaching it is refused, as a send no method can serve.)
+class FpDirty
+  def clear_attribute_change(n) = n
+  def clear(a) = public_send(:"clear_#{a}_change")
+end
+p FpDirty.new.clear_attribute_change(1)
+
+# A block parameter nothing types, reassigned from a call on itself and then
+# read with a String key (activerecord's nested attributes: `attributes =
+# attributes.with_indifferent_access; attributes["id"]`): with every write
+# still unknown, the key read promoted it to a String-keyed hash; the next
+# round its own call read that hash and typed it an Array, which the key
+# read does not promote, and the round after it was unknown again. (Nothing
+# calls it here: a caller would type the parameter.)
+def fp_ids(coll)
+  coll.each do |a|
+    a = a.keys
+    a["id"]
+  end
+end
+p 1

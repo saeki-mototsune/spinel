@@ -105,7 +105,7 @@ Recognized type specs:
 | `:double` | `double` | `float` |
 | `:bool` | `int` | `bool` |
 | `:str` | `const char *` | `string` (NUL-terminated) |
-| `:binstr` | `const char *` | `string` (binary-safe, return only) |
+| `:binstr` | `const char *` | `string` (a return is binary-safe) |
 | `:ptr` | `void *` | `ptr`; an argument also takes an `IO::Buffer` (its base address) |
 | `:float_array` | `const double *` | `Array<Float>` (`.data` pointer) |
 | `:int_array` | `const int64_t *` | `Array<Int>` (`.data` pointer) |
@@ -113,7 +113,21 @@ Recognized type specs:
 
 All integer types collapse to `sp_int` (int64) inside Spinel and are
 cast to the declared C type at the call boundary. Floats collapse to
-`double` the same way.
+`double` the same way. A nullable Integer passed where a C integer type
+is declared goes through `sp_oint_arg`, which raises the
+`no implicit conversion from nil to integer` TypeError for nil and passes
+every other value, `INT64_MIN` included.
+
+The other direction, the C contract header `--ext-entry` emits for a
+kernel's exported methods (see [spin.md](spin.md)), spells a nullable
+Integer or Float -- a parameter the kernel is also called with `nil`, a
+return that can be `nil` -- as `sp_oint` / `sp_ofloat` rather than
+`sp_int` / `sp_float`: a struct of the machine word and a nil flag
+(`{ sp_int v; sp_bool nil; }`), built with `sp_oint_of(v)` or
+`sp_oint_nil()` and read through `.nil` and `.v`. No bit pattern of the
+word means nil, so `INT64_MIN` and a NaN of any payload cross the
+boundary as values. A parameter or return the analysis never sees `nil`
+reach stays a plain `sp_int` / `sp_float`.
 
 The function's `extern` is built from these C types and declared under a
 private name that an asm label binds to the real symbol, so it can't
@@ -131,11 +145,16 @@ redirected variant, name it with the ffi gem's rename form,
 `attach_function :fopen, :fopen64, [:string, :string], :pointer`.
 
 `:str` builds the result String by `strlen`, so it stops at the first
-embedded NUL. `:binstr` is a return-only variant that builds a
-binary-safe String of an exact byte count instead (it reads
-`sp_ffi_bin_len`, which the callee sets to the exact byte count
-just before returning), so embedded NUL bytes are preserved. Use it for
-binary socket reads or raw digests where `:str` would truncate.
+embedded NUL. As a return, `:binstr` builds a binary-safe String of an
+exact byte count instead (it reads `sp_ffi_bin_len`, which the callee
+sets to the exact byte count just before returning), so embedded NUL
+bytes are preserved. Use it for binary socket reads or raw digests where
+`:str` would truncate.
+
+As an argument or an `ffi_callback` parameter, `:binstr` (and the ffi
+gem's `:string`) is the same as `:str`: a `const char *`. nil passes
+NULL and a non-String raises `TypeError`. The length is not part of it,
+so pass the bytesize separately as `:size_t` if the bytes may hold NUL.
 
 `:float_array` / `:int_array` hand the C side a pointer to the Spinel
 Array's contiguous storage (`.data`). Length is **not** part of the

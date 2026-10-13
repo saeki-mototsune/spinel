@@ -45,6 +45,8 @@ static const PolyFace ty_poly_face_tbl[] = {
      disagree, so `.to_a` / `.map` read it as the Enumerator's answer (#4779);
      an Integer or Float Range's step(n) materializes the same way */
   {"step", PF_INT | PF_FLOAT | PF_RANGE | PF_FRANGE, 1, 2, 0},
+  /* with no argument at all, a number's endless walk by 1 */
+  {"step", PF_INT | PF_FLOAT, 0, 0, 0},
   /* A Range of each kind owns step and bsearch with a block: unboxed to its
      own by-value struct, the typed emitter walks it. A blockless step(n)
      takes the row above; blockless bsearch answers an Enumerator no typed
@@ -428,12 +430,13 @@ TyKind ty_unify(TyKind a, TyKind b) {
      widen to poly, so `v.nil? ? nil : v.upcase`, `return nil if v.nil?` and
      `t = nil; t = "y" if ...` all took the boxed slow path where `v&.upcase`
      did not, and that one rule was the largest single source of untyped
-     slots in a real tree (#4567). Integer and Float have sentinels too and
-     may follow; bool and Symbol have no spare inhabitant and stay poly. */
+     slots in a real tree (#4567). Integer and Float hold their nil beside
+     the value and follow below; bool and Symbol have no spare inhabitant and
+     stay poly. */
   if (a == TY_NIL && b == TY_STRING) return b;
   if (b == TY_NIL && a == TY_STRING) return a;
   /* An Integer or a Float that also sees nil stays a (nullable) scalar: the
-     slot's nil is the sentinel (SP_INT_NIL, the NaN payload), which the
+     slot's nil rides beside the value (sp_oint / sp_ofloat), which the
      search misses already leave there, and every consumer that can carry
      it is guarded by the #3505 marking (nullable_int on the local, the
      ivar, the return). `best = nil` followed by `best = x` in a search
@@ -491,6 +494,18 @@ int fold_seed_typed(TyKind seed, TyKind elem) {
   if (seed == TY_UNKNOWN) return 1;
   if (seed == elem) return 1;
   return elem == TY_FLOAT && seed == TY_INT;
+}
+
+/* A sum can return the untouched seed when empty. Keep that class as well as
+   the block's values; nonnumeric accumulators use the boxed Ruby operator. */
+TyKind fold_sum_type(TyKind seed, TyKind elem, int promote) {
+  if (elem != TY_INT && elem != TY_FLOAT) return TY_POLY;
+  if (seed == TY_POLY || seed == TY_STRING ||
+      (seed != TY_INT && seed != TY_FLOAT && seed != TY_UNKNOWN &&
+       !fold_seed_typed(seed, elem))) return TY_POLY;
+  if (elem == TY_FLOAT && seed != TY_FLOAT) return TY_POLY;
+  if (promote && elem == TY_INT && seed != TY_FLOAT) return TY_POLY;
+  return seed == TY_FLOAT ? TY_FLOAT : elem;
 }
 
 TyIterShape ty_iter_shape(const char *name) {
@@ -620,7 +635,11 @@ int ty_builtin_ivar_less(TyKind t) {
 }
 
 /* Of those, the values whose identity Spinel keeps, so the runtime's map can
-   hold their ivars (sp_bivar_*): an Array, a Hash, a Random. */
+   hold their ivars (sp_bivar_*): an Array, a Hash, a Random. An exception
+   is keyed too, though it is no ivar-less builtin: one of the program's
+   exception classes keeps its ivars in its own layout, so the reflection on
+   it dispatches by the runtime class (emit_exc_ivar_call), and only a copy
+   of it reads this predicate. */
 int ty_bivar_keyed(TyKind t) {
-  return t == TY_RANDOM || ty_is_array(t) || ty_is_hash(t);
+  return t == TY_RANDOM || t == TY_EXCEPTION || ty_is_array(t) || ty_is_hash(t);
 }

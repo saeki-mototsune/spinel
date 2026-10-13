@@ -3,7 +3,7 @@
  * One executable does the whole job, with no shell wrapper and no chain of
  * helper binaries (the legacy parse -> analyze -> codegen pipeline collapsed
  * into this process). It:
- *   1. parses the .rb (Prism walk -> text AST -> in-memory node table),
+ *   1. parses the .rb (the Prism walk fills the in-memory node table),
  *   2. infers types and emits C (codegen_program),
  *   3. invokes the C compiler (cc) to link the generated C against
  *      libspinel_rt.a into a native binary, and
@@ -22,6 +22,7 @@
 #include "codegen.h"
 #include "analyze.h"
 #include "repr.h"
+#include "share.h"
 #include "csplit.h"
 #include "decide.h"
 
@@ -72,7 +73,7 @@ extern char *g_ext_shim_text;
 #define EXE_SUFFIX SPINEL_EXE_SUFFIX
 
 /* Defined in spinel_parse.c (compiled with -DSPINEL_PARSE_AS_LIB). */
-char *sp_parse_file_to_text(const char *source_file, const char *argv0);
+NodeTable *sp_parse_file(const char *source_file, const char *argv0);
 
 /* ---------- tiny growable string ---------- */
 typedef struct { char *p; size_t len, cap; } Str;
@@ -129,6 +130,25 @@ static void bi_put_toks(Str *bi, const char *kind, const char *toks) {
   free(d);
 }
 
+/* The host libraries a native program needs beyond libc and libm.
+   OpenBSD's backtrace(3), which the runtime archive calls, is
+   libexecinfo's rather than libc's. String#crypt is libc crypt(3), linked
+   only when the program calls it: Darwin's and OpenBSD's libc have it,
+   with no libcrypt, and elsewhere a linker without a default --as-needed
+   (Fedora's) otherwise made libcrypt a dependency of every binary (#6674). */
+static void add_host_libs(Str *cmd, Str *bi, int uses_crypt) {
+#if defined(__OpenBSD__)
+  s_add(cmd, "-lexecinfo ");
+  bi_put(bi, "lib", "-lexecinfo");
+#elif !defined(__APPLE__)
+  if (uses_crypt) {
+    s_add(cmd, "-lcrypt ");
+    bi_put(bi, "lib", "-lcrypt");
+  }
+#endif
+  (void)uses_crypt;
+}
+
 #if defined(_WIN32)
 /* The platform's own flags (SPINEL_PLATFORM_CFLAGS / _LIBS) onto the command
    line, "@LIB@" spelled as the runtime's lib directory (quoted: it may hold a
@@ -144,7 +164,8 @@ static void add_platform_flags(Str *cmd, Str *bi, const char *flags, const char 
     else snprintf(tok, sizeof tok, "%s", t);
     if ((tok[0] == '-' && (tok[1] == 'I' || tok[1] == 'L')) && at) {
       char q[4300]; snprintf(q, sizeof q, "-%c\"%s\" ", tok[1], tok + 2); s_add(cmd, q);
-    } else { s_add(cmd, tok); s_add(cmd, " "); }
+    }
+    else { s_add(cmd, tok); s_add(cmd, " "); }
     bi_put(bi, tok[1] == 'I' ? "include" : tok[1] == 'D' ? "define" :
                (tok[1] == 'l' || tok[1] == 'L' || tok[1] == 'W' || !strcmp(tok, "-static")) ? "lib" : "cflag",
            tok[1] == 'I' ? tok + 2 : tok);
@@ -332,7 +353,9 @@ static int cc_split_build(const char *cmd, size_t src_at, size_t src_end,
   char pre[4200]; snprintf(pre, sizeof pre, "%s/pre.i", dir);
   size_t cl = strlen(flags) + strlen(c_path) + strlen(pre) + 64;
   char *c1 = malloc(cl);
-  snprintf(c1, cl, "%s -E -P '%s' -o '%s'", flags, c_path, pre);
+  /* -E keeps the line markers: csplit.c replays them, so the parts know which
+     lines are system headers and which are the .rb (#8579) */
+  snprintf(c1, cl, "%s -E '%s' -o '%s'", flags, c_path, pre);
   double tm_pre = sp_timing_now();
   int rc = system(c1);
   free(c1);
@@ -431,9 +454,9 @@ static void usage(void) {
     "              and writes <out>.symbols.json (perf record -g ready)\n"
     "  --debug     Debug build: step through the .rb in gdb/lldb (#line, -g -O0)\n"
     "  --no-line-map  Suppress #line directives\n"
-    "  --defer-refusals  Build anyway: a refused method raises NotImplementedError\n"
-    "               when called, a refused top-level or class-body statement\n"
-    "               when reached\n"
+    "  --defer-refusals  Build anyway: a refused statement raises\n"
+    "               NotImplementedError when reached (a refusal outside any\n"
+    "               statement of a method, when the method is called)\n"
     "  --ext-init NAME    Emit a host-callable library: NAME() replaces main\n"
     "  --ext-entry M.m,.. Export these module methods (with -c; writes a .h contract)\n"
     "  --ext cruby        Also generate the CRuby extension shim (<out>_ext.c)\n"
@@ -452,8 +475,13 @@ static void usage(void) {
     "  --target=wasm32-wasi  Build a WebAssembly module for a WASI host with the\n"
     "              wasi-sdk at $WASI_SDK (default /opt/wasi-sdk); Integer is 32-bit,\n"
     "              and Fiber, Thread, processes and sockets are not available there\n"
+    "  --exceptions=abort  With --target=wasm32-wasi, for a host without wasm\n"
+    "              exception handling: a raise traps, and rescue, retry, catch and a\n"
+    "              break or return that leaves a block through a frame are refused\n"
     "  -e STR      Inline Ruby source (repeatable; joined with newlines)\n"
     "  --rbs DIR   Seed analyzer with RBS signatures from DIR (advisory)\n"
+    "  --no-inline-rbs  Ignore inline RBS comments (`#: ...`, `# @rbs ...`)\n"
+    "              in the program (default: apply them; docs/inline-rbs.md)\n"
     "  --int-overflow=MODE  Int +/-/* overflow handling (default: raise)\n"
     "  --dump-ast  Print the text AST and exit (debug)\n");
 }
@@ -500,8 +528,13 @@ int main(int argc, char **argv) {
      host (wasmtime, Node's WASI, a browser shim), built by the wasi-sdk's
      clang against the runtime archive in lib/wasm32-wasi/. */
   int target_wasi = 0;
+  /* --exceptions=abort (wasm32-wasi only): a runtime without setjmp/longjmp,
+     for a host that has no exception-handling proposal. A raise traps; the
+     constructs that need a frame to catch it are refused (see lib/sp_setjmp.h). */
+  int exc_abort = 0;
   const char *int_overflow = "raise";
   const char *rbs_dir = NULL;
+  extern int sp_inline_rbs_enabled, sp_inline_rbs_failed;
   int c_only = 0, stdout_mode = 0, run_mode = 0, dump_ast = 0;
   int print_build = 0;   /* --print-build: emit the build ingredients, run nothing */
   int cc_jobs = 0;       /* --jobs=N: compile the C as N units in parallel (#4847); 0 = auto */
@@ -527,8 +560,15 @@ int main(int argc, char **argv) {
       else { fprintf(stderr, "spinel: unknown --target %s (wasm32-wasi or native)\n", a + 9); return 1; }
       i++;
     }
+    else if (!strncmp(a, "--exceptions=", 13)) {
+      if (sp_streq(a + 13, "abort")) exc_abort = 1;
+      else if (sp_streq(a + 13, "unwind")) exc_abort = 0;
+      else { fprintf(stderr, "spinel: unknown --exceptions %s (abort or unwind)\n", a + 13); return 1; }
+      i++;
+    }
     else if (!strncmp(a, "--rbs=", 6))    { rbs_dir = a + 6; i++; }
     else if (sp_streq(a, "--rbs"))         { if (++i < argc) rbs_dir = argv[i]; i++; }
+    else if (sp_streq(a, "--no-inline-rbs")) { sp_inline_rbs_enabled = 0; i++; }
     else if (sp_streq(a, "--disable=frozen-string-literal") ||
              sp_streq(a, "--disable-frozen-string-literal")) {
       fprintf(stderr, "spinel: --disable=frozen-string-literal is not "
@@ -605,10 +645,14 @@ int main(int argc, char **argv) {
     else if (sp_streq(a, "--emit-rbs"))    { emit_rbs = 1; i++; }
     else if (sp_streq(a, "--emit-types"))  { emit_types = 1; i++; }
     else if (sp_streq(a, "--plan-check"))  { g_plan_check = 1; i++; }
+    else if (sp_streq(a, "--arm-check"))   { g_arm_check = 1; i++; }
     else if (sp_streq(a, "--repr-check"))  { g_repr_check = 1; i++; }
+    else if (sp_streq(a, "--share-check")) { g_share_check = 1; i++; }
     else if (sp_streq(a, "--dump-repr"))   { g_dump_repr = 1; i++; }
-    else if (sp_streq(a, "--nil-check"))   { g_nil_check = 1; i++; }
     else if (sp_streq(a, "--check-traits")) { g_check_traits = 1; i++; }
+#ifdef SP_BOP_SHARE_CHECK
+    else if (sp_streq(a, "--check-bop-share")) return builtin_ops_share_check() ? 1 : 0;
+#endif
     else if (sp_streq(a, "--check-bop-arity")) return builtin_ops_arity_check() ? 1 : 0;
     else if (sp_streq(a, "--dump-traits"))  { g_dump_traits = 1; i++; }
     else if (sp_streq(a, "--emit-symbol-map")) { emit_symbol_map = 1; i++; }
@@ -749,6 +793,11 @@ int main(int argc, char **argv) {
   /* Let the analyzer widen accumulating int locals to bigint more freely in
      promote mode (block-iteration loops, not just `while`). See analyze.h. */
   g_promote_mode = sp_streq(int_overflow, "promote");
+  if (exc_abort && !target_wasi) {
+    fprintf(stderr, "spinel: --exceptions=abort is for --target=wasm32-wasi\n");
+    return 1;
+  }
+  g_exc_abort = exc_abort;
 
   /* Base name for default output paths. */
   char basename[1024];
@@ -783,6 +832,9 @@ int main(int argc, char **argv) {
       make_temp_path(seed_path, sizeof seed_path, "seed", 0, ".txt");
       Str cmd = {0};
       s_add_arg(&cmd, extractor);
+      /* each seed preceded by its .rbs position, which a disagreement with
+         an inline RBS annotation names */
+      if (sp_inline_rbs_enabled) s_add_arg(&cmd, "--positions");
       s_add_arg(&cmd, rbs_dir);
       s_add(&cmd, "> ");
       s_add_arg(&cmd, seed_path);
@@ -905,16 +957,17 @@ int main(int argc, char **argv) {
   else target_i386 = 1;
 #endif
   double tm_front = sp_timing_now();
-  char *text = sp_parse_file_to_text(source, argv[0]);
+  NodeTable *nt = sp_parse_file(source, argv[0]);
   if (eval_path[0]) remove(eval_path);
-  if (!text) { fprintf(stderr, "spinel: parse failed for '%s'\n", source); if (seed_path[0]) remove(seed_path); return 1; }
+  if (!nt) {
+    /* an inline RBS error has been reported at the annotation */
+    if (!sp_inline_rbs_failed) fprintf(stderr, "spinel: parse failed for '%s'\n", source);
+    if (seed_path[0]) remove(seed_path);
+    return 1;
+  }
 
-  if (dump_ast) { fputs(text, stdout); free(text); if (seed_path[0]) remove(seed_path); return 0; }
-
-  NodeTable *nt = nt_load_text(text);
-  free(text);
+  if (dump_ast) { nt_dump(nt, stdout); nt_free(nt); if (seed_path[0]) remove(seed_path); return 0; }
   sp_timing_end(tm_front, "frontend", "");
-  if (!nt) { fprintf(stderr, "spinel: failed to load AST\n"); if (seed_path[0]) remove(seed_path); return 1; }
 
   /* the CRuby shim's feature name (Init_<feature>, the require name) derives
      from the output basename; codegen needs it while generating the shim */
@@ -1030,6 +1083,24 @@ int main(int argc, char **argv) {
      byte-identical single-threaded archive. See codegen's SPINEL_USES_THREADS
      marker and the two-variant build in the Makefile. */
   int uses_threads = strstr(csrc, "/* SPINEL_USES_THREADS */") != NULL;
+  /* --exceptions=abort: what leaves through a frame by longjmp is refused,
+     as the analysis refused rescue, retry and catch: a break out of a block
+     that is not spliced in, a return out of a proc, a Fiber's switch. The
+     runtime's text names each (sp_brk_throw, sp_proc_return, sp_Fiber_). */
+  if (exc_abort) {
+    static const struct { const char *tok, *what; } nl[] = {
+      { "sp_brk_throw(", "a break out of a block that is not spliced into its method" },
+      { "sp_proc_return(", "a return out of a proc" },
+      { "sp_Fiber_", "Fiber" },
+    };
+    for (size_t k = 0; k < sizeof nl / sizeof nl[0]; k++)
+      if (strstr(csrc, nl[k].tok)) {
+        fprintf(stderr, "spinel: %s needs exception handling, which --exceptions=abort leaves out\n", nl[k].what);
+        free(csrc);
+        if (c_is_temp) remove(c_path);
+        return 1;
+      }
+  }
   /* A frame past the fiber stack crashes on the guard page rather than
      overflowing detectably, and always_inline bypasses the C compiler's own
      large-frame brake -- ask for the warning back (#3913). */
@@ -1047,7 +1118,7 @@ int main(int argc, char **argv) {
       if (c_is_temp) remove(c_path);
       return 1;
     }
-    rt_lib = "wasm32-wasi/libspinel_rt.a";
+    rt_lib = exc_abort ? "wasm32-wasi/libspinel_rt_noexc.a" : "wasm32-wasi/libspinel_rt.a";
     if (run_mode) {
       fprintf(stderr, "spinel: -E cannot run a wasm32-wasi module; build it and run it with wasmtime\n");
       if (c_is_temp) remove(c_path);
@@ -1166,7 +1237,10 @@ int main(int argc, char **argv) {
     static const char *const wdefs[] = { "-D_WASI_EMULATED_SIGNAL", "-D_WASI_EMULATED_PROCESS_CLOCKS", "-D_WASI_EMULATED_GETPID", "-D_WASI_EMULATED_MMAN" };
     for (size_t wi = 0; wi < sizeof wdefs / sizeof wdefs[0]; wi++) { s_add(&cmd, wdefs[wi]); s_add(&cmd, " "); bi_put(&bi, "define", wdefs[wi]); }
     static const char *const wcfl[] = { "-mllvm", "-wasm-enable-sjlj", "-mllvm", "-wasm-use-legacy-eh=false", "-Wl,-z,stack-size=8388608" };
-    for (size_t wi = 0; wi < sizeof wcfl / sizeof wcfl[0]; wi++) { s_add(&cmd, wcfl[wi]); s_add(&cmd, " "); bi_put(&bi, "cflag", wcfl[wi]); }
+    /* --exceptions=abort: no sjlj lowering (it is what needs the host's
+       exception handling) and the runtime's abort form of setjmp/longjmp; the first four flags are the sjlj lowering */
+    for (size_t wi = exc_abort ? 4 : 0; wi < sizeof wcfl / sizeof wcfl[0]; wi++) { s_add(&cmd, wcfl[wi]); s_add(&cmd, " "); bi_put(&bi, "cflag", wcfl[wi]); }
+    if (exc_abort) { s_add(&cmd, "-DSP_EXC_ABORT "); bi_put(&bi, "define", "-DSP_EXC_ABORT"); }
   }
 #if defined(_WIN32)
   if (!target_wasi) add_platform_flags(&cmd, &bi, SPINEL_PLATFORM_CFLAGS, lib_dir);
@@ -1266,7 +1340,7 @@ int main(int argc, char **argv) {
            (the Makefile's wasm-rt target builds the bundled ones) */
         size_t tl = strlen(t);
         if (tl > 2 && strcmp(t + tl - 2, ".o") == 0)
-          snprintf(tmt, sizeof tmt, "%.*s%s.o", (int)(tl - 2), t, uses_threads ? "_mt" : "_wasi");
+          snprintf(tmt, sizeof tmt, "%.*s%s.o", (int)(tl - 2), t, uses_threads ? "_mt" : exc_abort ? "_wasi_noexc" : "_wasi");
       }
       const char *cands[2] = { tmt[0] ? tmt : t, tmt[0] ? t : NULL };
       int placed = 0;
@@ -1292,17 +1366,10 @@ int main(int argc, char **argv) {
   if (target_wasi) {
     /* the emulations the defines above asked for, and sjlj's runtime */
     static const char *const wlibs[] = { "-lsetjmp", "-lwasi-emulated-signal", "-lwasi-emulated-process-clocks", "-lwasi-emulated-getpid", "-lwasi-emulated-mman" };
-    for (size_t wi = 0; wi < sizeof wlibs / sizeof wlibs[0]; wi++) { s_add(&cmd, wlibs[wi]); s_add(&cmd, " "); bi_put(&bi, "lib", wlibs[wi]); }
+    /* --exceptions=abort leaves out the first, -lsetjmp */
+    for (size_t wi = exc_abort ? 1 : 0; wi < sizeof wlibs / sizeof wlibs[0]; wi++) { s_add(&cmd, wlibs[wi]); s_add(&cmd, " "); bi_put(&bi, "lib", wlibs[wi]); }
   }
-#if !defined(__APPLE__)
-  /* String#crypt = libc crypt(3), linked only when the program calls it:
-     a linker without a default --as-needed (Fedora's) otherwise made
-     libcrypt a dependency of every binary (#6674) */
-  else if (uses_crypt) {
-    s_add(&cmd, "-lcrypt ");
-    bi_put(&bi, "lib", "-lcrypt");
-  }
-#endif
+  else add_host_libs(&cmd, &bi, uses_crypt);
   for (int li = 0; li < n_link_extra; li++)
     if (strncmp(link_extra[li], "-l", 2) == 0) {
       s_add(&cmd, link_extra[li]); s_add(&cmd, " ");

@@ -155,7 +155,9 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     }
     if ((sp_streq(name, "fnmatch") || sp_streq(name, "fnmatch?")) && argc >= 2) {
       buf_puts(b, "sp_file_fnmatch("); emit_str_expr(c, argv[0], b); buf_puts(b, ", ");
-      emit_path_expr(c, argv[1], b); buf_puts(b, ")"); return 1;
+      emit_path_expr(c, argv[1], b); buf_puts(b, ", ");
+      if (argc >= 3) emit_int_expr(c, argv[2], b); else buf_puts(b, "0");
+      buf_puts(b, ")"); return 1;
     }
     if (sp_streq(name, "dirname") && argc == 2) {
       /* File.dirname(path, level): apply dirname `level` times (#2787) */
@@ -175,11 +177,23 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       buf_puts(b, "sp_file_truncate("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
       emit_int_expr(c, argv[1], b); buf_puts(b, ")"); return 1;
     }
-    /* File.write(path, str, offset) / File.write(path, str, mode: "a") (#2782) */
+    /* File.write(path, str, offset) / File.write(path, str, mode: "a", perm: 0o600) (#2782) */
     if ((sp_streq(name, "write") || sp_streq(name, "binwrite")) && argc == 3) {
       const char *k3 = nt_type(nt, argv[2]);
       if (k3 && sp_streq(k3, "KeywordHashNode")) {
         int mv = struct_kwarg_value(c, argv[2], "mode");
+        int pv = struct_kwarg_value(c, argv[2], "perm");
+        if (pv >= 0) {
+          buf_puts(b, "sp_file_write_perm("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
+          emit_to_s_expr(c, argv[1], b); buf_puts(b, ", ");
+          if (mv >= 0) emit_str_expr(c, mv, b); else buf_puts(b, "\"w\"");
+          buf_puts(b, ", ");
+          if (comp_ntype(c, pv) == TY_NIL) buf_puts(b, "sp_oint_nil()");
+          else if (yield_site_type(c, pv) == TY_POLY) { buf_puts(b, "sp_poly_arg_perm("); emit_expr(c, pv, b); buf_puts(b, ")"); }
+          else emit_oint_expr(c, pv, TY_INT, b);
+          buf_puts(b, ")");
+          return 1;
+        }
         if (mv >= 0) {
           buf_puts(b, "sp_file_write_mode("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
           emit_to_s_expr(c, argv[1], b); buf_puts(b, ", ");
@@ -347,7 +361,8 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       for (int k = 0; k < argc; k++) {
         Repr jr = repr_of(c, argv[k]);
         TyKind jt = jr.as_ty;
-        if (ty_is_array(jt) || jt == TY_POLY_ARRAY || jr.kind == RK_BOXED) has_dyn = 1;
+        if (ty_is_array(jt) || jt == TY_POLY_ARRAY || jr.kind == RK_BOXED ||
+            nt_kind(c->nt, argv[k]) == NK_SplatNode) has_dyn = 1;
       }
       emit_file_join_args(c, argv, argc, has_dyn, b);
       return 1;
@@ -402,11 +417,11 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       if (perm < 0 && kw_mode < 0 && argc >= 3 &&
           !(nt_type(nt, argv[2]) && sp_streq(nt_type(nt, argv[2]), "KeywordHashNode")))
         perm = argv[2];
-      /* a nil perm is CRuby's default; the runtime reads SP_INT_NIL as 0666 */
+      /* a nil perm is CRuby's default; the runtime reads a nil sp_oint as 0666 */
       if (perm >= 0 && comp_ntype(c, perm) == TY_NIL) perm = -1;
       #define emit_perm_expr(c, n, b) do { \
         if (yield_site_type(c, n) == TY_POLY) { buf_puts(b, "sp_poly_arg_perm("); emit_expr(c, n, b); buf_puts(b, ")"); } \
-        else emit_int_expr_nilable(c, n, b); \
+        else emit_oint_expr(c, n, TY_INT, b); \
       } while (0)
       /* A mode the analysis cannot classify (a boxed read, a computed flags
          word in a poly slot) is decided at run time rather than assumed to be
@@ -419,7 +434,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
           buf_puts(b, "sp_File_open_val("); \
           emit_path_expr(c, argv[0], b); buf_puts(b, ", "); \
           emit_boxed(c, mnode, b); buf_puts(b, ", "); \
-          if (perm >= 0) emit_perm_expr(c, perm, b); else buf_puts(b, "SP_INT_NIL"); \
+          if (perm >= 0) emit_perm_expr(c, perm, b); else buf_puts(b, "sp_oint_nil()"); \
           buf_puts(b, ")"); \
         } \
         else if (int_mode) { \
@@ -580,6 +595,17 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         sp_streq(nt_type(nt, argv[1]), "ConstantPathNode") &&
         nt_str(nt, argv[1], "name") && sp_streq(nt_str(nt, argv[1], "name"), "FNM_DOTMATCH")) {
       buf_puts(b, "sp_dir_glob_dot("); emit_path_expr(c, argv[0], b); buf_puts(b, ")"); return 1;
+    }
+    /* Dir.glob(pattern, base: dir): a lone base: keyword; nil is the current directory */
+    if (sp_streq(name, "glob") && argc == 2 && nt_kind(nt, argv[1]) == NK_KeywordHashNode &&
+        !ty_is_array(comp_ntype(c, argv[0]))) {
+      int en = 0; (void)nt_arr(nt, argv[1], "elements", &en);
+      int bv = kwh_lookup(nt, argv[1], "base");
+      if (en == 1 && bv >= 0) {
+        buf_puts(b, "sp_dir_glob_base("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
+        if (comp_ntype(c, bv) == TY_NIL) buf_puts(b, "NULL"); else emit_path_expr(c, bv, b);
+        buf_puts(b, ")"); return 1;
+      }
     }
     if (sp_streq(name, "glob") && argc == 1 && ty_is_array(comp_ntype(c, argv[0]))) {
       buf_puts(b, "sp_dir_glob_multi("); emit_boxed(c, argv[0], b); buf_puts(b, ")"); return 1;
@@ -813,6 +839,11 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     buf_puts(b, "sp_encoding_find("); emit_boxed(c, argv[0], b); buf_puts(b, ")");
     return 1;
   }
+  if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode && argc == 0 &&
+      sp_streq(name, "list") && nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Encoding")) {
+    buf_puts(b, "sp_encoding_list()");
+    return 1;
+  }
 
   /* GC module methods */
   if (recv >= 0 && nt_type(nt, recv) && sp_streq(nt_type(nt, recv), "ConstantReadNode") &&
@@ -933,6 +964,30 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     }
     if (sp_streq(name, "groups") && argc == 0) {  /* (#3046) */
       buf_puts(b, "sp_process_groups()"); return 1;
+    }
+    /* Process.daemon(nochdir = nil, noclose = nil): every argument is
+       evaluated first; then, as CRuby goes, a platform with no fork raises
+       NotImplementedError, the count is checked, and the flags are checked
+       noclose first */
+    if (sp_streq(name, "daemon")) {
+      for (int k = 0; k < argc; k++)
+        if (nt_kind(nt, argv[k]) == NK_SplatNode || nt_kind(nt, argv[k]) == NK_KeywordHashNode ||
+            nt_kind(nt, argv[k]) == NK_BlockArgumentNode)
+          unsupported(c, id, "Process.daemon with a splat, keyword or block argument");
+      int t = ++g_tmp;
+      buf_puts(b, "({ ");
+      for (int k = 0; k < 2 || k < argc; k++) {
+        buf_printf(b, "sp_RbVal _t%d_%d = ", t, k);
+        if (k < argc) emit_boxed(c, argv[k], b); else buf_puts(b, "sp_box_nil()");
+        buf_puts(b, "; ");
+      }
+      buf_puts(b, "sp_process_daemon_available(); ");
+      if (argc > 2)
+        buf_printf(b, "sp_raise_cls(\"ArgumentError\", \"wrong number of arguments (given %d, expected 0..2)\"); (sp_int)0; })", argc);
+      else
+        buf_printf(b, "int _t%d_cl = sp_process_daemon_flag(_t%d_1, \"noclose\"); "
+                      "sp_process_daemon(sp_process_daemon_flag(_t%d_0, \"nochdir\"), _t%d_cl); })", t, t, t, t);
+      return 1;
     }
   }
 
@@ -1201,8 +1256,34 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
     /* IO.popen is not implemented: refused at compile time, as an
        unsupported API is, rather than a NoMethodError the first time the
        line runs (#7199). A program's own IO.popen is its own. */
-    /* Time.parse / Time.strptime, refused here under --defer-refusals (the
-       pass ahead of emission refuses them otherwise; see reject_time_parse) */
+    /* Time.httpdate / rfc2822 / xmlschema / parse: the runtime parser of
+       that format. A nil argument reaches it as NULL, which it answers as
+       CRuby does (time.rb matches a regexp against it, Date._parse wants a
+       String); any other non-String is
+       CRuby's TypeError, or for httpdate, whose regexp is matched with
+       String#match?, its NoMethodError. */
+    { const char *tfn = time_strict_parser_call(c, id);
+      if (tfn) {
+        TyKind at = comp_ntype(c, argv[0]);
+        buf_printf(b, "%s(", tfn);
+        if (at == TY_STRING) emit_expr(c, argv[0], b);
+        else if (at == TY_NIL) buf_puts(b, "(const char *)0");
+        else {
+          int tv = ++g_tmp;
+          buf_printf(b, "({ sp_RbVal _t%d = ", tv);
+          emit_boxed(c, argv[0], b);
+          buf_printf(b, "; _t%d.tag == SP_TAG_NIL ? (const char *)0 : ", tv);
+          if (sp_streq(tfn, "sp_time_s_httpdate"))
+            buf_printf(b, "(_t%d.tag != SP_TAG_STR && !sp_poly_is_strbuf(_t%d))"
+                          " ? (sp_raise_nomethod(sp_nomethod_msg(\"match?\", _t%d)), (const char *)0) : ", tv, tv, tv);
+          buf_printf(b, "sp_poly_arg_str_chk(_t%d); })", tv);
+        }
+        buf_puts(b, ")");
+        return 1;
+      } }
+    /* Time.strptime, and a Time.parse the parser above does not take,
+       refused here under --defer-refusals (the pass ahead of emission
+       refuses them otherwise; see reject_time_parse) */
     { char tpm[320];
       if (defer_refusals() && time_parse_refusal(c, id, tpm, sizeof tpm)) {
         unsupported_feature(c, id, tpm);
@@ -1268,6 +1349,21 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
         return 1;
       }
     }
+    /* TCPServer.for_fd(fd) and the other socket classes': the descriptor
+       wrapped as that class (BasicSocket.for_fd answers a Socket). */
+    if (tcn && sp_feature_required("socket") && io_family_name(tcn) && !is_io_class_name(tcn) &&
+        sp_streq(name, "for_fd") && argc == 1) {
+      int skc = comp_class_index(c, tcn);
+      if (skc < 0 || comp_cmethod_in_chain(c, skc, name, NULL) < 0) {
+        int kind = sp_streq(tcn, "TCPServer") ? 1 : sp_streq(tcn, "TCPSocket") ? 2 :
+                   sp_streq(tcn, "UDPSocket") ? 3 : sp_streq(tcn, "UNIXServer") ? 4 :
+                   sp_streq(tcn, "UNIXSocket") ? 5 : 0;
+        buf_puts(b, "sp_sock_for_fd(");
+        emit_int_expr(c, argv[0], b);
+        buf_printf(b, ", %d)", kind);
+        return 1;
+      }
+    }
     /* Socket class methods (#2922) */
     if (tcn && sp_streq(tcn, "Socket") && sp_feature_required("socket")) {
       if (sp_streq(name, "gethostname") && argc == 0) {
@@ -1314,6 +1410,28 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
       if (sp_streq(name, "unpack_sockaddr_in") && argc == 1) {
         buf_puts(b, "sp_sock_unpack_sockaddr_in(");
         emit_str_expr(c, argv[0], b);
+        buf_puts(b, ")");
+        return 1;
+      }
+      if (sp_streq(name, "unpack_sockaddr_un") && argc == 1) {
+        buf_puts(b, "sp_sock_unpack_sockaddr_un(");
+        emit_str_expr(c, argv[0], b);
+        buf_puts(b, ")");
+        return 1;
+      }
+      /* Socket.tcp_server_sockets([host,] port) -> [Socket, ...]. The block
+         form, which yields the Sockets and closes them after, is refused. */
+      if (sp_streq(name, "tcp_server_sockets") && (argc == 1 || argc == 2) &&
+          nt_ref(nt, id, "block") >= 0) {
+        unsupported_feature(c, id, "Socket.tcp_server_sockets with a block is not supported: call it without one and close the Sockets in an ensure");
+      }
+      if (sp_streq(name, "tcp_server_sockets") && (argc == 1 || argc == 2)) {
+        buf_puts(b, "sp_sock_tcp_server_sockets(");
+        if (argc == 2 && !(nt_type(nt, argv[0]) && sp_streq(nt_type(nt, argv[0]), "NilNode")))
+          emit_str_expr(c, argv[0], b);
+        else buf_puts(b, "NULL");
+        buf_puts(b, ", ");
+        emit_int_expr(c, argv[argc - 1], b);
         buf_puts(b, ")");
         return 1;
       }
@@ -1464,7 +1582,7 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
       }
       buf_puts(b, "sp_signal_signame(");
       /* a Float argument truncates toward zero, as CRuby's to_int does (#3105) */
-      if (sa0 == TY_FLOAT) { buf_puts(b, "(sp_int)("); emit_float_expr(c, argv[0], b); buf_puts(b, ")"); }
+      if (sa0 == TY_FLOAT) { buf_puts(b, "sp_float_arg_i("); emit_float_expr(c, argv[0], b); buf_puts(b, ")"); }
       else emit_int_expr(c, argv[0], b);
       buf_puts(b, ")");
       return 1;
@@ -1803,12 +1921,14 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
        answers too */
     if (sp_streq(name, "find_index") && argc == 1 && nt_ref(nt, id, "block") < 0) {
       int t = ++g_tmp;
-      buf_printf(b, "({ sp_int _t%d = sp_enum_find_index_val(sp_box_obj(", t);
+      int as_int = repr_of(c, id).as_ty == TY_INT;
+      if (as_int && !node_is_oint(c, id)) buf_puts(b, "sp_oint_arg(");
+      buf_printf(b, "({ sp_oint _t%d = sp_enum_find_index_val(sp_box_obj(", t);
       emit_expr(c, recv, b);
       buf_puts(b, ", SP_BUILTIN_ENUMERATOR), ");
       emit_boxed(c, argv[0], b);
-      if (repr_of(c, id).as_ty == TY_INT) buf_printf(b, "); _t%d; })", t);
-      else buf_printf(b, "); _t%d == SP_INT_NIL ? sp_box_nil() : sp_box_int(_t%d); })", t, t);
+      if (as_int) buf_printf(b, "); _t%d; })%s", t, node_is_oint(c, id) ? "" : ")");
+      else buf_printf(b, "); sp_box_oint(_t%d); })", t);
       return 1;
     }
     /* Enumerator#+ chains two enumerators (#2481): the concatenation of their
@@ -1874,7 +1994,7 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     }
     if (sp_streq(name, "bytes") && argc == 1) {
       buf_puts(b, "sp_Random_bytes(sp_random_default_get(), ");
-      emit_int_expr_conv(c, argv[0], b); buf_puts(b, ")");
+      emit_to_int_expr(c, argv[0], b); buf_puts(b, ")");
       return 1;
     }
     if (sp_streq(name, "new_seed") && argc == 0) {   /* #2523 */
@@ -1887,7 +2007,7 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     }
     if (sp_streq(name, "srand")) {                    /* #2525 (returns previous seed) */
       if (argc == 0) { buf_puts(b, "sp_kernel_srand((sp_int)time(NULL))"); return 1; }
-      buf_puts(b, "sp_kernel_srand("); emit_int_expr_conv(c, argv[0], b); buf_puts(b, ")");
+      buf_puts(b, "sp_kernel_srand("); emit_to_int_expr(c, argv[0], b); buf_puts(b, ")");
       return 1;
     }
   }

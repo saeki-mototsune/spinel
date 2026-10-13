@@ -1,6 +1,7 @@
 #ifndef SP_STR_H
 #define SP_STR_H
-/* sp_str.h -- cold String transforms compiled once in lib/sp_str.c.
+/* sp_str.h -- cold String transforms compiled once in lib/sp_str.c and
+ * lib/sp_str_cold.c.
  *
  * These are leaf `const char*` operations (case, strip, split-family,
  * partition, dump/undump, concat, repeat, ...) that depend only on the
@@ -64,6 +65,7 @@ static inline void sp_str_split_push(sp_StrArray*a,const char*p,size_t n){
   sp_StrArray_push(a,r);
 }
 
+const char *sp_bytestr(const char *hay, size_t hn, const char *need, size_t nn);   /* byte-wise substring search; lib/sp_str.c, also used by lib/sp_str_cold.c */
 int sp_utf8_set_has(const uint32_t*cps,size_t n,uint32_t cp);
 uint32_t sp_uc_toupper(uint32_t cp);
 uint32_t sp_uc_tolower(uint32_t cp);
@@ -135,7 +137,7 @@ const char *sp_plain_char(unsigned char c);
 const char *sp_bin_char(unsigned char c);
 const char*sp_str_b(const char*s);
 
-/* ---- utf8-dependent cold transforms (lib/sp_str.c) ---- */
+/* ---- utf8-dependent cold transforms (lib/sp_str.c, lib/sp_str_cold.c) ---- */
 /* nil-receiver raise: a nullable string carries nil as NULL, and CRuby
    answers NoMethodError. The bare primitives below stay total over NULL
    (runtime internals pass legitimately-nil elements); the _m/_p variants
@@ -169,11 +171,12 @@ const char*sp_str_gsub(const char*s,const char*pat,const char*rep);
 sp_int sp_str_index(const char*s,const char*sub);
 sp_int sp_str_index_from(const char*s,const char*sub,sp_int start);
 sp_int sp_str_rindex(const char*s,const char*sub);
-sp_int sp_str_rindex_from(const char*s,const char*sub,sp_int pos);
-sp_int sp_str_byteindex(const char*s,const char*sub);
-sp_int sp_str_byteindex_from(const char*s,const char*sub,sp_int start);
-sp_int sp_str_byterindex(const char*s,const char*sub);
-sp_int sp_str_byterindex_from(const char*s,const char*sub,sp_int pos);
+/* the position, nil on a miss */
+sp_oint sp_str_rindex_from(const char*s,const char*sub,sp_int pos);
+sp_oint sp_str_byteindex(const char*s,const char*sub);
+sp_oint sp_str_byteindex_from(const char*s,const char*sub,sp_int start);
+sp_oint sp_str_byterindex(const char*s,const char*sub);
+sp_oint sp_str_byterindex_from(const char*s,const char*sub,sp_int pos);
 const char*sp_str_sub_range(const char*s,sp_int start,sp_int len);
 const char*sp_str_char_at_or_nil(const char*s,sp_int i);
 const char*sp_str_sub_range_len(const char*s,sp_int cl,sp_int start,sp_int len);
@@ -192,6 +195,9 @@ const char*sp_str_delete(const char*s,const char*chars);
 const char*sp_str_squeeze(const char*s);
 const char*sp_str_squeeze_chars(const char*s,const char*cs);
 const char*sp_str_delete_n(const char*s,const char**chars,sp_int n);
+const char*sp_str_strip_n(const char*s,const char**chars,sp_int n);
+const char*sp_str_lstrip_n(const char*s,const char**chars,sp_int n);
+const char*sp_str_rstrip_n(const char*s,const char**chars,sp_int n);
 const char*sp_str_squeeze_n(const char*s,const char**chars,sp_int n);
 const char *sp_str_scrub(const char *s, const char *repl);
 const char *sp_str_scrub_utf8(const char *s, const char *repl);
@@ -205,9 +211,9 @@ const char*sp_str_center(const char*s,sp_int w);
 const char*sp_str_ljust2(const char*s,sp_int w,const char*pad);
 const char*sp_str_rjust2(const char*s,sp_int w,const char*pad);
 const char*sp_str_center2(const char*s,sp_int w,const char*pad);
-sp_int sp_str_index_opt(const char *s, const char *sub);
-sp_int sp_str_index_from_opt(const char *s, const char *sub, sp_int start);
-sp_int sp_str_rindex_opt(const char *s, const char *sub);
+sp_oint sp_str_index_opt(const char *s, const char *sub);
+sp_oint sp_str_index_from_opt(const char *s, const char *sub, sp_int start);
+sp_oint sp_str_rindex_opt(const char *s, const char *sub);
 
 /* ---- relocated from spinel_rt.h: hash key primitives (sp_str_hash /
    sp_str_eq / _sp_istr_idx) used by lib/sp_hash.c's StrInt/StrStr/IntStr/

@@ -22,6 +22,7 @@
 #include "spinel_rt.h"
 
 const char *(*sp_class_name_fn)(sp_Class);
+const char *(*sp_class_display_fn)(sp_Class);
 /* the hooks the generated unit installs for this unit (SP_INSTALL_HOOK) */
 sp_user_binop_fn sp_user_binop_hook_lib;
 sp_obj_eq_fn sp_obj_eq_hook_lib;
@@ -36,6 +37,15 @@ const char *sp_poly_cold_sym_to_s(sp_sym id) { return sp_sym_name_fn ? sp_sym_na
 const char *sp_poly_cold_class_to_s(sp_Class c) {
   if (c.name) return c.name;
   return sp_class_name_fn ? sp_class_name_fn(c) : sp_str_empty;
+}
+/* The class name a default #to_s / #inspect prints for a user object: the
+   display form of a Class.new class when the program installed one, else its name. */
+static const char *sp_poly_obj_class_display(sp_RbVal v) {
+  if (sp_class_display_fn && v.cls_id >= 0) {
+    sp_Class c = {v.cls_id, NULL};
+    return sp_class_display_fn(c);
+  }
+  return sp_poly_class_name(v);
 }
 
 const char *sp_sym_inspect(sp_sym id)
@@ -56,7 +66,7 @@ void sp_poly_puts(sp_RbVal v)
     case SP_TAG_NIL: putchar('\n'); break;
     case SP_TAG_SYM: { const char *_ss = sp_sym_to_s((sp_sym)v.v.i); fputs(_ss, stdout); putchar('\n'); break; }
     case SP_TAG_ENCODING: { const char *_es = v.v.s ? v.v.s : sp_str_empty; fputs(_es, stdout); putchar('\n'); break; }
-    case SP_TAG_CLASS: { fputs(sp_class_val_name(v), stdout); putchar('\n'); break; }
+    case SP_TAG_CLASS: { fputs(sp_class_val_display(v), stdout); putchar('\n'); break; }
     case SP_TAG_BIGINT: { const char *_bs = sp_bigint_to_s((sp_Bigint *)v.v.p); if (_bs) fputs(_bs, stdout); putchar('\n'); break; }
     case SP_TAG_OBJ: {
       /* MRI's `puts arr` iterates an Array, printing one element per
@@ -99,7 +109,7 @@ void sp_poly_puts(sp_RbVal v)
         }
         case SP_BUILTIN_RANGE: puts(sp_range_str(*(sp_Range *)v.v.p)); break;
         case SP_BUILTIN_FLOAT_RANGE: puts(sp_frange_inspect(*(sp_FloatRange *)v.v.p)); break;
-        case SP_BUILTIN_STR_RANGE: puts(sp_srange_to_s(*(sp_StrRange *)v.v.p)); break;
+        case SP_BUILTIN_STR_RANGE: puts(sp_srange_to_s(SP_SRANGE_OF(v.v.p))); break;
         case SP_BUILTIN_TIME: puts(sp_Time_to_s((sp_Time *)v.v.p)); break;
         case SP_BUILTIN_STRBUF: sp_puts_str_line(sp_String_cstr((sp_String *)v.v.p)); break;
         case SP_BUILTIN_COMPLEX: puts(sp_complex_to_s(*(sp_Complex *)v.v.p)); break;
@@ -137,14 +147,13 @@ void sp_poly_puts(sp_RbVal v)
 const char *sp_poly_to_s(sp_RbVal v)
 {
   switch (v.tag) {
-    /* int-typed nil (SP_INT_NIL) is Ruby nil; nil.to_s is "" -- match it. */
-    case SP_TAG_INT: return v.v.i == SP_INT_NIL ? sp_str_frozen_empty : sp_int_to_s(v.v.i);
+    case SP_TAG_INT: return sp_int_to_s(v.v.i);
     case SP_TAG_STR: return v.v.s ? v.v.s : sp_str_frozen_empty;
     case SP_TAG_FLT: return sp_float_to_s(v.v.f);
     case SP_TAG_BOOL: return v.v.b ? sp_str_frozen_true : sp_str_frozen_false;
     case SP_TAG_NIL: return sp_str_frozen_empty;
     case SP_TAG_SYM: return sp_sym_to_s_chilled((sp_sym)v.v.i);
-    case SP_TAG_CLASS: return sp_class_val_name(v);
+    case SP_TAG_CLASS: return sp_class_val_display(v);
     case SP_TAG_ENCODING: return v.v.s ? v.v.s : sp_str_empty;
     case SP_TAG_BIGINT: return sp_bigint_to_s((sp_Bigint *)v.v.p);
     case SP_TAG_OBJ:
@@ -159,7 +168,7 @@ const char *sp_poly_to_s(sp_RbVal v)
         case SP_BUILTIN_POLY_ARRAY: return sp_PolyArray_inspect((sp_PolyArray *)v.v.p);
         case SP_BUILTIN_RANGE: return sp_range_str(*(sp_Range *)v.v.p);
         case SP_BUILTIN_FLOAT_RANGE: return sp_frange_inspect(*(sp_FloatRange *)v.v.p);
-        case SP_BUILTIN_STR_RANGE: return sp_srange_to_s(*(sp_StrRange *)v.v.p);
+        case SP_BUILTIN_STR_RANGE: return sp_srange_to_s(SP_SRANGE_OF(v.v.p));
         case SP_BUILTIN_TIME: return sp_Time_to_s((sp_Time *)v.v.p);
         case SP_BUILTIN_STRBUF: return sp_String_cstr((sp_String *)v.v.p);   /* live buffer (#3227) */
         case SP_BUILTIN_METHOD: return sp_method_desc_cstr((sp_BoundMethod *)v.v.p);
@@ -195,7 +204,7 @@ const char *sp_poly_to_s(sp_RbVal v)
             if (sp_is_exc_subclass_cls(v.cls_id))
               return sp_exc_message((volatile struct sp_Exception_s *)v.v.p);
             if (v.v.p == sp_main_obj) return SPL("main");
-            return sp_sprintf("#<%s:0x%016llx>", sp_poly_class_name(v),
+            return sp_sprintf("#<%s:0x%016llx>", sp_poly_obj_class_display(v),
                               (unsigned long long)(uintptr_t)v.v.p);
           }
           /* a builtin container kind with no explicit arm above (the hash
@@ -308,11 +317,8 @@ sp_RbVal sp_poly_slice(sp_RbVal a, sp_int start, sp_int len)
      `start` -- the two-argument form of the bit read, which the typed arms
      have had all along. A boxed receiver fell past this to the nil default
      below, so `[255, nil][0][0, 4]` was nil where CRuby says 15, and the
-     value went on being used as a number (#4742). The int-typed nil keeps
-     the default: `nil[0, 4]` is a missing method, not a bit field. */
+     value went on being used as a number (#4742). */
   if (a.tag == SP_TAG_INT) {
-    /* the sentinel IS nil, and nil has no `[]` */
-    if (a.v.i == SP_INT_NIL) sp_raise_poly_nomethod("[]", sp_box_nil());
     return sp_box_int(sp_int_bit_range(a.v.i, start, len));
   }
   if (a.tag == SP_TAG_BIGINT) {
@@ -421,9 +427,7 @@ sp_RbVal sp_poly_slice(sp_RbVal a, sp_int start, sp_int len)
 const char *sp_poly_inspect(sp_RbVal v)
 {
   switch (v.tag) {
-    /* An int-typed nil (unfilled int block param, nullable-int miss) carries
-       the SP_INT_NIL sentinel; render it as nil, not the raw INT64_MIN. */
-    case SP_TAG_INT:  return v.v.i == SP_INT_NIL ? SPL("nil") : sp_int_to_s(v.v.i);
+    case SP_TAG_INT:  return sp_int_to_s(v.v.i);
     case SP_TAG_STR:  return sp_str_inspect(v.v.s);
     case SP_TAG_FLT:  return sp_float_to_s(v.v.f);
     /* true.inspect is true.to_s, the frozen one; nil.inspect is a new "nil" */
@@ -431,7 +435,7 @@ const char *sp_poly_inspect(sp_RbVal v)
     case SP_TAG_NIL:  return SPL("nil");
     case SP_TAG_SYM:  return sp_sym_inspect((sp_sym)v.v.i);
     case SP_TAG_ENCODING: return sp_encoding_inspect_name(v.v.s ? v.v.s : "");
-    case SP_TAG_CLASS: return sp_class_val_name(v);
+    case SP_TAG_CLASS: return sp_class_val_display(v);
     case SP_TAG_BIGINT: return sp_bigint_to_s((sp_Bigint *)v.v.p);
     case SP_TAG_OBJ:
  /* Built-in container / value-type tags get their typed inspect
@@ -450,7 +454,7 @@ const char *sp_poly_inspect(sp_RbVal v)
         case SP_BUILTIN_POLY_ARRAY: return sp_PolyArray_inspect((sp_PolyArray *)v.v.p);
         case SP_BUILTIN_RANGE:     return sp_Range_inspect((sp_Range *)v.v.p);
         case SP_BUILTIN_FLOAT_RANGE: return sp_frange_inspect(*(sp_FloatRange *)v.v.p);
-        case SP_BUILTIN_STR_RANGE: return sp_srange_inspect(*(sp_StrRange *)v.v.p);
+        case SP_BUILTIN_STR_RANGE: return sp_srange_inspect(SP_SRANGE_OF(v.v.p));
         case SP_BUILTIN_TIME:      return sp_Time_inspect((sp_Time *)v.v.p);
       case SP_BUILTIN_STRBUF: return sp_str_inspect(sp_String_cstr((sp_String *)v.v.p));   /* (#3227) */
       case SP_BUILTIN_METHOD: return sp_method_desc_cstr((sp_BoundMethod *)v.v.p);
@@ -488,7 +492,7 @@ const char *sp_poly_inspect(sp_RbVal v)
           }
           if (v.cls_id == SP_BUILTIN_OBJECT && v.v.p && v.v.p == sp_main_obj) return SPL("main");
           if ((v.cls_id >= 0 || v.cls_id == SP_BUILTIN_OBJECT) && v.v.p)
-            return sp_sprintf("#<%s:0x%016llx>", sp_poly_class_name(v),
+            return sp_sprintf("#<%s:0x%016llx>", sp_poly_obj_class_display(v),
                               (unsigned long long)(uintptr_t)v.v.p);
           /* a builtin handle with no inspect of its own (a Fiber, a Queue, a
              Mutex): name it rather than answering the useless "#<Object>" --
@@ -689,8 +693,8 @@ sp_RbVal sp_poly_dup(sp_RbVal v, int keep_frozen)
       case SP_BUILTIN_INT_ARRAY: {
         sp_IntArray *a = (sp_IntArray *)v.v.p; SP_GC_ROOT(a);
         sp_IntArray *r = sp_IntArray_new();
-        for (sp_int i = 0; i < a->len; i++) sp_IntArray_push(r, a->data[a->start + i]);
-        SP_MAY_NIL(r) = SP_MAY_NIL(a);
+        SP_GC_ROOT(r);
+        for (sp_int i = 0; i < a->len; i++) sp_IntArray_push_o(r, sp_IntArray_oget(a, i));
         if (keep_frozen && a->frozen) r->frozen = 1;
         v.v.p = r; break;
       }
@@ -704,8 +708,8 @@ sp_RbVal sp_poly_dup(sp_RbVal v, int keep_frozen)
       case SP_BUILTIN_FLT_ARRAY: {
         sp_FloatArray *a = (sp_FloatArray *)v.v.p; SP_GC_ROOT(a);
         sp_FloatArray *r = sp_FloatArray_new();
-        for (sp_int i = 0; i < a->len; i++) sp_FloatArray_push(r, a->data[i]);
-        SP_MAY_NIL(r) = SP_MAY_NIL(a);
+        SP_GC_ROOT(r);
+        for (sp_int i = 0; i < a->len; i++) sp_FloatArray_push_o(r, sp_FloatArray_oget(a, i));
         if (keep_frozen && a->frozen) r->frozen = 1;
         v.v.p = r; break;
       }
@@ -719,6 +723,11 @@ sp_RbVal sp_poly_dup(sp_RbVal v, int keep_frozen)
         v.v.p = r; break;
       }
     }
+    return v;
+  }
+  /* IO#dup/#clone on a boxed IO: a handle on its own descriptor */
+  if (v.tag == SP_TAG_OBJ && v.v.p && v.cls_id == SP_BUILTIN_IO) {
+    v.v.p = sp_File_dup((sp_File *)v.v.p, keep_frozen);
     return v;
   }
   /* OpenStruct#dup/#clone on a boxed OpenStruct: a copy over its own member
@@ -785,25 +794,35 @@ void sp_poly_hash_merge_into(sp_RbVal dst, sp_RbVal src)
       case SP_BUILTIN_POLY_POLY_HASH: sp_PolyPolyHash_set((sp_PolyPolyHash *)dst.v.p, k, v); break;
       case SP_BUILTIN_SYM_POLY_HASH:
         if (k.tag == SP_TAG_SYM) sp_SymPolyHash_set((sp_SymPolyHash *)dst.v.p, (sp_sym)k.v.i, v);
+        else sp_poly_typed_hash_store_miss(k, v, "Symbol", NULL);
         break;
       case SP_BUILTIN_STR_POLY_HASH:
         if (k.tag == SP_TAG_STR) sp_StrPolyHash_set((sp_StrPolyHash *)dst.v.p, k.v.s, v);
+        else sp_poly_typed_hash_store_miss(k, v, "String", NULL);
         break;
       case SP_BUILTIN_STR_STR_HASH:
         if (k.tag == SP_TAG_STR && v.tag == SP_TAG_STR)
           sp_StrStrHash_set((sp_StrStrHash *)dst.v.p, k.v.s, v.v.s);
+        else sp_poly_typed_hash_store_miss(k, v, "String", "String");
         break;
       case SP_BUILTIN_STR_INT_HASH:
         if (k.tag == SP_TAG_STR && v.tag == SP_TAG_INT)
           sp_StrIntHash_set((sp_StrIntHash *)dst.v.p, k.v.s, v.v.i);
+        else if (k.tag == SP_TAG_STR && v.tag == SP_TAG_NIL)   /* a nil value is kept (D3b-ii) */
+          sp_StrIntHash_set_nil((sp_StrIntHash *)dst.v.p, k.v.s);
+        else sp_poly_typed_hash_store_miss(k, v, "String", "Integer");
         break;
       case SP_BUILTIN_INT_INT_HASH:
         if (k.tag == SP_TAG_INT && v.tag == SP_TAG_INT)
           sp_IntIntHash_set((sp_IntIntHash *)dst.v.p, k.v.i, v.v.i);
+        else if (k.tag == SP_TAG_INT && v.tag == SP_TAG_NIL)   /* a nil value is kept (D3b-ii) */
+          sp_IntIntHash_set_nil((sp_IntIntHash *)dst.v.p, k.v.i);
+        else sp_poly_typed_hash_store_miss(k, v, "Integer", "Integer");
         break;
       case SP_BUILTIN_INT_STR_HASH:
         if (k.tag == SP_TAG_INT && v.tag == SP_TAG_STR)
           sp_IntStrHash_set((sp_IntStrHash *)dst.v.p, k.v.i, v.v.s);
+        else sp_poly_typed_hash_store_miss(k, v, "Integer", "String");
         break;
       default: break;
     }
@@ -925,7 +944,7 @@ sp_RbVal sp_poly_to_h_m(sp_RbVal v)
   }
   /* a String Range likewise, its elements Strings */
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STR_RANGE && v.v.p) {
-    if (!sp_srange_min_v(*(sp_StrRange *)v.v.p)) return sp_box_obj(sp_SymPolyHash_new(), SP_BUILTIN_SYM_POLY_HASH);
+    if (!sp_srange_min_v(SP_SRANGE_OF(v.v.p))) return sp_box_obj(sp_SymPolyHash_new(), SP_BUILTIN_SYM_POLY_HASH);
     sp_raise_cls("TypeError", "wrong element type String (expected array)");
   }
   sp_raise_nomethod(sp_nomethod_msg("to_h", v));  /* "for true", "for an instance of String", as CRuby words it */
@@ -1018,10 +1037,10 @@ sp_PolyPolyHash *sp_poly_hash_merge(sp_RbVal a, sp_RbVal b)
   /* merge inherits the receiver's default; cross-layout receivers arrive boxed */
   if (a.tag == SP_TAG_OBJ && a.v.p) {
     switch (a.cls_id) {
-      case SP_BUILTIN_STR_INT_HASH: r->default_v = sp_box_int_or_nil(((sp_StrIntHash *)a.v.p)->default_v); break;
+      case SP_BUILTIN_STR_INT_HASH: { sp_StrIntHash *h = (sp_StrIntHash *)a.v.p; r->default_v = h->default_nil ? sp_box_nil() : sp_box_int(h->default_v); break; }
       case SP_BUILTIN_STR_STR_HASH: r->default_v = sp_box_nullable_str(((sp_StrStrHash *)a.v.p)->default_v); break;
       case SP_BUILTIN_INT_STR_HASH: r->default_v = sp_box_nullable_str(((sp_IntStrHash *)a.v.p)->default_v); break;
-      case SP_BUILTIN_INT_INT_HASH: r->default_v = sp_box_int_or_nil(((sp_IntIntHash *)a.v.p)->default_v); break;
+      case SP_BUILTIN_INT_INT_HASH: { sp_IntIntHash *h = (sp_IntIntHash *)a.v.p; r->default_v = h->default_nil ? sp_box_nil() : sp_box_int(h->default_v); break; }
       case SP_BUILTIN_STR_POLY_HASH: r->default_v = ((sp_StrPolyHash *)a.v.p)->default_v; break;
       case SP_BUILTIN_SYM_POLY_HASH: r->default_v = ((sp_SymPolyHash *)a.v.p)->default_v; break;
       case SP_BUILTIN_POLY_POLY_HASH: r->default_v = ((sp_PolyPolyHash *)a.v.p)->default_v; break;
@@ -1081,7 +1100,7 @@ void sp_poly_hash_writeback_ex(sp_RbVal orig, sp_PolyPolyHash *work, int with_de
     sp_int j = work->order[i];
     sp_RbVal k = work->keys[j], v = work->vals[j];
     switch (orig.cls_id) {
-      case SP_BUILTIN_STR_INT_HASH: sp_hash_wb_want(k, SP_TAG_STR, 0, "key", "String keys"); sp_hash_wb_want(v, SP_TAG_INT, 1, "value", "Integer values"); break;
+      case SP_BUILTIN_STR_INT_HASH: sp_hash_wb_want(k, SP_TAG_STR, 0, "key", "String keys"); sp_hash_wb_want(v, SP_TAG_INT, 1, "value", "Integer values"); break;   /* a nil value is kept (D3b-ii) */
       case SP_BUILTIN_STR_STR_HASH: sp_hash_wb_want(k, SP_TAG_STR, 0, "key", "String keys"); sp_hash_wb_want(v, SP_TAG_STR, 1, "value", "String values"); break;
       case SP_BUILTIN_INT_STR_HASH: sp_hash_wb_want(k, SP_TAG_INT, 0, "key", "Integer keys"); sp_hash_wb_want(v, SP_TAG_STR, 1, "value", "String values"); break;
       case SP_BUILTIN_INT_INT_HASH: sp_hash_wb_want(k, SP_TAG_INT, 0, "key", "Integer keys"); sp_hash_wb_want(v, SP_TAG_INT, 1, "value", "Integer values"); break;
@@ -1113,10 +1132,10 @@ void sp_poly_hash_writeback_ex(sp_RbVal orig, sp_PolyPolyHash *work, int with_de
     case SP_BUILTIN_STR_INT_HASH: {
       sp_StrIntHash *h = (sp_StrIntHash *)orig.v.p;
       sp_StrIntHash_clear(h);
-      if (with_default) h->default_v = sp_poly_to_i_or_nil(work->default_v);
+      if (with_default) { h->default_nil = work->default_v.tag == SP_TAG_NIL; h->default_v = h->default_nil ? 0 : sp_poly_to_i(work->default_v); }
       for (sp_int i = 0; i < work->len; i++) {
         sp_int j = work->order[i];
-        sp_StrIntHash_set(h, sp_poly_to_s(work->keys[j]), sp_poly_to_i_or_nil(work->vals[j]));
+        sp_StrIntHash_oset(h, sp_poly_to_s(work->keys[j]), sp_poly_hval_oi(work->vals[j]));
       }
       return;
     }
@@ -1143,10 +1162,10 @@ void sp_poly_hash_writeback_ex(sp_RbVal orig, sp_PolyPolyHash *work, int with_de
     case SP_BUILTIN_INT_INT_HASH: {
       sp_IntIntHash *h = (sp_IntIntHash *)orig.v.p;
       sp_IntIntHash_clear(h);
-      if (with_default) h->default_v = sp_poly_to_i_or_nil(work->default_v);
+      if (with_default) { h->default_nil = work->default_v.tag == SP_TAG_NIL; h->default_v = h->default_nil ? 0 : sp_poly_to_i(work->default_v); }
       for (sp_int i = 0; i < work->len; i++) {
         sp_int j = work->order[i];
-        sp_IntIntHash_set(h, sp_poly_to_i(work->keys[j]), sp_poly_to_i_or_nil(work->vals[j]));
+        sp_IntIntHash_oset(h, sp_poly_to_i(work->keys[j]), sp_poly_hval_oi(work->vals[j]));
       }
       return;
     }
@@ -1217,4 +1236,37 @@ sp_RbVal sp_builtin_class_new(int kind, sp_int argc, const sp_RbVal *av, sp_Proc
     sp_dyn_new_arity(argc, 0);
     return sp_box_obj(sp_Object_new(), SP_BUILTIN_OBJECT);
   }
+}
+
+/* A case/in that no arm took, or a rightward `expr => pat` that failed:
+   NoMatchingPatternError with the subject's inspect. A single pattern also
+   says why it failed (`detail`), as CRuby does: "[1, 2]: [1, 2] length
+   mismatch (given 2, expected 1)". A key the hash lacks is the
+   NoMatchingPatternKeyError subclass. */
+void sp_pm_raise_nomatch(sp_RbVal subj, const char *detail, int key_err) {
+  SP_GC_ROOT_RBVAL(subj); SP_GC_ROOT_STR(detail);
+  const char *s = sp_poly_inspect(subj); SP_GC_ROOT_STR(s);
+  sp_raise_cls(key_err ? "NoMatchingPatternKeyError" : "NoMatchingPatternError",
+               detail ? sp_sprintf("%s: %s", s, detail) : s);
+}
+/* `pat === v` was false; pat is the pattern's inspect */
+/* sp_sprintf renders a long message again from its arguments after it
+   allocates, so every inspect it is handed is rooted first */
+const char *sp_pm_eqq_msg(const char *pat, sp_RbVal v) {
+  SP_GC_ROOT_STR(pat);
+  const char *s = sp_poly_inspect(v); SP_GC_ROOT_STR(s);
+  return sp_sprintf("%s === %s does not return true", pat, s);
+}
+/* `fmt`, a message with one %s, about v's inspect */
+const char *sp_pm_inspect_msg(const char *fmt, sp_RbVal v) {
+  SP_GC_ROOT_RBVAL(v);
+  const char *s = sp_poly_inspect(v); SP_GC_ROOT_STR(s);
+  return sp_sprintf(fmt, s);
+}
+/* an array pattern of `want` elements (at least that many with a rest) */
+const char *sp_pm_len_msg(sp_RbVal arr, sp_int want, int at_least) {
+  SP_GC_ROOT_RBVAL(arr);
+  const char *s = sp_poly_inspect(arr); SP_GC_ROOT_STR(s);
+  return sp_sprintf("%s length mismatch (given %lld, expected %lld%s)", s,
+                    (long long)sp_poly_length(arr), (long long)want, at_least ? "+" : "");
 }

@@ -118,9 +118,13 @@ static const char *sp_errf_conv(sp_RbVal v) {
    The previous /dev/null behaviour silently swallowed the child's stderr
    and made `Process.spawn("cc -c foo.c")` in verbose mode look like it
    produced no output. */
-static void apply_redirect(int target_fd, int src_fd) {
-  if (src_fd < 0) return;
-  if (src_fd != target_fd) dup2(src_fd, target_fd);
+static int apply_redirect(int target_fd, int src_fd) {
+  if (src_fd < 0) return 0;
+  if (src_fd != target_fd) { dup2(src_fd, target_fd); return 0; }
+  /* already in place (a pipe took a free fd 0): no dup2 clears close-on-exec */
+  int fl = fcntl(target_fd, F_GETFD);
+  if (fl < 0) return -1;
+  return (fl & FD_CLOEXEC) ? fcntl(target_fd, F_SETFD, fl & ~FD_CLOEXEC) : 0;
 }
 
 /* Close the source descriptors, once every dup2 above has been made. Not
@@ -252,6 +256,23 @@ static char **sp_spawn_envp(sp_RbVal env) {
   return envp;
 }
 
+/* Kernel#system with an environment Hash ahead of the command: the Hash is
+   checked and the child's environment built as Process.spawn's is, then the
+   command runs as sp_system_args runs it. */
+void sp_system_env_check(sp_RbVal env) {
+  int owned[3] = { -1, -1, -1 };
+  sp_spawn_env_check(env, owned);
+}
+int sp_system_env_args(sp_RbVal env, int argc, const char *const *argv) {
+  SP_GC_ROOT_RBVAL(env);
+  sp_system_env_check(env);
+  char **envp = sp_spawn_envp(env);
+  if (!envp) sp_raise_cls("NoMemoryError", "out of memory");
+  int ok = sp_system_envp(argc, argv, envp);
+  free(envp);
+  return ok;
+}
+
 /* Extract a resolved Integer fd from a pre-resolved opts slot. The
    codegen turns IO/false into Integer before passing, and a String
    path arrives as the fd sp_process_open_redirect returned; we just
@@ -303,9 +324,15 @@ sp_int sp_process_spawn(sp_RbVal cmd, sp_RbVal args_box,
 
   int rlimit_as_set = 0;
   rlim_t rlimit_as_val = 0;
+#ifdef RLIMIT_AS
   if (opts->data[5].tag == SP_TAG_INT) { rlimit_as_set = 1; rlimit_as_val = (rlim_t)opts->data[5].v.i; }
   else if (opts->data[5].tag != SP_TAG_NIL)
     sp_process_spawn_fail(owned, "TypeError", "rlimit_as must be Integer");
+#else
+  /* OpenBSD has no RLIMIT_AS: CRuby does not know the option there */
+  if (opts->data[5].tag != SP_TAG_NIL)
+    sp_process_spawn_fail(owned, "ArgumentError", "wrong exec option symbol: rlimit_as");
+#endif
 
   const char *chdir_to = NULL;
   sp_RbVal chdir_v = sp_spawn_str(opts->data[6]);
@@ -487,19 +514,24 @@ sp_int sp_process_spawn(sp_RbVal cmd, sp_RbVal args_box,
       struct rlimit rl = { rlimit_cpu_val, RLIM_INFINITY };
       setrlimit(RLIMIT_CPU, &rl);
     }
+#ifdef RLIMIT_AS
     if (rlimit_as_set) {
       struct rlimit rl = { rlimit_as_val, RLIM_INFINITY };
       setrlimit(RLIMIT_AS, &rl);
     }
+#endif
     if (pgroup == 1) {
       setpgid(0, 0);
     }
     else if (pgroup > 1) {
       setpgid(0, pgroup);
     }
-    apply_redirect(0, in_fd);
-    apply_redirect(1, out_fd);
-    apply_redirect(2, err_fd);
+    if (apply_redirect(0, in_fd) != 0 || apply_redirect(1, out_fd) != 0 ||
+        apply_redirect(2, err_fd) != 0) {
+      int fail[2] = { errno, 0 };
+      (void)!write(err_pipe[1], fail, sizeof fail);
+      _exit(127);
+    }
     close_redirect_srcs(in_fd, out_fd, err_fd);
     /* execvp searches the PATH of the environment it passes on, as CRuby
        searches the child's */
@@ -626,4 +658,64 @@ sp_PolyArray *sp_process_waitpid2(sp_int pid) {
      not a raw int -- .signaled? / .termsig dispatch on the boxed cls_id. */
   sp_PolyArray_push(pa, sp_box_process_status(sp_process_status_new((sp_int)r, (sp_int)status)));
   return pa;
+}
+
+/* Process.daemon(nochdir, noclose): the process carries on as a child of
+   itself in a session of its own, detached from the terminal, as CRuby's
+   daemon(3) does. The parent leaves at once with status 0 and runs none of
+   the program's exit handlers. Unless nochdir, the child moves to "/";
+   unless noclose, its stdin, stdout and stderr read and write /dev/null.
+   Answers 0. The flags arrive already checked (sp_process_daemon_flag). */
+/* Where there is no fork, CRuby's Process.daemon raises NotImplementedError
+   before it looks at its arguments; the call checks this first. */
+void sp_process_daemon_available(void) {
+#if defined(__wasi__) || defined(_WIN32)
+  sp_raise_cls("NotImplementedError", "daemon() function is unimplemented on this machine");
+#endif
+}
+sp_int sp_process_daemon(int nochdir, int noclose) {
+#if defined(__wasi__) || defined(_WIN32)
+  (void)nochdir; (void)noclose;
+  sp_process_daemon_available();
+  return 0;
+#else
+  /* see the note at the top on this TU's includes */
+  extern int sp_sched_threads_started(void);
+  extern const char *sp_errno_class_name(int e);
+  /* the worker pool, its monitor and the collector's sweepers are threads a
+     fork leaves behind, and the child's scheduler would wait on them (the
+     SPINEL_ALLOC_REPORT reader is one too, but only a debugging report
+     waits on it, and the child just goes without) */
+  if (sp_sched_threads_started())
+    sp_raise_cls("NotImplementedError",
+                 "Process.daemon after a Thread has started: spinel's threads do not survive a fork");
+  /* what the program has buffered is written once, by the parent, before
+     the child's streams move to /dev/null */
+  fflush(NULL);
+  pid_t pid = fork();
+  if (pid > 0) _exit(0);
+  if (pid == 0) {
+    /* as CRuby's own daemon path goes: a setsid failure only means the
+       process already leads its group, the redirect is skipped when
+       /dev/null will not open, and a failed chdir raises after it */
+    (void)setsid();
+    int err = nochdir ? 0 : chdir("/");
+    int e = errno;
+    if (!noclose) {
+      int fd = open("/dev/null", O_RDWR);
+      if (fd >= 0) {
+        (void)dup2(fd, 0);
+        (void)dup2(fd, 1);
+        (void)dup2(fd, 2);
+        if (fd > 2) close(fd);
+      }
+    }
+    if (err == 0) return 0;
+    errno = e;
+  }
+  /* CRuby's rb_sys_fail("daemon"): `Resource temporarily unavailable - daemon` */
+  int e = errno;
+  sp_raise_cls(sp_errno_class_name(e), sp_errf_path(e, "daemon"));
+  return 0;
+#endif
 }

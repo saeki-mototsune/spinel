@@ -1,12 +1,19 @@
 /* sp_sched.c -- cooperative M:N thread scheduler bodies, Phase 0 (N=1).
  * See sp_sched.h. Built on the sp_fiber context switch: the main thread runs on
  * the root fiber and pumps a run queue of green threads whenever it blocks. */
+#if defined(__linux__) && !defined(_GNU_SOURCE)
+#define _GNU_SOURCE   /* sched_getaffinity / CPU_COUNT for the worker count */
+#endif
 #include "sp_sched.h"
 #include "sp_alloc.h"   /* sp_box_nil / sp_box_obj */
+#include "sp_exc.h"     /* sp_exc_cls_display / sp_exc_cls_unnamed (the thread report) */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
 #include <unistd.h>     /* sysconf (worker count) */
+#ifdef __linux__
+#include <sched.h>      /* sched_getaffinity (worker count) */
+#endif
 #include <time.h>       /* clock_gettime (Kernel#sleep) */
 #include <errno.h>      /* EINTR (sleep fallback) */
 #ifdef __linux__
@@ -2024,7 +2031,9 @@ static void sp_thread_report(sp_thread *t) {
   SP_GC_ROOT_STR(msg);
   const char *ins = sp_Thread_inspect(t);
   fprintf(stderr, "%s terminated with exception (report_on_exception is true):\n", ins);
-  fprintf(stderr, "%s (%s)\n", (msg && *msg) ? msg : cls, cls);
+  const char *shown = sp_exc_cls_display(cls);   /* an unnamed Class.new class takes no suffix */
+  if (sp_exc_cls_unnamed(shown)) fprintf(stderr, "%s\n", (msg && *msg) ? msg : shown);
+  else fprintf(stderr, "%s (%s)\n", (msg && *msg) ? msg : shown, shown);
 }
 
 /* Park/wake primitives (defined below; used by join here). */
@@ -2349,6 +2358,8 @@ sp_thread *sp_Thread_spawn_fiber(sp_Fiber *f, sp_RbVal arg) {
   t->arg = arg;
   t->retval = sp_box_nil();
   t->name = sp_box_nil();
+  /* CRuby: a new thread starts at its creator's priority */
+  t->priority = g_current ? g_current->priority : 0;
   t->report_on_exception = g_report_default;
   SCHED_LOCK();
   t->id = g_next_id++;
@@ -2500,6 +2511,16 @@ sp_thread *sp_Thread_main(void) { return &g_main_thread; }
 
 sp_RbVal sp_Thread_get_name(sp_thread *t) { return t->name; }
 sp_RbVal sp_Thread_set_name(sp_thread *t, sp_RbVal v) { sp_gc_wb((void*)t); t->name = v; return v; }
+/* #priority= as CRuby's rb_thread_priority_set: the Integer value (a Float
+   truncates, nil is a TypeError: the generated call converts), clamped to
+   -3..3. CRuby treats it as a
+   hint to its scheduler and so does this one: it is kept and answered, and
+   the green-thread scheduler does not reorder by it. The call answers its
+   argument, as an assignment does. */
+sp_int sp_Thread_get_priority(sp_thread *t) { return t->priority; }
+void sp_Thread_set_priority(sp_thread *t, sp_int p) {
+  t->priority = p > 3 ? 3 : (p < -3 ? -3 : (int)p);
+}
 
 /* Thread.list enumeration: the main thread followed by every live spawned
    thread (dead ones are off the registry). The generated TU builds the array
@@ -2604,12 +2625,56 @@ sp_PolyArray *sp_Thread_tls_keys(sp_thread *t) {
 /* ---- helper OS workers (design 3.2, Appendix B) ---- */
 static pthread_t g_worker_threads[SP_MAX_WORKERS];
 
-/* min(online cores, SPINEL_WORKERS); the env var overrides the autodetect. */
+#ifdef __linux__
+/* The CPU quota a cgroup gives the process, rounded up, or 0 for none:
+   cgroup v2's cpu.max ("200000 100000" is two CPUs, "max ..." is none),
+   else v1's cfs_quota_us / cfs_period_us (a quota of -1 is none). */
+static int sp_cgroup_cpu_quota(void) {
+  long quota = -1, period = 0;
+  FILE *f = fopen("/sys/fs/cgroup/cpu.max", "r");
+  if (f) {
+    char q[32];
+    if (fscanf(f, "%31s %ld", q, &period) == 2 && strcmp(q, "max") != 0) quota = atol(q);
+    fclose(f);
+  }
+  else {
+    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_quota_us", "r");
+    if (f) { if (fscanf(f, "%ld", &quota) != 1) quota = -1; fclose(f); }
+    f = fopen("/sys/fs/cgroup/cpu/cpu.cfs_period_us", "r");
+    if (f) { if (fscanf(f, "%ld", &period) != 1) period = 0; fclose(f); }
+  }
+  if (quota <= 0 || period <= 0) return 0;
+  long n = (quota + period - 1) / period;
+  return n > 0 ? (int)n : 1;
+}
+#endif
+
+/* The CPUs this process may run on: the online ones, narrowed by its
+   affinity mask and a cgroup's CPU quota (a container's --cpus), as
+   CRuby's Etc.nprocessors and Go's GOMAXPROCS narrow them. Sized from the
+   host's count alone, a 2-CPU container on an 18-CPU host ran 18 workers
+   (#8206). */
+static int sp_available_cpus(void) {
+  long c = sysconf(_SC_NPROCESSORS_ONLN);
+  int n = (c > 0) ? (int)c : 1;
+#ifdef __linux__
+  cpu_set_t set;
+  if (sched_getaffinity(0, sizeof set, &set) == 0) {
+    int a = CPU_COUNT(&set);
+    if (a > 0 && a < n) n = a;
+  }
+  int q = sp_cgroup_cpu_quota();
+  if (q > 0 && q < n) n = q;
+#endif
+  return n;
+}
+
+/* min(available CPUs, SPINEL_WORKERS); the env var overrides the autodetect. */
 static int sp_worker_count(void) {
   const char *e = getenv("SPINEL_WORKERS");
   int n;
   if (e && *e) { n = atoi(e); if (n < 1) n = 1; }
-  else { long c = sysconf(_SC_NPROCESSORS_ONLN); n = (c > 0) ? (int)c : 1; }
+  else n = sp_available_cpus();
   if (n > SP_MAX_WORKERS) n = SP_MAX_WORKERS;
   return n;
 }
@@ -4041,4 +4106,15 @@ const char *sp_Thread_inspect(sp_thread *t) {
                       (unsigned long long)(uintptr_t)t, t->birth_file,
                       (long long)t->birth_line, st);
   return sp_sprintf("#<Thread:0x%016llx %s>", (unsigned long long)(uintptr_t)t, st);
+}
+
+/* Whether the first Thread has brought up the worker pool, its monitor and the
+   collector's sweepers: OS threads a fork does not carry into the child
+   (Process.daemon, lib/sp_process.c). Before that the program is one thread. */
+int sp_sched_threads_started(void) {
+#ifdef SP_THREADS
+  return g_workers_started;
+#else
+  return 0;
+#endif
 }

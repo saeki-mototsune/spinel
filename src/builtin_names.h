@@ -13,6 +13,7 @@
 int is_zip_name(const char *n);       /* zip: tuple-yielding iteration */
 int is_call_alias(const char *n);     /* call () []: a Proc/Method's invocation */
 int is_method_invoke(const char *n);  /* call () [] ===: Method invocation */
+int is_bind_call(const char *n);  /* bind_call: an UnboundMethod bound and called in one */
 int is_kind_query(const char *n);     /* is_a? kind_of? instance_of? */
 int is_member_blind_query(const char *n); /* class object_id __id__ nil? frozen? equal? respond_to? is_a? ... */
 int is_round_family(const char *n);   /* round ceil floor truncate */
@@ -22,6 +23,9 @@ int is_basic_arith(const char *n);    /* + - * / (is_arith_op adds % and **) */
 int is_int_arith_op(const char *n);   /* + - * / %: an Integer's arithmetic that answers an Integer */
 int is_add_sub_mul(const char *n);    /* + - * */
 int is_int_bit_op(const char *n);     /* & | ^ << >>: Integer's bitwise operators */
+int is_embedding_builtin(const char *nm); /* Array Hash String: subclass instances embed the builtin */
+int is_class_name_name(const char *n);   /* name */
+int is_inspect_name(const char *n);       /* inspect */
 int is_object_root(const char *n);    /* Object Kernel BasicObject: the classes every object has */
 int is_send_family(const char *n);    /* send __send__ public_send */
 int is_opaque_reaching_call(const char *n); /* send family, call, new, lambda/proc, freeze, eval, instance_/class_/module_*, *method* */
@@ -34,6 +38,14 @@ int is_set_op(const char *n);         /* & intersection | union - difference */
 int is_combination_family(const char *n);  /* combination permutation repeated_combination repeated_permutation */
 int is_visibility_name(const char *n);     /* private protected public */
 int is_select_bang(const char *n);    /* select! filter! keep_if reject! delete_if: the in-place filters */
+int is_retaining_filter(const char *n); /* select filter find_all reject, and the in-place filters: the iterators answering some of their elements */
+int is_reorder_iter(const char *n); /* sort sort_by: the iterators answering all of their elements, reordered by a block */
+int is_enum_partition_def(const char *n); /* __enum_partition__N: partition's builtin definition, per call site */
+int is_each_name(const char *n); /* each */
+int is_each_entry(const char *n); /* each_entry */
+int is_find_index(const char *n); /* find_index */
+int is_range_member_walk(const char *n); /* each each_entry step: a Range's block walks of its members */
+int is_stop_walk(const char *n); /* find detect take_while find_index each_with_index: walks that stop at the block's answer */
 int is_each_walk(const char *n);      /* each each_entry reverse_each */
 int is_index_query(const char *n);    /* find_index index rindex */
 int is_self_copy(const char *n);      /* freeze dup clone itself: the receiver, or a copy of it */
@@ -47,6 +59,7 @@ int is_key_query(const char *n);      /* key? has_key? include? member?: Hash/EN
 int is_hash_key_lookup(const char *n); /* [] fetch delete and is_key_query: a Hash call that only compares its key */
 int is_receiver_conversion(const char *n); /* to_s to_str itself: conversions a String answers with itself */
 int is_to_s_name(const char *n);
+int is_message_name(const char *n);
 int is_range_membership(const char *n); /* cover? include? member? ===: Range membership predicates */
 int is_each_walk_or_with_index(const char *n); /* each each_entry reverse_each each_with_index */
 int is_call_or_yield(const char *n);  /* call () [] yield: is_call_alias's names and yield */
@@ -56,6 +69,8 @@ int is_push_unshift(const char *n);   /* << push append unshift: is_push_alias's
 int is_identity_query(const char *n); /* equal? object_id __id__ frozen?: tells an object from its copy */
 int is_len_alias(const char *n);      /* length size */
 int is_str_each_iter(const char *n);  /* each_char each_line each_byte each_codepoint: String's element iterators */
+int is_freeze_name(const char *n);    /* freeze */
+int is_enum_step_name(const char *n); /* next peek size: an Enumerator stepped from outside */
 int is_str_string_yield(const char *n); /* each_char each_line upto chars lines split scrub: String methods whose block takes a String */
 int is_unpack_name(const char *n); /* unpack: a String decoded into values, which a block takes one by one */
 int is_catch_name(const char *n); /* catch: a tagged non-local jump target */
@@ -64,8 +79,10 @@ int is_diverging_call(const char *n); /* raise fail throw exit exit! abort: a Ke
 int is_block_loop_method(const char *n); /* times each upto downto step loop each_with_index: a block run an unbounded number of times */
 
 int is_each_window(const char *n); /* each_cons each_slice: consecutive or disjoint element windows */
+int is_sum_name(const char *n);
 int is_reduce_alias(const char *n); /* inject reduce: Enumerable reduction aliases */
 int is_minmax_query(const char *n); /* min max: extrema queries */
+int is_minmax_pair(const char *n); /* minmax: both extrema in one answer */
 int is_endpoint_query(const char *n); /* first last: collection or Range endpoints */
 int is_map_alias(const char *n); /* map collect: Enumerable transformation aliases */
 int is_instance_eval_family(const char *n); /* instance_eval instance_exec */
@@ -73,12 +90,15 @@ int is_find_alias(const char *n); /* find detect: Enumerable search aliases */
 
 int is_text_conversion(const char *n); /* inspect to_s */
 int is_slice_alias(const char *n); /* [] slice */
+int is_seq_index_call(const char *n); /* [] []= slice slice! byteslice: an Array or String index */
 int is_shift_op(const char *n); /* << >> */
 int is_copy_alias(const char *n); /* clone dup */
 int is_hash_merge_bang(const char *n); /* merge! update */
 int is_membership_alias(const char *n); /* include? member? */
 int is_eql_or_equal(const char *n); /* eql? equal? */
+int is_equal_name(const char *n);   /* equal? */
 int is_substitution(const char *n); /* gsub sub */
+int is_substitution_bang(const char *n); /* gsub! sub! */
 int is_element_at_alias(const char *n); /* [] at */
 int is_map_bang_alias(const char *n); /* collect! map! */
 int is_each_or_pair(const char *n); /* each each_pair */
@@ -104,6 +124,8 @@ int is_indexed_each(const char *n); /* each_index each_with_index */
 int is_to_array_alias(const char *n); /* entries to_a */
 int is_match_p_name(const char *n);   /* match? */
 int is_record_class_builder(const char *recv, const char *meth); /* Struct.new, Data.define */
+int is_class_builder(const char *recv, const char *meth); /* Struct.new, Data.define, Class.new, Module.new */
+int is_value_constructor(const char *recv, const char *meth); /* Hash.new, Array.new, String.new, Object.new */
 int is_array_new(const char *recv, const char *meth); /* Array.new */
 int is_array_class_name(const char *n); /* Array */
 int is_string_index(const char *n); /* index rindex */
@@ -118,6 +140,11 @@ int is_freeze_family(const char *n); /* freeze frozen? */
 int is_bivar_access(const char *n);  /* __bivar_get __bivar_set __bivar_defined */
 int is_object_copy(const char *n);   /* dup clone */
 int is_ivar_set_name(const char *n); /* instance_variable_set */
+int is_marshal_dump(const char *recv, const char *meth); /* Marshal.dump */
+int is_marshal_load(const char *recv, const char *meth); /* Marshal.load */
+int is_allocate_name(const char *n); /* allocate */
+int is_ivar_remove_name(const char *n); /* remove_instance_variable */
+int is_ivar_presence_read(const char *n); /* instance_variables instance_variable_defined? remove_instance_variable inspect p pp */
 int is_bivar_keyed_class(const char *n);  /* Array Hash Random */
 int is_string_class_name(const char *n);   /* String */
 int is_frozen_value_class(const char *n); /* Integer Float Symbol NilClass TrueClass FalseClass Range */
@@ -149,6 +176,7 @@ int is_io_offset_move(const char *n); /* pos= sysseek: the descriptor-control ca
 int is_sort_family(const char *n); /* sort sort! */
 int is_hash_transform(const char *n); /* transform_values transform_keys */
 int is_fallback_block_call(const char *n); /* fetch delete fetch_values: the block is the fallback */
+int is_delete_name(const char *n);       /* delete: removal by key (ENV's missing-key block answers) */
 int is_io_write(const char *n); /* syswrite write */
 int is_to_integer(const char *n); /* to_i to_int */
 int is_match_operator(const char *n); /* !~ =~ */
@@ -178,6 +206,7 @@ int is_with_object_alias(const char *n); /* each_with_object with_object */
 int is_exist_alias(const char *n); /* exist? exists? */
 int is_select_alias(const char *n); /* filter select */
 int is_format_alias(const char *n); /* format sprintf */
+int is_initialize_name(const char *n); /* initialize */
 int is_initialize_family(const char *n); /* initialize initialize_copy */
 
 int is_iso8601_alias(const char *n); /* iso8601 xmlschema */
@@ -200,17 +229,27 @@ int is_io_wait(const char *n); /* wait_priority wait_readable wait_writable */
 int is_match_family(const char *n); /* !~ =~ match match? */
 int is_integer_iteration(const char *n); /* downto step times upto */
 int is_visibility_or_module_function(const char *n); /* module_function private protected public */
+int is_mixin_call(const char *n); /* include extend prepend */
+int is_const_set_name(const char *n); /* const_set */
+int is_const_query_name(const char *n); /* const_get const_defined? const_source_location */
+int is_constants_list_name(const char *n); /* constants */
+int is_definition_hook_name(const char *n); /* inherited included extended prepended method_added singleton_method_added const_added */
+int is_const_missing_name(const char *n); /* const_missing */
+int is_const_table_def_name(const char *n); /* __const_get__ __const_defined__ */
 int is_string_position_mutator(const char *n); /* []= clear insert setbyte slice! */
 int is_array_push_family(const char *n); /* << append prepend push unshift */
 
 int is_io_class_name(const char *n); /* File IO */
 int is_file_class_name(const char *n); /* File */
+int is_filetest_module_name(const char *n); /* FileTest */
 int is_immediate_class_name(const char *n); /* FalseClass NilClass TrueClass */
 int is_object_base_name(const char *n); /* BasicObject Object */
 int is_boolean_class_name(const char *n); /* FalseClass TrueClass */
 int is_numeric_literal_tag(const char *n); /* Float Int */
 int is_standard_output_global(const char *n); /* $stderr $stdout */
 int is_program_name_global(const char *n); /* $0 $PROGRAM_NAME */
+int is_loaded_features_global(const char *n); /* $" $LOADED_FEATURES */
+int is_load_path_global(const char *n); /* $: $-I $LOAD_PATH */
 int is_range_or_time_class(const char *n); /* Range Time */
 int is_numeric_class_name(const char *n); /* Float Integer */
 int is_queue_class_name(const char *n); /* Queue SizedQueue */
@@ -226,12 +265,20 @@ int is_ivar_set(const char *n);      /* instance_variable_set */
 int is_string_append_or_prepend(const char *n); /* << concat prepend */
 
 int is_string_append(const char *n); /* << concat: appends answering the receiver */
+int is_string_byte_mutator(const char *n); /* bytesplice append_as_bytes: byte-level mutators answering the receiver */
 int is_replace_name(const char *n); /* replace: a String's, Array's or Hash's contents swapped for another's, which ignores a block */
 
 int is_string_rebind_mutator(const char *n); /* mutators needing argument-rebind snapshots */
+/* String methods that only read the receiver's bytes and never retain the
+   pointer: a shared-mutable receiver hands them its live buffer. */
+int is_string_read_only_method(const char *name);
 int str_mutator_str_args(const char *n, int argc, int *int_ok); /* the arguments a String mutator takes as Strings */
 
 int builtin_module_owns(const char *cls, const char *name); /* included ahead of Object */
+int builtin_comparable_owns(const char *cls, const char *name); /* Comparable's, on a class including it */
+int builtin_comparable_arity(const char *name);
+int builtin_numeric_owns(const char *cls, const char *name); /* Numeric's, on Integer or Float */
+int builtin_numeric_arity(const char *name, int *out);
 
 int is_gated_exception_accessor(const char *n); /* accessors owned by specific exception classes */
 int is_symbol_exception_accessor(const char *n); /* exception accessors that can return a Symbol */
@@ -251,6 +298,8 @@ enum { ARRAY_ADD_NONE, ARRAY_ADD_CONCAT, ARRAY_ADD_INSERT, ARRAY_ADD_PREPEND };
 int array_unseen_add_kind(const char *n);
 
 int is_scan_name(const char *n); /* scan: a String's match iterator */
+int is_insert_name(const char *n); /* insert */
+int is_clear_name(const char *n); /* clear */
 int is_enumerator_with(const char *n); /* with_index with_object: an enumerator link */
 int is_lazy_name(const char *n);       /* lazy */
 int is_concat_name(const char *n);     /* concat */
@@ -267,5 +316,15 @@ int is_argv_const(const char *n);        /* ARGV */
 int is_proc_conversion_name(const char *n); /* to_proc curry: makes a proc */
 int is_aref_name(const char *n);         /* []: an element read */
 int is_shovel_name(const char *n);       /* <<: an append, a chain's link */
+
+const char *dir_surface_alias(const char *n, int blockless_iter);
+
+int is_kernel_module_name(const char *n);
+int is_kernel_module_function(const char *n);
+int is_builtin_module_const_name(const char *n);
+int is_untabled_native_class_name(const char *n);
+
+int is_define_method_name(const char *n); /* define_method */
+int is_alias_method_name(const char *n);  /* alias_method */
 
 #endif

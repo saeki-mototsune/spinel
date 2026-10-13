@@ -26,6 +26,23 @@ typedef struct { char *data; int64_t len; int64_t cap; unsigned binary; unsigned
 _Static_assert(offsetof(sp_String, chilled) == offsetof(sp_String, binary) + 4 && sizeof(unsigned) == 4,
                "sp_String.binary and .chilled are adjacent 32-bit fields");
 
+/* A generated frozen literal owns its handle slot. The tagged header link
+   distinguishes that slot from the aligned links in the string heap. */
+typedef struct sp_StringLiteral {
+  sp_String *value;
+  struct sp_StringLiteral *next;
+} sp_StringLiteral;
+static inline sp_StringLiteral *sp_String_literal_slot(const char *s) {
+  if (!s || ((const unsigned char *)s)[-1] != 0xf1) return NULL;
+  uintptr_t p = (uintptr_t)(((const sp_str_hdr *)(s - 1)) - 1)->next;
+  return p & 1 ? (sp_StringLiteral *)(p - 1) : NULL;
+}
+sp_String *sp_String_literal_handle(sp_StringLiteral *slot, const char *s);
+void sp_String_mark_literals(void);
+static inline const void *sp_String_identity(sp_String *h) {
+  return h && sp_String_literal_slot(h->data) ? (const void *)h->data : (const void *)h;
+}
+
 /* Per-mutable-string freeze flag rides in the GC header alongside `marked`. */
 static inline sp_bool sp_String_is_frozen(sp_String*s){if(!s)return TRUE;sp_gc_hdr*h=(sp_gc_hdr*)((char*)s-sizeof(sp_gc_hdr));return h->frozen;}
 static inline sp_String*sp_String_freeze(sp_String*s){if(s){sp_gc_hdr*h=(sp_gc_hdr*)((char*)s-sizeof(sp_gc_hdr));h->frozen=1;}return s;}
@@ -108,6 +125,17 @@ static inline sp_String*sp_String_new_len(const char*s,int64_t len){
   return r;
 }
 static inline sp_String*sp_String_new(const char*s){return sp_String_new_len(s,(int64_t)strlen(s));}
+/* The empty String a String subclass instance starts with, inside the
+   instance (a GC object whose finalizer is sp_String_fin): the handle's
+   payload is malloc'd and linked back to the handle, which is the instance. */
+static inline void sp_String_init_embedded(sp_String*r){
+  int64_t cap=16;
+  char*raw=(char*)malloc(SP_FD_OVH+cap);
+  if(!raw)sp_oom_die();
+  r->data=sp_fd_setup(raw);r->data[0]=0;r->len=0;r->cap=cap;r->binary=0;r->chilled=0;sp_fd_own(r);
+  {sp_gc_hdr*h=(sp_gc_hdr*)((char*)r-sizeof(sp_gc_hdr));h->size+=r->cap+SP_FD_OVH;sp_gc_bytes_add(r->cap+SP_FD_OVH);}
+  sp_fd_publish(r);
+}
 /* The same over a payload inside the object, when it fits: for a String the
    handle is made for and nobody else holds, a literal or a temporary handed to
    a parameter that is the handle (#6179), made and dropped once per call. The
@@ -193,6 +221,10 @@ static inline sp_String*sp_String_new_shared(const char*s){
   int bin=sp_str_is_binary(s);
   int frozen=sp_str_is_frozen_val(s);
   int mk=((const unsigned char*)s)[-1];
+#ifdef SP_SHARE_STRING_LITERALS
+  sp_StringLiteral *literal = sp_String_literal_slot(s);
+  if (literal) return sp_String_literal_handle(literal, s);
+#endif
   int64_t len=(int64_t)sp_str_byte_len(s);
   sp_String*r=sp_String_new_len(s,len);
   if(bin){r->binary=1;sp_fd_publish(r);}
@@ -214,6 +246,10 @@ static inline sp_String*sp_String_new_fresh(const char*s){
   int bin=sp_str_is_binary(s);
   int frozen=sp_str_is_frozen_val(s);
   int mk=((const unsigned char*)s)[-1];
+#ifdef SP_SHARE_STRING_LITERALS
+  sp_StringLiteral *literal = sp_String_literal_slot(s);
+  if (literal) return sp_String_literal_handle(literal, s);
+#endif
   int64_t len=(int64_t)sp_str_byte_len(s);
   sp_String*r=sp_String_new_inline_len(s,len);
   if(bin){r->binary=1;sp_fd_publish(r);}

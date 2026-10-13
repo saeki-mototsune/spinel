@@ -238,8 +238,10 @@ int emit_call_bigint_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       buf_printf(b, "; sp_int_round_check_ndigits(_rnd); _rnd; }), %d)", mode); free(rs.p); return 1;
     }
     if (sp_streq(name, "to_s") && argc == 1) {
-      buf_printf(b, "sp_str_dup_external(sp_bigint_to_s_base(%s, ", r);
-      emit_int_expr(c, argv[0], b); buf_puts(b, "))"); free(rs.p); return 1;
+      /* a string-heap String already: a copy of it allocated while it was
+         held by nothing, and a collection there freed it */
+      buf_printf(b, "sp_bigint_to_s_base(%s, ", r);
+      emit_int_expr(c, argv[0], b); buf_puts(b, ")"); free(rs.p); return 1;
     }
     /* digits: kept only for the poly "face table" re-entry, not reached by
        any static concrete call site any more -- see the matching comment
@@ -391,20 +393,30 @@ int emit_call_bigint_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       /* an index span: each end through to_int (sp_range_ix), so an end
          written as a Float truncates and keeps its exclusivity */
       buf_printf(b, "({ sp_Range _t%d = sp_range_ix(", tr); emit_expr(c, argv[0], b); buf_puts(b, ")");
-      buf_printf(b, "; sp_int _lo%d = _t%d.first == INTPTR_MIN"
+      /* the open sides are the range's flags: -2**63 and 2**63-1 are bounds.
+         A field as wide as a word's range is CRuby's RangeError (an
+         inclusive end of 2**63-1 overflows as its end + 1 does); the
+         answer is the field's low word, so one of 64 bits or more takes no
+         mask (one that wide is no Bignum to build). */
+      int tw = ++g_tmp;
+      buf_printf(b, "; sp_int _lo%d = _t%d.nobeg"
                     " ? (sp_raise_cls(\"ArgumentError\","
                     " \"The beginless range for Integer#[] results in infinity\"), 0)"
                     " : _t%d.first;"
+                    " uintptr_t _t%d = (uintptr_t)_t%d.last - (uintptr_t)_lo%d + (_t%d.excl ? 0 : 1);"
+                    " if (!_t%d.noend && _t%d.last >= _lo%d && ((!_t%d.excl && _t%d.last == INTPTR_MAX) || _t%d > (uintptr_t)INTPTR_MAX))"
+                    " sp_raise_cls(\"RangeError\", \"bignum too big to convert into 'long long'\");"
                     " sp_Bigint *_t%d = sp_bigint_shr(%s, (int64_t)_lo%d);"
-                    " _t%d.last == INTPTR_MAX ? sp_bigint_to_int(_t%d)"
+                    " _t%d.noend || _t%d.last < _lo%d || _t%d >= 64 ? sp_bigint_to_int(_t%d)"
                     " : sp_bigint_to_int(sp_bigint_and(_t%d,"
-                    " sp_bigint_sub(sp_bigint_shl(sp_bigint_new_int(1),"
-                    " (int64_t)(_t%d.last - _lo%d + (_t%d.excl ? 0 : 1))), sp_bigint_new_int(1)))); })",
+                    " sp_bigint_sub(sp_bigint_shl(sp_bigint_new_int(1), (int64_t)_t%d), sp_bigint_new_int(1)))); })",
                  tr, tr, tr,
+                 tw, tr, tr, tr,
+                 tr, tr, tr, tr, tr, tw,
                  ts, r, tr,
-                 tr, ts,
+                 tr, tr, tr, tw, ts,
                  ts,
-                 tr, tr, tr);
+                 tw);
       free(rs.p); return 1;
     }
     if (sp_streq(name, "[]") && argc == 1) {
@@ -418,8 +430,8 @@ int emit_call_bigint_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     if (sp_streq(name, "[]") && argc == 2) {
       /* Bignum n[start, len]: the len-bit field starting at bit `start`. */
       int tst = ++g_tmp, tln = ++g_tmp, tsh = ++g_tmp;
-      buf_printf(b, "({ sp_int _t%d = ", tst); emit_int_expr(c, argv[0], b);
-      buf_printf(b, "; sp_int _t%d = ", tln); emit_int_expr(c, argv[1], b);
+      buf_printf(b, "({ sp_int _t%d = ", tst); emit_to_int_expr(c, argv[0], b);
+      buf_printf(b, "; sp_int _t%d = ", tln); emit_to_int_expr(c, argv[1], b);
       buf_printf(b, "; sp_Bigint *_t%d = sp_bigint_shr(%s, (int64_t)_t%d);"
                     " (_t%d < 0 || _t%d < 0) ? (sp_int)0"
                     " : sp_bigint_to_int(sp_bigint_and(_t%d,"
@@ -594,7 +606,7 @@ int emit_call_iter_expr_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       int lf = comp_ntype(c, argv[0]) == TY_FLOAT;
       buf_puts(b, "(sp_Range){ .first = "); emit_upto_recv(c, recv, argv[0], b);
       buf_puts(b, ", .last = ");
-      if (lf) { buf_puts(b, "(sp_int)floor("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      if (lf) { buf_puts(b, "sp_flt_range_bound("); emit_expr(c, argv[0], b); buf_puts(b, ", 1)"); }
       else emit_int_expr(c, argv[0], b);
       buf_puts(b, ", .excl = 0 }");
       return 1;
@@ -606,7 +618,7 @@ int emit_call_iter_expr_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       int lf = comp_ntype(c, argv[0]) == TY_FLOAT;
       buf_puts(b, "sp_range_new_step("); emit_int_recv_named(c, recv, name, b);
       buf_puts(b, ", ");
-      if (lf) { buf_puts(b, "(sp_int)ceil("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      if (lf) { buf_puts(b, "sp_flt_range_bound("); emit_expr(c, argv[0], b); buf_puts(b, ", 0)"); }
       else emit_int_expr(c, argv[0], b);
       buf_puts(b, ", 0, -1LL)");
       return 1;
@@ -680,7 +692,7 @@ int emit_op_range_freeze(Compiler *c, const BopCtx *x, Buf *b) {
   buf_printf(b, "; _t%d.unfrozen = 0; ", t);
   if (rk == NK_LocalVariableReadNode || rk == NK_InstanceVariableReadNode ||
       rk == NK_ClassVariableReadNode || rk == NK_GlobalVariableReadNode) {
-    emit_expr(c, x->recv, b); buf_printf(b, " = _t%d; ", t);
+    emit_slot_expr(c, x->recv, b); buf_printf(b, " = _t%d; ", t);
   }
   buf_printf(b, "_t%d; })", t);
   return 1;

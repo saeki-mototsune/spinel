@@ -5,13 +5,12 @@
    decided once by the analysis: for every node, and for every
    slot a value is read back from (a local, a parameter, a block parameter,
    a global, a constant, an ivar, a method's value), whether the value may
-   be nil. Today the question is asked again where each answer is needed --
-   codegen's nil receiver guards (local_obj_nil_written, nil_value_node,
-   method_ret_nilable), the value-type selection's nil witness, parameter
-   tracking's obj_nilable -- and each asks it about the shapes it knows.
-   Step 1 computes the fact and changes nothing that reads those answers:
-   --nil-check holds it against them (nil_check_report, codegen_call.c, and
-   vt_nil_witness_check, analyze.c).
+   be nil. Its readers: the value-type selection (vt_nil_fact_classes,
+   analyze.c), where a class an instance of which may be nil keeps its
+   pointer layout; the representation (repr_of's may_nil); and the call
+   plan's nil target (cplan_nil, call_plan.c), which tests a receiver that
+   may be nil ahead of the call, or answers as NilClass does. Parameter
+   tracking's obj_nilable (a call hands the parameter nil) seeds it.
 
    The fact is a may-be-nil over-approximation. Where the analysis cannot
    see what reaches a slot it answers "may be nil": an object a builtin call
@@ -25,8 +24,10 @@
    into or leaves a gap in (one level in, below: NFW_ELEM_NIL); a container call
    other than the element reads and picks that can miss (an Array's or a
    Hash's own methods); and a builtin value a builtin call answers other
-   than those picks and a String's slice (`gets` at the end of its input, a
-   bang method that changed nothing).
+   than those picks and a String's slice (`gets` at the end of its input).
+   A String bang that changed nothing is not one of them: it answers nil, and
+   its fact says so (a String slice, `slice!` included, stays the unarmed
+   element read it is, so a hot loop over slices pays for no test).
 
    Flow: the slots are flow-insensitive (a slot one write leaves nil may be
    nil at every read), except that a read of a local inside a truthiness
@@ -43,8 +44,9 @@
 
    Each may-be-nil answer carries where its nil comes from (NFW_*: of
    several sources, the first in that enum's order, a nil the program
-   writes before one the analysis cannot bound), which --nil-check reports
-   beside a disagreement and the call plan's nil target reads (cplan_nil). */
+   writes before one the analysis cannot bound), which the call plan's nil
+   target reads (cplan_nil): it tests a nil the program writes, not one the
+   fact cannot bound. */
 
 #include "analyze_internal.h"
 #include "call_plan.h"
@@ -528,6 +530,121 @@ static int nf_region_writes(NF *f, int region, const char *nm) {
   f->rg_n++;
   return w;
 }
+/* is a an ancestor of d (or d itself), looking no further out than region? */
+static int nf_is_ancestor(NF *f, int a, int d, int region) {
+  for (int n = d, g = 0; n >= 0 && g < 4096; n = f->par[n], g++) {
+    if (n == a) return 1;
+    if (n == region) return 0;
+  }
+  return 0;
+}
+/* a construct that can run its body again: the next pass, or a retry,
+   reads after a write the pass before made */
+static int nf_repeats(NodeKind k) {
+  return k == NK_WhileNode || k == NK_UntilNode || k == NK_ForNode || k == NK_BlockNode ||
+         k == NK_LambdaNode || k == NK_BeginNode;
+}
+/* Can a write of nm in the guarded region (subtree n) run before the read
+   rd of it? A write on an earlier line can; one on the read's own line is
+   taken to (the two are not ordered here), unless it is the write whose
+   value holds the read (`cur = cur.nxt`: the read runs first); one on a
+   later line can only when a loop, a block, a lambda or a begin inside the
+   region holds both, whose next pass runs the read after it. */
+static int nf_write_runs_first(NF *f, int n, const char *nm, int rd, long long rl, int region, int depth) {
+  const NodeTable *nt = f->nt;
+  if (n < 0 || depth > 512) return 0;
+  switch (nt_kind(nt, n)) {
+  case NK_LocalVariableWriteNode: case NK_LocalVariableOrWriteNode:
+  case NK_LocalVariableAndWriteNode: case NK_LocalVariableOperatorWriteNode:
+  case NK_LocalVariableTargetNode: {
+    const char *wn = nt_str(nt, n, "name");
+    if (wn && sp_streq(wn, nm) && !nf_is_ancestor(f, n, rd, region)) {
+      long long wl = nt_int(nt, n, "node_line", 0);
+      if (wl <= 0 || wl <= rl) return 1;
+      for (int a = f->par[n], g = 0; a >= 0 && g < 4096; a = f->par[a], g++) {
+        if (nf_repeats(nt_kind(nt, a)) && nf_is_ancestor(f, a, rd, region)) return 1;
+        if (a == region) break;
+      }
+    }
+    break;
+  }
+  case NK_DefNode: return 0;
+  default: break;
+  }
+  for (int i = 0; i < nt_num_refs(nt, n); i++)
+    if (nf_write_runs_first(f, nt_ref_at(nt, n, i), nm, rd, rl, region, depth + 1)) return 1;
+  for (int i = 0; i < nt_num_arrs(nt, n); i++) {
+    int an = 0; const int *av = nt_arr_at(nt, n, i, &an);
+    for (int k = 0; k < an; k++) if (nf_write_runs_first(f, av[k], nm, rd, rl, region, depth + 1)) return 1;
+  }
+  return 0;
+}
+/* the region's writes of nm, as they bear on its read rd: none, or none
+   that can run before the read */
+static int nf_region_writes_before(NF *f, int region, const char *nm, int rd) {
+  if (!nf_region_writes(f, region, nm)) return 0;
+  long long rl = nt_int(f->nt, rd, "node_line", 0);
+  if (rl <= 0) return 1;
+  return nf_write_runs_first(f, region, nm, rd, rl, region, 0);
+}
+/* Does the program give nil a method `name` of its own (on NilClass, Object,
+   Kernel, BasicObject, or at the top level)? Then a call of it on nil
+   raises nothing. */
+static int nf_nil_user_method(Compiler *c, const char *name) {
+  static const char *const owners[] = { "NilClass", "Object", "Kernel", "BasicObject", NULL };
+  if (comp_method_index(c, name) >= 0) return 1;
+  for (int i = 0; owners[i]; i++) {
+    int k = comp_class_index(c, owners[i]);
+    if (k >= 0 && comp_method_in_chain(c, k, name, NULL) >= 0) return 1;
+  }
+  return 0;
+}
+/* Does evaluating n call, on every path through it, a method on local nm
+   that nil does not answer? Such a call raises NoMethodError for a nil nm
+   (the plan's nil target tests it), so a read of nm after it is not nil:
+   `if key < t.key` then `t.left` reads a t the comparison dereferenced.
+   The parts every evaluation runs: a call's receiver and arguments, a
+   write's value, a conditional's or a loop's predicate, a jump's value, the
+   left of `&&` and `||`, a list's statements, an Array's elements. */
+static int nf_derefs(Compiler *c, int n, const char *nm, int depth) {
+  const NodeTable *nt = c->nt;
+  n = nf_unparen(nt, n);
+  if (n < 0 || depth > 64) return 0;
+  switch (nt_kind(nt, n)) {
+  case NK_CallNode: {
+    int r = nt_ref(nt, n, "receiver");
+    const char *cn = nt_str(nt, n, "name");
+    const char *op = nt_str(nt, n, "call_operator");
+    if (r >= 0 && cn && !(op && sp_streq(op, "&.")) && nf_is_read_of(nt, r, nm) &&
+        nt_kind(nt, nf_unparen(nt, r)) == NK_LocalVariableReadNode && !is_nil_method(cn) &&
+        !nf_nil_user_method(c, cn)) return 1;
+    if (r >= 0 && nf_derefs(c, r, nm, depth + 1)) return 1;
+    int a = nt_ref(nt, n, "arguments"), an = 0;
+    const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
+    for (int i = 0; i < an; i++) if (nf_derefs(c, av[i], nm, depth + 1)) return 1;
+    return 0;
+  }
+  case NK_LocalVariableWriteNode: case NK_InstanceVariableWriteNode: case NK_GlobalVariableWriteNode:
+  case NK_LocalVariableOperatorWriteNode: case NK_InstanceVariableOperatorWriteNode:
+    return nf_derefs(c, nt_ref(nt, n, "value"), nm, depth + 1);
+  case NK_IfNode: case NK_UnlessNode: case NK_WhileNode: case NK_UntilNode:
+    return nf_derefs(c, nt_ref(nt, n, "predicate"), nm, depth + 1);
+  case NK_AndNode: case NK_OrNode:
+    return nf_derefs(c, nt_ref(nt, n, "left"), nm, depth + 1);
+  case NK_ReturnNode: case NK_BreakNode: case NK_NextNode: {
+    int a = nt_ref(nt, n, "arguments"), an = 0;
+    const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
+    for (int i = 0; i < an; i++) if (nf_derefs(c, av[i], nm, depth + 1)) return 1;
+    return 0;
+  }
+  case NK_StatementsNode: case NK_ArrayNode: {
+    int bn = 0; const int *b = nt_arr(nt, n, nt_kind(nt, n) == NK_ArrayNode ? "elements" : "body", &bn);
+    for (int i = 0; i < bn; i++) if (nf_derefs(c, b[i], nm, depth + 1)) return 1;
+    return 0;
+  }
+  default: return 0;
+  }
+}
 /* A statement that leaves the list: `return`, `next`, `break`, `raise` */
 static int nf_is_jump(const NodeTable *nt, int s) {
   s = nf_unparen(nt, s);
@@ -561,8 +678,13 @@ static int nf_exit_guard(Compiler *c, int s, const char *nm) {
 }
 
 /* Is the read rd of local nm (slot lv) under a guard that proves it is not
-   nil, with no write of nm between the guard and the read? Walks out to the
-   method, a block or a lambda, which may run after the slot changed. */
+   nil, with no write of nm between the guard and the read
+   (nf_region_writes_before: a write after the read in the guarded region is
+   no write between, unless a loop in the region runs the read again)? An
+   earlier statement of the same list that calls a method on nm which nil
+   does not answer (nf_derefs) is such a guard: it raised for a nil.
+   Walks out to the method, a block or a lambda, which may run after the
+   slot changed. */
 static int nf_local_guarded(NF *f, int rd, const char *nm, const LocalVar *lv) {
   Compiler *c = f->c;
   const NodeTable *nt = f->nt;
@@ -581,6 +703,8 @@ static int nf_local_guarded(NF *f, int rd, const char *nm, const LocalVar *lv) {
       int then_ok = pk == NK_IfNode ? nf_truthy_implies(c, pr, nm) : nf_falsy_implies(c, pr, nm);
       int else_ok = pk == NK_IfNode ? nf_falsy_implies(c, pr, nm) : nf_truthy_implies(c, pr, nm);
       if (in_then ? then_ok : else_ok) region = cur;
+      /* a predicate that dereferenced nm ran before either branch */
+      else if (nf_derefs(c, pr, nm, 0)) region = cur;
     }
     else if (pk == NK_AndNode && cur == nt_ref(nt, p, "right") &&
              nf_truthy_implies(c, nt_ref(nt, p, "left"), nm)) region = cur;
@@ -589,22 +713,28 @@ static int nf_local_guarded(NF *f, int rd, const char *nm, const LocalVar *lv) {
     /* not a loop that tests after its body (`begin ... end while nm`,
        Prism's begin-modifier flag): that body runs once before the test */
     else if (pk == NK_WhileNode && !(nt_int(nt, p, "flags", 0) & 4) && cur == nt_ref(nt, p, "statements") &&
-             nf_truthy_implies(c, nt_ref(nt, p, "predicate"), nm)) region = cur;
+             (nf_truthy_implies(c, nt_ref(nt, p, "predicate"), nm) || nf_derefs(c, nt_ref(nt, p, "predicate"), nm, 0)))
+      region = cur;
+    else if (pk == NK_UntilNode && !(nt_int(nt, p, "flags", 0) & 4) && cur == nt_ref(nt, p, "statements") &&
+             (nf_falsy_implies(c, nt_ref(nt, p, "predicate"), nm) || nf_derefs(c, nt_ref(nt, p, "predicate"), nm, 0)))
+      region = cur;
     if (region >= 0) {
-      if (!nf_region_writes(f, region, nm)) return 1;
+      if (!nf_region_writes_before(f, region, nm, rd)) return 1;
     }
     else if (pk == NK_StatementsNode) {
       int bn = 0; const int *b = nt_arr(nt, p, "body", &bn);
       int at = -1;
       for (int i = 0; i < bn; i++) if (b[i] == cur) { at = i; break; }
       for (int i = at - 1; i >= 0; i--) {
-        if (nf_exit_guard(c, b[i], nm)) {
+        int exit_guard = nf_exit_guard(c, b[i], nm);
+        if (!exit_guard && nf_region_writes(f, b[i], nm)) break;
+        if (exit_guard || nf_derefs(c, b[i], nm, 0)) {
           int clean = 1;
-          for (int j = i + 1; j <= at && clean; j++) clean = !nf_region_writes(f, b[j], nm);
+          for (int j = i + 1; j <= at && clean; j++)
+            clean = j == at ? !nf_region_writes_before(f, b[j], nm, rd) : !nf_region_writes(f, b[j], nm);
           if (clean) return 1;
           break;
         }
-        if (nf_region_writes(f, b[i], nm)) break;
       }
     }
     cur = p;
@@ -705,6 +835,14 @@ static int nf_call(NF *f, int v) {
   if (r >= 0 && (sp_streq(nm, "itself") || sp_streq(nm, "tap") || sp_streq(nm, "dup") ||
                  sp_streq(nm, "clone") || sp_streq(nm, "freeze")))
     return nf_expr(f, r);
+  /* a String bang answers nil when it changes nothing (strip!, sub!, chomp!,
+     ...), except those that answer the receiver always (PF_STR_SELF): the
+     nil a mutator or any other method called on its result then meets. A
+     boxed receiver (an element of a boxed Array or Hash) answers it as a
+     String too. */
+  if (r >= 0 && (rt == TY_STRING || rt == TY_STRBUF || (rt == TY_POLY && c->ntype[v] == TY_STRING)) &&
+      ty_str_typed_bang_flags(nm) && !(ty_str_typed_bang_flags(nm) & PF_STR_SELF))
+    return NFW_NIL;
   /* an element read that can miss, a pick that finds nothing */
   if (r >= 0 && nf_container(rt)) {
     static const char *const picks[] = { "find", "detect", "first", "last", "min", "max", "min_by",
@@ -1507,10 +1645,16 @@ static void nf_calls(NF *f, int **yields, int *nyields) {
     if (an == 0 && blk < 0) continue;
     int owner = -1, dispatch = CP_NONE;
     int mi = nf_plan(f, id, &owner, &dispatch);
-    /* `W.new(k)` binds initialize's parameters */
-    if (mi < 0 && r >= 0 && sp_streq(cn, "new")) {
-      int rk = nt_kind(nt, r);
-      int k = rk == NK_ConstantReadNode || rk == NK_ConstantPathNode ? comp_class_index(c, nt_str(nt, r, "name")) : -1;
+    /* `W.new(k)` binds initialize's parameters; so does a `new` a class
+       method of W calls on its own class (`def self.empty = new(nil, 0)`) */
+    if (mi < 0 && sp_streq(cn, "new")) {
+      int k = -1;
+      if (r >= 0 && (nt_kind(nt, r) == NK_ConstantReadNode || nt_kind(nt, r) == NK_ConstantPathNode))
+        k = comp_class_index(c, nt_str(nt, r, "name"));
+      else if (r < 0 || nt_kind(nt, r) == NK_SelfNode) {
+        Scope *s = comp_scope_of(c, id);
+        if (s && s->is_cmethod && s->class_id >= 0) k = s->class_id;
+      }
       if (k >= 0) mi = comp_method_in_chain(c, k, "initialize", NULL);
       dispatch = CP_DIRECT;
     }

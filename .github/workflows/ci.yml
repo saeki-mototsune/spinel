@@ -81,7 +81,11 @@ jobs:
       # Keep the server alive across steps. See the pre-start step below.
       SCCACHE_IDLE_TIMEOUT: "0"
     steps:
+      # Two commits deep: a pull request's checkout is its merge commit, and
+      # the pre-commit check below compares it with its first parent.
       - uses: actions/checkout@v6
+        with:
+          fetch-depth: 2
 
       - name: Set up sccache
         uses: mozilla-actions/sccache-action@v0.0.10
@@ -105,6 +109,15 @@ jobs:
         uses: ruby/setup-ruby@v1
         with:
           ruby-version: "4.0"
+
+      # The pre-commit hook's checks (tools/gate.rb check) on what the pull
+      # request changes: the merge commit against its first parent, the base
+      # it merges into. A commit made without the hook reached master past
+      # them, and the next contributor's hook then refused a merge of master
+      # it did not write. It needs no build, so it runs first and fails fast.
+      - name: Check the change as the pre-commit hook does
+        if: github.event_name == 'pull_request'
+        run: ruby tools/gate.rb check-range HEAD^1 HEAD
 
       # coreutils is NOT preinstalled on the macOS runners, so `timeout` and
       # `gtimeout` were both absent and the whole suite ran with no time limit:
@@ -312,6 +325,61 @@ jobs:
           shard="$(( GITHUB_RUN_NUMBER % 4 + 1 ))/4"
           echo "corpus slice: $shard"
           make -j$(getconf _NPROCESSORS_ONLN) test-corpus OPT=-O0 TEST_SHARD=$shard
+
+      - name: sccache stats
+        if: always()
+        run: sccache --show-stats
+
+  # The other two Integer overflow modes. The corpus ran only under the
+  # default raise mode, so a change that broke wrap or promote was found
+  # from outside the repo, if at all (#8331). Master pushes only, as the
+  # 32-bit and macOS lanes: a pull request keeps its one job. The tests a
+  # mode answers otherwise today are listed in test/int-overflow/<mode>-skip.txt,
+  # and a gap leaves its list with its fix. clang -O0, as the 32-bit lane:
+  # the lane checks what the mode answers, not what an optimizer makes of it.
+  int-overflow:
+    name: ubuntu-latest / --int-overflow=${{ matrix.mode }}
+    if: github.event_name == 'push'
+    runs-on: ubuntu-latest
+    timeout-minutes: 60
+    strategy:
+      fail-fast: false
+      matrix:
+        mode: [wrap, promote]
+    env:
+      CC: sccache clang
+      SCCACHE_DIR: ${{ github.workspace }}/.sccache
+      SCCACHE_STARTUP_TIMEOUT: "30"
+      SCCACHE_IDLE_TIMEOUT: "0"
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up sccache
+        uses: mozilla-actions/sccache-action@v0.0.10
+
+      - name: Restore the sccache store
+        uses: actions/cache@v6
+        with:
+          path: .sccache
+          key: sccache-ubuntu-latest-clang-${{ matrix.mode }}-${{ github.run_id }}
+          restore-keys: sccache-ubuntu-latest-clang-${{ matrix.mode }}-
+
+      - name: Pre-start sccache server
+        run: sccache --start-server
+
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+
+      - name: Fetch libprism sources
+        run: make deps
+
+      - name: Build (parse + regexp + spinelc)
+        run: make -j$(getconf _NPROCESSORS_ONLN) all
+
+      - name: Run the test corpus under --int-overflow=${{ matrix.mode }}
+        run: make -j$(getconf _NPROCESSORS_ONLN) test-corpus OPT=-O0 SPINEL_INT_OVERFLOW=${{ matrix.mode }}
 
       - name: sccache stats
         if: always()

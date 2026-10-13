@@ -7,6 +7,7 @@
 
 #include "codegen_internal.h"
 
+void emit_poly_user_box(Compiler *c, int id, Scope *m, const char *call, Buf *b);
 int  class_is_prim_reopen(Compiler *c, int k);
 int  exc_arm_definer(Compiler *c, int k, const char *name);
 int  poly_arm_refuses_none(Compiler *c, int mi, char *exp, size_t n);
@@ -54,16 +55,16 @@ void emit_poly_user_arms_n(Compiler *c, int id, const char *name, const PolyUser
 unsigned poly_form_check(int id, const char *name, const char *site, int served, unsigned form, unsigned oform);
 void emit_poly_arm_args(Compiler *c, Scope *m, Scope *ms, const ArgLayout *L, const PolyArgs *A, const char *selfd, const char *lead, Buf *pre, Buf *cb);
 int poly_native_arm_call(Compiler *c, int k, const char *name, int n, const int *argv, const int *atmp, const TyKind *atmp_ty, int tv, Buf *cb, TyKind *mret);
-int emit_poly_native_arm_stmt(Compiler *c, const char *call, TyKind mret, TyKind ret, int tr, int is_setter_val, Buf *b);
+int emit_poly_native_arm_stmt(Compiler *c, const char *call, TyKind mret, TyKind ret, int so, int tr, int is_setter_val, Buf *b);
 int  poly_arm_count(Compiler *c, Scope *m, int kwh, int pos_argc, int splat, char *exp, size_t n);
 int  poly_kw_splat_ok(Compiler *c, int el);
 int  poly_kw_any_key(Compiler *c, int kwh);
 int  obj_class_unrelated(Compiler *c, int a, int b);
 int  poly_native_arm_fits(Compiler *c, int k, const char *name, int n, const int *argv,
                           const TyKind *atmp_ty, TyKind *mret);
-int  emit_poly_user_arm_n(Compiler *c, int k, const char *call, TyKind mret, Scope *ms, TyKind ret,
-                          int tr, int is_setter_val, Buf *b);
-void emit_poly_index_cases(TyKind ret, int tr, int tv, const char *idxref, Buf *b);
+int  emit_poly_user_arm_n(Compiler *c, int id, int k, const char *call, TyKind mret, Scope *ms, TyKind ret,
+                          int tr, int so, int is_setter_val, Buf *b);
+void emit_poly_index_cases(TyKind ret, int tr, int tv, const char *idxref, int so, Buf *b);
 int  poly_pred_kind(const char *name, int argc);
 int  poly_exc_cand(Compiler *c, const char *name);
 int  hoist_block_proc(Compiler *c, int cblk);
@@ -98,7 +99,12 @@ typedef struct {
   TyKind ret;
   int tv, tr;
   const char *idxref;   /* the index as a raw sp_int, for `[]` */
+  int id;               /* the call */
+  int kwh_tmp;          /* the keyword Hash a callable arm takes, declared ahead
+                           of the pre-arms (emit_poly_callable_kwh_decl); 0 for none */
 } PolyTemps;
+int  emit_poly_callable_kwh_decl(Compiler *c, const char *name, const PolySpecialsN *ps, const PolyTemps *T,
+                                 const PolyKw *kw, Buf *b);
 void emit_poly_prearms_n(Compiler *c, const char *name, const PolySpecialsN *ps, const PolyTemps *T, Buf *b);
 void emit_poly_str_aset_prearm(Compiler *c, int recv, const PolySpecialsN *ps, const PolyTemps *T, Buf *b);
 void emit_poly_str_aset_writeback(Compiler *c, int recv, const PolySpecialsN *ps, const PolyTemps *T, Buf *b);

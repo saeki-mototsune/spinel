@@ -53,8 +53,20 @@ typedef struct sp_Exception_s {
                                  (sp_exc_attach_msg). Read the message
                                  through sp_exc_message / sp_exc_msg_text. */
 } sp_Exception;
+/* No message was given: msg is NULL (a constructor given none, or super(nil)).
+   #message then answers the class name, read when it is asked. */
+static inline int sp_exc_msg_absent(const sp_Exception *e) { return !e->msg; }
 
 extern const char *(*sp_user_exc_parent_fn)(const char *);   /* set by the generated main() */
+/* A program's exception class with ivars of its own, for an instance the
+   runtime allocates by the class's name (sp_exc_new, sp_exc_new_sub_sized):
+   its struct's size and the scan that marks its ivars (0 for any other
+   name), and the seeding of their unset state. */
+extern size_t (*sp_user_exc_layout_fn)(const char *, void (**)(void *));
+extern void (*sp_user_exc_ivinit_fn)(void *);
+/* Copies the ivars the runtime's map holds for one exception onto another
+   (Exception#exception(msg) is a copy), once the program can write one. */
+extern void (*sp_exc_bivar_copy_fn)(void *from, void *to);
 /* The modules a class includes, NULL-terminated, or NULL for none. Ruby's type
    hierarchy is not a chain -- `rescue IO::WaitReadable` and `e.is_a?(Retryable)`
    both ask about a MODULE, which a single-parent walk cannot answer. Same shape
@@ -74,6 +86,8 @@ int sp_exc_nearest_cls(const char *raised, const char *const *targets, int n);
 SP_COLD void sp_exc_acc_gate(sp_Exception *e, const char *cls, const char *acc);
 int sp_exc_is_standard_error(const char *raised);
 sp_Exception *sp_exc_new_for_catch(const char *cls, const char *msg);
+/* the object an ensure holds for the exception passing through it */
+void *sp_exc_ensure_obj(void **obj, const char **msg, const char *cls);
 /* The message a bare `raise` carries: empty, and distinct from "no message
    given" (which falls back to the class name, as Exception.new does) (#3711). */
 extern const char *const sp_exc_no_msg;
@@ -115,12 +129,22 @@ sp_bool sp_exc_eq(sp_Exception *a, sp_Exception *b);
  * and is updated in place. Returns the boxed value so chained assignments
  * (`e = e.set_backtrace(bt)`) work. */
 sp_RbVal sp_Exception_set_backtrace(sp_Exception *e, sp_StrArray *bt);
+
+/* --debug: each line of block code, by the C function it was compiled into,
+   with how many blocks deep it is, so a backtrace frame there reads
+   `block in X` (set by the debug-build main(); defined in lib/sp_cold.c). */
+typedef struct { const char *sym, *file; int line, depth; } sp_bt_block;
+extern const sp_bt_block *sp_bt_blocks;
+extern int sp_bt_nblocks;
 sp_Exception *sp_exc_new_sub(const char *cls_name, const char *parent_cls, const char *msg);
 sp_Exception *sp_exc_dup(sp_Exception *e);
+sp_Exception *sp_exc_clone(sp_Exception *e);
 void *sp_exc_apply_staged(const char *cls, const char *msg, void *obj);
 int sp_exc_exit_status(void *obj);
 sp_Exception *sp_exc_exception(sp_Exception *e, const char *msg);
 const char *sp_exc_class_name(volatile sp_Exception *ve);
+const char *sp_exc_cls_display(const char *cn);   /* how class `cn` prints (a Class.new class: #<Class:0x...>) */
+sp_bool sp_exc_cls_unnamed(const char *shown);   /* an unnamed Class.new class's address form */
 const char *sp_exc_message(volatile sp_Exception *ve);
 /* the message's text now, not to be kept (a handle's live buffer) */
 const char *sp_exc_msg_text(volatile sp_Exception *ve);
@@ -139,7 +163,7 @@ enum { SP_SYSERR_NONE, SP_SYSERR_NUM, SP_SYSERR_BASE, SP_SYSERR_BARE };
 int sp_syserr_kind(const char *cls, sp_int *num);   /* where cls stands in the SystemCallError family */
 const char *sp_syserr_text(int has_num, sp_int num, const char *func, const char *msg);
 void sp_exc_syserr_init(sp_Exception *e);   /* #errno from the class's Errno ancestor */
-sp_int sp_errno_num(const char *cls);   /* Errno::ENOENT::Errno */
+sp_int sp_errno_num(const char *cls);   /* Errno::ENOENT::Errno; -1 for a name outside Errno:: */
 const char *sp_exc_parent_of_name(const char *cls);
 sp_RbVal sp_exc_name_acc(sp_Exception *e);
 sp_RbVal sp_exc_key_acc(sp_Exception *e);

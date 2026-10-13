@@ -53,11 +53,27 @@ int sp_gc_obj_budget_mode = 2;
 /* The last gate decision, in 1024ths, so the stats line can report it and a
    test can read it. 1024 is `walk`, 0 is `obj`. */
 size_t sp_gc_obj_alpha1024 = 1024;
+/* The MEASUREMENT that decision starts from -- the mark's share of the last
+   collection -- before SPINEL_GC_OBJ_BUDGET has pinned it at either end. The
+   string budget's gate reads this one: its own knob is what pins it. */
+static size_t sp_gc_mark_share1024 = 1024;
 /* SPINEL_GC_OBJ_BUDGET=fixed / SPINEL_GC_STR_BUDGET=fixed: hold that heap's
    budget at its floor instead of re-aiming it after every collection. Read
    once beside the other boot-time GC modes; see the comment there. */
 int sp_gc_obj_budget_fixed = 0;
 int sp_gc_str_budget_fixed = 0;
+/* SPINEL_GC_STR_BUDGET: what the string collection budget is priced from.
+   0 = the string heap alone (`str`), 1 = plus a share of the object old
+   generation, always (`walk`), 2 = that share gated on what the last
+   collection cost (the default). The three ends SPINEL_GC_OBJ_BUDGET has; see
+   sp_str_retune, which is where the reasoning lives. */
+int sp_gc_str_budget_mode = 2;
+/* That share: one part in this many. An ORDER, like the gate's coefficients. */
+#define SP_STR_BUDGET_OBJ_DIV 8
+/* What the last string retune put into the per-worker trigger for the object
+   old generation, so the stats line can report it and a test can read it.
+   Zero after a retune that put none in. */
+static size_t sp_str_budget_obj_bytes = 0;
 /* SPINEL_GC_STR_MAJOR=fixed: hold the string old generation's gate at its floor
    instead of re-aiming it, adapting nothing. */
 int sp_gc_str_major_fixed = 0;
@@ -111,7 +127,9 @@ static int sp_str_major_forced = 0;
    Sampling at the sweep removes that limit: the cadence becomes the
    collector's, not the clock's. A ring, so a long run costs no more than a
    short one and the samples are the most recent SP_STR_SHAPE_MAX. */
+#ifndef SP_STR_SHAPE_MAX
 #define SP_STR_SHAPE_MAX 8192
+#endif
 static size_t sp_str_shape[SP_STR_SHAPE_MAX];
 static unsigned sp_str_shape_n = 0;      /* total sweeps seen */
 static int sp_str_shape_cmp(const void *a, const void *b) {
@@ -362,6 +380,8 @@ static void sp_gc_stats_report(void) {
   last = now;
   sp_gc_stats_emit();
 }
+/* The `[gc]` line itself, and under SPINEL_GC_PHASES the `[gcph]` breakdown
+   below it. */
 static void sp_gc_stats_emit(void) {
   static double first = 0;
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
@@ -381,14 +401,15 @@ static void sp_gc_stats_emit(void) {
   fprintf(stderr,
           "[gc] %llu collections (%llu full) in %.2fs of %.1fs wall (%.1f%%), %.2fms avg; "
           "live %.1f MB obj + %.1f MB str; trigger %.1f MB obj + %.2f MB str/worker x %d; "
-          "mark share %.2f\n",
+          "mark share %.2f; old obj in str trigger %.2f MB\n",
           n, sp_gc_stat_fulls, sp_gc_stat_seconds, wall,
           wall > 0 ? 100.0 * sp_gc_stat_seconds / wall : 0.0,
           n ? 1000.0 * sp_gc_stat_seconds / (double)n : 0.0,
           (double)SP_GC_CTR_GET(sp_gc_bytes) / 1048576.0, (double)sbytes / 1048576.0,
           (double)SP_GC_CTR_GET(sp_gc_threshold) / 1048576.0,
           (double)SP_GC_CTR_GET(sp_str_threshold) / 1048576.0, nw,
-          (double)sp_gc_obj_alpha1024 / 1024.0);
+          (double)sp_gc_obj_alpha1024 / 1024.0,
+          (double)sp_str_budget_obj_bytes / 1048576.0);
   if (!sp_gc_ph_on) return;
   /* Which part of a collection cost that time. The names are the ones the
      collector's own comments use, so a number leads to the code that spent it.
@@ -475,9 +496,12 @@ static void sp_gc_stats_emit(void) {
           sp_gc_ph_mk_globals, sp_gc_ph_mk_scan);
 }
 
+/* Re-aim the object trigger from what a collection left, and take the
+   measurement both budgets' gates start from: the mark's share of that
+   collection. The reasoning is inline, beside each step. */
 void sp_gc_retune_object(size_t before) {
   sp_gc_stats_report();
-  if (sp_gc_stress_pin || sp_gc_obj_budget_fixed) { sp_gc_threshold = sp_gc_threshold_init; return; }
+  if (sp_gc_stress_pin) { sp_gc_threshold = sp_gc_threshold_init; return; }
   size_t live = sp_gc_bytes;
   /* The budget is what may be ALLOCATED before the next collection, and what
      pays for it is what that collection COSTS. A collection marks BOTH heaps,
@@ -549,6 +573,12 @@ void sp_gc_retune_object(size_t before) {
       if (alpha > 1024) alpha = 1024;
     }
   }
+  /* What was measured, kept before the knobs below decide what the OBJECT
+     budget makes of it. `fixed` leaves here and not at the top for the same
+     reason: a budget held at its floor still has a collection to measure, and
+     the string budget's gate (sp_str_retune) reads the measurement. */
+  sp_gc_mark_share1024 = alpha;
+  if (sp_gc_obj_budget_fixed) { sp_gc_threshold = sp_gc_threshold_init; return; }
   if (sp_gc_obj_budget_mode == 0) alpha = 0;
   else if (sp_gc_obj_budget_mode == 1) alpha = 1024;
   sp_gc_obj_alpha1024 = alpha;
@@ -588,6 +618,9 @@ static size_t sp_str_gate_old = 0;   /* the old total at the gate, for `before` 
    retunes at the next barrier, by which time the young lists hold a cycle of
    new allocation that the swept generation never contained. */
 static size_t sp_str_retune_young_exclude = 0;
+/* Re-aim the per-worker string trigger from what a sweep left: twice the live
+   strings plus the object heap's share of it (below), or twice the pre-sweep
+   total when the sweep reclaimed under a quarter of that. */
 static void sp_str_retune(size_t before, size_t promoted) {
   if (sp_gc_stress_pin || sp_gc_str_budget_fixed) { sp_str_threshold = sp_str_threshold_init; return; }
 #ifdef SP_THREADS
@@ -606,9 +639,64 @@ static void sp_str_retune(size_t before, size_t promoted) {
   before += sp_str_gate_old;
 #endif
   size_t freed = before > after ? before - after : 0;   /* saturating; see sp_gc_retune_object */
-  if (freed < before / 4) { sp_str_threshold = sp_gc_sat_mul(before, 2); }
-  else if (after > 0) { sp_str_threshold = sp_gc_sat_mul(after, 2); if (sp_str_threshold < sp_str_threshold_init) sp_str_threshold = sp_str_threshold_init; }
-  else { sp_str_threshold = sp_str_threshold_init; }
+  /* ---- the object heap's share ----
+
+     The collection this budget pays for is not a string sweep, it is a
+     collection: it marks objects too. Priced off the string live set alone,
+     the budget of a program that keeps OBJECTS and throws its strings away
+     stays at the floor however large the object heap grows, and every 256 KB
+     of dead strings buys a collection whose cost grows with that heap -- a
+     minor re-reads every old container written since the last one from end to
+     end, and one string sweep in SP_STR_MAJOR_INTERVAL is a major, which makes
+     the cycle full. Collections linear in the work, each linear in the heap:
+     appending 1M, 2M, 4M parsed records to one Array took 1.9, 7.9, 31 s.
+     This is sp_gc_retune_object's argument with the two heaps exchanged, and
+     the widening is gated the same way, by the mark's share of the last
+     collection.
+
+     The OLD generation, because that is the part of the object heap a
+     string-triggered collection walks beyond what any collection would, and
+     the one reading that is settled wherever this runs: after the object sweep
+     serially, before the slab promotions are folded in when the workers sweep
+     (so one cycle behind there), at the next barrier for the concurrent sweep.
+     alpha is one cycle behind everywhere -- the object retune runs after this.
+     It is the share that retune MEASURED, not what SPINEL_GC_OBJ_BUDGET made
+     of it: `obj`, `walk` and `fixed` pin the object budget, and this budget
+     has its own knob for the same three ends.
+
+     One part in SP_STR_BUDGET_OBJ_DIV, and not the whole of it, because the
+     whole is mostly memory. Measured from 1 to 1/32: on the Array above and
+     on bm_csv_build wall time is flat from 1 to 1/8 and climbs after it,
+     while the resident set falls by 27-40% over the same range; the whole
+     share also cost bm_str_readonly_param 2.8x its memory for nothing, and
+     1/8 costs it none. A Hash would take more (it is dearer to re-read: 1.4x
+     faster at the whole share than at 1/8). 1/8 is the order of the major's
+     base cadence, which is how often a string sweep buys the full mark. What
+     it allows: dead strings up to a quarter of the object old generation
+     between collections, across all workers.
+
+     Nothing here reads what this budget itself lets accumulate (#4396): the
+     term is live object bytes and a ratio of counts, no string figure. */
+  size_t share = 0;
+  if (sp_gc_str_budget_mode) {
+    size_t obj = sp_gc_old_bytes;
+    size_t alpha = sp_gc_str_budget_mode == 1 ? 1024 : sp_gc_mark_share1024;
+    share = (obj / 1024) * alpha + ((obj % 1024) * alpha) / 1024;
+#ifdef SP_THREADS
+    share /= (size_t)nw;   /* per worker, as `after` is */
+#endif
+    share /= SP_STR_BUDGET_OBJ_DIV;
+  }
+  /* An unproductive sweep doubles the budget as it stands, which already
+     keeps the collections it buys from piling up: the share goes into the
+     other case only. That case is also the empty heap now -- no live string
+     and no share reads as zero and takes the floor. */
+  if (freed < before / 4) { sp_str_threshold = sp_gc_sat_mul(before, 2); sp_str_budget_obj_bytes = 0; }
+  else {
+    sp_str_threshold = sp_gc_sat_mul(after + share, 2);
+    if (sp_str_threshold < sp_str_threshold_init) sp_str_threshold = sp_str_threshold_init;
+    sp_str_budget_obj_bytes = sp_gc_sat_mul(share, 2);
+  }
 }
 
 /* Collect and re-tune. The caller guarantees exclusive heap access: the

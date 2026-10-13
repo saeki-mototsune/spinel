@@ -20,7 +20,7 @@ Ruby (.rb)
 parse (libprism)       Parse with Prism, linked in as a C library
     |                  (a CRuby + Prism-gem path produces the same AST)
     v
-text AST -> NodeTable  Loaded into an in-memory node table
+NodeTable              The walk fills an in-memory node table
     |
     v
 analyze                Whole-program type inference (src/analyze*.c).
@@ -44,7 +44,7 @@ Native binary           Standalone, no runtime dependencies
 Analyze and codegen run in one process and share the in-memory model:
 codegen reads the types analyze just inferred directly, with no
 serialization step in between. See [docs/internals/AST.md](docs/internals/AST.md)
-for the text AST format the parser emits and the analyzer consumes.
+for the node table the parser fills and the analyzer consumes.
 
 ## Quick Start
 
@@ -161,6 +161,11 @@ the compiler can see is a compile error (see
 turns out wrong at run time, narrowed out of a box into the slot, is
 reinterpreted rather than widened. See
 [docs/rbs-extract.md](docs/rbs-extract.md) for the supported subset.
+
+The same signatures can be written inline, as RBS comments in the Ruby
+source (`#: (Integer) -> String` above a `def`, `attr_reader :name #:
+String`); Spinel applies them on every compile, the same way. See
+[docs/inline-rbs.md](docs/inline-rbs.md).
 
 ## Benchmarks
 
@@ -388,8 +393,8 @@ Whole-program type inference drives several compile-time optimizations:
 ```
 spinel                Single binary: parse + analyze + codegen + cc driver
                       (repo-root symlink to build/spinel)
-src/spinel_parse.c    Frontend: libprism → text AST
-src/node_table.c      AST loader: text AST → in-memory NodeTable
+src/spinel_parse.c    Frontend: libprism → NodeTable
+src/node_table.c      The in-memory NodeTable and its --dump-ast printer
 src/analyze*.c        Whole-program type inference
 src/codegen*.c        C code generation
 src/main.c            CLI driver: pipeline + cc invocation
@@ -468,7 +473,7 @@ Generated C includes the header and links the archive; `--gc-sections`
 drops every unused runtime function from the final binary.
 
 The parser is **src/spinel_parse.c**, which links libprism directly (no
-CRuby needed) and emits the text AST the compiler consumes.
+CRuby needed) and fills the node table the compiler consumes.
 `require_relative` is resolved at parse time by inlining the referenced
 file.
 

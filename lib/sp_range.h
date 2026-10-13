@@ -39,8 +39,14 @@ sp_RbVal sp_range_dup(sp_RbVal v, int keep_frozen);
 void sp_range_freeze(sp_RbVal v);
 sp_bool sp_range_frozen(sp_RbVal v);
 
-static inline sp_Range sp_range_new(sp_int f,sp_int l,sp_int e){sp_Range r;r.first=f;r.last=l;r.excl=e;r.step=0;r.fend=0.0;r.fe=0;r.unfrozen=0;return r;}
-static inline sp_Range sp_range_new_step(sp_int f,sp_int l,sp_int e,sp_int s){sp_Range r;r.first=f;r.last=l;r.excl=e;r.step=s;r.fend=0.0;r.fe=0;r.unfrozen=0;return r;}
+static inline sp_Range sp_range_new(sp_int f,sp_int l,sp_int e){sp_Range r;r.first=f;r.last=l;r.excl=e;r.step=0;r.fend=0.0;r.fe=0;r.unfrozen=0;r.nobeg=0;r.noend=0;return r;}
+static inline sp_Range sp_range_new_step(sp_int f,sp_int l,sp_int e,sp_int s){sp_Range r;r.first=f;r.last=l;r.excl=e;r.step=s;r.fend=0.0;r.fe=0;r.unfrozen=0;r.nobeg=0;r.noend=0;return r;}
+/* a Range whose sides may be absent (`..5`, `1..`, `nil..nil`): a nil bound is
+   an open side, stored as the extreme and flagged */
+static inline sp_Range sp_range_new_o(sp_oint f,sp_oint l,sp_int e){sp_Range r=sp_range_new(f.nil?SP_RANGE_NO_BEGIN:f.v,l.nil?SP_RANGE_NO_END:l.v,e);r.nobeg=f.nil;r.noend=l.nil;return r;}
+/* the bounds as nullable Integers (nil for an open side) */
+static inline sp_oint sp_range_begin_o(sp_Range r){return r.nobeg?sp_oint_nil():sp_oint_of(r.first);}
+static inline sp_oint sp_range_end_o(sp_Range r){return r.noend?sp_oint_nil():sp_oint_of(r.last);}
 /* (1..2.5) / (1...2.5): an Integer begin with a finite Float end. The walk
    stops at the last Integer the end admits -- floor(end), or end - 1 for an
    excluded integral end -- and the end itself is kept for the readers that
@@ -66,12 +72,35 @@ static inline sp_float sp_range_end_num(sp_Range r){return r.fe?r.fend:(sp_float
 static inline sp_bool sp_range_excl_end(sp_Range r){return r.fe?r.fe==2:r.excl!=0;}
 /* The effective stride: a literal `a..b` range stores 0, which iterates by +1. */
 static inline sp_int sp_range_step(sp_Range r){return r.step==0?1:r.step;}
-/* Number of elements the range enumerates (0 for an empty one), honoring step. */
+/* Whether the range enumerates nothing in its step's direction, and if not,
+   the distance from its first element to the last value it may reach (its end,
+   less one when excluded) and the stride, both in unsigned: exact for a
+   non-empty range however far apart its ends, where the signed difference of
+   two far ends (a range wider than 2**63) overflowed. */
+static inline sp_bool sp_range_none(sp_Range r, sp_int s){
+  return s>0?(r.last<r.first||(r.excl&&r.last==r.first)):(r.last>r.first||(r.excl&&r.last==r.first));
+}
+static inline uintptr_t sp_range_span(sp_Range r, sp_int s){
+  return s>0?(uintptr_t)r.last-(uintptr_t)r.first-(r.excl?1:0):(uintptr_t)r.first-(uintptr_t)r.last-(r.excl?1:0);
+}
+static inline uintptr_t sp_range_ustep(sp_int s){return s>0?(uintptr_t)s:(uintptr_t)0-(uintptr_t)s;}
+/* Number of elements the range enumerates (0 for an empty one), honoring step.
+   A count past 2**63-1 saturates there. */
 static inline sp_int sp_range_count(sp_Range r){
   sp_int s=sp_range_step(r);
-  sp_int lastv=r.excl?(r.last-(s>0?1:-1)):r.last;
-  sp_int n=(lastv-r.first)/s+1;
-  return n<0?0:n;
+  if(sp_range_none(r,s))return 0;
+  uintptr_t q=sp_range_span(r,s)/sp_range_ustep(s);
+  return q>=(uintptr_t)INTPTR_MAX?INTPTR_MAX:(sp_int)q+1;
+}
+/* The width of Integer#[lo..last]'s bit field, as sp_int_bit_range reads it:
+   last - lo + 1 bits (one fewer for an exclusive end); every bit from lo up
+   (-1) for an endless range or one whose end is below lo, as CRuby reads
+   `n[5..2]`. Taken in unsigned and capped at 64, the most a word holds, so a
+   far end does not overflow. */
+static inline sp_int sp_range_bit_width(sp_Range r, sp_int lo){
+  if(r.noend||r.last<lo)return -1;
+  uintptr_t d=(uintptr_t)r.last-(uintptr_t)lo;
+  return d>=64?64:(sp_int)d+(r.excl?0:1);
 }
 /* Materialize the range into an int array (ascending or descending per step).
    The +1 stride (every literal `a..b` range) keeps the tight from_range loop; a
@@ -79,38 +108,67 @@ static inline sp_int sp_range_count(sp_Range r){
    path only then. */
 static inline sp_IntArray *sp_range_to_ia(sp_Range r){
   /* an endless range cannot materialize (CRuby raises instead of hanging) */
-  if(r.last==INTPTR_MAX)sp_raise_cls("RangeError","cannot convert endless range to an array");
-  if(r.first==INTPTR_MIN)sp_raise_cls("TypeError","can't iterate from NilClass");
+  if(r.noend)sp_raise_cls("RangeError","cannot convert endless range to an array");
+  if(r.nobeg)sp_raise_cls("TypeError","can't iterate from NilClass");
   sp_int s=sp_range_step(r);
-  if(s==1)return sp_IntArray_from_range(r.first,r.last-r.excl);
+  if(s==1){
+    /* `a...-2**63` holds nothing: its last element would be below sp_int */
+    if(r.excl&&r.last==INTPTR_MIN)return sp_IntArray_new();
+    return sp_IntArray_from_range(r.first,r.last-r.excl);
+  }
   return sp_IntArray_from_range_step(r.first,r.last,s,r.excl);
+}
+/* The first n elements of the range, or all of them when it has fewer:
+   what zip reads of a Range argument, which stops at its receiver's size
+   (an endless one included, as CRuby's zip takes an infinite enumerator). */
+static inline sp_IntArray *sp_range_to_ia_first(sp_Range r, sp_int n){
+  if(r.nobeg)sp_raise_cls("TypeError","can't iterate from NilClass");
+  sp_int s=sp_range_step(r);
+  sp_int cnt=r.noend?n:sp_range_count(r);
+  if(cnt>n)cnt=n;
+  sp_IntArray *a=sp_IntArray_new();
+  for(sp_int i=0;i<cnt;i++)sp_IntArray_push(a,r.first+i*s);
+  return a;
+}
+/* A Float limit of upto / downto as an Integer bound, floor (upto) or ceil
+   (downto): an infinite or out-of-range limit saturates (+Infinity is the
+   endless bound) and NaN leaves nothing to enumerate. The plain cast was
+   undefined behaviour there. */
+static inline sp_int sp_flt_range_bound(sp_float f, int up){
+  if(f!=f)return up?INTPTR_MIN+1:INTPTR_MAX-1;
+  f=up?floor(f):ceil(f);
+  if(f>=9.2233720368547758e18)return INTPTR_MAX;
+  if(f<=-9.2233720368547758e18)return INTPTR_MIN+1;
+  return (sp_int)f;
 }
 /* Last enumerated element (== first for an empty range), and the min/max of the
    enumerated set -- direction-aware, so a descending range reports them right. */
 static inline sp_int sp_range_last_elem(sp_Range r){
-  sp_int n=sp_range_count(r);
-  return n<=0?r.first:r.first+(n-1)*sp_range_step(r);
+  sp_int s=sp_range_step(r);
+  if(sp_range_none(r,s))return r.first;
+  uintptr_t by=sp_range_ustep(s), off=sp_range_span(r,s)/by*by;
+  return (sp_int)(s>0?(uintptr_t)r.first+off:(uintptr_t)r.first-off);
 }
-/* min/max of an EMPTY (backwards, or exclusive single-point) range is nil
-   (SP_INT_NIL, the nullable-int sentinel) -- CRuby returns nil there. A
-   descending step range (5.downto(1)) still enumerates, so only a
-   positive-step empty span is nil (#2412). */
-static inline sp_int sp_range_min_v(sp_Range r){
+/* min/max of an EMPTY (backwards, or exclusive single-point) range is nil --
+   CRuby returns nil there. A descending step range (5.downto(1)) still
+   enumerates, so only a positive-step empty span is nil (#2412). */
+static inline sp_oint sp_range_min_v(sp_Range r){
   /* a beginless range has no minimum; an endless one's is its begin (#3668) */
-  if(r.first==INTPTR_MIN)sp_raise_cls("RangeError","cannot get the minimum of beginless range");
-  if(r.last==INTPTR_MAX)return r.first;
-  if(sp_range_count(r)<=0)return SP_INT_NIL; sp_int a=r.first,b=sp_range_last_elem(r); return a<b?a:b; }
+  if(r.nobeg)sp_raise_cls("RangeError","cannot get the minimum of beginless range");
+  if(r.noend)return sp_oint_of(r.first);
+  if(sp_range_count(r)<=0)return sp_oint_nil(); sp_int a=r.first,b=sp_range_last_elem(r); return sp_oint_of(a<b?a:b); }
 void sp_range_fend_max_raise(sp_Range r);
-static inline sp_int sp_range_max_v(sp_Range r){
+static inline sp_oint sp_range_max_v(sp_Range r){
   /* a beginless range's maximum is its end; an endless one has none (#3668) */
   /* a Float end (an infinite one too) is the maximum, which this Integer
      reader cannot answer */
-  if(r.fe){if(r.first!=INTPTR_MIN&&(sp_float)r.first>r.fend)return SP_INT_NIL;sp_range_fend_max_raise(r);}
-  if(r.last==INTPTR_MAX)sp_raise_cls("RangeError","cannot get the maximum of endless range");
-  if(r.first==INTPTR_MIN)return r.excl?r.last-1:r.last;
-  if(sp_range_count(r)<=0)return SP_INT_NIL; sp_int a=r.first,b=sp_range_last_elem(r); return a>b?a:b; }
+  if(r.fe){if(r.nobeg == 0&&(sp_float)r.first>r.fend)return sp_oint_nil();sp_range_fend_max_raise(r);}
+  if(r.noend)sp_raise_cls("RangeError","cannot get the maximum of endless range");
+  if(r.nobeg)return sp_oint_of(r.excl?r.last-1:r.last);
+  if(sp_range_count(r)<=0)return sp_oint_nil(); sp_int a=r.first,b=sp_range_last_elem(r); return sp_oint_of(a>b?a:b); }
 /* == compares the ends as numbers ((1..2.0) == (1..2)), eql? by class too */
 static inline sp_bool sp_range_eq(sp_Range a,sp_Range b){
+  if(a.nobeg!=b.nobeg||a.noend!=b.noend)return FALSE;
   if(!a.fe&&!b.fe)return a.first==b.first&&a.last==b.last&&a.excl==b.excl;
   return a.first==b.first&&sp_range_end_num(a)==sp_range_end_num(b)&&sp_range_excl_end(a)==sp_range_excl_end(b);}
 static inline sp_bool sp_range_eql(sp_Range a,sp_Range b){return (a.fe!=0)==(b.fe!=0)&&sp_range_eq(a,b);}
@@ -131,7 +189,12 @@ const char *sp_frange_inspect(sp_FloatRange r);
 sp_RbVal sp_box_frange(sp_FloatRange v);
 sp_float sp_frange_max(sp_FloatRange r);
 sp_StrRange sp_srange_new(const char *f, const char *l, sp_int e);
+/* a Range read with the handles it keeps as they are now (#8321) */
+sp_StrRange sp_srange_live(sp_StrRange r);
+/* a boxed String Range read so */
+#define SP_SRANGE_OF(p) sp_srange_live(*(sp_StrRange *)(p))
 sp_StrArray *sp_srange_to_a(sp_StrRange r);
+sp_StrArray *sp_srange_first_n(sp_RbVal box, sp_int n, int take);
 sp_bool sp_srange_eq(sp_StrRange a, sp_StrRange b);
 sp_bool sp_srange_cover(sp_StrRange r, const char *x);
 sp_bool sp_srange_include(sp_StrRange r, const char *x);

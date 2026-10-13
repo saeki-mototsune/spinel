@@ -111,6 +111,7 @@ sp_Random *sp_Random_dup(sp_Random *r) {
    -- always deterministic (same float -> same stream), which is the actual
    contract (the exact sequence is not MT19937 anyway). */
 sp_Random *sp_Random_new_float(sp_float f) {
+  if (!isfinite(f)) (void)sp_float_to_i_checked(f);
   uint64_t s;
   if (f >= -9.2233720368547758e18 && f < 9.2233720368547758e18) {
     s = (uint64_t)(int64_t)f;
@@ -148,9 +149,8 @@ sp_Random *sp_Random_new_auto(void) {
 /* Random#rand(Range): an integer in the (int-endpoint) range, empty raises. */
 sp_int sp_Random_rand_range(sp_Random *r, sp_Range rg) {SP_GC_ROOT(r);
   sp_range_int_only(rg, "Random#rand");   /* (1..2.5): CRuby answers a Float */
-  /* an open side has no span: CRuby's Errno::EDOM, where the sentinel drew
-     from a span of the whole sp_int range */
-  if (rg.first == INTPTR_MIN || rg.last == INTPTR_MAX)
+  /* an open side has no span: CRuby's Errno::EDOM */
+  if (rg.nobeg || rg.noend)
     sp_raise_cls("Errno::EDOM", "Numerical argument out of domain");
   sp_int lo = rg.first, hi = rg.excl ? rg.last - 1 : rg.last;
   if (hi < lo) sp_raise_cls("ArgumentError", sp_sprintf("invalid argument - %s", sp_Range_inspect(&rg)));

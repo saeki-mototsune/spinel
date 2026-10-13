@@ -7,10 +7,13 @@
  * (sp_exc_ctx_new/free/mark, lib/sp_exc.c). sp_exc_ctx_save/load copy the
  * handler stacks in and out, and those stacks are TU-local statics of
  * spinel_rt.h, so the two stay there. */
-#include <setjmp.h>
+#include "sp_setjmp.h"
 #include "sp_types.h"   /* sp_int */
 #include "sp_gc.h"      /* sp_RbVal */
 #include "sp_inspect.h" /* sp_poly_recur_frame */
+#ifdef SP_CEXT
+#include "sp_cext.h"
+#endif
 
 /* A non-lambda proc's home method: a node on that method's C stack, linked
    onto the per-fiber chain sp_proc_ret_head (see the proc-return machinery in
@@ -28,6 +31,11 @@ typedef struct sp_proc_home {
 /* The live prefix of every handler array, saved into the outgoing fiber's
    context and loaded from the incoming one's at each switch. */
 typedef struct {
+#ifdef SP_CEXT
+  sp_cext_arena_mark *cext_marks;
+  sp_cext_arena_context cext_arena;
+  VALUE cext_errinfo;
+#endif
   jmp_buf *es; const char **em; const char **ec; void **eo; int en, ecap;
   jmp_buf *cs; const char **ct; unsigned char *ctk; sp_RbVal *cv; int *cet;  int cn, ccap;
   jmp_buf *bs; sp_RbVal *bv; sp_int *bser; int *bet;     int bn, bcap;  /* break scopes */

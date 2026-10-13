@@ -53,9 +53,11 @@ int sp_net_shutdown_requested(void);
  *   accept/accept_nb/connect; exposed for fds obtained elsewhere). */
 int sp_net_listen(int port, int reuseport);
 int sp_net_listen_host(const char *host, int port, int backlog);
+int sp_net_listen_all(const char *host, int port, int *fds, int cap, const char **op);
 int sp_net_local_port(int fd);
 int sp_net_sock_ip(int fd, int peer, char *ipbuf, int cap);
 int sp_net_sock_host(int fd, int peer, char *hostbuf, int cap);
+int sp_net_sock_name(int fd, int peer, void *out, int cap);
 int sp_net_accept(int sfd);
 int sp_net_accept_nb(int sfd);
 int sp_net_connect(const char *host, int port);

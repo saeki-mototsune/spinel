@@ -130,6 +130,16 @@ int emit_op_condvar_wait(Compiler *c, const BopCtx *x, Buf *b) {
                       ": sp_CondVar_wait_timeout(_t%d, _m%d, sp_poly_to_f_with_rational(_timeout%d)); })",
                    timeout, t, m, t, m, timeout);
       }
+      /* an Integer or Float timeout that can be nil: nil waits with no
+         timeout, as a boxed nil does */
+      else if (oint_kind(comp_ntype(c, to_arg)) && node_has_oint_form(c, to_arg)) {
+        int timeout = ++g_tmp;
+        TyKind tk = comp_ntype(c, to_arg);
+        buf_printf(b, "; %s _timeout%d = ", oint_ctype(tk), timeout); emit_oint_expr(c, to_arg, tk, b);
+        buf_printf(b, "; _timeout%d.nil ? sp_CondVar_wait(_t%d, _m%d) "
+                      ": sp_CondVar_wait_timeout(_t%d, _m%d, (double)_timeout%d.v); })",
+                   timeout, t, m, t, m, timeout);
+      }
       else {
         int timeout = ++g_tmp;
         buf_printf(b, "; double _timeout%d = ", timeout); emit_float_expr(c, to_arg, b);
@@ -316,7 +326,16 @@ int emit_call_synchronize_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
       buf_printf(b, "sp_mutex *_t%d = ", mtmp);
       if (rty == TY_POLY) { buf_puts(b, "sp_poly_mutex_recv("); emit_boxed(c, recv, b); buf_puts(b, ")"); }
       else emit_expr(c, recv, b);
-      buf_printf(b, "; sp_Mutex_lock(_t%d); ", mtmp);
+      buf_puts(b, "; ");
+      /* a Mutex nothing else names (`Mutex.new.synchronize { }`, one out of
+         a call) is held by this temp alone: the body and the exception it
+         raises allocate */
+      { NodeKind rk = nt_kind(c->nt, recv);
+        if (rk != NK_LocalVariableReadNode && rk != NK_InstanceVariableReadNode &&
+            rk != NK_ConstantReadNode && rk != NK_ConstantPathNode && rk != NK_GlobalVariableReadNode &&
+            rk != NK_ClassVariableReadNode)
+          buf_printf(b, "SP_GC_ROOT(_t%d); ", mtmp); }
+      buf_printf(b, "sp_Mutex_lock(_t%d); ", mtmp);
       buf_printf(b, "int _retf%d = 0; int _excf%d = 0; const char *_excmsg%d = NULL, *_exccls%d = NULL; ",
                  eid, eid, eid, eid);
       /* the fields a begin..ensure nested in the block hands its deferred
@@ -325,14 +344,36 @@ int emit_call_synchronize_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
          epilogue named fields this frame did not have (#7342) */
       buf_printf(b, "int _nxtf%d = 0; (void)_nxtf%d; void *_excobj%d = NULL; ", eid, eid, eid);
       if (g_c_loop_depth > 0) buf_printf(b, "int _brkf%d = 0; (void)_brkf%d; ", eid, eid);
-      if (has_retval) { emit_ctype(c, g_ret_type, b); buf_printf(b, " _retv%d = %s; ", eid, default_value_from_compiler(c, g_ret_type)); }
-      g_ensure_stack[g_ensure_depth++] = (EnsureCtx){ eid, has_retval, g_exc_frame_depth, g_ret_type };
+      if (has_retval) {
+        /* a number slot holding its nil beside the value is the oint */
+        if (oint_kind(g_ret_type) && g_ret_oint) buf_printf(b, "%s _retv%d = %s; ", oint_ctype(g_ret_type), eid, oint_nil(g_ret_type));
+        else { emit_ctype(c, g_ret_type, b); buf_printf(b, " _retv%d = %s; ", eid, default_value_from_compiler(c, g_ret_type)); }
+      }
+      g_ensure_stack[g_ensure_depth++] = (EnsureCtx){ .lid = eid, .has_retval = has_retval, .exc_base = g_exc_frame_depth,
+                                                      .retv_ty = g_ret_type, .rescue_base = g_rescue_save_depth,
+                                                      .retv_o = g_ret_oint };
       buf_puts(b, "sp_exc_check_depth(); sp_exc_rootmark[sp_exc_top] = sp_gc_nroots; ");
       buf_puts(b, "sp_exc_msg[sp_exc_top] = 0; sp_exc_obj[sp_exc_top] = 0; sp_exc_top++; if (setjmp(sp_exc_stack[sp_exc_top-1]) == 0) { ");
       g_exc_frame_depth++;
     }
-    for (int k = 0; k < bbn - 1; k++) emit_stmt(c, bbb[k], b, 0);
-    if (bbn > 0) {
+    /* A `next` in the block answers synchronize's value and leaves the
+       block, not the loop around it: the body runs in the do{}while(0) a
+       collecting block's does, its value into the result temp (#8205).
+       A body with a break of its own keeps the plain shape, whose break
+       is the enclosing loop's. */
+    int via_next = fold_body_has_next(c, bdy) && !block_has_top_break(c, bdy);
+    if (via_next) {
+      char dest[32];
+      int dv = rv;
+      if (!scalar) { dv = ++g_tmp; buf_printf(b, "sp_RbVal _t%d = sp_box_nil(); (void)_t%d; ", dv, dv); }
+      snprintf(dest, sizeof dest, "_t%d", dv);
+      Buf *sv_pre = g_pre; int sv_ind = g_indent;
+      g_pre = b; g_indent = 0;
+      emit_block_value_into(c, blk, dest, !scalar || res == TY_POLY, 0);
+      g_pre = sv_pre; g_indent = sv_ind;
+    }
+    for (int k = 0; !via_next && k < bbn - 1; k++) emit_stmt(c, bbb[k], b, 0);
+    if (bbn > 0 && !via_next) {
       TyKind lty = comp_ntype(c, bbb[bbn-1]);
       const char *lnty = nt_type(nt, bbb[bbn-1]);
       int nil_lit = (lty == TY_NIL && lnty && sp_streq(lnty, "NilNode"));
@@ -366,7 +407,7 @@ int emit_call_synchronize_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     if (is_mx) {
       g_ensure_depth--;
       g_exc_frame_depth--;
-      buf_printf(b, "sp_exc_top--; }\nelse { sp_exc_top--; sp_gc_nroots = sp_exc_rootmark[sp_exc_top]; if (sp_unwind_kind == SP_UNWIND_NONE) { _excf%d = 1; _excmsg%d = sp_exc_msg[sp_exc_top]; _exccls%d = sp_exc_cls[sp_exc_top]; _excobj%d = sp_exc_obj[sp_exc_top]; } } ",
+      buf_printf(b, "sp_exc_top--; }\nelse { sp_exc_top--; sp_gc_nroots = sp_exc_rootmark[sp_exc_top]; if (sp_unwind_kind == SP_UNWIND_NONE) { _excf%d = 1; _excmsg%d = sp_exc_msg[sp_exc_top]; _exccls%d = sp_exc_cls[sp_exc_top]; _excobj%d = sp_exc_caught_obj(); } } ",
                  eid, eid, eid, eid);
       buf_printf(b, "_ensure%d: ; sp_Mutex_unlock(_t%d); ", eid, mtmp);
       buf_puts(b, "if (sp_unwind_kind != SP_UNWIND_NONE) sp_unwind_resume(); ");
@@ -374,9 +415,13 @@ int emit_call_synchronize_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
          way an ordinary ensure frame passes its own (codegen_stmt.c) */
       if (g_ensure_depth > g_loop_ensure_base) {
         EnsureCtx *o2 = &g_ensure_stack[g_ensure_depth - 1];
-        buf_printf(b, "if (_nxtf%d) { _nxtf%d = 1; sp_exc_top--; goto _ensure%d; } ", eid, o2->lid, o2->lid);
+        int fp2 = g_exc_frame_depth - o2->exc_base;
+        buf_printf(b, "if (_nxtf%d) { _nxtf%d = 1; ", eid, o2->lid);
+        if (fp2 > 0) buf_printf(b, "sp_exc_top -= %d; ", fp2);
+        emit_rescue_pops_to(b, o2->rescue_base);
+        buf_printf(b, "goto _ensure%d; } ", o2->lid);
       }
-      else if (g_c_loop_depth > 0) buf_printf(b, "if (_nxtf%d) continue; ", eid);
+      else if (g_c_loop_depth > 0) { buf_printf(b, "if (_nxtf%d) { ", eid); emit_loop_unwind(b); buf_puts(b, "continue; } "); }
       if (g_c_loop_depth > 0 && g_ensure_depth > g_loop_ensure_base) {
         EnsureCtx *o3 = &g_ensure_stack[g_ensure_depth - 1];
         int fp3 = g_exc_frame_depth - o3->exc_base;
@@ -394,13 +439,20 @@ int emit_call_synchronize_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         /* nested inside another begin..ensure / synchronize: hand the deferred
            return and unhandled exception to the enclosing ensure. */
         EnsureCtx *outer = &g_ensure_stack[g_ensure_depth - 1];
-        if (has_retval && outer->has_retval)
-          buf_printf(b, "if (_retf%d) { _retv%d = _retv%d; _retf%d = 1; sp_exc_top--; goto _ensure%d; } ",
-                     eid, outer->lid, eid, outer->lid, outer->lid);
+        buf_printf(b, "if (_retf%d) { ", eid);
+        if (has_retval && outer->has_retval) buf_printf(b, "_retv%d = _retv%d; ", outer->lid, eid);
+        buf_printf(b, "_retf%d = 1; ", outer->lid);
+        emit_ensure_chain_pops(b, outer);
+        buf_printf(b, "goto _ensure%d; } ", outer->lid);
+        /* An intervening rescue owns the exception after the unlock, as
+           in the begin..ensure epilogue. Its still-live frame distinguishes
+           it from a direct handoff to the enclosing ensure. */
+        if (g_exc_frame_depth > outer->exc_base + 1 || outer->catches)
+          buf_printf(b, "if (_excf%d) { sp_pending_exc_obj = _excobj%d; sp_reraise_continues = 1; sp_raise_cls(_exccls%d, _excmsg%d); } ",
+                     eid, eid, eid, eid);
         else
-          buf_printf(b, "if (_retf%d) { _retf%d = 1; sp_exc_top--; goto _ensure%d; } ", eid, outer->lid, outer->lid);
-        buf_printf(b, "if (_excf%d) { _excf%d = 1; _excmsg%d = _excmsg%d; _exccls%d = _exccls%d; _excobj%d = _excobj%d; sp_exc_top--; goto _ensure%d; } ",
-                   eid, outer->lid, outer->lid, eid, outer->lid, eid, outer->lid, eid, outer->lid);
+          buf_printf(b, "if (_excf%d) { _excf%d = 1; _excmsg%d = _excmsg%d; _exccls%d = _exccls%d; _excobj%d = _excobj%d; sp_exc_top--; goto _ensure%d; } ",
+                     eid, outer->lid, outer->lid, eid, outer->lid, eid, outer->lid, eid, outer->lid);
       }
       else {
         /* the deferred return leaves through every enclosing live begin
@@ -427,7 +479,7 @@ int emit_call_synchronize_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         /* a proc body returns sp_int: see the sibling in codegen_iter.c */
         else if (g_in_proc_body) buf_printf(b, "if (_retf%d) return 0; ", eid);
         else buf_printf(b, "if (_retf%d) return; ", eid);
-        buf_printf(b, "if (_excf%d) { sp_pending_exc_obj = _excobj%d; sp_raise_cls(_exccls%d, _excmsg%d); } ", eid, eid, eid, eid);
+        buf_printf(b, "if (_excf%d) { sp_pending_exc_obj = _excobj%d; sp_reraise_continues = 1; sp_raise_cls(_exccls%d, _excmsg%d); } ", eid, eid, eid, eid);
       }
     }
     if (scalar) buf_printf(b, "_t%d; })", rv);

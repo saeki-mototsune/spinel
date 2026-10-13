@@ -36,11 +36,16 @@ enum {
   SHF_MUT      = 1,   /* an in-place String mutation reaches the class */
   SHF_UNKNOWN  = 2,   /* the class meets UNKNOWN */
   SHF_INDIRECT = 4,   /* mutated through a receiver that is no holder */
-  SHF_MULTI    = 16   /* an ivar of the class is written a String it did not
+  SHF_MULTI    = 16,  /* an ivar of the class is written a String it did not
                          make (a call's answer, a member read): the holder is
                          one per class but a slot per object, so it can be
                          several names at once (sh_ivar_store) */
+  SHF_IDENTITY = 32   /* a reopening's receiver is compared by identity or
+                         handed to a consumer that keeps or mutates it */
 };
+/* The facts are kept in one byte per class (ShareFacts.flags): with SHF_OUT
+   (8), SHF_CHG (64) and SHF_FRZ (128) of analyze_share.c, bits 1 to 128 are
+   all taken. The next flag has to widen the field first. */
 
 typedef struct {
   unsigned char kind;   /* ShareKind */
@@ -129,13 +134,25 @@ typedef struct ShareRoute {
   int carry;           /* the node that hands the String along, or -1
                           (SHARE_CARRY_NONE); SHARE_CARRY_COPY when the
                           route hands over a copy whatever it reads */
+  int sole;            /* a local's read node whose String must have no other
+                          name, or -1: a plain local (no parameter, no
+                          capture) whose class holds one name at most
+                          (share_node_one_name), asked of the final facts */
   int fresh_elems;     /* (with elems) the container's elements reach only the
                           route's holder: an element iterator answering its
                           receiver whose value is dropped, so a container
                           whose elements no name holds hands on Strings no
                           other name holds */
+  int rt_site, rt_grow; /* (scan routes) the call whose block changes no
+                          String in place but by growing or clearing it
+                          (scan_block_changes), or -1: a failed sole check
+                          leaves its subject to a run-time length check
+                          (rt_grow: one is needed, on a handle subject)
+                          instead of refusing */
   char *msg;           /* (a kept route's message) */
 } ShareRoute;
+/* a route's sole when the subject is no local the facts can be asked of */
+enum { SHARE_SOLE_UNVOUCHED = -2 };
 enum { SHARE_CARRY_NONE = -1, SHARE_CARRY_COPY = -2 };
 ShareRoute share_route(int site, int value, int elems);
 /* Is node n's value a String the walk reached and found no identity in (a
@@ -147,6 +164,20 @@ int share_node_elems_share(const Compiler *c, int n);
    the rule shares? Its one evaluation is the only source of those Strings,
    so where it is consumed each can be wrapped as a handle of its own. */
 int share_node_fresh_elems(const Compiler *c, int n);
+/* Can a method of the program's own (a reopening of builtin class cls, or
+   a module a prepend can put ahead of it) stand in for cls's method name
+   where the call plan does not see it? */
+int share_builtin_overridden(Compiler *c, const char *cls, const char *name);
+/* Is call node `call` a retaining iterator (select, reject, find_all, the
+   in-place filters, partition) with a literal block over a fresh Array of
+   new Strings (as share_node_fresh_elems has it, before the rule is asked
+   whether they share)? Its answer keeps elements the block's parameter
+   names. */
+int share_iter_fresh_elems(const Compiler *c, int call);
+/* ... and the rule shares those elements: the answer holds the handles its
+   block saw, so the receiver is consumed as the PolyArray of handles a
+   local's would be and the answer is one too. */
+int share_iter_answers_handles(const Compiler *c, int call);
 /* Can node n's value (a container) be reached again once its expression
    is done: a holder keeps it, it leaves a call to be read after, or it
    meets what the walk does not follow? */
@@ -170,6 +201,12 @@ void share_routes_free(Compiler *c);
    0..share_flow_count-1: the kind, the site and the value node. */
 int share_flow_count(const Compiler *c);
 int share_flow_at(const Compiler *c, int i, int *site, int *value);
+/* Does the rule share the class of flow i's destination: the holder of the
+   variable, parameter, ivar or block parameter, or the elements of the
+   container, that takes the value (-1 when the walk made none)? A new
+   String joins no class, so its own class never says whether the holder it
+   is stored into shares. */
+int share_flow_dest_shares(const Compiler *c, int i);
 /* The literal blocks method scope mi yields to, as a list in *blocks:
    their count, or -1 when a block the walk does not list reaches its
    yields (a block passed as a value, a zsuper's, a dynamic call's). */
@@ -180,6 +217,12 @@ int share_method_blocks(const Compiler *c, int mi, const int **blocks);
    The settled return-tail fact also admits fresh returns and a returned
    parameter bound to a fresh argument or omitted fresh default. */
 int share_call_fresh(Compiler *c, int call);
+/* Can block node blk hand control back to the call that yields to it: does
+   its body fall off its end, or hold a `next` of its own (not a nested
+   block's, lambda's, method's or loop's)? A body whose last statement is a
+   `break` and that holds no such `next` leaves only by jumping out of the
+   call (break, raise, throw). */
+int share_block_returns(const Compiler *c, int blk);
 /* The builtin arms of a boxed call, before checking its user targets. */
 int share_builtin_fresh(Compiler *c, int call);
 /* Is node n's String a new one no name holds yet, by where it comes from: a
@@ -187,18 +230,102 @@ int share_builtin_fresh(Compiler *c, int call);
    element read of a temporary container of new Strings (an Array literal of
    them, `map(&:to_s)` over Symbols)? depth: 0 from a caller. */
 int share_value_fresh(Compiler *c, int n, int depth);
+/* Is node n the frozen String literal itself (a literal, or a freeze, -@ or
+   dedup of one)? Its handle is the literal's own, never a new one. */
+int share_frozen_literal(Compiler *c, int n);
 int share_return_owned(const Compiler *c, int n, int mi);
 /* Is node n a container literal a builtin only reads and keeps none of
    (`puts [a, b]`)? */
 int share_node_peeked(const Compiler *c, int n);
+/* Is node n's result dropped or only read by a builtin that keeps none? */
+int share_node_transient(const Compiler *c, int n);
+/* Is call n an attribute assignment of one plain value, under --share-strings? */
+int share_assign_call(const Compiler *c, int n);
+/* Is node n's value dropped (a statement, or a tail no caller reads)? */
+int share_node_unread(const Compiler *c, int n);
 /* The facts (SHF_*) of the class of node n's value. */
 unsigned share_node_flags(const Compiler *c, int n);
 /* Does the class of node n's value hold one name at most: no more than one
    holder stores its String, and nothing the walk does not follow meets it
    (its other values are transients a call or a mutator made)? */
 int share_node_one_name(const Compiler *c, int n);
+/* A fresh value or a single-use local whose destination is its only live name. */
+int share_value_unobserved(Compiler *c, int n);
 /* Does the rule share the class of node n's value? */
 int share_node_shares(const Compiler *c, int n);
+/* --share-check (share_check.c): the flag, and the compiler's state freed
+   with it. */
+extern int g_share_check;
+void share_check_free(Compiler *c);
+/* Is node v the receiver of an in-place String change the walk recorded, or
+   a link of the chain of self-answering calls down to it? */
+int share_node_mutated(Compiler *c, int v);
+
+/* Must the String node v evaluates to be the shared handle where it is
+   emitted, and not a copy of its bytes: SHN_YES, or SHN_FRESH when no other
+   name sees it, so a copy is fine unless a box keeps it (the box has to be
+   the handle's, or no change shows through the box's other names). A pure
+   query, answered from the final facts. */
+enum { SHN_NO, SHN_YES, SHN_FRESH };
+int share_value_needs_handle(Compiler *c, int v);
+/* ... asked for the target of a multiple write that stores v, an element
+   of an Array literal it splits into its targets (also through a splat):
+   the literal is no container that keeps v (its own need says bytes where
+   no name sees the literal), the target is one. */
+int share_store_needs_handle(Compiler *c, int v);
+/* Does node n hand over the shared handle (or a box holding it), not a
+   copy of its bytes? The carry a deferred route is checked against
+   (share_route_defer), and the String plan's supply for a value held as
+   bytes. */
+int share_node_carries_handle(const Compiler *c, int n);
+
+/* ---- the String plan (share_plan.c, #8328) ----
+   For each String value under --share-strings, once the analysis is final:
+   what its consumer needs, what its producer supplies, and the form those
+   give. No emitter reads it yet; --share-check compares it with the
+   conversion each emitted site has. */
+enum { SPN_BYTES, SPN_NEW, SPN_OBJECT };              /* need */
+enum { SPS_BYTES, SPS_HANDLE };                       /* supply */
+enum { SPF_BYTES, SPF_HANDLE, SPF_WRAP, SPF_REFUSE }; /* form */
+/* the role of a value's consumer: it takes the value (keeps, changes,
+   compares or hands it on), reads its bytes, tests it for nil or false,
+   stores it into a multiple write's target, or asks its identity (equal?,
+   object_id, __id__) */
+enum { SPR_TAKE, SPR_READ, SPR_TEST, SPR_STORE, SPR_IDENTITY };
+typedef struct {
+  unsigned char need, supply, form;
+} SharePlan;
+/* the form a need and a supply give */
+int share_plan_form(int need, int supply);
+/* Fill the memo of each node's need (the end of repr_seal); free it with
+   the Compiler. */
+void share_plan_build(Compiler *c);
+void share_plan_free(Compiler *c);
+/* The plan of node v for a consumer in `role` (SPR_*) where codegen is:
+   the value's need from the memo where the node is read as itself, else
+   asked live (*memo, which may be NULL, says which); the supply always
+   asked live, as it reads repr_of. */
+SharePlan share_plan_of(Compiler *c, int v, int role, int *memo);
+/* The memo's need of node v where codegen is, or -1 where it cannot answer. */
+int share_plan_memo_need(Compiler *c, int v);
+/* The value's need (what a taker needs), asked live (--share-check
+   compares the memo with it), and the plan for a consumer in `role` with
+   that need given. */
+int share_plan_need(Compiler *c, int v);
+SharePlan share_plan_with_need(Compiler *c, int v, int role, int need);
+/* The role of the consumer node v sits in, as the program has it (a taker
+   for a node made after seal), and the role of its second consumer, or -1:
+   a call answering its receiver's String has its own answer tested. */
+int share_plan_role(Compiler *c, int v);
+int share_plan_second_role(Compiler *c, int v);
+const char *share_plan_form_name(int form);
+const char *share_plan_role_name(int role);
+/* Is node n an explicit writer's attribute assignment whose value the facts
+   keep apart from its right-hand side's String (nothing observes them as one
+   object)? */
+int share_assign_unjoined(const Compiler *c, int n);
+/* Does the rule share the String attribute assignment n hands on? */
+int share_assign_shares(const Compiler *c, int n);
 
 /* SPINEL_SHARE_STATS=3: name the mutations that reach UNKNOWN's class */
 void share_dump_unknown_mutations(Compiler *c);

@@ -3,12 +3,14 @@
    nothing. */
 
 #include <string.h>
+#include <limits.h>
 #include "repr.h"
 #include "analyze_internal.h"
 #include "codegen_internal.h"
 #include "share.h"
 #include "holder.h"
 #include "call_plan.h"
+#include "builtin_ops.h"
 
 static int repr_sealed_flag;
 
@@ -96,27 +98,18 @@ int repr_dyn_cls(const Compiler *c, TyKind t) {
   return 0;
 }
 
-/* An Integer or Float node whose box has to test for the nil sentinel, as
-   emit_boxed decides it: the analysis's answer for the node
-   (nullable_int_value, through call_returns_nullable_int, which also reads
-   a local's slot and a builtin's name), an Integer ivar read (every one is
-   nil-initialized), a parameter bound from such an ivar (box_nullable_arg),
-   a node in a Ruby-defined builtin (enum_builtin_node), and every Integer
-   under --int-overflow=promote.
-   nullable_int_value re-derives a receiver's type (infer_type), so the
-   questions are asked as a pure read (an_pure_read_begin): nothing derived
-   is recorded, and asking changes nothing codegen reads next. */
+/* An Integer or Float node whose box has to test for nil, as emit_boxed
+   decides it: the node has an oint form (node_has_oint_form), the value
+   carrying its nil beside it.
+   The analysis re-derives a receiver's type (infer_type) to answer, so the
+   question is asked as a pure read (an_pure_read_begin): nothing derived is
+   recorded, and asking changes nothing codegen reads next. */
+
 int repr_nil_scalar(const Compiler *c, int node, TyKind t) {
   Compiler *mc = (Compiler *)c;
   int r = 0;
   an_pure_read_begin();
-  if (t == TY_INT)
-    r = g_promote_mode || call_returns_nullable_int(mc, node) ||
-        nt_kind(c->nt, node) == NK_InstanceVariableReadNode ||
-        box_nullable_arg(mc, node) || enum_builtin_node(mc, node);
-  else if (t == TY_FLOAT)
-    r = call_returns_nullable_int(mc, node) || box_nullable_arg(mc, node) ||
-        enum_builtin_node(mc, node);
+  if (t == TY_INT || t == TY_FLOAT) r = node_has_oint_form(mc, node);
   an_pure_read_end();
   return r;
 }
@@ -143,6 +136,12 @@ int repr_write_share(const Compiler *c, int node) {
   if (k == NK_GlobalVariableWriteNode || k == NK_GlobalVariableOrWriteNode || k == NK_GlobalVariableAndWriteNode ||
       k == NK_ClassVariableWriteNode || k == NK_ClassVariableOrWriteNode || k == NK_ClassVariableAndWriteNode)
     return repr_static_share(c, node);
+  /* an attribute assignment (`obj.x = v`): its value is v, the handle an
+     attr writer stored in its field or an explicit writer was handed */
+  if (k == NK_CallNode) {
+    int cid, iv;
+    return attr_assign_slot(mc, node, &cid, &iv) ? repr_of_ivar(c, cid, iv).share : user_assign_handle(mc, node);
+  }
   return 0;
 }
 
@@ -158,6 +157,12 @@ int repr_call_returns_handle(Compiler *c, int v) {
     return p->dispatch == CP_DIRECT && repr_self_handle(c, p->mi) && c->scopes[p->mi].ret_handle;
   }
   if (!repr_share_rule(c) || v < 0 || nt_kind(nt, v) != NK_CallNode) return 0;
+  /* an attribute assignment answers its right-hand side, not what the
+     writer returns: where the facts keep its value apart from the
+     right-hand side's String (share_assign_unjoined), that value is the
+     right-hand side's own pointer, and a writer that dups publishes its
+     own copy */
+  if (share_assign_unjoined(c, v)) return 0;
   /* a String's value, or one the pickup marks to be stored as the handle */
   TyKind t = c->ntype[v];
   if (t != TY_STRING && !(t == TY_STRBUF && c->strbuf_box[v])) return 0;
@@ -165,6 +170,18 @@ int repr_call_returns_handle(Compiler *c, int v) {
   /* a Method's call: the method `method(:m)` names */
   int recv = nt_ref(nt, v, "receiver");
   const char *nm = nt_str(nt, v, "name");
+  /* A missing ENV key answers the default handle; a present one clears
+     the return channel before making its own String. delete's
+     missing-key block answers its value the same way. */
+  if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
+      is_env_const(nt_str(nt, recv, "name")) && !comp_const(c, "ENV") &&
+      bop_share_named(BOP_ENV, nm) == BSH_FETCH) {
+    int argc = 0; const int *argv = call_args(nt, v, &argc);
+    int tail = env_delete_block_value(c, v);
+    if (nt_ref(nt, v, "block") < 0 ? argc == 2 && repr_of(c, argv[1]).kind == RK_STRBUF
+                                   : tail >= 0 && (repr_of(c, tail).kind == RK_STRBUF || strbuf_value_carries(c, tail)))
+      return 1;
+  }
   if (recv >= 0 && nm && comp_ntype(c, recv) == TY_METHOD && is_call_alias(nm)) {
     int mn = method_recv_node(c, recv);
     int mi = mn >= 0 ? method_obj_target_mi(c, mn) : -1;
@@ -217,16 +234,17 @@ int repr_boxed_reader_handle(Compiler *c, int v) {
   if (p->n == 0) return 0;
   for (int i = 0; i < p->n; i++)
     if (p->arm[i].kind != PA_READER || p->arm[i].vty != TY_STRBUF) return 0;
-  return 1;
+  /* (an exception in the box answers #message through the exception's
+     route, whose fallback takes these readers' boxes: exc_message_boxed_call) */
+  return !exc_message_boxed_call(c, v);
 }
 
-/* A boxed to_s can answer the String in the box itself,
-   beside user methods answering fresh Strings. Keep that handle; the
-   ordinary call still dispatches every other receiver. A String reopen
-   must run even on the handle, so cannot take this shortcut. */
-/* Exception#to_s also borrows its stored message. Its builtin arm can
-   carry that handle, but an exception override (including one supplied
-   by a module) needs the ordinary dispatch and declines this route. */
+/* A boxed to_s can answer the String in the box itself. The route takes a
+   block-less, argument-less to_s on a boxed receiver, typed as a String or
+   shared buffer, under --share-strings. Every user method the call can
+   dispatch to must return the handle or a new String; a target answering
+   anything else, or one the call cannot resolve, declines. Builtin arms
+   are not among those targets. */
 int repr_boxed_to_s_operand(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
   if (!repr_share_rule(c) || v < 0 || nt_kind(nt, v) != NK_CallNode) return -1;
@@ -236,13 +254,10 @@ int repr_boxed_to_s_operand(Compiler *c, int v) {
       nt_ref(nt, v, "block") >= 0 || repr_of(c, recv).kind != RK_BOXED ||
       (c->ntype[v] != TY_STRING && c->ntype[v] != TY_STRBUF)) return -1;
   int targets[CPT_MAX], n = cplan_targets(c, v, targets, CPT_MAX);
-  int string_ci = comp_class_index(c, "String");
-  if (n <= 0 || (string_ci >= 0 && comp_method_in_chain(c, string_ci, nm, NULL) >= 0)) return -1;
-  if (any_exc_reopen(c)) return -1;
+  if (n < 0) return -1;
   for (int i = 0; i < n; i++) {
     Scope *m = &c->scopes[targets[i]];
-    if (!m->ret_fresh || m->class_id < 0 || comp_class_is_module(c, &c->classes[m->class_id]) ||
-        class_is_exc_subclass(c, m->class_id)) return -1;
+    if (m->ret != TY_STRING || (!m->ret_handle && !m->ret_fresh)) return -1;
   }
   return recv;
 }
@@ -268,6 +283,21 @@ int repr_string_conversion_operand(Compiler *c, int v) {
   return r >= 0 && is_receiver_conversion(nt_str(c->nt, v, "name")) &&
          call_plain_argc(c, v) == 0 && nt_ref(c->nt, v, "block") < 0 &&
          comp_recv_type(c, r) == TY_STRING && cplan_user(c, v)->dispatch == CP_NONE ? r : -1;
+}
+/* ENV copies its stored bytes, but a store answers its value operand.
+   A boxed operand can still hold plain bytes: an observable alias stays
+   refused. A mutable key held across value evaluation that can change it
+   must carry its handle too. */
+int repr_env_store_operand(Compiler *c, int v) {
+  const NodeTable *nt = c->nt;
+  if (!repr_share_rule(c) || v < 0 || nt_kind(nt, v) != NK_CallNode) return -1;
+  int r = nt_ref(nt, v, "receiver"), argc = 0;
+  const int *argv = call_args(nt, v, &argc);
+  return r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode && is_env_const(nt_str(nt, r, "name")) &&
+         !comp_const(c, "ENV") && argc == 2 && bop_share_named(BOP_ENV, nt_str(nt, v, "name")) == BSH_LAST &&
+         (repr_of(c, argv[1]).kind != RK_BOXED || share_value_unobserved(c, argv[1])) &&
+         (!(share_node_flags(c, argv[0]) & SHF_MUT) || repr_of(c, argv[0]).handle ||
+          share_value_fresh(c, argv[0], 0) || !subtree_has_side_effect(c, argv[1])) ? argv[1] : -1;
 }
 /* Where the boxed form of a shared-mutable String comes from, as emit_boxed
    decides it for a node stored as (or holding) the handle. */
@@ -338,18 +368,23 @@ static int repr_strbuf_src(const Compiler *c, int node, TyKind t) {
     if (repr_string_conversion_operand(mc, node) >= 0) return RS_HANDLE;
     int ops[3];
     if (strbuf_route_clamp(mc, node, ops)) return RS_HANDLE;
+    if (repr_env_store_operand(mc, node) >= 0) return RS_HANDLE;
     /* A demanded call whose return route carries a handle is already that
        handle, including when operand ordering holds it in a temp. */
     if (c->strbuf_handle_demand[node] && repr_call_returns_handle(mc, node)) return RS_DEMANDED;
     /* A container store can mark the reader itself as the handle too. */
     if (repr_boxed_reader_handle(mc, node)) return RS_DEMANDED;
+    /* The implicit-self reader boxes its slot too, not a fresh String. */
+    if (c->share_strings && (c->strbuf_box[node] || c->strbuf_handle_demand[node]) &&
+        strbuf_self_reader_slot(mc, node)) return RS_DEMANDED;
     int r = nt_ref(nt, node, "receiver");
     if (r >= 0 && ty_is_object(comp_ntype(c, r)) &&
         (strbuf_marked_yields_handle(mc, node) || c->strbuf_handle_demand[node]))
       return RS_DEMANDED;
     /* A boxed return pickup keeps its published handle too. A demanded
        reader above already emits the handle, including from a held temp. */
-    if (c->strbuf_box[node] && repr_call_returns_handle(mc, node)) return RS_HANDLE;
+    if (c->strbuf_box[node] &&
+        (repr_call_returns_handle(mc, node) || strbuf_route_inline_call(mc, node))) return RS_HANDLE;
   }
   /* a String value stored where a handle is demanded: a fresh one */
   return RS_FRESH;
@@ -404,8 +439,8 @@ int repr_box_nullable_arg(Compiler *c, int v) {
   return 0;
 }
 
-/* A local that was assigned a nilable Integer result carries the sentinel
-   just as the call did: `i = s.index("z")` then `i == nil` has to answer
+/* A local that was assigned a nilable Integer result holds its nil as the
+   call's answer did: `i = s.index("z")` then `i == nil` has to answer
    true. The analysis marks the local (call_returns_nullable_int's local
    arm). */
 int repr_local_nullable_int(Compiler *c, int node) {
@@ -453,7 +488,7 @@ Repr repr_of(const Compiler *c, int node) {
   r.kind = (unsigned char)repr_kind_of_type(c, kt);
   r.dyn_cls = repr_dyn_cls(c, kt);
   if (repr_nil_scalar(c, node, kt)) {
-    r.kind = RK_SENTINEL;
+    r.kind = RK_OPT;
     r.may_nil = r.nil_scalar = 1;
   }
   r.strbuf_src = (unsigned char)repr_strbuf_src(c, node, kt);
@@ -488,7 +523,7 @@ ReprForm repr_box_form(const Compiler *c, Repr r) {
   switch ((ReprKind)r.kind) {
   case RK_NONE:     return RF_NIL_EFFECT;
   case RK_BOXED:    return RF_PASS;
-  case RK_SENTINEL: return t == TY_FLOAT ? RF_FLT_NIL : RF_INT_NIL;
+  case RK_OPT: return t == TY_FLOAT ? RF_FLT_NIL : RF_INT_NIL;
   case RK_STRUCT:   return RF_STRUCT;
   case RK_VOBJ:     return RF_VOBJ;
   case RK_STRBUF:
@@ -551,8 +586,8 @@ int repr_store_class(const Compiler *c, TyKind t) {
    false: it is written as it is there, and into an operand a builtin
    converts itself (CO_CONVERT), whose nilable forms read the 0 as they
    always have. Any other nil value -- a call that answers nil, kept for its
-   effect -- and a nil into a variable whose nil is a sentinel (an Integer,
-   a Float, a Symbol) takes the slot's nil. */
+   effect -- and a nil into a variable whose nil is not a 0 (an Integer or
+   a Float, its nil beside the value; a Symbol) takes the slot's nil. */
 int repr_store_nil_fits(Compiler *c, int node, TyKind slot, int how) {
   return node >= 0 && nt_kind(c->nt, node) == NK_NilNode &&
          (repr_store_class(c, slot) == SC_PTR || slot == TY_BOOL ||
@@ -632,6 +667,11 @@ int repr_coerce_plan(Compiler *c, int node, TyKind slot, int how, TyKind *from_o
   if (container && repr_empty_lit_as(c, node, slot)) return CF_EMPTY_LIT;
   if (from == TY_NIL && nt_kind(c->nt, node) == NK_NilNode) return CF_NIL_SENT;
   if (slot == TY_BIGINT && from == TY_INT) return CF_INT2BIG;
+  /* a String into the shared handle slot an ivar holds under the share
+     rule: the handle the value is, or a fresh one around it, as a plain
+     `@x = v` stores it. A frozen literal is the handle of its own site
+     (SP_SHARE_STRING_LITERALS), so it keeps one identity and stays frozen */
+  if (slot == TY_STRBUF && how == CO_HOLD && from == TY_STRING && repr_share_rule(c)) return CF_STRBUF_HANDLE;
   if (from == TY_POLY && how == CO_HOLD) {
     if (repr_poly_rhs_ok(slot)) return CF_POLY_RHS;
     if (ty_is_array(slot) || ty_is_ptr_array(slot) || ty_is_hash(slot) || slot == TY_BIGINT ||
@@ -647,7 +687,7 @@ int repr_coerce_form(Compiler *c, int node, TyKind slot, int how) {
 
 const char *repr_coerce_form_name(int form) {
   static const char *const names[CF__COUNT] = {
-    "FIT", "BOX", "EMPTY_LIT", "NIL_SENT", "INT2BIG", "POLY_RHS", "CHECKED_UNBOX", "CONVERT", "REFUSE",
+    "FIT", "BOX", "EMPTY_LIT", "NIL_SENT", "INT2BIG", "POLY_RHS", "CHECKED_UNBOX", "STRBUF_HANDLE", "CONVERT", "REFUSE",
   };
   return form >= 0 && form < CF__COUNT ? names[form] : "?";
 }
@@ -663,15 +703,188 @@ void repr_check_ask(const Compiler *c, int node) {
   if (node >= 0 && node < c->nt->count) (void)repr_of(c, node);
 }
 
+/* Like the boxing shadow, this observes emission without changing it. The
+   existing settled return walk records leaves, not a second return walk.
+   Frames distinguish repeated emissions of a node; an enclosing frame
+   drops abandoned trial frames just as pa_end does. */
+typedef struct { int mi, active; unsigned char want, seen; } ChannelLeaf;
+typedef struct { int node, form, ensure, clearing; } ChannelFrame;
+struct ReprChannelCheck {
+  ChannelLeaf *leaf;
+  ChannelFrame *frame;
+  int count, n, cap, clearing;
+  unsigned long checked, conflicts, pickups;
+};
+
+static void channel_grow(struct ReprChannelCheck *q) {
+  if (q->n < q->cap) return;
+  if (q->cap > INT_MAX / 2) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  q->cap = q->cap ? q->cap * 2 : 16;
+  q->frame = realloc(q->frame, (size_t)q->cap * sizeof *q->frame);
+  if (!q->frame) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+}
+
+static void channel_drop(struct ReprChannelCheck *q, int frame) {
+  q->clearing = q->frame[frame].clearing;
+  while (q->n > frame) {
+    ChannelFrame *d = &q->frame[--q->n];
+    if (!d->ensure) q->leaf[d->node].active = 0;
+  }
+}
+
+void repr_channel_predict(Compiler *c, int node, int mi, int form) {
+  if (!c->share_strings || node < 0) return;
+  struct ReprChannelCheck *q = c->repr_channel_check;
+  if (!q) {
+    q = calloc(1, sizeof *q);
+    if (!q) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    q->count = c->nt->count;
+    q->leaf = calloc((size_t)q->count, sizeof *q->leaf);
+    if (!q->leaf) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    c->repr_channel_check = q;
+  }
+  if (node >= q->count) {
+    int count = c->nt->count;
+    q->leaf = realloc(q->leaf, (size_t)count * sizeof *q->leaf);
+    if (!q->leaf) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    memset(q->leaf + q->count, 0, (size_t)(count - q->count) * sizeof *q->leaf);
+    q->count = count;
+  }
+  q->leaf[node].mi = mi;
+  q->leaf[node].want = (unsigned char)form;
+}
+
+int repr_channel_begin(Compiler *c, int node) {
+  struct ReprChannelCheck *q = c->repr_channel_check;
+  if (!q || node < 0 || node >= q->count) return -1;
+  ChannelLeaf *l = &q->leaf[node];
+  if (!l->want || l->active || l->mi <= 0 || l->mi >= c->nscopes) return -1;
+  Scope *m = &c->scopes[l->mi];
+  if (!m->ret_handle && !m->ret_channel_check) return -1;
+  channel_grow(q);
+  int f = q->n++;
+  q->frame[f] = (ChannelFrame){ node, RCH_NONE, 0, q->clearing };
+  l->active = f + 1;
+  return f;
+}
+
+void repr_channel_clearing(Compiler *c, int delta) {
+  if (c->repr_channel_check) c->repr_channel_check->clearing += delta;
+}
+
+int repr_channel_ensure(Compiler *c, int node) {
+  struct ReprChannelCheck *q = c->repr_channel_check;
+  Scope *m = q ? comp_scope_of(c, node) : NULL;
+  if (!m || (!m->ret_handle && !m->ret_channel_check)) return -1;
+  channel_grow(q);
+  int f = q->n++;
+  q->frame[f] = (ChannelFrame){ node, RCH_NONE, 1, q->clearing };
+  return f;
+}
+
+void repr_channel_note(Compiler *c, int node, int form) {
+  struct ReprChannelCheck *q = c->repr_channel_check;
+  if (!q || node < 0 || node >= q->count) return;
+  /* An ensure can overwrite a saved return's channel even when its own
+     value is dropped. Report the unproved preservation separately: an
+     ensure that returns instead can deliberately supersede that value. */
+  if (form == RCH_PUBLISH || form == RCH_CLEAR)
+    for (int i = 0; i < q->n; i++) if (q->frame[i].ensure) q->frame[i].form = form;
+  int f = q->leaf[node].active - 1;
+  if (f >= 0 && f < q->n) q->frame[f].form = form;
+}
+
+static const char *channel_form(int form) {
+  const char *const names[] = { "unobserved", "publish", "clear", "nil", "handle", "bytes", "boxed" };
+  return form >= RCH_NONE && form <= RCH_BOXED ? names[form] : "?";
+}
+
+void repr_channel_end(Compiler *c, int frame) {
+  struct ReprChannelCheck *q = c->repr_channel_check;
+  if (!q || frame < 0 || frame >= q->n) return;
+  ChannelFrame f = q->frame[frame];
+  if (f.ensure) {
+    if (f.form != RCH_NONE)
+      fprintf(stderr, "repr-check: channel-gap: node %d ensure: emitted %s after saved value; preservation unproved\n",
+              f.node, channel_form(f.form));
+    channel_drop(q, frame);
+    return;
+  }
+  ChannelLeaf *l = &q->leaf[f.node];
+  if (q->clearing) f.form = RCH_CLEAR;
+  /* The early pickup walk can precede the owned-return proof. Its local
+     read still publishes, but the settled ownership fact permits clearing.
+     A call returning a fresh bound argument has the same permission once
+     its parameter-return fact has settled. */
+  int fresh = share_return_owned(c, f.node, l->mi) ||
+              share_node_fresh(c, f.node) || share_call_fresh(c, f.node);
+  int want = fresh ? RCH_CLEAR : l->want;
+  l->seen = 1;
+  q->checked++;
+  /* nil is decided by the returned bytes, before any pickup reads the
+     channel. A handle-valued view/boxed return carries the value itself. */
+  if (want != RCH_NIL && f.form != RCH_HANDLE && f.form != RCH_BOXED && f.form != want &&
+      !(fresh && f.form == RCH_PUBLISH)) {
+    int conflict = want == RCH_CLEAR || f.form != RCH_NONE;
+    const char *cls = conflict ? "channel-conflict" : "channel-unobserved";
+    if (conflict) q->conflicts++;
+    fprintf(stderr, "repr-check: %s: node %d %s method %s: emitted %s, predicted %s\n",
+            cls, f.node, nt_type(c->nt, f.node), c->scopes[l->mi].name,
+            channel_form(f.form), channel_form(want));
+  }
+  channel_drop(q, frame);
+}
+
+void repr_channel_call(Compiler *c, int node, int mi) {
+  if (mi > 0 && mi < c->nscopes && c->scopes[mi].ret_handle)
+    repr_channel_note(c, node, RCH_PUBLISH);
+}
+
+void repr_channel_boxed(Compiler *c, int node, int frame) {
+  repr_channel_note(c, node, RCH_BOXED);
+  repr_channel_end(c, frame);
+}
+
+void repr_channel_pickup(Compiler *c, int node, int nil_guard) {
+  if (!c->share_strings) return;
+  int mis[CPT_MAX], n = cplan_targets(c, node, mis, CPT_MAX);
+  if (c->repr_channel_check) c->repr_channel_check->pickups++;
+  for (int i = 0; i < n; i++) {
+    Scope *m = &c->scopes[mis[i]];
+    /* The earlier pickup proof also admits owned handles and mixed fresh
+       tails. ret_handle is the later forwarding proof, not its negation. */
+    if ((m->ret_handle || m->ret_channel_check) && (!m->ret_nil_pickup || nil_guard)) continue;
+    fprintf(stderr, "repr-check: channel-conflict: node %d pickup method %s: "
+            "ret_handle %d ret_fresh %d ret_nil_pickup %d nil_guard %d\n",
+            node, m->name, m->ret_handle, m->ret_fresh, m->ret_nil_pickup, nil_guard);
+  }
+  if (n <= 0)
+    fprintf(stderr, "repr-check: channel-unobserved: node %d pickup: targets %d\n", node, n);
+}
+
+void repr_channel_report(Compiler *c) {
+  struct ReprChannelCheck *q = c->repr_channel_check;
+  if (!q) return;
+  int unseen = 0;
+  for (int i = 0; i < q->count; i++) {
+    ChannelLeaf *l = &q->leaf[i];
+    if (l->want && !l->seen && l->mi > 0 && c->scopes[l->mi].ret_handle) unseen++;
+  }
+  fprintf(stderr, "repr-check: channel: %lu tails, %lu conflicts, %lu pickups, %d unemitted leaves\n",
+          q->checked, q->conflicts, q->pickups, unseen);
+}
+
+void repr_channel_free(Compiler *c) {
+  struct ReprChannelCheck *q = c->repr_channel_check;
+  if (!q) return;
+  free(q->leaf); free(q->frame); free(q);
+  c->repr_channel_check = NULL;
+}
+
 ReprKind repr_slot_kind(const Compiler *c, const LocalVar *lv) {
   if (!lv) return RK_NONE;
-  /* an Integer or Float slot some write leaves nil in: its sentinel; under
-     --int-overflow=promote every Integer can be the sentinel, as every
-     Integer read is (repr_nil_scalar) */
-  if ((lv->type == TY_INT || lv->type == TY_FLOAT) &&
-      (lv->nullable_int || lv->box_nullable || lv->maybe_unset ||
-       (lv->type == TY_INT && g_promote_mode)))
-    return RK_SENTINEL;
+  /* an Integer or Float slot that holds its nil beside the value */
+  if (slot_is_oint(lv)) return RK_OPT;
   return repr_kind_of_type(c, lv->type);
 }
 Repr repr_of_slot(const Compiler *c, const LocalVar *lv) {
@@ -684,9 +897,7 @@ Repr repr_of_slot(const Compiler *c, const LocalVar *lv) {
   r.ty = r.as_ty = lv->type;
   repr_layout(&r, lv->type);
   ReprKind k = repr_slot_kind(c, lv);
-  /* a sentinel slot's box tests for it, as a read of it does
-     (repr_nil_scalar) */
-  if (k == RK_SENTINEL) r.may_nil = r.nil_scalar = 1;
+  if (k == RK_OPT) r.may_nil = r.nil_scalar = 1;
   /* a `||=` can read the slot before any write: nil until then */
   if (lv->or_written) r.may_nil = 1;
   /* a pointer slot that can hold nil (repr_may_nil) */
@@ -725,6 +936,9 @@ void repr_seal(Compiler *c) {
   if (g_repr_check) repr_check_block_params(c);
   if (c->share_strings) repr_share_seal(c);
   repr_sealed_flag = 1;
+  /* the String plan (share_plan.c), from the final facts and flags, asked
+     as codegen will ask them: sealed */
+  if (c->share_strings) share_plan_build(c);
 }
 
 int repr_sealed(void) { return repr_sealed_flag; }
@@ -744,6 +958,7 @@ int repr_static_share(const Compiler *c, int node) {
 }
 
 int repr_str_class_shares(unsigned flags, int holders) {
+  if (flags & SHF_IDENTITY) return 1;
   if (!(flags & SHF_MUT)) return 0;
   return holders >= 2 || (flags & (SHF_UNKNOWN | SHF_INDIRECT | SHF_MULTI)) != 0;
 }
@@ -921,6 +1136,9 @@ static int repr_flow_checked(Compiler *c, int v) {
   if (t != TY_STRING && t != TY_STRBUF && t != TY_POLY) return 0;
   /* a container literal is no String */
   if (k == NK_ArrayNode || k == NK_HashNode || k == NK_RangeNode) return 0;
+  /* an explicit writer's assignment whose value nothing sees as its
+     right-hand side's object: the value a holder wraps is its own */
+  if (share_assign_unjoined(c, v)) return 0;
   return share_node_shares(c, v);
 }
 
@@ -939,6 +1157,14 @@ static void repr_share_flows_check(Compiler *c, const char *stats) {
   for (int i = 0; i < nf; i++) {
     int site, v;
     int kind = share_flow_at(c, i, &site, &v);
+    /* the String a flow stores that must be the handle where it is emitted
+       (share_value_needs_handle), and whether its destination shares */
+    if (stats && stats[0] == '2' && v >= 0 && share_value_needs_handle(c, v)) {
+      const char *fp = nt_file_path(c->nt, (int)nt_int(c->nt, v, "node_file", -1));
+      fprintf(stderr, "share-flow-need: %s:%d node %d into %s dest-shares=%d needs-handle=%d\n", fp ? fp : "?",
+              (int)nt_int(c->nt, v, "node_line", 0), v, repr_flow_kind_name(kind), share_flow_dest_shares(c, i),
+              share_value_needs_handle(c, v));
+    }
     /* a flow in an unreachable scope is never emitted (bad_lit's rule) */
     if (v < 0 || !comp_scope_of(c, v)->reachable || !repr_flow_checked(c, v)) continue;
     int u = unwrap_parens(c, v);
@@ -1087,15 +1313,15 @@ int g_dump_repr = 0;
 
 static const char *repr_kind_name(int k) {
   static const char *const names[] = {
-    "none", "scalar", "sentinel", "struct", "vobj", "ptr", "strbuf", "boxed",
+    "none", "scalar", "opt", "struct", "vobj", "ptr", "strbuf", "boxed",
   };
   return k >= 0 && k <= RK_BOXED ? names[k] : "?";
 }
 
-/* an ivar's slot: every Integer ivar reads nil until written, as
-   repr_nil_scalar answers for its reads; a Float one when some write can
-   leave the sentinel, or when initialize does not write it (a Struct
-   member among them), which its reads box nil-aware (box_nullable_arg) */
+/* an ivar's slot: an Integer or Float one keeps its nil in its nil byte
+   (ivar_has_nilbit) when some write can leave nil in it, or when it can be
+   read before any write (initialize does not write it, Class#allocate
+   makes the object), which its reads box nil-aware (box_nullable_arg) */
 Repr repr_of_ivar(const Compiler *c, int cid, int iv) {
   const ClassInfo *ci = &c->classes[cid];
   Repr r;
@@ -1104,10 +1330,8 @@ Repr repr_of_ivar(const Compiler *c, int cid, int iv) {
   r.narrowed = TY_UNKNOWN;
   repr_layout(&r, r.ty);
   r.kind = (unsigned char)repr_kind_of_type(c, r.ty);
-  if (r.ty == TY_INT ||
-      (r.ty == TY_FLOAT && (ci->ivar_nullable_int[iv] ||
-                            !ivar_assigned_in_initialize((Compiler *)c, cid, ci->ivars[iv])))) {
-    r.kind = RK_SENTINEL;
+  if (ivar_has_nilbit((Compiler *)c, cid, iv)) {
+    r.kind = RK_OPT;
     r.may_nil = r.nil_scalar = 1;
   }
   if (repr_may_nil(r.ty, nil_fact_ivar(c, cid, ci->ivars[iv]))) r.may_nil = 1;
@@ -1130,13 +1354,11 @@ Repr repr_of_ivar(const Compiler *c, int cid, int iv) {
 }
 
 /* a class variable's slot, as an ivar's: an Integer or Float one some
-   write leaves nil in holds the sentinel, and under --int-overflow=promote
-   every Integer one, as every Integer read is (repr_nil_scalar) */
+   write leaves nil in is an oint (cvar_is_oint) */
 ReprKind repr_cvar_kind(const Compiler *c, int cid, int idx) {
   const ClassInfo *ci = &c->classes[cid];
   TyKind t = ci->cvar_types[idx];
-  if ((t == TY_INT || t == TY_FLOAT) && (ci->cvar_nullable_int[idx] || (t == TY_INT && g_promote_mode)))
-    return RK_SENTINEL;
+  if (cvar_is_oint((Compiler *)c, cid, idx)) return RK_OPT;
   return repr_kind_of_type(c, t);
 }
 /* Only the rule makes a class variable the shared handle
@@ -1151,7 +1373,7 @@ Repr repr_of_cvar(const Compiler *c, int cid, int idx) {
   r.narrowed = r.elem = r.key = r.val = TY_UNKNOWN;
   repr_layout(&r, r.ty);
   r.kind = (unsigned char)repr_cvar_kind(c, cid, idx);
-  if (r.kind == RK_SENTINEL) r.may_nil = r.nil_scalar = 1;
+  if (r.kind == RK_OPT) r.may_nil = r.nil_scalar = 1;
   if (repr_may_nil(r.ty, 1)) r.may_nil = 1;
   if (r.ty == TY_STRBUF && ci->cvar_str_shared[idx]) r.handle = 1;
   r.share = r.handle && c->share_strings;
@@ -1160,8 +1382,8 @@ Repr repr_of_cvar(const Compiler *c, int cid, int idx) {
   return r;
 }
 
-/* a method's value: its nilable scalar is the sentinel, and under
-   --int-overflow=promote every Integer, as every Integer read is */
+/* a method's value: its nilable scalar (ret_nullable_int, or an RBS
+   signature's `?`) is an oint */
 Repr repr_of_ret(const Compiler *c, const Scope *sc) {
   Repr r;
   memset(&r, 0, sizeof r);
@@ -1169,9 +1391,8 @@ Repr repr_of_ret(const Compiler *c, const Scope *sc) {
   r.narrowed = TY_UNKNOWN;
   repr_layout(&r, r.ty);
   r.kind = (unsigned char)repr_kind_of_type(c, r.ty);
-  if ((r.ty == TY_INT || r.ty == TY_FLOAT) &&
-      (sc->ret_nullable_int || sc->ret_rbs_nilable || (r.ty == TY_INT && g_promote_mode))) {
-    r.kind = RK_SENTINEL;
+  if ((r.ty == TY_INT || r.ty == TY_FLOAT) && (sc->ret_nullable_int || sc->ret_rbs_nilable)) {
+    r.kind = RK_OPT;
     r.may_nil = r.nil_scalar = 1;
   }
   if (repr_may_nil(r.ty, sc->ret_obj_may_nil)) r.may_nil = 1;

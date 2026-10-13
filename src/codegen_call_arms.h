@@ -42,7 +42,7 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
 int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_append_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
-int emit_call_store_value_arms(Compiler *c, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
+int emit_call_store_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
 int emit_call_array_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
 int emit_array_random_kw(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
 int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
@@ -116,12 +116,26 @@ void emit_poly_dispatch_key(Compiler *c, int tv, int cls0_cand, int prim_cand, i
 void emit_responds_name(Compiler *c, int k, const char *nm, int tv, Buf *b);
 extern const char *const enumerable_names[];
 extern int g_rto_nil_obj;
+extern int g_rto_by_cls;
+int emit_respond_to_by_cls(Compiler *c, int recv, const char *qm, int argc, const int *argv, Buf *b);
 int method_hidden_from_reflection(Compiler *c, int cid, const char *m);
 int name_is_synth_method(Compiler *c, const char *m);
 int refl_member_of_struct_superclass(Compiler *c, int ci, const char *m);
 int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const char *qm, int argc, const int *argv);
 int respond_to_user_defined(Compiler *c, int id, int recv);
 extern const char *const respond_universal[];
+extern const char *const respond_universal_all[]; /* public and private */
+int object_private_method_name(const char *qm);
+const char *const *object_private_method_names(void); /* NULL-terminated */
+int respond_to_runtime_reaches(Compiler *c, TyKind rt);
+int root_reopen_defines(Compiler *c, const char *qm);
+int private_answer_overridden(Compiler *c, const char *qm, TyKind rt);
+int refl_md_dynamic_used(Compiler *c);
+void emit_method_parameters_pushes(Compiler *c, int pn4, int tr4, Buf *b);
+int refl_im_params_used(Compiler *c);
+int emit_refl_im_params_call(Compiler *c, int id, Buf *b);
+void emit_refl_im_params(Compiler *c, Buf *b);
+void emit_refl_method_defined(Compiler *c, Buf *b);
 int rt_probe_answer(Compiler *c, int id, int *yes);
 extern const char *const struct_names[];
 void emit_call_body(Compiler *c, int id, Buf *b);
@@ -165,6 +179,9 @@ extern int g_cls_value_recv;
 int hoist_dispatch_args(Compiler *c, int argsN, int **sv, int **vw);
 int obj_member_shadows(Compiler *c, TyKind rt, const char *nm);
 void refl_class_singleton_methods(Compiler *c, int ci, int all, ReflNames *r);
+void refl_class_instance_methods(Compiler *c, int ci, int pub, int prot, ReflNames *r);
+void refl_module_instance_methods(Compiler *c, int m, int prot, ReflNames *r);
+void refl_module_own_methods(Compiler *c, int m, int pub, int prot, int priv, ReflNames *r);
 void refl_emit_sym_array(Compiler *c, int cid, ReflNames *r, Buf *b);
 void refl_free(ReflNames *r);
 void refl_own_instance_methods(Compiler *c, int ci, int pub, int prot, int priv, int with_modules, ReflNames *r);
@@ -177,6 +194,23 @@ int emit_struct_new_early(Compiler *c, int ci, int argc, const int *argv, int kw
 void emit_io_reopen_call(Compiler *c, int id, int recv, const char *name, Buf *b);
 int emit_reopen_block_call(Compiler *c, int id, int recv, int mi, const char *box_fn, Buf *b);
 void emit_reopen_pf_call(Compiler *c, int id, int pf, int cblk, const char *recv_text, Buf *b);
+/* `fmt % args` where the format is a String made where it is written (an
+   interpolation, a call's result) and the arguments allocate: nothing holds
+   the format while they are built, and C does not say which of the two is
+   built first. Opens the call with the format in a rooted temp ahead of the
+   arguments, `({ const char *_tN = fmt; SP_GC_ROOT_STR(_tN);
+   sp_str_format_polyarr(_tN`, with the nil check where `fck` names the
+   temp, and answers the text that closes it after the arguments. NULL, with
+   nothing written, for a format something else holds while the arguments
+   are built (a literal, a read that cannot allocate, a read out of a slot),
+   and for a call's answer beside an argument `arg` that runs code: that
+   code may append to the String the call answered, which a temp read
+   ahead of it would miss. The caller then emits the call as before. */
+const char *emit_str_format_held(Compiler *c, int recv, int arg, int fck, Buf *b);
+/* That last case: the format is a call's answer and `arg` runs code, so the
+   whole `recv % arg` is emitted as it was before the format was held. */
+int str_format_left_alone(Compiler *c, int recv, int arg);
+int reopen_yields_container(Compiler *c, Scope *m);
 int emit_str_format_untyped_array(Compiler *c, int recv, int a0n, int fck, Buf *b);
 void emit_voided_operands(Compiler *c, int recv, int arg, int v, Buf *b);
 int parse_named_format(const char *fmt, Buf *rew, const char **names, int *name_len, int maxn);
@@ -226,6 +260,7 @@ char adapter_arg_kind(TyKind arr, int is_push, int is_set, int pos);
 int bam_binop_wrapper(const Scope *tm);
 int bm_call_needs_layout(const NodeTable *nt, int id, const int *argv, int argc);
 const char *bm_self_ctype(Scope *tm, int shift);
+void emit_bm_self_arg(const char *sct, const char *self, Buf *b);
 int call_arg_sig(Compiler *c, const int *argv, int argc, char *out, size_t cap);
 void emit_adapter_arg_boxed(const char *v, char kind, Buf *out);
 void emit_adapter_arg_static(Compiler *c, int node, char kind, Buf *out);
@@ -242,6 +277,11 @@ void abi_sig_token(TyKind t, char *out);
 const char *bam_builtin_sym(Compiler *c, int mi, const char *dflt);
 int bind_owner_mismatch(Compiler *c, int target, TyKind ot);
 int builtin_method_arity(const char *cls, const char *m, int *out);
+int builtin_method_known(const char *cls, const char *m);
+int builtin_comparable_owns(const char *cls, const char *m);
+int builtin_comparable_arity(const char *m);
+int builtin_numeric_owns(const char *cls, const char *m);
+int builtin_numeric_arity(const char *m, int *out);
 void emit_bind_call(Compiler *c, int id, int target, const int *argv, int argc, Buf *b);
 void emit_bind_call_boxed(Compiler *c, int id, int target, int kn, const char *sym, const int *argv, int argc, Buf *b);
 void emit_bm_abi_args(Buf *b, const char *rb, int abi, const char *sig, int fixed, int rest, int ret, int poly, int pfixed, const char *thunk, int tmin, int tmax);
@@ -258,10 +298,14 @@ void emit_int_recv_named(Compiler *c, int recv, const char *name, Buf *b);
 void emit_upto_recv(Compiler *c, int recv, int lim, Buf *b);
 int emit_implicit_self_member(Compiler *c, int id, Buf *b);
 int emit_reopen_own_call(Compiler *c, int id, int dispatch_cid, Buf *b);
-void emit_reopen_recv_args(Compiler *c, int id, int mi, int recv, int boxed, const char *box_fn, Buf *b);
+int emit_reopen_recv_args(Compiler *c, int id, int mi, int recv, int boxed, const char *box_fn, size_t at, Buf *b);
+int emit_reopen_recv_in_order(Compiler *c, int id, int mi, int recv, int boxed, const char *box_fn, size_t at, Buf *b);
 void emit_reopen_self_arg(Compiler *c, int id, int mi, Buf *b);
+int str_fresh_value(Compiler *c, int n);
 int implicit_self_plan_mi(Compiler *c, int id, int dispatch_cid);
 
 int emit_send_blind(Compiler *c, int id, Buf *b);
+
+int emit_call_const_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv);
 
 #endif

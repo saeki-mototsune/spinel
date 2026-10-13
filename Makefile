@@ -6,6 +6,7 @@
 #   make bench        Run benchmarks vs CRuby
 #   make bench-compile  Time analysis/emission on a synthetic program at K=100, 200
 #   make optcarrot    End-to-end optcarrot integration test
+#   make rubyboy      End-to-end Rubyboy integration test
 #   make check        Fast pre-commit: rebuild + tests
 #   make gate         Full pre-push: test || bench || optcarrot (reuses the
 #                     passes of unchanged programs, see RUN_ONE_TEST)
@@ -52,20 +53,27 @@ RBS_SRC      = $(wildcard $(RBS_DIR)/src/*.c) $(wildcard $(RBS_DIR)/src/util/*.c
 RBS_OBJ      = $(patsubst $(RBS_DIR)/src/%.c,build/rbs/%.o,$(RBS_SRC))
 RBS_LIB      = build/librbs.a
 
-.PHONY: int-min-test all hooks share-strings-test gate-tool-test regexp wasm-rt wasm-test rbs_extract rbs-test rbs-seed-test rbs-seed-extractor cident plan-check-test timing-test signal-default-test source-marker-test repr-check-test nil-check-test traits-check-test poly-cold-test bop-arity-check-test arity-spec-check re-lit-test reject-test cli-opts-test link-names-test defer-refusals-test check-stores-test backtrace-test gc-minor-test thread-puts-test ext-test ext-cruby-test alloc-report-test rubyspec rubyspec-gate spin-check \ repr-diff c-costs alloc-diff \
+.PHONY: int-min-test all hooks share-strings-test gate-tool-test regexp wasm-rt wasm-test rbs_extract rbs-test rbs-seed-test inline-rbs-test rbs-seed-extractor cident plan-check-test timing-test shadow-check signal-default-test source-marker-test repr-check-test run-scale-test gate-costs arm-check-test traits-check-test poly-cold-test bop-arity-check-test bop-share-check-test share-spec-check arity-spec-check re-lit-test reject-test cli-opts-test link-names-test defer-refusals-test check-stores-test backtrace-test gc-minor-test thread-puts-test ext-test ext-cruby-test alloc-report-test rubyspec rubyspec-gate spin-check \ repr-diff c-costs alloc-diff \
         test test-run clean-test-results regen-rbs-expected \
-        regen-expected regen-expected-err bench optcarrot gate gate-full check gate-legs gate-test gate-test-shared gate-bench gc-phases-test gc-stress-test gc-str-major-test threaded-render-test gc-locality-test test-corpus test-corpus-summary \
-        gate-optcarrot scale-test clean install uninstall deps tools
+        regen-expected regen-expected-err bench optcarrot gate gate-full check gate-legs gate-test gate-test-shared gate-bench gc-phases-test gc-stress-test gc-str-major-test gc-str-budget-test threaded-render-test gc-locality-test test-corpus test-corpus-summary \
+        gate-optcarrot rubyboy gate-rubyboy scale-test clean install uninstall deps tools
 
 # `make all` includes the RBS extractor when vendor/rbs has been fetched
 # (via `make deps`); without it the extractor is silently omitted. Built under
 # build/ like other intermediates; rbs-seed-test copies it beside $(SPINEL),
 # where main.c looks for it as a sibling at runtime.
 RBS_EXTRACT_BIN = build/spinel_rbs_extract
+# The compiler reads inline RBS comments itself (src/inline_rbs.c) when the
+# rbs C parser is there to read them with; built without it, a program with
+# such comments is told they are not applied (docs/inline-rbs.md).
 ifneq ($(wildcard $(RBS_INC)/rbs/parser.h),)
   RBS_EXTRACT_TARGET = $(RBS_EXTRACT_BIN)
+  INLINE_RBS_CFLAGS = -DSPINEL_INLINE_RBS -I$(RBS_INC)
+  INLINE_RBS_LIBS = build/csrc/rbs_map.o $(RBS_LIB)
 else
   RBS_EXTRACT_TARGET =
+  INLINE_RBS_CFLAGS =
+  INLINE_RBS_LIBS =
 endif
 
 # The single Spinel binary (compiler + cc driver). Defined here, before the
@@ -184,7 +192,7 @@ endif
 BUNDLED_NATIVE_MT_OBJS = $(BUNDLED_NATIVE_OBJS:.o=_mt.o)
 PKG_MT_FLAGS = -DSP_THREADS -ftls-model=initial-exec
 
-all: regexp $(SPINEL) $(RBS_EXTRACT_TARGET) tools $(BUNDLED_NATIVE_OBJS) $(BUNDLED_NATIVE_MT_OBJS)
+all: regexp $(SPINEL) $(RBS_EXTRACT_TARGET) tools $(BUNDLED_NATIVE_OBJS) $(BUNDLED_NATIVE_MT_OBJS) lib/spinel_rt_responds_generated.h
 
 # ---- Dependencies ----
 deps: vendor/prism/include/prism/diagnostic.h vendor/rbs/include/rbs/parser.h
@@ -270,17 +278,17 @@ build/rbs/%.o: $(RBS_DIR)/src/%.c
 # ---- C compiler (src/) ----
 # The single-binary C reimplementation of the analyzer + code generator.
 # Links src/spinel_parse.c, the library copy of the Prism walk (no main();
-# exposes sp_parse_file_to_text).
+# exposes sp_parse_file).
 # `spinel` is the single binary: it emits C and then drives cc to link it.
 # (SPINEL itself is defined above, just before the `all` target.)
 
-SPINEL_HDRS = src/builtin_ops.h src/builtin_name_traits.inc src/builtin_zero_ops.inc src/builtin_arity.inc src/codegen_call_arms.h src/builtin_names.h src/ty_traits.inc src/call_plan.h src/codegen_poly.h src/repr.h src/holder.h src/share.h src/node_table.h src/codegen.h src/codegen_internal.h src/types.h src/compiler.h src/analyze.h src/analyze_internal.h src/ffi_spec.h src/csplit.h $(PLATFORM_HDRS)
+SPINEL_HDRS = src/builtin_ops.h src/builtin_name_traits.inc src/builtin_zero_ops.inc src/builtin_arity.inc src/builtin_share_pure.inc src/codegen_call_arms.h src/builtin_names.h src/ty_traits.inc src/call_plan.h src/codegen_poly.h src/repr.h src/holder.h src/share.h src/node_table.h src/codegen.h src/codegen_internal.h src/types.h src/compiler.h src/analyze.h src/analyze_internal.h src/ffi_spec.h src/csplit.h $(PLATFORM_HDRS)
 build/csrc/analyze_desugar.o build/csrc-work/analyze_desugar.o build/csrc/codegen_call.o build/csrc-work/codegen_call.o: $(wildcard src/*_method_names.inc)
 SPINEL_OBJ  = build/csrc/node_table.o build/csrc/types.o build/csrc/compiler.o \
                build/csrc/ffi_spec.o \
                build/csrc/analyze.o build/csrc/analyze_util.o build/csrc/analyze_infer.o build/csrc/analyze_infer_recv.o \
-               build/csrc/analyze_scope.o build/csrc/analyze_pass.o build/csrc/analyze_desugar.o build/csrc/analyze_nil.o build/csrc/analyze_share.o build/csrc/repr.o build/csrc/holder.o build/csrc/codegen.o build/csrc/codegen_util.o build/csrc/ty_traits_check.o \
-               build/csrc/codegen_fold.o build/csrc/codegen_call.o build/csrc/codegen_call_poly.o build/csrc/codegen_call_method.o build/csrc/codegen_call_io.o build/csrc/codegen_call_kernel.o build/csrc/codegen_call_exception.o build/csrc/codegen_call_module.o build/csrc/codegen_call_string.o build/csrc/codegen_call_class.o build/csrc/codegen_call_operator.o build/csrc/codegen_call_object.o build/csrc/codegen_ops.o build/csrc/codegen_call_concurrency.o build/csrc/codegen_call_numeric.o build/csrc/codegen_call_hash.o build/csrc/codegen_call_array.o build/csrc/codegen_view.o build/csrc/builtin_ops.o build/csrc/builtin_names.o build/csrc/codegen_call_recv.o build/csrc/codegen_iter.o build/csrc/call_plan.o build/csrc/codegen_poly_plan.o \
+               build/csrc/analyze_scope.o build/csrc/analyze_pass.o build/csrc/analyze_desugar.o build/csrc/analyze_nil.o build/csrc/analyze_cls.o build/csrc/analyze_arm.o build/csrc/analyze_const.o build/csrc/analyze_share.o build/csrc/repr.o build/csrc/holder.o build/csrc/codegen.o build/csrc/codegen_util.o build/csrc/ty_traits_check.o \
+               build/csrc/codegen_fold.o build/csrc/codegen_call.o build/csrc/codegen_call_poly.o build/csrc/codegen_call_method.o build/csrc/codegen_call_io.o build/csrc/codegen_call_kernel.o build/csrc/codegen_call_exception.o build/csrc/codegen_call_module.o build/csrc/codegen_call_string.o build/csrc/codegen_call_class.o build/csrc/codegen_call_operator.o build/csrc/codegen_call_object.o build/csrc/codegen_ops.o build/csrc/codegen_call_concurrency.o build/csrc/codegen_call_numeric.o build/csrc/codegen_call_hash.o build/csrc/codegen_call_array.o build/csrc/codegen_view.o build/csrc/builtin_ops.o build/csrc/builtin_names.o build/csrc/codegen_call_recv.o build/csrc/codegen_iter.o build/csrc/call_plan.o build/csrc/codegen_poly_plan.o build/csrc/share_check.o build/csrc/share_plan.o \
                build/csrc/codegen_expr.o build/csrc/codegen_stmt.o build/csrc/csplit.o build/csrc/main.o
 # The decision registry (--decisions, --decisions-log; `make decisions-test`).
 SPINEL_HDRS += src/decide.h
@@ -340,12 +348,45 @@ build/csrc/main.o: build/csrc/spinel_rev.h
 # spinel_rev.h, so only a real change recompiles.
 SP_RT_NAME_SRC = $(wildcard lib/*.h lib/*.c packages/*/*.h packages/*/*.c)
 
-build/csrc/sp_rt_names.h: $(SP_RT_NAME_SRC) | build/csrc
+# sp_poly_responds_builtin's Array/Hash/String/Integer/Float reflection
+# tables, from src/builtin_ops.c's bop_rows (tools/gen_respond_to_tables.rb
+# has the full story). cmp-guarded like sp_rt_names.h, so a
+# content-identical regeneration does not touch the .h's mtime and does
+# not force a PCH rebuild it doesn't need. src/builtin_zero_ops.inc is a
+# prerequisite too: tools/builtin_row_gen.rb (the generator's own
+# dependency) parses TY_STRING rows out of it, so a String-only edit
+# there must also trigger regeneration.
+#
+# `|| { rm -f $$t; exit 1; }` on the ruby invocation is load-bearing, not
+# defensive boilerplate: the generator's self-checks (check_proc_coverage
+# and friends) can legitimately fail closed with no output at all. Without
+# this, a failing run still produces an empty $$t, `cmp -s` sees it differ
+# from the last good header, and the final `mv` -- which make takes as
+# this recipe's exit status -- replaces that good header with the empty
+# one while reporting success, discarding the generator's actual error
+# message. The empty header does eventually break the C compile that
+# includes it, but as a confusing, unrelated-looking error, and a second
+# `make` run regenerates the same empty file (cmp now matches empty-to-
+# empty) and "succeeds" again, forever hiding the real GenError.
+lib/spinel_rt_responds_generated.h: src/builtin_ops.c src/builtin_zero_ops.inc tools/gen_respond_to_tables.rb tools/builtin_row_gen.rb lib/spinel_rt.h
 	@t=$@.tmp.$$$$; \
+	ruby tools/gen_respond_to_tables.rb > $$t || { rm -f $$t; exit 1; }; \
+	if cmp -s $$t $@; then rm -f $$t; else mv $$t $@; fi
+
+# lib/spinel_rt_responds_generated.h is an explicit prerequisite (not just
+# part of $(SP_RT_NAME_SRC)'s wildcard) because make caches a directory's
+# wildcard() listing for the life of this invocation: on a from-clean build
+# this header does not exist yet when $(SP_RT_NAME_SRC) is first expanded, and
+# that stale listing would persist even after the header is generated. The
+# recipe below re-globs with the shell instead of reusing $(SP_RT_NAME_SRC),
+# so it always sees the header once this prerequisite has built it.
+build/csrc/sp_rt_names.h: lib/spinel_rt_responds_generated.h $(SP_RT_NAME_SRC) | build/csrc
+	@t=$@.tmp.$$$$; \
+	src="$$(echo lib/*.h lib/*.c packages/*/*.h packages/*/*.c)"; \
 	{ echo "/* generated from the runtime sources; see the Makefile rule */"; \
 	  echo "static const char *const SP_RT_PREFIXES[] = {"; \
-	  { grep -hoE '\bsp_[a-z][a-z0-9_]*' $(SP_RT_NAME_SRC) 2>/dev/null \
-	    | sed 's/^sp_//' | cut -d_ -f1; echo rb; } \
+	  { grep -hoE '\bsp_[a-z][a-z0-9_]*' $$src 2>/dev/null \
+    | sed 's/^sp_//' | cut -d_ -f1 | grep -v '^cext$$'; echo rb; } \
 	    | sort -u | sed 's/.*/  "&",/'; \
 	  echo "  NULL"; echo "};"; } > $$t; \
 	if cmp -s $$t $@; then rm -f $$t; else mv $$t $@; fi
@@ -354,8 +395,16 @@ build/csrc/codegen_util.o: build/csrc/sp_rt_names.h
 
 FORCE:
 
-build/csrc/sp_parse_lib.o: src/spinel_parse.c src/sp_macro.c $(PRISM_LIB) $(PLATFORM_HDRS) | build/csrc
-	$(CC) $(CFLAGS) -I$(PRISM_INC) -c src/spinel_parse.c -o $@
+build/csrc/sp_parse_lib.o: src/spinel_parse.c src/sp_macro.c src/sp_const_loop.c src/inline_rbs.c src/rbs_map.h src/node_table.h src/types.h $(PRISM_LIB) $(PLATFORM_HDRS) | build/csrc
+	$(CC) $(CFLAGS) -I$(PRISM_INC) $(INLINE_RBS_CFLAGS) -c src/spinel_parse.c -o $@
+build/csrc/rbs_map.o: src/rbs_map.c src/rbs_map.h $(PLATFORM_HDRS) | build/csrc
+	$(CC) -c $(CFLAGS) -I$(RBS_INC) src/rbs_map.c -o $@
+
+# Exercise the fallback even when vendor/rbs is present, without replacing
+# the parser object used by the ordinary compiler.
+SPINEL_NO_RBS = build/spinel-no-rbs
+build/csrc/sp_parse_no_rbs.o: src/spinel_parse.c src/sp_macro.c src/sp_const_loop.c src/node_table.h src/types.h $(PRISM_LIB) $(PLATFORM_HDRS) | build/csrc
+	$(CC) $(CFLAGS) -I$(PRISM_INC) -U SPINEL_INLINE_RBS -c src/spinel_parse.c -o $@
 
 # The compiler links the regexp engine so it can compile a literal at build
 # time and refuse one the engine cannot read, where it used to reach the
@@ -376,9 +425,12 @@ build/csrc/re_lit_check.o: src/re_lit_check.c $(RE_HDRS) | build/csrc
 RE_SRC = lib/regexp/re_compile.c lib/regexp/re_exec.c lib/regexp/re_utf8.c lib/regexp/unicase.c lib/regexp/re_spinel.c
 RE_OBJ = $(patsubst lib/regexp/%.c,build/regexp/%.o,$(RE_SRC))
 
-$(SPINEL): $(SPINEL_OBJ) build/csrc/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(PLATFORM_OBJ)
+$(SPINEL_NO_RBS): $(SPINEL_OBJ) build/csrc/sp_parse_no_rbs.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(PLATFORM_OBJ)
+	$(CC) $(CFLAGS) $(SPINEL_OBJ) build/csrc/sp_parse_no_rbs.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(PLATFORM_OBJ) -lm $(LDFLAGS) $(SPINEL_LDFLAGS) -o $@
+
+$(SPINEL): $(SPINEL_OBJ) build/csrc/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(INLINE_RBS_LIBS) $(PLATFORM_OBJ)
 	@mkdir -p bin
-	$(CC) $(CFLAGS) $(SPINEL_OBJ) build/csrc/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(PLATFORM_OBJ) -lm $(LDFLAGS) $(SPINEL_LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $(SPINEL_OBJ) build/csrc/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(INLINE_RBS_LIBS) $(PLATFORM_OBJ) -lm $(LDFLAGS) $(SPINEL_LDFLAGS) -o $@
 	@# Dev convenience: a repo-root `./spinel` pointing at the built binary
 	@# (the installed command is `spinel` too). Best-effort; gitignored.
 	@ln -sf $@ spinel 2>/dev/null || cp $@ spinel 2>/dev/null || true
@@ -396,8 +448,8 @@ build/csrc-work/%.o: src/%.c $(SPINEL_HDRS) | build/csrc
 # codegen_util.c before sp_rt_names.h existed and stopped
 build/csrc-work/main.o: build/csrc/spinel_rev.h
 build/csrc-work/codegen_util.o: build/csrc/sp_rt_names.h
-$(SPINEL_WORK): $(SPINEL_WORK_OBJ) build/csrc/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB)
-	$(CC) $(CFLAGS) $(SPINEL_WORK_OBJ) build/csrc/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) -lm $(LDFLAGS) -o $@
+$(SPINEL_WORK): $(SPINEL_WORK_OBJ) build/csrc/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(INLINE_RBS_LIBS)
+	$(CC) $(CFLAGS) $(SPINEL_WORK_OBJ) build/csrc/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(INLINE_RBS_LIBS) -lm $(LDFLAGS) -o $@
 
 # The compiler again under AddressSanitizer and UndefinedBehaviorSanitizer,
 # for `make san-check` (tools/san_check.sh): every program of the corpus
@@ -415,11 +467,11 @@ build/csrc-san/%.o: src/%.c $(SPINEL_HDRS) | build/csrc
 	$(CC) $(CFLAGS) $(SAN_FLAGS) -Isrc -Ibuild/csrc -c $< -o $@
 build/csrc-san/main.o: build/csrc/spinel_rev.h
 build/csrc-san/codegen_util.o: build/csrc/sp_rt_names.h
-build/csrc-san/sp_parse_lib.o: src/spinel_parse.c src/sp_macro.c $(PRISM_LIB) | build/csrc
+build/csrc-san/sp_parse_lib.o: src/spinel_parse.c src/sp_macro.c src/sp_const_loop.c src/inline_rbs.c src/rbs_map.h src/node_table.h src/types.h $(PRISM_LIB) | build/csrc
 	@mkdir -p build/csrc-san
-	$(CC) $(CFLAGS) $(SAN_FLAGS) -I$(PRISM_INC) -c src/spinel_parse.c -o $@
-$(SPINEL_SAN): $(SPINEL_SAN_OBJ) build/csrc-san/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB)
-	$(CC) $(CFLAGS) $(SAN_FLAGS) $(SPINEL_SAN_OBJ) build/csrc-san/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) -lm $(LDFLAGS) -o $@
+	$(CC) $(CFLAGS) $(SAN_FLAGS) -I$(PRISM_INC) $(INLINE_RBS_CFLAGS) -c src/spinel_parse.c -o $@
+$(SPINEL_SAN): $(SPINEL_SAN_OBJ) build/csrc-san/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(INLINE_RBS_LIBS)
+	$(CC) $(CFLAGS) $(SAN_FLAGS) $(SPINEL_SAN_OBJ) build/csrc-san/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(INLINE_RBS_LIBS) -lm $(LDFLAGS) -o $@
 
 .PHONY: san-check
 san-check: $(SPINEL_SAN)
@@ -428,7 +480,10 @@ san-check: $(SPINEL_SAN)
 # Wrapper around the system `timeout` that always returns GNU coreutils'
 # exit code (124 on timeout), regardless of which `timeout` is on PATH.
 # The bench target keys on 124 to mark a run as SKIP; busybox uses 143
-# and BSDs use 399, which would be misclassified. Built once from C.
+# and BSDs use 399, which would be misclassified. Built once from C. The
+# limit counts the command's CPU time, with a backstop on the clock six times
+# longer: a loaded machine slows a correct program down without making it a
+# runaway (scripts/spinel-timeout.c has the reasoning).
 SPINEL_TIMEOUT_SRC ?= scripts/spinel-timeout.c
 # Parallel sub-makes can both rebuild it while another leg runs it. Link to
 # a PID-specific name, then rename: a reader always gets a complete binary.
@@ -450,9 +505,9 @@ rbs-missing:
 else
 rbs_extract: $(RBS_EXTRACT_BIN)
 
-$(RBS_EXTRACT_BIN): tools/spinel_rbs_extract.c $(RBS_LIB) $(PLATFORM_OBJ)
+$(RBS_EXTRACT_BIN): tools/spinel_rbs_extract.c build/csrc/rbs_map.o $(RBS_LIB) $(PLATFORM_OBJ)
 	@mkdir -p $(@D)
-	$(CC) $(CFLAGS) -I$(RBS_INC) tools/spinel_rbs_extract.c $(RBS_LIB) $(PLATFORM_OBJ) $(PLATFORM_LIBS) -o $@
+	$(CC) $(CFLAGS) -I$(RBS_INC) -Isrc tools/spinel_rbs_extract.c build/csrc/rbs_map.o $(RBS_LIB) $(PLATFORM_OBJ) $(PLATFORM_LIBS) -o $@
 endif
 
 # ---- Runtime library (regexp + bigint + …) ----
@@ -468,7 +523,20 @@ build/regexp/%.o: lib/regexp/%.c $(RE_HDRS)
 	@mkdir -p build/regexp
 	$(CC) -c $(COPT) $(SEC_FLAGS) $(RE_CASE_FLAGS) -Ilib/regexp -Ilib/regexp/shim $< -o $@
 
-RT_HDRS = $(wildcard lib/*.h lib/regexp/*.h lib/regexp/*.inc lib/regexp/shim/*.h lib/regexp/shim/mruby/*.h) $(PLATFORM_HDRS)
+# lib/spinel_rt_responds_generated.h is a plain filename here, not part of
+# the $(wildcard ...) above: on a from-clean build it does not exist yet
+# when $(RT_HDRS) is first expanded, and make caches that directory
+# listing for the rest of this invocation, so the wildcard would never
+# pick it up even after its own rule generates it later in the same run.
+# Every rule below that lists $(RT_HDRS) compiles a .c file that
+# transitively includes lib/spinel_rt.h, which #includes this header, so
+# without this every one of them races the generator under -j$(nproc) on
+# a fresh checkout (observed in CI: build/sp_poly_cold.o losing that race
+# with "fatal error: spinel_rt_responds_generated.h: No such file or
+# directory"). A plain filename here is looked up as a real prerequisite
+# with its own rule, not a wildcard scan, so it is immune to the caching
+# above and make schedules its generation before any of these rules runs.
+RT_HDRS = $(wildcard lib/*.h lib/regexp/*.h lib/regexp/*.inc lib/regexp/shim/*.h lib/regexp/shim/mruby/*.h) $(PLATFORM_HDRS) lib/spinel_rt_responds_generated.h
 
 # One rule for every lib/*.c object. The per-object header lists here used to be
 # written by hand and had drifted: build/sp_array.o never named lib/sp_str.h,
@@ -488,10 +556,10 @@ build/%.o: lib/%.c $(RT_HDRS)
 # spinel/runtime.h ABI (-Ilib) plus its own package headers. BUNDLED_NATIVE_OBJS
 # is defined near the top (before `all`, whose prereqs expand at parse time).
 packages/json/sp_json.o: packages/json/sp_json.c packages/json/sp_json.h \
-                         lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                         lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib -Ipackages/json packages/json/sp_json.c -o $@
 packages/json/sp_json_mt.o: packages/json/sp_json.c packages/json/sp_json.h \
-                            lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                            lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib -Ipackages/json packages/json/sp_json.c -o $@
 
 # openssl is glue over the SYSTEM libssl, so unlike the other package C it is
@@ -501,63 +569,63 @@ packages/json/sp_json_mt.o: packages/json/sp_json.c packages/json/sp_json.h \
 # link error. -lssl/-lcrypto reach the link line through openssl.rb's ffi_lib,
 # which is parsed only when a program requires it.
 packages/openssl/sp_openssl.o: packages/openssl/sp_openssl.c \
-                               lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                               lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(OPENSSL_CPPFLAGS) -Ilib -Ipackages/openssl packages/openssl/sp_openssl.c -o $@
 packages/openssl/sp_openssl_mt.o: packages/openssl/sp_openssl.c \
-                                  lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                                  lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) $(OPENSSL_CPPFLAGS) -Ilib -Ipackages/openssl packages/openssl/sp_openssl.c -o $@
 
 packages/ffi/sp_ffi.o: packages/ffi/sp_ffi.c \
-                       lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                       lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(LIBFFI_CPPFLAGS) -Ilib -Ipackages/ffi packages/ffi/sp_ffi.c -o $@
 packages/ffi/sp_ffi_mt.o: packages/ffi/sp_ffi.c \
-                          lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                          lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) $(LIBFFI_CPPFLAGS) -Ilib -Ipackages/ffi packages/ffi/sp_ffi.c -o $@
 
 # stringio is a native-bound spin package (Path B typed object): the struct,
 # every method, and the header live in the package; the compiler knows it only
 # through the native_* declarations in stringio.rb.
 packages/stringio/sp_stringio.o: packages/stringio/sp_stringio.c packages/stringio/sp_stringio.h \
-                                 lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                                 lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib -Ipackages/stringio packages/stringio/sp_stringio.c -o $@
 packages/stringio/sp_stringio_mt.o: packages/stringio/sp_stringio.c packages/stringio/sp_stringio.h \
-                                    lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                                    lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib -Ipackages/stringio packages/stringio/sp_stringio.c -o $@
 
 # strscan is likewise a native-bound spin package; its regex matching links
 # against the runtime archive's re_exec (a forward extern in the package C).
 packages/strscan/sp_strscan.o: packages/strscan/sp_strscan.c \
-                               lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                               lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib packages/strscan/sp_strscan.c -o $@
 packages/strscan/sp_strscan_mt.o: packages/strscan/sp_strscan.c \
-                                  lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                                  lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib packages/strscan/sp_strscan.c -o $@
 
 # base64 carries its whole implementation; digest carries none (it binds the
 # runtime's vendored sp_crypto symbols and has no object of its own).
 packages/base64/sp_base64.o: packages/base64/sp_base64.c \
-                             lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                             lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib packages/base64/sp_base64.c -o $@
 packages/base64/sp_base64_mt.o: packages/base64/sp_base64.c \
-                                lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                                lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib packages/base64/sp_base64.c -o $@
 
 # tmpdir: Dir.tmpdir and Dir.mktmpdir, the system temp directory and a
 # unique-directory creator. Pure C, no struct.
 packages/tmpdir/sp_tmpdir.o: packages/tmpdir/sp_tmpdir.c \
-                             lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                             lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib packages/tmpdir/sp_tmpdir.c -o $@
 packages/tmpdir/sp_tmpdir_mt.o: packages/tmpdir/sp_tmpdir.c \
-                                lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                                lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib packages/tmpdir/sp_tmpdir.c -o $@
 
 # pty: PTY.spawn, a child on a new pseudo-terminal (posix_openpt + fork).
 # Pure C over libc; no wasm32-wasi object, since WASI has no fork.
 packages/pty/sp_pty.o: packages/pty/sp_pty.c \
-                       lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                       lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib packages/pty/sp_pty.c -o $@
 packages/pty/sp_pty_mt.o: packages/pty/sp_pty.c \
-                          lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                          lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib packages/pty/sp_pty.c -o $@
 
 # zlib: DEFLATE, zlib and gzip in the package's own C. No system libz and so
@@ -565,10 +633,10 @@ packages/pty/sp_pty_mt.o: packages/pty/sp_pty.c \
 # box without the -dev package -- would drop the package and give a green
 # `make test` that never ran it. Pure C, no struct.
 packages/zlib/sp_zlib.o: packages/zlib/sp_zlib.c \
-                         lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                         lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) -Ilib packages/zlib/sp_zlib.c -o $@
 packages/zlib/sp_zlib_mt.o: packages/zlib/sp_zlib.c \
-                            lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h
+                            lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_compat.h lib/sp_setjmp.h
 	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) -Ilib packages/zlib/sp_zlib.c -o $@
 
 build/sp_cold.o: lib/sp_cold.c $(RT_HDRS)
@@ -577,7 +645,59 @@ build/sp_cold.o: lib/sp_cold.c $(RT_HDRS)
 
 SP_RT_LIB = lib/libspinel_rt.a
 
-RT_MEMBERS = sp_bigint sp_crypto sp_pack sp_time sp_core sp_net sp_system sp_gc sp_slab sp_alloc sp_dtoa sp_marshal sp_format sp_string sp_inspect sp_poly_cold sp_array sp_str sp_str_crypt sp_hash sp_proc sp_exc sp_re sp_random sp_fiber sp_sched sp_io sp_iobuffer sp_cold sp_process sp_process_status
+RT_MEMBERS = sp_bigint sp_crypto sp_pack sp_time sp_core sp_net sp_system sp_gc sp_slab sp_alloc sp_dtoa sp_marshal sp_format sp_string sp_inspect sp_poly_cold sp_array sp_str sp_str_cold sp_str_crypt sp_hash sp_proc sp_exc sp_re sp_random sp_fiber sp_sched sp_io sp_iobuffer sp_cold sp_enum_str sp_process sp_process_status
+
+# Opt-in runtime for carried C extensions. The regular archive has no hook
+# branches or extension state, preserving its instruction stream.
+.PHONY: cext-runtime cext-gc-test
+cext-runtime: lib/libspinel_cext_rt.a
+build/cext/sp_gc.o: lib/sp_gc.c $(RT_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(COPT) $(SEC_FLAGS) -DSP_CEXT -Ilib $< -o $@
+build/cext/sp_cext.o: lib/sp_cext.c lib/sp_cext.h include/ruby.h $(RT_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(COPT) $(SEC_FLAGS) -DSP_CEXT -Iinclude -Ilib $< -o $@
+build/cext/sp_cext_exc.o: lib/sp_cext_exc.c lib/sp_cext.h include/ruby.h $(RT_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(COPT) $(SEC_FLAGS) -DSP_CEXT -Iinclude -Ilib $< -o $@
+build/cext/sp_exc.o: lib/sp_exc.c $(RT_HDRS) include/ruby.h
+	@mkdir -p $(@D)
+	$(CC) -c $(COPT) $(SEC_FLAGS) -DSP_CEXT -Iinclude -Ilib $< -o $@
+lib/libspinel_cext_rt.a: $(RE_OBJ) $(addprefix build/,$(addsuffix .o,$(filter-out sp_gc sp_exc,$(RT_MEMBERS)))) build/cext/sp_gc.o build/cext/sp_exc.o build/cext/sp_cext.o build/cext/sp_cext_exc.o $(PLATFORM_OBJ)
+	@rm -f $@
+	ar rcs $@ $^
+cext-gc-test: lib/libspinel_cext_rt.a
+	$(CC) -O1 -g -DSP_CEXT -Iinclude -Ilib test/cext/handles.c $< $(LDFLAGS) -lm -o build/cext/handles-test
+	./build/cext/handles-test
+	SPINEL_GC_MINOR=1 SPINEL_GC_VERIFY_GEN=1 ./build/cext/handles-test
+	SPINEL_GC_SLAB=0 ./build/cext/handles-test
+	SPINEL_GC_STRESS=1 ./build/cext/handles-test
+# Step 4: standalone build-time recorder; no regular-runtime source changes.
+.PHONY: cext-recorder cext-recorder-test cext-recorder-oracle
+cext-recorder: lib/libspinel_cext_rec.a
+build/cext/recorder.o: tools/cext/recorder.c tools/cext/recorder.h include/ruby.h include/ruby/spinel_record.h
+	@mkdir -p build/cext
+	$(CC) -std=c11 -O0 -DSP_CEXT_RECORDER -Iinclude -Itools/cext -c $< -o $@
+lib/libspinel_cext_rec.a: build/cext/recorder.o
+	$(AR) rcs $@ $<
+cext-recorder-test:
+	@CC="$(CC)" ruby test/cext/recorder-test.rb
+cext-recorder-oracle:
+	@CC="$(CC)" sh test/cext/recorder-oracle.sh
+
+.PHONY: cext-exceptions-test cext-exceptions-oracle
+cext-exceptions-oracle:
+	@sh test/cext/exception-oracle.sh
+build/cext/host.c: test/cext/host.rb $(SPINEL)
+	@mkdir -p $(@D)
+	$(SPINEL) -c --no-line-map $< -o $@
+cext-exceptions-test: lib/libspinel_cext_rt.a build/cext/host.c
+	$(CC) $(CFLAGS) -O1 -g -DSP_CEXT -Iinclude -Ilib test/cext/exceptions.c lib/libspinel_cext_rt.a $(LDFLAGS) -lm $(GC_FLAGS) -o build/cext/exceptions-test
+	./build/cext/exceptions-test
+	SPINEL_GC_STRESS=1 ./build/cext/exceptions-test
+	@status=0; ./build/cext/exceptions-test fatal > build/cext/fatal.out 2> build/cext/fatal.err || status=$$?; \
+	  test $$status = 1 && grep -qx 'fatal ensured' build/cext/fatal.out && grep -q 'fatal test' build/cext/fatal.err
+
 
 $(SP_RT_LIB): $(RE_OBJ) $(addprefix build/,$(addsuffix .o,$(RT_MEMBERS))) $(PLATFORM_OBJ)
 	ar rcs $@ $^
@@ -635,6 +755,71 @@ $(SP_RT_MT_TSAN_LIB): $(RE_MT_TSAN_OBJ) $(addprefix build/mt-tsan/,$(addsuffix .
 
 tsan-archive: $(SP_RT_MT_TSAN_LIB)
 
+# ---- The runtime under AddressSanitizer and UndefinedBehaviorSanitizer ----
+# For `make rt-san-check` (tools/rt_san_check.sh), which runs the corpus
+# against it as san-check compiles the corpus with the instrumented
+# compiler: the runtime archives, the regexp engine and the bundled
+# packages' objects built with the sanitizers into build/rt-san. A
+# program's own translation unit carries most of the runtime as
+# spinel_rt.h's inline code, so it is compiled with them too, at -O0: the
+# instrumented -O1 compile of a test took three times as long, and the
+# precompiled header saved nothing of it. COPT's defines are kept and its
+# -O and -g replaced. Not built by default and not a gate leg: the pass
+# compiles and runs every program twice and the --share-strings binary
+# once more.
+RT_SAN_DIR = build/rt-san
+# -fsanitize-recover=address: a run goes on past a report (halt_on_error=0
+# in the script), so one report does not hide the ones after it
+RT_SAN_FLAGS = -O1 -g -fno-omit-frame-pointer -fsanitize=address,undefined -fsanitize-recover=address
+RT_SAN_COPT = $(filter-out -O% -g%,$(COPT)) $(RT_SAN_FLAGS)
+SP_RT_SAN_LIB = $(RT_SAN_DIR)/libspinel_rt.a
+SP_RT_MT_SAN_LIB = $(RT_SAN_DIR)/libspinel_rt_mt.a
+RT_SAN_PKG_OBJS = $(patsubst packages/%.o,$(RT_SAN_DIR)/packages/%.o,$(BUNDLED_NATIVE_OBJS))
+RT_SAN_PKG_MT_OBJS = $(patsubst packages/%.o,$(RT_SAN_DIR)/packages-mt/%.o,$(BUNDLED_NATIVE_OBJS))
+# what a program's C is compiled with: the test harness's CFLAGS and
+# SEC_FLAGS, with the sanitizers and -O0 -g
+RT_SAN_CFLAGS = $(filter-out -O% -g%,$(CFLAGS)) $(filter-out -O%,$(RT_SAN_FLAGS)) -O0 $(SEC_FLAGS)
+
+# Specific before generic, as in the mt pair above.
+$(RT_SAN_DIR)/regexp/%.o: lib/regexp/%.c $(RE_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(RT_SAN_COPT) $(SEC_FLAGS) $(RE_CASE_FLAGS) -Ilib/regexp -Ilib/regexp/shim $< -o $@
+$(RT_SAN_DIR)/mt/regexp/%.o: lib/regexp/%.c $(RE_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(RT_SAN_COPT) $(SEC_FLAGS) $(RE_CASE_FLAGS) $(MT_DEF) -Ilib/regexp -Ilib/regexp/shim $< -o $@
+$(RT_SAN_DIR)/mt/%.o: lib/%.c $(RT_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(RT_SAN_COPT) -Wno-all $(SEC_FLAGS) $(MT_DEF) -Ilib -Ilib/regexp -Ilib/regexp/shim $< -o $@
+# a package's C beside its own headers, with the system headers openssl and
+# ffi are glue over (the flags of each package's rule above, together)
+$(RT_SAN_DIR)/packages/%.o: packages/%.c $(RT_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(RT_SAN_COPT) -Wno-all $(SEC_FLAGS) $(OPENSSL_CPPFLAGS) $(LIBFFI_CPPFLAGS) -Ilib -I$(<D) $< -o $@
+$(RT_SAN_DIR)/packages-mt/%.o: packages/%.c $(RT_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(RT_SAN_COPT) -Wno-all $(SEC_FLAGS) $(PKG_MT_FLAGS) $(OPENSSL_CPPFLAGS) $(LIBFFI_CPPFLAGS) -Ilib -I$(<D) $< -o $@
+$(RT_SAN_DIR)/%.o: lib/%.c $(RT_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(RT_SAN_COPT) -Wno-all $(SEC_FLAGS) -Ilib -Ilib/regexp -Ilib/regexp/shim $< -o $@
+
+$(SP_RT_SAN_LIB): $(patsubst lib/regexp/%.c,$(RT_SAN_DIR)/regexp/%.o,$(RE_SRC)) $(addprefix $(RT_SAN_DIR)/,$(addsuffix .o,$(RT_MEMBERS)))
+	ar rcs $@ $^
+$(SP_RT_MT_SAN_LIB): $(patsubst lib/regexp/%.c,$(RT_SAN_DIR)/mt/regexp/%.o,$(RE_SRC)) $(addprefix $(RT_SAN_DIR)/mt/,$(addsuffix .o,$(RT_MEMBERS)))
+	ar rcs $@ $^
+
+# The programs `make test` leaves out on this host and in this mode (the
+# complement of its TESTS and PKG_TESTS, a short list) go to the script by
+# name, so it runs the same selection and says what it skipped.
+.PHONY: rt-san-check
+rt-san-check: $(SPINEL) $(SPINEL_TIMEOUT) $(SP_RT_SAN_LIB) $(SP_RT_MT_SAN_LIB) $(RT_SAN_PKG_OBJS) $(RT_SAN_PKG_MT_OBJS)
+	@RT_SAN_SPINEL="$(CURDIR)/$(SPINEL)" RT_SAN_TIMEOUT_BIN="$(CURDIR)/$(SPINEL_TIMEOUT)" \
+	  RT_SAN_LIB="$(SP_RT_SAN_LIB)" RT_SAN_MT_LIB="$(SP_RT_MT_SAN_LIB)" \
+	  RT_SAN_PKG_OBJS="$(RT_SAN_PKG_OBJS)" RT_SAN_PKG_MT_OBJS="$(RT_SAN_PKG_MT_OBJS)" \
+	  RT_SAN_CC="$(CC)" RT_SAN_CFLAGS="$(RT_SAN_CFLAGS)" RT_SAN_MT_DEF="$(MT_DEF)" \
+	  RT_SAN_LDFLAGS="$(LDFLAGS) $(GC_FLAGS)" \
+	  RT_SAN_SKIP="$(filter-out $(TESTS) $(PKG_TESTS),$(wildcard test/*.rb packages/*/test/*.rb))" \
+	  tools/rt_san_check.sh $(RT_SAN_FILES)
+
 # ---- wasm32-wasi runtime archive ----
 # `spinel --target=wasm32-wasi` links lib/wasm32-wasi/libspinel_rt.a, the
 # same sources compiled by the wasi-sdk's clang (WASI_SDK, or the sdk's own
@@ -677,7 +862,35 @@ BUNDLED_NATIVE_WASI_OBJS = $(patsubst %.o,%_wasi.o,$(filter-out packages/openssl
 packages/%_wasi.o: packages/%.c lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h $(WASI_SHIM_HDRS)
 	$(WASI_CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(WASI_CFLAGS) -Ilib -I$(@D) $< -o $@
 
-wasm-rt: $(SP_RT_WASI_LIB) $(BUNDLED_NATIVE_WASI_OBJS)
+# --exceptions=abort (#8401): the same archive with no setjmp/longjmp, for a
+# host without the exception-handling proposal -- no sjlj lowering, and the
+# runtime's abort form of the pair (lib/sp_setjmp.h, SP_EXC_ABORT).
+WASI_NOEXC_CFLAGS = $(filter-out -mllvm -wasm-enable-sjlj -wasm-use-legacy-eh=false,$(WASI_CFLAGS)) -DSP_EXC_ABORT
+SP_RT_WASI_NOEXC_LIB = lib/wasm32-wasi/libspinel_rt_noexc.a
+
+build/wasm32-wasi-noexc/regexp/%.o: lib/regexp/%.c $(RE_HDRS)
+	@mkdir -p $(@D)
+	$(WASI_CC) -c $(COPT) $(SEC_FLAGS) $(RE_CASE_FLAGS) $(WASI_NOEXC_CFLAGS) -Ilib/regexp -Ilib/regexp/shim $< -o $@
+
+build/wasm32-wasi-noexc/wasi/%.o: lib/wasi/%.c $(WASI_SHIM_HDRS)
+	@mkdir -p $(@D)
+	$(WASI_CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(WASI_NOEXC_CFLAGS) -Ilib $< -o $@
+
+build/wasm32-wasi-noexc/%.o: lib/%.c $(RT_HDRS) $(WASI_SHIM_HDRS)
+	@mkdir -p $(@D)
+	$(WASI_CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(WASI_NOEXC_CFLAGS) -Ilib -Ilib/regexp -Ilib/regexp/shim $< -o $@
+
+$(SP_RT_WASI_NOEXC_LIB): $(patsubst lib/regexp/%.c,build/wasm32-wasi-noexc/regexp/%.o,$(RE_SRC)) \
+                         $(patsubst lib/wasi/%.c,build/wasm32-wasi-noexc/wasi/%.o,$(wildcard lib/wasi/*.c)) \
+                         $(addprefix build/wasm32-wasi-noexc/,$(addsuffix .o,$(RT_MEMBERS)))
+	@mkdir -p $(@D)
+	rm -f $@ && $(WASI_AR) rcs $@ $^
+
+BUNDLED_NATIVE_WASI_NOEXC_OBJS = $(patsubst %_wasi.o,%_wasi_noexc.o,$(BUNDLED_NATIVE_WASI_OBJS))
+packages/%_wasi_noexc.o: packages/%.c lib/spinel/runtime.h lib/sp_alloc.h lib/sp_gc.h lib/sp_types.h lib/sp_setjmp.h $(WASI_SHIM_HDRS)
+	$(WASI_CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(WASI_NOEXC_CFLAGS) -Ilib -I$(@D) $< -o $@
+
+wasm-rt: $(SP_RT_WASI_LIB) $(BUNDLED_NATIVE_WASI_OBJS) $(SP_RT_WASI_NOEXC_LIB) $(BUNDLED_NATIVE_WASI_NOEXC_OBJS)
 
 # A few of the corpus's programs built with --target=wasm32-wasi and run
 # under wasmtime (WASMTIME, default: the one on PATH) against their expected
@@ -686,6 +899,12 @@ wasm-rt: $(SP_RT_WASI_LIB) $(BUNDLED_NATIVE_WASI_OBJS)
 # an engine. `make wasm-test` where both are.
 WASMTIME ?= wasmtime
 WASM_TESTS = $(shell grep -l '^\# spinel: wasm$$' test/*.rb)
+# --exceptions=abort: programs built without exception handling and run with
+# the engine's exceptions off, which a module still holding one of their
+# instructions fails to load; a raise must trap with its message
+# (`# spinel: wasm-abort-raises: MESSAGE`); the refusals name the flag.
+WASM_ABORT_TESTS = $(shell grep -l '^\# spinel: wasm-abort' test/wasm_abort/*.rb 2>/dev/null | xargs -r grep -L '^\# spinel: wasm-abort-refuse: ')
+WASM_ABORT_REFUSE_TESTS = $(shell grep -l '^\# spinel: wasm-abort-refuse: ' test/wasm_abort/*.rb 2>/dev/null)
 # WASM_ENGINE_REQUIRED=1 makes a missing engine a failure rather than a skip:
 # the one job whose whole purpose is to prove these programs still link and run
 # cannot report that by exiting 0 with "skipped" (#4807). CI sets it.
@@ -701,6 +920,25 @@ wasm-test: $(SPINEL) wasm-rt
 	  $(WASMTIME) run -W max-wasm-stack=16777216 --dir=. $$tmp/$$bn.wasm >$$tmp/$$bn.out 2>$$tmp/$$bn.err </dev/null; \
 	  if cmp -s $$tmp/$$bn.out $$t.expected; then echo "wasm-test: pass $$t"; \
 	  else echo "wasm-test: FAIL $$t"; diff -u $$t.expected $$tmp/$$bn.out | head -6; head -3 $$tmp/$$bn.err; ok=0; fi; \
+	done; \
+	for t in $(WASM_ABORT_TESTS); do \
+	  bn=$$(basename $$t .rb); \
+	  if ! WASI_SDK=$(WASI_SDK) $(SPINEL) --target=wasm32-wasi --exceptions=abort --no-line-map $$t -o $$tmp/$$bn.wasm >/dev/null 2>$$tmp/$$bn.build; then \
+	    echo "wasm-test: FAIL (build, --exceptions=abort) $$t"; head -3 $$tmp/$$bn.build; ok=0; continue; fi; \
+	  $(WASMTIME) run -W exceptions=n -W max-wasm-stack=16777216 --dir=. $$tmp/$$bn.wasm >$$tmp/$$bn.out 2>$$tmp/$$bn.err </dev/null; rc=$$?; \
+	  want=$$(sed -n 's/^# spinel: wasm-abort-raises: //p' $$t); \
+	  if ! cmp -s $$tmp/$$bn.out $$t.expected; then echo "wasm-test: FAIL (--exceptions=abort) $$t"; diff -u $$t.expected $$tmp/$$bn.out | head -6; head -3 $$tmp/$$bn.err; ok=0; \
+	  elif [ -n "$$want" ] && { [ $$rc -eq 0 ] || ! grep -qF "$$want" $$tmp/$$bn.err; }; then \
+	    echo "wasm-test: FAIL (--exceptions=abort: the raise did not trap with its message) $$t"; head -3 $$tmp/$$bn.err; ok=0; \
+	  elif [ -z "$$want" ] && [ $$rc -ne 0 ]; then echo "wasm-test: FAIL (--exceptions=abort: exit $$rc) $$t"; head -3 $$tmp/$$bn.err; ok=0; \
+	  else echo "wasm-test: pass (--exceptions=abort) $$t"; fi; \
+	done; \
+	for t in $(WASM_ABORT_REFUSE_TESTS); do \
+	  why=$$(sed -n 's/^# spinel: wasm-abort-refuse: //p' $$t); \
+	  if WASI_SDK=$(WASI_SDK) $(SPINEL) --target=wasm32-wasi --exceptions=abort --no-line-map $$t -o $$tmp/r.wasm >/dev/null 2>$$tmp/r.err; then \
+	    echo "wasm-test: FAIL (--exceptions=abort built what it must refuse) $$t"; ok=0; \
+	  elif ! grep -qF "$$why" $$tmp/r.err; then echo "wasm-test: FAIL (--exceptions=abort refused without saying why) $$t"; head -3 $$tmp/r.err; ok=0; \
+	  else echo "wasm-test: pass (--exceptions=abort refuses) $$t"; fi; \
 	done; \
 	rm -rf $$tmp; [ $$ok -eq 1 ]
 
@@ -758,8 +996,8 @@ endif
 # float_to_int_out_of_range and float_to_int_boundary are the same case for
 # the Float -> Integer conversions: they pin the RangeError raise mode keeps,
 # which promote answers as a Bignum instead (#4688). The promote answers are
-# pinned by promote_float_to_int.rb. str_to_i_overflow,
-# string_to_i_overflow_raises and integer_argument_error's LLONG_MIN line pin
+# pinned by promote_float_to_int.rb. str_to_i_overflow and
+# string_to_i_overflow_raises pin
 # the RangeError String#to_i and Integer() answer past sp_int in raise mode;
 # promote reads a Bignum there, pinned by promote_str_to_i_bigint.rb.
 # poly_call_legacy_abi_gate / poly_call_fast_abi_gate pin the raise/wrap legacy
@@ -772,16 +1010,51 @@ endif
 # by promote_poly_slot_method_call instead. poly_method_return_kinds
 # additionally trips a typed `.to_proc`-with-defaults promote gap (an IntArray
 # default in a poly-widened callee), unrelated to the dispatch these pin.
+# int_min_overflow_raises pins the RangeError an operation on -2**63 raises
+# when its result leaves int64; promote answers a Bignum there, pinned by
+# promote_int_min_overflow.rb.
+# masgn_boxed_ivar_slot_mismatch pins the TypeError a typed Integer slot
+# raises where CRuby stores the value; promote boxes the slot and answers
+# CRuby's line.
+RAISE_MODE_PINS := test/int_overflow_raises.rb test/int_overflow_op_assign.rb test/poly_int_overflow_raises.rb test/str_to_i_overflow.rb test/string_to_i_overflow_raises.rb test/bounded_counter_unchecked_add.rb test/float_to_int_out_of_range.rb test/bigrational_to_i_out_of_range.rb test/float_to_int_boundary.rb test/poly_call_legacy_abi_gate.rb test/poly_call_fast_abi_gate.rb test/poly_method_return_kinds.rb test/int_min_overflow_raises.rb test/masgn_boxed_ivar_slot_mismatch.rb
 ifeq ($(SPINEL_INT_OVERFLOW),promote)
-TESTS := $(filter-out test/int_overflow_raises.rb test/int_overflow_op_assign.rb test/poly_int_overflow_raises.rb test/str_to_i_overflow.rb test/string_to_i_overflow_raises.rb test/integer_argument_error.rb test/bounded_counter_unchecked_add.rb test/float_to_int_out_of_range.rb test/bigrational_to_i_out_of_range.rb test/float_to_int_boundary.rb test/poly_call_legacy_abi_gate.rb test/poly_call_fast_abi_gate.rb test/poly_method_return_kinds.rb,$(TESTS))
+TESTS := $(filter-out $(RAISE_MODE_PINS),$(TESTS))
 # Drive the spinel front-end and the C compile in promote mode so the test
 # rule actually exercises the auto-promotion path end to end.
 SP_OV_FLAG := --int-overflow=promote
 SP_OV_DEFINE := -DSP_INT_OVERFLOW_MODE_PROMOTE
+else ifeq ($(SPINEL_INT_OVERFLOW),wrap)
+# The wrap lane (`SPINEL_INT_OVERFLOW=wrap make test`): the same corpus with
+# wraparound arithmetic. The raise-mode pins expect a RangeError wrap never
+# raises, and promote_*.rb a Bignum wrap never makes, so both stay out (the
+# first wrap run found no test whose answer needs the Bignum of the default
+# mode's growth-pattern promotion: that promotion is the analysis's and is
+# the same here). stack_overflow_unhandled and stack_overflow_rescued guard
+# the C stack, not arithmetic: their `1 + deep(n + 1)` is a checked add in
+# raise mode, which keeps the recursion a call, and a plain add here, which
+# lets clang turn it into a loop that never overflows the stack and runs
+# until the test's timeout.
+TESTS := $(filter-out $(RAISE_MODE_PINS) test/promote_%.rb test/stack_overflow_unhandled.rb test/stack_overflow_rescued.rb,$(TESTS))
+SP_OV_FLAG := --int-overflow=wrap
+SP_OV_DEFINE := -DSP_INT_OVERFLOW_MODE_WRAP
 else
 # `promote_*` tests overflow on purpose and only have defined output under
 # --int-overflow=promote; in raise/wrap mode they would (correctly) raise.
 TESTS := $(filter-out test/promote_%.rb,$(TESTS))
+ifeq ($(SPINEL_INT_OVERFLOW),wrap)
+# Drive the front-end and the C compile in wrap mode (#8331), as promote is
+# driven above.
+SP_OV_FLAG := --int-overflow=wrap
+SP_OV_DEFINE := -DSP_INT_OVERFLOW_MODE_WRAP
+endif
+endif
+# The tests a mode answers otherwise than its .expected: those that pin
+# raise mode's overflow answers, which wrap gives as wrapped values, and the
+# gaps found when the mode lanes began (#8331). A gap is taken off its list
+# with its fix.
+ifneq ($(filter wrap promote,$(SPINEL_INT_OVERFLOW)),)
+INT_OV_SKIP := $(shell grep -v '^\#' test/int-overflow/$(SPINEL_INT_OVERFLOW)-skip.txt 2>/dev/null)
+TESTS := $(filter-out $(INT_OV_SKIP),$(TESTS))
 endif
 # A 32-bit target has a 32-bit Integer (lib/sp_types.h): a test that assumes
 # the 64-bit one (values or arithmetic past 2^31, `Integer#size == 8`, a
@@ -843,6 +1116,9 @@ endif
 endif
 TEST_RESULT_DIR ?= build/test-results
 TEST_TARGETS := $(patsubst test/%.rb,$(TEST_RESULT_DIR)/%.ok,$(TESTS))
+ifeq ($(TEST_REVERSE),1)
+TEST_TARGETS := $(patsubst test/%.rb,$(TEST_RESULT_DIR)/%.ok,$(filter $(TESTS),$(shell ls -r test/*.rb)))
+endif
 
 # Bundled spin packages carry their own test/*.rb (the same snapshot contract,
 # runnable with `spin test` inside the package). The compiler gate runs them
@@ -916,7 +1192,7 @@ CC_KIND  := $(if $(findstring clang,$(shell $(CC) --version 2>/dev/null | head -
 sp_empty :=
 sp_space := $(sp_empty) $(sp_empty)
 sp_pathify = $(subst =,,$(subst /,,$(subst $(sp_space),,$(subst -,,$(1)))))
-PCH_ROOT := build/pch/$(CC_KIND)$(call sp_pathify,$(OPT))$(if $(SP_OV_DEFINE),promote)
+PCH_ROOT := build/pch/$(CC_KIND)$(call sp_pathify,$(OPT))$(if $(SP_OV_DEFINE),$(SPINEL_INT_OVERFLOW))
 PCH_FLAGS = $(CFLAGS) $(SP_OV_DEFINE) -Werror $(TEST_WARN_SUPPRESS) $(SEC_FLAGS)
 PCH_PLAIN  := $(PCH_ROOT)/plain/spinel_rt.h.gch
 PCH_NOPOLY := $(PCH_ROOT)/nopoly/spinel_rt.h.gch
@@ -925,12 +1201,12 @@ SP_LIB_HDRS := $(wildcard lib/*.h) $(PLATFORM_HDRS)
 .PHONY: test-pch
 test-pch: $(PCH_PLAIN) $(PCH_NOPOLY)
 
-$(PCH_PLAIN): $(SP_LIB_HDRS)
+$(PCH_PLAIN): $(SP_LIB_HDRS) lib/spinel_rt_responds_generated.h
 	@mkdir -p $(@D)
 	@cp lib/spinel_rt.h $(@D)/spinel_rt.h
 	@$(CC) $(PCH_FLAGS) -Ilib -x c-header $(@D)/spinel_rt.h -o $@
 
-$(PCH_NOPOLY): $(SP_LIB_HDRS)
+$(PCH_NOPOLY): $(SP_LIB_HDRS) lib/spinel_rt_responds_generated.h
 	@mkdir -p $(@D)
 	@cp lib/spinel_rt.h $(@D)/spinel_rt.h
 	@$(CC) $(PCH_FLAGS) -DSP_TU_NO_POLY_RENDER=1 -Ilib -x c-header $(@D)/spinel_rt.h -o $@
@@ -956,14 +1232,14 @@ NPROC := $(shell nproc 2>/dev/null || sysctl -n hw.ncpu 2>/dev/null || echo 4)
 # already inherits the jobserver (a -j is in MAKEFLAGS), so this stays empty and
 # there is no oversubscription; a bare `make test` / `make check` now fans the
 # per-test .ok builds across the cores (~5x). An explicit `make -jN test` wins.
-TEST_JOBS := $(if $(filter -j%,$(MAKEFLAGS)),,-j$(NPROC))
+TEST_JOBS = $(if $(filter -j%,$(MAKEFLAGS)),,-j$(NPROC))
 # `bench` is one monolithic recipe (a shell loop), so it can't fan out through
 # the .ok pattern the way `test` does. Parallelize its loop with `xargs -P`
 # instead -- but only when there is no jobserver to respect: under `make -j gate`
 # the leg runs alongside test/optcarrot on the shared jobserver, so keep it
 # serial (-P 1) there and let the jobserver schedule; a bare `make bench` uses
 # all cores.
-BENCH_PJOBS := $(if $(filter -j%,$(MAKEFLAGS)),1,$(NPROC))
+BENCH_PJOBS = $(if $(filter -j%,$(MAKEFLAGS)),1,$(NPROC))
 
 # A regexp literal is two constants, the pattern and its flags, so whether the
 # engine can read it is settled at compile time. It used to reach the engine
@@ -1015,19 +1291,18 @@ re-lit-test: $(SPINEL)
 SHARE_TESTS = $(wildcard test/share/*.rb test/share_strings_*.rb) \
                $(shell grep -l '^\# spinel: share$$' test/*.rb packages/*/test/*.rb) \
                $(shell grep -l '^\# spinel: reject-share$$' test/reject/*.rb)
+# test/share_strings_copy_beside_alloc.rb runs at SPINEL_GC_STRESS=2 as
+# well: a copy its roots lost can still read right at level 1.
 ifneq ($(FFI_AVAILABLE),yes)
 SHARE_SKIP = test/share/share_strings_fiddle.rb packages/ffi/test/%.rb packages/fiddle/test/%.rb
 endif
+# Each program runs in tools/share_strings_one.sh, one per core: one after
+# another they took about 13 minutes, the gate's longest leg by far.
 share-strings-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(BUNDLED_NATIVE_OBJS) $(BUNDLED_NATIVE_MT_OBJS)
 	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/spinel-share.XXXXXX"); ok=1; \
-	for t in $(filter-out $(SHARE_SKIP),$(SHARE_TESTS)); do \
-	  e="$$t.expected"; case "$$t" in test/reject/*) e="test/share/reject/$${t##*/}.expected";; esac; \
-	  if $(SPINEL) --share-strings "$$t" -o "$$tmp/b" >"$$tmp/out" 2>&1; then \
-	    ! grep -q 'did not converge' "$$tmp/out" || { echo "share-strings-test: FAIL $$t (the inference fixpoint ran to its round cap)"; ok=0; }; \
-	    "$$tmp/b" 2>&1 | cmp -s - "$$e" || { echo "share-strings-test: FAIL $$t"; ok=0; }; \
-	    SPINEL_GC_STRESS=1 "$$tmp/b" 2>&1 | cmp -s - "$$e" || { echo "share-strings-test: FAIL $$t (GC stress)"; ok=0; }; \
-	  else echo "share-strings-test: FAIL $$t (refused)"; cat "$$tmp/out"; ok=0; fi; \
-	done; \
+	printf '%s\n' $(filter-out $(SHARE_SKIP),$(SHARE_TESTS)) | \
+	  xargs -P $(NPROC) -n 1 sh tools/share_strings_one.sh $(SPINEL) > "$$tmp/runs" 2>&1 || ok=0; \
+	cat "$$tmp/runs"; \
 	for flags in '' '--share-strings'; do \
 	  if ! $(SPINEL) $$flags test/share_strings_class_value_stat_fields.rb -c --no-line-map -o "$$tmp/stat.c" >"$$tmp/out" 2>&1 || \
 	     grep -q 'sp_pd_[0-9]' "$$tmp/stat.c"; then \
@@ -1047,6 +1322,12 @@ share-strings-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(BUNDLED_NATIVE_OBJS
 	   grep -q 'sp_poly_as_strbuf' "$$tmp/reads.c"; then \
 	  echo "share-strings-test: FAIL (a narrowed byte read allocates a handle)"; ok=0; \
 	fi; \
+	if ! $(SPINEL) --share-strings test/share/share_strings_poly_transient_returns.rb -c --no-line-map -o "$$tmp/transient.c" >"$$tmp/out" 2>&1 || \
+	   ! grep -q 'sp_box_str(sp_TransientStringReturn_upcase(' "$$tmp/transient.c" || \
+	   ! grep -q 'sp_box_str(sp_TransientStringReturn_delete(' "$$tmp/transient.c" || \
+	   [ "$$(grep -c 'const char \*_t[0-9]* = sp_TransientStringReturn_upcase(' "$$tmp/transient.c")" != 1 ]; then \
+	  echo "share-strings-test: FAIL (transient String returns allocate, or kept returns lose their handle)"; ok=0; \
+	fi; \
 	if ! $(SPINEL) --share-strings test/share/share_strings_self.rb -c --no-line-map -o "$$tmp/self.c" >"$$tmp/out" 2>&1 || \
 	   ! grep -q 'sp_String_receiver_return(sp_String \*self)' "$$tmp/self.c" || \
 	   ! grep -q 'sp_String_receiver_bytes(const char \*self)' "$$tmp/self.c"; then \
@@ -1058,6 +1339,20 @@ share-strings-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(BUNDLED_NATIVE_OBJS
 	   ! grep -q 'sp_String_self_bytes_argument(const char \*self)' "$$tmp/forward.c" || \
 	   ! grep -q 'sp_String_self_handle_argument(sp_String \*self)' "$$tmp/forward.c"; then \
 	  echo "share-strings-test: FAIL (String self forwarding does not select the callee ABI)"; ok=0; \
+	fi; \
+	if ! SPINEL_SHARE_STATS=3 $(SPINEL) --share-strings test/share/share_strings_dead_send.rb -c --no-line-map -o "$$tmp/dead.c" >"$$tmp/out" 2>&1 || \
+	   grep -q '^share-unknown-mut:' "$$tmp/out"; then \
+	  echo "share-strings-test: FAIL (a send in an uncalled method widens the sharing facts)"; ok=0; \
+	fi; \
+	t=test/share/share_strings_flow_destinations; \
+	if ! SPINEL_SHARE_STATS=2 $(SPINEL) --share-strings "$$t.rb" -c --no-line-map -o "$$tmp/dest.c" >"$$tmp/out" 2>&1 || \
+	   ! grep '^share-flow-need:' "$$tmp/out" | cmp -s - "$$t.flows"; then \
+	  echo "share-strings-test: FAIL (a flow's destination, or the handle a stored value needs, changed)"; ok=0; \
+	fi; \
+	t=test/share_strings_copy_beside_alloc.rb; \
+	if ! $(SPINEL) --share-strings "$$t" -o "$$tmp/cba" >"$$tmp/out" 2>&1 || \
+	   ! SPINEL_GC_STRESS=2 "$$tmp/cba" 2>&1 | cmp -s - "$$t.expected"; then \
+	  echo "share-strings-test: FAIL (a shared String's copy beside an allocating operand is not rooted, GC stress 2)"; ok=0; \
 	fi; \
 	for t in test/share/refuse/*.rb; do \
 	  if $(SPINEL) --share-strings "$$t" -c -o "$$tmp/r.c" >"$$tmp/out" 2>&1; then \
@@ -1071,7 +1366,7 @@ share-strings-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(BUNDLED_NATIVE_OBJS
 # `make test` always runs fresh: it wipes the prior `.ok` stamps first,
 # then runs the suite. (The old incremental `test` + `retest` split is
 # gone -- a stale `.ok` reading PASS was a recurring foot-gun.)
-test: $(SPINEL_TIMEOUT)
+test: lib/spinel_rt_responds_generated.h $(SPINEL_TIMEOUT) cext-header-test cext-gc-test cext-exceptions-test cext-recorder-test
 	@if [ -z "$(TIMEOUT_BIN)" ]; then \
 	  echo "WARNING: no 'timeout'/'gtimeout' on PATH -- tests run with NO time limit."; \
 	  echo "         A hanging test will hang this run until the CI job's own limit."; \
@@ -1082,13 +1377,13 @@ test: $(SPINEL_TIMEOUT)
 # The actual run. rbs-test golden-checks the RBS extractor (cheap, C-only).
 # rbs-seed-test checks the seeds actually reach the analyzer (incl. nested
 # classes, #1417).
-test-run: int-min-test timing-test signal-default-test source-marker-test rbs-test rbs-seed-test re-lit-test reject-test cli-opts-test link-names-test defer-refusals-test check-stores-test backtrace-test gc-minor-test gc-phases-test gc-stress-test gc-threshold-test gc-obj-budget-test gc-str-major-test threaded-render-test gc-locality-test byref-capture-test thread-puts-test ext-test ext-cruby-test test-corpus-summary
+test-run: int-min-test timing-test signal-default-test source-marker-test rbs-test rbs-seed-test inline-rbs-test re-lit-test reject-test cli-opts-test link-names-test defer-refusals-test check-stores-test backtrace-test gc-minor-test gc-phases-test gc-stress-test gc-threshold-test gc-obj-budget-test gc-str-budget-test gc-str-major-test threaded-render-test gc-locality-test byref-capture-test thread-puts-test ext-test ext-cruby-test test-corpus-summary
 
 # The test/*.rb corpus (and the bundled packages') on its own, without the
 # C-side legs: what a 32-bit target runs (`make test-corpus CC='cc -m32'`),
 # whose CRuby extension leg and rbs tooling have no 32-bit toolchain to
 # build against.
-test-corpus: $(SPINEL_TIMEOUT)
+test-corpus: lib/spinel_rt_responds_generated.h $(SPINEL_TIMEOUT)
 	+@$(MAKE) --no-print-directory clean-test-results
 	+@$(MAKE) $(TEST_JOBS) --no-print-directory test-corpus-summary
 .PHONY: test-corpus-results test-corpus-shared-summary
@@ -1124,7 +1419,7 @@ ext-test: $(SPINEL) $(SP_RT_LIB)
 	@tmp=$$(mktemp -d /tmp/spinel-ext.XXXXXX); ok=1; \
 	$(SPINEL) test/ext/kernel.rb -c --no-line-map \
 	  --ext-init Init_ext_kernel \
-	  --ext-entry ExtKernel.triple,ExtKernel.shout,ExtKernel.total,ExtKernel.must_pos \
+	  --ext-entry ExtKernel.triple,ExtKernel.shout,ExtKernel.total,ExtKernel.must_pos,ExtKernel.opt_inc,ExtKernel.find_pos \
 	  -o "$$tmp/k.c" >/dev/null 2>&1 || { echo "ext-test: FAIL (emission)"; ok=0; }; \
 	printf 'module M\n  def self.eat(a)\n    a.sort!\n  end\nend\nif __FILE__ == $$0\n  M.eat([2, 1])\nend\n' > "$$tmp/mut.rb"; \
 	if $(SPINEL) "$$tmp/mut.rb" -c --no-line-map --ext-init spx_i --ext-entry M.eat -o "$$tmp/m.c" >"$$tmp/m.out" 2>&1; then \
@@ -1171,13 +1466,30 @@ ext-cruby-test: $(SPINEL) $(SP_RT_LIB)
 	rm -rf "$$tmp"; \
 	if [ $$ok -eq 1 ]; then echo "ext-cruby-test: pass"; else exit 1; fi
 
+# wrap-test: test/wrap/*.rb are compiled with --int-overflow=wrap and run
+# against their .expected, which is Spinel's own: CRuby never wraps, so a
+# program that lands on -2**63 by shifting or by a wrapping `+ - *` has no
+# CRuby answer to snapshot. Each says so in a `# spinel: not-cruby` line. A
+# `.args` file beside the program is passed on the command line, as in test/.
+wrap-test: $(SPINEL) $(SP_RT_LIB) $(SPINEL_TIMEOUT)
+	@tmp=$$(mktemp -d /tmp/spinel-wrap.XXXXXX); ok=1; \
+	for t in test/wrap/*.rb; do \
+	  args=""; if [ -f "$$t.args" ]; then args=$$(cat "$$t.args"); fi; \
+	  $(SPINEL) --int-overflow=wrap "$$t" -o "$$tmp/w" >"$$tmp/w.log" 2>&1 || \
+	    { echo "wrap-test: FAIL ($$t: compile)"; sed -n 1,3p "$$tmp/w.log"; ok=0; continue; }; \
+	  $(TIMEOUT10) "$$tmp/w" $$args >"$$tmp/out" 2>&1; \
+	  cmp -s "$$tmp/out" "$$t.expected" || \
+	    { echo "wrap-test: FAIL ($$t)"; diff -u "$$t.expected" "$$tmp/out" | head -8; ok=0; }; \
+	done; \
+	rm -rf "$$tmp"; \
+	if [ $$ok -eq 1 ]; then echo "wrap-test: pass"; else exit 1; fi
+
 # An option spinel does not know is a mistake, and building something other
 # than what was asked for is the one thing it must not do quietly. Also pins
 # the joined -O<n> spelling, which every C compiler takes and which used to
 # fall through to the unknown-flag arm and be discarded.
 # --defer-refusals: the program the compiler refuses builds anyway; a refused
-# method raises NotImplementedError when called, a refused top-level or
-# class-body statement is left out.
+# statement raises NotImplementedError when reached.
 defer-refusals-test: $(SPINEL)
 	@ok=1; tmp=$$(mktemp -d /tmp/spinel-defer.XXXXXX); \
 	for t in $(shell grep -l '^\# spinel: defer-refusals: ' test/defer/*.rb); do \
@@ -1308,10 +1620,10 @@ decisions-test: $(SPINEL) $(SPINEL_TIMEOUT)
 	$(SPINEL) --decisions="$$t.allow" --decisions-log="$$t.log1" $$f -c -o "$$t.c" >/dev/null 2>&1; \
 	[ "$$(cat "$$t.log1")" = 'root-frame@Sprites#place' ] && [ "$$(grep -c 'SP_GC_ROOT_FRAME(_gcf)' "$$t.c")" = 1 ] || \
 	  { echo "decisions-test: FAIL (an allow-list of one method's root frame gave: $$(tr '\n' ' ' < "$$t.log1"))"; ok=0; }; \
-	t=$$tmp/nil_narrowing; f=test/nil_narrowing.rb; k='nn-read@test/nil_narrowing.rb:39:8:v'; \
+	t=$$tmp/nil_narrowing; f=test/nil_narrowing.rb; k='nn-read@test/nil_narrowing.rb:40:8:v'; \
 	grep -vxF "$$k" "$$t.log" > "$$t.allow"; \
 	$(SPINEL) --decisions="$$t.allow" $$f -c -o "$$t.c" >/dev/null 2>&1; \
-	[ "$$(grep -o SP_INT_NIL_CMP_CK "$$t.c" | wc -l)" -eq $$(( $$(grep -o SP_INT_NIL_CMP_CK "$$t.plain" | wc -l) + 1 )) ] || \
+	[ "$$(grep -oF 'sp_oint_val(' "$$t.c" | wc -l)" -eq $$(( $$(grep -oF 'sp_oint_val(' "$$t.plain" | wc -l) + 1 )) ] || \
 	  { echo "decisions-test: FAIL (denying $$k did not put back that one read's nil check)"; ok=0; }; \
 	rm -rf "$$tmp"; \
 	[ $$ok = 1 ] && echo "decisions-test: pass" || exit 1
@@ -1343,7 +1655,7 @@ cli-opts-test: $(SPINEL)
 	  { echo "cli-opts-test: FAIL (a -g build did not raise NoMethodError for an unset ivar, #5960)"; ok=0; }; \
 	$(SPINEL) -I test/require_load_path test/require_load_path/main.rb -o "$$tmp/lp" >"$$tmp/lp.out" 2>&1 && \
 	  "$$tmp/lp" 2>&1 | cmp -s - test/require_load_path/main.rb.expected || \
-	  { echo "cli-opts-test: FAIL (a file reached by -I require and by require_relative loaded twice)"; ok=0; }; \
+	  { echo "cli-opts-test: FAIL (a file reached by -I require and by require_relative loaded twice, or a require naming the .rb found nothing)"; ok=0; }; \
 	mkdir -p "$$tmp/shadow/openssl"; printf 'module OpenSSL\n  def self.whoami = "project"\nend\n' > "$$tmp/shadow/openssl/openssl.rb"; \
 	printf 'require "openssl"\nputs OpenSSL.whoami\n' > "$$tmp/shadow.rb"; \
 	$(SPINEL) -I "$$tmp/shadow" "$$tmp/shadow.rb" -o "$$tmp/shadowbin" >"$$tmp/shadow.out" 2>&1 && [ "$$("$$tmp/shadowbin")" = "project" ] || \
@@ -1462,6 +1774,11 @@ reject-test: $(SPINEL)
 	  echo "reject-test: FAIL (a singleton def on an untraceable receiver compiled)"; ok=0; \
 	else grep -q "singleton method that needs a self, on a receiver that is not one user-class instance" "$$tmp/r.out" || \
 	  { echo "reject-test: FAIL (rejected without saying why)"; sed -n 1,5p "$$tmp/r.out"; ok=0; }; fi; \
+	t=test/reject/singleton_untraced_no_self.rb; \
+	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/r.c" >"$$tmp/r.out" 2>&1; then \
+	  echo "reject-test: FAIL (a singleton def no call could reach compiled)"; ok=0; \
+	else n=$$(grep -c "singleton method on a receiver spinel cannot trace to one" "$$tmp/r.out"); [ "$$n" -eq 11 ] || \
+	  { echo "reject-test: FAIL (refused $$n of 11 untraced singleton defs)"; sed -n 1,9p "$$tmp/r.out"; ok=0; }; fi; \
 	t=test/reject/new_receiver_class_method_still_reached.rb; \
 	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/nrc.c" >"$$tmp/nrc.out" 2>&1; then \
 	  echo "reject-test: FAIL (a called class method's provable NoMethodError compiled)"; ok=0; \
@@ -1661,6 +1978,11 @@ reject-test: $(SPINEL)
 	  else grep -qF "$$why" "$$tmp/nc.out" || \
 	    { echo "reject-test: FAIL ($$t refused without saying why)"; sed -n 1,5p "$$tmp/nc.out"; ok=0; }; fi; \
 	done; \
+	t=test/reject/compact_class_internal_name_clash.rb; \
+	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/q.c" >"$$tmp/q.out" 2>&1; then \
+	  echo "reject-test: FAIL ($$t compiled: two classes share an internal name)"; ok=0; \
+	else grep -q "takes the internal name X__Foo" "$$tmp/q.out" || \
+	  { echo "reject-test: FAIL ($$t rejected without saying why)"; sed -n 1,5p "$$tmp/q.out"; ok=0; }; fi; \
 	t=test/reject/superclass_mismatch.rb; \
 	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/s.c" >"$$tmp/s.out" 2>&1; then \
 	  echo "reject-test: FAIL (#4309: a class reopened with another superclass compiled)"; ok=0; \
@@ -1682,6 +2004,11 @@ reject-test: $(SPINEL)
 	  echo "reject-test: FAIL (#6179: a global's String copied into an appending initialize compiled)"; ok=0; \
 	else grep -q "which the method appends to" "$$tmp/sn.out" || \
 	  { echo "reject-test: FAIL (#6179: rejected without saying why)"; sed -n 1,5p "$$tmp/sn.out"; ok=0; }; fi; \
+	t=test/reject/system_env_options_hash.rb; \
+	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/se.c" >"$$tmp/se.out" 2>&1; then \
+	  echo "reject-test: FAIL (system with an environment Hash and an options Hash compiled)"; ok=0; \
+	else grep -q "system with an options Hash" "$$tmp/se.out" || \
+	  { echo "reject-test: FAIL (system with an environment and an options Hash refused without saying why)"; sed -n 1,5p "$$tmp/se.out"; ok=0; }; fi; \
 	t=test/reject/string_append_through_proc_keyword.rb; \
 	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/sk.c" >"$$tmp/sk.out" 2>&1; then \
 	  echo "reject-test: FAIL (#6179: a block parameter's String copied into a proc's appending keyword compiled)"; ok=0; \
@@ -1708,6 +2035,17 @@ reject-test: $(SPINEL)
 	  echo "reject-test: FAIL (a const_get with a run-time name on a class value compiled)"; ok=0; \
 	else grep -q "const_get with a name known only at run time" "$$tmp/cg.out" || \
 	  { echo "reject-test: FAIL (a run-time const_get refused without saying why)"; sed -n 1,5p "$$tmp/cg.out"; ok=0; }; fi; \
+	t=test/reject/load_path_assign.rb; \
+	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/lp.c" >"$$tmp/lp.out" 2>&1; then \
+	  echo "reject-test: FAIL (an assignment to the read-only \$$LOAD_PATH compiled)"; ok=0; \
+	else grep -q "it is a read-only variable" "$$tmp/lp.out" || \
+	  { echo "reject-test: FAIL (an assignment to \$$LOAD_PATH refused without saying why)"; sed -n 1,5p "$$tmp/lp.out"; ok=0; }; fi; \
+	for t in test/reject/load_path_alias.rb test/reject/load_path_alias_from.rb; do \
+	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/la.c" >"$$tmp/la.out" 2>&1; then \
+	  echo "reject-test: FAIL ($$t: an alias between \$$LOAD_PATH and the program's own global compiled)"; ok=0; \
+	else grep -q "names the runtime's own Array" "$$tmp/la.out" || \
+	  { echo "reject-test: FAIL ($$t: an alias of \$$LOAD_PATH refused without saying why)"; sed -n 1,5p "$$tmp/la.out"; ok=0; }; fi; \
+	done; \
 	for t in test/reject/macro_*.rb; do \
 	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/mc.c" >"$$tmp/mc.out" 2>&1; then \
 	  echo "reject-test: FAIL ($$t: a macro over state or a name it cannot compute was expanded)"; ok=0; \
@@ -1781,16 +2119,11 @@ reject-test: $(SPINEL)
 	      { echo "reject-test: FAIL ($$t refused without saying why)"; cat "$$tmp/ivp.out"; ok=0; }; fi; \
 	  done; \
 	done; \
-	t=test/reject/bare_const_nested_unreachable.rb; \
+	t=test/reject/bare_const_unreachable_const_missing.rb; \
 	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/bcn.c" >"$$tmp/bcn.out" 2>&1; then \
-	  echo "reject-test: FAIL (a bare constant CRuby's lookup cannot reach compiled, bound to a nested one)"; ok=0; \
-	else grep -q "uninitialized constant X (NameError): the program defines it only as A::X" "$$tmp/bcn.out" || \
+	  echo "reject-test: FAIL (an unreachable bare constant compiled beside a const_missing that would take the miss)"; ok=0; \
+	else grep -q "uninitialized constant B::X (NameError): the program defines it only as A::X" "$$tmp/bcn.out" || \
 	  { echo "reject-test: FAIL (an unreachable bare constant refused without saying why)"; sed -n 1,5p "$$tmp/bcn.out"; ok=0; }; fi; \
-	t=test/reject/bare_const_compact_class_path.rb; \
-	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/bcp.c" >"$$tmp/bcp.out" 2>&1; then \
-	  echo "reject-test: FAIL (a constant of A read bare from a class A::B body compiled)"; ok=0; \
-	else grep -q "uninitialized constant A::B::LIMIT (NameError)" "$$tmp/bcp.out" || \
-	  { echo "reject-test: FAIL (a constant of A read bare from class A::B refused without saying why)"; sed -n 1,5p "$$tmp/bcp.out"; ok=0; }; fi; \
 	for t in test/reject/systemcallerror_subclass_errno_const*.rb; do \
 	  if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/sce.c" >"$$tmp/sce.out" 2>&1; then \
 	    echo "reject-test: FAIL ($$t: an Errno constant in a subclass of SystemCallError compiled)"; ok=0; \
@@ -1812,6 +2145,13 @@ reject-test: $(SPINEL)
 	$(SPINEL) "$$t" -c --no-line-map -o "$$tmp/ds.c" >"$$tmp/ds.out" 2>&1; st=$$?; \
 	if [ $$st -ne 1 ] || ! grep -q "1 refusal," "$$tmp/ds.out"; then \
 	  echo "reject-test: FAIL (a refusal after a dynamic send's probed arms did not report cleanly, exit $$st)"; sed -n 1,5p "$$tmp/ds.out"; ok=0; fi; \
+	for t in $(shell grep -l '^\# spinel: reject-syntax: ' test/reject/*.rb); do \
+	  why=$$(sed -n 's/^# spinel: reject-syntax: //p' "$$t"); \
+	  if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/sy.c" >"$$tmp/sy.out" 2>&1; then \
+	    echo "reject-test: FAIL ($$t compiled: CRuby rejects it as a SyntaxError)"; ok=0; \
+	  else grep -qF "$$why" "$$tmp/sy.out" || \
+	    { echo "reject-test: FAIL ($$t refused without saying why)"; sed -n 1,5p "$$tmp/sy.out"; ok=0; }; fi; \
+	done; \
 	for t in $(shell grep -l '^\# spinel: reject-conversion: ' test/reject/*.rb); do \
 	  why=$$(sed -n 's/^# spinel: reject-conversion: //p' "$$t"); \
 	  if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/co.c" >"$$tmp/co.out" 2>&1; then \
@@ -1826,11 +2166,21 @@ reject-test: $(SPINEL)
 	  else grep -qF "$$why" "$$tmp/sb.out" || \
 	    { echo "reject-test: FAIL ($$t refused without saying why)"; sed -n 1,5p "$$tmp/sb.out"; ok=0; }; fi; \
 	done; \
+	t=test/reject/setter_symbol_block_builtin.rb; \
+	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/ssb.c" >"$$tmp/ssb.out" 2>&1; then \
+	  echo "reject-test: FAIL (a setter Symbol as a builtin's block compiled)"; ok=0; \
+	else grep -q "setter Symbol" "$$tmp/ssb.out" || \
+	  { echo "reject-test: FAIL (a setter Symbol as a builtin's block refused without saying why)"; sed -n 1,5p "$$tmp/ssb.out"; ok=0; }; fi; \
 	t=test/reject/io_popen.rb; \
 	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/pop.c" >"$$tmp/pop.out" 2>&1; then \
 	  echo "reject-test: FAIL (IO.popen compiled into a run-time NoMethodError)"; ok=0; \
 	else grep -q "IO.popen is not supported" "$$tmp/pop.out" || \
 	  { echo "reject-test: FAIL (IO.popen refused without saying why)"; sed -n 1,5p "$$tmp/pop.out"; ok=0; }; fi; \
+	t=test/reject/unsupported_node_kind.rb; \
+	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/unk.c" >"$$tmp/unk.out" 2>&1; then \
+	  echo "reject-test: FAIL (a flip-flop compiled)"; ok=0; \
+	else grep -qF "FlipFlopNode at $$t:5:8" "$$tmp/unk.out" && grep -qF "MatchLastLineNode at $$t:10:8" "$$tmp/unk.out" || \
+	  { echo "reject-test: FAIL (an unsupported node kind refused without naming it)"; sed -n 1,5p "$$tmp/unk.out"; ok=0; }; fi; \
 	for t in $(shell grep -l '^\# spinel: reject-time-parse: ' test/reject/*.rb); do \
 	  why=$$(sed -n 's/^# spinel: reject-time-parse: //p' "$$t"); \
 	  if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/tp.c" >"$$tmp/tp.out" 2>&1; then \
@@ -1860,8 +2210,9 @@ reject-test: $(SPINEL)
 gc-phases-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	@tmp=$$(mktemp -d /tmp/spinel-gcph.XXXXXX); ok=1; \
 	src=test/gc_minor_thread_local_slot.rb; \
-	$(SPINEL) "$$src" -o "$$tmp/m" >/dev/null 2>&1 || \
-	  { echo "gc-phases-test: FAIL (compile)"; rm -rf "$$tmp"; exit 1; }; \
+	$(SPINEL) "$$src" -o "$$tmp/m" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	[ $$rc -eq 0 ] || \
+	  { echo "gc-phases-test: FAIL (compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; rm -rf "$$tmp"; exit 1; }; \
 	$(TIMEOUT60) "$$tmp/m" > "$$tmp/off.out" 2> "$$tmp/off.err"; \
 	SPINEL_GC_PHASES=1 $(TIMEOUT60) "$$tmp/m" > "$$tmp/on.out" 2> "$$tmp/on.err"; \
 	if ! cmp -s "$$tmp/off.out" "$$tmp/on.out"; then \
@@ -1907,8 +2258,9 @@ gc-stress-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	else echo "gc-stress-test: FAIL (host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
 	for src in $(GC_STRESS_TESTS); do \
 	  bn=$$(basename "$$src" .rb); \
-	  if ! $(SPINEL) "$$src" -o "$$tmp/$$bn" >/dev/null 2>&1; then \
-	    echo "gc-stress-test: FAIL ($$bn: compile)"; ok=0; continue; fi; \
+	  $(SPINEL) "$$src" -o "$$tmp/$$bn" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	  if [ $$rc -ne 0 ]; then \
+	    echo "gc-stress-test: FAIL ($$bn: compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; ok=0; continue; fi; \
 	  for v in 0 1; do \
 	    SPINEL_GC_STRESS=2 SPINEL_GC_VERIFY=$$v $(TIMEOUT60) "$$tmp/$$bn" > "$$tmp/out" 2> "$$tmp/err"; rc=$$?; \
 	    if [ $$rc -ne 0 ] || ! cmp -s "$$tmp/out" "$$src.expected"; then \
@@ -1926,8 +2278,9 @@ gc-stress-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 gc-threshold-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	@tmp=$$(mktemp -d /tmp/spinel-gcthr.XXXXXX); ok=1; \
 	src=test/gc_threshold_per_heap.rb; \
-	$(SPINEL) "$$src" -o "$$tmp/t" >/dev/null 2>&1 || \
-	  { echo "gc-threshold-test: FAIL (compile)"; rm -rf "$$tmp"; exit 1; }; \
+	$(SPINEL) "$$src" -o "$$tmp/t" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	[ $$rc -eq 0 ] || \
+	  { echo "gc-threshold-test: FAIL (compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; rm -rf "$$tmp"; exit 1; }; \
 	SPINEL_GC_STATS=1 $(TIMEOUT60) "$$tmp/t" >/dev/null 2> "$$tmp/base.err"; \
 	SPINEL_GC_THRESHOLD_OBJ_KB=16384 SPINEL_GC_STATS=1 $(TIMEOUT60) "$$tmp/t" >/dev/null 2> "$$tmp/obj.err"; \
 	SPINEL_GC_THRESHOLD_STR_KB=16384 SPINEL_GC_STATS=1 $(TIMEOUT60) "$$tmp/t" >/dev/null 2> "$$tmp/str.err"; \
@@ -1961,8 +2314,9 @@ gc-threshold-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 gc-str-major-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	@tmp=$$(mktemp -d /tmp/spinel-gcstrmaj.XXXXXX); ok=1; \
 	src=test/gc_str_major_interval.rb; \
-	$(SPINEL) "$$src" -o "$$tmp/t" >/dev/null 2>&1 || \
-	  { echo "gc-str-major-test: FAIL (compile)"; rm -rf "$$tmp"; exit 1; }; \
+	$(SPINEL) "$$src" -o "$$tmp/t" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	[ $$rc -eq 0 ] || \
+	  { echo "gc-str-major-test: FAIL (compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; rm -rf "$$tmp"; exit 1; }; \
 	run() { SPINEL_GC_STR_BUDGET=fixed SPINEL_GC_THRESHOLD_STR_KB=4096 \
 	        SPINEL_GC_PHASES=1 $(TIMEOUT60) "$$tmp/t" > "$$tmp/$$1.out" 2> "$$tmp/$$1.err"; }; \
 	run default; \
@@ -2001,8 +2355,9 @@ gc-obj-budget-test: $(SPINEL) $(SP_RT_LIB) $(SPINEL_TIMEOUT)
 	str_of() { sed -n 's/.*+ \([0-9.]*\) MB str; trigger.*/\1/p' "$$1" | tail -1; }; \
 	trg_of() { sed -n 's/.*trigger \([0-9.]*\) MB obj.*/\1/p' "$$1" | tail -1; }; \
 	for prog in gc_obj_budget_walk gc_obj_budget_mark; do \
-	  $(SPINEL) test/$$prog.rb -o "$$tmp/$$prog" >/dev/null 2>&1 || \
-	    { echo "gc-obj-budget-test: FAIL ($$prog: compile)"; ok=0; continue; }; \
+	  $(SPINEL) test/$$prog.rb -o "$$tmp/$$prog" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	  [ $$rc -eq 0 ] || \
+	    { echo "gc-obj-budget-test: FAIL ($$prog: compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; ok=0; continue; }; \
 	  for mode in default walk obj; do \
 	    if [ "$$mode" = default ]; then unset SPINEL_GC_OBJ_BUDGET; \
 	    else SPINEL_GC_OBJ_BUDGET=$$mode; export SPINEL_GC_OBJ_BUDGET; fi; \
@@ -2034,6 +2389,102 @@ gc-obj-budget-test: $(SPINEL) $(SP_RT_LIB) $(SPINEL_TIMEOUT)
 	rm -rf "$$tmp"; \
 	if [ $$ok -eq 1 ]; then echo "gc-obj-budget-test: pass"; else exit 1; fi
 
+# The string budget carries a share of the object old generation, gated on
+# what the last collection cost; SPINEL_GC_STR_BUDGET=str pins the share off
+# and `walk` pins it on. Three arms of the SAME binary on two programs at the
+# two ends of the gate, as gc-obj-budget-test does for the object budget.
+# gc_str_budget_objects keeps objects and throws its strings away: the share is
+# read as a WITHIN-RUN invariant -- the figure the `[gc]` line reports against
+# the object live set on that same line -- and has to sit between an eighth and
+# a half of it, so the leg fails with the share gone and with the whole heap in
+# it. gc_str_budget_still holds a heap its collections do not walk: there the
+# gate has to decline, which is read against `walk`. The collection counts are
+# compared across arms: they are counts, so a busy machine gives the same
+# answer as an idle one.
+# The gate reads the mark share the last collection MEASURED, not what
+# SPINEL_GC_OBJ_BUDGET made of it for the object budget, and four more runs
+# hold that: `obj` there must not take the share off the first program, `walk`
+# must not put it on the second, and neither must `fixed` (with the object
+# floor raised, so that budget is held where the string trigger still decides
+# when to collect), read against `walk` under the same held budget.
+# gc_str_budget_kept is the reading itself: a sweep that reclaims nothing puts
+# no share in the trigger, so the last `[gc]` line has to say zero -- on a
+# program whose first half did carry it, which the count against `str` shows.
+gc-str-budget-test: $(SPINEL) $(SP_RT_LIB) $(SPINEL_TIMEOUT)
+	@tmp=$$(mktemp -d /tmp/spinel-gcstr.XXXXXX); ok=1; \
+	for prog in gc_str_budget_objects gc_str_budget_still gc_str_budget_kept; do \
+	  $(SPINEL) test/$$prog.rb -o "$$tmp/$$prog" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	  [ $$rc -eq 0 ] || \
+	    { echo "gc-str-budget-test: FAIL ($$prog: compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; ok=0; continue; }; \
+	  for mode in default walk str; do \
+	    if [ "$$mode" = default ]; then unset SPINEL_GC_STR_BUDGET; \
+	    else SPINEL_GC_STR_BUDGET=$$mode; export SPINEL_GC_STR_BUDGET; fi; \
+	    SPINEL_GC_STATS=1 $(TIMEOUT60) "$$tmp/$$prog" > "$$tmp/$$prog.$$mode.out" 2> "$$tmp/$$prog.$$mode.err"; \
+	    cmp -s "$$tmp/$$prog.$$mode.out" test/$$prog.rb.expected || \
+	      { echo "gc-str-budget-test: FAIL ($$prog: $$mode changed the answer)"; ok=0; }; \
+	  done; \
+	  unset SPINEL_GC_STR_BUDGET; \
+	done; \
+	held="SPINEL_GC_OBJ_BUDGET=fixed SPINEL_GC_THRESHOLD_OBJ_KB=65536"; \
+	for arm in "gc_str_budget_objects objpin SPINEL_GC_OBJ_BUDGET=obj" \
+	           "gc_str_budget_still walkpin SPINEL_GC_OBJ_BUDGET=walk" \
+	           "gc_str_budget_still held $$held" \
+	           "gc_str_budget_still heldwalk $$held SPINEL_GC_STR_BUDGET=walk"; do \
+	  set -- $$arm; prog=$$1; tag=$$2; shift 2; \
+	  [ -x "$$tmp/$$prog" ] || continue; \
+	  env "$$@" SPINEL_GC_STATS=1 $(TIMEOUT60) "$$tmp/$$prog" > "$$tmp/$$prog.$$tag.out" 2> "$$tmp/$$prog.$$tag.err"; \
+	  cmp -s "$$tmp/$$prog.$$tag.out" test/$$prog.rb.expected || \
+	    { echo "gc-str-budget-test: FAIL ($$prog: $$* changed the answer)"; ok=0; }; \
+	done; \
+	n_of() { sed -n 's/^\[gc\] \([0-9]*\) collections.*/\1/p' "$$1" | tail -1; }; \
+	obj_of() { sed -n 's/.*live \([0-9.]*\) MB obj.*/\1/p' "$$1" | tail -1; }; \
+	share_of() { sed -n 's/.*old obj in str trigger \([0-9.]*\) MB.*/\1/p' "$$1" | tail -1; }; \
+	on=$$(n_of "$$tmp/gc_str_budget_objects.default.err"); \
+	ow=$$(n_of "$$tmp/gc_str_budget_objects.walk.err"); \
+	os=$$(n_of "$$tmp/gc_str_budget_objects.str.err"); \
+	ol=$$(obj_of "$$tmp/gc_str_budget_objects.default.err"); \
+	oh=$$(share_of "$$tmp/gc_str_budget_objects.default.err"); \
+	sh=$$(share_of "$$tmp/gc_str_budget_objects.str.err"); \
+	gn=$$(n_of "$$tmp/gc_str_budget_still.default.err"); \
+	gw=$$(n_of "$$tmp/gc_str_budget_still.walk.err"); \
+	pl=$$(obj_of "$$tmp/gc_str_budget_objects.objpin.err"); \
+	ph=$$(share_of "$$tmp/gc_str_budget_objects.objpin.err"); \
+	wn=$$(n_of "$$tmp/gc_str_budget_still.walkpin.err"); \
+	hn=$$(n_of "$$tmp/gc_str_budget_still.held.err"); \
+	hw=$$(n_of "$$tmp/gc_str_budget_still.heldwalk.err"); \
+	kn=$$(n_of "$$tmp/gc_str_budget_kept.default.err"); \
+	ks=$$(n_of "$$tmp/gc_str_budget_kept.str.err"); \
+	kh=$$(share_of "$$tmp/gc_str_budget_kept.default.err"); \
+	for v in "$$on" "$$ow" "$$os" "$$ol" "$$oh" "$$sh" "$$gn" "$$gw" "$$pl" "$$ph" "$$wn" "$$hn" "$$hw" "$$kn" "$$ks" "$$kh"; do \
+	  [ -n "$$v" ] || { echo "gc-str-budget-test: FAIL (no [gc] line with the share on it)"; ok=0; break; }; \
+	done; \
+	awk -v s="$$sh" 'BEGIN{exit !(s == 0)}' || \
+	  { echo "gc-str-budget-test: FAIL (str still carried the object heap: $$sh MB)"; ok=0; }; \
+	awk -v s="$$oh" -v o="$$ol" 'BEGIN{exit !(s > o / 8)}' || \
+	  { echo "gc-str-budget-test: FAIL (the string budget did not see the object heap: $$oh MB against $$ol MB live)"; ok=0; }; \
+	awk -v s="$$oh" -v o="$$ol" 'BEGIN{exit !(s < o / 2)}' || \
+	  { echo "gc-str-budget-test: FAIL (the string budget carried more than a share of the object heap: $$oh MB against $$ol MB live)"; ok=0; }; \
+	awk -v d="$$on" 'BEGIN{exit !(d >= 8)}' || \
+	  { echo "gc-str-budget-test: FAIL (only $$on collections: the program no longer exercises the budget)"; ok=0; }; \
+	awk -v d="$$on" -v s="$$os" 'BEGIN{exit !(d * 2 < s)}' || \
+	  { echo "gc-str-budget-test: FAIL (the share did not buy fewer collections: $$os -> $$on)"; ok=0; }; \
+	awk -v d="$$on" -v w="$$ow" 'BEGIN{exit !(d * 4 <= w * 5)}' || \
+	  { echo "gc-str-budget-test: FAIL (the gate fell short of walk on a mark-bound program: $$on collections vs walk $$ow)"; ok=0; }; \
+	awk -v d="$$gn" -v w="$$gw" 'BEGIN{exit !(d * 2 > w * 3)}' || \
+	  { echo "gc-str-budget-test: FAIL (the gate carried the share on a sweep-bound program: $$gn collections vs walk $$gw)"; ok=0; }; \
+	awk -v s="$$ph" -v o="$$pl" 'BEGIN{exit !(s > o / 8)}' || \
+	  { echo "gc-str-budget-test: FAIL (SPINEL_GC_OBJ_BUDGET=obj took the share off the string budget: $$ph MB against $$pl MB live)"; ok=0; }; \
+	awk -v d="$$wn" -v w="$$gw" 'BEGIN{exit !(d * 2 > w * 3)}' || \
+	  { echo "gc-str-budget-test: FAIL (SPINEL_GC_OBJ_BUDGET=walk opened the string budget's gate: $$wn collections vs walk $$gw)"; ok=0; }; \
+	awk -v d="$$hn" -v w="$$hw" 'BEGIN{exit !(d * 2 > w * 3)}' || \
+	  { echo "gc-str-budget-test: FAIL (SPINEL_GC_OBJ_BUDGET=fixed opened the string budget's gate: $$hn collections vs walk $$hw)"; ok=0; }; \
+	awk -v d="$$kn" -v s="$$ks" 'BEGIN{exit !(d * 2 < s)}' || \
+	  { echo "gc-str-budget-test: FAIL (gc_str_budget_kept never carried the share: $$ks -> $$kn collections)"; ok=0; }; \
+	awk -v s="$$kh" 'BEGIN{exit !(s == 0)}' || \
+	  { echo "gc-str-budget-test: FAIL (the reading kept a share the last retune did not put in: $$kh MB)"; ok=0; }; \
+	rm -rf "$$tmp"; \
+	if [ $$ok -eq 1 ]; then echo "gc-str-budget-test: pass"; else exit 1; fi
+
 # A byref String parameter that a lifted proc also captures: the capture holds
 # the CALLER's slot, which for the stack shape is not a GC object, and marking
 # it read a header off the stack (#4391). Run under GC stress because the fault
@@ -2045,21 +2496,24 @@ gc-obj-budget-test: $(SPINEL) $(SP_RT_LIB) $(SPINEL_TIMEOUT)
 # vary, so the check is by shape: every line is W/I and there are 8 x 300.
 thread-puts-test: $(SPINEL) $(SP_RT_LIB) $(SPINEL_TIMEOUT)
 	@tmp=$$(mktemp -d /tmp/spinel-tputs.XXXXXX); ok=1; \
-	$(SPINEL) test/threads/puts_lines_atomic.rb -o "$$tmp/p" >/dev/null 2>&1 || \
-	  { echo "thread-puts-test: FAIL (compile)"; rm -rf "$$tmp"; exit 1; }; \
+	$(SPINEL) test/threads/puts_lines_atomic.rb -o "$$tmp/p" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	[ $$rc -eq 0 ] || \
+	  { echo "thread-puts-test: FAIL (compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; rm -rf "$$tmp"; exit 1; }; \
 	for r in 1 2 3; do \
 	  $(TIMEOUT60) "$$tmp/p" > "$$tmp/out" 2>/dev/null || { echo "thread-puts-test: FAIL (crashed or timed out)"; ok=0; }; \
 	  n=$$(wc -l < "$$tmp/out"); bad=$$(grep -vcE '^[0-7]/[0-9]+$$' "$$tmp/out"); \
 	  [ "$$n" -eq 2400 ] && [ "$$bad" -eq 0 ] || { echo "thread-puts-test: FAIL (run $$r: $$n lines, $$bad malformed)"; grep -vE '^[0-7]/[0-9]+$$' "$$tmp/out" | head -3; ok=0; }; \
 	done; \
-	$(SPINEL) test/threads/ffi_blocking_under_gc.rb -o "$$tmp/f" >/dev/null 2>&1 || \
-	  { echo "thread-puts-test: FAIL (ffi blocking: compile)"; rm -rf "$$tmp"; exit 1; }; \
+	$(SPINEL) test/threads/ffi_blocking_under_gc.rb -o "$$tmp/f" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	[ $$rc -eq 0 ] || \
+	  { echo "thread-puts-test: FAIL (ffi blocking: compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; rm -rf "$$tmp"; exit 1; }; \
 	for r in 1 2; do \
 	  SPINEL_GC_STRESS=1 $(TIMEOUT60) "$$tmp/f" > "$$tmp/fout" 2>/dev/null || { echo "thread-puts-test: FAIL (ffi blocking: crashed or timed out under GC stress)"; ok=0; }; \
 	  grep -q '^\[177, 177, 177, 177, 177, 177\]$$' "$$tmp/fout" || { echo "thread-puts-test: FAIL (ffi blocking: a value held across the call was lost)"; head -3 "$$tmp/fout"; ok=0; }; \
 	done; \
-	$(SPINEL) test/threads/fiber_stack_overflow.rb -o "$$tmp/s" >/dev/null 2>&1 || \
-	  { echo "thread-puts-test: FAIL (fiber stack overflow: compile)"; rm -rf "$$tmp"; exit 1; }; \
+	$(SPINEL) test/threads/fiber_stack_overflow.rb -o "$$tmp/s" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	[ $$rc -eq 0 ] || \
+	  { echo "thread-puts-test: FAIL (fiber stack overflow: compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; rm -rf "$$tmp"; exit 1; }; \
 	$(TIMEOUT60) "$$tmp/s" > "$$tmp/sout" 2> "$$tmp/serr"; rc=$$?; \
 	[ $$rc -ne 0 ] && [ $$rc -ne 124 ] || { echo "thread-puts-test: FAIL (fiber stack overflow: the program did not die, rc=$$rc)"; ok=0; }; \
 	grep -q 'fiber stack overflow' "$$tmp/serr" || { echo "thread-puts-test: FAIL (fiber stack overflow: the fault was not reported as one)"; head -3 "$$tmp/serr"; ok=0; }; \
@@ -2068,8 +2522,9 @@ thread-puts-test: $(SPINEL) $(SP_RT_LIB) $(SPINEL_TIMEOUT)
 
 byref-capture-test: $(SPINEL) $(RBS_EXTRACT_BIN) $(SP_RT_LIB) $(SPINEL_TIMEOUT)
 	@tmp=$$(mktemp -d /tmp/spinel-byrefcap.XXXXXX); ok=1; \
-	$(SPINEL) test/rbs-seed/byref_capture_scan.rb --rbs test/rbs-seed/sig -o "$$tmp/b" >/dev/null 2>&1 || \
-	  { echo "byref-capture-test: FAIL (compile)"; rm -rf "$$tmp"; exit 1; }; \
+	$(SPINEL) test/rbs-seed/byref_capture_scan.rb --rbs test/rbs-seed/sig -o "$$tmp/b" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	[ $$rc -eq 0 ] || \
+	  { echo "byref-capture-test: FAIL (compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; rm -rf "$$tmp"; exit 1; }; \
 	SPINEL_GC_STRESS=1 $(TIMEOUT60) "$$tmp/b" > "$$tmp/out" 2>/dev/null || \
 	  { echo "byref-capture-test: FAIL (crashed or timed out under GC stress)"; ok=0; }; \
 	cmp -s "$$tmp/out" test/rbs-seed/byref_capture_scan.expected || \
@@ -2112,8 +2567,9 @@ GC_LOCALITY_SRC := test/gc_locality_build.rb
 
 gc-locality-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	@tmp=$$(mktemp -d /tmp/spinel-gcloc.XXXXXX); ok=1; \
-	$(SPINEL) $(GC_LOCALITY_SRC) -o "$$tmp/l" >/dev/null 2>&1 || \
-	  { echo "gc-locality-test: FAIL (compile)"; rm -rf "$$tmp"; exit 1; }; \
+	$(SPINEL) $(GC_LOCALITY_SRC) -o "$$tmp/l" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	[ $$rc -eq 0 ] || \
+	  { echo "gc-locality-test: FAIL (compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; rm -rf "$$tmp"; exit 1; }; \
 	for b in 1 2 4; do \
 	  for w in 1 8; do \
 	    LOCALITY_BUILD=$$b SPINEL_WORKERS=$$w $(TIMEOUT60) "$$tmp/l" > "$$tmp/out.$$b.$$w" 2>/dev/null || \
@@ -2163,8 +2619,9 @@ THREADED_RENDER_SRC := benchmark/bm_threaded_render.rb
 
 threaded-render-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	@tmp=$$(mktemp -d /tmp/spinel-thrender.XXXXXX); ok=1; \
-	$(SPINEL) $(THREADED_RENDER_SRC) -o "$$tmp/r" >/dev/null 2>&1 || \
-	  { echo "threaded-render-test: FAIL (compile)"; rm -rf "$$tmp"; exit 1; }; \
+	$(SPINEL) $(THREADED_RENDER_SRC) -o "$$tmp/r" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	[ $$rc -eq 0 ] || \
+	  { echo "threaded-render-test: FAIL (compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; rm -rf "$$tmp"; exit 1; }; \
 	for w in 1 2 8; do \
 	  for mode in default obj walk; do \
 	    if [ "$$mode" = default ]; then unset SPINEL_GC_OBJ_BUDGET; \
@@ -2216,8 +2673,9 @@ build/gc-minor-results/%.res: test/%.rb FORCE | $(SPINEL) $(SP_RT_LIB) $(SP_RT_M
 	@mkdir -p $(@D); tmp=$$(mktemp -d /tmp/spinel-gcminor.XXXXXX); ok=1; src=$<; \
 	{ \
 	  bn=$$(basename "$$src" .rb); \
-	  if ! $(SPINEL) $(GC_MINOR_FLAGS) "$$src" -o "$$tmp/$$bn" >/dev/null 2>&1; then \
-	    echo "gc-minor-test: FAIL ($$bn: compile)"; ok=0; \
+	  $(SPINEL) $(GC_MINOR_FLAGS) "$$src" -o "$$tmp/$$bn" >"$$tmp/cc.out" 2>&1; rc=$$?; \
+	  if [ $$rc -ne 0 ]; then \
+	    echo "gc-minor-test: FAIL ($$bn: compile, exit $$rc)"; tail -5 "$$tmp/cc.out"; ok=0; \
 	  else \
 	  for mode in 0 1; do \
 	    SPINEL_GC_MINOR=$$mode $(TIMEOUT60) "$$tmp/$$bn" > "$$tmp/$$bn.$$mode" 2>&1; \
@@ -2300,11 +2758,21 @@ backtrace-test: $(SPINEL) $(SP_RT_LIB)
 	$(SPINEL) --debug --no-inline-hot test/backtrace/required_main.rb -o "$$tmp/rq" >/dev/null 2>&1 || \
 	  { echo "backtrace-test: FAIL (compile required_main)"; ok=0; }; \
 	"$$tmp/rq" > "$$tmp/rq.out" 2>&1; \
-	l3=; l17=; [ "$$(uname -s)" = Linux ] && { l3=3:; l17=17:; }; \
+	l3=; l17=; case "$$(uname -s)" in Linux|Darwin) l3=3:; l17=17:;; esac; \
 	for f in "required_lib.rb:$${l3}in .Lib#inner'" "required_lib.rb:\([0-9]*:\)\{0,1\}in .Lib#boom'" "required_lib.rb:\([0-9]*:\)\{0,1\}in .Lib.go'" "required_main.rb:\([0-9]*:\)\{0,1\}in .Top#run'" "required_lib.rb:$${l17}in .lib_inner'" "required_lib.rb:\([0-9]*:\)\{0,1\}in .lib_outer'" "required_main.rb:\([0-9]*:\)\{0,1\}in .entry_run'"; do \
 	  grep -q "$$f" "$$tmp/rq.out" || { echo "backtrace-test: FAIL (#7658: no frame $$f)"; cat "$$tmp/rq.out"; ok=0; }; \
 	done; \
 	grep -q "required_main.rb:\([0-9]*:\)\{0,1\}in .\(Lib\|lib_\)" "$$tmp/rq.out" && { echo "backtrace-test: FAIL (#7658: a Lib frame names the entry script)"; cat "$$tmp/rq.out"; ok=0; }; \
+	case "$$(uname -s)" in Linux|Darwin) \
+	  $(SPINEL) --debug --no-inline-hot test/backtrace/block_frames.rb -o "$$tmp/bf" >/dev/null 2>&1 || \
+	    { echo "backtrace-test: FAIL (compile block_frames)"; ok=0; }; \
+	  "$$tmp/bf" > "$$tmp/bf.out" 2>&1; \
+	  for f in "block_frames.rb:14:in .block in Runner#run'" "block_frames.rb:16:in .block (2 levels) in Runner#run'" \
+	           "block_frames.rb:20:in .block (3 levels) in Runner#run'" "block_frames.rb:29:in .block in <main>'" \
+	           "block_frames.rb:31:in .block in <main>'" "block_frames_lib.rb:2:in .block in lib_blocks'"; do \
+	    grep -q "$$f" "$$tmp/bf.out" || { echo "backtrace-test: FAIL (a frame inside a block: no $$f)"; cat "$$tmp/bf.out"; ok=0; }; \
+	  done;; \
+	esac; \
 	rm -rf "$$tmp"; \
 	if [ $$ok -eq 1 ]; then echo "backtrace-test: pass"; else exit 1; fi
 
@@ -2332,6 +2800,15 @@ rbs-test: $(RBS_EXTRACT_BIN)
 	done; \
 	if [ -t 1 ]; then printf '\n'; fi; \
 	tmp=$$(mktemp -d /tmp/spinel-rbscyc.XXXXXX); \
+	awk '{printf "%s\r\n", $$0}' test/rbs/positions.rbs > "$$tmp/positions.rbs"; \
+	for f in test/rbs/positions.rbs "$$tmp/positions.rbs"; do \
+	  if ! $(RBS_EXTRACT_BIN) --positions "$$f" > "$$tmp/positions.seed" 2>"$$tmp/positions.err"; then \
+	    echo "rbs-test FAIL: position fixture $$f did not extract"; fail=1; continue; fi; \
+	  if [ -s "$$tmp/positions.err" ]; then echo "rbs-test FAIL: position fixture $$f produced diagnostics"; fail=1; fi; \
+	  d=$$(awk -v src="src $$f:" 'index($$0, src) == 1 { $$0 = "src positions.rbs:" substr($$0, length(src) + 1) } { print }' "$$tmp/positions.seed" \
+	    | diff -u test/rbs/positions.positions.expected -); \
+	  if [ -n "$$d" ]; then echo "rbs-test FAIL: position records for $$f"; echo "$$d"; fail=1; fi; \
+	done; \
 	mkdir -p "$$tmp/d"; ln -s . "$$tmp/d/d"; \
 	mkdir -p "$$tmp/b/inner"; ln -s .. "$$tmp/b/inner/up"; \
 	mkdir -p "$$tmp/x" "$$tmp/y"; ln -s ../y "$$tmp/x/toy"; ln -s ../x "$$tmp/y/tox"; \
@@ -2382,6 +2859,25 @@ rbs-seed-extractor: $(SPINEL) $(RBS_EXTRACT_BIN)
 build/rbs-seed-results/%.res: FORCE | rbs-seed-extractor $(SP_RT_LIB) $(SPINEL_TIMEOUT)
 	@mkdir -p $(@D); tmp=$$(mktemp -d /tmp/spinel-rbsseed.XXXXXX); ok=1; \
 	{ case $* in \
+	renarrow_reset_return_only) \
+	calls=$$($(SPINEL) test/rbs-seed/renarrow_reset_return_only.rb --rbs test/rbs-seed/sig --timing -c --no-line-map -o "$$tmp/rro.c" 2>&1 | sed -n 's/^spinel-timing: pass=infer_param_types ms=[0-9.]* calls=\([0-9]*\).*/\1/p'); \
+	case "$$calls" in ''|*[!0-9]*) echo "rbs-seed-test: FAIL (no infer_param_types call count for renarrow_reset_return_only)"; ok=0;; \
+	  *) [ "$$calls" -lt 32 ] || { echo "rbs-seed-test: FAIL (the re-narrow loop ran $$calls binds: with only a return reset, its re-derivation kept the no-change exit from firing)"; ok=0; };; \
+	esac; \
+	;; \
+	rbs_pinned_str_hash_demand) \
+	$(SPINEL) test/rbs-seed/rbs_pinned_str_hash_demand.rb --rbs test/rbs-seed/sig -c -o "$$tmp/psh.c" >/dev/null 2>"$$tmp/psh.err" || \
+	  { echo "rbs-seed-test: FAIL (#8302 a store into an --rbs Hash[String, String] ivar was refused)"; sed -n 1,3p "$$tmp/psh.err"; ok=0; }; \
+	;; \
+	hash_each_untyped_appending_writer) \
+	if $(SPINEL) test/rbs-seed/hash_each_untyped_appending_writer.rb --rbs test/rbs-seed/sig -o "$$tmp/heuw" >/dev/null 2>"$$tmp/heuw.err" || \
+	   ! grep -q 'passed to an appending value block' "$$tmp/heuw.err"; then \
+	  echo "rbs-seed-test: FAIL (#8235 a Hash#each value into an untyped appending writer was not refused)"; ok=0; fi; \
+	;; \
+	time_unknown_method_seeded_return) \
+	$(SPINEL) test/rbs-seed/time_unknown_method_seeded_return.rb --rbs test/rbs-seed/sig --defer-refusals -o "$$tmp/tums" >"$$tmp/tums.err" 2>&1 && \
+	  "$$tmp/tums" > "$$tmp/tums.out" 2>/dev/null && cmp -s "$$tmp/tums.out" test/rbs-seed/time_unknown_method_seeded_return.expected || { echo "rbs-seed-test: FAIL (a Time method nothing defines contradicted a seeded return)"; sed -n 1,3p "$$tmp/tums.err"; ok=0; }; \
+	;; \
 	attr_writer_poly_value) \
 	$(SPINEL) test/rbs-seed/attr_writer_poly_value.rb --rbs test/rbs-seed/sig -o "$$tmp/awp" >/dev/null 2>&1 && \
 	  "$$tmp/awp" > "$$tmp/awp.out" 2>/dev/null && cmp -s "$$tmp/awp.out" test/rbs-seed/attr_writer_poly_value.expected || { echo "rbs-seed-test: FAIL (#4856 a boxed value into an --rbs Integer attr as a method's value)"; ok=0; }; \
@@ -2806,6 +3302,382 @@ build/rbs-seed-results/%.run: FORCE | rbs-seed-extractor $(SP_RT_LIB) $(SPINEL_T
 	cat "$$tmp/log"; rm -rf "$$tmp"; echo $$ok > $@
 endif
 
+# ---- inline RBS comments (docs/inline-rbs.md) ----
+# Each `parity` check compiles one program twice: with its inline annotations,
+# and with --no-inline-rbs plus a .rbs directory saying the same thing. The C
+# must be identical byte for byte (the SP_RBS_CHECK_TAG sites included), and
+# must differ from the C compiled with neither, so an annotation that silently
+# did nothing cannot pass. The binary then runs against the CRuby snapshot,
+# exit status included. The other checks are the deliberate responses: errors
+# that stop the compile, warnings that ignore an annotation whole, comments
+# that are not annotations at all, and precedence against --rbs.
+.PHONY: inline-rbs-no-parser-test
+inline-rbs-test: inline-rbs-no-parser-test
+inline-rbs-no-parser-test: $(SPINEL_NO_RBS)
+	@tmp=$$(mktemp -d); ok=1; \
+	trap 'rm -rf "$$tmp"' 0; \
+	for tp in methods=methods.rb:8 warnings=warnings_part.rb:2 syntax_error=syntax_error.rb:3 false_positives=none; do \
+	  t=$${tp%%=*}; at=$${tp#*=}; \
+	  $(SPINEL_NO_RBS) test/inline-rbs/$$t.rb -c --no-line-map -o "$$tmp/i.c" 2>"$$tmp/i.err" || { echo "inline-rbs-no-parser-test: FAIL ($$t: compile failed)"; ok=0; }; \
+	  $(SPINEL_NO_RBS) test/inline-rbs/$$t.rb --no-inline-rbs -c --no-line-map -o "$$tmp/n.c" 2>"$$tmp/n.err" || { echo "inline-rbs-no-parser-test: FAIL ($$t: disabled compile failed)"; ok=0; }; \
+	  cmp -s "$$tmp/i.c" "$$tmp/n.c" || { echo "inline-rbs-no-parser-test: FAIL ($$t: annotations changed the C)"; ok=0; }; \
+	  if grep -vq '^Wrote ' "$$tmp/n.err"; then echo "inline-rbs-no-parser-test: FAIL ($$t: disabled annotations produced diagnostics)"; ok=0; fi; \
+	  if [ "$$at" = none ]; then \
+	    if grep -vq '^Wrote ' "$$tmp/i.err"; then echo "inline-rbs-no-parser-test: FAIL ($$t: ordinary comments produced diagnostics)"; ok=0; fi; \
+	  else \
+	    grep -q "$$at: warning: inline RBS comments are not applied: .*without the rbs parser" "$$tmp/i.err" || { echo "inline-rbs-no-parser-test: FAIL ($$t: no located missing-parser warning)"; ok=0; }; \
+	    [ "$$(grep -c 'warning: inline RBS' "$$tmp/i.err")" = 1 ] || { echo "inline-rbs-no-parser-test: FAIL ($$t: expected one warning)"; ok=0; }; \
+	    if grep -Evq '^Wrote |warning: inline RBS comments are not applied:' "$$tmp/i.err"; then echo "inline-rbs-no-parser-test: FAIL ($$t: unexpected diagnostics)"; ok=0; fi; \
+	  fi; \
+	done; \
+	if [ $$ok -eq 1 ]; then echo "inline-rbs-no-parser-test: pass"; else exit 1; fi
+
+ifeq ($(wildcard $(RBS_INC)/rbs/parser.h),)
+inline-rbs-test:
+	@echo "inline-rbs-test: parser-backed cases skipped (vendor/rbs not fetched; run 'make deps')"
+else
+INLINE_RBS_PARITY := methods attrs association identity_reopen identity_collide check_honest
+INLINE_RBS_CHECKS := false_positives ignored_symlink ignored_errors warnings syntax_error syntax_error_multiline syntax_error_rbs two_annotations precedence_agree precedence_disagree reader_pin_precedence reader_pin_conflicts stray_rb override_family check_false off_switch \
+                     placements duplicate_reopen_agree duplicate_reopen_disagree duplicate_nilable precedence_objarray duplicate_rbs_decl \
+                     redefine_unannotated redefine_unannotated_req redefine_define_method redefine_class_eval redefine_ignored redefine_refused mixin_not_applied analyzer_warnings dump_ast_malformed \
+                     contradiction_inline objarray_boxed
+INLINE_RBS_RESULTS := $(patsubst %,build/inline-rbs-results/%.par,$(INLINE_RBS_PARITY)) \
+                      $(patsubst %,build/inline-rbs-results/%.res,$(INLINE_RBS_CHECKS))
+inline-rbs-test: $(INLINE_RBS_RESULTS)
+	@ok=1; for r in $(INLINE_RBS_RESULTS); do [ "$$(cat $$r)" = 1 ] || ok=0; done; \
+	if [ $$ok -eq 1 ]; then echo "inline-rbs-test: pass"; else exit 1; fi
+IRB := test/inline-rbs
+# A warning says an annotation was not applied; tools/inline_rbs_ignored.sh
+# proves it, by removing every annotation a compile warned about and getting
+# the same C. Run in the check's own mode and in the corpus's.
+IRB_IGNORED = for fl in "" --int-overflow=promote; do tools/inline_rbs_ignored.sh $(SPINEL) $(IRB)/$(1) $$fl || ok=0; done
+build/inline-rbs-results/%.par: FORCE | rbs-seed-extractor $(SP_RT_LIB) $(SPINEL_TIMEOUT)
+	@mkdir -p $(@D); tmp=$$(mktemp -d /tmp/spinel-inlinerbs.XXXXXX); ok=1; t=$*; \
+	{ \
+	  $(SPINEL) $(IRB)/$$t.rb -c --no-line-map -o "$$tmp/inline.c" 2>"$$tmp/inline.err" || { echo "inline-rbs-test: FAIL ($$t: the inline compile failed)"; sed -n 1,5p "$$tmp/inline.err"; ok=0; }; \
+	  if [ "$$t" = association ]; then \
+	    grep -q 'association.rb:10:3: warning: inline RBS' "$$tmp/inline.err" && [ "$$(grep -c 'warning: inline RBS' "$$tmp/inline.err")" = 1 ] || { echo "inline-rbs-test: FAIL (association: expected one unused leading attribute annotation)"; cat "$$tmp/inline.err"; ok=0; }; \
+	    if grep -Evq '^Wrote |association.rb:10:3: warning: inline RBS' "$$tmp/inline.err"; then echo "inline-rbs-test: FAIL (association: unexpected diagnostics)"; cat "$$tmp/inline.err"; ok=0; fi; \
+	    $(call IRB_IGNORED,association.rb); \
+	  elif [ -s "$$tmp/inline.err" ] && grep -vq '^Wrote ' "$$tmp/inline.err"; then echo "inline-rbs-test: FAIL ($$t: the inline compile printed a diagnostic)"; sed -n 1,5p "$$tmp/inline.err"; ok=0; fi; \
+	  $(SPINEL) $(IRB)/$$t.rb --no-inline-rbs --rbs $(IRB)/sig/$$t -c --no-line-map -o "$$tmp/rbs.c" >/dev/null 2>&1 || { echo "inline-rbs-test: FAIL ($$t: the --rbs compile failed)"; ok=0; }; \
+	  $(SPINEL) $(IRB)/$$t.rb --no-inline-rbs -c --no-line-map -o "$$tmp/none.c" >/dev/null 2>&1 || { echo "inline-rbs-test: FAIL ($$t: the unannotated compile failed)"; ok=0; }; \
+	  cmp -s "$$tmp/inline.c" "$$tmp/rbs.c" || { echo "inline-rbs-test: FAIL ($$t: inline RBS and the equivalent --rbs produce different C)"; diff "$$tmp/rbs.c" "$$tmp/inline.c" | head -10; ok=0; }; \
+	  if cmp -s "$$tmp/inline.c" "$$tmp/none.c"; then echo "inline-rbs-test: FAIL ($$t: the annotations changed nothing)"; ok=0; fi; \
+	  case $$t in \
+	  identity_collide) \
+	    grep -Eq 'sp_RbVal sp_Left__Item_weigh' "$$tmp/inline.c" || { echo "inline-rbs-test: FAIL (Left::Item#weigh did not take its annotation)"; ok=0; }; \
+	    if grep -Eq 'sp_RbVal sp_Right__Item_weigh' "$$tmp/inline.c"; then echo "inline-rbs-test: FAIL (Left::Item's annotation pinned Right::Item)"; ok=0; fi ;; \
+	  esac; \
+	  if $(CC) -O0 -Ilib $(RBS_SEED_STRICT) "$$tmp/inline.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/$$t" 2>"$$tmp/cc.err"; then \
+	    "$$tmp/$$t" > "$$tmp/out" 2>"$$tmp/err"; rc=$$?; \
+	    [ $$rc -eq 0 ] || { echo "inline-rbs-test: FAIL ($$t exited $$rc; CRuby exits 0)"; ok=0; }; \
+	    cmp -s "$$tmp/out" $(IRB)/$$t.expected || { echo "inline-rbs-test: FAIL ($$t output differs from CRuby)"; diff -u $(IRB)/$$t.expected "$$tmp/out" | head -10; ok=0; }; \
+	    [ -s "$$tmp/err" ] && { echo "inline-rbs-test: FAIL ($$t wrote to stderr)"; sed -n 1,3p "$$tmp/err"; ok=0; }; \
+	  else echo "inline-rbs-test: FAIL ($$t: C did not compile)"; sed -n 1,10p "$$tmp/cc.err"; ok=0; fi; \
+	} > "$$tmp/log" 2>&1; \
+	cat "$$tmp/log"; rm -rf "$$tmp"; echo $$ok > $@
+build/inline-rbs-results/%.res: FORCE | rbs-seed-extractor $(SP_RT_LIB) $(SPINEL_TIMEOUT)
+	@mkdir -p $(@D); tmp=$$(mktemp -d /tmp/spinel-inlinerbs.XXXXXX); ok=1; \
+	{ case $* in \
+	false_positives) \
+	$(SPINEL) $(IRB)/false_positives.rb -c --no-line-map -o "$$tmp/a.c" 2>"$$tmp/a.err"; \
+	$(SPINEL) $(IRB)/false_positives_plain.rb -c --no-line-map -o "$$tmp/b.c" >/dev/null 2>&1; \
+	cmp -s "$$tmp/a.c" "$$tmp/b.c" || { echo "inline-rbs-test: FAIL (an ordinary comment was read as inline RBS)"; diff "$$tmp/b.c" "$$tmp/a.c" | head -10; ok=0; }; \
+	if grep -vq '^Wrote ' "$$tmp/a.err"; then echo "inline-rbs-test: FAIL (an ordinary comment drew a diagnostic)"; sed -n 1,5p "$$tmp/a.err"; ok=0; fi; \
+	;; \
+	ignored_symlink) \
+	cp $(IRB)/warnings_part.rb "$$tmp/before.rb"; \
+	printf '%s\n' '#!/bin/sh' 'if [ -f "$$IRB_SYMLINK_CHECK/before" ]; then stage=after; else stage=before; fi' 'cp part.rb "$$IRB_SYMLINK_CHECK/$$stage" || exit 1' 'exec "$$IRB_SYMLINK_COMPILER" "$$@"' > "$$tmp/compiler"; chmod +x "$$tmp/compiler"; \
+	for route in entry required; do \
+	  mkdir "$$tmp/$$route" "$$tmp/$$route/check"; \
+	  cp "$$tmp/before.rb" "$$tmp/$$route/target.rb"; \
+	  mkdir "$$tmp/$$route/src"; ln -s "$$tmp/$$route/target.rb" "$$tmp/$$route/src/part.rb"; \
+	  prog="$$tmp/$$route/src/part.rb"; \
+	  if [ $$route = required ]; then printf '%s\n' 'require_relative "part"' 'p part_value' > "$$tmp/$$route/src/main.rb"; prog="$$tmp/$$route/src/main.rb"; fi; \
+	  IRB_SYMLINK_CHECK="$$tmp/$$route/check" IRB_SYMLINK_COMPILER="$(abspath $(SPINEL))" tools/inline_rbs_ignored.sh "$$tmp/compiler" "$$prog" || { echo "inline-rbs-test: FAIL ($$route symlink: ignored-annotation check failed)"; ok=0; }; \
+	  cmp -s "$$tmp/before.rb" "$$tmp/$$route/target.rb" || { echo "inline-rbs-test: FAIL ($$route symlink: the original target changed)"; ok=0; }; \
+	  cmp -s "$$tmp/before.rb" "$$tmp/$$route/check/before" && [ -f "$$tmp/$$route/check/after" ] && ! grep -q '^#:' "$$tmp/$$route/check/after" || { echo "inline-rbs-test: FAIL ($$route symlink: no annotation was removed from the copy)"; ok=0; }; \
+	done; \
+	mkdir "$$tmp/outside" "$$tmp/outside/src"; cp "$$tmp/before.rb" "$$tmp/outside/target.rb"; \
+	printf 'require_relative "%s"\np part_value\n' "$$tmp/outside/target.rb" > "$$tmp/outside/src/main.rb"; \
+	if tools/inline_rbs_ignored.sh $(SPINEL) "$$tmp/outside/src/main.rb" > "$$tmp/outside/check.log" 2>&1; then echo "inline-rbs-test: FAIL (an absolute required file outside the copy was accepted)"; ok=0; fi; \
+	grep -q 'outside the temporary copy' "$$tmp/outside/check.log" && cmp -s "$$tmp/before.rb" "$$tmp/outside/target.rb" || { echo "inline-rbs-test: FAIL (an absolute required file was not refused unchanged)"; cat "$$tmp/outside/check.log"; ok=0; }; \
+	;; \
+	ignored_errors) \
+	mkdir "$$tmp/src" "$$tmp/shims"; cp $(IRB)/warnings_part.rb "$$tmp/src/part.rb"; \
+	printf 'p 1\n' > "$$tmp/src/plain.rb"; \
+	tools/inline_rbs_ignored.sh $(SPINEL) "$$tmp/src/plain.rb" || { echo "inline-rbs-test: FAIL (no warnings were treated as an error)"; ok=0; }; \
+	for cmd in grep sed awk cat; do \
+	  if [ "$$cmd" = awk ]; then \
+	    real=$$(command -v awk); \
+	    printf '#!/bin/sh\ncase "$$2" in lines=*) exit 2 ;; esac\nexec "%s" "$$@"\n' "$$real" > "$$tmp/shims/$$cmd"; \
+	  else printf '%s\n' '#!/bin/sh' 'exit 2' > "$$tmp/shims/$$cmd"; fi; \
+	  chmod +x "$$tmp/shims/$$cmd"; rc=0; \
+	  PATH="$$tmp/shims:$$PATH" tools/inline_rbs_ignored.sh $(SPINEL) "$$tmp/src/part.rb" || rc=$$?; \
+	  [ $$rc -eq 2 ] || { echo "inline-rbs-test: FAIL ($$cmd failure was not propagated: $$rc)"; ok=0; }; \
+	  rm "$$tmp/shims/$$cmd"; \
+	done; \
+	;; \
+	warnings) \
+	for fl in "" --int-overflow=promote; do \
+	ovdef=""; [ "$$fl" != --int-overflow=promote ] || ovdef=-DSP_INT_OVERFLOW_MODE_PROMOTE; \
+	$(SPINEL) $(IRB)/warnings.rb $$fl -c --no-line-map -o "$$tmp/w.c" 2>"$$tmp/w.err" || { echo "inline-rbs-test: FAIL (an unapplied annotation stopped the compile)"; sed -n 1,5p "$$tmp/w.err"; ok=0; }; \
+	$(SPINEL) $(IRB)/warnings.rb $$fl --no-inline-rbs -c --no-line-map -o "$$tmp/n.c" >/dev/null 2>&1 || { echo "inline-rbs-test: FAIL (disabled warning fixture did not compile)"; ok=0; }; \
+	cmp -s "$$tmp/w.c" "$$tmp/n.c" || { echo "inline-rbs-test: FAIL (an annotation that was warned about was applied, in part or whole)"; diff "$$tmp/n.c" "$$tmp/w.c" | head -10; ok=0; }; \
+	for ln in 7 12 17 22 28 34 39 45 52 55 56 59 62 64 84 87; do \
+	  grep -q "warnings.rb:$$ln:[0-9:]* warning: inline RBS" "$$tmp/w.err" || { echo "inline-rbs-test: FAIL (no inline RBS warning at warnings.rb:$$ln)"; ok=0; }; done; \
+	grep -q "warnings_part.rb:2:[0-9:]* warning: inline RBS" "$$tmp/w.err" || { echo "inline-rbs-test: FAIL (a warning in a required file did not name that file and line)"; ok=0; }; \
+	[ "$$(grep -c 'warning: inline RBS' "$$tmp/w.err")" = 17 ] || { echo "inline-rbs-test: FAIL (expected 17 inline RBS warnings)"; cat "$$tmp/w.err"; ok=0; }; \
+	if $(CC) -O0 -Ilib $$ovdef "$$tmp/w.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/w" 2>/dev/null; then \
+	  "$$tmp/w" > "$$tmp/w.out" 2>"$$tmp/w.run.err"; rc=$$?; \
+	  [ $$rc -eq 0 ] && [ ! -s "$$tmp/w.run.err" ] || { echo "inline-rbs-test: FAIL (warnings.rb $$fl: runtime failed)"; ok=0; }; \
+	  cmp -s "$$tmp/w.out" $(IRB)/warnings.expected || { echo "inline-rbs-test: FAIL (warnings.rb output differs from CRuby)"; ok=0; }; \
+	else echo "inline-rbs-test: FAIL (warnings.rb: C did not compile)"; ok=0; fi; \
+	done; \
+	$(call IRB_IGNORED,warnings.rb); \
+	;; \
+	syntax_error) \
+	if $(SPINEL) $(IRB)/syntax_error.rb -c --no-line-map -o "$$tmp/s.c" >"$$tmp/s.err" 2>&1; then echo "inline-rbs-test: FAIL (a malformed signature compiled)"; ok=0; \
+	else grep -q 'syntax_error.rb:3:15: inline RBS syntax error' "$$tmp/s.err" || { echo "inline-rbs-test: FAIL (a malformed signature was not reported at its line and column)"; sed -n 1,5p "$$tmp/s.err"; ok=0; }; fi; \
+	;; \
+	syntax_error_rbs) \
+	if $(SPINEL) $(IRB)/syntax_error_rbs.rb -c --no-line-map -o "$$tmp/s.c" >"$$tmp/s.err" 2>&1; then echo "inline-rbs-test: FAIL (a malformed # @rbs line compiled)"; ok=0; \
+	else grep -q 'syntax_error_rbs.rb:3:13: inline RBS syntax error' "$$tmp/s.err" || { echo "inline-rbs-test: FAIL (a malformed # @rbs line was not reported at its line and column)"; sed -n 1,5p "$$tmp/s.err"; ok=0; }; \
+	grep -q 'does not start with `@rbs`' "$$tmp/s.err" && ! grep -q '`# :`' "$$tmp/s.err" || { echo "inline-rbs-test: FAIL (the hint for a malformed # @rbs line is not about # @rbs)"; sed -n 1,5p "$$tmp/s.err"; ok=0; }; fi; \
+	;; \
+	syntax_error_multiline) \
+	if $(SPINEL) $(IRB)/syntax_error_multiline.rb -c --no-line-map -o "$$tmp/s.c" >"$$tmp/s.err" 2>&1; then echo "inline-rbs-test: FAIL (a malformed continued signature compiled)"; ok=0; \
+	else grep -q 'syntax_error_multiline.rb:4:18: inline RBS syntax error' "$$tmp/s.err" || { echo "inline-rbs-test: FAIL (an error on a continuation line was not mapped to that line and column)"; sed -n 1,5p "$$tmp/s.err"; ok=0; }; fi; \
+	;; \
+	two_annotations) \
+	if $(SPINEL) $(IRB)/two_annotations.rb -c --no-line-map -o "$$tmp/t.c" >"$$tmp/t.err" 2>&1; then echo "inline-rbs-test: FAIL (two signatures for one method compiled)"; ok=0; \
+	else grep -q 'two_annotations.rb:4:.*two_annotations.rb:3' "$$tmp/t.err" || { echo "inline-rbs-test: FAIL (two signatures for one method were refused without naming both)"; sed -n 1,5p "$$tmp/t.err"; ok=0; }; fi; \
+	;; \
+	precedence_agree) \
+	$(SPINEL) $(IRB)/precedence.rb --rbs $(IRB)/sig/precedence_agree -c --no-line-map -o "$$tmp/both.c" 2>"$$tmp/both.err" || { echo "inline-rbs-test: FAIL (an inline annotation agreeing with --rbs was refused)"; sed -n 1,5p "$$tmp/both.err"; ok=0; }; \
+	$(SPINEL) $(IRB)/precedence.rb -c --no-line-map -o "$$tmp/inl.c" >/dev/null 2>&1; \
+	cmp -s "$$tmp/both.c" "$$tmp/inl.c" || { echo "inline-rbs-test: FAIL (agreeing inline RBS and --rbs compile differently from inline RBS alone)"; ok=0; }; \
+	if grep -vq '^Wrote ' "$$tmp/both.err"; then echo "inline-rbs-test: FAIL (agreeing inline RBS and --rbs drew a diagnostic)"; sed -n 1,3p "$$tmp/both.err"; ok=0; fi; \
+	;; \
+	precedence_disagree) \
+	if $(SPINEL) $(IRB)/precedence.rb --rbs $(IRB)/sig/precedence_disagree -c --no-line-map -o "$$tmp/d.c" >"$$tmp/d.err" 2>&1; then echo "inline-rbs-test: FAIL (inline RBS disagreeing with --rbs compiled)"; ok=0; \
+	else grep -q 'precedence.rb:5:.*meter.rbs:2' "$$tmp/d.err" || { echo "inline-rbs-test: FAIL (a disagreement with --rbs was refused without naming both)"; sed -n 1,5p "$$tmp/d.err"; ok=0; }; fi; \
+	;; \
+	reader_pin_precedence) \
+	for fl in "" --int-overflow=promote; do \
+	  ovdef=""; [ "$$fl" != --int-overflow=promote ] || ovdef=-DSP_INT_OVERFLOW_MODE_PROMOTE; \
+	  for mode in inline both; do \
+	    rbs=""; [ $$mode != both ] || rbs="--rbs $(IRB)/sig/reader_pin_agree"; \
+	    $(SPINEL) $(IRB)/reader_pin_precedence.rb $$fl $$rbs -c --no-line-map -o "$$tmp/$$mode.c" 2>"$$tmp/$$mode.err" || { echo "inline-rbs-test: FAIL (reader_pin_precedence $$mode $$fl: the compile failed)"; cat "$$tmp/$$mode.err"; ok=0; }; \
+	    if grep -vq '^Wrote ' "$$tmp/$$mode.err"; then echo "inline-rbs-test: FAIL (reader_pin_precedence $$mode $$fl: unexpected diagnostics)"; cat "$$tmp/$$mode.err"; ok=0; fi; \
+	  done; \
+	  cmp -s "$$tmp/inline.c" "$$tmp/both.c" || { echo "inline-rbs-test: FAIL (agreeing reader pins changed the C $$fl)"; ok=0; }; \
+	  if $(CC) -O0 -Ilib $(RBS_SEED_STRICT) $$ovdef "$$tmp/inline.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/x" 2>"$$tmp/cc.err"; then \
+	    "$$tmp/x" > "$$tmp/x.out" 2>"$$tmp/x.err"; rc=$$?; \
+	    [ $$rc -eq 0 ] && [ ! -s "$$tmp/x.err" ] && cmp -s "$$tmp/x.out" $(IRB)/reader_pin_precedence.expected || { echo "inline-rbs-test: FAIL (reader_pin_precedence $$fl: runtime status, stderr or output differs from CRuby)"; ok=0; }; \
+	  else echo "inline-rbs-test: FAIL (reader_pin_precedence $$fl: C did not compile)"; sed -n 1,10p "$$tmp/cc.err"; ok=0; fi; \
+	  if $(SPINEL) $(IRB)/reader_pin_precedence.rb $$fl --rbs $(IRB)/sig/reader_pin_disagree -c --no-line-map -o "$$tmp/d.c" >"$$tmp/d.err" 2>&1; then echo "inline-rbs-test: FAIL (conflicting external reader pins compiled $$fl)"; ok=0; fi; \
+	  [ "$$(grep -c 'disagrees with the .rbs signature' "$$tmp/d.err")" = 4 ] || { echo "inline-rbs-test: FAIL (expected four external reader-pin disagreements $$fl)"; cat "$$tmp/d.err"; ok=0; }; \
+	  for at in 5:2:ExplicitReader 19:6:ImplicitReader 19:7:ImplicitReader 26:11:MemoReader; do \
+	    ln=$${at%%:*}; rest=$${at#*:}; rln=$${rest%%:*}; cn=$${rest#*:}; \
+	    grep -q "reader_pin_precedence.rb:$$ln: inline RBS: the type of $$cn @items disagrees with the .rbs signature at .*readers.rbs:$$rln$$" "$$tmp/d.err" || { echo "inline-rbs-test: FAIL (external reader-pin disagreement omitted $$at $$fl)"; cat "$$tmp/d.err"; ok=0; }; \
+	  done; \
+	done; \
+	;; \
+	reader_pin_conflicts) \
+	for fl in "" --int-overflow=promote; do \
+	  if $(SPINEL) $(IRB)/reader_pin_conflicts.rb $$fl -c --no-line-map -o "$$tmp/d.c" >"$$tmp/d.err" 2>&1; then echo "inline-rbs-test: FAIL (conflicting inline reader pins compiled $$fl)"; ok=0; fi; \
+	  [ "$$(grep -c 'disagrees with another annotation' "$$tmp/d.err")" = 4 ] || { echo "inline-rbs-test: FAIL (expected four inline reader-pin disagreements $$fl)"; cat "$$tmp/d.err"; ok=0; }; \
+	  for at in 10:4:IvarFirst 15:18:ReaderFirst 33:30:StringsFirst 45:42:IntegersFirst; do \
+	    ln=$${at%%:*}; rest=$${at#*:}; prev=$${rest%%:*}; cn=$${rest#*:}; \
+	    grep -q "reader_pin_conflicts.rb:$$ln: inline RBS: the type of $$cn @items disagrees with another annotation at .*reader_pin_conflicts.rb:$$prev$$" "$$tmp/d.err" || { echo "inline-rbs-test: FAIL (inline reader-pin disagreement omitted $$at $$fl)"; cat "$$tmp/d.err"; ok=0; }; \
+	  done; \
+	done; \
+	;; \
+	stray_rb) \
+	$(SPINEL) $(IRB)/precedence.rb --no-inline-rbs --rbs $(IRB)/sig/stray -c --no-line-map -o "$$tmp/s.c" >/dev/null 2>&1; \
+	$(SPINEL) $(IRB)/precedence.rb --no-inline-rbs -c --no-line-map -o "$$tmp/n.c" >/dev/null 2>&1; \
+	cmp -s "$$tmp/s.c" "$$tmp/n.c" || { echo "inline-rbs-test: FAIL (a .rb file under an --rbs directory contributed types)"; ok=0; }; \
+	;; \
+	override_family) \
+	$(SPINEL) $(IRB)/override_family.rb -c --no-line-map -o "$$tmp/o.c" 2>"$$tmp/o.err" || { echo "inline-rbs-test: FAIL (override_family did not compile)"; ok=0; }; \
+	grep -q 'override_family.rb:4:[0-9:]* warning: inline RBS' "$$tmp/o.err" || { echo "inline-rbs-test: FAIL (an unapplied return on an overridden method was not reported)"; sed -n 1,3p "$$tmp/o.err"; ok=0; }; \
+	grep -Eq 'sp_RbVal lv_x' "$$tmp/o.c" || { echo "inline-rbs-test: FAIL (the parameter of an overridden method lost its annotation)"; ok=0; }; \
+	$(SPINEL) $(IRB)/override_family.rb --no-inline-rbs --rbs $(IRB)/sig/override_family -c --no-line-map -o "$$tmp/r.c" >/dev/null 2>&1; \
+	cmp -s "$$tmp/o.c" "$$tmp/r.c" || { echo "inline-rbs-test: FAIL (the warned-about return of an overridden method did more than the same .rbs signature does)"; diff "$$tmp/r.c" "$$tmp/o.c" | head -10; ok=0; }; \
+	if $(CC) -O0 -Ilib "$$tmp/o.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/o" 2>/dev/null; then \
+	  "$$tmp/o" > "$$tmp/o.out" 2>/dev/null; cmp -s "$$tmp/o.out" $(IRB)/override_family.expected || { echo "inline-rbs-test: FAIL (override_family output differs from CRuby)"; ok=0; }; \
+	else echo "inline-rbs-test: FAIL (override_family: C did not compile)"; ok=0; fi; \
+	;; \
+	check_false) \
+	$(SPINEL) $(IRB)/check_false.rb -c --no-line-map -o "$$tmp/f.c" 2>/dev/null; \
+	if $(CC) -O0 -Ilib $(RBS_SEED_STRICT) -DSP_RBS_CHECK "$$tmp/f.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/f" 2>/dev/null; then \
+	  if "$$tmp/f" > "$$tmp/f.out" 2>&1; then echo "inline-rbs-test: FAIL (a false inline annotation did NOT abort under -DSP_RBS_CHECK)"; ok=0; \
+	  else grep -q "seed violated" "$$tmp/f.out" || { echo "inline-rbs-test: FAIL (a false inline annotation aborted without naming the slot)"; sed -n 1,3p "$$tmp/f.out"; ok=0; }; fi; \
+	else echo "inline-rbs-test: FAIL (check_false: C did not compile)"; ok=0; fi; \
+	$(SPINEL) $(IRB)/check_honest.rb -c --no-line-map -o "$$tmp/h.c" 2>/dev/null; \
+	if $(CC) -O0 -Ilib $(RBS_SEED_STRICT) -DSP_RBS_CHECK "$$tmp/h.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/h" 2>/dev/null; then \
+	  "$$tmp/h" > "$$tmp/h.out" 2>&1; cmp -s "$$tmp/h.out" $(IRB)/check_honest.expected || { echo "inline-rbs-test: FAIL (the run-time check fired on an honest inline annotation)"; ok=0; }; \
+	else echo "inline-rbs-test: FAIL (check_honest: C did not compile under -DSP_RBS_CHECK)"; ok=0; fi; \
+	;; \
+	off_switch) \
+	for t in warnings syntax_error; do \
+	  $(SPINEL) $(IRB)/$$t.rb --no-inline-rbs -c --no-line-map -o "$$tmp/n.c" 2>"$$tmp/n.err" || { echo "inline-rbs-test: FAIL ($$t: disabled annotations stopped the compile)"; ok=0; }; \
+	  if grep -vq '^Wrote ' "$$tmp/n.err"; then echo "inline-rbs-test: FAIL ($$t: disabled annotations produced diagnostics)"; ok=0; fi; \
+	done; \
+	;; \
+	placements) \
+	for fl in "" --int-overflow=promote; do \
+	  ovdef=""; [ "$$fl" != --int-overflow=promote ] || ovdef=-DSP_INT_OVERFLOW_MODE_PROMOTE; \
+	  $(SPINEL) $(IRB)/placements.rb $$fl -c --no-line-map -o "$$tmp/i.c" 2>"$$tmp/i.err" || { echo "inline-rbs-test: FAIL (placements: an unused annotation stopped the compile)"; cat "$$tmp/i.err"; ok=0; }; \
+	  $(SPINEL) $(IRB)/placements.rb $$fl --no-inline-rbs -c --no-line-map -o "$$tmp/n.c" >/dev/null 2>&1 || { echo "inline-rbs-test: FAIL (placements: disabled compile failed)"; ok=0; }; \
+	  cmp -s "$$tmp/i.c" "$$tmp/n.c" || { echo "inline-rbs-test: FAIL (placements: an unused annotation produced type facts)"; diff "$$tmp/n.c" "$$tmp/i.c" | head -10; ok=0; }; \
+	  for ln in 3 6 12 16 19 22 30 35 38 45 50 55 60; do \
+	    grep -q "placements.rb:$$ln:[0-9:]* warning: inline RBS" "$$tmp/i.err" || { echo "inline-rbs-test: FAIL (placements: no unused-annotation warning at line $$ln)"; ok=0; }; \
+	  done; \
+	  [ "$$(grep -c 'warning: inline RBS' "$$tmp/i.err")" = 13 ] || { echo "inline-rbs-test: FAIL (placements: expected thirteen unused-annotation warnings)"; cat "$$tmp/i.err"; ok=0; }; \
+	  if grep -Evq '^Wrote |warning: inline RBS' "$$tmp/i.err"; then echo "inline-rbs-test: FAIL (placements: unexpected diagnostics)"; cat "$$tmp/i.err"; ok=0; fi; \
+	  if $(CC) -O0 -Ilib $(RBS_SEED_STRICT) $$ovdef "$$tmp/i.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/x" 2>"$$tmp/cc.err"; then \
+	    "$$tmp/x" > "$$tmp/x.out" 2>"$$tmp/x.err"; rc=$$?; \
+	    [ $$rc -eq 0 ] && [ ! -s "$$tmp/x.err" ] && cmp -s "$$tmp/x.out" $(IRB)/placements.expected || { echo "inline-rbs-test: FAIL (placements: runtime differs from CRuby)"; ok=0; }; \
+	  else echo "inline-rbs-test: FAIL (placements: C did not compile)"; sed -n 1,10p "$$tmp/cc.err"; ok=0; fi; \
+	done; \
+	$(call IRB_IGNORED,placements.rb); \
+	;; \
+	duplicate_reopen_agree) \
+	$(SPINEL) $(IRB)/$*.rb -c --no-line-map -o "$$tmp/i.c" 2>"$$tmp/i.err" || { echo "inline-rbs-test: FAIL ($*: the inline compile failed)"; cat "$$tmp/i.err"; ok=0; }; \
+	if grep -vq '^Wrote ' "$$tmp/i.err"; then echo "inline-rbs-test: FAIL (agreeing reopened definitions produced diagnostics)"; cat "$$tmp/i.err"; ok=0; fi; \
+	grep -q 'sp_RbVal sp_K_m(sp_K \*self, sp_RbVal lv_x)' "$$tmp/i.c" || { echo "inline-rbs-test: FAIL (the final agreeing definition lost its annotation)"; ok=0; }; \
+	$(SPINEL) $(IRB)/$*.rb --no-inline-rbs -c --no-line-map -o "$$tmp/n.c" >/dev/null 2>&1; \
+	if cmp -s "$$tmp/i.c" "$$tmp/n.c"; then echo "inline-rbs-test: FAIL (agreeing reopened annotations changed nothing)"; ok=0; fi; \
+	if $(CC) -O0 -Ilib $(RBS_SEED_STRICT) "$$tmp/i.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/x" 2>"$$tmp/cc.err"; then \
+	  "$$tmp/x" > "$$tmp/x.out" 2>"$$tmp/x.err"; rc=$$?; \
+	  [ $$rc -eq 0 ] && [ ! -s "$$tmp/x.err" ] && cmp -s "$$tmp/x.out" $(IRB)/$*.expected || { echo "inline-rbs-test: FAIL (agreeing reopened definitions differ from CRuby)"; ok=0; }; \
+	else echo "inline-rbs-test: FAIL ($*: C did not compile)"; sed -n 1,10p "$$tmp/cc.err"; ok=0; fi; \
+	;; \
+	duplicate_reopen_disagree|duplicate_nilable) \
+	case $* in duplicate_reopen_disagree) lines="9 4" ;; duplicate_nilable) lines="10 5" ;; esac; \
+	if $(SPINEL) $(IRB)/$*.rb -c --no-line-map -o "$$tmp/d.c" >"$$tmp/d.err" 2>&1; then echo "inline-rbs-test: FAIL ($*: two different signatures for one method compiled)"; ok=0; \
+	else for ln in $$lines; do grep -q "$*.rb:$$ln" "$$tmp/d.err" || { echo "inline-rbs-test: FAIL ($*: the refusal does not name line $$ln)"; sed -n 1,5p "$$tmp/d.err"; ok=0; }; done; fi; \
+	;; \
+	precedence_objarray) \
+	if $(SPINEL) $(IRB)/precedence_objarray.rb --rbs $(IRB)/sig/precedence_disagree_objarray -c --no-line-map -o "$$tmp/d.c" >"$$tmp/d.err" 2>&1; then echo "inline-rbs-test: FAIL (Array[Foo] inline and Array[Bar] in --rbs compiled)"; ok=0; \
+	else grep -q 'precedence_objarray.rb:7:.*box.rbs:2' "$$tmp/d.err" || { echo "inline-rbs-test: FAIL (an array-of-class disagreement with --rbs was refused without naming both)"; sed -n 1,5p "$$tmp/d.err"; ok=0; }; fi; \
+	$(SPINEL) $(IRB)/precedence_objarray.rb --rbs $(IRB)/sig/precedence_agree_objarray -c --no-line-map -o "$$tmp/both.c" 2>"$$tmp/both.err" || { echo "inline-rbs-test: FAIL (Array[Foo] inline and in --rbs was refused)"; sed -n 1,5p "$$tmp/both.err"; ok=0; }; \
+	$(SPINEL) $(IRB)/precedence_objarray.rb -c --no-line-map -o "$$tmp/inl.c" 2>"$$tmp/inl.err"; \
+	cmp -s "$$tmp/both.c" "$$tmp/inl.c" || { echo "inline-rbs-test: FAIL (agreeing Array[Foo] inline and in --rbs compile differently from inline alone)"; ok=0; }; \
+	grep -v '^Wrote ' "$$tmp/both.err" > "$$tmp/both.e"; grep -v '^Wrote ' "$$tmp/inl.err" > "$$tmp/inl.e"; \
+	cmp -s "$$tmp/both.e" "$$tmp/inl.e" || { echo "inline-rbs-test: FAIL (agreeing Array[Foo] inline and in --rbs drew a diagnostic inline alone does not)"; diff "$$tmp/inl.e" "$$tmp/both.e" | head -5; ok=0; }; \
+	;; \
+	duplicate_rbs_decl) \
+	for mode in "" --no-inline-rbs; do \
+	  if $(SPINEL) $(IRB)/duplicate_rbs_decl.rb $$mode --rbs $(IRB)/sig/duplicate_rbs_decl -c --no-line-map -o "$$tmp/d.c" >"$$tmp/d.err" 2>&1; then echo "inline-rbs-test: FAIL (two different .rbs declarations of one method compiled$${mode:+ with $$mode})"; ok=0; \
+	  else grep -q 'declares Router#path twice with different signatures' "$$tmp/d.err" || { echo "inline-rbs-test: FAIL (an inline annotation changed how --rbs refuses two declarations of one method$${mode:+ with $$mode})"; sed -n 1,5p "$$tmp/d.err"; ok=0; }; fi; \
+	done; \
+	;; \
+	redefine_unannotated|redefine_unannotated_req|redefine_define_method|redefine_class_eval|redefine_ignored) \
+	case $* in redefine_unannotated) at=7; other="redefine_unannotated.rb:12" ;; redefine_unannotated_req) at=4; other="redefine_unannotated_part.rb:2" ;; \
+	  redefine_define_method) at=5; other="redefine_define_method.rb:7" ;; redefine_class_eval) at=4; other="redefine_class_eval.rb:9" ;; \
+	  redefine_ignored) at=6; other="redefine_ignored.rb:12" ;; esac; \
+	$(SPINEL) $(IRB)/$*.rb -c --no-line-map -o "$$tmp/i.c" 2>"$$tmp/i.err" || { echo "inline-rbs-test: FAIL ($*: an annotation on a replaced definition stopped the compile)"; sed -n 1,5p "$$tmp/i.err"; ok=0; }; \
+	grep -q "$*.rb:$$at:[0-9:]* warning: inline RBS: .* without an applied annotation, at [^ ]*$$other, replaces this one" "$$tmp/i.err" || { echo "inline-rbs-test: FAIL ($*: no warning at line $$at naming the definition at $$other that replaces it)"; sed -n 1,5p "$$tmp/i.err"; ok=0; }; \
+	$(call IRB_IGNORED,$*.rb); \
+	if $(CC) -O0 -Ilib $(RBS_SEED_STRICT) "$$tmp/i.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/x" 2>/dev/null; then \
+	  "$$tmp/x" > "$$tmp/x.out" 2>"$$tmp/x.err"; rc=$$?; [ $$rc -eq 0 ] || { echo "inline-rbs-test: FAIL ($* exited $$rc; CRuby exits 0)"; ok=0; }; \
+	  cmp -s "$$tmp/x.out" $(IRB)/$*.expected || { echo "inline-rbs-test: FAIL ($* output differs from CRuby)"; ok=0; }; \
+	else echo "inline-rbs-test: FAIL ($*: C did not compile)"; ok=0; fi; \
+	;; \
+	redefine_refused) \
+	for mode in "" "--rbs $(IRB)/sig/redefine_refused"; do \
+	  $(SPINEL) $(IRB)/redefine_refused.rb $$mode -c --no-line-map -o "$$tmp/i.c" 2>"$$tmp/i.err" || { echo "inline-rbs-test: FAIL (redefine_refused $$mode: a replaced annotation and a refused one stopped the compile)"; sed -n 1,5p "$$tmp/i.err"; ok=0; continue; }; \
+	  grep -q "redefine_refused.rb:7:[0-9:]* warning: inline RBS: .* without an applied annotation, at [^ ]*redefine_refused.rb:10, replaces this one" "$$tmp/i.err" || { echo "inline-rbs-test: FAIL (redefine_refused $$mode: no warning at line 7 naming the definition at line 10 that replaces it)"; sed -n 1,5p "$$tmp/i.err"; ok=0; }; \
+	  grep -q 'redefine_refused.rb:9:3: warning: inline RBS: the signature of `m` is not applied: `Wibble` names no type Spinel can pin' "$$tmp/i.err" || { echo "inline-rbs-test: FAIL (redefine_refused $$mode: the refused annotation at line 9 was not reported as written)"; sed -n 1,5p "$$tmp/i.err"; ok=0; }; \
+	  $(SPINEL) $(IRB)/redefine_refused.rb $$mode --no-inline-rbs -c --no-line-map -o "$$tmp/n.c" >/dev/null 2>&1; \
+	  cmp -s "$$tmp/i.c" "$$tmp/n.c" || { echo "inline-rbs-test: FAIL (redefine_refused $$mode: an annotation that was reported was applied, in part or whole)"; diff "$$tmp/n.c" "$$tmp/i.c" | head -10; ok=0; }; \
+	  if $(CC) -O0 -Ilib $(RBS_SEED_STRICT) "$$tmp/i.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/x" 2>/dev/null; then \
+	    "$$tmp/x" > "$$tmp/x.out" 2>"$$tmp/x.err"; rc=$$?; [ $$rc -eq 0 ] || { echo "inline-rbs-test: FAIL (redefine_refused $$mode exited $$rc; CRuby exits 0)"; ok=0; }; \
+	    cmp -s "$$tmp/x.out" $(IRB)/redefine_refused.expected || { echo "inline-rbs-test: FAIL (redefine_refused $$mode output differs from CRuby)"; ok=0; }; \
+	  else echo "inline-rbs-test: FAIL (redefine_refused $$mode: C did not compile)"; ok=0; fi; \
+	done; \
+	$(call IRB_IGNORED,redefine_refused.rb); \
+	for fl in "" --int-overflow=promote; do tools/inline_rbs_ignored.sh $(SPINEL) $(IRB)/redefine_refused.rb --rbs sig/redefine_refused $$fl || ok=0; done; \
+	;; \
+	mixin_not_applied) \
+	for tp in mixin_include=6:3:include mixin_extend=4:3:extend mixin_prepend=4:3:prepend mixin_truthful=4:3:include mixin_req=mixin_req_part.rb:2:3:include; do \
+	  t=$${tp%%=*}; pos=$${tp#*=}; how=$${pos##*:}; pos=$${pos%:*}; case $$pos in *.rb:*) ;; *) pos=$$t.rb:$$pos ;; esac; \
+	  $(SPINEL) $(IRB)/$$t.rb -c --no-line-map -o "$$tmp/i.c" 2>"$$tmp/i.err" || { echo "inline-rbs-test: FAIL ($$t: an annotation on a mixed-in module's method stopped the compile)"; sed -n 1,5p "$$tmp/i.err"; ok=0; continue; }; \
+	  grep -q "$$pos: warning: inline RBS: the signature of .* is not applied: it is a method of a module mixed in with $$how," "$$tmp/i.err" || { echo "inline-rbs-test: FAIL ($$t: no warning at $$pos for a module mixed in with $$how)"; sed -n 1,5p "$$tmp/i.err"; ok=0; }; \
+	  [ "$$(grep -c 'warning: inline RBS' "$$tmp/i.err")" = 1 ] || { echo "inline-rbs-test: FAIL ($$t: expected one inline RBS warning)"; cat "$$tmp/i.err"; ok=0; }; \
+	  $(SPINEL) $(IRB)/$$t.rb --no-inline-rbs -c --no-line-map -o "$$tmp/n.c" >/dev/null 2>&1; \
+	  cmp -s "$$tmp/i.c" "$$tmp/n.c" || { echo "inline-rbs-test: FAIL ($$t: an annotation that was reported was applied, in part or whole)"; diff "$$tmp/n.c" "$$tmp/i.c" | head -10; ok=0; }; \
+	  $(call IRB_IGNORED,$$t.rb); \
+	  if $(CC) -O0 -Ilib $(RBS_SEED_STRICT) "$$tmp/i.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/x" 2>/dev/null; then \
+	    "$$tmp/x" > "$$tmp/x.out" 2>"$$tmp/x.err"; rc=$$?; [ $$rc -eq 0 ] || { echo "inline-rbs-test: FAIL ($$t exited $$rc; CRuby exits 0)"; ok=0; }; \
+	    cmp -s "$$tmp/x.out" $(IRB)/$$t.expected || { echo "inline-rbs-test: FAIL ($$t output differs from CRuby)"; ok=0; }; \
+	  else echo "inline-rbs-test: FAIL ($$t: C did not compile)"; ok=0; fi; \
+	done; \
+	$(SPINEL) $(IRB)/mixin_include.rb -c --no-line-map -o "$$tmp/i.c" 2>/dev/null; \
+	$(SPINEL) $(IRB)/mixin_include.rb --no-inline-rbs --rbs $(IRB)/sig/mixin_include -c --no-line-map -o "$$tmp/r.c" 2>"$$tmp/r.err" || { echo "inline-rbs-test: FAIL (mixin_include: the --rbs compile failed)"; sed -n 1,5p "$$tmp/r.err"; ok=0; }; \
+	cmp -s "$$tmp/i.c" "$$tmp/r.c" || { echo "inline-rbs-test: FAIL (mixin_include: the reported annotation and the equivalent --rbs signature produce different C)"; diff "$$tmp/r.c" "$$tmp/i.c" | head -10; ok=0; }; \
+	$(SPINEL) $(IRB)/mixin_include.rb --rbs $(IRB)/sig/mixin_include -c --no-line-map -o "$$tmp/b.c" 2>/dev/null || { echo "inline-rbs-test: FAIL (mixin_include: the annotation and the --rbs signature together stopped the compile)"; ok=0; }; \
+	cmp -s "$$tmp/i.c" "$$tmp/b.c" || { echo "inline-rbs-test: FAIL (mixin_include: the annotation and the --rbs signature together changed the C)"; ok=0; }; \
+	if $(SPINEL) $(IRB)/mixin_controls.rb -c --no-line-map -o "$$tmp/c.c" >"$$tmp/c.err" 2>&1; then echo "inline-rbs-test: FAIL (mixin_controls: false annotations on methods no mixin copies compiled)"; ok=0; fi; \
+	for ln in 35:wide 45:sup 46:cls 47:copy 48:own 49:peek 51:mine 52:solo; do \
+	  grep -q "mixin_controls.rb:$${ln%%:*}: .*contradicted: parameter n of $${ln##*:} " "$$tmp/c.err" || { echo "inline-rbs-test: FAIL (mixin_controls: the annotation on $${ln##*:} was not applied and refused at line $${ln%%:*})"; ok=0; }; done; \
+	if grep -q 'warning: inline RBS' "$$tmp/c.err"; then echo "inline-rbs-test: FAIL (mixin_controls: an annotation that applies was reported as not applied)"; grep 'warning: inline RBS' "$$tmp/c.err"; ok=0; fi; \
+	if $(SPINEL) $(IRB)/mixin_ivar.rb -c --no-line-map -o "$$tmp/v.c" >"$$tmp/v.err" 2>&1; then echo "inline-rbs-test: FAIL (mixin_ivar: a false instance variable annotation compiled)"; ok=0; fi; \
+	[ "$$(grep -c 'mixin_ivar.rb:9: inline RBS annotation contradicted: @x' "$$tmp/v.err")" = 1 ] || { echo "inline-rbs-test: FAIL (mixin_ivar: one false assignment was not reported exactly once)"; cat "$$tmp/v.err"; ok=0; }; \
+	;; \
+	analyzer_warnings) \
+	$(SPINEL) $(IRB)/analyzer_warnings.rb -c --no-line-map -o "$$tmp/w.c" 2>"$$tmp/w.err" || { echo "inline-rbs-test: FAIL (an annotation the compiler cannot apply stopped the compile)"; sed -n 1,5p "$$tmp/w.err"; ok=0; }; \
+	$(SPINEL) $(IRB)/analyzer_warnings.rb --no-inline-rbs -c --no-line-map -o "$$tmp/n.c" >/dev/null 2>&1; \
+	cmp -s "$$tmp/w.c" "$$tmp/n.c" || { echo "inline-rbs-test: FAIL (an annotation the compiler reported was applied, in part or whole)"; diff "$$tmp/n.c" "$$tmp/w.c" | head -10; ok=0; }; \
+	$(call IRB_IGNORED,analyzer_warnings.rb); \
+	for w in 'analyzer_warnings_part.rb:3:3: warning: inline RBS: the signature of `part_count` is not applied: `Array[Set]` names no type' \
+	         'analyzer_warnings.rb:9:3: warning: inline RBS: the declaration of @log is not applied: `Array[Time]` names no type' \
+	         'analyzer_warnings.rb:12:24: warning: inline RBS: this type is not applied: `Time?` names no type' \
+	         'analyzer_warnings.rb:10:3: warning: inline RBS: the declaration of @zone is not applied: `Net::HTTP` names no type' \
+	         'analyzer_warnings.rb:20:3: warning: inline RBS: the signature of `at` is not applied: `Time` names no type' \
+	         'analyzer_warnings.rb:25:3: warning: inline RBS: the signature of `size` is not applied: `Pathname` names no type' \
+	         'analyzer_warnings.rb:33:1: warning: inline RBS: this instance variable declaration is not applied: it is not inside a class body'; do \
+	  grep -qF "$$w" "$$tmp/w.err" || { echo "inline-rbs-test: FAIL (no warning '$$w')"; ok=0; }; done; \
+	[ "$$(grep -c 'warning: inline RBS' "$$tmp/w.err")" = 7 ] || { echo "inline-rbs-test: FAIL (expected 7 inline RBS warnings)"; cat "$$tmp/w.err"; ok=0; }; \
+	if grep -q 'obj_' "$$tmp/w.err"; then echo "inline-rbs-test: FAIL (a warning spelled a type as a seed tag, not as written)"; ok=0; fi; \
+	if $(CC) -O0 -Ilib "$$tmp/w.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/w" 2>/dev/null; then \
+	  "$$tmp/w" > "$$tmp/w.out" 2>/dev/null; cmp -s "$$tmp/w.out" $(IRB)/analyzer_warnings.expected || { echo "inline-rbs-test: FAIL (analyzer_warnings.rb output differs from CRuby)"; ok=0; }; \
+	else echo "inline-rbs-test: FAIL (analyzer_warnings.rb: C did not compile)"; ok=0; fi; \
+	;; \
+	dump_ast_malformed) \
+	for m in --dump-ast --emit-types --emit-rbs; do for tp in syntax_error=3:15 syntax_error_multiline=4:18; do \
+	  t=$${tp%%=*}; pos=$${tp#*=}; \
+	  if $(SPINEL) $(IRB)/$$t.rb $$m -o "$$tmp/m.out" >"$$tmp/m.std" 2>"$$tmp/m.err"; then echo "inline-rbs-test: FAIL ($$t.rb $$m: a malformed signature exited 0)"; ok=0; \
+	  else grep -q "$$t.rb:$$pos: inline RBS syntax error" "$$tmp/m.err" || { echo "inline-rbs-test: FAIL ($$t.rb $$m: the malformed signature was not reported at $$pos)"; sed -n 1,5p "$$tmp/m.err"; ok=0; }; fi; \
+	done; done; \
+	;; \
+	contradiction_inline) \
+	if $(SPINEL) $(IRB)/contradiction_inline.rb -c --no-line-map -o "$$tmp/c.c" >"$$tmp/c.err" 2>&1; then echo "inline-rbs-test: FAIL (annotations the program contradicts compiled)"; ok=0; \
+	else for at in "9:@reading is declared Integer at [^ ]*contradiction_inline.rb:6 " "13:Meter#label is declared to return Integer at [^ ]*contradiction_inline.rb:12 " \
+	               "21:parameter n of scale is declared Integer at [^ ]*contradiction_inline.rb:15 "; do \
+	  grep -q "contradiction_inline.rb:$${at%%:*}: inline RBS annotation contradicted: $${at#*:}" "$$tmp/c.err" || { echo "inline-rbs-test: FAIL (no contradiction at contradiction_inline.rb:$${at%%:*} reported as the annotation's)"; sed -n 1,9p "$$tmp/c.err"; ok=0; }; done; \
+	  if grep -q 'seed contradicted' "$$tmp/c.err"; then echo "inline-rbs-test: FAIL (a contradicted inline annotation was reported as an --rbs seed)"; ok=0; fi; fi; \
+	if $(SPINEL) $(IRB)/contradiction_inline.rb --no-inline-rbs --rbs $(IRB)/sig/contradiction_inline -c --no-line-map -o "$$tmp/r.c" >"$$tmp/r.err" 2>&1; then echo "inline-rbs-test: FAIL (the same signatures through --rbs compiled)"; ok=0; \
+	else [ "$$(grep -c 'seed contradicted' "$$tmp/r.err")" = 3 ] || { echo "inline-rbs-test: FAIL (the same signatures through --rbs did not give the three --rbs contradictions)"; sed -n 1,9p "$$tmp/r.err"; ok=0; }; fi; \
+	;; \
+	objarray_boxed) \
+	$(SPINEL) $(IRB)/objarray_boxed.rb -c --no-line-map -o "$$tmp/o.c" 2>"$$tmp/o.err" || { echo "inline-rbs-test: FAIL (objarray_boxed did not compile)"; sed -n 1,3p "$$tmp/o.err"; ok=0; }; \
+	grep -q 'objarray_boxed.rb:11:[0-9:]* warning: inline RBS: the type of Box @items is not applied' "$$tmp/o.err" || { echo "inline-rbs-test: FAIL (an Array[Foo] annotation the array cannot honour was not reported at its line)"; sed -n 1,3p "$$tmp/o.err"; ok=0; }; \
+	if grep -q 'warning: --rbs' "$$tmp/o.err"; then echo "inline-rbs-test: FAIL (an inline annotation was reported as --rbs)"; ok=0; fi; \
+	$(call IRB_IGNORED,objarray_boxed.rb); \
+	if $(CC) -O0 -Ilib "$$tmp/o.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/o" 2>/dev/null; then \
+	  "$$tmp/o" > "$$tmp/o.out" 2>/dev/null; cmp -s "$$tmp/o.out" $(IRB)/objarray_boxed.expected || { echo "inline-rbs-test: FAIL (objarray_boxed output differs from CRuby)"; ok=0; }; \
+	else echo "inline-rbs-test: FAIL (objarray_boxed: C did not compile)"; ok=0; fi; \
+	;; \
+	*) echo "inline-rbs-test: FAIL (no check named $*)"; ok=0 ;; \
+	esac; } > "$$tmp/log" 2>&1; \
+	cat "$$tmp/log"; rm -rf "$$tmp"; echo $$ok > $@
+endif
+
 # The .ok target is the test's stamp. Order-only $(SPINEL) keeps a
 # compiler relink from invalidating every test.
 # One snapshot test: compile $< with the integrated pipeline, run, diff
@@ -2886,6 +3758,13 @@ GATE_CACHE ?= 1
 export GATE_CACHE
 RESULT_CACHE_HARNESS := 1
 RESULT_CACHE_FP = $(if $(filter 0,$(GATE_CACHE)),off,$(eval RESULT_CACHE_FP := $(shell RC_CC="$(CC)" tools/result_cache.sh fp $(SP_RT_LIB) $(SP_RT_MT_LIB) $(BUNDLED_NATIVE_OBJS) $(BUNDLED_NATIVE_MT_OBJS) $(PCH_PLAIN) $(PCH_NOPOLY) $(SPINEL_TIMEOUT)))$(RESULT_CACHE_FP))
+# A `<test>.rb.opt` file beside a test names the C optimization flag it is
+# compiled with (`-O0`), for a test whose C is a shape the optimizer does not
+# finish: test/cmethod_chain_reachability.rb's 24-deep static-inline chain,
+# which clang's inliner expands in full once the checked arithmetic lost the
+# sentinel test that kept each frame from inlining (the test checks the
+# reachability walk, not the C). Like the >= 2000-line rule it drops the
+# PCH, which was built at the default level.
 define RUN_ONE_TEST
 @mkdir -p $(TEST_RESULT_DIR)
 @# Raise the descriptor soft limit toward the hard one, best effort. A test
@@ -2907,23 +3786,29 @@ if [ -f "$<.args" ]; then args=$$(cat "$<.args"); fi; \
 stdinf=/dev/null; \
 if [ -f "$<.stdin" ]; then stdinf="$<.stdin"; fi; \
 rm -f "$@.diff" "$@.cached"; \
-ckey=""; hit=0; \
+ckey=""; hit=0; own=0; \
 $(SPINEL) "$<" $(SP_OV_FLAG) -c --no-line-map -o "$$cfile" 2>/dev/null && \
 { pchuse="$(PCH_USE_PLAIN)"; pchf="$(PCH_PLAIN)"; \
   if head -2 "$$cfile" | grep -q SP_TU_NO_POLY_RENDER; then pchuse="$(PCH_USE_NOPOLY)"; pchf="$(PCH_NOPOLY)"; fi; \
   [ -f "$$pchf" ] || pchuse=""; \
+  if sed -n '1,/^#include "spinel_rt.h"/p' "$$cfile" | grep '^#define' | grep -qv SP_TU_NO_POLY_RENDER; then pchuse=""; fi; \
   xlibs=$$(sed -n 's|^/\* SPINEL_LINK: \(.*\) \*/$$|\1|p' "$$cfile" | tr '\n' ' '); \
   bigopt=""; \
   if [ "$$(wc -l < "$$cfile")" -ge 2000 ]; then bigopt="-O0"; pchuse=""; fi; \
+  if [ -f "$<.opt" ]; then bigopt=$$(cat "$<.opt"); pchuse=""; fi; \
   mtdef=""; rtlib="$(SP_RT_LIB)"; natobjs="$(BUNDLED_NATIVE_OBJS)"; mtld=""; \
   if grep -q SPINEL_USES_THREADS "$$cfile"; then \
     mtdef="$(MT_DEF)"; rtlib="$(SP_RT_MT_LIB)"; natobjs="$(BUNDLED_NATIVE_MT_OBJS)"; mtld="-lpthread"; pchuse=""; \
   fi; \
   if [ -f "$<.expected" ]; then \
     ckey=$$(RC_CC="$(CC)" tools/result_cache.sh key "$<" "$$cfile" \
-      "$(RESULT_CACHE_FP)|$(RESULT_CACHE_HARNESS)|$(CC)|$(TEST_SINGLE_INVOKE)|$(CFLAGS) $$bigopt $(SP_OV_DEFINE) $$mtdef -Werror $(TEST_WARN_SUPPRESS) $(SEC_FLAGS) $$pchuse -Ilib|$$natobjs $$rtlib $(LDFLAGS) -lm $$mtld $$xlibs $(GC_FLAGS)|$(TIMEOUT10)|share=$(SPINEL_SHARE_STRINGS)" \
+      "$(RESULT_CACHE_FP)|$(RESULT_CACHE_HARNESS)|$(CC)|$(TEST_SINGLE_INVOKE)|$(CFLAGS) $$bigopt $(SP_OV_DEFINE) $$mtdef -Werror $(TEST_WARN_SUPPRESS) $(SEC_FLAGS) $$pchuse -Ilib|$$natobjs $$rtlib $(LDFLAGS) -lm $$mtld $$xlibs $(GC_FLAGS)|$(TIMEOUT10)" \
       "$<.expected" "$<.err.expected" "$<.args" "$<.stdin"); \
-    if [ -n "$$ckey" ] && tools/result_cache.sh get "$$ckey" 2>/dev/null | grep -qx PASS; then hit=1; fi; \
+    if [ -n "$$ckey" ]; then \
+      if tools/result_cache.sh get "$$ckey" 2>/dev/null | grep -qx PASS; then hit=1; \
+      elif tools/result_cache.sh claim "$$ckey"; then own=1; \
+      elif tools/result_cache.sh await "$$ckey" 2>/dev/null | grep -qx PASS; then hit=1; fi; \
+    fi; \
   fi; \
   if [ $$hit = 1 ]; then \
     :; \
@@ -2962,7 +3847,7 @@ elif [ $$built -eq 0 ]; then \
     if [ -t 1 ]; then printf .; fi; \
   else \
     echo FAIL > "$@"; \
-    { if [ "$$run_rc" -eq 124 ]; then echo "=== timed out after 10s (the output below is partial) ==="; fi; \
+    { if [ "$$run_rc" -eq 124 ]; then echo "=== timed out: 10 s of CPU, or the clock backstop of 60 s (the output below is partial) ==="; fi; \
       echo "=== stdout diff (expected vs actual) ==="; diff -u "$$exp.n" "$$act.n" || true; \
       echo "=== stderr diff (expected vs actual) ==="; diff -u "$$experr.n" "$$acterr.n" || true; } > "$@.diff" 2>&1; \
     if [ -t 1 ]; then printf F; fi; \
@@ -2971,6 +3856,7 @@ else \
   echo ERR > "$@"; \
   if [ -t 1 ]; then printf E; fi; \
 fi; \
+if [ $$own = 1 ]; then tools/result_cache.sh release "$$ckey"; fi; \
 rm -f "$$cfile" "$$cfile.o"; \
 rm -rf "$$tmpdir"
 endef
@@ -3063,6 +3949,17 @@ BENCH_COMPILE_K ?= 100 200
 bench-compile: $(SPINEL)
 	@ruby tools/compile_scale.rb $(BENCH_COMPILE_K)
 
+# What an RBS signature buys on one hot path (docs/inline-rbs.md): the loop of
+# benchmark/bm_rbs_items.rb built without RBS, with its inline annotation and
+# with the same signature through --rbs, beside a control inference already
+# types; the call's dispatch in the C, binary and .text sizes, interleaved
+# timings and CRuby parity. A measurement, not part of the gate.
+# BENCH_RBS_ARGS="--runs 11 --n 200000000" sets the repetitions and the size.
+BENCH_RBS_ARGS ?=
+.PHONY: bench-rbs
+bench-rbs: $(SPINEL) $(SP_RT_LIB) rbs-seed-extractor
+	@ruby tools/rbs_bench.rb $(BENCH_RBS_ARGS)
+
 bench: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	@if [ -z "$(TIMEOUT_BIN)" ]; then echo "Note: no 'timeout' command found; running without time limits."; fi
 	@rm -rf build/bench-results; mkdir -p build/bench-results
@@ -3129,9 +4026,9 @@ $(RUBYSPEC_DIR)/.pinned:
 # (core/comparable is not enrolled: its specs build fixture classes through
 # Module.new/def_method patterns the extractor can't project -- 53 of 54
 # extract as HARNESS-SKEW, leaving nothing to defend.)
-RUBYSPEC_SUITES := language core/array core/string core/hash core/integer core/range
+RUBYSPEC_SUITES := language core/array core/string core/hash core/integer core/range core/symbol core/float core/matchdata core/set core/math core/rational core/nil core/true core/false core/time core/proc core/regexp core/exception core/struct core/complex core/random
 
-rubyspec: $(SPINEL) $(RUBYSPEC_DIR)/.pinned
+rubyspec: $(SPINEL) $(RUBYSPEC_DIR)/.pinned | $(SPINEL_TIMEOUT)
 	@for d in $(RUBYSPEC_SUITES); do \
 	  nm=$$(echo $$d | tr / -); \
 	  echo "=== ruby/spec $$d ==="; \
@@ -3156,7 +4053,7 @@ rubyspec: $(SPINEL) $(RUBYSPEC_DIR)/.pinned
 # list exactly once, so the shards' combined result is the same gate the
 # unsharded target runs. Unset (the default), the whole list runs, byte-for-byte
 # as before.
-rubyspec-gate: $(SPINEL) $(RUBYSPEC_DIR)/.pinned
+rubyspec-gate: $(SPINEL) $(RUBYSPEC_DIR)/.pinned | $(SPINEL_TIMEOUT)
 	@ok=1; for d in $(RUBYSPEC_SUITES); do \
 	  nm=$$(echo $$d | tr / -); \
 	  rm -rf build/rubyspec-ex-$$nm build/rubyspec-gate-$$nm.tsv; \
@@ -3240,7 +4137,33 @@ optcarrot: $(SPINEL) $(SP_RT_LIB) $(SPINEL_TIMEOUT)
 	  exit 1; \
 	fi
 
+# ---- Rubyboy integration test ----
+# Rubyboy is a Game Boy emulator. Its headless benchmark prints the checksum of
+# the final frame, which CRuby prints too for the same number of frames.
+RUBYBOY_DIR  := build/rubyboy
+RUBYBOY_REPO := https://github.com/sacckey/rubyboy.git
+RUBYBOY_TAG  := v1.7.1
+RUBYBOY_CHECKSUM := 661048662
+
+rubyboy: $(SPINEL) $(SP_RT_LIB) $(SPINEL_TIMEOUT)
+	@if [ ! -d $(RUBYBOY_DIR) ]; then \
+	  git clone --depth=1 --branch=$(RUBYBOY_TAG) $(RUBYBOY_REPO) $(RUBYBOY_DIR); \
+	fi
+	@$(SPINEL) -I $(RUBYBOY_DIR)/lib $(RUBYBOY_DIR)/exe/rubyboy-bench -o build/rubyboy-bench
+	@out=$$($(TIMEOUT60) ./build/rubyboy-bench --frames 600 --count 3 2>&1); \
+	echo "$$out"; \
+	if echo "$$out" | grep -q "^Checksum: $(RUBYBOY_CHECKSUM)$$"; then \
+	  echo "Rubyboy: OK"; \
+	else \
+	  echo "Rubyboy: FAIL -- expected 'Checksum: $(RUBYBOY_CHECKSUM)'"; \
+	  exit 1; \
+	fi
+
 # ---- Developer gates ----
+.PHONY: cext-header-test
+cext-header-test:
+	@CC="$(CC)" sh test/cext/header-test.sh
+
 #
 # `test`, `bench` and `optcarrot` only READ the compiler binaries and
 # write to disjoint build/ dirs, so they run concurrently as parallel
@@ -3257,7 +4180,31 @@ check:
 	+@$(MAKE) --no-print-directory test OPT=-O1
 	+@$(MAKE) --no-print-directory alloc-report-test
 	+@$(MAKE) --no-print-directory infer-test
+	+@$(MAKE) --no-print-directory respond-to-audit
+	+@$(MAKE) --no-print-directory gen-respond-to-tables-test
 	+@$(MAKE) --no-print-directory spin-check
+
+# tools/gen_respond_to_tables.rb's own unit tests (dedup, false-positive
+# exclusion, the Proc/Range/Symbol/Exception self-checks' failure paths)
+# and a regression test that executes the Makefile's own
+# lib/spinel_rt_responds_generated.h recipe (with the generator swapped
+# for a command that fails the same way a real self-check failure does)
+# to prove it fails closed rather than silently overwriting a good header
+# with empty output. Neither file has CRuby-comparable runtime behavior
+# of its own, so this runs here rather than as a test/*.rb corpus entry.
+gen-respond-to-tables-test: lib/spinel_rt.h
+	ruby tools/gen_respond_to_tables_test.rb
+	ruby tools/gen_respond_to_tables_makefile_test.rb
+
+# Cross-checks sp_poly_responds_builtin's per-class method tables
+# (lib/spinel_rt.h) against src/builtin_ops.c's bop_rows, the actual
+# dispatch registry, so the two cannot drift silently again the way they
+# did before this target existed (tools/respond_to_audit.rb has the full
+# story and its scope's limits).
+respond-to-audit: $(SPINEL) $(SP_RT_LIB)
+	@ref_ruby="$(REF_RUBY)"; [ -n "$$ref_ruby" ] || ref_ruby=ruby; \
+	if ! command -v "$$ref_ruby" >/dev/null 2>&1; then echo "respond-to-audit: skipped (needs $$ref_ruby)"; exit 0; fi; \
+	SPINEL=$(SPINEL) "$$ref_ruby" tools/respond_to_audit.rb --ref "$$ref_ruby"
 
 # SPINEL_ALLOC_REPORT / SPINEL_ALLOC_SITES (#1336): the site is an address, so
 # assert the line SHAPE rather than a snapshot -- per-type lines without the
@@ -3282,6 +4229,14 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	  grep -q 'static sp_PointValue sp_PointValue_new(' "$$tmp/oir.c" && ! grep -q 'iv_unused;' "$$tmp/oir.c" || { echo "infer-test: FAIL (an Object setter changes unrelated layouts)"; ok=0; }; \
 	  $(SPINEL) $$flags test/hash_store_boxed_unbounded.rb -c --no-line-map -o "$$tmp/hbu.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (hash_store_boxed_unbounded: -c)"; ok=0; }; \
 	  ! grep -q 'sp_PolyPolyHash_new' "$$tmp/hbu.c" || { echo "infer-test: FAIL (an unbounded boxed store widened a known Hash)"; ok=0; }; \
+	  $(SPINEL) $$flags test/index_read_unsettled_local.rb -c --no-line-map -o "$$tmp/iru.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (index_read_unsettled_local: -c)"; ok=0; }; \
+	  ! grep -q 'sp_RbVal lv_line\b' "$$tmp/iru.c" || { echo "infer-test: FAIL (an index read guessed a settling local a Hash and boxed a block parameter)"; ok=0; }; \
+	  $(SPINEL) $$flags -e 'def run = 0' -e 'p run' -c --no-line-map -o "$$tmp/dfn.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (a statement def: -c)"; ok=0; }; \
+	  grep -q 'SP_TU_NO_POLY_RENDER' "$$tmp/dfn.c" || { echo "infer-test: FAIL (a statement def made its name a Symbol of the program)"; ok=0; }; \
+	  $(SPINEL) $$flags test/no_poly_values_unrun_code.rb -c --no-line-map -o "$$tmp/npu.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (no_poly_values_unrun_code: -c)"; ok=0; }; \
+	  grep -q 'SP_TU_NO_POLY_VALUES' "$$tmp/npu.c" || { echo "infer-test: FAIL (code the program never runs counted as a poly value)"; ok=0; }; \
+	  $(SPINEL) $$flags -e 'module Host' -e '  ffi_func :abs, [:int], :int' -e 'end' -e 'module Fn' -e '  def self.run = Host.abs(-3)' -e 'end' -e 'p Fn.run' -c --no-line-map -o "$$tmp/npf.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (an ffi_func program: -c)"; ok=0; }; \
+	  grep -q 'SP_TU_NO_POLY_VALUES' "$$tmp/npf.c" || { echo "infer-test: FAIL (an ffi_func's argument list counted as a poly value)"; ok=0; }; \
 	  for t in $(patsubst test/%.rb,%,$(shell grep -l '^\# spinel: infer-ivar-get$$' test/*.rb)); do \
 	    $(SPINEL) $$flags test/$$t.rb -c --no-line-map -o "$$tmp/ivg.c" >/dev/null 2>&1 || { echo "infer-test: FAIL ($$t: -c)"; ok=0; }; \
 	    ! grep -Eq 'else if \(_t[0-9]+.tag == SP_TAG_CLASS\)' "$$tmp/ivg.c" || { echo "infer-test: FAIL ($$t: an instance-only getter boxes class ivars)"; ok=0; }; \
@@ -3316,6 +4271,8 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -A1 -E '_t[0-9]+ = lv_env;' "$$tmp/rfp_w.c" | grep -q 'SP_GC_ROOT(_t' || { echo "infer-test: FAIL (a reassigned parameter's argument temp lost its root)"; ok=0; }; \
 	$(SPINEL) test/infer/hash_one_class_each_value.rb -c --no-line-map -o "$$tmp/hoc.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (hash_one_class_each_value: -c)"; ok=0; }; \
 	grep -q 'sp_Item \* lv_it' "$$tmp/hoc.c" && grep -q 'sp_Item_describe((sp_Item \*)lv_it)' "$$tmp/hoc.c" || { echo "infer-test: FAIL (#4846 a one-class hash's each_value is not typed)"; ok=0; }; \
+	$(SPINEL) test/boxed_recv_class_set_binding.rb -c --no-line-map -o "$$tmp/bcs.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (boxed_recv_class_set_binding: -c)"; ok=0; }; \
+	grep -q 'sp_int sp_Seq_output(sp_Seq \*self, sp_int lv_col, sp_int lv_shift)' "$$tmp/bcs.c" || { echo "infer-test: FAIL (#8530 a call on a boxed receiver bound the parameters of a class it never holds)"; ok=0; }; \
 	$(SPINEL) test/class_ancestor_tests_dynamic.rb -c --no-line-map -o "$$tmp/cat.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (class_ancestor_tests_dynamic: -c)"; ok=0; }; \
 	awk '/^static int sp_class_le_mod\(/,/^}/' "$$tmp/cat.c" > "$$tmp/cat_le.c"; \
 	grep -q 'sp_class_anc_walk(a,b,NULL)' "$$tmp/cat_le.c" && ! grep -q 'sp_class_ancestors(' "$$tmp/cat_le.c" || { echo "infer-test: FAIL (a module-aware class test builds the ancestors array)"; ok=0; }; \
@@ -3327,13 +4284,17 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -q 'sp_push_other(sp_PolyArray \* lv_a)' "$$tmp/ead.c" && grep -q 'sp_untouched(sp_PolyArray \* lv_xs)' "$$tmp/ead.c" || { echo "infer-test: FAIL (an empty [] default no longer widens, or lost its poly-array default)"; ok=0; }; \
 	$(SPINEL) test/frozen_literal_warning_op_write.rb -c --no-line-map -o "$$tmp/flw.c" 2> "$$tmp/flw.err" >/dev/null || { echo "infer-test: FAIL (frozen_literal_warning_op_write: -c)"; ok=0; }; \
 	grep -q '`text` only ever holds frozen string literals' "$$tmp/flw.err" && ! grep -Eq '`(s|m)` only ever holds frozen string literals' "$$tmp/flw.err" || { echo "infer-test: FAIL (the frozen-literal << warning is wrong about a local an op-write or and-write assigns)"; ok=0; }; \
-	$(SPINEL) test/infer/define_method_runtime_name_next.rb -c --no-line-map -o "$$tmp/dmr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (define_method_runtime_name_next: -c)"; ok=0; }; \
-	grep -q 'sp_sym sp_Maker_s_make(' "$$tmp/dmr.c" && grep -q 'sp_int sp_Maker_s_count(' "$$tmp/dmr.c" && grep -q 'sp_sym sp_Maker_s_mixed(' "$$tmp/dmr.c" || { echo "infer-test: FAIL (a next in a define_method block with a run-time name is read as the enclosing method's return)"; ok=0; }; \
+	$(SPINEL) test/infer/define_method_literal_names_next.rb -c --no-line-map -o "$$tmp/dmr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (define_method_literal_names_next: -c)"; ok=0; }; \
+	grep -q 'sp_sym sp_Maker_s_make(' "$$tmp/dmr.c" && grep -q 'sp_int sp_Maker_s_count(' "$$tmp/dmr.c" && grep -q 'sp_sym sp_Maker_s_mixed(' "$$tmp/dmr.c" || { echo "infer-test: FAIL (a next in a define_method block is read as the enclosing method's return)"; ok=0; }; \
 	$(SPINEL) test/string_append_interp_int.rb -c --no-line-map -o "$$tmp/sai.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (string_append_interp_int: -c)"; ok=0; }; \
 	grep -q 'sp_String_append_n(lv_out, _d[0-9]* + 1, (size_t)(sp_w_int(_d[0-9]* + 1, _t[0-9]*)' "$$tmp/sai.c" && ! grep -q 'sp_int_to_s(' "$$tmp/sai.c" || { echo "infer-test: FAIL (an appended interpolation builds a String for each Integer part)"; ok=0; }; \
 	SPINEL_SPLIT_STRICT=1 $(SPINEL) --jobs=3 test/dispatch_override_param_list.rb -o "$$tmp/split" >/dev/null 2>&1 && "$$tmp/split" | cmp -s - test/dispatch_override_param_list.rb.expected || { echo "infer-test: FAIL (#4847 --jobs=3 split build)"; ok=0; }; \
 	SPINEL_SPLIT_STRICT=1 $(SPINEL) --int-overflow=promote --jobs=3 test/infer/split_build_overflow_mode.rb -o "$$tmp/splitov" >/dev/null 2>&1 && [ "$$("$$tmp/splitov" 2>&1 | tr '\n' ' ')" = "18446744073709551623 36893488147419103232 " ] || { echo "infer-test: FAIL (a split build's parts are not compiled in --int-overflow=promote)"; ok=0; }; \
 	SPINEL_SPLIT_STRICT=1 $(SPINEL) --int-overflow=wrap --jobs=3 test/infer/split_build_overflow_mode.rb -o "$$tmp/splitov" >/dev/null 2>&1 && [ "$$("$$tmp/splitov" 2>&1 | tr '\n' ' ')" = "7 0 " ] || { echo "infer-test: FAIL (a split build's parts are not compiled in --int-overflow=wrap)"; ok=0; }; \
+	SPINEL_SPLIT_STRICT=1 SPINEL_KEEP_SPLIT=1 $(SPINEL) --jobs=2 test/dispatch_override_param_list.rb -o "$$tmp/splitm" >/dev/null 2>"$$tmp/splitm.err"; d=$$(sed -n 's/^spinel: split kept at //p' "$$tmp/splitm.err"); \
+	{ [ -n "$$d" ] && grep -q '^# [0-9][0-9]* ".*" 3' "$$d/sp_split.h" && grep -q '^# [0-9][0-9]* "test/dispatch_override_param_list.rb"$$' "$$d"/sp_part*.c; } || { echo "infer-test: FAIL (#8579 a split build's parts lost the line markers: system headers and the .rb are unmarked)"; ok=0; }; \
+	case "$$d" in /tmp/spinel_split_*) rm -rf "$$d";; esac; \
+	$(SPINEL) --int-overflow=wrap test/infer/wrap_signed_overflow.rb -o "$$tmp/wso" >/dev/null 2>&1 && [ "$$("$$tmp/wso" 2>&1 | tr '\n' ' ')" = "true true true false " ] || { echo "infer-test: FAIL (--int-overflow=wrap arithmetic is signed C, whose overflow the C compiler may assume away)"; ok=0; }; \
 	$(SPINEL) test/infer/file_foreach_block_streams.rb -c --no-line-map -o "$$tmp/ffbs.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (file_foreach_block_streams: -c)"; ok=0; }; \
 	grep -q 'sp_file_readlines(' "$$tmp/ffbs.c" && { echo "infer-test: FAIL (File.foreach with a block reads the whole file through readlines)"; ok=0; }; \
 	$(SPINEL) test/io_each_block_param_typed.rb -c --no-line-map -o "$$tmp/iebp.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (io_each_block_param_typed: -c)"; ok=0; }; \
@@ -3356,7 +4317,7 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -q '^static inline sp_IntIntHash \* sp___enum_tally__[0-9]*(' "$$tmp/tly.c" && grep -q '^static inline sp_StrIntHash \* sp___enum_tally__[0-9]*(' "$$tmp/tly.c" || { echo "infer-test: FAIL (tally over a typed array answers a boxed hash)"; ok=0; }; \
 	$(SPINEL) test/infer/param_narrow_super_route.rb -c --no-line-map -o "$$tmp/psr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (param_narrow_super_route: -c)"; ok=0; }; \
 	grep -q 'sp_Holder_initialize(sp_Holder \*self, sp_RbVal lv_v)' "$$tmp/psr.c" || { echo "infer-test: FAIL (a parameter reached by super was narrowed from the visible calls alone)"; ok=0; }; \
-	grep -q 'sp_Plain_initialize(sp_Plain \*self, sp_int lv_v)' "$$tmp/psr.c" || { echo "infer-test: FAIL (the super guard stopped an unrelated parameter narrowing)"; ok=0; }; \
+	grep -Eq 'sp_Plain_initialize\(sp_Plain \*self, sp_o?int lv_v\)' "$$tmp/psr.c" || { echo "infer-test: FAIL (the super guard stopped an unrelated parameter narrowing)"; ok=0; }; \
 	$(SPINEL) test/infer/ivar_typed_array_meets_boxed_array.rb -c --no-line-map -o "$$tmp/tmb.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (ivar_typed_array_meets_boxed_array: -c)"; ok=0; }; \
 	grep -q 'sp_PolyArray \* iv_xs;' "$$tmp/tmb.c" || { echo "infer-test: FAIL (#5521 a slot holding only Arrays widened to a boxed value)"; ok=0; }; \
 	grep -q 'sp_RbVal iv_ys;' "$$tmp/tmb.c" || { echo "infer-test: FAIL (#4196 two typed array kinds no longer box)"; ok=0; }; \
@@ -3377,11 +4338,21 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -qE 'sp_FloatArray \* _t[0-9]+ = lv_zsum; .*(->frozen|_hcw[0-9_]+) && \(unsigned long long\)' "$$tmp/iof.c" || { echo "infer-test: FAIL (a Float slot's op-assign with a typed-array RHS is not folded in place)"; ok=0; }; \
 	grep -E 'sp_IntArray \* _t[0-9]+ = lv_g;' "$$tmp/iof.c" | grep -q -- '->frozen &&' && { echo "infer-test: FAIL (an op-assign whose RHS runs code was folded through an element pointer)"; ok=0; }; \
 	grep -qE 'sp_IntArray \* _t([0-9]+) = self->iv_a; SP_GC_ROOT\(_t\1\)' "$$tmp/iof.c" || { echo "infer-test: FAIL (an op-assign's receiver is unrooted while a key that can reassign it runs)"; ok=0; }; \
+	$(SPINEL) test/float_opassign_nil_marked.rb -c --no-line-map -o "$$tmp/fonm.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (float_opassign_nil_marked: -c)"; ok=0; }; \
+	awk '/^[a-z].* sp_zero_then_add\(.*\{$$/,/^}/' "$$tmp/fonm.c" | grep -qE 'SP_LIKELY\(_hcw[0-9_]+ && \(unsigned long long\)_t[0-9]+ < \(unsigned long long\)_hcn[0-9_]+\)' || { echo "infer-test: FAIL (a Float op-assign in a cached loop is not folded below the nil-free length of an array analyze marks as able to hold nil)"; ok=0; }; \
+	awk '/^[a-z].* sp_tail_mul\(.*\{$$/,/^}/' "$$tmp/fonm.c" | grep -qE '!SP_MAY_NIL\(_t[0-9]+\) && ' || { echo "infer-test: FAIL (a Float op-assign outside a cached loop is not folded for an array analyze marks as able to hold nil)"; ok=0; }; \
 	$(SPINEL) test/loop_array_header_cache.rb -c --no-line-map -o "$$tmp/lahc.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_array_header_cache: -c)"; ok=0; }; \
 	grep -qE '^#define _SP_HCR[0-9]+\(\) .*lv_bins.*lv_counts.*lv_vals.*lv_sums' "$$tmp/lahc.c" || { echo "infer-test: FAIL (a loop that only indexes typed arrays still reads their headers at every access)"; ok=0; }; \
 	grep -E '^#define _SP_HCR' "$$tmp/lahc.c" | grep -q 'lv_cur\b' && { echo "infer-test: FAIL (an array local the loop reassigns was read through a cached header)"; ok=0; }; \
 	grep -E '^#define _SP_HCR' "$$tmp/lahc.c" | grep -q 'self->iv_v\b' && { echo "infer-test: FAIL (an ivar the loop writes was read through a cached header)"; ok=0; }; \
 	grep -qE '^#define _SP_HCR[0-9]+\(\) .*lv_qv.*lv_qk.*lv_qs' "$$tmp/lahc.c" || { echo "infer-test: FAIL (a class test on a scalar kept a loop from caching its arrays' headers)"; ok=0; }; \
+	$(SPINEL) test/loop_string_getbyte_unheld.rb -c --no-line-map -o "$$tmp/lsgu.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_string_getbyte_unheld: -c)"; ok=0; }; \
+	awk '/^[a-z].* sp_(total|edges|uncached)\(.*\{$$/,/^}/' "$$tmp/lsgu.c" | grep -c 'getbyte_opt(sp_String_cstr(lv_rows), ' | grep -qx 3 || { echo "infer-test: FAIL (String#getbyte with an arithmetic index does not read its receiver where the call needs it)"; ok=0; }; \
+	awk '/^[a-z].* sp_(total|edges|uncached)\(.*\{$$/,/^}/' "$$tmp/lsgu.c" | grep -q 'SP_GC_ROOT(_t' && { echo "infer-test: FAIL (String#getbyte with an arithmetic index fetches and roots its receiver's bytes ahead of the index)"; ok=0; }; \
+	awk '/^[a-z].* sp_built\(.*\{$$/,/^}/' "$$tmp/lsgu.c" | grep -qE 'const char \*_t[0-9]+ = \(sp_String_cstr\(lv_rows\)\); SP_GC_ROOT\(_t' || { echo "infer-test: FAIL (String#getbyte with an index that allocates does not hold its receiver rooted)"; ok=0; }; \
+	$(SPINEL) test/begin_while_locals_not_volatile.rb -c --no-line-map -o "$$tmp/bwv.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (begin_while_locals_not_volatile: -c)"; ok=0; }; \
+	grep -qE 'volatile .* lv_(sum|v|f|n) ' "$$tmp/bwv.c" && { echo "infer-test: FAIL (a local a handler-less begin ... end while writes was declared volatile)"; ok=0; }; \
+	grep -qE 'volatile sp_int lv_x ' "$$tmp/bwv.c" || { echo "infer-test: FAIL (a local a begin with a rescue writes lost its volatile)"; ok=0; }; \
 	$(SPINEL) test/poly_user_relop_no_coerce.rb -c --no-line-map -o "$$tmp/urn.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (poly_user_relop_no_coerce: -c)"; ok=0; }; \
 	grep -q 'SP_INSTALL_HOOK(sp_user_binop_hook, sp_user_binop_dispatch);' "$$tmp/urn.c" || { echo "infer-test: FAIL (a class ordering itself with < and no coerce has no binop table for a boxed comparison)"; ok=0; }; \
 	$(SPINEL) test/loop_bounded_index_read.rb -c --no-line-map -o "$$tmp/lbi.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_bounded_index_read: -c)"; ok=0; }; \
@@ -3393,6 +4364,10 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -F 'while (({ if (SP_UNLIKELY(SP_SAFEPOINT_POLL())) sp_safepoint(), _SP_HCR' "$$tmp/lbp.c" | grep -qF 'sp_fin_run_pending(), _SP_HCR' && grep -qE '_hcd[0-9]+_[0-9]+\[lv_i\]' "$$tmp/lbp.c" || { echo "infer-test: FAIL (a loop that reads a[i] untested does not poll ahead of its i < a.length test)"; ok=0; }; \
 	awk '/^[a-z].* sp_total\(.*\{$$/,/^}/' "$$tmp/lbp.c" | awk 'f { print; exit } /while \(\(\{/ { f = 1 }' | grep -qE 'SP_SAFEPOINT_POLL|SP_FIN_POLL|sp_fin_run_pending' && { echo "infer-test: FAIL (a loop that reads a[i] untested polls between its test and the read)"; ok=0; }; \
 	awk '/^[a-z].* sp_back\(.*\{$$/,/^}/' "$$tmp/lbp.c" | grep -qE '^ +if .*sp_fin_run_pending\(\), _SP_HCR' || { echo "infer-test: FAIL (a cached loop does not read its headers again after a finalizer runs)"; ok=0; }; \
+	$(SPINEL) test/loop_bounded_index_nested.rb -c --no-line-map -o "$$tmp/lbn.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_bounded_index_nested: -c)"; ok=0; }; \
+	grep -qE '_hcd[0-9]+_[0-9]+\[lv_e\]' "$$tmp/lbn.c" && grep -qE '_hcd[0-9]+_[0-9]+\[lv_ie\]' "$$tmp/lbn.c" && grep -qE '_hcd[0-9]+_[0-9]+\[lv_wi\]' "$$tmp/lbn.c" || { echo "infer-test: FAIL (a while nested in a cached loop is not proved by its own i < a.length test)"; ok=0; }; \
+	grep -F 'while (({ if (SP_UNLIKELY(SP_SAFEPOINT_POLL())) sp_safepoint(), _SP_HCR' "$$tmp/lbn.c" | grep -qE '\(lv_e < _hcl[0-9]+_[0-9]+\)' || { echo "infer-test: FAIL (a nested loop that reads a[i] untested does not poll ahead of its i < a.length test)"; ok=0; }; \
+	grep -qE '_hcd[0-9]+_[0-9]+\[lv_(o|ob|oi|mi)\]' "$$tmp/lbn.c" && { echo "infer-test: FAIL (a loop read a[i] untested after a nested loop polled, where the array can have shrunk)"; ok=0; }; \
 	$(SPINEL) test/array_new_fill_sized.rb -c --no-line-map -o "$$tmp/anf.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (array_new_fill_sized: -c)"; ok=0; }; \
 	grep -q 'sp_IntArray_new_fill(' "$$tmp/anf.c" && grep -q 'sp_FloatArray_new_fill(' "$$tmp/anf.c" || { echo "infer-test: FAIL (Array.new(n, v) on an Integer or Float array grows by n pushes instead of allocating n)"; ok=0; }; \
 	$(SPINEL) test/reader_operands_pure_read.rb -c --no-line-map -o "$$tmp/rop.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (reader_operands_pure_read: -c)"; ok=0; }; \
@@ -3400,7 +4375,7 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -qE 'sp_IntArray \* _t[0-9]+ = sp_Loud_vals\(\(sp_Loud \*\)lv_l\); SP_GC_ROOT' "$$tmp/rop.c" || { echo "infer-test: FAIL (a def overriding a reader was taken for a pure field read)"; ok=0; }; \
 	grep -qE '= \(lv_h\)->iv_data; SP_GC_ROOT\(_t' "$$tmp/rop.c" || { echo "infer-test: FAIL (a reader next to a call that reassigns it lost its ordering)"; ok=0; }; \
 	$(SPINEL) test/infer/typed_array_elem_arg_types_param.rb -c --no-line-map -o "$$tmp/tae.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (typed_array_elem_arg_types_param: -c)"; ok=0; }; \
-	grep -q 'sp_Plan_write_column(sp_Plan \*self, sp_int lv_wcol)' "$$tmp/tae.c" || { echo "infer-test: FAIL (an int-array element passed as an argument left the parameter boxed)"; ok=0; }; \
+	grep -Eq 'sp_Plan_write_column\(sp_Plan \*self, sp_o?int lv_wcol\)' "$$tmp/tae.c" || { echo "infer-test: FAIL (an int-array element passed as an argument left the parameter boxed)"; ok=0; }; \
 	grep -q 'sp_Plan_shout(sp_Plan \*self, const char \* lv_s)' "$$tmp/tae.c" || { echo "infer-test: FAIL (a String-array element passed as an argument left the parameter boxed)"; ok=0; }; \
 	grep -q 'sp_Mixed_take(sp_Mixed \*self, sp_RbVal lv_v)' "$$tmp/tae.c" || { echo "infer-test: FAIL (a parameter whose call sites pass two element kinds must keep the boxed slot)"; ok=0; }; \
 	$(SPINEL) test/infer/array_new_default_push_narrows.rb -c --no-line-map -o "$$tmp/and.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (array_new_default_push_narrows: -c)"; ok=0; }; \
@@ -3412,7 +4387,8 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -q 'sp_PolyArray \* lv_ia = ' "$$tmp/iow.c" || { echo "infer-test: FAIL (an Integer Array written a[i] /= <Float> must widen)"; ok=0; }; \
 	$(SPINEL) test/infer/float_elem_fast_paths.rb -c --no-line-map -o "$$tmp/fefp.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (float_elem_fast_paths: -c)"; ok=0; }; \
 	grep -q '__typeof__(cst_K)' "$$tmp/fefp.c" || { echo "infer-test: FAIL (a[i] += <constant> on a Float array missed the in-place fold)"; ok=0; }; \
-	grep -q 'sp_FloatArray_get_recv(lv_a' "$$tmp/fefp.c" && ! grep -q 'SP_FLOAT_NIL_CK(' "$$tmp/fefp.c" || { echo "infer-test: FAIL (a Float array element in a binary + - * / took the up-front nil check instead of the nil-free read)"; ok=0; }; \
+	grep -q 'sp_ofloat_val(({ sp_int _t[0-9]* = lv_i; .*sp_FloatArray_oget(lv_a, ' "$$tmp/fefp.c" && ! grep -q 'SP_FLOAT_NIL_CK(' "$$tmp/fefp.c" || { echo "infer-test: FAIL (a Float array element in a binary + - * / took the up-front nil check instead of the nil-free read)"; ok=0; }; \
+	grep -q 'sp_ofloat_cmp_opnd(sp_FloatArray_oget(lv_a, ' "$$tmp/fefp.c" && ! grep -q 'SP_FLOAT_NIL_CMP_CK(' "$$tmp/fefp.c" || { echo "infer-test: FAIL (a Float array element in a comparison took the up-front nil check of both operands instead of the nil-free read)"; ok=0; }; \
 	$(SPINEL) test/infer/object_array_map.rb -c --no-line-map -o "$$tmp/oam.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (object_array_map: -c)"; ok=0; }; \
 	grep -q 'sp_PtrArray \* iv_list;' "$$tmp/oam.c" || { echo "infer-test: FAIL (#4846 an array of one class walked by map stayed boxed)"; ok=0; }; \
 	grep -q '(lv_x)->iv_name' "$$tmp/oam.c" || { echo "infer-test: FAIL (#4846 an element call is not a direct read)"; ok=0; }; \
@@ -3430,11 +4406,22 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -q '"line":16,"col":4,.*"kind":"CallNode","name":"widen","dispatch":"direct"' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a direct call is reported as one)"; ok=0; }; \
 	grep -q '"line":6,"col":12,"end_line":6,"end_col":13,"kind":"RequiredParameterNode","name":"o","type":"poly","rbs":"untyped"' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a parameter has a record carrying the slot type)"; ok=0; }; \
 	grep -q '"line":4,"col":17,.*"kind":"RequiredParameterNode","name":"x","type":"int","rbs":"Integer"' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a typed parameter record)"; ok=0; }; \
+	$(SPINEL) test/infer/emit_types_nullable.rb --emit-types -o "$$tmp/etn.json" >/dev/null 2>&1 || { echo "infer-test: FAIL (--emit-types on emit_types_nullable)"; exit 1; }; \
+	grep -q '"line":16,"col":2,"end_line":16,"end_col":13,"kind":"CallNode","name":"\[\]","type":"string","rbs":"String","nullable":true' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: a String a pick can miss is nullable)"; ok=0; }; \
+	grep -q '"line":19,"col":3,.*"kind":"StringNode","type":"string","rbs":"String","nullable":false' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: a String literal is not nullable)"; ok=0; }; \
+	grep -q '"line":13,"col":2,.*"kind":"LocalVariableReadNode","name":"s","type":"int","rbs":"Integer","nullable":false' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: an Integer local no nil reaches is not nullable)"; ok=0; }; \
+	grep -q '"line":15,"col":0,.*"kind":"DefNode","name":"first_name",.*"return_nullable":true' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: a method whose value a pick can miss has return_nullable)"; ok=0; }; \
+	grep -q '"line":10,"col":0,.*"kind":"DefNode","name":"total",.*"return_nullable":false' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: an Integer-returning method no nil reaches has return_nullable false)"; ok=0; }; \
+	grep -q '"line":6,"col":0,.*"kind":"DefNode","name":"find",.*"rbs":"Symbol","owner":"Object","signature":"[^"]*","widened":true}' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: an untyped return carries no return_nullable)"; ok=0; }; \
+	grep -q '"line":6,"col":12,.*"kind":"RequiredParameterNode","name":"k","type":"int","rbs":"Integer","nullable":false' "$$tmp/etn.json" || { echo "infer-test: FAIL (--emit-types: a parameter record answers for its slot)"; ok=0; }; \
+	$(SPINEL) test/poly_attr_writer_distinct_family_override.rb --emit-types -o "$$tmp/paf.json" >/dev/null 2>&1 || { echo "infer-test: FAIL (--emit-types on distinct poly attr-writer families)"; ok=0; }; \
+	grep -q '"line":17,"col":4,.*"kind":"InstanceVariableReadNode","name":"@params","type":"str_str_hash"' "$$tmp/paf.json" && \
+	grep -q '"line":35,"col":4,.*"kind":"InstanceVariableReadNode","name":"@params","type":"str_str_hash"' "$$tmp/paf.json" || { echo "infer-test: FAIL (an unknown writer merged distinct @params families)"; ok=0; }; \
 	grep -q '"line":16,"col":4,.*"kind":"CallNode","name":"widen","dispatch":"direct","callee":"widen"' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a direct call names its callee)"; ok=0; }; \
 	grep -q '"line":13,"col":19,.*"kind":"CallNode","name":"dist2","dispatch":"switch","candidates":\["Point#dist2"\]' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a switch lists its candidate defs)"; ok=0; }; \
 	grep -q '"kind":"DefNode","name":"dist2",.*"owner":"Point","signature":"(untyped) -> Integer","widened":true' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a def carries its owner and signature)"; ok=0; }; \
 	grep -q '"kind":"DefNode","name":"widen",.*"owner":"Object","signature":"(untyped, Integer) -> untyped","widened":true' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: a top-level def is owned by Object)"; ok=0; }; \
-	grep -q '"kind":"DefNode","name":"x",.*"signature":"() -> Integer"}' "$$tmp/et.json" || { echo "infer-test: FAIL (--emit-types: an unwidened def carries no widened flag)"; ok=0; }; \
+	grep '"kind":"DefNode","name":"x",' "$$tmp/et.json" | grep -q '"signature":"() -> Integer"' && ! grep '"kind":"DefNode","name":"x",' "$$tmp/et.json" | grep -q '"widened"' || { echo "infer-test: FAIL (--emit-types: an unwidened def carries no widened flag)"; ok=0; }; \
 	$(SPINEL) test/infer/emit_types_fields.rb --emit-types -o "$$tmp/et2.json" -S > "$$tmp/et2.c" 2>/dev/null || { echo "infer-test: FAIL (--emit-types -S)"; ok=0; }; \
 	cmp -s "$$tmp/et.json" "$$tmp/et2.json" && grep -q 'sp_Point_dist2' "$$tmp/et2.c" || { echo "infer-test: FAIL (--emit-types -S: the same JSON and the C in one run)"; ok=0; }; \
 	$(SPINEL) test/infer/emit_types_fields.rb -S > "$$tmp/et3.c" 2>/dev/null && cmp -s "$$tmp/et2.c" "$$tmp/et3.c" || { echo "infer-test: FAIL (--emit-types -S: the C is the one -S alone emits, not the debug compile's)"; ok=0; }; \
@@ -3443,6 +4430,12 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	(cd "$$tmp" && $(CURDIR)/$(SPINEL) pe.rb --emit-types -o pe.json 2> pe.err; test $$? -eq 1) || { echo "infer-test: FAIL (a parse error still exits 1)"; ok=0; }; \
 	grep -q '^  pe_lib.rb:3:1: unexpected' "$$tmp/pe.err" || { echo "infer-test: FAIL (a parse error is placed, file:line:col, through the require map)"; cat "$$tmp/pe.err"; ok=0; }; \
 	grep -q '"types": \[' "$$tmp/pe.json" && grep -q '{"file":"pe_lib.rb","line":3,"col":0,"end_line":3,"end_col":3,"severity":"error","message":"unexpected' "$$tmp/pe.json" || { echo "infer-test: FAIL (--emit-types on a parse error writes the errors as diagnostics)"; ok=0; }; \
+	$(SPINEL) test/infer/emit_types_sym_proc_columns.rb --emit-types -o "$$tmp/spc.json" >/dev/null 2>&1 || { echo "infer-test: FAIL (--emit-types on emit_types_sym_proc_columns)"; ok=0; }; \
+	grep -q '"line":4,"col":34,"end_line":4,"end_col":35,"kind":"RequiredParameterNode","name":"s"' "$$tmp/spc.json" && \
+	grep -q '"line":4,"col":19,"end_line":4,"end_col":25,"kind":"BlockNode"' "$$tmp/spc.json" || { echo "infer-test: FAIL (--emit-types: the nodes on a line with &:to_s keep their columns)"; ok=0; }; \
+	printf 'p [1, 2].map(&:to_s).join(",") }\n' > "$$tmp/pe2.rb"; \
+	$(SPINEL) "$$tmp/pe2.rb" -S >/dev/null 2> "$$tmp/pe2.err"; \
+	grep -q 'pe2.rb:1:32: unexpected' "$$tmp/pe2.err" || { echo "infer-test: FAIL (a parse error after &:to_s is placed at its own column)"; cat "$$tmp/pe2.err"; ok=0; }; \
 	$(SPINEL) test/infer/emit_types_fields.rb --warn-widen -c -o "$$tmp/ww.c" 2> "$$tmp/ww.err" >/dev/null || { echo "infer-test: FAIL (--warn-widen compiles)"; ok=0; }; \
 	test "$$(grep -c ': warning: ' "$$tmp/ww.err")" = 3 && grep -q '^spinel: test/infer/emit_types_fields.rb:6:13: warning: parameter `o` of `dist2` widened to untyped' "$$tmp/ww.err" && grep -q '^spinel: test/infer/emit_types_fields.rb:11:1: warning: the return of `widen` widened' "$$tmp/ww.err" || { echo "infer-test: FAIL (--warn-widen: one warning per widened slot, at the slot, 1-based column)"; cat "$$tmp/ww.err"; ok=0; }; \
 	$(SPINEL) test/infer/emit_types_fields.rb -c -o "$$tmp/nw.c" 2>&1 >/dev/null | grep -q ': warning: ' && { echo "infer-test: FAIL (a plain compile stays quiet about widening)"; ok=0; }; \
@@ -3469,28 +4462,28 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	$(SPINEL) test/class_method_self_is_no_escape.rb -c --no-line-map -o "$$tmp/cms.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile class_method_self_is_no_escape)"; exit 1; }; \
 	grep -Eq 'sp_Digest_initialize\(sp_Digest \*self, const char \* lv_raw_hash\)' "$$tmp/cms.c" || { echo "infer-test: FAIL (the self of def self.m let a class-value new reach every class with a class method)"; grep -E 'sp_Digest_initialize\(' "$$tmp/cms.c" | head -1; ok=0; }; \
 	$(SPINEL) test/infer/unsettled_index_write.rb -c --no-line-map -o "$$tmp/u.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile unsettled_index_write)"; exit 1; }; \
-	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_M_s_mul\(sp_int [A-Za-z_]+, sp_int [A-Za-z_]+\)' "$$tmp/u.c" || { echo "infer-test: FAIL (an int-keyed []= on an unsettled slot poisoned the call graph)"; grep -E 'sp_M_s_mul\(' "$$tmp/u.c" | head -1; ok=0; }; \
+	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_M_s_mul\(sp_o?int [A-Za-z_]+, sp_o?int [A-Za-z_]+\)' "$$tmp/u.c" || { echo "infer-test: FAIL (an int-keyed []= on an unsettled slot poisoned the call graph)"; grep -E 'sp_M_s_mul\(' "$$tmp/u.c" | head -1; ok=0; }; \
 	grep -Eq 'sp_IntArray \* *lv_xs' "$$tmp/u.c" || { echo "infer-test: FAIL (the mapped array did not settle to an int array)"; ok=0; }; \
 	$(SPINEL) test/infer/int_keyed_hash.rb -c --no-line-map -o "$$tmp/k.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile int_keyed_hash)"; exit 1; }; \
 	grep -Eq 'sp_IntIntHash \* *lv_h' "$$tmp/k.c" || { echo "infer-test: FAIL (a slot with no array evidence lost its int-keyed hash)"; ok=0; }; \
 	$(SPINEL) test/infer/int_table_ivar_param.rb -c --no-line-map -o "$$tmp/t.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile int_table_ivar_param)"; exit 1; }; \
-	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_add\(sp_int [A-Za-z_]+, sp_int [A-Za-z_]+\)' "$$tmp/t.c" || { echo "infer-test: FAIL (an int table on an ivar poisoned the helper it feeds)"; grep -E 'sp_F_s_add\(' "$$tmp/t.c" | head -1; ok=0; }; \
+	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_add\(sp_o?int [A-Za-z_]+, sp_o?int [A-Za-z_]+\)' "$$tmp/t.c" || { echo "infer-test: FAIL (an int table on an ivar poisoned the helper it feeds)"; grep -E 'sp_F_s_add\(' "$$tmp/t.c" | head -1; ok=0; }; \
 	grep -Eq 'sp_PtrArray \* *iv_t;' "$$tmp/t.c" || { echo "infer-test: FAIL (the ivar table lost its typed representation)"; ok=0; }; \
 	grep -Eq 'sp_IntArray \* *lv_row' "$$tmp/t.c" || { echo "infer-test: FAIL (a row read out of the table stayed boxed)"; ok=0; }; \
 	$(SPINEL) test/infer/ivar_table_nil_only_store.rb -c --no-line-map -o "$$tmp/tn.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile ivar_table_nil_only_store)"; exit 1; }; \
 	for v in loc par ret; do grep -Eq "sp_PtrArray \* *iv_$$v;" "$$tmp/tn.c" || { echo "infer-test: FAIL (an ivar table that stores a nil-only value lost its typed representation: @$$v)"; ok=0; }; done; \
 	$(SPINEL) test/infer/class_method_table_arg.rb -c --no-line-map -o "$$tmp/m.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile class_method_table_arg)"; exit 1; }; \
 	grep -Eq 'sp_PtrArray \* *lv_rows' "$$tmp/m.c" || { echo "infer-test: FAIL (a table passed to a class method lost its typed representation)"; grep -E 'sp_M_s_consume\(' "$$tmp/m.c" | head -1; ok=0; }; \
-	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_mul\(sp_int [A-Za-z_]+, sp_int [A-Za-z_]+\)' "$$tmp/m.c" || { echo "infer-test: FAIL (a helper reading an element of the table bound a boxed parameter)"; grep -E 'sp_F_s_mul\(' "$$tmp/m.c" | head -1; ok=0; }; \
+	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_mul\(sp_o?int [A-Za-z_]+, sp_o?int [A-Za-z_]+\)' "$$tmp/m.c" || { echo "infer-test: FAIL (a helper reading an element of the table bound a boxed parameter)"; grep -E 'sp_F_s_mul\(' "$$tmp/m.c" | head -1; ok=0; }; \
 	$(SPINEL) test/infer/return_table_across_methods.rb -c --no-line-map -o "$$tmp/r.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile return_table_across_methods)"; exit 1; }; \
 	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_PtrArray \* *sp_T_s_build\(' "$$tmp/r.c" || { echo "infer-test: FAIL (a method returning a table of int arrays stayed a boxed poly array)"; grep -E 'sp_T_s_build\(' "$$tmp/r.c" | head -1; ok=0; }; \
 	grep -Eq 'sp_PtrArray \* *lv_rows' "$$tmp/r.c" || { echo "infer-test: FAIL (the caller's table did not follow the callee's return type)"; ok=0; }; \
-	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_mul\(sp_int [A-Za-z_]+, sp_int [A-Za-z_]+\)' "$$tmp/r.c" || { echo "infer-test: FAIL (the narrowing was not visible while the helper's parameters bound)"; grep -E 'sp_F_s_mul\(' "$$tmp/r.c" | head -1; ok=0; }; \
+	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_mul\(sp_o?int [A-Za-z_]+, sp_o?int [A-Za-z_]+\)' "$$tmp/r.c" || { echo "infer-test: FAIL (the narrowing was not visible while the helper's parameters bound)"; grep -E 'sp_F_s_mul\(' "$$tmp/r.c" | head -1; ok=0; }; \
 	$(SPINEL) test/infer/ctor_table_arg.rb -c --no-line-map -o "$$tmp/ca.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile ctor_table_arg)"; exit 1; }; \
 	grep -Eq 'sp_PtrArray \* *lv_rows' "$$tmp/ca.c" || { echo "infer-test: FAIL (a table handed to a constructor lost its typed representation)"; grep -oE 'sp_[A-Za-z]+Array \* *lv_rows' "$$tmp/ca.c" | head -1; ok=0; }; \
 	grep -Eq 'sp_PtrArray \* *iv_t;' "$$tmp/ca.c" || { echo "infer-test: FAIL (the ivar the constructor stored the table in stayed boxed)"; ok=0; }; \
 	grep -Eq 'sp_IntArray \* *lv_row' "$$tmp/ca.c" || { echo "infer-test: FAIL (a row read out of the constructor-assigned table stayed boxed)"; ok=0; }; \
-	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_mul\(sp_int [A-Za-z_]+, sp_int [A-Za-z_]+\)' "$$tmp/ca.c" || { echo "infer-test: FAIL (a helper reading an element of the constructor-assigned table bound a boxed parameter)"; grep -E 'sp_F_s_mul\(' "$$tmp/ca.c" | head -1; ok=0; }; \
+	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_mul\(sp_o?int [A-Za-z_]+, sp_o?int [A-Za-z_]+\)' "$$tmp/ca.c" || { echo "infer-test: FAIL (a helper reading an element of the constructor-assigned table bound a boxed parameter)"; grep -E 'sp_F_s_mul\(' "$$tmp/ca.c" | head -1; ok=0; }; \
 	grep -Eq 'sp_PtrArray \* *lv_bare' "$$tmp/ca.c" || { echo "infer-test: FAIL (a table handed to a RECEIVERLESS new(...) lost its typed representation)"; grep -oE 'sp_[A-Za-z]+Array \* *lv_bare' "$$tmp/ca.c" | head -1; ok=0; }; \
 	grep -Eq 'sp_PtrArray \* *iv_u;' "$$tmp/ca.c" || { echo "infer-test: FAIL (the ivar a receiverless new(...) stored the table in stayed boxed)"; ok=0; }; \
 	grep -Eq 'sp_IntArray \* *lv_urow' "$$tmp/ca.c" || { echo "infer-test: FAIL (a row read out of the receiverless-constructed table stayed boxed)"; ok=0; }; \
@@ -3499,7 +4492,7 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -Eq 'sp_PtrArray \* *iv_rows;' "$$tmp/mtr.c" || { echo "infer-test: FAIL (the ivar holding a mapped table stayed boxed)"; ok=0; }; \
 	grep -Eq 'sp_IntArray \* *lv_row ' "$$tmp/mtr.c" || { echo "infer-test: FAIL (a row read out of a mapped table stayed boxed)"; ok=0; }; \
 	grep -Eq 'sp_PolyArray \* *lv_rows' "$$tmp/mtr.c" || { echo "infer-test: FAIL (a table mapped from a HASH must stay boxed -- its emitter cannot build a pointer array, and narrowing it stops the program running)"; grep -oE 'sp_[A-Za-z]+Array \* *lv_rows' "$$tmp/mtr.c" | head -1; ok=0; }; \
-	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_mul\(sp_int [A-Za-z_]+, sp_int [A-Za-z_]+\)' "$$tmp/mtr.c" || { echo "infer-test: FAIL (a helper reading an element of a mapped table bound a boxed parameter)"; grep -E 'sp_F_s_mul\(' "$$tmp/mtr.c" | head -1; ok=0; }; \
+	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_mul\(sp_o?int [A-Za-z_]+, sp_o?int [A-Za-z_]+\)' "$$tmp/mtr.c" || { echo "infer-test: FAIL (a helper reading an element of a mapped table bound a boxed parameter)"; grep -E 'sp_F_s_mul\(' "$$tmp/mtr.c" | head -1; ok=0; }; \
 	$(SPINEL) test/nested_table_iter.rb -c --no-line-map -o "$$tmp/nti.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile nested_table_iter)"; exit 1; }; \
 	grep -Eq 'sp_mul\(sp_PtrArray \* *lv_a, sp_PtrArray \* *lv_b\)' "$$tmp/nti.c" || { echo "infer-test: FAIL (a nested table passed as a method argument stayed boxed)"; grep -E 'sp_mul\(' "$$tmp/nti.c" | head -1; ok=0; }; \
 	grep -Eq 'sp_FloatArray \* *lv_bj' "$$tmp/nti.c" || { echo "infer-test: FAIL (each_with_index on that argument did not yield a float row)"; ok=0; }; \
@@ -3516,7 +4509,7 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -Eq 'lv_r = sp_box_nullable_obj\(\(void \*\)\((sp_PtrArray_get\(lv_rows,|lv_r__bpin\))' "$$tmp/nrp.c" || { echo "infer-test: FAIL (a boxed block parameter over a nested table was not given the row pointer)"; ok=0; }; \
 	grep -q 'lv_r = sp_PtrArray_get' "$$tmp/nrp.c" && { echo "infer-test: FAIL (a void * row was assigned straight into the boxed parameter)"; ok=0; }; \
 	$(SPINEL) test/infer/generator_element_cycle.rb -c --no-line-map -o "$$tmp/g.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile generator_element_cycle)"; exit 1; }; \
-	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_add\(sp_int [A-Za-z_]+, sp_int [A-Za-z_]+\)' "$$tmp/g.c" || { echo "infer-test: FAIL (a generator whose element feeds back into its own operands latched a poly array)"; grep -E 'sp_F_s_add\(' "$$tmp/g.c" | head -1; ok=0; }; \
+	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_add\(sp_o?int [A-Za-z_]+, sp_o?int [A-Za-z_]+\)' "$$tmp/g.c" || { echo "infer-test: FAIL (a generator whose element feeds back into its own operands latched a poly array)"; grep -E 'sp_F_s_add\(' "$$tmp/g.c" | head -1; ok=0; }; \
 	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_IntArray \* *sp_E_s_add\(sp_IntArray \*' "$$tmp/g.c" || { echo "infer-test: FAIL (the extension-field add did not settle on the Integer array)"; grep -E 'sp_E_s_add\(' "$$tmp/g.c" | head -1; ok=0; }; \
 	$(SPINEL) test/infer/hash_new_method_value.rb -c --no-line-map -o "$$tmp/hn.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile hash_new_method_value)"; exit 1; }; \
 	grep -Eq 'sp_StrStrHash \* *lv_s' "$$tmp/hn.c" || { echo "infer-test: FAIL (a returned Hash.new lost the variant its caller narrowed it to)"; grep -oE 'sp_[A-Za-z]+Hash \* *lv_s' "$$tmp/hn.c" | head -1; ok=0; }; \
@@ -3526,12 +4519,36 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -Eq 'sp_Bus_poke_ram\(sp_Bus \*self, sp_int lv_addr, sp_int lv_data\)' "$$tmp/mcd.c" || { echo "infer-test: FAIL (a captured method called only with Integers through a dispatch table lost its sp_int parameters)"; grep -E 'sp_Bus_poke_ram\(' "$$tmp/mcd.c" | head -1; ok=0; }; \
 	$(SPINEL) test/infer/dead_constructor_no_arm.rb -c --no-line-map -o "$$tmp/dc.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile dead_constructor_no_arm)"; exit 1; }; \
 	grep -q 'sp_poly_add' "$$tmp/dc.c" && { echo "infer-test: FAIL (a class constructed only in dead code widened a poly receiver's field read to poly)"; ok=0; }; \
-	grep -Eq '(sp_int_add\(|sp_int _t[0-9]+ = )\(\{ sp_RbVal _t[0-9]+ = lv_d; sp_int _t[0-9]+ = (0|SP_INT_NIL); switch' "$$tmp/dc.c" || { echo "infer-test: FAIL (the field read of a boxed receiver did not stay an int switch, or its receiver is rooted for an arm that cannot run)"; ok=0; }; \
+	grep -Eq '(sp_int_add\(|sp_o?int _t[0-9]+ = )\(\{ sp_RbVal _t[0-9]+ = lv_d; sp_o?int _t[0-9]+ = (0|sp_oint_nil\(\)); switch' "$$tmp/dc.c" || { echo "infer-test: FAIL (the field read of a boxed receiver did not stay an int switch, or its receiver is rooted for an arm that cannot run)"; ok=0; }; \
 	$(SPINEL) test/infer/folded_arm_reads_not_nil.rb -c --no-line-map -o "$$tmp/fan.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile folded_arm_reads_not_nil)"; exit 1; }; \
 	! grep -q 'sp_nomethod_msg(' "$$tmp/fan.c" || { echo "infer-test: FAIL (a read in an arm a fold blanked made a local that cannot be nil test for nil)"; grep -o 'sp_nomethod_msg("[^"]*"' "$$tmp/fan.c" | sort -u; ok=0; }; \
 	rounds=$$(SP_FIXPOINT_LOG=1 $(SPINEL) test/infer/fixpoint_converges.rb -c --no-line-map -o "$$tmp/fp.c" 2>&1 | sed -n 's/^\[fp\] rounds=\([0-9]*\).*/\1/p' | tail -1); \
 	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count -- SP_FIXPOINT_LOG gone?)"; ok=0;; \
 	  *) [ "$$rounds" -lt 128 ] || { echo "infer-test: FAIL (the inference fixpoint ran to its $$rounds-round cap: it stopped mid-oscillation, and where it stops decides which typing is emitted)"; ok=0; };; \
+	esac; \
+	rounds=$$(SP_FIXPOINT_LOG=1 $(SPINEL) test/infer/module_ivar_object_array_converges.rb -c --no-line-map -o "$$tmp/mio.c" 2>&1 | sed -n 's/^\[fp\] rounds=\([0-9]*\).*/\1/p' | tail -1); \
+	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count for module_ivar_object_array_converges)"; ok=0;; \
+	  *) [ "$$rounds" -lt 128 ] || { echo "infer-test: FAIL (a module's ivar write widened the includer's narrowed object array every round: the fixpoint ran to its cap)"; ok=0; };; \
+	esac; \
+	$(SPINEL) test/infer/module_source_call_binds_nothing.rb -c --no-line-map -o "$$tmp/msc.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile module_source_call_binds_nothing)"; exit 1; }; \
+	grep -Eq 'sp_int sp_Seq_output\(sp_Seq \*self, sp_int lv_col, sp_int lv_shift\)' "$$tmp/msc.c" && grep -Eq 'sp_int sp_Port_output\(sp_Port \*self, sp_int lv_port, sp_int lv_value\)' "$$tmp/msc.c" || { echo "infer-test: FAIL (a call in a module method an include copied away boxed the parameters of every method of its name)"; grep -E 'sp_(Seq|Port)_output\(' "$$tmp/msc.c" | head -2; ok=0; }; \
+	$(SPINEL) test/infer/poly_candidate_arity.rb -c --no-line-map -o "$$tmp/pca.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile poly_candidate_arity)"; exit 1; }; \
+	grep -Eq 'sp_int sp_Seq_output\(sp_Seq \*self, sp_int lv_col, sp_int lv_shift\)' "$$tmp/pca.c" || { echo "infer-test: FAIL (a call on an untyped receiver bound a method of its name that cannot take its argument count)"; grep -E 'sp_Seq_output\(' "$$tmp/pca.c" | head -1; ok=0; }; \
+	calls=$$($(SPINEL) test/infer/renarrow_reset_return_cycle.rb --timing -c --no-line-map -o "$$tmp/rrc.c" 2>&1 | sed -n 's/^spinel-timing: pass=infer_param_types ms=[0-9.]* calls=\([0-9]*\).*/\1/p'); \
+	case "$$calls" in ''|*[!0-9]*) echo "infer-test: FAIL (no infer_param_types call count for renarrow_reset_return_cycle)"; ok=0;; \
+	  *) [ "$$calls" -lt 32 ] || { echo "infer-test: FAIL (the re-narrow loop ran $$calls binds: a reset return re-derived every iteration kept its fixed-cycle exit from firing)"; ok=0; };; \
+	esac; \
+	rounds=$$(SP_FIXPOINT_LOG=1 $(SPINEL) test/infer/default_empty_array_object_rows.rb -c --no-line-map -o "$$tmp/dea.c" 2>&1 | sed -n 's/^\[fp\] rounds=\([0-9]*\).*/\1/p' | tail -1); \
+	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count for default_empty_array_object_rows)"; ok=0;; \
+	  *) [ "$$rounds" -lt 128 ] || { echo "infer-test: FAIL (an empty [] default widened an object-array parameter every round: the fixpoint ran to its cap)"; ok=0; };; \
+	esac; \
+	rounds=$$(SP_FIXPOINT_LOG=1 $(SPINEL) --share-strings test/infer/reopen_implicit_self_converges.rb -c --no-line-map -o "$$tmp/ris.c" 2>&1 | sed -n 's/^\[fp\] rounds=\([0-9]*\).*/\1/p' | tail -1); \
+	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count for reopen_implicit_self_converges)"; ok=0;; \
+	  *) [ "$$rounds" -lt 128 ] || { echo "infer-test: FAIL (a bare call in a Time reopen was tried on a new self node every round, and --share-strings saw the types move: the fixpoint ran to its cap)"; ok=0; };; \
+	esac; \
+	rounds=$$(SP_FIXPOINT_LOG=1 $(SPINEL) test/infer/self_feeding_write_converges.rb -c --no-line-map -o "$$tmp/sfw.c" 2>&1 | sed -n 's/^\[fp\] rounds=\([0-9]*\).*/\1/p' | tail -1); \
+	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count for self_feeding_write_converges)"; ok=0;; \
+	  *) [ "$$rounds" -lt 128 ] || { echo "infer-test: FAIL (a local written from a call on itself widened and narrowed every other round: the fixpoint ran to its cap)"; ok=0; };; \
 	esac; \
 	$(SPINEL) test/infer/inline_force_fanout.rb -c --no-line-map -o "$$tmp/iff.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile inline_force_fanout)"; exit 1; }; \
 	grep -q 'SP_ALWAYS_INLINE [^(]* sp_f4(' "$$tmp/iff.c" && { echo "infer-test: FAIL (forced inlining copied a small-method chain past the size budget)"; ok=0; }; \
@@ -3543,43 +4560,46 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -q 'sp_int lv_oraa' "$$tmp/bko.c" || { echo "infer-test: FAIL (the right of a || a predicate reads widened a block parameter it does not let go)"; ok=0; }; \
 	grep -q 'sp_RbVal lv_orkaa' "$$tmp/bko.c" || { echo "infer-test: FAIL (a block kept through the right of a parenthesized || did not widen its parameters)"; ok=0; }; \
 	$(SPINEL) test/infer/yield_splat_int_params.rb -c --no-line-map -o "$$tmp/ysi.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile yield_splat_int_params)"; exit 1; }; \
-	for m in 'sp_int lv_e = ' 'sp_int lv_f = ' 'sp_int_mul(lv_e, lv_f)'; do \
+	for m in 'sp_oint lv_e = ' 'sp_oint lv_f = ' 'sp_int_mul(sp_oint_val(lv_e, "\*"), sp_oint_opnd(lv_f))'; do \
 	  grep -q "$$m" "$$tmp/ysi.c" || { echo "infer-test: FAIL (yield(*xs) of an Integer array left a block parameter boxed: $$m)"; ok=0; }; \
 	done; \
-	grep -q 'sp_int lv_a = ' "$$tmp/ysi.c" && grep -q 'sp_int lv_b = ' "$$tmp/ysi.c" || { echo "infer-test: FAIL (a yield(*xs) reached before xs is typed boxed its block parameters for good)"; ok=0; }; \
-	grep -q 'sp_box_int_or_nil(lv_h)' "$$tmp/ysi.c" || { echo "infer-test: FAIL (a block parameter yield(*xs) may leave without a value is not marked nullable)"; ok=0; }; \
+	grep -q 'sp_oint lv_a = ' "$$tmp/ysi.c" && grep -q 'sp_oint lv_b = ' "$$tmp/ysi.c" || { echo "infer-test: FAIL (a yield(*xs) reached before xs is typed boxed its block parameters for good)"; ok=0; }; \
+	grep -q 'sp_box_oint(lv_h)' "$$tmp/ysi.c" || { echo "infer-test: FAIL (a block parameter yield(*xs) may leave without a value is not marked nullable)"; ok=0; }; \
 	grep -q 'sp_box_int(lv_d)' "$$tmp/ysi.c" || { echo "infer-test: FAIL (the parameters of yield(*[i, i + 1]) test for a nil they cannot hold)"; ok=0; }; \
 	$(SPINEL) test/infer/yield_nil_int_params.rb -c --no-line-map -o "$$tmp/yni.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile yield_nil_int_params)"; exit 1; }; \
-	for m in 'sp_int lv_a = ' 'sp_int lv_d = ' 'sp_int lv_f = ' 'sp_int lv_g = '; do \
+	for m in 'sp_oint lv_a = ' 'sp_oint lv_d = ' 'sp_oint lv_f = ' 'sp_oint lv_g = '; do \
 	  grep -q "$$m" "$$tmp/yni.c" || { echo "infer-test: FAIL (a block parameter bound an Integer and nil is boxed: $$m)"; ok=0; }; \
 	done; \
-	grep -q 'lv_a = SP_INT_NIL;' "$$tmp/yni.c" && grep -q 'lv_f = SP_INT_NIL;' "$$tmp/yni.c" || { echo "infer-test: FAIL (a nil yielded into an Integer block parameter is not its sentinel)"; ok=0; }; \
-	grep -q 'lv_d = (1 < .*sp_poly_as_int_or_nil(' "$$tmp/yni.c" || { echo "infer-test: FAIL (a nil element of yield(*[i, nil]) is not unboxed to the sentinel)"; ok=0; }; \
-	grep -q 'sp_int lv_g = (argc > 0) ? (_sp_proc_poly_args\[0\].tag == SP_TAG_NIL ? SP_INT_NIL : args\[0\])' "$$tmp/yni.c" || { echo "infer-test: FAIL (a proc prologue reads a nil argument as 0)"; ok=0; }; \
+	grep -q 'lv_a = sp_oint_nil();' "$$tmp/yni.c" && grep -q 'lv_f = sp_oint_nil();' "$$tmp/yni.c" || { echo "infer-test: FAIL (a nil yielded into an Integer block parameter is not its sentinel)"; ok=0; }; \
+	grep -q 'lv_d = (1 < .*sp_unbox_oint(' "$$tmp/yni.c" || { echo "infer-test: FAIL (a nil element of yield(*[i, nil]) is not unboxed to the sentinel)"; ok=0; }; \
+	grep -q 'sp_oint lv_g = (argc > 0) ? (_sp_proc_poly_args\[0\].tag == SP_TAG_NIL ? sp_oint_nil() : sp_oint_of(args\[0\]))' "$$tmp/yni.c" || { echo "infer-test: FAIL (a proc prologue reads a nil argument as 0)"; ok=0; }; \
 	$(SPINEL) test/infer/yield_nil_float_params.rb -c --no-line-map -o "$$tmp/ynf.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile yield_nil_float_params)"; exit 1; }; \
-	for m in 'sp_float lv_a = ' 'sp_float lv_b = ' 'sp_float lv_c = ' 'sp_float lv_g = ' 'sp_float lv_k = ' 'sp_float lv_m = '; do \
+	for m in 'sp_ofloat lv_a = ' 'sp_ofloat lv_b = ' 'sp_ofloat lv_c = ' 'sp_ofloat lv_g = ' 'sp_ofloat lv_k = ' 'sp_ofloat lv_m = '; do \
 	  grep -q "$$m" "$$tmp/ynf.c" || { echo "infer-test: FAIL (a Float block parameter bound nothing or nil is boxed: $$m)"; ok=0; }; \
 	done; \
-	grep -q 'sp_box_float_or_nil(lv_f)' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a Float block parameter yield(*xs) may leave without a value is not marked nullable)"; ok=0; }; \
-	grep -q 'lv_c = sp_float_nil();' "$$tmp/ynf.c" && grep -q 'lv_k = sp_float_nil();' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a nil yielded into a Float block parameter is not its sentinel)"; ok=0; }; \
-	grep -q 'lv_g = (1 < .*sp_poly_as_float_or_nil(' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a nil element of yield(*[x, nil]) is not unboxed to the Float sentinel)"; ok=0; }; \
-	grep -q 'sp_float lv_m = (argc > 0) ? sp_poly_to_f_or_nil(_sp_proc_poly_args\[0\])' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a proc prologue reads a nil Float argument as 0.0)"; ok=0; }; \
+	grep -q 'sp_box_ofloat(lv_f)' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a Float block parameter yield(*xs) may leave without a value is not marked nullable)"; ok=0; }; \
+	grep -q 'lv_c = sp_ofloat_nil();' "$$tmp/ynf.c" && grep -q 'lv_k = sp_ofloat_nil();' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a nil yielded into a Float block parameter is not its sentinel)"; ok=0; }; \
+	grep -q 'lv_g = (1 < .*sp_unbox_ofloat(' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a nil element of yield(*[x, nil]) is not unboxed to the Float sentinel)"; ok=0; }; \
+	grep -q 'sp_ofloat lv_m = (argc > 0) ? sp_unbox_ofloat(_sp_proc_poly_args\[0\])' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a proc prologue reads a nil Float argument as 0.0)"; ok=0; }; \
 	$(SPINEL) test/infer/yield_splat_rows_sure.rb -c --no-line-map -o "$$tmp/ysr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile yield_splat_rows_sure)"; exit 1; }; \
-	for m in 'sp_int lv_a = ' 'sp_int lv_b = ' 'sp_int lv_c = ' 'sp_int_mul(lv_b, lv_c)'; do \
+	for m in 'sp_oint lv_a = ' 'sp_oint lv_b = ' 'sp_oint lv_c = ' 'sp_int_mul(sp_oint_val(lv_b, "\*"), sp_oint_opnd(lv_c))'; do \
 	  grep -q "$$m" "$$tmp/ysr.c" || { echo "infer-test: FAIL (yield(*row) of an Integer table's row left a block parameter boxed: $$m)"; ok=0; }; \
 	done; \
-	grep -q 'sp_box_int_or_nil(lv_d)' "$$tmp/ysr.c" || { echo "infer-test: FAIL (a block parameter a short row may leave without a value is not marked nullable)"; ok=0; }; \
+	grep -q 'sp_box_oint(lv_d)' "$$tmp/ysr.c" || { echo "infer-test: FAIL (a block parameter a short row may leave without a value is not marked nullable)"; ok=0; }; \
 	grep -q 'lv_g = _t[0-9]*->data\[_t[0-9]*->start+0\];' "$$tmp/ysr.c" && grep -q 'lv_h = _t[0-9]*->data\[_t[0-9]*->start+1\];' "$$tmp/ysr.c" || { echo "infer-test: FAIL (yield(*pair) of a literal local no one changes tests a length it cannot lack)"; ok=0; }; \
 	grep -q 'sp_int_mul(lv_g, lv_h)' "$$tmp/ysr.c" && grep -q 'sp_box_int(lv_g)' "$$tmp/ysr.c" || { echo "infer-test: FAIL (yield(*pair) of a literal local no one changes binds a nil it cannot hold)"; ok=0; }; \
 	$(SPINEL) test/infer/array_nil_flag_plain_store.rb -c --no-line-map -o "$$tmp/anf.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (array_nil_flag_plain_store: -c)"; ok=0; }; \
-	! grep -q '_nilable(' "$$tmp/anf.c" && grep -q '\] = _t[0-9]*; else sp_IntArray_set(lv_a, ' "$$tmp/anf.c" && grep -q 'sp_IntArray_push(lv_b, ' "$$tmp/anf.c" && grep -q 'sp_FloatArray_set(lv_f, ' "$$tmp/anf.c" || { echo "infer-test: FAIL (a loop storing numbers into a typed array took the nil-flag-setting store)"; ok=0; }; \
-	grep -q 'sp_IntArray_push(lv_c, sp_IntArray_get(lv_a, ' "$$tmp/anf.c" && grep -q 'sp_IntArray_push(lv_q, sp_IntArray_pop(lv_b))' "$$tmp/anf.c" && grep -q 'sp_IntArray_push(_t[0-9]*, self->iv_v)\|sp_IntArray_push(lv_out, self->iv_v)' "$$tmp/anf.c" || { echo "infer-test: FAIL (copying an element or an ivar into a typed array took the nil-flag-setting store)"; ok=0; }; \
-	grep -q 'sp_IntArray_sum(sp_IntArray_nil_sum_if_flagged(lv_a, 0), 0)' "$$tmp/anf.c" && grep -q 'sp_IntArray_max(sp_IntArray_nil_cmp_if_flagged(lv_b))' "$$tmp/anf.c" || { echo "infer-test: FAIL (a whole-array sum or max does not ask the nil flag)"; ok=0; }; \
-	grep -q 'sp_IntArray_sum(sp_IntArray_nil_sum_ck(lv_m, 0), 0)' "$$tmp/anf.c" || { echo "infer-test: FAIL (the sum of an array analyze marked does not scan for nil)"; ok=0; }; \
+	! grep -q 'sp_IntArray_set_nilable(lv_a, \|sp_IntArray_push_nilable(lv_b, \|sp_FloatArray_set_nilable(lv_f, ' "$$tmp/anf.c" && grep -q '\] = _t[0-9]*; else sp_IntArray_set(lv_a, ' "$$tmp/anf.c" && grep -q 'sp_IntArray_push(lv_b, ' "$$tmp/anf.c" && grep -q 'sp_FloatArray_set(lv_f, ' "$$tmp/anf.c" || { echo "infer-test: FAIL (a loop storing numbers into a typed array took the nil-flag-setting store)"; ok=0; }; \
+	grep -q 'sp_IntArray_push_nilable(lv_c, sp_IntArray_oget(lv_a, ' "$$tmp/anf.c" && grep -q 'sp_IntArray_push_nilable(lv_q, sp_IntArray_pop_o(lv_b))' "$$tmp/anf.c" && grep -q 'sp_IntArray_push(_t[0-9]*, self->iv_v)\|sp_IntArray_push(lv_out, self->iv_v)' "$$tmp/anf.c" || { echo "infer-test: FAIL (copying an element or an ivar into a typed array took the nil-flag-setting store)"; ok=0; }; \
+	grep -q 'sp_IntArray_sum(sp_IntArray_nil_sum_if_flagged(lv_a, 0), 0)' "$$tmp/anf.c" && grep -q 'sp_IntArray_max_o(sp_IntArray_nil_cmp_if_flagged(lv_b))' "$$tmp/anf.c" || { echo "infer-test: FAIL (a whole-array sum or max does not ask the nil flag)"; ok=0; }; \
+	grep -q 'sp_IntArray_sum(sp_IntArray_nil_sum_if_flagged(lv_m, 0), 0)' "$$tmp/anf.c" || { echo "infer-test: FAIL (the sum of an array that can hold nil does not ask its nil bitmap)"; ok=0; }; \
 	$(SPINEL) test/infer/nil_narrowing_reads.rb -c --no-line-map -o "$$tmp/nnr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (nil_narrowing_reads: -c)"; ok=0; }; \
-	grep -q 'if ((lv_w > 2LL))' "$$tmp/nnr.c" && grep -q 'if ((lv_v > lv_k))' "$$tmp/nnr.c" || { echo "infer-test: FAIL (a read a guard or an in-bounds index proves non-nil still tests for nil)"; ok=0; }; \
-	grep -q 'SP_INT_NIL_CMP_CK(_t[0-9]*, 0, ">"); _t[0-9]* > _t[0-9]*_r; })' "$$tmp/nnr.c" && grep -q 'SP_INT_NIL_CMP_CK(_t[0-9]*, 0, "<"); _t[0-9]* < _t[0-9]*_r; })' "$$tmp/nnr.c" || { echo "infer-test: FAIL (a narrowed read of a nilable local does not keep the other operand's half of the test)"; ok=0; }; \
-	grep -q 'sp_int _t[0-9]* = lv_gv, _t[0-9]*_r = 0LL; SP_INT_NIL_CMP_CK(_t[0-9]*, _t[0-9]*_r, ">")' "$$tmp/nnr.c" || { echo "infer-test: FAIL (an in-bounds read of an array a write past the end can leave a nil in lost its test)"; ok=0; }; \
+	grep -q 'if ((lv_w.v > 2LL))' "$$tmp/nnr.c" && grep -q 'if ((lv_v > lv_k))' "$$tmp/nnr.c" || { echo "infer-test: FAIL (a read a guard or an in-bounds index proves non-nil still tests for nil)"; ok=0; }; \
+	grep -q '_t[0-9]*_r = lv_best.v; _t[0-9]* > _t[0-9]*_r; })' "$$tmp/nnr.c" && grep -q '_t[0-9]*_r = lv_lo.v; _t[0-9]* < _t[0-9]*_r; })' "$$tmp/nnr.c" || { echo "infer-test: FAIL (a narrowed read of a nilable local does not keep the other operand's half of the test)"; ok=0; }; \
+	grep -q 'sp_int _t[0-9]* = sp_oint_val(lv_gv, ">"), _t[0-9]*_r = 0LL;' "$$tmp/nnr.c" || { echo "infer-test: FAIL (an in-bounds read of an array a write past the end can leave a nil in lost its test)"; ok=0; }; \
+	$(SPINEL) test/infer/nil_narrowing_operands.rb -c --no-line-map -o "$$tmp/nno.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (nil_narrowing_operands: -c)"; ok=0; }; \
+	grep -q 'lv_s = (lv_a.v > 1LL);' "$$tmp/nno.c" || { echo "infer-test: FAIL (a local an Integer operator took still tests for nil)"; ok=0; }; \
+	grep -q 'sp_int _t[0-9]* = sp_oint_val(lv_b, ">"), _t[0-9]*_r = 1LL;' "$$tmp/nno.c" || { echo "infer-test: FAIL (a local after == lost its nil test)"; ok=0; }; \
 	$(SPINEL) test/gc_root_hoisted_arg_once.rb -c --no-line-map -o "$$tmp/rha.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (gc_root_hoisted_arg_once: -c)"; ok=0; }; \
 	awk '/ sp_make_tree\(sp_int lv_depth\) \{/,/^}/' "$$tmp/rha.c" > "$$tmp/rha_mt.c"; \
 	grep -q 'sp_make_tree(' "$$tmp/rha_mt.c" && ! grep -Eq '_gcf\.v\[[0-9]+\] = _gcf\.v\[[0-9]+\];|_t[0-9]+ = _t[0-9]+;' "$$tmp/rha_mt.c" || { echo "infer-test: FAIL (an argument the call hoisted into a rooted temp is copied into a second rooted one)"; ok=0; }; \
@@ -3723,23 +4743,78 @@ signal-default-test: $(SPINEL)
 timing-test: $(SPINEL)
 	@tools/timing_check.sh
 
+# #7237: the tree-only desugar passes the fixpoint skips still change nothing
+# when run (the shadow schedule, SP_SHADOW_GEN)
+shadow-check: $(SPINEL)
+	@tools/shadow_check.sh
+
 plan-check-test: $(SPINEL)
 	@tools/plan_check.sh
 
 repr-check-test: $(SPINEL)
 	@tools/repr_check.sh
 
-# nil-check (#7444): the analysis's nil fact held against the answers the
-# codegen helpers give today. #7444's shapes (test/nil_check/) must report
-# as recorded; over the corpus nothing may be HELPER-ONLY, and the C must be
-# the same with the flag.
-nil-check-test: $(SPINEL)
-	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/spinel-nil-check-shapes.XXXXXX"); \
-	$(SPINEL) -c --nil-check test/nil_check/shapes.rb -o "$$tmp/shapes.c" 2>&1 | grep '^nil-check:' > "$$tmp/got"; \
-	if diff -u test/nil_check/shapes.nil-check "$$tmp/got"; then echo "nil-check: shapes pass"; \
-	else echo "nil-check: shapes FAIL"; rm -rf "$$tmp"; exit 1; fi; \
-	rm -rf "$$tmp"
-	@tools/nil_check.sh
+# arm-check (#7483): the per-arm facts the analysis records against the
+# typing codegen runs for a block body under one arm's parameter type
+arm-check-test: $(SPINEL)
+	@tools/arm_check.sh
+
+# run-scale (#7501, item 4): each shape under test/run_scale/ runs at two
+# sizes under SPINEL_ALLOC_REPORT, and the bytes it allocates may grow by no
+# more than its first line allows (#7482's program: not with the number of
+# calls). It runs programs, so it is not part of `make gate`.
+run-scale-test: $(SPINEL) $(SP_RT_LIB)
+	@tools/run_scale.sh $(SPINEL)
+
+# The sharing verifier has its own focused corpus and conflict ratchet.
+.PHONY: share-verify-test
+share-verify-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(BUNDLED_NATIVE_OBJS) $(BUNDLED_NATIVE_MT_OBJS)
+	@ruby tools/share_verify.rb
+
+# share-check (--share-check): the handle/copy agreement check. The shapes in
+# test/share_check/ report as recorded (a program per kind of copy, and
+# programs that report none); the C is the same with the flag, and the flag
+# alone, without --share-strings, reports nothing. A program with no
+# .expected is one whose answer differs from CRuby's under --share-strings
+# today: only its report is recorded, and it is named here.
+SHARE_CHECK_REPORT_ONLY = map_param_copy store
+.PHONY: share-check-test
+share-check-test: $(SPINEL)
+	@tmp=$$(mktemp -d "$${TMPDIR:-/tmp}/spinel-share-check.XXXXXX"); ok=1; \
+	for t in test/share_check/*.rb; do \
+	  b=$${t%.rb}; \
+	  if ! $(SPINEL) --share-strings --share-check -c --no-line-map "$$t" -o "$$tmp/on.c" >/dev/null 2>"$$tmp/err" || \
+	     ! $(SPINEL) --share-strings -c --no-line-map "$$t" -o "$$tmp/off.c" >/dev/null 2>&1; then \
+	    echo "share-check: FAIL $$t (compile)"; ok=0; continue; \
+	  fi; \
+	  grep '^share-check:' "$$tmp/err" | diff -u "$$b.share-check" - || { echo "share-check: FAIL $$t (report)"; ok=0; }; \
+	  cmp -s "$$tmp/on.c" "$$tmp/off.c" || { echo "share-check: FAIL $$t (the C differs with the flag)"; ok=0; }; \
+	  if [ -f "$$t.expected" ]; then \
+	    if $(SPINEL) --share-strings --share-check "$$t" -o "$$tmp/b" >/dev/null 2>&1; then \
+	      "$$tmp/b" 2>&1 | cmp -s - "$$t.expected" || { echo "share-check: FAIL $$t (output)"; ok=0; }; \
+	    else echo "share-check: FAIL $$t (build)"; ok=0; fi; \
+	  elif ! echo " $(SHARE_CHECK_REPORT_ONLY) " | grep -q " $${b##*/} "; then \
+	    echo "share-check: FAIL $$t (no .expected)"; ok=0; \
+	  fi; \
+	  if $(SPINEL) --share-check -c --no-line-map "$$t" -o "$$tmp/def.c" 2>&1 | grep -q '^share-check:'; then \
+	    echo "share-check: FAIL $$t (reports without --share-strings)"; ok=0; \
+	  fi; \
+	done; \
+	rm -rf "$$tmp"; \
+	if [ $$ok = 1 ]; then echo "share-check: pass"; else exit 1; fi
+
+# share-check-ratchet: the sites --share-check reports over the sharing
+# corpus (test/share/*.rb, test/share/verify/*.rb,
+# test/share/verify/conflicts/*.rb and test/share_strings_*.rb), compared line
+# by line with test/share_check/ratchet.txt (tools/share_check_ratchet.sh has
+# the line format and how to update the list). A site the list lacks fails,
+# and so does a listed line no site matches, so the list only shrinks. It is
+# report-only (Matz, #8328): the compiler refuses at no flagged site yet. It
+# is a `make gate` leg (gate-props), so a pull request that adds a site or
+# leaves a stale line fails its gate rather than master's ratchet.
+.PHONY: share-check-ratchet
+share-check-ratchet: $(SPINEL)
+	@tools/share_check_ratchet.sh
 
 cident: $(SPINEL)
 	@tools/cident.sh $(REF)
@@ -3783,7 +4858,15 @@ gate-tool-test:
 gate-full:
 	+@$(MAKE) --no-print-directory gate GATE_CACHE=0
 
-gate-legs: gate-test gate-test-shared gate-bench gate-optcarrot gate-rubyspec gate-props
+# gate-rubyspec is listed first so it starts first: it is the leg that ran
+# last. Its examples run through xargs, outside the job server, and at the
+# default of nproc-2 workers it was still running long after the corpus legs
+# had finished, on half the machine. Under the gate it takes every core.
+# GATE_RUBYSPEC=0 leaves the rubyspec leg out, for a gate whose rubyspec run
+# happens elsewhere at the same commit (the maintainer's merge cycle runs it
+# on a second machine beside the CI lanes). A plain `make gate` runs it.
+GATE_RUBYSPEC ?= 1
+gate-legs: $(if $(filter 0,$(GATE_RUBYSPEC)),,gate-rubyspec) gate-test gate-test-shared gate-bench gate-optcarrot gate-rubyboy gate-props
 # Both corpus sub-makes use the same -O1 PCH files. Build them once before
 # either leg starts so one cannot read a PCH while the other writes it.
 .PHONY: gate-pch
@@ -3798,7 +4881,7 @@ gate-test:
 # infer-test and reject-test keep their default-build expectations.
 gate-test-shared:
 	+@$(MAKE) --no-print-directory clean-test-results TEST_RESULT_DIR=build/test-results-shared
-	+@$(MAKE) $(TEST_JOBS) --no-print-directory test-corpus-shared-summary OPT=-O1 SPINEL_SHARE_STRINGS=1 TEST_RESULT_DIR=build/test-results-shared
+	+@$(MAKE) $(TEST_JOBS) --no-print-directory test-corpus-shared-summary OPT=-O1 SPINEL_SHARE_STRINGS=1 TEST_REVERSE=1 TEST_RESULT_DIR=build/test-results-shared
 
 test-corpus-shared-summary: test-corpus-results
 	@awk -f tools/shared_test_results.awk test/share/known-failures.txt $(TEST_RESULT_DIR)/*.ok
@@ -3811,7 +4894,7 @@ test-corpus-shared-summary: test-corpus-results
 # under the gate's job server (they took 181 s one after another, the
 # longest of the gate's legs; spin-check alone is 72 s).
 gate-props:
-	+@$(MAKE) --no-print-directory alloc-report-test infer-test collect-errors-test spin-check diff-test scale-test traits-check-test bop-arity-check-test poly-cold-test share-strings-test
+	+@$(MAKE) --no-print-directory alloc-report-test infer-test collect-errors-test spin-check diff-test scale-test traits-check-test bop-arity-check-test bop-share-check-test poly-cold-test share-strings-test share-check-ratchet wrap-test
 
 # The ty_traits table (types.c) against the functions each column names,
 # for every builtin kind, in both integer-overflow modes.
@@ -3820,6 +4903,24 @@ gate-props:
 # Method#arity table against the same counts, and no stale keyword exemption.
 bop-arity-check-test: $(SPINEL)
 	@$(SPINEL) --check-bop-arity
+
+# Committed identity observations; the gate needs no reference CRuby.
+build/csrc/builtin_ops-share-check.o: src/builtin_ops.c src/builtin_share_spec.inc $(SPINEL_HDRS) | build/csrc
+	$(CC) $(CFLAGS) -DSP_BOP_SHARE_CHECK -Isrc -Ibuild/csrc -c $< -o $@
+
+build/csrc/main-share-check.o: src/main.c build/csrc/spinel_rev.h $(SPINEL_HDRS) | build/csrc
+	$(CC) $(CFLAGS) -DSP_BOP_SHARE_CHECK -Isrc -Ibuild/csrc -c $< -o $@
+
+SHARE_CHECK_OBJ = $(filter-out build/csrc/builtin_ops.o build/csrc/main.o,$(SPINEL_OBJ)) build/csrc/builtin_ops-share-check.o build/csrc/main-share-check.o
+build/spinel-share-check: $(SHARE_CHECK_OBJ) build/csrc/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(INLINE_RBS_LIBS) $(PLATFORM_OBJ)
+	$(CC) $(CFLAGS) $^ -lm $(LDFLAGS) $(SPINEL_LDFLAGS) -o $@
+
+bop-share-check-test: build/spinel-share-check
+	@build/spinel-share-check --check-bop-share
+
+SHARE_RUBY ?= ruby
+share-spec-check:
+	@$(SHARE_RUBY) --enable-frozen-string-literal tools/gen_builtin_share_spec.rb --check
 
 # The arity tables in codegen_call.c against the CRuby they were generated
 # from: regenerates them in memory and fails on any drift. It probes for
@@ -3896,6 +4997,12 @@ SCALE_CODEGEN_LIMIT ?= 6.9
 # scanned per lookup, took 4,798 steps at N=100 against a billion, which no
 # count or clock sees at a test's size.
 CALL_SHAPES_LIMIT ?= 4.5
+# The same 4x program compiled to C with --share-strings, which no other leg
+# compiles with: the share facts, the seal's holder and flow checks and the
+# String plan run only under the flag (#8328). 6.25x when it was added (the
+# plan's own work is about 0.02% of either count); the limit sits about 5%
+# above.
+SCALE_SHARE_LIMIT ?= 6.6
 # Each count is taken only from a compile that succeeded (sw): spinel-work
 # prints its count from an atexit handler, also when the compile fails, so
 # reading it alone would accept the ratio of a program that did not build.
@@ -3909,6 +5016,8 @@ scale-test: $(SPINEL_WORK)
 	wb=$$(sw --emit-rbs -o "$$tmp/b.rbs" "$$tmp/b.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	ca=$$(sw -c -o "$$tmp/a.c" "$$tmp/a.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	cb=$$(sw -c -o "$$tmp/b.c" "$$tmp/b.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	ga=$$(sw --share-strings -c -o "$$tmp/a.c" "$$tmp/a.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	gb=$$(sw --share-strings -c -o "$$tmp/b.c" "$$tmp/b.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	sh test/scale/call_shapes.sh 25 > "$$tmp/s1.rb"; sh test/scale/call_shapes.sh 100 > "$$tmp/s4.rb"; \
 	sa=$$(sw -c -o "$$tmp/s1.c" "$$tmp/s1.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	sb=$$(sw -c -o "$$tmp/s4.c" "$$tmp/s4.rb") || { rm -rf "$$tmp"; exit 1; }; \
@@ -3925,7 +5034,8 @@ scale-test: $(SPINEL_WORK)
 	fb=$$(sw -c -o "$$tmp/f4.c" "$$tmp/f4.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	rm -rf "$$tmp"; \
 	if [ -z "$$wa" ] || [ -z "$$wb" ] || [ -z "$$fa" ] || [ -z "$$fb" ] || [ -z "$$pa" ] || [ -z "$$pb" ] || \
-	   [ -z "$$ha" ] || [ -z "$$hb" ] || [ -z "$$ca" ] || [ -z "$$cb" ] || [ -z "$$sa" ] || [ -z "$$sb" ]; then echo "scale-test: FAIL (the counting compiler reported no work count)"; exit 1; fi; \
+	   [ -z "$$ha" ] || [ -z "$$hb" ] || [ -z "$$ca" ] || [ -z "$$cb" ] || [ -z "$$sa" ] || [ -z "$$sb" ] || \
+	   [ -z "$$ga" ] || [ -z "$$gb" ]; then echo "scale-test: FAIL (the counting compiler reported no work count)"; exit 1; fi; \
 	awk -v a="$$ha" -v b="$$hb" 'BEGIN { r = b / a; \
 	  printf "scale-test: boxed Hash store work at 2x the methods is %.2fx (limit 2.20)\n", r; exit (r > 2.20) }' || \
 	  { echo "scale-test: FAIL (a boxed Hash store rescanned unrelated method bodies)"; exit 1; }; \
@@ -3941,6 +5051,9 @@ scale-test: $(SPINEL_WORK)
 	awk -v a="$$ca" -v b="$$cb" -v lim="$(SCALE_CODEGEN_LIMIT)" 'BEGIN { r = b / a; \
 	  printf "scale-test: work at 4x the program, compiled to C, is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
 	  { echo "scale-test: FAIL (the C emission grew superlinearly: some pass rescans per method or call site; compare the -c and --emit-rbs counts)"; exit 1; }; \
+	awk -v a="$$ga" -v b="$$gb" -v lim="$(SCALE_SHARE_LIMIT)" 'BEGIN { r = b / a; \
+	  printf "scale-test: work at 4x the program, compiled to C with --share-strings, is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
+	  { echo "scale-test: FAIL (the --share-strings compile grew superlinearly: a share pass rescans per holder, flow or node; compare with the plain -c count)"; exit 1; }; \
 	awk -v a="$$sa" -v b="$$sb" -v lim="$(CALL_SHAPES_LIMIT)" 'BEGIN { r = b / a; \
 	  printf "scale-test: call-shape work at 4x the units, compiled to C, is %.2fx (linear 4.00, limit %.2f)\n", r, lim; exit (r > lim) }' || \
 	  { echo "scale-test: FAIL (a binding or block-typing pass grew superlinearly: it rescans per call site or argument, see test/scale/call_shapes.sh)"; exit 1; }
@@ -3955,6 +5068,14 @@ scale-test: $(SPINEL_WORK)
 # (test/fixtures/bisect/oracle.sh), and a stand-in compiler whose binaries
 # print which way one decision went (fake_spinel.sh). One of the gate's
 # property tests: gate-props waits for it.
+# The run-time cost checks of #7501 (matz, 2026-10-13: items 1, 2 and 4 in
+# the gate). run-scale-test fails past a shape's limit; gate-costs reports
+# the representation and C cost changes against the base and does not fail
+# on them (a cost is explained in the pull request).
+gate-props: run-scale-test gate-costs
+gate-costs: $(SPINEL)
+	@tools/gate_costs.sh
+
 gate-props: bisect-test
 bisect-test: $(SPINEL) bin/spinel-bisect
 	@ok=1; B=test/fixtures/bisect; f=test/gc_root_elided_array_slot.rb; \
@@ -4037,8 +5158,10 @@ gate-bench:
 	+@$(MAKE) --no-print-directory bench
 gate-optcarrot:
 	+@$(MAKE) --no-print-directory optcarrot
+gate-rubyboy:
+	+@$(MAKE) --no-print-directory rubyboy
 gate-rubyspec:
-	+@$(MAKE) --no-print-directory rubyspec-gate
+	+@$(MAKE) --no-print-directory rubyspec-gate RUBYSPEC_JOBS=$(or $(RUBYSPEC_JOBS),$(NPROC))
 
 # ---- Install ----
 
@@ -4069,16 +5192,19 @@ install: all bin/spin
 	install -d $(SPNLDIR)/lib/spinel
 	install -m 644 lib/spinel/runtime.h  $(SPNLDIR)/lib/spinel/
 	@# The wasm32-wasi shim headers go with the runtime headers; the target's
-	@# archive goes too when `make wasm-rt` built it (packages' _wasi.o ride
-	@# the packages copy below).
+	@# archives go too when `make wasm-rt` built them -- the --exceptions=abort
+	@# one beside the default, since main.c links it for that flag (packages'
+	@# _wasi.o and _wasi_noexc.o ride the packages copy below).
 	install -d $(SPNLDIR)/lib/wasi/sys
 	for h in lib/wasi/*.h; do install -m 644 $$h $(SPNLDIR)/lib/wasi/; done
 	for h in lib/wasi/sys/*.h; do install -m 644 $$h $(SPNLDIR)/lib/wasi/sys/; done
 	$(PLATFORM_INSTALL)
-	@if [ -f $(SP_RT_WASI_LIB) ]; then \
-	  install -d $(SPNLDIR)/lib/wasm32-wasi; \
-	  install -m 644 $(SP_RT_WASI_LIB) $(SPNLDIR)/lib/wasm32-wasi/; \
-	fi
+	@for a in $(SP_RT_WASI_LIB) $(SP_RT_WASI_NOEXC_LIB); do \
+	  if [ -f $$a ]; then \
+	    install -d $(SPNLDIR)/lib/wasm32-wasi; \
+	    install -m 644 $$a $(SPNLDIR)/lib/wasm32-wasi/; \
+	  fi; \
+	done
 	rm -rf $(SPNLDIR)/packages
 	cp -r packages $(SPNLDIR)/packages
 	@# the core methods written in Ruby, spliced by the compiler beside packages/

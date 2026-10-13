@@ -19,6 +19,18 @@ int poly_ivar_set_reaches(Compiler *c, int call, int k);
    of them, or NULL when the analysis cannot bound them (analyze_scope.c) */
 /* Kernel#String uses its argument as the conversion's implicit receiver. */
 const int *poly_recv_classes(Compiler *c, int call, int *n);
+/* Can that receiver be a builtin value as well (nil, a literal, a builtin
+   class's instance), which no class it lists stands for? 1 also when the
+   walk cannot bound it. */
+int poly_recv_builtin(Compiler *c, int call);
+/* The same walk for a value no call takes as its receiver (an argument of
+   `p`): the classes node v, or with elems one of its elements, can be an
+   instance of, marked in set (c->nclasses entries); 0 when it cannot bound
+   them. */
+int pivs_value_classes(Compiler *c, int v, int elems, char *set);
+/* The same for the boxed ivar ivn of class cid: the classes its stores can
+   put there, marked in set; 0 when it cannot bound them. */
+int pivs_ivar_classes(Compiler *c, int cid, const char *ivn, char *set);
 /* --share-strings: the callable literals (a lambda, a proc's literal
    block, a top-level method's `method(:name)`) the receiver of call `call`
    can be, by the same walk: into out (at most cap), their count, or -1
@@ -34,18 +46,25 @@ void strbuf_arg_index_free(Compiler *c);
    exactly what promote mode is asking us to avoid. Off (0) for raise/wrap, so
    the default gates and optcarrot (which pins wrap) see no behavior change. */
 extern int g_promote_mode;
+extern int g_exc_abort;   /* --exceptions=abort (src/main.c) */
+/* is a def's value (the Symbol it names) used? par: an_parent_map */
+int an_def_value_used(const NodeTable *nt, const int *par, int v);
+int *an_parent_map(const NodeTable *nt);
 
 /* Set by main.c from --plan-check (#7100): inference records, per call node,
    the builtin-op row it answered the call with (c->bop_inf), and codegen
    reports on stderr every call it emitted through a row inference did not
    choose. Off in every normal build. */
 extern int g_plan_check;
-
-/* Set by main.c from --nil-check (#7444): the nil fact the analysis decides
-   (analyze_nil.c) is held against the answers the helpers that decide it
-   today give, at each place they answer, and every disagreement reported on
-   stderr. Off in every normal build; the C is the same either way. */
-extern int g_nil_check;
+/* --arm-check (#7483): each per-arm re-typing codegen runs (arm_body_infer)
+   is held against the fact the analysis recorded for it (an_arm_facts);
+   a missing fact or a type that differs is reported on stderr. Off in
+   every normal build; the C is the same either way. */
+extern int g_arm_check;
+/* the per-arm facts (analyze_arm.c, #7483) */
+typedef struct ArmFact { int block; TyKind kind; int n; int *nodes; TyKind *types; } ArmFact;
+void an_arm_facts(Compiler *c);
+const ArmFact *arm_fact_find(const Compiler *c, int block, TyKind kind);
 
 /* The nil fact (analyze_nil.c, #7444): whether an object-typed value, or a
    builtin one held as a pointer (nil_fact_tracked), may be nil, decided once
@@ -57,6 +76,11 @@ extern int g_nil_check;
    Scope.ret_obj_may_nil. repr_of and repr_of_slot read them into may_nil. */
 enum { NF_UNKNOWN, NF_NOT_NIL, NF_MAY_NIL, NF_GUARDED /* not nil past a guard */ };
 void an_nil_facts(Compiler *c);
+/* Which constants a read can reach before their assignment: sets
+   LocalVar.const_early on each one whose assignment is not settled
+   (analyze_const.c). Runs once the constants are registered, ahead of the
+   folds that decide `defined?(K)`. */
+void an_const_presence(Compiler *c);
 int nil_fact_node(const Compiler *c, int node);
 int nil_fact_ivar(const Compiler *c, int cid, const char *ivn);
 /* where a nil comes from: a node's (nil_fact_why), a slot's flag itself.
@@ -107,6 +131,9 @@ TyKind local_aset_key_type(Compiler *c, Scope *sc, const char *name, int *nwrite
 /* Run inference over the whole program: register locals, reach a fixpoint
    on their types, and fill the node type cache. */
 void analyze_program(Compiler *c);
+/* The program as written gives no class a method named `nm`, beyond `defs`
+   (0 or 1) defs of that name: read ahead of the desugars, by absence. */
+int an_prog_never_gives(const char *nm, int defs);
 /* True if a regex source contains a capturing group: an unescaped '(' that
    isn't the start of a non-capturing/extension group '(?...'. scan returns
    nested arrays for capturing patterns, which the str_array path can't model. */
@@ -116,6 +143,9 @@ int an_re_has_captures(const char *src);
    pickup of a call to it then answers the call's nil as nil
    (an_tail_is_shared_handle). */
 int an_tail_answers_nil(Compiler *c, int mi);
+/* A String `||` or `&&` over a String left operand: a tail whose operands
+   are its arms (an_tail_is_shared_handle, emit_tail_value). */
+int an_tail_logic_op(Compiler *c, int node);
 int an_send_name_is_computed(Compiler *c, int arg);
 /* Is scope si an iterator synth_struct_each generated, not a def? */
 int scope_is_struct_synth(Compiler *c, int si);
@@ -152,6 +182,8 @@ void dyn_yield_reach(Compiler *c, int y, int k, DynReach *r);
 void dyn_blk_reach(Compiler *c, int mi, int k, DynReach *r);
 int dyn_yield_param_appends(Compiler *c, int mi, int j);
 int dyn_yield_live(Compiler *c, int mi, int k);
+typedef struct { int unknown, app, keeps, n; TyKind ty[4]; } DynParams;
+void dyn_blk_params(Compiler *c, int mi, int k, DynParams *out);
 int dyn_open_site(Compiler *c, int n, int *shift);
 void dyn_open_reach(Compiler *c, int n, int k, DynReach *r);
 int dyn_method_appends(Compiler *c, int mi, int j);
@@ -160,6 +192,7 @@ int an_local_array_stores_unshared(Compiler *c, const char *xn, Scope *xs);
 /* 1 appends, 0 does not, -1 cannot tell (refused as appending) */
 int fwd_rest_elem_appends(Compiler *c, int mi, int i);
 int fwd_poly_param_appends(Compiler *c, int mi, int j);
+int refl_im_params_call(Compiler *c, int id);
 /* A boxed parameter's argument a literal block appends to through a yield
    (yield_splice_handles): a String variable there must be the handle. */
 int yield_poly_arg_wants_handle(Compiler *c, int a);
@@ -194,12 +227,15 @@ TyKind infer_type(Compiler *c, int id);
    builtin_only, kept for the inference asking). So asking cannot change
    what codegen reads next. They nest. */
 void an_pure_read_begin(void);
+/* pin one node against infer_type recording its answer; returns the previous pin */
+int an_pin_node(int id);
 void an_pure_read_end(void);
 
 /* String#lines' argument shapes besides none: (sep), (chomp: ...) and
    (sep, chomp: ...), sep a String -- what a boxed receiver takes the
    typed String path for. */
 int poly_lines_args(Compiler *c, int argc, const int *argv);
+int lines_sep_ty(Compiler *c, int a);
 
 /* `recv` is a blockless call making an Enumerator that yields two values per
    element: each_with_index, with_index, each_with_object, with_object. */
@@ -210,17 +246,26 @@ int enum_pair_source_call(const NodeTable *nt, int recv);
 int poly_blockless_enum_name(const char *name);
 
 /* True when node `id`'s value, held in an unboxed scalar slot, can be the
-   reserved nil sentinel (SP_INT_NIL / the float twin). The slot type alone
+   nil it carries beside the value (an sp_oint / sp_ofloat). The slot type alone
    cannot say -- an `Integer?` and an `Integer` are both TY_INT -- so codegen
-   asks this before choosing between sp_box_int and sp_box_int_or_nil at a poly
+   asks this before choosing between sp_box_int and sp_box_oint at a poly
    boundary. Valid only after analyze_program has settled the marking. */
 int nullable_int_value(Compiler *c, int id);
+/* The call node nullable_int_value is asked of for its builtin answer
+   alone (a poly dispatch's builtin arm re-entering it): the program's
+   methods and readers of the name are no targets there. -1 when none. */
+extern int g_nn_builtin_call;
+/* 1: the typed Integer-valued Hash `node` evaluates to (TY_STR_INT_HASH /
+   TY_INT_INT_HASH) may hold a nil VALUE; 0 for every other kind and for
+   node < 0 (DESIGN.md D3b-ii) */
+int hash_vals_nullable(Compiler *c, int node);
 /* The same, asked of the variable rather than of the read: what it can hold
    anywhere, the nil narrowing's facts left out. */
 int nullable_int_value_raw(Compiler *c, int id);
+/* `@x = v` at write node id leaves @x's nil bit clear, as it already was */
+int nn_ivar_write_keeps_clear(Compiler *c, int id);
 int scalar_nil_only_call(Compiler *c, int id, TyKind rt);
 int nullable_scalar_nil_only_call(Compiler *c, int id);
-int nullable_int_elem_read(Compiler *c, int call);
 int nullable_int_elem_array(Compiler *c, int node);
 TyKind tuple_elem_read_type(Compiler *c, int node);
 TyKind tuple_elem_read_unboxed(Compiler *c, int node);
@@ -262,6 +307,9 @@ int reduce_tail_from_acc(Compiler *c, int tail, const char *accp);
    `break` that binds to the enclosing block -- i.e. not captured by a nested
    loop or block-bearing call. */
 int block_has_top_break(Compiler *c, int node);
+/* A `while true` / `until false` with no break of its own: it never
+   completes normally, so it answers no value. */
+int loop_never_completes(Compiler *c, int node);
 /* True if CallNode `id` takes a literal block whose body has a top-level
    break and is an inlined iterator the break wrapper should catch (a real
    receiver, not instance_exec/eval). When true, the call returns the break
@@ -294,9 +342,12 @@ TyKind face_of(int node);
 int face_active(void);
 void an_face_push(int node, TyKind kind);
 void an_face_pop(void);
+int an_face_pinned(int node);
 int view_face_top(int *node, TyKind *kind);   /* codegen_view.c */
 /* Name of a block's idx-th required parameter, or NULL. */
 const char *block_param_name(Compiler *c, int block, int idx);
+int native_call_ret_plain_num(Compiler *c, int v);   /* a native method declared :int / :float */
+int param_strict(Compiler *c, int mi, int k, const char **what, int *ord);   /* a parameter whose nil raises at its first use */
 int block_param_used_up(Compiler *c, int blk, const char *nm, int value);
 /* The name of a numbered block parameter (`_1`..`_9`) on this parameters node.
    Per BLOCK where a scope holds more than one such block; see
@@ -307,6 +358,8 @@ const char *block_rest_name(Compiler *c, int block);
 const char *block_opt_name(Compiler *c, int block, int idx);
 const char *block_param_at(Compiler *c, int block, int idx, int n);
 int call_plain_argc(Compiler *c, int call);
+/* The local a String's own conversion (`s.to_s`) reads, or -1 (analyze.c). */
+int an_str_conversion_local(Compiler *c, int v);
 const char *block_post_name(Compiler *c, int block, int idx);
 int block_lone_rest(Compiler *c, int block);
 int block_rest_marker(Compiler *c, int block);
@@ -346,6 +399,8 @@ int an_user_recv_defines_method(Compiler *c, const char *name);
 /* obj.methods / public_methods / singleton_methods on an instance of `cid`
    fold to a static symbol list */
 int an_object_methods_listable(Compiler *c, int cid, const char *name);
+int an_module_methods_listable(Compiler *c, int m, const char *name);
+int an_module_defines(Compiler *c, int m, const char *nm, int *vis);
 int an_object_methods_all_arg(Compiler *c, int cid, int argc, const int *argv);
 int an_class_singleton_methods_listable(Compiler *c, int cid);
 int ewo_memo_passed_to_callable_at(Compiler *c, int callid, int pidx);
@@ -491,4 +546,11 @@ int gather_reaches(Compiler *c, Scope *m, const int *argv, int pos_argc, int gat
 int zsuper_kw_positional(Compiler *c, Scope *s, Scope *pm);
 int an_thread_arg_block(Compiler *c, int n);
 int cap_wrap_mutates_param(Compiler *c, int blk, const char *bp);
+int std_stream_boxed(Compiler *c, const char *nm);   /* $stdout/$stderr may hold a non-IO */
+int gvar_has_write(Compiler *c, const char *name);   /* is global name (no `$`) assigned anywhere */
+int std_stream_assigned(Compiler *c, const char *nm);   /* ... or is assigned at all */
+int std_stream_value_classes(Compiler *c, char *set);   /* classes the streams' stores hold; 0: unbounded */
+int std_stream_foreign_writer(Compiler *c, const char *nm);   /* an object output cannot write to */
+int std_stream_bare_call_own(Compiler *c, int id, const char *nm);   /* bare nm reaches the program's own */
+
 #endif

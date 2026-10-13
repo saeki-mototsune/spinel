@@ -7,6 +7,7 @@
 #include "analyze_internal.h"
 #include "call_plan.h"
 #include "repr.h"
+#include "codegen_call_arms.h"
 
 static CallPlan *g_cp_memo = NULL;
 static unsigned char *g_cp_have = NULL;
@@ -17,16 +18,8 @@ static int g_cp_cap = 0;
 static char **g_cp_name = NULL;
 
 /* a descendant of cid with its own `name`: the dispatch is a switch */
-static int cplan_overridden(Compiler *c, int cid, const char *name, int cmeth) {
-  int nd = 0;
-  const int *ds = comp_descendants(c, cid, &nd);
-  for (int i = 0; i < nd; i++) {
-    int k = ds[i];
-    if (k == cid) continue;
-    if ((cmeth ? comp_cmethod_in_class(c, k, name) : comp_method_in_class(c, k, name)) >= 0)
-      return 1;
-  }
-  return 0;
+int cplan_overridden(Compiler *c, int cid, const char *name, int cmeth) {
+  return comp_method_overridden(c, cid, name, cmeth);
 }
 
 int cplan_dispatch_form(Compiler *c, int cid, const char *name, int has_base) {
@@ -105,16 +98,65 @@ static void cplan_resolve_super(Compiler *c, int id, CallPlan *p) {
     return;
   }
   int par = comp_super_parent(c, s->class_id, s->is_cmethod);
-  if (par < 0) return;
   const char *uname = comp_super_name(c, par, s->name, s->is_cmethod);
   if (!uname) return;
-  int mi = s->is_cmethod ? comp_cmethod_in_chain(c, par, uname, NULL)
-                         : comp_method_in_chain(c, par, uname, NULL);
+  int mi = par < 0 ? -1 : s->is_cmethod ? comp_cmethod_in_chain(c, par, uname, NULL)
+                                       : comp_method_in_chain(c, par, uname, NULL);
   if (mi >= 0) cplan_set(p, mi, par, UC_SUPER, CP_DIRECT);
+  else if (s->is_cmethod &&
+           builtin_super_cmethod_known(c->classes[s->class_id].name, uname)) {
+    cplan_set(p, -1, s->class_id, UC_SUPER, CP_REFUSE);
+    p->rkind = CR_FEATURE; p->rfrom = CRF_LIMIT;
+    p->msg = "super to an inherited builtin singleton method is not supported; see docs/limitations.md";
+  }
 }
 
+/* Where node `target` sits under n: 0 not there, 1 outside any block,
+   lambda or method body, 2 inside one (it may run later). */
+static int cplan_node_place(const NodeTable *nt, int n, int target, int inner, int depth) {
+  if (n < 0 || depth > 400) return 0;
+  if (n == target) return inner ? 2 : 1;
+  NodeKind k = nt_kind(nt, n);
+  int in = inner || k == NK_BlockNode || k == NK_LambdaNode || k == NK_DefNode;
+  for (int i = 0; i < nt_num_refs(nt, n); i++) {
+    int r = cplan_node_place(nt, nt_ref_at(nt, n, i), target, in, depth + 1);
+    if (r) return r;
+  }
+  for (int i = 0; i < nt_num_arrs(nt, n); i++) {
+    int m = 0; const int *ids = nt_arr_at(nt, n, i, &m);
+    for (int j = 0; j < m; j++) {
+      int r = cplan_node_place(nt, ids[j], target, in, depth + 1);
+      if (r) return r;
+    }
+  }
+  return 0;
+}
+/* Does call `id` run, at the program's top level, ahead of the statement
+   that defines method mi? There the name is still the builtin's. */
+static int cplan_called_before_def(Compiler *c, int id, int mi) {
+  const NodeTable *nt = c->nt;
+  int root = nt->root_id, st = root >= 0 ? nt_ref(nt, root, "statements") : -1, n = 0;
+  const int *sv = st >= 0 ? nt_arr(nt, st, "body", &n) : NULL;
+  int dn = c->scopes[mi].def_node;
+  for (int i = 0; i < n && dn >= 0; i++) {
+    if (cplan_node_place(nt, sv[i], dn, 0, 0)) return 0;
+    if (cplan_node_place(nt, sv[i], id, 0, 0) == 1) return 1;
+  }
+  return 0;
+}
+/* --share-strings: does call `id`, with a literal block, still reach the
+   builtin rather than String reopening mi's yielding method of its name,
+   for being one the program runs ahead of mi's definition at its top level
+   (as in CRuby)? The plan, the inference and the emitter ask it alike. */
+int cplan_reopen_runs_builtin(Compiler *c, int id, int mi) {
+  const NodeTable *nt = c->nt;
+  int blk = nt_ref(nt, id, "block");
+  return c->share_strings && mi >= 0 && blk >= 0 && nt_kind(nt, blk) == NK_BlockNode && c->scopes[mi].yields &&
+         c->scopes[mi].class_id == comp_class_index(c, "String") && cplan_called_before_def(c, id, mi);
+}
 static void cplan_resolve_call(Compiler *c, int id, CallPlan *p) {
   const NodeTable *nt = c->nt;
+  if (nt_int(nt, id, "builtin_only", 0)) return;
   const char *name = nt_str(nt, id, "name");
   if (!name) return;
   int recv = nt_ref(nt, id, "receiver");
@@ -183,6 +225,9 @@ static void cplan_resolve_call(Compiler *c, int id, CallPlan *p) {
   if (sci >= 0 || (rty && (sp_streq(rty, "ConstantReadNode") || sp_streq(rty, "ConstantPathNode")))) {
     int ci = sci >= 0 ? sci : comp_class_index(c, nt_str(nt, recv, "name"));
     int mi = ci >= 0 ? comp_cmethod_in_chain(c, ci, name, NULL) : -1;
+    /* a package's native_func, which the constant calls in C directly; its
+       def is for the module reached as a value */
+    if (sci < 0 && comp_scope_native_twin(c, mi)) return;
     if (mi >= 0) { cplan_set(p, mi, ci, UC_CMETH, CP_DIRECT); return; }
     /* a method the program adds to Class, on a builtin class constant */
     int rmi = class_reopen_cmethod(c, recv, name);
@@ -261,6 +306,11 @@ static void cplan_resolve_call(Compiler *c, int id, CallPlan *p) {
   if (rc) {
     int ci = comp_class_index(c, rc);
     int mi = ci >= 0 ? comp_method_in_chain(c, ci, name, NULL) : -1;
+    /* (--share-strings: a String reopening's yielding method of a name,
+       which a call with a literal block reaches, is the builtin's still for
+       a call the program runs ahead of the method's definition, at its top
+       level, as in CRuby) */
+    if (mi >= 0 && cplan_reopen_runs_builtin(c, id, mi)) return;
     if (mi >= 0) { cplan_set(p, mi, ci, UC_REOPEN, CP_DIRECT); return; }
   }
   /* a nil receiver's NilClass reopen, an Integer or Float receiver's
@@ -304,6 +354,24 @@ static void cplan_resolve(Compiler *c, int id, CallPlan *p) {
       if (mi >= 0 && !c->scopes[mi].yields) p->send_fallback = mi;
     }
   }
+}
+
+/* A constant call's user singleton target, shared by inference, rewrites
+   and builtin emitters. Unregistered constants need no target lookup.
+   Ordinary user classes never need this precedence decision; native package
+   bindings supply their own builtin names. The caller supplies the constant
+   receiver name, or NULL for any other receiver. */
+const CallPlan *cplan_const_user(Compiler *c, int id, const char *cn, int fresh) {
+  if (!cn || c->nclasses == 0) return NULL;
+  const NodeTable *nt = c->nt;
+  int ci = comp_class_index(c, cn);
+  if (ci < 0) return NULL;
+  if (!c->classes[ci].is_native_class && !c->classes[ci].is_builtin_const &&
+      (c->n_native_funcs == 0 || comp_native_find(c, cn, nt_str(nt, id, "name")) < 0) &&
+      (c->n_ffi_funcs == 0 || ffi_find_func(c, cn, nt_str(nt, id, "name")) < 0)) return NULL;
+  if (nt_int(nt, id, "builtin_only", 0)) return NULL;
+  const CallPlan *p = fresh ? cplan_user_fresh(c, id) : cplan_user(c, id);
+  return p->mi >= 0 && p->via == UC_CMETH && p->dispatch == CP_DIRECT ? p : NULL;
 }
 
 int cplan_virtual_member(Compiler *c, int id, const CallPlan *p, int mi) {
@@ -371,7 +439,7 @@ void cplan_served_report(void) {
 }
 
 /* the node is read as itself: nothing re-types or re-scopes it */
-static int cplan_plain_ctx(void) {
+int cplan_plain_ctx(void) {
   return view_depth() == 0 && comp_scope_move_depth() == 0 && g_ie_class_id < 0 &&
          inline_splice_depth() == 0;
 }
@@ -451,17 +519,52 @@ const CallPlan *cplan_user_fresh(Compiler *c, int id) {
   return &fresh;
 }
 
+/* The class a constructor call builds: a constant receiver's, or the class
+   its method runs for, as inference types it (bare or `self.new` in a class
+   method, `self.class.new` in an instance method). *own is set for the
+   second kind, which a subclass receiving the method builds its own of. */
+static int cplan_new_class(Compiler *c, int id, int *own) {
+  const NodeTable *nt = c->nt;
+  int r = nt_ref(nt, id, "receiver");
+  NodeKind k = r >= 0 ? nt_kind(nt, r) : NK_NONE;
+  *own = 0;
+  if (k == NK_ConstantReadNode || k == NK_ConstantPathNode) return comp_class_index(c, nt_str(nt, r, "name"));
+  Scope *s = comp_scope_of(c, id);
+  int ci = -1;
+  if (s && s->is_cmethod && (r < 0 || k == NK_SelfNode)) ci = s->class_id;
+  else if (s && !s->is_cmethod && k == NK_CallNode && nt_ref(nt, r, "receiver") >= 0 &&
+           nt_kind(nt, nt_ref(nt, r, "receiver")) == NK_SelfNode && nt_str(nt, r, "name") &&
+           sp_streq(nt_str(nt, r, "name"), "class")) ci = s->class_id;
+  if (ci < 0 || ci >= c->nclasses || comp_class_is_module(c, &c->classes[ci])) return -1;
+  *own = 1;
+  return ci;
+}
+
 /* A constructor's result can be discarded, so resolve from its receiver
    after the user new plan has declined, rather than from its result type. */
 int cplan_initialize(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   if (id < 0 || nt_kind(nt, id) != NK_CallNode || !is_new_name(nt_str(nt, id, "name"))) return -1;
-  int r = nt_ref(nt, id, "receiver");
-  NodeKind k = nt_kind(nt, r);
-  if (k != NK_ConstantReadNode && k != NK_ConstantPathNode) return -1;
-  if (cplan_user_fresh(c, id)->dispatch != CP_NONE) return -1;
-  int ci = comp_class_index(c, nt_str(nt, r, "name"));
-  return ci >= 0 ? comp_method_in_chain(c, ci, "initialize", NULL) : -1;
+  int own, ci = cplan_new_class(c, id, &own);
+  if (ci < 0 || cplan_user_fresh(c, id)->dispatch != CP_NONE) return -1;
+  return comp_method_in_chain(c, ci, "initialize", NULL);
+}
+
+/* Every initialize a constructor call may run: cplan_initialize's, and for
+   a `new` on the class its method runs for the initialize of each subclass
+   too, which may be the one that receives the method. Answers the count. */
+int cplan_initializers(Compiler *c, int id, int *out, int cap) {
+  const NodeTable *nt = c->nt;
+  if (id < 0 || nt_kind(nt, id) != NK_CallNode || !is_new_name(nt_str(nt, id, "name"))) return 0;
+  int own, ci = cplan_new_class(c, id, &own), n = 0;
+  if (ci < 0 || cplan_user_fresh(c, id)->dispatch != CP_NONE) return 0;
+  for (int k = ci; k < c->nclasses && n < cap; k++) {
+    if (k != ci && (!own || !is_descendant(c, k, ci))) continue;
+    int mi = comp_method_in_chain(c, k, "initialize", NULL), dup = 0;
+    for (int j = 0; j < n; j++) dup |= out[j] == mi;
+    if (mi >= 0 && !dup) out[n++] = mi;
+  }
+  return n;
 }
 
 /* ---- cplan_targets: the user methods a call may reach ---- */
@@ -500,7 +603,52 @@ static void ct_index_build(Compiler *c) {
   qsort(g_ct_idx, (size_t)g_ct_nidx, sizeof *g_ct_idx, ct_idx_cmp);
 }
 
+/* Exception#message invokes #to_s when the class has no message override.
+   Use the existing class candidates for both names so the share walk binds
+   that implicit edge just as it binds an explicit call. */
+static int ct_exception_text(Compiler *c, int id, int *out) {
+  const char *name = nt_str(c->nt, id, "name");
+  if (!c->share_strings || !name || nt_int(c->nt, id, "builtin_only", 0) ||
+      !is_exception_message(name) || call_plain_argc(c, id) != 0 ||
+      nt_ref(c->nt, id, "block") >= 0) return -2;
+  int recv = nt_ref(c->nt, id, "receiver");
+  TyKind rt = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN;
+  int cid = ty_is_object(rt) ? ty_object_class(rt) : -1;
+  if (rt != TY_EXCEPTION && (cid < 0 || !class_is_exc_subclass(c, cid))) return -2;
+  if (cid >= 0) {
+    int nd = 0;
+    comp_descendants(c, cid, &nd);
+    if (nd == 1) {
+      int mi = is_to_s_name(name) ? -1 : comp_method_in_chain(c, cid, "message", NULL);
+      if (mi < 0) mi = comp_method_in_chain(c, cid, "to_s", NULL);
+      if (mi >= 0) out[0] = mi;
+      return mi >= 0;
+    }
+  }
+  int n = 0;
+  for (int pass = is_to_s_name(name) ? 1 : 0; pass < 2; pass++) {
+    int nc = 0;
+    const PolyCand *cs = comp_poly_candidates(c, pass ? "to_s" : "message", &nc);
+    for (int i = 0; i < nc; i++) {
+      int k = cs[i].cls;
+      if (!class_is_exc_subclass(c, k) && !class_is_exc_reopen(c, k)) continue;
+      if (cid >= 0 && k != cid && !is_descendant(c, k, cid)) continue;
+      int mi = is_to_s_name(name) ? -1 : comp_method_in_chain(c, k, "message", NULL);
+      if (mi < 0) mi = comp_method_in_chain(c, k, "to_s", NULL);
+      if (mi < 0) continue;
+      int j = 0;
+      while (j < n && out[j] != mi) j++;
+      if (j < n) continue;
+      if (n == CPT_MAX) return CPT_UNKNOWN;
+      out[n++] = mi;
+    }
+  }
+  return n;
+}
+
 static int ct_resolve(Compiler *c, int id, int *out) {
+  int text = ct_exception_text(c, id, out);
+  if (text != -2) return text;
   const CallPlan *p = cplan_user_fresh(c, id);
   if (p->mi < 0 || p->dispatch == CP_REFUSE) {
     int recv = nt_ref(c->nt, id, "receiver");
@@ -526,6 +674,28 @@ static int ct_resolve(Compiler *c, int id, int *out) {
     if (k == plan.mi || !cplan_virtual_member(c, id, &plan, k)) continue;
     if (n == CPT_MAX) return CPT_UNKNOWN;
     out[n++] = k;
+  }
+  /* --share-strings: the methods named by the call, each class's own
+     (comp_poly_candidates follows an alias, `alias get text`, whose method
+     has another name than the call's and the first target's) */
+  const char *cn = nt_str(c->nt, id, "name");
+  /* (not for a text conversion, #to_s or #inspect: the boxed to_s route
+     asks each class the receiver can hold for its own method, and adding
+     every class's here widened the facts of the bundled library's calls,
+     a Set's #inspect over its elements, for nothing) */
+  if (c->share_strings && cn && !is_text_conversion(cn)) {
+    int np = 0;
+    const PolyCand *pc = comp_poly_candidates(c, cn, &np);
+    for (int i = 0; i < np; i++) {
+      int k = pc[i].mi, seen = 0;
+      /* (only a method of another name than the first target's: the loop
+         above has the methods of that name) */
+      if (k < 0 || !c->scopes[k].name || sp_streq(c->scopes[k].name, name)) continue;
+      for (int j = 0; j < n && !seen; j++) seen = out[j] == k;
+      if (seen || !cplan_virtual_member(c, id, &plan, k)) continue;
+      if (n == CPT_MAX) return CPT_UNKNOWN;
+      out[n++] = k;
+    }
   }
   return n;
 }
@@ -600,8 +770,9 @@ static int cplan_argc(const NodeTable *nt, int id) {
    it the call falls through to the generic diagnostic, which dumps node ids
    and argument types rather than naming the feature -- or, for a name the
    runtime happens to reach, to a NoMethodError that reads like an
-   implementation gap instead of a documented limit. Names a user class
-   defines are left alone: they are that method, not the builtin. *stop is
+   implementation gap instead of a documented limit. A call that reaches a
+   method the program defines is left alone: it is that method, not the
+   builtin, and each limit names how that is told (limit_exempt). *stop is
    0 when the node names no limit at all, so a limit further down its
    receiver chain is the one to report (diagnose_unsupported_call), and 1
    when the node itself settles it. The message may be a static buffer the
@@ -626,13 +797,195 @@ static int cplan_str_method_mutator(Compiler *c, int id) {
   return sym && an_str_mutator_name(sym);
 }
 
-const char *cplan_feature_why(Compiler *c, int id, int *stop) {
+static int cplan_reachable(Compiler *c, int id);
+
+/* A computed instance_variable_get or _set on a boxed receiver reads or
+   writes by name over the classes the receiver may be (emit_poly_ivar_call,
+   #8219); a class that defines its own method of that name takes the
+   program's, which that dispatch cannot call, so a program with such a
+   class keeps the refusal for the boxed shape. A typed receiver of such a
+   class binds to the method as any call does. */
+static int cplan_computed_ivar_get(Compiler *c, int id, const char *name) {
+  int set = sp_streq(name, "instance_variable_set");
+  if (!set && !sp_streq(name, "instance_variable_get")) return 0;
+  if (!cplan_reachable(c, id)) return 0;
+  const NodeTable *nt = c->nt;
+  int args = nt_ref(nt, id, "arguments"), ac = 0;
+  const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
+  if (ac != (set ? 2 : 1) || nt_kind(nt, av[0]) == NK_SymbolNode || nt_kind(nt, av[0]) == NK_StringNode) return 0;
+  int recv = nt_ref(nt, id, "receiver");
+  TyKind rt = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN;
+  if (rt != TY_POLY && rt != TY_EXCEPTION) return 0;
+  for (int k = 0; k < c->nclasses; k++)
+    if (c->classes[k].instantiated && !is_builtin_reopen(c->classes[k].name) &&
+        comp_method_in_chain(c, k, name, NULL) >= 0) return 1;
+  return 0;
+}
+
+/* How a documented limit tells a call that reaches a method the program
+   defines (which answers it, not the builtin) from one that reaches the
+   builtin it limits. Each limit names one, and limit_exempt applies it. */
+enum {
+  LX_NONE,          /* the call is the builtin's, whatever the program defines */
+  LX_NAME,          /* a method of the name anywhere in the program */
+  LX_RECV_CMETHOD,  /* a class method of the name in the constant receiver's chain */
+  LX_BINDING,       /* the call plan binds the call to a user method */
+};
+
+static int limit_exempt(Compiler *c, int id, int lx) {
+  const NodeTable *nt = c->nt;
+  const char *name = nt_str(nt, id, "name");
+  switch (lx) {
+  case LX_NAME: return diag_user_defines(c, name);
+  case LX_RECV_CMETHOD: {
+    int recv = nt_ref(nt, id, "receiver");
+    NodeKind rk = nt_kind(nt, recv);
+    int ci = rk == NK_ConstantReadNode || rk == NK_ConstantPathNode
+               ? comp_class_index(c, nt_str(nt, recv, "name")) : -1;
+    return ci >= 0 && comp_cmethod_in_chain(c, ci, name, NULL) >= 0;
+  }
+  case LX_BINDING: {
+    /* a switch over every class with a class method of the name (a class
+       value, bare or boxed) leaves the classes without one on the builtin */
+    const CallPlan *p = cplan_user_fresh(c, id);
+    return p->dispatch != CP_NONE && !p->by_name &&
+           !(p->via == UC_POLY && p->mi >= 0 && c->scopes[p->mi].is_cmethod);
+  }
+  }
+  return 0;
+}
+
+/* Object's public and private instance methods, Kernel's private ones
+   aside (kernel_private_method): with those, every method an object answers
+   before a define_method replaces it */
+static int object_method_name(const char *nm) {
+  static const char *const names[] = {
+    "!", "!=", "!~", "<=>", "==", "===", "__callee__", "__dir__", "__id__", "__method__",
+    "__send__", "`", "class", "clone", "define_singleton_method", "display", "dup", "enum_for",
+    "eql?", "equal?", "extend", "freeze", "frozen?", "hash", "initialize", "initialize_clone",
+    "initialize_copy", "initialize_dup", "inspect", "instance_eval", "instance_exec",
+    "instance_of?", "instance_variable_defined?", "instance_variable_get",
+    "instance_variable_set", "instance_variables", "is_a?", "itself", "kind_of?", "method",
+    "method_missing", "methods", "nil?", "object_id", "private_methods", "protected_methods",
+    "public_method", "public_methods", "public_send", "remove_instance_variable", "respond_to?",
+    "respond_to_missing?", "send", "singleton_class", "singleton_method",
+    "singleton_method_added", "singleton_method_removed", "singleton_method_undefined",
+    "singleton_methods", "tap", "then", "to_enum", "to_s", "yield_self", NULL };
+  for (int i = 0; nm && names[i]; i++) if (sp_streq(nm, names[i])) return 1;
+  return kernel_private_method(nm);
+}
+
+/* A define_method in a method's body defines its method when that method
+   runs, but analysis registers it from the start (walk_scope marks the call
+   dm_host, and dm_scope for the method it registers). A method nothing names
+   is not registered at all (method_never_named). Otherwise the early
+   registration is right only for a method that is new: one the class does
+   not answer before then. Anything else is refused: its own def or one up
+   its chain, a module's, a subclass's, an alias, attr or Struct member
+   (spelled as a Symbol), or a method every object has. A call in a branch
+   that never runs registers nothing (walk_scope). */
+int cplan_define_method_early(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  int host = (int)nt_int(nt, id, "dm_host", 0) - 1, dm = (int)nt_int(nt, id, "dm_scope", 0) - 1;
+  if (host < 0 || host >= c->nscopes) return 0;
+  int an = nt_ref(nt, id, "arguments"), ac = 0;
+  const int *av = an >= 0 ? nt_arr(nt, an, "arguments", &ac) : NULL;
+  int own = ac > 0 ? av[0] : -1;
+  if (own < 0 || (nt_kind(nt, own) != NK_SymbolNode && nt_kind(nt, own) != NK_StringNode)) return 0;
+  /* a method object (`define_method(:m, instance_method(:x))`) registers nothing */
+  if (dm < 0 || dm >= c->nscopes) return 1;
+  const Scope *ds = &c->scopes[dm];
+  if (!ds->name || ds->class_id < 0 || object_method_name(ds->name)) return 1;
+  int dc = -1, mi = comp_method_in_chain(c, ds->class_id, ds->name, &dc);
+  if (mi >= 0 && mi != dm) return 1;
+  for (int t = 0; t < c->nscopes; t++) {
+    const Scope *ts = &c->scopes[t];
+    if (t == dm || ts->is_cmethod || ts->class_id < 0 || !ts->name || !sp_streq(ts->name, ds->name)) continue;
+    for (int k = ds->class_id, h = 0; k >= 0 && k < c->nclasses && h < 64; k = c->classes[k].parent, h++) {
+      if (ts->class_id == k) return 1;
+      for (int m = 0; m < c->classes[k].nincluded_mods; m++)
+        if (c->classes[k].included_mods[m] == ts->class_id) return 1;
+    }
+    /* a subclass's: a class method run on the subclass defines it there */
+    for (int k = ts->class_id, h = 0; k >= 0 && k < c->nclasses && h < 64; k = c->classes[k].parent, h++)
+      if (k == ds->class_id) return 1;
+  }
+  for (int k = comp_kind_first(c, NK_SymbolNode); k >= 0; k = comp_kind_next(c, k)) {
+    const char *v = nt_kind(nt, k) == NK_SymbolNode && k != own ? nt_str(nt, k, "value") : NULL;
+    if (v && sp_streq(v, ds->name)) return 1;
+  }
+  for (int k = comp_kind_first(c, NK_StringNode); k >= 0; k = comp_kind_next(c, k)) {
+    const char *v = nt_kind(nt, k) == NK_StringNode && k != own ? nt_str(nt, k, "content") : NULL;
+    if (v && sp_streq(v, ds->name)) return 1;
+  }
+  /* the block is registered whichever define_method the call reaches, and a
+     program's own may answer it without defining anything: then a call of
+     the name would find a method CRuby never defines */
+  if (an_user_define_method(c))
+    for (int k = comp_kind_first(c, NK_CallNode); k >= 0; k = comp_kind_next(c, k)) {
+      const char *v = nt_kind(nt, k) == NK_CallNode ? nt_str(nt, k, "name") : NULL;
+      if (v && sp_streq(v, ds->name)) return 1;
+    }
+  return 0;
+}
+
+/* the limit the call's shape names, and in *lx how a user method exempts it */
+static const char *feature_limit(Compiler *c, int id, int *stop, int *lx, char *buf, size_t cap) {
   *stop = 1;
+  *lx = LX_NONE;
   const NodeTable *nt = c->nt;
   const char *nty = nt_type(nt, id);
   if (!nty || !sp_streq(nty, "CallNode")) return NULL;
   const char *name = nt_str(nt, id, "name");
   if (!name) return NULL;
+  if (is_raise_alias(name) && nt_int(nt, id, "class_new_capture", 0) && cplan_reachable(c, id))
+    return "Class.new or Module.new with a block that captures outer locals is not supported; see docs/limitations.md";
+  if (is_raise_alias(name) && nt_int(nt, id, "class_new_superclass", 0) && cplan_reachable(c, id))
+    return "Class.new with a non-constant superclass is not supported; "
+           "use a constant superclass (see docs/limitations.md)";
+  if (nt_int(nt, id, "define_method_name", 0) && cplan_reachable(c, id))
+    return "Module#define_method with a non-literal name is not supported; "
+           "use a literal Symbol or String (see docs/limitations.md)";
+  if (cplan_computed_ivar_get(c, id, name))
+    return sp_streq(name, "instance_variable_set")
+      ? "Object#instance_variable_set with a non-literal name on a receiver that may be an instance "
+        "of a class defining its own instance_variable_set is not supported (see docs/limitations.md)"
+      : "Object#instance_variable_get with a non-literal name on a receiver that may be an instance "
+        "of a class defining its own instance_variable_get is not supported (see docs/limitations.md)";
+  /* marked by mark_anon_superclass_reflection: no class object stands for
+     the anonymous class that CRuby's answer names. A call the plan binds to
+     a user method is that method's, not Class#superclass (RDoc's
+     ClassModule#superclass beside `class Rule < Struct.new(:weight)`). */
+  int anon_reflect = (int)nt_int(nt, id, "anon_reflect", 0);
+  if (anon_reflect && cplan_reachable(c, id)) {
+    *lx = LX_BINDING;
+    snprintf(buf, cap, "unsupported `%s` that can reach a class whose superclass is an anonymous "
+             "class (Class.new, Struct.new or Data.define as the superclass): spinel has no class "
+             "object for the anonymous class", anon_reflect == 1 ? "superclass" : "ancestors");
+    return buf;
+  }
+
+  int recv = nt_ref(nt, id, "receiver");
+  if ((nt_kind(nt, recv) == NK_ConstantReadNode || nt_kind(nt, recv) == NK_ConstantPathNode) &&
+      !nt_int(nt, id, "builtin_only", 0)) {
+    int ci = comp_class_index(c, nt_str(nt, recv, "name")), builtin = 0;
+    const char *target = ci >= 0 && c->classes[ci].naliases > 0
+                           ? comp_resolve_alias_ex(c, ci, name, NULL, &builtin) : NULL;
+    if (builtin == 2) {
+      snprintf(buf, cap, "%s.%s: calling an alias of a builtin singleton method is not supported; see docs/limitations.md", c->classes[ci].name, target);
+      return buf;
+    }
+  }
+  if (is_then_alias(name)) {
+    int blk = nt_ref(nt, id, "block"), recv = nt_ref(nt, id, "receiver");
+    TyKind rt = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN;
+    /* A callable block has no inline body or returned-String identity fact. */
+    if (blk >= 0 && nt_kind(nt, blk) != NK_BlockNode && (rt == TY_STRING || rt == TY_STRBUF)) {
+      *lx = LX_BINDING;
+      return "String#then / #yield_self with a callable block is not supported; "
+             "use a literal block to preserve its result identity (see docs/limitations.md)";
+    }
+  }
   static const struct { const char *m; const char *why; } tbl[] = {
     { "define_singleton_method",
       "Object#define_singleton_method is not supported by AOT compilation: a per-object "
@@ -705,11 +1058,11 @@ const char *cplan_feature_why(Compiler *c, int id, int *stop) {
   for (int k = 0; tbl[k].m; k++) if (sp_streq(name, tbl[k].m)) { hit = k; break; }
 
   /* The receiver's constant name, for the limits that are keyed on it. */
-  int recv = nt_ref(nt, id, "receiver");
   const char *rty = recv >= 0 ? nt_type(nt, recv) : NULL;
   const char *rcn = (rty && (sp_streq(rty, "ConstantReadNode") || sp_streq(rty, "ConstantPathNode")))
                     ? nt_str(nt, recv, "name") : NULL;
   const char *why = hit >= 0 ? tbl[hit].why : NULL;
+  if (why) *lx = LX_NAME;
   /* resolved to String#method's own wrapper, so a user `method` elsewhere
      (`def method` in some Foo) is not what the call reaches */
   int str_mutator = !why && cplan_str_method_mutator(c, id);
@@ -739,9 +1092,10 @@ const char *cplan_feature_why(Compiler *c, int id, int *stop) {
        and is left to the normal path. */
     else if (sp_streq(rcn, "Class") && sp_streq(name, "new") &&
              (nt_ref(nt, id, "block") >= 0 || cplan_argc(nt, id) > 0))
-      why = "Class.new(parent) { ... } is not supported by AOT compilation: the class "
+      why = "Class.new(parent) is not supported by AOT compilation: the class "
             "graph, ancestor chain, and method/ivar layout are baked at compile time. "
             "Declare the class with `class ... end` instead (see docs/limitations.md)";
+    if (why) *lx = LX_NAME;
   }
 
   /* Structural mutation of a class through an explicit receiver: the same
@@ -749,7 +1103,6 @@ const char *cplan_feature_why(Compiler *c, int id, int *stop) {
      Object counts though a program that never reopens it has no class entry
      for it: `Object.include M` (or through `O = Object`) otherwise compiled
      to a NoMethodError at run time. */
-  int restructure = 0;
   if (!why && rcn && (comp_class_index(c, rcn) >= 0 || sp_streq(rcn, "Object")) &&
       (sp_streq(name, "include") || sp_streq(name, "prepend") ||
        sp_streq(name, "attr_accessor") || sp_streq(name, "attr_reader") ||
@@ -757,9 +1110,7 @@ const char *cplan_feature_why(Compiler *c, int id, int *stop) {
     /* only the receiver's own class method of the name answers instead:
        a method of that name in an unrelated class (`def include` in some
        Foo) does not */
-    int rci = comp_class_index(c, rcn);
-    if (rci >= 0 && comp_cmethod_in_chain(c, rci, name, NULL) >= 0) return NULL;
-    restructure = 1;
+    *lx = LX_RECV_CMETHOD;
     static char buf[512];
     snprintf(buf, sizeof buf,
              "%s.%s(...) is not supported by AOT compilation: the class graph, ancestor "
@@ -770,8 +1121,13 @@ const char *cplan_feature_why(Compiler *c, int id, int *stop) {
   }
 
   if (!why) { *stop = 0; return NULL; }
-  if (!restructure && !str_mutator && diag_user_defines(c, name)) return NULL;
   return why;
+}
+
+const char *cplan_feature_why(Compiler *c, int id, int *stop, char *buf, size_t cap) {
+  int lx;
+  const char *why = feature_limit(c, id, stop, &lx, buf, cap);
+  return why && limit_exempt(c, id, lx) ? NULL : why;
 }
 
 
@@ -793,6 +1149,9 @@ static int cplan_user_names(Compiler *c, const char *name) {
    enclosing method's scope, and the emit loop emits a scope's body only when
    it is reachable */
 static int cplan_reachable(Compiler *c, int id) {
+  if (nt_int(c->nt, id, "refusal_dead", 0)) return 0;
+  int proc = nt_int(c->nt, id, "refusal_proc", -1);
+  if (proc >= 0 && proc_literal_uncalled(c, proc)) return 0;
   int sc = c->nscope[id];
   return sc >= 0 && sc < c->nscopes && c->scopes[sc].reachable;
 }
@@ -938,7 +1297,19 @@ static void cplan_refuse_set(CallPlan *p, int from, int rkind, const char *msg, 
 /* in the order codegen meets them: the prepasses, then the emitters */
 static void cplan_refuse_resolve(Compiler *c, int id, CallPlan *p, char *buf, size_t cap) {
   cplan_set(p, -1, -1, UC_NONE, CP_NONE);
-  if (nt_kind(c->nt, id) != NK_CallNode) return;
+  NodeKind k = nt_kind(c->nt, id);
+  if (k == NK_SuperNode || k == NK_ForwardingSuperNode) {
+    const CallPlan *sp = cplan_user(c, id);
+    if (sp->dispatch == CP_REFUSE) {
+      Scope *s = comp_scope_of(c, id);
+      char msg[2400];
+      snprintf(msg, sizeof msg, "%s.%s: %s", c->classes[s->class_id].name,
+               comp_prep_user_name(s->name), sp->msg);
+      cplan_refuse_set(p, sp->rfrom, sp->rkind, msg, buf, cap);
+    }
+    return;
+  }
+  if (k != NK_CallNode) return;
   const char *what = NULL;
   int from = CRF_NONE;
   if ((what = cplan_runtime_send_what(c, id))) from = CRF_SEND;
@@ -946,7 +1317,8 @@ static void cplan_refuse_resolve(Compiler *c, int id, CallPlan *p, char *buf, si
   else if ((what = cplan_binding_what(c, id))) from = CRF_BINDING;
   if (!what) {
     int stop;
-    const char *why = cplan_feature_why(c, id, &stop);
+    char why_buf[512];
+    const char *why = cplan_feature_why(c, id, &stop, why_buf, sizeof why_buf);
     /* an object's singleton support (extend_module_is_a, singleton_dsm_local)
        answers these first; the limit is the refusal only once it declines,
        which codegen alone knows */
@@ -1026,14 +1398,18 @@ static void cpoly_add(PolyPlan *p, int *cap, int kind, int key, int mi, TyKind v
    whose chain has the method or a reader, and the native ones (the
    memoized candidates); every class while an exception reopening can lend
    its method to a class outside them. Into ks (sized nclasses). */
-static int cpoly_arm_classes(Compiler *c, const char *name, int *ks) {
-  int n = 0;
+/* ...less the classes the receiver never holds (cls_fact_excludes, #8530):
+   their arms could not run, and an arm's parameters, typed by the calls
+   that can reach it, need not take this call's arguments */
+static int cpoly_arm_classes(Compiler *c, int id, const char *name, int *ks) {
+  int n = 0, recv = nt_ref(c->nt, id, "receiver");
   if (any_exc_reopen(c) || (is_element_access(name) && is_store_alias(name))) {
-    for (int k = 0; k < c->nclasses; k++) ks[n++] = k;
+    for (int k = 0; k < c->nclasses; k++)
+      if (!cls_fact_excludes(c, recv, k)) ks[n++] = k;
     return n;
   }
   int npc = 0;
-  const PolyCand *pcs = comp_poly_candidates(c, name, &npc);
+  const PolyCand *pcs = comp_poly_candidates_at(c, id, name, &npc);
   for (int i = 0; i < npc; i++) ks[n++] = pcs[i].cls;
   return n;
 }
@@ -1050,7 +1426,7 @@ int cplan_struct_aset(Compiler *c, int cid, const char *name, int argc) {
 static void cpoly_user_arms0(Compiler *c, int id, const char *name, TyKind ret, PolyPlan *p) {
   int cap = 0;
   int *ks = malloc(sizeof(int) * (size_t)(c->nclasses > 0 ? c->nclasses : 1));
-  int nks = cpoly_arm_classes(c, name, ks);
+  int nks = cpoly_arm_classes(c, id, name, ks);
   for (int ki = 0; ki < nks; ki++) {
     int k = ks[ki];
     if (!c->classes[k].instantiated && !class_is_prim_reopen(c, k)) continue;
@@ -1133,6 +1509,9 @@ int cplan_arm_args_fit(Compiler *c, Scope *ks, const ArgLayout *L, int pos_argc,
     TyKind pt0 = pv0 ? pv0->type : TY_UNKNOWN;
     TyKind at0 = atmp_ty[L->arg[a]];
     if (pt0 == TY_STRBUF && pv0->str_shared && (at0 == TY_STRING || at0 == TY_STRBUF)) continue;
+    /* --share-strings: a handle into a String parameter passes its bytes
+       (emit_poly_temp_as reads the held handle) */
+    if (pt0 == TY_STRING && at0 == TY_STRBUF && repr_share_rule(c)) continue;
     int pc = pt0 != TY_POLY && pt0 != TY_UNKNOWN && pt0 != TY_NIL && pt0 != TY_VOID;
     int ac = at0 != TY_POLY && at0 != TY_UNKNOWN && at0 != TY_NIL && at0 != TY_VOID;
     if (pc && ac && pt0 != at0 &&
@@ -1141,6 +1520,7 @@ int cplan_arm_args_fit(Compiler *c, Scope *ks, const ArgLayout *L, int pos_argc,
          (ty_is_object(pt0) && ty_is_object(at0) &&
           obj_class_unrelated(c, ty_object_class(pt0), ty_object_class(at0))) ||
          ty_is_struct_valued(pt0) || ty_is_struct_valued(at0) ||
+         (pt0 == TY_BOOL) != (at0 == TY_BOOL) ||
          (ty_is_hash(pt0) && ty_is_hash(at0)) || (ty_is_array(pt0) && ty_is_array(at0))))
       return 0;
   }
@@ -1329,7 +1709,7 @@ static void cpoly_user_arms_n(Compiler *c, int id, const char *name, int argc, c
   PolyArgs pargs = { argv, pos_argc, NULL, atmp_ty, &kw, NULL };
   if (full) cpoly_prearms_n(c, id, name, argc, argv, ret, atmp_ty, kwall_any, is_setter_val, p, &cap);
   int *ks = malloc(sizeof(int) * (size_t)(c->nclasses > 0 ? c->nclasses : 1));
-  int nks = cpoly_arm_classes(c, name, ks);
+  int nks = cpoly_arm_classes(c, id, name, ks);
   for (int ki = 0; ki < nks; ki++) {
     int k = ks[ki];
     if (!has_splat_arg && kwh < 0 && cplan_struct_aset(c, k, name, argc)) {
@@ -1676,6 +2056,19 @@ static const PolyPlan *cplan_poly_level(Compiler *c, int id, int full) {
   return p;
 }
 
+const PolyPlan *cplan_poly_fresh(Compiler *c, int id) {
+  static PolyPlan fresh;
+  if (id < 0 || id >= c->node_cap) { free(fresh.arm); fresh.arm = NULL; fresh.n = 0; return &fresh; }
+#ifndef NDEBUG
+  int tmp0 = g_tmp;
+#endif
+  cpoly_resolve(c, id, &fresh, 1);
+#ifndef NDEBUG
+  assert(g_tmp == tmp0);   /* resolving emits nothing */
+#endif
+  return &fresh;
+}
+
 const PolyPlan *cplan_poly_block(Compiler *c, int id) {
   static PolyPlan bp;
   free(bp.arm);
@@ -1805,10 +2198,11 @@ void cplan_poly_free(PolyPlan *p) {
 
 /* ---- CN_*: a call's nil target (#7444) ---- */
 
-/* the builtin receivers whose nil target the plan decides: a typed pointer
-   whose NULL is nil */
+/* the receivers whose nil target the plan decides: a typed pointer whose
+   NULL is nil, a builtin's or a user object's (repr_of says which object
+   is held as a pointer; a by-value one has no nil) */
 static int cplan_nil_family(TyKind t) {
-  return t == TY_STRING || ty_is_array(t) || ty_is_obj_array(t) || ty_is_hash(t) || t == TY_IO;
+  return t == TY_STRING || ty_is_array(t) || ty_is_obj_array(t) || ty_is_hash(t) || t == TY_IO || ty_is_object(t);
 }
 
 /* Does the program give nil a method `name` of its own: on NilClass,
@@ -1840,11 +2234,17 @@ int cplan_nil(Compiler *c, int id) {
   TyKind rt = c->ntype[r];
   /* under --share-strings, a String the rule made the shared handle is
      nil as its NULL handle (#6765) */
-  if (!(cplan_nil_family(rt) || (rt == TY_STRBUF && c->share_strings)) || comp_ntype(c, r) != rt) return CN_NONE;
+  /* Exception text dispatch has the same nil target as an ordinary call,
+     including a subclass whose #message invokes #to_s implicitly. */
+  int exc_text = is_exception_message(nm) &&
+    (rt == TY_EXCEPTION || (ty_is_object(rt) && class_is_exc_subclass(c, ty_object_class(rt))));
+  if (!(cplan_nil_family(rt) || exc_text || (rt == TY_STRBUF && c->share_strings)) || comp_ntype(c, r) != rt) return CN_NONE;
   Repr rr = repr_of(c, r);
   if ((rr.kind != RK_PTR && rr.kind != RK_STRBUF) || !rr.may_nil || rr.nil_tested) return CN_NONE;
-  /* an ivar keeps the release build's policy (ivar_nil_recv_guard, #5960);
-     a class variable's arms write back into it */
+  /* an ivar keeps the release build's policy (ivar_nil_recv_guard, #5960):
+     a hot path reads one that a reset or a setup fills, and a test in front
+     of every call through it is not paid for; a class variable's arms write
+     back into it */
   NodeKind rk = nt_kind(nt, r);
   if (rk == NK_InstanceVariableReadNode || rk == NK_ClassVariableReadNode) return CN_NONE;
   /* a local or a global is tested in its slot, where a mutator writes
@@ -1879,6 +2279,20 @@ int cplan_nil(Compiler *c, int id) {
     if (!rn || !sp_streq(rn, "__self")) return CN_NONE;
   }
   if (cplan_nil_user_method(c, nm)) return CN_NONE;
+  /* an arm of a lowered `send` on a user object, for a name its class does
+     not define: the arm reaches a Kernel method, which nil answers through
+     send as any object does (`nil.send(:Integer, "12")`) */
+  if (nt_int(nt, id, "dyn_arm", 0) && ty_is_object(rt)) {
+    int k = ty_object_class(rt);
+    if (comp_method_in_chain(c, k, nm, NULL) < 0 && !comp_reader_in_chain(c, k, nm, NULL)) return CN_NONE;
+  }
+  /* the typed String bang emitter tests a receiver it does not write back
+     into a variable itself (sp_nil_recv), and marks the plain form it emits
+     for it: a second test here would only repeat that one */
+  if (nt_int(nt, id, "recv_nil_tested", 0)) return CN_NONE;
+  if (rt == TY_STRING && ty_str_typed_bang_flags(nm) && comp_ntype(c, id) != TY_ENUMERATOR &&
+      !str_mut_var_recv(c, r) && !sb_shadowed_reader(r))
+    return CN_NONE;
   return is_nil_method(nm) ? CN_ANSWER : CN_RAISE;
 }
 

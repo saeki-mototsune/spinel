@@ -11,6 +11,22 @@
 #include "codegen_call_arms.h"
 
 static void emit_exc_own_render(Compiler *c, int id, int recv, int xcm, int own, Buf *b) {
+  /* NilClass#to_s answers its one frozen empty String before a nullable
+     exception's own renderer. The call plan already proves the written nil
+     arm and its builtin target. */
+  if (is_to_s_name(c->scopes[own].name) && cplan_nil(c, id) == CN_ANSWER &&
+      (TyKind)c->scopes[own].ret == TY_STRING) {
+    int t = ++g_tmp;
+    buf_printf(b, "({ sp_%s *_t%d = ", c->classes[xcm].c_name, t);
+    emit_expr(c, recv, b);
+    buf_printf(b, "; SP_GC_ROOT(_t%d); _t%d ? ", t, t);
+    int mark = view_bind(recv, "_t%d", t);
+    int tested = view_push_repr(c, recv, VR_NIL_TESTED, 1);
+    emit_exc_own_render(c, id, recv, xcm, own, b);
+    view_pop(c, tested); view_unbind(mark);
+    buf_puts(b, " : sp_str_frozen_empty; })");
+    return;
+  }
   int defc = xcm;
   (void)comp_method_in_chain(c, xcm, c->scopes[own].name, &defc);
   if (g_plan_check) ucall_observe(c, id, own, defc, 0);
@@ -87,7 +103,8 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     if ((is_copy_alias(name)) && argc == 0 &&
         comp_method_in_chain(c, ty_object_class(comp_ntype(c, recv)), name, NULL) < 0) {
       int xc2 = ty_object_class(repr_of(c, recv).as_ty);
-      buf_printf(b, "((sp_%s *)sp_exc_dup((sp_Exception *)(", c->classes[xc2].c_name);
+      buf_printf(b, "((sp_%s *)sp_exc_%s((sp_Exception *)(", c->classes[xc2].c_name,
+                 sp_streq(name, "clone") ? "clone" : "dup");
       emit_expr(c, recv, b);
       buf_puts(b, ")))");
       return 1;
@@ -276,6 +293,28 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       return 1;
     }
   }
+  /* ...and on a POLY receiver, an exception built from a Class known only at
+     run time (minitest's `ne = klass.new msg; ne.set_backtrace bt`): the
+     same store once the value is seen to be an exception, the NoMethodError
+     otherwise. Not where a program class defines the name. */
+  if (argc == 1 && sp_streq(name, "set_backtrace") && recv >= 0 &&
+      comp_ntype(c, recv) == TY_POLY && nt_ref(nt, id, "block") < 0) {
+    int pu = 0;
+    for (int k = 0; k < c->nclasses && !pu; k++)
+      if (comp_method_in_class(c, k, name) >= 0) pu = 1;
+    if (!pu || g_poly_builtin_arm) {
+      int t = ++g_tmp, ta = ++g_tmp;
+      buf_printf(b, "({ sp_RbVal _t%d = ", t);
+      emit_expr(c, recv, b);
+      buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_RbVal _t%d = ", t, ta);
+      emit_boxed(c, argv[0], b);
+      buf_printf(b, "; if (!(_t%d.tag == SP_TAG_OBJ && _t%d.v.p && (_t%d.cls_id == SP_BUILTIN_EXCEPTION"
+                    " || sp_is_exc_subclass_cls(_t%d.cls_id)))) sp_raise_poly_nomethod(\"set_backtrace\", _t%d); "
+                    "sp_Exception_set_backtrace((sp_Exception *)_t%d.v.p, sp_poly_as_str_array(_t%d)); })",
+                 t, t, t, t, t, t, ta);
+      return 1;
+    }
+  }
   /* exception accessors on a POLY receiver (an exception rescued into a
      union-typed local): runtime unbox-and-delegate, but only when no user
      class defines the name (which would need the poly method dispatch)
@@ -304,9 +343,16 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
         buf_printf(b, "; (_t%d.tag == SP_TAG_OBJ && _t%d.v.p && (_t%d.cls_id == SP_BUILTIN_EXCEPTION"
                    " || sp_is_exc_subclass_cls(_t%d.cls_id))) ? ", t, t, t, t);
         int boxed = repr_of(c, id).kind == RK_BOXED;
+        /* a dispatch whose call reads the handle its arms publish: an
+           exception no override owns publishes the handle it holds too, so
+           each read of it answers the same String */
+        int pub = g_poly_builtin_arm && !boxed && !exc_has_nonstring_msg_override(c) &&
+                  repr_call_returns_handle(c, id);
+        if (pub) c->uses_exc_text_handle |= 2;
         const char *arm = exc_has_nonstring_msg_override(c)
           ? (boxed ? "sp_user_exc_message_v(%s)" : "sp_poly_to_s(sp_user_exc_message_v(%s))")
-          : (boxed ? "sp_box_str(sp_user_exc_message(%s))" : "sp_user_exc_message(%s)");
+          : (boxed ? "sp_box_str(sp_user_exc_message(%s))"
+                   : pub ? "sp_user_exc_message_shared(%s)" : "sp_user_exc_message(%s)");
         char ep[64];
         snprintf(ep, sizeof ep, "(sp_Exception *)_t%d.v.p", t);
         buf_printf(b, arm, ep);
@@ -358,14 +404,36 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
      parameter it is passed to): the call re-enters with the receiver boxed
      as the exception it is, and the poly dispatch keys it by its user class,
      raising NoMethodError for any exception whose class lacks the method */
-  if (recv >= 0 && comp_ntype(c, recv) == TY_EXCEPTION && exc_user_method_name(c, name, argc)) {
+  static int exc_um_skip = -1;   /* the call being re-entered below */
+  if (recv >= 0 && exc_um_skip != id && comp_ntype(c, recv) == TY_EXCEPTION && exc_user_method_name(c, name, argc)) {
     int tv = ++g_tmp;
     buf_printf(b, "({ sp_RbVal _t%d = sp_box_nullable_obj((void *)(", tv);
     emit_expr(c, recv, b);
     buf_printf(b, "), SP_BUILTIN_EXCEPTION); SP_GC_ROOT_RBVAL(_t%d); ", tv);
     int slot = view_bind(recv, "_t%d", tv);
     int vw = view_push(c, recv, TY_POLY);
-    emit_expr(c, id, b);
+    int sv_skip = exc_um_skip; exc_um_skip = id;
+    /* `e.cause&.m`: the nil test is taken here, and the re-entry is past
+       it, as the safe-navigation guard's own second pass is; that guard
+       narrowed the boxed receiver back to the exception it had been */
+    const char *sop = nt_str(c->nt, id, "call_operator");
+    int sn = sop && sp_streq(sop, "&.");
+    int sv_sn = g_sn_skip;
+    TyKind at = repr_of(c, id).as_ty;
+    /* an Integer / Float answer is the `&.`'s oint, nil where it stops */
+    int so = sn && oint_kind(at) && node_is_oint(c, id);
+    if (sn) {
+      const char *nv = nil_value(at);
+      buf_printf(b, "_t%d.tag == SP_TAG_NIL ? %s : ", tv, so ? oint_nil(at) : nv ? nv : default_value_from_compiler(c, at));
+      g_sn_skip = id;
+      /* past the test the call is a plain one on the boxed exception */
+      nt_node_set_str((NodeTable *)c->nt, id, "call_operator", ".");
+    }
+    if (so) emit_oint_expr(c, id, at, b);
+    else emit_expr(c, id, b);
+    if (sn) nt_node_set_str((NodeTable *)c->nt, id, "call_operator", "&.");
+    g_sn_skip = sv_sn;
+    exc_um_skip = sv_skip;
     view_pop(c, vw);
     view_unbind(slot);
     buf_puts(b, "; })");
@@ -442,7 +510,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     /* dup/clone copy the whole (subclass-sized) struct so mutating the copy
        leaves the original alone (#2772) */
     if ((is_copy_alias(name)) && argc == 0) {
-      buf_puts(b, "sp_exc_dup((sp_Exception *)(");
+      buf_printf(b, "sp_exc_%s((sp_Exception *)(", sp_streq(name, "clone") ? "clone" : "dup");
       emit_expr(c, recv, b); buf_puts(b, "))");
       return 1;
     }
@@ -717,7 +785,11 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
     if (ac == 0) {
       /* a bare re-raise keeps the handled exception's own cause (#3745) */
       if (g_rescue_cls) buf_printf(b, "(sp_reraise_current = 1, sp_raise_cls(%s, %s))", g_rescue_cls, g_rescue_msg);
-      else buf_puts(b, "sp_raise(sp_exc_no_msg)");   /* a bare raise's message is "" (#3711) */
+      /* outside a rescue the exception in flight is still re-raised: an ensure
+         reached while unwinding carries one (#8374). Without one the message
+         is "" (#3711). */
+      else buf_puts(b, "(sp_cur_handled() ? sp_raise_exc((volatile sp_Exception *)sp_cur_handled())"
+                       " : sp_raise(sp_exc_no_msg))");
     }
     else if (ac == 1 && nt_type(nt, av[0]) &&
              (sp_streq(nt_type(nt, av[0]), "ConstantReadNode") || sp_streq(nt_type(nt, av[0]), "ConstantPathNode")) &&
@@ -906,7 +978,8 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
         int rk = ++g_tmp, rm = ++g_tmp;
         buf_printf(b, "({ sp_RbVal _t%d = ", rk); emit_boxed(c, av[0], b);
         buf_printf(b, "; sp_RbVal _t%d = ", rm); emit_boxed(c, av[1], b);
-        buf_printf(b, "; sp_raise_poly_msg(_t%d, _t%d); })", rk, rm);
+        buf_printf(b, "; %s(_t%d, _t%d); })",
+                   repr_share_rule(c) && share_node_shares(c, av[1]) ? "sp_raise_poly_msg_h" : "sp_raise_poly_msg", rk, rm);
       }
       else if (at == TY_EXCEPTION)
         { buf_puts(b, "sp_raise_exc((sp_Exception *)("); emit_expr(c, av[0], b); buf_puts(b, "))"); }

@@ -125,6 +125,9 @@ static inline void sp_gc_cleanup(int *p) { sp_gc_nroots = *p; }
    byte is exactly 0xfe -- safe on arbitrary memory, unlike sp_gc_mark's
    header walk. Use this for string parameters in runtime helpers. */
 #define SP_GC_ROOT_STR(v) int SP_CLEANUP(_sp_gc_root_pop) _SP_GC_CONCAT(_sp_gcr_, __COUNTER__) = _sp_gc_root_push((void**)((uintptr_t)&(v) | (uintptr_t)2))
+/* a String Range by value: its endpoint strings and, built --share-strings,
+   the handles they came from (#8321) */
+#define SP_GC_ROOT_SRANGE(v) SP_GC_ROOT_STR((v).first); SP_GC_ROOT_STR((v).last); SP_GC_ROOT((v).hf); SP_GC_ROOT((v).hl)
 #define SP_GC_RESTORE() sp_gc_nroots = _gc_saved
 
 /* ---- root frames ----
@@ -173,7 +176,9 @@ typedef struct { int nv; int np; } sp_gc_frame_hdr;
    assignment inside a larger expression. The statement expression evaluates the
    object once, which a comma form would not. */
 #define SP_WBO(x) ({ __typeof__(x) _sp_wbo = (x); sp_gc_wb((void *)_sp_wbo); _sp_wbo; })
+#ifndef SP_GC_REMEMBERED_MAX
 #define SP_GC_REMEMBERED_MAX 65536
+#endif
 extern void *sp_gc_remembered[SP_GC_REMEMBERED_MAX];
 extern int sp_gc_nremembered;
 extern int sp_gc_rem_overflow;
@@ -189,6 +194,7 @@ extern int sp_gc_str_major_sched;
 extern size_t sp_gc_str_majors;
 extern int sp_gc_obj_budget_fixed;
 extern int sp_gc_str_budget_fixed;
+extern int sp_gc_str_budget_mode;   /* 0 str, 1 walk, 2 gated (default) */
 /* Set for the duration of the string sweep hook on a minor cycle: only the
    young string list may be swept, because the mark that just ran did not
    walk old objects and so did not reach the strings they hold. */
@@ -222,7 +228,9 @@ void sp_gc_pin_remembered_slow(void *obj);
 static inline void sp_gc_pin_remembered(void *obj) {
   if (SP_EXPECT(sp_gc_minor_on, 1)) sp_gc_pin_remembered_slow(obj);
 }
+#ifndef SP_GC_PINNED_MAX
 #define SP_GC_PINNED_MAX 16384
+#endif
 extern void *sp_gc_pinned[SP_GC_PINNED_MAX];
 extern int sp_gc_npinned;
 extern int sp_gc_pin_overflow;
@@ -563,6 +571,10 @@ extern const char *(*sp_ivtbl_inspect_fn)(void *tbl);
  * sp_gc_mark_all / sp_gc_collect invoke them through these pointers, the
  * same way fibers register sp_gc_mark_suspended_fibers_hook. */
 extern void (*sp_gc_mark_globals_hook)(void);
+#ifdef SP_CEXT
+extern void (*sp_gc_mark_cext_hook)(void);
+extern void (*sp_gc_sweep_cext_hook)(int full);
+#endif
 extern void (*sp_gc_str_sweep_hook)(void);
 /* Whether the string heap's own schedule (or its growth backstop) would take
    a major this cycle. A string major needs a whole-heap mark, so under the
@@ -651,6 +663,9 @@ extern const char *(*sp_obj_cls_name_fn)(int cls_id);
    scan-function table names it, -1 for a plain one. NULL in a program with
    no such class. */
 extern int (*sp_bsub_cls_fn)(sp_RbVal v);
+/* the class id Ruby sees for a user class id: a synthesized singleton class
+   answers as the class it hides behind (generated sp_cls_visible) */
+extern int (*sp_cls_visible_fn)(int cls_id);
 /* Is user class `sub` the class `super` or a descendant of it? The generated
    class bank installs it; NULL means only an exact id can be trusted. A
    pointer array of one class checks a stored object against it (#4486). */
@@ -726,6 +741,8 @@ static inline void sp_cell_scan_srange(void *p) {
   sp_StrRange *r = (sp_StrRange *)p;
   if (r->first) sp_mark_string(r->first);
   if (r->last) sp_mark_string(r->last);
+  if (r->hf) sp_gc_mark(r->hf);
+  if (r->hl) sp_gc_mark(r->hl);
 }
 /* A captured Proc rides in an sp_int cell as (sp_int)(uintptr_t)ptr -- the cell
    is an integer slot, but what it holds is a collectable object, and without a

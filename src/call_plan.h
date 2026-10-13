@@ -74,8 +74,10 @@ const CallPlan *cplan_user(Compiler *c, int id);
    analyze_nil.c): it answers from the types as they stand. The answer
    lasts until the next call. */
 const CallPlan *cplan_user_fresh(Compiler *c, int id);
+const CallPlan *cplan_const_user(Compiler *c, int id, const char *cn, int fresh);
 /* A constant receiver's builtin new reaches this initialize, or -1. */
 int cplan_initialize(Compiler *c, int id);
+int cplan_initializers(Compiler *c, int id, int *out, int cap);
 /* Every user method the call node id may reach, into out (at most cap):
    its plan's method and, for a switch, each member. Answered from the types
    as they stand, never kept past cplan_targets_drop.
@@ -111,7 +113,8 @@ int cplan_exc_object_method(Compiler *c, const char *name);
 const CallPlan *cplan_refuse(Compiler *c, int id);
 /* the documented-limit family: the node's message or NULL; *stop 0 when
    a limit down the receiver chain is the one to report */
-const char *cplan_feature_why(Compiler *c, int id, int *stop);
+const char *cplan_feature_why(Compiler *c, int id, int *stop, char *buf, size_t cap);
+int cplan_define_method_early(Compiler *c, int id);
 
 /* The plan of the same call read in a context the node does not carry
    itself: its self, or its receiver, is an instance of self_ci. That is an
@@ -124,6 +127,10 @@ const char *cplan_feature_why(Compiler *c, int id, int *stop);
    self_ci < 0 is the node's own context, cplan_user. */
 enum { CPX_IE = 1, CPX_EMIT = 2, CPX_ARM = 4 };
 const CallPlan *cplan_user_in(Compiler *c, int id, int self_ci, int flags);
+/* Is the node codegen is at read as itself: no view, no instance_exec scope
+   move or class, no inline splice? Only there may a memo per node answer
+   (cplan_user's, the String plan's in share_plan.c). */
+int cplan_plain_ctx(void);
 /* --plan-check: a codegen site that took its target from a plan counts it
    (site: a short constant name); cplan_served_report prints the counts */
 void cplan_served(const char *site);
@@ -134,6 +141,8 @@ void cplan_served_report(void);
    than one (or any, without a base method: has_base 0), CP_PER_ARM for a
    switch whose arms disagree on the argument layout; CP_NONE for neither
    a base method nor a descendant's. */
+/* Whether a descendant defines its own method of this name. */
+int cplan_overridden(Compiler *c, int cid, const char *name, int cmeth);
 int cplan_dispatch_form(Compiler *c, int cid, const char *name, int has_base);
 
 /* whether mi is the plan's method or, for a switch, one of its arms */
@@ -224,7 +233,8 @@ typedef enum {
   PC_VOID,        /* no value (a void method, a raise) */
   PC_NUM,         /* a Bignum converted into an Integer or Float result */
   PC_COPY,        /* a shared-mutable String copied into a String result */
-  PC_BOX_OR_NIL   /* an Integer ivar boxed with its nil sentinel */
+  PC_BOX_OR_NIL,  /* an Integer ivar boxed with its nil (its nil byte) */
+  PC_BOX_HANDLE   /* emission observation: PC_BOX retains the String handle */
 } PolyConv;
 
 typedef struct {
@@ -285,6 +295,10 @@ const PolyPlan *cplan_poly(Compiler *c, int id);
    receiver form). Cheaper: the builtin families and trials, which only the
    --plan-check shadow compares, are left out. */
 const PolyPlan *cplan_poly_arms(Compiler *c, int id);
+/* Resolve the complete plan without reading or writing the per-node memo.
+   Use while inference facts are still moving; the scratch plan is overwritten
+   by the next fresh resolve, so finish reading it before another planner call. */
+const PolyPlan *cplan_poly_fresh(Compiler *c, int id);
 int cplan_struct_aset(Compiler *c, int cid, const char *name, int argc);
 /* A plan the caller keeps across emissions that may resolve others (a
    resolve outside the memo reuses one buffer); cplan_poly_free drops it. */
@@ -317,6 +331,7 @@ int  pa_begin(int id);
 void pa_resume(int frame);
 void pa_drop(int frame);     /* a dispatch that declined after opening its frame */
 void pa_flags(unsigned flags);
+void pa_box_text(TyKind ty);
 void pa_observe(int kind, int key, int mi, TyKind vty, int conv);
 /* the same, only into node id's own frame: for a helper more than one
    dispatch shares */
@@ -339,15 +354,19 @@ void pa_report(void);
 typedef enum {
   CN_NONE,     /* not nil here, a `&.` call, or a method the program gives nil */
   CN_RAISE,    /* nil has no such method: NoMethodError, after the operands */
-  CN_ANSWER    /* nil has it (is_nil_method): NilClass answers. Not emitted
-                  yet: the call's type has to join NilClass's answer */
+  CN_ANSWER    /* nil has it (is_nil_method): NilClass answers, where its
+                  answer has the call's type (nil_answer_text); a call whose
+                  answer has not is emitted as before, untested */
 } CplanNil;
 int cplan_nil(Compiler *c, int id);
+int cplan_nil_answer_served(Compiler *c, int id);   /* codegen_call.c: nil's answer has the call's type */
 /* Is a nil fact's source `why` (nil_fact_why) a nil the program writes --
    a literal, a missing else, a safe navigation, a slot read before its
    write, an element of an Array the program stores nil into -- which a
    receiver's nil test answers for? One the fact cannot bound (any element,
    a global, an ivar, an unseen caller) is not. */
 int cplan_nil_written(int why);
+
+int cplan_reopen_runs_builtin(Compiler *c, int id, int mi);
 
 #endif

@@ -56,7 +56,16 @@ static void emit_io_readlines_args(Compiler *c, const char *r, const int *pos, i
 static void emit_line_param_decl(Compiler *c, int id, const char *pn, int lt, Buf *b) {
   Scope *s = comp_scope_of(c, id);
   LocalVar *lv = s ? scope_local(s, pn) : NULL;
-  if (repr_of_slot(c, lv).kind == RK_STRBUF)
+  /* inside a yield spliced into its caller `pn` is the renamed local: the
+     slot is the block's own parameter, under its written name */
+  int blk = nt_ref(c->nt, id, "block");
+  if (!lv && blk >= 0 && nt_kind(c->nt, blk) == NK_BlockNode) {
+    Scope *bs = comp_scope_of(c, blk);
+    const char *raw = block_param_name(c, blk, 0);
+    lv = bs && raw ? scope_local(bs, raw) : NULL;
+  }
+  /* a buffer, or a parameter held as the shared handle (--share-strings) */
+  if (repr_of_slot(c, lv).kind == RK_STRBUF || repr_of_slot(c, lv).handle)
     buf_printf(b, " sp_String *lv_%s = sp_String_new_shared(_t%d); SP_GC_ROOT(lv_%s);", pn, lt, pn);
   else buf_printf(b, " const char *lv_%s = _t%d; SP_GC_ROOT_STR(lv_%s);", pn, lt, pn);
 }
@@ -136,6 +145,94 @@ static void emit_io_read_buffer(Compiler *c, const char *name, const char *fn, c
   else if (handle)
     buf_printf(b, "_t%d && _t%d ? sp_String_cstr((sp_String *)_t%d.v.p) : _t%d; })", tr, ts, ta + nint, tr);
   else buf_printf(b, "_t%d; })", tr);
+}
+
+/* Can IO#reopen's argument be an IO without being one statically? A boxed
+   value, or a program object whose #to_io the runtime dispatches
+   (class_to_io_dispatched). */
+static int reopen_arg_may_be_io(Compiler *c, int arg) {
+  if (yield_site_type(c, arg) == TY_POLY) return 1;
+  TyKind t = comp_ntype(c, arg);
+  int cid = ty_is_object(t) ? ty_object_class(t) : -1;
+  return cid >= 0 && !c->classes[cid].is_native_class && class_to_io_dispatched(c, cid);
+}
+
+/* reopen(other) on the handle text r: the IO other is or answers, else
+   other as a path. With a mode CRuby reads the argument as a path only, so
+   that form stays with the path arm. */
+static void emit_io_reopen_poly(Compiler *c, const char *r, int arg, Buf *b) {
+  buf_printf(b, "sp_File_reopen_poly(%s, ", r); emit_boxed(c, arg, b); buf_puts(b, ")");
+}
+
+
+/* `io.read(len)` on the receiver text r. read(nil) is read with no length:
+   the rest of the stream. A length that may be nil -- boxed, or an
+   Integer-or-nil (`def read(len = nil)` handing its parameter on) -- picks
+   between the two at run time; the strict Integer slot raised TypeError for
+   its nil. */
+static void emit_io_read_len_call(Compiler *c, const char *r, int len, Buf *b) {
+  TyKind lt0 = comp_ntype(c, len);
+  if (lt0 == TY_NIL) {
+    buf_puts(b, "({ (void)("); emit_expr(c, len, b);
+    buf_printf(b, "); sp_File_read(%s); })", r);
+  }
+  else if (lt0 == TY_POLY) {
+    int tl = ++g_tmp;
+    buf_printf(b, "({ sp_RbVal _t%d = ", tl); emit_boxed(c, len, b);
+    buf_printf(b, "; _t%d.tag == SP_TAG_NIL ? sp_File_read(%s) : sp_File_read_n(%s, sp_poly_arg_int_chk(_t%d)); })",
+               tl, r, r, tl);
+  }
+  else if (lt0 == TY_INT && node_has_oint_form(c, len)) {
+    int tl = ++g_tmp;
+    buf_printf(b, "({ sp_oint _t%d = ", tl); emit_oint_expr(c, len, TY_INT, b);
+    buf_printf(b, "; _t%d.nil ? sp_File_read(%s) : sp_File_read_n(%s, _t%d.v); })", tl, r, r, tl);
+  }
+  else { buf_printf(b, "sp_File_read_n(%s, ", r); emit_int_expr(c, len, b); buf_puts(b, ")"); }
+}
+
+/* The separator, the limit and `chomp:` of a line reader whose arguments a
+   splat or a `**` carries (io_line_args_spread), into _t<ls>, _t<ll> and
+   _t<lc>: the positional ones are gathered into a list and read as CRuby
+   reads them (sp_io_line_args), and `chomp:` is looked up in the call's
+   keywords merged in order. A limit of 0 is ArgumentError naming `who`;
+   with no `who` (gets, readline) it is left 0 and _t<ll>z says so. */
+static void emit_io_line_args_spread(Compiler *c, const int *argv, int argc, int ls, int ll, int lc,
+                                     const char *who, Buf *b) {
+  const NodeTable *nt = c->nt;
+  int tpa = ++g_tmp, kwh = -1;
+  buf_printf(b, "sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d); ", tpa, tpa);
+  if (argc > 0 && nt_kind(nt, argv[argc - 1]) == NK_KeywordHashNode) kwh = argv[argc - 1];
+  emit_push_arg_list(c, argv, kwh >= 0 ? argc - 1 : argc, tpa, b);
+  /* every argument is evaluated before any of them is checked */
+  int th = ++g_tmp, any = kwh >= 0 ? poly_kw_any_key(c, kwh) : 0;
+  if (kwh >= 0) emit_poly_kw_all(c, kwh, th, any, 1, b);
+  buf_printf(b, "const char *_t%d = NULL; SP_GC_ROOT_STR(_t%d); sp_int _t%d = 0; "
+                "sp_bool _t%dz = sp_io_line_args(_t%d, &_t%d, &_t%d, %s%s%s); sp_bool _t%d = 0; ",
+             ls, ls, ll, ll, tpa, ls, ll, who ? "\"" : "", who ? who : "NULL", who ? "\"" : "", lc);
+  if (kwh >= 0) {
+    int chs = comp_sym_intern(c, "chomp");
+    if (any)
+      buf_printf(b, "if (sp_PolyPolyHash_has_key(_t%d, sp_box_sym((sp_sym)%d))) "
+                    "_t%d = sp_poly_truthy(sp_PolyPolyHash_get(_t%d, sp_box_sym((sp_sym)%d))); ",
+                 th, chs, lc, th, chs);
+    else
+      buf_printf(b, "if (sp_SymPolyHash_has_key(_t%d, (sp_sym)%d)) "
+                    "_t%d = sp_poly_truthy(sp_SymPolyHash_get(_t%d, (sp_sym)%d)); ",
+                 th, chs, lc, th, chs);
+  }
+}
+
+/* gets / readline on the handle in _t<rf>, rooted across its arguments,
+   which a splat or a `**` carries (emit_io_line_args_spread). A limit of 0
+   answers "" without reading, as CRuby's does, once the stream is known to
+   be open: a closed one raises IOError first. */
+static void emit_io_line_read_spread(Compiler *c, const char *name, int rf, const int *argv, int argc, Buf *b) {
+  int ls = ++g_tmp, ll = ++g_tmp, lc = ++g_tmp;
+  buf_printf(b, "SP_GC_ROOT(_t%d); ", rf);
+  emit_io_line_args_spread(c, argv, argc, ls, ll, lc, NULL, b);
+  buf_printf(b, "if (_t%dz) SP_IO_OPEN(_t%d); ", ll, rf);
+  buf_printf(b, "_t%dz ? sp_str_empty : sp_File_%s(_t%d, _t%d, _t%d, _t%d)",
+             ll, sp_streq(name, "readline") ? "readline_sep" : "gets_sep", rf, ls, ll, lc);
 }
 
 static int emit_io_read_outbuf(Compiler *c, int id, const char *name, const char *fn, const char *r, const int *argv,
@@ -440,17 +537,17 @@ static int emit_io_socket_opt_call(Compiler *c, const NodeTable *nt, const char 
         int tn = ++g_tmp;
         buf_printf(b, "({ const char *_t%d = ", ts);
         emit_str_expr(c, argv[0], b);
-        buf_printf(b, "; sp_int _n%d = sp_sock_connect_nb_sa(%s, _t%d,", tn, r, ts);
+        buf_printf(b, "; sp_oint _n%d = sp_sock_connect_nb_sa(%s, _t%d,", tn, r, ts);
         buf_printf(b, " (sp_int)sp_str_byte_len(_t%d), 0);", ts);
-        buf_printf(b, " _n%d == SP_INT_NIL", tn);
+        buf_printf(b, " _n%d.nil", tn);
         buf_printf(b, " ? sp_box_sym(sp_sym_intern(\"wait_writable\"))");
-        buf_printf(b, " : sp_box_int(_n%d); })", tn);
+        buf_printf(b, " : sp_box_int(_n%d.v); })", tn);
       }
       else {
         buf_printf(b, "({ const char *_t%d = ", ts);
         emit_str_expr(c, argv[0], b);
         buf_printf(b, "; sp_sock_connect_nb_sa(%s, _t%d,"
-                      " (sp_int)sp_str_byte_len(_t%d), 1); })",
+                      " (sp_int)sp_str_byte_len(_t%d), 1).v; })",   /* exception: true never answers nil */
                       r, ts, ts);
       }
       return 1;
@@ -458,14 +555,14 @@ static int emit_io_socket_opt_call(Compiler *c, const NodeTable *nt, const char 
     if (sp_streq(name, "connect_nonblock") && pos9 == 2) {
       if (no_exc) {
         int tw = ++g_tmp;
-        buf_printf(b, "({ sp_int _t%d = sp_sock_connect_nb(%s, ", tw, r);
+        buf_printf(b, "({ sp_oint _t%d = sp_sock_connect_nb(%s, ", tw, r);
         emit_str_expr(c, argv[0], b); buf_puts(b, ", "); emit_int_expr(c, argv[1], b);
-        buf_printf(b, ", 0); _t%d == SP_INT_NIL"
-                      " ? sp_box_sym(sp_sym_intern(\"wait_writable\")) : sp_box_int(_t%d); })", tw, tw);
+        buf_printf(b, ", 0); _t%d.nil"
+                      " ? sp_box_sym(sp_sym_intern(\"wait_writable\")) : sp_box_int(_t%d.v); })", tw, tw);
       }
       else {
         buf_printf(b, "sp_sock_connect_nb(%s, ", r); emit_str_expr(c, argv[0], b);
-        buf_puts(b, ", "); emit_int_expr(c, argv[1], b); buf_puts(b, ", 1)");
+        buf_puts(b, ", "); emit_int_expr(c, argv[1], b); buf_puts(b, ", 1).v");
       }
       return 1;
     }
@@ -506,6 +603,12 @@ static int boxed_accept_nb_ok(const NodeTable *nt, const char *name, int argc, c
   return ev >= 0 && nt_type(nt, ev) && sp_streq(nt_type(nt, ev), "FalseNode");
 }
 
+/* winsize= as the typed arm takes it: one Integer Array */
+static int boxed_winsize_set(Compiler *c, const char *name, int argc, const int *argv) {
+  return sp_streq(name, "winsize=") && argc == 1 && sp_feature_enabled("io/console") &&
+         comp_ntype(c, argv[0]) == TY_INT_ARRAY;
+}
+
 /* the IO methods on a poly receiver that may hold a stream (write, read, gets, puts, print, ...) */
 int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
   if (emit_io_read_nonblock_outbuf(c, id, b)) return 1;
@@ -527,6 +630,7 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
        sp_streq(name, "to_path") ||
        sp_streq(name, "tty?") || sp_streq(name, "isatty") ||
        (sp_streq(name, "winsize") && sp_feature_enabled("io/console")) ||
+       (boxed_winsize_set(c, name, argc, argv)) ||
        sp_streq(name, "readlines") || sp_streq(name, "rewind") ||
        sp_streq(name, "readpartial") ||
        /* a socket read back out of a container: its non-blocking connect and
@@ -540,6 +644,11 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
        (sp_feature_required("socket") &&
         ((sp_streq(name, "do_not_reverse_lookup") && argc == 0) ||
          (sp_streq(name, "do_not_reverse_lookup=") && argc == 1))) ||
+       /* the descriptor flags: a Socket out of Socket.tcp_server_sockets is
+          an Array element, and WEBrick sets autoclose = false on each before
+          wrapping its fd as a TCPServer */
+       ((sp_streq(name, "autoclose=") || sp_streq(name, "close_on_exec=")) && argc == 1 &&
+        !attr_writer_named(c, -1, name)) ||
        /* the descriptor controls, at CRuby's arities, unless a splat carries
           the arguments, the advice is not a Symbol, or a class method or an
           attribute writer of that name may be the receiver's */
@@ -567,8 +676,15 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           an Array built around it, and the to_io an event loop calls on
           whatever it waited on (WEBrick's accept loop) */
        (sp_streq(name, "to_io") && argc == 0) ||
+       /* and reopen, on $stdout once a StringIO was put there too: the
+          IO's own arm, after its argument is boxed (sp_File_reopen_poly) */
+       (argc == 1 && sp_streq(name, "reopen") && !call_has_splat_arg(nt, argv, argc)) ||
        (sp_feature_required("socket") &&
         ((sp_streq(name, "accept") && argc == 0) || boxed_accept_nb_ok(nt, name, argc, argv))) ||
+       /* and its shutdown, which WEBrick calls on each listener it kept in
+          an Array when a signal stops the server */
+       (sp_feature_required("socket") && sp_streq(name, "shutdown") && argc <= 1 &&
+        !call_has_splat_arg(nt, argv, argc)) ||
        /* the readiness family: a lambda's parameter is boxed, so a handle
           passed through one reached `wait_readable` with no emitter, and in
           a condition it was refused as non-bool. IO#wait stays off the list,
@@ -625,19 +741,31 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       c->args_in_call = recv;
       return 1;
     }
-    /* rewind takes no argument, an Enumerator's or a stream's: given one,
-       CRuby raises ArgumentError for either and NoMethodError for any other
-       receiver (sp_poly_as_io's), once the arguments have run. The stream
-       arm below took such a call and answered its sp_int into the boxed
-       slot, which did not build. */
-    if (!iocand && is_rewind_name(name) && argc > 0 && !call_has_splat_arg(nt, argv, argc)) {
+    /* A stream method that takes no argument, given some (close, flush,
+       path, rewind, ...): CRuby raises ArgumentError for a stream and for
+       any other builtin that owns the name at that count (a Dir's close,
+       a Queue's closed?, an Enumerator's rewind), by the instance arity
+       table, and NoMethodError for any other receiver, once the arguments
+       have run. The stream arms below dropped the arguments and ran the
+       method (`o.close(1)` closed the file). A `*` or `**` splat's count
+       is the run time's, and stays with those arms. */
+    int kwsplat = 0;
+    for (int k = 0; k < argc; k++)
+      if (nt_kind(nt, argv[k]) == NK_KeywordHashNode && kwh_has_splat(nt, argv[k])) kwsplat = 1;
+    if (!iocand && argc > 0 && !kwsplat && !call_has_splat_arg(nt, argv, argc) &&
+        builtin_arity_admits("File", name, 0) && !builtin_arity_admits("File", name, 1)) {
+      static const struct { const char *cls, *id; } owners[] = {
+        { "Dir", "SP_BUILTIN_DIR" }, { "Queue", "SP_BUILTIN_QUEUE" },
+        { "Enumerator", "SP_BUILTIN_ENUMERATOR" } };
       int tv = ++g_tmp;
       char msg[96]; arity_message(msg, sizeof msg, argc, 0, 0, NULL);
       buf_puts(b, "({ "); tv = hold_operand(c, recv, TY_POLY, 1, tv, 1, " ", b);
       for (int k = 0; k < argc; k++) { buf_puts(b, "(void)("); emit_expr(c, argv[k], b); buf_puts(b, "); "); }
-      buf_printf(b, "if (!(_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_ENUMERATOR)) (void)sp_poly_as_io(_t%d, \"rewind\");"
-                    " sp_raise_cls(\"ArgumentError\", \"%s\"); %s; })",
-                 tv, tv, tv, msg, raise_tail_value(comp_ntype(c, id)));
+      buf_printf(b, "if (!(_t%d.tag == SP_TAG_OBJ && (0", tv);
+      for (size_t o = 0; o < sizeof owners / sizeof owners[0]; o++)
+        if (!builtin_arity_admits(owners[o].cls, name, argc)) buf_printf(b, " || _t%d.cls_id == %s", tv, owners[o].id);
+      buf_printf(b, "))) (void)sp_poly_as_io(_t%d, \"%s\"); sp_raise_cls(\"ArgumentError\", \"%s\"); %s; })",
+                 tv, name, msg, raise_tail_value(comp_ntype(c, id)));
       return 1;
     }
     /* rewind on a boxed value: an Enumerator rewinds and answers itself,
@@ -687,6 +815,18 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       }
       int tio2 = ++g_tmp;
       char tio[32]; snprintf(tio, sizeof tio, "_t%d", tio2);
+      /* winsize=: the receiver, then the size, then the handle, as the
+         typed arm sets it; a PTY master returned through a lambda is boxed */
+      if (boxed_winsize_set(c, name, argc, argv)) {
+        int trv = ++g_tmp, tsz = ++g_tmp;
+        buf_puts(b, "({ "); trv = hold_operand(c, recv, TY_POLY, 1, trv, 1, " ", b);
+        buf_printf(b, "sp_IntArray *_t%d = ", tsz);
+        emit_expr(c, argv[0], b);
+        buf_printf(b, "; SP_GC_ROOT(_t%d); ", tsz);
+        buf_printf(b, "sp_File_set_winsize(sp_poly_as_io(_t%d, \"winsize=\"), _t%d); })", trv, tsz);
+        c->args_in_call = recv;
+        return 1;
+      }
       /* pos=, sysseek, flock, fcntl and advise, answering what the typed
          arms answer: the offset pos= set, sysseek's and fcntl's integers,
          flock's status, nil from advise. The receiver and then the
@@ -739,7 +879,10 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           else if (theld[ai])
             buf_printf(b, "sp_int _t%d = sp_poly_arg_int_chk(_t%d); ", targ[ai], theld[ai]);
         if (sp_streq(name, "pos=")) {
-          buf_printf(b, "sp_File_seek(_t%d, _t%d, 0); _t%d; })", tio2, targ[0], targ[0]);
+          /* the assigned offset, never nil: lifted where an oint is wanted */
+          int po = node_is_oint(c, id);
+          buf_printf(b, "sp_File_seek(_t%d, _t%d, 0); %s_t%d%s; })", tio2, targ[0],
+                     po ? "sp_oint_of(" : "", targ[0], po ? ")" : "");
         }
         else if (sp_streq(name, "flock")) {
           buf_printf(b, "sp_File_flock(_t%d, _t%d); })", tio2, targ[0]);
@@ -772,8 +915,10 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       }
       /* and a boxed Queue closes and answers closed? itself */
       int qname = argc == 0 && (sp_streq(name, "close") || sp_streq(name, "closed?"));
+      /* and a boxed Mutex answers owned? itself, where a stat answers its own */
+      int mname = argc == 0 && sp_streq(name, "owned?");
       int tdr = 0;
-      if (dirfn || qname) {
+      if (dirfn || qname || mname) {
         tdr = ++g_tmp;
         buf_puts(b, "({ "); tdr = hold_operand(c, recv, TY_POLY, 1, tdr, 1, " ", b);
         if (qname) {
@@ -781,6 +926,9 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           if (sp_streq(name, "close")) buf_printf(b, "((void)sp_Queue_close((sp_queue *)_t%d.v.p), _t%d) : ", tdr, tdr);
           else buf_printf(b, "sp_Queue_closed((sp_queue *)_t%d.v.p) : ", tdr);
         }
+        if (mname)
+          buf_printf(b, "_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_MUTEX ? "
+                        "sp_Mutex_owned((sp_mutex *)_t%d.v.p) : ", tdr, tdr, tdr);
         if (dirfn) {
           buf_printf(b, "_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_DIR ? ", tdr, tdr);
           if (sp_streq(name, "close")) buf_printf(b, "((void)sp_Dir_close((sp_Dir *)_t%d.v.p), sp_box_nil()) : ", tdr);
@@ -848,7 +996,13 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       else if (is_socket_address(name))
         buf_printf(b, "sp_sock_addr(_t%d, %d); })", tio2, sp_streq(name, "peeraddr") ? 1 : 0);
       else if (sp_streq(name, "to_io")) buf_printf(b, "_t%d; })", tio2);
+      else if (sp_streq(name, "reopen")) { emit_io_reopen_poly(c, tio, argv[0], b); buf_puts(b, "; })"); }
       else if (sp_streq(name, "accept")) buf_printf(b, "sp_sock_accept(_t%d); })", tio2);
+      else if (sp_streq(name, "shutdown")) {
+        buf_printf(b, "sp_sock_shutdown(_t%d, ", tio2);
+        if (argc == 1) emit_int_expr(c, argv[0], b); else buf_puts(b, "2");
+        buf_puts(b, "); })");
+      }
       /* the same answers the typed arm gives: `exception: false` swaps
          IO::EAGAINWaitReadable for the :wait_readable marker */
       else if (sp_streq(name, "accept_nonblock")) {
@@ -870,17 +1024,33 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
         emit_unbox_or_keep(c, repr_of(c, id).as_ty, ts3, b);
         buf_puts(b, "; })");
       }
+      else if (sp_streq(name, "autoclose=") || sp_streq(name, "close_on_exec=")) {
+        /* answers its argument; only its truth sets the flag */
+        int ts3 = ++g_tmp;
+        buf_printf(b, "SP_GC_ROOT(_t%d); sp_RbVal _t%d = ", tio2, ts3);
+        emit_boxed(c, argv[0], b);
+        buf_printf(b, "; sp_File_set_%s(_t%d, sp_poly_truthy(_t%d)); ",
+                   sp_streq(name, "autoclose=") ? "autoclose" : "close_on_exec", tio2, ts3);
+        emit_unbox_or_keep(c, repr_of(c, id).as_ty, ts3, b);
+        buf_puts(b, "; })");
+      }
       /* a stat's mode and fields, answered as the TY_IO arms answer them,
          for a stat's handle only */
       else if (sp_streq(name, "mode")) {
         emit_stat_handle_only(tio2, name, b);
-        buf_printf(b, "sp_stat_mode(_t%d); })", tio2);
+        /* sp_stat_mode answers an sp_int; a call whose value is an oint
+           (a user class's nil-able `mode` in the same dispatch) takes it
+           wrapped, as sp_stat_field's answers already are */
+        if (node_is_oint(c, id)) buf_printf(b, "sp_oint_of(sp_stat_mode(_t%d)); })", tio2);
+        else buf_printf(b, "sp_stat_mode(_t%d); })", tio2);
       }
       else if (boxed_stat_name(name)) {
         int k = 0;
         while (boxed_stat_sfield[k] && !sp_streq(name, boxed_stat_sfield[k])) k++;
         emit_stat_handle_only(tio2, name, b);
-        buf_printf(b, "sp_stat_field(_t%d, %d); })", tio2, k);
+        /* the field's nil (a failed stat) beside it, in the call's form */
+        if (node_is_oint(c, id)) buf_printf(b, "sp_stat_field(_t%d, %d); })", tio2, k);
+        else buf_printf(b, "sp_oint_arg(sp_stat_field(_t%d, %d)); })", tio2, k);
       }
       else if (is_path_reader(name))
         buf_printf(b, "sp_File_path(_t%d); })", tio2);
@@ -910,6 +1080,12 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       else if (argc == 0 && boxed_stat_pred(name) >= 100) {
         emit_stat_handle_only(tio2, name, b);
         buf_printf(b, "sp_stat_type_pred(_t%d, %d); })", tio2, boxed_stat_pred(name) - 100);
+      }
+      /* size?: nil for a failed stat or an empty file (sp_stat_size_q) */
+      else if (argc == 0 && sp_streq(name, "size?")) {
+        emit_stat_handle_only(tio2, name, b);
+        if (node_is_oint(c, id)) buf_printf(b, "sp_stat_size_q(_t%d); })", tio2);
+        else buf_printf(b, "sp_oint_arg(sp_stat_size_q(_t%d)); })", tio2);
       }
       else if (argc == 0 && boxed_stat_pred(name) >= 0) {
         emit_stat_handle_only(tio2, name, b);
@@ -960,12 +1136,14 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           int skw9 = repr_of(c, argv[0]).as_ty == TY_STRING;
           const char *wfn9 = skw9 ? "sp_sock_write_nb_bin" : "sp_sock_write_nb";
           int tw9 = ++g_tmp;
-          buf_printf(b, "sp_int _t%d = %s(_t%d, ", tw9, wfn9, tio2);
+          /* the runtime answers an sp_oint: nil where the write would block
+             (exception: false), which CRuby answers :wait_writable */
+          buf_printf(b, "sp_oint _t%d = %s(_t%d, ", tw9, wfn9, tio2);
           emit_to_s_expr(c, argv[0], b);
           if (no_exc9)
-            buf_printf(b, ", 0); _t%d < 0 ? sp_box_nil() : sp_box_int(_t%d); })", tw9, tw9);
+            buf_printf(b, ", 0); _t%d.nil ? sp_box_sym(sp_sym_intern(\"wait_writable\")) : sp_box_int(_t%d.v); })", tw9, tw9);
           else
-            buf_printf(b, ", 1); _t%d; })", tw9);
+            buf_printf(b, ", 1); _t%d.v; })", tw9);
         }
       }
       /* read takes (len, buf): a third argument was dropped and the read
@@ -1009,6 +1187,13 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       else if (sp_streq(name, "fsync") || sp_streq(name, "fdatasync"))
         buf_printf(b, "sp_File_fsync(_t%d); })", tio2);
       else if (sp_streq(name, "gets") && argc == 0) buf_printf(b, "sp_File_gets(_t%d); })", tio2);
+      /* and through a splat or a `**`, read at run time as the typed arm
+         reads them: the fixed reader below passed the list itself as the
+         separator, and the C did not build */
+      else if (is_line_read(name) && io_line_args_spread(nt, argv, argc)) {
+        emit_io_line_read_spread(c, name, tio2, argv, argc, b);
+        buf_puts(b, "; })");
+      }
       /* the separator, limit and `chomp:` a typed handle takes: dropping
          them read `f.gets("o")` and `f.gets(3)` as a whole line. The handle
          is rooted across the arguments, which are evaluated after it. */
@@ -1062,6 +1247,14 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       }
       else if (sp_streq(name, "close")) buf_printf(b, "(void)sp_File_close(_t%d); sp_box_nil(); })", tio2);
       else if (sp_streq(name, "flush")) buf_printf(b, "sp_File_flush(_t%d); })", tio2);
+      /* read_nonblock or write_nonblock with nothing to read into or write:
+         the arity error CRuby raises, answering the type the call is typed
+         as (a String, an Integer), where the fileno below did not compile
+         as the String (a `method(name)` wrapper over a poly receiver) */
+      else if (is_nonblock_io(name) && argc == 0)
+        buf_printf(b, "(void)_t%d; sp_raise_cls(\"ArgumentError\", \"wrong number of arguments (given 0, expected %s)\"); %s; })",
+                   tio2, sp_streq(name, "read_nonblock") ? "1..2" : "1",
+                   sp_streq(name, "read_nonblock") ? "(const char *)NULL" : "(sp_int)0");
       else buf_printf(b, "sp_File_fileno(_t%d); })", tio2);
       if (tdr) buf_puts(b, "; })");
       return 1;
@@ -1328,6 +1521,11 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
       buf_printf(b, "sp_sock_address(%s, %d)", r, sp_streq(name, "remote_address") ? 1 : 0);
       free(rb.p); return 1;
     }
+    if (sp_feature_required("socket") && argc == 0 &&
+        (sp_streq(name, "getsockname") || sp_streq(name, "getpeername"))) {
+      buf_printf(b, "sp_sock_getname(%s, %d)", r, sp_streq(name, "getpeername") ? 1 : 0);
+      free(rb.p); return 1;
+    }
     if (sp_feature_required("socket")) {
       /* the address-taking pair; UDPSocket#send's 3-arg form carries the
          destination, the 2-arg form goes to the connected peer */
@@ -1383,6 +1581,16 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
         free(rb.p); return 1;
       }
     }
+    if (sp_streq(name, "read") && call_has_splat_arg(nt, argv, argc)) {
+      /* read(*args), a wrapper handing its own arguments on: counted and
+         read at run time, where the arms below took the list as the length */
+      int tf = ++g_tmp, tpa = ++g_tmp;
+      buf_printf(b, "({ sp_File *_t%d = %s; SP_GC_ROOT(_t%d); sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d); ",
+                 tf, r, tf, tpa, tpa);
+      emit_push_arg_list(c, argv, argc, tpa, b);
+      buf_printf(b, "sp_io_read_splat(_t%d, _t%d); })", tf, tpa);
+      free(rb.p); return 1;
+    }
     if (sp_streq(name, "read")) {
       if (argc > 2) emit_io_read_overcount(c, name, r, argv, argc, "0..2", b);
       else if (argc == 2 && emit_io_read_outbuf(c, id, name, "sp_File_read_n", r, argv, 1, argv[1], 1, b)) {}
@@ -1393,27 +1601,22 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
         int trd = ++g_tmp;
         /* CRuby raises FrozenError on the output buffer BEFORE reading (#3335) */
         buf_puts(b, "({ sp_str_check_mutable("); emit_expr(c, argv[1], b); buf_puts(b, "); ");
-        buf_printf(b, "const char *_t%d = sp_File_read_n(%s, ", trd, r);
-        emit_int_expr(c, argv[0], b);
-        buf_puts(b, "); ");
+        buf_printf(b, "const char *_t%d = ", trd);
+        emit_io_read_len_call(c, r, argv[0], b);
+        buf_puts(b, "; ");
         emit_local_ref(c, argv[1], bnm, b);
         buf_printf(b, " = _t%d ? _t%d : sp_str_empty; _t%d; })", trd, trd, trd);
       }
-      else {
-        /* read(nil) is read with no length: the rest of the stream */
-        TyKind lt0 = comp_ntype(c, argv[0]);
-        if (lt0 == TY_NIL) {
-          buf_puts(b, "({ (void)("); emit_expr(c, argv[0], b);
-          buf_printf(b, "); sp_File_read(%s); })", r);
-        }
-        else if (lt0 == TY_POLY) {
-          int tl = ++g_tmp;
-          buf_printf(b, "({ sp_RbVal _t%d = ", tl); emit_boxed(c, argv[0], b);
-          buf_printf(b, "; _t%d.tag == SP_TAG_NIL ? sp_File_read(%s) : sp_File_read_n(%s, sp_poly_arg_int_chk(_t%d)); })",
-                     tl, r, r, tl);
-        }
-        else { buf_puts(b, "sp_File_read_n("); buf_puts(b, r); buf_puts(b, ", "); emit_int_expr(c, argv[0], b); buf_puts(b, ")"); }
-      }
+      else emit_io_read_len_call(c, r, argv[0], b);
+      free(rb.p); return 1;
+    }
+    if (is_line_read(name) && io_line_args_spread(nt, argv, argc)) {
+      /* gets(*args, **opts), a wrapper handing its own arguments on: read
+         at run time, where gets_sep_arg_texts saw one Array argument */
+      int rf = ++g_tmp;
+      buf_printf(b, "({ sp_File *_t%d = %s; ", rf, r);
+      emit_io_line_read_spread(c, name, rf, argv, argc, b);
+      buf_puts(b, "; })");
       free(rb.p); return 1;
     }
     if (is_line_read(name)) {
@@ -1474,9 +1677,13 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
       if (argc >= 2) emit_int_expr_offt(c, argv[1], b); else buf_puts(b, "0");
       buf_puts(b, ")"); free(rb.p); return 1;
     }
+    if (sp_streq(name, "reopen") && argc == 1 && reopen_arg_may_be_io(c, argv[0])) {
+      /* an object answering #to_io, or a box that may hold an IO */
+      emit_io_reopen_poly(c, r, argv[0], b); free(rb.p); return 1;
+    }
     if (sp_streq(name, "reopen") && argc >= 1) {
       buf_printf(b, "sp_File_reopen(%s, ", r); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
-      if (argc >= 2) emit_str_expr(c, argv[1], b); else buf_puts(b, "\"r\"");
+      if (argc >= 2) emit_str_expr(c, argv[1], b); else buf_puts(b, "NULL");
       buf_puts(b, ")"); free(rb.p); return 1;
     }
     /* read_nonblock / write_nonblock: a real non-blocking try. `exception:
@@ -1532,14 +1739,14 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
         const char *wfn = skw ? "sp_sock_write_nb_bin" : "sp_sock_write_nb";
         if (no_exc8) {
           int tw = ++g_tmp;
-          buf_printf(b, "({ sp_int _t%d = %s(%s, ", tw, wfn, r);
+          buf_printf(b, "({ sp_oint _t%d = %s(%s, ", tw, wfn, r);
           emit_to_s_expr(c, argv[0], b);
-          buf_printf(b, ", 0); _t%d == SP_INT_NIL"
-                        " ? sp_box_sym(sp_sym_intern(\"wait_writable\")) : sp_box_int(_t%d); })", tw, tw);
+          buf_printf(b, ", 0); _t%d.nil"
+                        " ? sp_box_sym(sp_sym_intern(\"wait_writable\")) : sp_box_int(_t%d.v); })", tw, tw);
         }
         else {
           buf_printf(b, "%s(%s, ", wfn, r); emit_to_s_expr(c, argv[0], b);
-          buf_puts(b, ", 1)");
+          buf_puts(b, ", 1).v");
         }
       }
       free(rb.p); return 1;
@@ -1593,6 +1800,10 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
          sp_streq(name, "each_codepoint")) &&
         nt_ref(nt, id, "block") >= 0) {
       int blk2 = nt_ref(nt, id, "block");
+      /* the loop runs a literal block's body in place; a `&callable` the
+         forward desugar left (desugar_value_callable_forwards) has none, and
+         the loop would run with nothing in it */
+      if (nt_kind(nt, blk2) == NK_BlockArgumentNode) unsupported(c, id, "&-argument form here");
       const char *bp2 = block_param_name(c, blk2, 0);
       const char *bpn2 = bp2 ? rename_local(bp2) : NULL;
       int bdy2 = nt_ref(nt, blk2, "body");
@@ -1603,7 +1814,9 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
       buf_puts(b, "({ ");
       buf_printf(b, "sp_File *_t%d = %s; SP_GC_ROOT(_t%d); ", rf2, r, rf2);
       if (is_byte)
-        buf_printf(b, "sp_int _t%d; while ((_t%d = sp_File_getbyte(_t%d)) != SP_INT_NIL) {", lt2, lt2, rf2);
+        /* getbyte answers nil at EOF: the oint read into its own temp, the
+           byte handed on as the plain Integer the block takes */
+        buf_printf(b, "sp_int _t%d; sp_oint _t%db; while (!(_t%db = sp_File_getbyte(_t%d)).nil && (_t%d = _t%db.v, 1)) {", lt2, lt2, lt2, rf2, lt2, lt2);
       else if (is_cp)
         /* each_codepoint yields the ordinal of each character, so read a
            whole UTF-8 character and decode it (#3038) */
@@ -1629,6 +1842,16 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
       }
       for (int k = 0; k < bbn2; k++) emit_stmt(c, bbb2[k], b, 0);
       buf_printf(b, " } (sp_File *)_t%d; })", rf2);
+      free(rb.p); return 1;
+    }
+    if (sp_streq(name, "readlines") && io_line_args_spread(nt, argv, argc)) {
+      int rf = ++g_tmp, ls = ++g_tmp, ll = ++g_tmp, lc = ++g_tmp, tr = ++g_tmp, tn = ++g_tmp;
+      buf_printf(b, "({ sp_File *_t%d = %s; SP_GC_ROOT(_t%d); ", rf, r, rf);
+      emit_io_line_args_spread(c, argv, argc, ls, ll, lc, "readlines", b);
+      buf_printf(b, "sp_StrArray *_t%d = sp_StrArray_new(); SP_GC_ROOT(_t%d); const char *_t%d; "
+                    "while ((_t%d = sp_File_gets_sep(_t%d, _t%d, _t%d, _t%d)) != NULL) "
+                    "sp_StrArray_push(_t%d, _t%d); _t%d; })",
+                 tr, tr, tn, tn, rf, ls, ll, lc, tr, tn, tr);
       free(rb.p); return 1;
     }
     if (sp_streq(name, "readlines")) {
@@ -1841,8 +2064,10 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
       for (int k = 0; k < argc; k++) {
         TyKind akt = comp_ntype(c, argv[k]);
         abin[k] = (akt == TY_STRING);
-        if (sp_streq(name, "puts") && (ty_is_array(akt) || akt == TY_POLY_ARRAY || akt == TY_POLY)) {
-          /* an Array argument prints one element per line (#2813) */
+        if (sp_streq(name, "puts") && (ty_is_array(akt) || akt == TY_POLY_ARRAY || akt == TY_POLY ||
+                                       nt_kind(nt, argv[k]) == NK_ArrayNode)) {
+          /* an Array argument prints one element per line (#2813); an empty
+             literal, which has no element type, prints nothing */
           aarr[k] = 1;
           emit_boxed(c, argv[k], &abs[k]);
         }
@@ -1913,6 +2138,8 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
     if ((sp_streq(name, "each_line") || sp_streq(name, "each")) &&
         nt_ref(nt, id, "block") >= 0) {
       int blk = nt_ref(nt, id, "block");
+      /* a literal block only, as each_char's arm above */
+      if (nt_kind(nt, blk) == NK_BlockArgumentNode) unsupported(c, id, "&-argument form here");
       const char *bp = block_param_name(c, blk, 0);
       const char *bpn = bp ? rename_local(bp) : NULL;
       int bdy = nt_ref(nt, blk, "body");
@@ -1937,32 +2164,7 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
       /* the separator, the limit and `chomp:` (#2810) are evaluated once,
          ahead of the loop, as CRuby evaluates them */
       int ls = ++g_tmp, ll = ++g_tmp, lc = ++g_tmp;
-      if (io_line_args_spread(nt, argv, argc)) {
-        /* a splat or a `**` carries them: the positional ones are gathered
-           into a list and read as CRuby reads them (sp_io_line_args), and
-           `chomp:` is looked up in the call's keywords merged in order */
-        int tpa = ++g_tmp, kwh = -1;
-        buf_printf(b, "sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d); ", tpa, tpa);
-        if (argc > 0 && nt_kind(nt, argv[argc - 1]) == NK_KeywordHashNode) kwh = argv[argc - 1];
-        emit_push_arg_list(c, argv, kwh >= 0 ? argc - 1 : argc, tpa, b);
-        /* every argument is evaluated before any of them is checked */
-        int th = ++g_tmp, any = kwh >= 0 ? poly_kw_any_key(c, kwh) : 0;
-        if (kwh >= 0) emit_poly_kw_all(c, kwh, th, any, 1, b);
-        buf_printf(b, "const char *_t%d = NULL; SP_GC_ROOT_STR(_t%d); sp_int _t%d = 0; "
-                      "sp_io_line_args(_t%d, &_t%d, &_t%d); sp_bool _t%d = 0; ",
-                   ls, ls, ll, tpa, ls, ll, lc);
-        if (kwh >= 0) {
-          int chs = comp_sym_intern(c, "chomp");
-          if (any)
-            buf_printf(b, "if (sp_PolyPolyHash_has_key(_t%d, sp_box_sym((sp_sym)%d))) "
-                          "_t%d = sp_poly_truthy(sp_PolyPolyHash_get(_t%d, sp_box_sym((sp_sym)%d))); ",
-                       th, chs, lc, th, chs);
-          else
-            buf_printf(b, "if (sp_SymPolyHash_has_key(_t%d, (sp_sym)%d)) "
-                          "_t%d = sp_poly_truthy(sp_SymPolyHash_get(_t%d, (sp_sym)%d)); ",
-                       th, chs, lc, th, chs);
-        }
-      }
+      if (io_line_args_spread(nt, argv, argc)) emit_io_line_args_spread(c, argv, argc, ls, ll, lc, "each_line", b);
       else {
         Buf esep, elim, echomp; memset(&esep, 0, sizeof esep); memset(&elim, 0, sizeof elim); memset(&echomp, 0, sizeof echomp);
         gets_sep_arg_texts(c, argv, argc, 1, &esep, &elim, &echomp);
@@ -1974,6 +2176,15 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
         for (int k = 0; k < argc; k++)
           if (comp_ntype(c, argv[k]) == TY_INT) {
             buf_printf(b, " if (_t%d == 0) sp_raise_cls(\"ArgumentError\", \"invalid limit: 0 for each_line\");", ll);
+            break;
+          }
+          /* a boxed variable read is the limit when it holds an Integer (an
+             Integer local under --int-overflow=promote): its 0 raises too */
+          else if (comp_ntype(c, argv[k]) == TY_POLY && nt_kind(c->nt, argv[k]) == NK_LocalVariableReadNode) {
+            int tz = ++g_tmp;
+            buf_printf(b, " { sp_RbVal _t%d = ", tz);
+            emit_expr(c, argv[k], b);
+            buf_printf(b, "; if (_t%d.tag == SP_TAG_INT && _t%d.v.i == 0) sp_raise_cls(\"ArgumentError\", \"invalid limit: 0 for each_line\"); }", tz, tz);
             break;
           }
       }

@@ -22,6 +22,19 @@ int is_record_class_builder(const char *recv, const char *meth) {
                           (sp_streq(recv, "Data") && sp_streq(meth, "define")));
 }
 
+/* Struct.new, Data.define, Class.new, Module.new: the builders of a class or a
+   module, whose block runs as its body */
+int is_class_builder(const char *recv, const char *meth) {
+  return is_record_class_builder(recv, meth) ||
+         (recv && meth && sp_streq(meth, "new") && (sp_streq(recv, "Class") || sp_streq(recv, "Module")));
+}
+
+/* Hash.new, Array.new, String.new, Object.new: a builtin's own constructor */
+int is_value_constructor(const char *recv, const char *meth) {
+  return recv && meth && sp_streq(meth, "new") &&
+         (sp_streq(recv, "Hash") || sp_streq(recv, "Array") || sp_streq(recv, "String") || sp_streq(recv, "Object"));
+}
+
 /* the Array class's own name, exactly */
 int is_array_class_name(const char *n) {
   return n && sp_streq(n, "Array");
@@ -38,6 +51,8 @@ int is_call_alias(const char *n) {
 int is_method_invoke(const char *n) {
   return is_call_alias(n) || sp_streq(n, "===");
 }
+
+int is_bind_call(const char *n) { return n && sp_streq(n, "bind_call"); }
 
 int is_kind_query(const char *n) {
   return sp_streq(n, "is_a?") || sp_streq(n, "kind_of?") || sp_streq(n, "instance_of?");
@@ -141,6 +156,39 @@ int is_select_bang(const char *n) {
          sp_streq(n, "reject!") || sp_streq(n, "delete_if");
 }
 
+int is_retaining_filter(const char *n) {
+  return is_select_bang(n) || sp_streq(n, "select") || sp_streq(n, "filter") ||
+         sp_streq(n, "find_all") || sp_streq(n, "reject");
+}
+
+int is_reorder_iter(const char *n) {
+  return sp_streq(n, "sort") || sp_streq(n, "sort_by");
+}
+
+int is_enum_partition_def(const char *n) {
+  return strncmp(n, "__enum_partition__", 18) == 0;
+}
+
+int is_stop_walk(const char *n) {
+  return is_find_or_take_while(n) || sp_streq(n, "find_index") || sp_streq(n, "each_with_index");
+}
+
+int is_range_member_walk(const char *n) {
+  return sp_streq(n, "each") || sp_streq(n, "each_entry") || sp_streq(n, "step");
+}
+
+int is_find_index(const char *n) {
+  return sp_streq(n, "find_index");
+}
+
+int is_each_entry(const char *n) {
+  return sp_streq(n, "each_entry");
+}
+
+int is_each_name(const char *n) {
+  return sp_streq(n, "each");
+}
+
 int is_each_walk(const char *n) {
   return sp_streq(n, "each") || sp_streq(n, "each_entry") || sp_streq(n, "reverse_each");
 }
@@ -192,6 +240,7 @@ int is_receiver_conversion(const char *n) {
   return sp_streq(n, "to_s") || sp_streq(n, "to_str") || sp_streq(n, "itself");
 }
 int is_to_s_name(const char *n) { return n && sp_streq(n, "to_s"); }
+int is_message_name(const char *n) { return n && sp_streq(n, "message"); }
 
 int is_range_membership(const char *n) {
   return sp_streq(n, "cover?") || sp_streq(n, "include?") ||
@@ -244,6 +293,9 @@ int is_str_each_iter(const char *n) {
          sp_streq(n, "each_byte") || sp_streq(n, "each_codepoint");
 }
 
+int is_freeze_name(const char *n) { return sp_streq(n, "freeze"); }
+int is_enum_step_name(const char *n) { return sp_streq(n, "next") || sp_streq(n, "peek") || sp_streq(n, "size"); }
+
 int is_str_string_yield(const char *n) {
   return sp_streq(n, "each_char") || sp_streq(n, "each_line") || sp_streq(n, "upto") ||
          sp_streq(n, "chars") || sp_streq(n, "lines") || sp_streq(n, "split") || sp_streq(n, "scrub");
@@ -272,6 +324,8 @@ int is_each_window(const char *n) {
   return sp_streq(n, "each_cons") || sp_streq(n, "each_slice");
 }
 
+int is_sum_name(const char *n) { return n && sp_streq(n, "sum"); }
+
 int is_reduce_alias(const char *n) {
   return sp_streq(n, "inject") || sp_streq(n, "reduce");
 }
@@ -279,6 +333,8 @@ int is_reduce_alias(const char *n) {
 int is_minmax_query(const char *n) {
   return sp_streq(n, "min") || sp_streq(n, "max");
 }
+
+int is_minmax_pair(const char *n) { return n && sp_streq(n, "minmax"); }
 
 int is_endpoint_query(const char *n) {
   return sp_streq(n, "first") || sp_streq(n, "last");
@@ -345,6 +401,8 @@ int is_hash_transform(const char *n) {
 int is_fallback_block_call(const char *n) {
   return sp_streq(n, "fetch") || sp_streq(n, "delete") || sp_streq(n, "fetch_values");
 }
+/* delete: removal by key */
+int is_delete_name(const char *n) { return n && sp_streq(n, "delete"); }
 
 int is_sort_family(const char *n) {
   return sp_streq(n, "sort") || sp_streq(n, "sort!");
@@ -373,11 +431,17 @@ int is_each_or_pair(const char *n) {
 int is_slice_alias(const char *n) {
   return sp_streq(n, "[]") || sp_streq(n, "slice");
 }
+int is_seq_index_call(const char *n) {
+  return is_slice_alias(n) || sp_streq(n, "[]=") || sp_streq(n, "slice!") || sp_streq(n, "byteslice");
+}
 
 int is_element_pick(const char *n) {
   return sp_streq(n, "first") || sp_streq(n, "last") || sp_streq(n, "sample");
 }
 
+int is_equal_name(const char *n) {
+  return sp_streq(n, "equal?");
+}
 int is_eql_or_equal(const char *n) {
   return sp_streq(n, "equal?") || sp_streq(n, "eql?");
 }
@@ -431,6 +495,40 @@ int is_visibility_or_module_function(const char *n) {
   return sp_streq(n, "private") || sp_streq(n, "protected") || sp_streq(n, "public") || sp_streq(n, "module_function");
 }
 
+int is_mixin_call(const char *n) {
+  return sp_streq(n, "include") || sp_streq(n, "extend") || sp_streq(n, "prepend");
+}
+
+int is_const_set_name(const char *n) {
+  return sp_streq(n, "const_set");
+}
+
+int is_const_query_name(const char *n) {
+  return sp_streq(n, "const_get") || sp_streq(n, "const_defined?") || sp_streq(n, "const_source_location");
+}
+
+int is_constants_list_name(const char *n) {
+  return sp_streq(n, "constants");
+}
+
+/* the methods a definition runs when the program defines them: inherited
+   (class), included, extended, prepended, method_added and its singleton
+   kin, const_added */
+int is_definition_hook_name(const char *n) {
+  return sp_streq(n, "inherited") || sp_streq(n, "included") || sp_streq(n, "extended") ||
+         sp_streq(n, "prepended") || sp_streq(n, "method_added") ||
+         sp_streq(n, "singleton_method_added") || sp_streq(n, "const_added");
+}
+
+int is_const_missing_name(const char *n) {
+  return sp_streq(n, "const_missing");
+}
+
+/* the tables a const_get or const_defined? with a computed name becomes */
+int is_const_table_def_name(const char *n) {
+  return n && (sp_streq(n, "__const_get__") || sp_streq(n, "__const_defined__"));
+}
+
 /* Kernel#dup and #clone, which copy any object with its ivars */
 int is_object_copy(const char *n) {
   return sp_streq(n, "dup") || sp_streq(n, "clone");
@@ -439,6 +537,39 @@ int is_object_copy(const char *n) {
 /* The reflective ivar write */
 int is_ivar_set_name(const char *n) {
   return sp_streq(n, "instance_variable_set");
+}
+
+/* Object#inspect, the text p prints */
+int is_inspect_name(const char *n) {
+  return n && sp_streq(n, "inspect");
+}
+
+/* `Marshal.dump`, by its receiver's constant name and the method */
+int is_marshal_dump(const char *recv, const char *meth) {
+  return recv && meth && sp_streq(meth, "dump") && sp_streq(recv, "Marshal");
+}
+
+/* `Marshal.load`, which builds the objects it reads without their initialize */
+int is_marshal_load(const char *recv, const char *meth) {
+  return recv && meth && sp_streq(meth, "load") && sp_streq(recv, "Marshal");
+}
+
+/* Class#allocate, an object without its initialize run */
+int is_allocate_name(const char *n) {
+  return sp_streq(n, "allocate");
+}
+
+/* The reflective ivar removal */
+int is_ivar_remove_name(const char *n) {
+  return sp_streq(n, "remove_instance_variable");
+}
+
+/* A call that tells an ivar assigned from one never assigned: the
+   reflective readers and removal, and the default inspect (inspect, and p
+   and pp, which print it) */
+int is_ivar_presence_read(const char *n) {
+  return sp_streq(n, "instance_variables") || sp_streq(n, "instance_variable_defined?") ||
+         is_ivar_remove_name(n) || is_inspect_name(n) || is_inspect_print(n);
 }
 
 /* A builtin class whose values keep their ivars in the runtime's map
@@ -515,6 +646,10 @@ int is_text_conversion(const char *n) {
 
 int is_substitution(const char *n) {
   return sp_streq(n, "gsub") || sp_streq(n, "sub");
+}
+
+int is_substitution_bang(const char *n) {
+  return sp_streq(n, "gsub!") || sp_streq(n, "sub!");
 }
 
 int is_encoding_mutator(const char *n) {
@@ -757,6 +892,10 @@ int is_mod_operator(const char *n) {
   return sp_streq(n, "%");
 }
 
+int is_initialize_name(const char *n) {
+  return sp_streq(n, "initialize");
+}
+
 int is_initialize_family(const char *n) {
   return sp_streq(n, "initialize_copy") || sp_streq(n, "initialize");
 }
@@ -813,12 +952,22 @@ int is_file_class_name(const char *n) {
   return n && sp_streq(n, "File");
 }
 
+int is_filetest_module_name(const char *n) {
+  return n && sp_streq(n, "FileTest");
+}
+
 int is_io_class_name(const char *n) {
   return sp_streq(n, "IO") || sp_streq(n, "File");
 }
 
 int is_program_name_global(const char *n) {
   return sp_streq(n, "$PROGRAM_NAME") || sp_streq(n, "$0");
+}
+int is_loaded_features_global(const char *n) {
+  return n && (sp_streq(n, "$\"") || sp_streq(n, "$LOADED_FEATURES"));
+}
+int is_load_path_global(const char *n) {
+  return n && (sp_streq(n, "$:") || sp_streq(n, "$LOAD_PATH") || sp_streq(n, "$-I"));
 }
 
 int is_immediate_class_name(const char *n) {
@@ -861,6 +1010,10 @@ int is_string_append(const char *n) {
   return sp_streq(n, "<<") || sp_streq(n, "concat");
 }
 
+int is_string_byte_mutator(const char *n) {
+  return sp_streq(n, "bytesplice") || sp_streq(n, "append_as_bytes");
+}
+
 int is_replace_name(const char *n) {
   return sp_streq(n, "replace");
 }
@@ -878,6 +1031,23 @@ int str_mutator_str_args(const char *n, int argc, int *int_ok) {
   if (sp_streq(n, "insert") && argc == 2) return 1;
   if (sp_streq(n, "[]=") && (argc == 2 || argc == 3)) return argc - 1;
   return argc;
+}
+
+/* String methods that only read the receiver's bytes: they answer a scalar or
+   build a new string, and never retain the pointer they were handed. A
+   shared-mutable receiver can hand them its live buffer instead of a copy. */
+int is_string_read_only_method(const char *name) {
+  static const char *const ro[] = {
+    "[]", "slice", "byteslice", "getbyte", "ord", "chr",
+    "index", "rindex", "include?", "start_with?", "end_with?",
+    "count", "length", "size", "bytesize", "empty?",
+    "to_i", "to_f", "hex", "oct", "match?", "casecmp", "casecmp?",
+    "upcase", "downcase", "capitalize", "swapcase", "reverse",
+    "strip", "lstrip", "rstrip", "chomp", "chop", "center", "ljust", "rjust",
+    "each_char", "each_byte", "each_line", "chars", "bytes", "lines", "split",
+    "sum", "hash", "unpack", "unpack1", "codepoints", "scan", NULL };
+  for (int i = 0; ro[i]; i++) if (sp_streq(name, ro[i])) return 1;
+  return 0;
 }
 
 int is_string_rebind_mutator(const char *n) {
@@ -900,14 +1070,32 @@ static int builtin_name_in(const char *name, const char *const *names) {
    public methods as CRuby 4.0 lists them: Integer and Float are Numeric and
    Comparable, String and Symbol Comparable, Array, Hash and Range
    Enumerable. The builtin table holds each class's own methods only. */
-int builtin_module_owns(const char *cls, const char *m) {
+/* Comparable's own methods on a builtin class that includes it: Integer,
+   Float, String and Symbol. */
+int builtin_comparable_owns(const char *cls, const char *m) {
   static const char *const cmp[] = { "<", "<=", "==", ">", ">=", "between?", "clamp", NULL };
+  return (is_numeric_class_name(cls) || sp_streq(cls, "String") || sp_streq(cls, "Symbol")) &&
+         builtin_name_in(m, cmp);
+}
+
+/* Method#arity of a Comparable method: between?(min, max), clamp(min, max)
+   or clamp(range), and the one-operand comparisons. */
+int builtin_comparable_arity(const char *m) {
+  return sp_streq(m, "between?") ? 2 : sp_streq(m, "clamp") ? -1 : 1;
+}
+
+/* Numeric's own methods on Integer and Float, which inherit them */
+int builtin_numeric_owns(const char *cls, const char *m) {
   static const char *const num[] = {
     "%", "+@", "-@", "<=>", "abs", "abs2", "angle", "arg", "ceil", "clone", "coerce", "conj",
     "conjugate", "denominator", "div", "divmod", "dup", "eql?", "fdiv", "finite?", "floor", "i",
     "imag", "imaginary", "infinite?", "integer?", "magnitude", "modulo", "negative?", "nonzero?",
     "numerator", "phase", "polar", "positive?", "quo", "real", "real?", "rect", "rectangular",
     "remainder", "round", "step", "to_c", "to_int", "truncate", "zero?", NULL };
+  return is_numeric_class_name(cls) && builtin_name_in(m, num);
+}
+
+int builtin_module_owns(const char *cls, const char *m) {
   static const char *const enm[] = {
     "all?", "any?", "chain", "chunk", "chunk_while", "collect", "collect_concat", "compact",
     "count", "cycle", "detect", "drop", "drop_while", "each_cons", "each_entry", "each_slice",
@@ -917,9 +1105,8 @@ int builtin_module_owns(const char *cls, const char *m) {
     "partition", "reduce", "reject", "reverse_each", "select", "slice_after", "slice_before",
     "slice_when", "sort", "sort_by", "sum", "take", "take_while", "tally", "to_a", "to_h", "to_set",
     "uniq", "zip", NULL };
-  int numeric = is_numeric_class_name(cls);
-  if ((numeric || sp_streq(cls, "String") || sp_streq(cls, "Symbol")) && builtin_name_in(m, cmp)) return 1;
-  if (numeric && builtin_name_in(m, num)) return 1;
+  if (builtin_comparable_owns(cls, m)) return 1;
+  if (builtin_numeric_owns(cls, m)) return 1;
   if ((sp_streq(cls, "Array") || sp_streq(cls, "Hash") || sp_streq(cls, "Range")) && builtin_name_in(m, enm)) return 1;
   return 0;
 }
@@ -951,6 +1138,10 @@ int is_builtin_reopen_name(const char *name) {
             typedef collision before any call was reached (activesupport's
             blank.rb reopens Range and Time) */
          sp_streq(name, "Range")     || sp_streq(name, "Time") ||
+         sp_streq(name, "Rational")  || sp_streq(name, "Proc") ||
+         sp_streq(name, "Enumerator") || sp_streq(name, "MatchData") ||
+         sp_streq(name, "Complex")   || sp_streq(name, "Regexp") ||
+         sp_streq(name, "Struct")    ||
          sp_streq(name, "File")      || sp_streq(name, "Class") ||
          sp_streq(name, "Hash")      ||
          /* a thread and a fiber are runtime handles too (activesupport's
@@ -1013,6 +1204,8 @@ int array_unseen_add_kind(const char *n) {
 }
 
 int is_scan_name(const char *n) { return sp_streq(n, "scan"); }
+int is_insert_name(const char *n) { return sp_streq(n, "insert"); }
+int is_clear_name(const char *n) { return sp_streq(n, "clear"); }
 
 /* with_index / with_object: an enumerator link that hands on its source's
    elements first */
@@ -1048,3 +1241,52 @@ int is_proc_conversion_name(const char *n) { return n && (sp_streq(n, "to_proc")
 int is_aref_name(const char *n) { return n && sp_streq(n, "[]"); }
 /* `<<` alone: String#<<'s append, a chain's link */
 int is_shovel_name(const char *n) { return n && sp_streq(n, "<<"); }
+
+/* Dir's surface rewrites keep the written name distinct from the builtin
+   operation it lowers to. The iterator aliases apply only without a block. */
+const char *dir_surface_alias(const char *n, int blockless_iter) {
+  if (blockless_iter) {
+    if (sp_streq(n, "foreach")) return "entries";
+    if (sp_streq(n, "each_child")) return "children";
+  }
+  else {
+    if (sp_streq(n, "getwd")) return "pwd";
+    if (sp_streq(n, "delete") || sp_streq(n, "unlink")) return "rmdir";
+    if (is_aref_name(n)) return "glob";
+  }
+  return NULL;
+}
+
+int is_kernel_module_name(const char *n) { return n && sp_streq(n, "Kernel"); }
+
+/* Kernel's module functions, by name. A whitelist rather than "anything with
+   the Kernel receiver": Kernel is also a VALUE, so `Kernel === 5` asks whether
+   5 is in the Object hierarchy, and `Kernel.name` / `.to_s` / `.freeze` /
+   `.instance_methods` are Module's own methods on it. Dropping the receiver for
+   those would change what they mean. Only names that Module does not also
+   answer belong here. */
+int is_kernel_module_function(const char *m) {
+  static const char *const K[] = {
+    "puts", "print", "p", "pp", "printf", "sprintf", "format",
+    "raise", "fail", "exit", "exit!", "abort", "at_exit",
+    "rand", "srand", "sleep", "gets", "loop", "lambda", "proc",
+    "block_given?", "catch", "throw", "caller", "binding", "__method__",
+    "require", "require_relative", "load", "warn", "system", "exec", "spawn",
+    "Integer", "Float", "String", "Array", "Hash", "Rational", "Complex",
+    NULL
+  };
+  return m && builtin_name_in(m, K);
+}
+
+/* the builtins whose subclass instance IS the builtin (#7449) */
+int is_embedding_builtin(const char *nm) {
+  return nm && (sp_streq(nm, "Array") || sp_streq(nm, "Hash") || sp_streq(nm, "String"));
+}
+
+int is_class_name_name(const char *n) { return n && sp_streq(n, "name"); }
+
+int is_alias_method_name(const char *n) { return n && sp_streq(n, "alias_method"); }
+
+int is_define_method_name(const char *n) {
+  return n && sp_streq(n, "define_method");
+}

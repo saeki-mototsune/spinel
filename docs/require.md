@@ -22,9 +22,11 @@ They are different mechanisms and stay distinct:
 | `Kernel.require "name"` / `::Kernel.require "name"` | the same as the bare `require` | as above; any other receiver (`obj.require`) is an ordinary method call |
 
 `require` is *not* a runtime file load. Spinel is a whole-program
-ahead-of-time compiler, so every `require` is known at compile time and there is
-no `$LOAD_PATH` to mutate at runtime. A `require` that names something Spinel
-cannot provide is reported when you compile, not when you run.
+ahead-of-time compiler, so every `require` is known at compile time and no
+directory is searched at runtime. `$LOAD_PATH` (`$:`, `$-I`) is still an Array
+of Strings the program can read and change, but it starts empty and a change to
+it looks nothing up. A `require` that names something Spinel cannot provide is
+reported when you compile, not when you run.
 
 ## The require-gate
 
@@ -58,6 +60,7 @@ These are provided by Spinel but, like CRuby, only after their `require`:
 | `require "monitor"` | `Monitor` (`#synchronize`) | `NameError` (uninitialized constant) |
 | `require "socket"` | `TCPServer`, `TCPSocket`, `UDPSocket`, `UNIXServer`, `UNIXSocket`, `Socket`, `Addrinfo` | `NameError` (uninitialized constant) |
 | `require "pathname"` | `Pathname` | uninitialized constant |
+| `require "pathname"` | `Pathname()` (the `Kernel` conversion method) | `NoMethodError` |
 | `require "io/console"` | `IO#winsize` | `NoMethodError` |
 | `require "time"` | `Time#iso8601` | `NoMethodError` |
 | `require "bigdecimal"` | `BigDecimal`, `BigDecimal()` (a minimal subset: see `packages/bigdecimal/bigdecimal.rb`) | `NoMethodError` (`BigDecimal()`) |
@@ -126,7 +129,9 @@ like `ffi`),
 `benchmark` (CRuby's own gem, unmodified), `shellwords` (likewise), `find` (likewise, but for one line; see its note),
 `fileutils`, `tmpdir`, `zlib`, `logger` (a compact implementation of its API),
 `benchmark` (CRuby's own gem, unmodified),
-`bigdecimal` (a minimal subset, see `packages/bigdecimal/bigdecimal.rb`)
+`bigdecimal` (a minimal subset, see `packages/bigdecimal/bigdecimal.rb`),
+`singleton` and `timeout` (compact implementations of their API; `Timeout.timeout`
+interrupts through `Thread#raise`, so not on the main thread yet)
 (plus the `stringio`/`strscan`/`json` marker shims for their C-backed
 features). `net/http` and `uri` are there, and so
 is `openssl` -- the one that is conditional: it is glue over the system libssl, so it exists only where those

@@ -65,6 +65,10 @@ size_t sp_gc_old_bytes = 0;
 int sp_gc_cycle = 0;
 void (*sp_gc_mark_suspended_fibers_hook)(void) = NULL;
 void (*sp_gc_mark_globals_hook)(void) = NULL;
+#ifdef SP_CEXT
+void (*sp_gc_mark_cext_hook)(void) = NULL;
+void (*sp_gc_sweep_cext_hook)(int full) = NULL;
+#endif
 void (*sp_gc_str_sweep_hook)(void) = NULL;
 int (*sp_gc_str_major_due_hook)(void) = NULL;
 int sp_gc_root_phase = 0;   /* the mark is walking the C roots (see sp_gc_mark_all) */
@@ -97,6 +101,7 @@ const char *(*sp_obj_to_path_fn)(int cls_id, void *p) = NULL;
 int (*sp_obj_conv_fn)(int cls_id, void *p, int which, sp_RbVal *out) = NULL;
 const char *(*sp_obj_cls_name_fn)(int cls_id) = NULL;
 int (*sp_bsub_cls_fn)(sp_RbVal v) = NULL;
+int (*sp_cls_visible_fn)(int cls_id) = NULL;
 int (*sp_class_le_id_fn)(int sub, int super) = NULL;
 sp_RbVal (*sp_class_cmp_fn)(sp_RbVal a, sp_RbVal b) = NULL;
 int (*sp_class_kind_of_name_fn)(int cls, const char *name) = NULL;
@@ -272,6 +277,8 @@ static void sp_gc_fault_report(int sig) {
   signal(sig, SIG_DFL);
   raise(sig);
 }
+/* The collector's boot-time modes, read from the environment once, before
+   main. */
 SP_CONSTRUCTOR static void sp_gc_debug_env(void){
   const char *v=getenv("SPINEL_GC_VERIFY"); sp_gc_verify=(v&&*v&&*v!='0');
   /* SPINEL_GC_STRESS=2 keeps what a sweep frees poisoned and out of reuse
@@ -318,6 +325,13 @@ SP_CONSTRUCTOR static void sp_gc_debug_env(void){
     sp_gc_obj_budget_fixed = (ob && strcmp(ob, "fixed") == 0);
     const char *sb = getenv("SPINEL_GC_STR_BUDGET");
     sp_gc_str_budget_fixed = (sb && strcmp(sb, "fixed") == 0);
+    /* The share of the object heap is gated by DEFAULT, as the object
+       budget's widening is, and for the same reason both ends are kept: `str`
+       is the way back to a string budget that sees the string heap alone,
+       `walk` carries the share whatever the last collection cost. */
+    sp_gc_str_budget_mode = (sb && strcmp(sb, "str") == 0)  ? 0
+                          : (sb && strcmp(sb, "walk") == 0) ? 1
+                          : 2;
     /* The schedule is the DEFAULT. `size` is the escape hatch back to the gate
        that shipped before it -- a size test re-aimed from its own leftover --
        for anyone the change costs more than it saves. `fixed` pins both the
@@ -584,6 +598,9 @@ else{void*obj=*e;if(obj)sp_gc_mark(obj);}}
   sp_gc_root_phase=0;
   SP_GC_MK_PH(sp_gc_ph_mk_fibers);
   if(vd)sp_gc_dbg_phase="globals";if(sp_gc_mark_globals_hook)sp_gc_mark_globals_hook();
+#ifdef SP_CEXT
+  if(sp_gc_mark_cext_hook)sp_gc_mark_cext_hook();
+#endif
   SP_GC_MK_PH(sp_gc_ph_mk_globals);
   sp_gc_mark_drain_all();
   sp_gc_mkl_fold();
@@ -1467,6 +1484,9 @@ void sp_gc_collect(void){
     if (sp_gc_pin_overflow && keep < SP_GC_PINNED_MAX) sp_gc_pin_overflow = 0; }
   if (sp_fin_n) sp_fin_after_mark(full);
   if (sp_ivt_n) sp_ivt_after_mark(full);
+#ifdef SP_CEXT
+  if (sp_gc_sweep_cext_hook) sp_gc_sweep_cext_hook(full);
+#endif
   SP_GC_PH(sp_gc_ph_mark);
   sp_str_mark_settle(full);
   if(full){
