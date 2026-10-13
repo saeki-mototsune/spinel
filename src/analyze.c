@@ -11410,6 +11410,9 @@ static int oa_recv_op_ok(const char *nm, int argc, int has_block) {
   if (is_len_alias(nm) && argc == 0) return 1;
   if (sp_streq(nm, "empty?") && argc == 0) return 1;
   if ((is_endpoint_query(nm)) && argc == 0) return 1;
+  /* pop/shift take an element off an end: the element type holds, and the
+     result is an element or nil on an empty array (NULL, as first/last) */
+  if ((sp_streq(nm, "pop") || sp_streq(nm, "shift")) && argc == 0) return 1;
   /* no-block comparisons: usable when the element class has `<=>` (the
      needs_cmp bit, checked at component resolution). sort's RESULT must
      also land in a modeled place (slot alias or statement position) --
@@ -11789,7 +11792,8 @@ static int narrow_int_table_ivars(Compiler *c, int in_round) {
           /* sort/min/max need the boxed comparator, which this element kind
              has no arm for: leave those tables alone */
           if (un && (sp_streq(un, "sort") || sp_streq(un, "sort!") ||
-                     sp_streq(un, "min") || sp_streq(un, "max"))) { used = 0; break; }
+                     sp_streq(un, "min") || sp_streq(un, "max") ||
+                     sp_streq(un, "pop") || sp_streq(un, "shift"))) { used = 0; break; }
           if (!oa_recv_op_ok(un, uan, nt_ref(nt, u, "block") >= 0)) { used = 0; break; }
           /* what a store puts in the table is a row: a boxed value or another
              kind would be taken as a bare sp_IntArray *. A value not typed
@@ -12103,6 +12107,116 @@ static int enum_copy_site(Compiler *c, const Scope *sc) {
   return (int)nt_int(c->nt, sc->def_node, "enum_site", -1);
 }
 
+/* A method whose body ends in a block walk answers the walk's value, the
+   array itself: `def walk; @kids.each { |k| k.walk }; end`. The object-array
+   narrowing kept such an array boxed (a walk whose value is used, #4879) even
+   when nothing ever reads the method's value -- the usual shape of a tree
+   walk, recursing from inside its own block. Mark the tail as discarded in
+   walk_disc when every route to the method throws its value away:
+     - every CallNode of that name (on any receiver, as a dynamic one may
+       dispatch to it) is a discarded statement (walk_disc), the tail of a
+       `while`/`until` body, or the tail of the block of a builtin walk that
+       ignores its block's value (each & co. on an Array, Hash, Range or
+       Integer receiver);
+     - no symbol or string names it (send, method, alias, &:m), no `super`
+       reaches it, and no send-like call takes a computed name;
+     - the runtime never calls it on its own (method_name_implicitly_invoked).
+   Only the call sites' own positions count: a call that is itself the tail of
+   another such method is a use (no transitivity), which keeps this one pass. */
+static int oa_ignores_block_value(Compiler *c, int call) {
+  const NodeTable *nt = c->nt;
+  static const char *const walks[] = {
+    "each", "each_with_index", "reverse_each", "each_entry", "times", "upto",
+    "downto", "each_key", "each_value", "each_pair", NULL };
+  const char *nm = nt_str(nt, call, "name");
+  int recv = nt_ref(nt, call, "receiver");
+  if (!nm || recv < 0 || !str_in(nm, walks)) return 0;
+  TyKind rt = infer_type(c, recv);
+  return ty_is_array(rt) || ty_is_ptr_array(rt) || ty_is_hash(rt) ||
+         rt == TY_RANGE || rt == TY_INT;
+}
+static void oa_mark_unused_method_tails(Compiler *c, char *walk_disc, int nc) {
+  const NodeTable *nt = c->nt;
+  int ncand = 0, ccap = 0;
+  int *ctail = NULL; const char **cname = NULL;
+  for (int s = 0; s < c->nscopes; s++) {
+    Scope *sc = &c->scopes[s];
+    if (sc->def_node < 0 || !sc->name || sc->body < 0) continue;
+    if (method_name_implicitly_invoked(sc->name)) continue;
+    const char *bty = nt_type(nt, sc->body);
+    if (!bty || !sp_streq(bty, "StatementsNode")) continue;
+    int bn = 0; const int *bl = nt_arr(nt, sc->body, "body", &bn);
+    if (bn == 0 || bl[bn - 1] < 0 || bl[bn - 1] >= nc) continue;
+    int t = bl[bn - 1];
+    if (nt_kind(nt, t) != NK_CallNode || nt_ref(nt, t, "block") < 0) continue;
+    if (ncand >= ccap) {
+      ccap = ccap ? ccap * 2 : 16;
+      ctail = (int *)realloc(ctail, sizeof(int) * (size_t)ccap);
+      cname = (const char **)realloc(cname, sizeof(char *) * (size_t)ccap);
+      if (!ctail || !cname) { fprintf(stderr, "oom\n"); exit(1); }
+    }
+    ctail[ncand] = t; cname[ncand] = sc->name; ncand++;
+  }
+  if (ncand == 0) { free(ctail); free(cname); return; }
+  /* positions whose value is thrown away: the statements walk_disc already
+     names, plus the tail of a loop body and of a value-ignoring walk's block */
+  char *disc = (char *)malloc((size_t)nc);
+  unsigned char *used = (unsigned char *)calloc((size_t)ncand, 1);
+  if (!disc || !used) { fprintf(stderr, "oom\n"); exit(1); }
+  memcpy(disc, walk_disc, (size_t)nc);
+  for (int id = 0; id < nt->count && id < nc; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty) continue;
+    int body = -1;
+    if (sp_streq(ty, "WhileNode") || sp_streq(ty, "UntilNode"))
+      body = nt_ref(nt, id, "statements");
+    else if (sp_streq(ty, "CallNode") && oa_ignores_block_value(c, id)) {
+      int b = nt_ref(nt, id, "block");
+      if (b >= 0 && nt_type(nt, b) && sp_streq(nt_type(nt, b), "BlockNode"))
+        body = nt_ref(nt, b, "body");
+    }
+    if (body < 0 || !nt_type(nt, body) || !sp_streq(nt_type(nt, body), "StatementsNode")) continue;
+    int bn = 0; const int *bl = nt_arr(nt, body, "body", &bn);
+    if (bn > 0 && bl[bn - 1] >= 0 && bl[bn - 1] < nc) disc[bl[bn - 1]] = 1;
+  }
+  static const char *const sendlike[] = {
+    "send", "__send__", "public_send", "method", "public_method",
+    "instance_method", "define_method", "alias_method", "respond_to?", NULL };
+  int dyn = 0;
+  for (int id = 0; id < nt->count && id < nc && !dyn; id++) {
+    const char *ty = nt_type(nt, id);
+    if (!ty) continue;
+    const char *mn = NULL;
+    if (sp_streq(ty, "CallNode")) {
+      mn = nt_str(nt, id, "name");
+      if (mn && str_in(mn, sendlike)) {
+        int args = nt_ref(nt, id, "arguments"); int an = 0;
+        const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+        if (an < 1 || (nt_kind(nt, av[0]) != NK_SymbolNode && nt_kind(nt, av[0]) != NK_StringNode))
+          dyn = 1;
+      }
+      if (mn && disc[id]) continue;   /* a discarded call is no use */
+    }
+    else if (sp_streq(ty, "SymbolNode")) {
+      mn = nt_str(nt, id, "value");
+      if (!mn) mn = nt_str(nt, id, "unescaped");
+    }
+    else if (sp_streq(ty, "StringNode")) {
+      mn = nt_str(nt, id, "content");
+      if (!mn) mn = nt_str(nt, id, "unescaped");
+    }
+    else if (sp_streq(ty, "SuperNode") || sp_streq(ty, "ForwardingSuperNode")) {
+      Scope *ssc = comp_scope_of(c, id);
+      mn = ssc ? ssc->name : NULL;
+    }
+    if (!mn) continue;
+    for (int k = 0; k < ncand; k++) if (sp_streq(cname[k], mn)) used[k] = 1;
+  }
+  if (!dyn)
+    for (int k = 0; k < ncand; k++) if (!used[k]) walk_disc[ctail[k]] = 1;
+  free(disc); free(used); free(ctail); free(cname);
+}
+
 static void oa_mark_subtree(const NodeTable *nt, int id, unsigned char *dead) {
   if (id < 0 || id >= nt->count || dead[id]) return;
   dead[id] = 1;
@@ -12366,6 +12480,7 @@ static int narrow_object_arrays(Compiler *c) {
     int ps = root >= 0 ? nt_ref(nt, root, "statements") : -1;
     int bn = 0; const int *bl = ps >= 0 ? nt_arr(nt, ps, "body", &bn) : NULL;
     for (int i = 0; i < bn; i++) if (bl[i] >= 0 && bl[i] < nc) walk_disc[bl[i]] = 1; }
+  oa_mark_unused_method_tails(c, walk_disc, nc);
   for (int id = 0; id < nt->count; id++) {
     const char *ty = nt_type(nt, id);
     if (!ty || !sp_streq(ty, "LocalVariableWriteNode")) continue;
@@ -12533,6 +12648,13 @@ static int narrow_object_arrays(Compiler *c) {
              has no emitter for: keep the slot on the poly path */
           if (infer_type(c, argv[0]) == TY_RANGE) sl[S].alive = 0;
           else sl[S].cls = oa_cls_join(sl[S].cls, oa_elem_evidence(c, sl, S, argv[1]));
+        }
+        else if (name && (sp_streq(name, "pop") || sp_streq(name, "shift"))) {
+          /* the element taken off is nil on an empty array: an object
+             element reads that as a NULL pointer (as first/last do), but a
+             nested table's row has no nil, so such a table stays boxed the
+             way one holding a boxed row does (the poly_elem bail) */
+          sl[S].poly_elem = 1;
         }
         else if (name && (sp_streq(name, "min") || sp_streq(name, "max") ||
                           sp_streq(name, "sort") || sp_streq(name, "sort!"))) {

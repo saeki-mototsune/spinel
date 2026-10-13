@@ -4949,6 +4949,24 @@ static int emit_array_call_arms(Compiler *c, int id, Buf *b) {
       buf_puts(b, sp_streq(name, "first") ? ", 0))" : ", -1))");
       return 1;
     }
+    /* pop/shift take an element off an end in place, with the frozen check
+       the poly array's template has; an empty array answers nil, the NULL
+       element pointer first/last answer too. Object arrays only: the pass
+       keeps a nested table that uses them boxed. */
+    if (!nested && (sp_streq(name, "pop") || sp_streq(name, "shift")) && argc == 0) {
+      int tr = ++g_tmp, te = ++g_tmp;
+      buf_printf(b, "({ sp_PtrArray *_t%d = ", tr); emit_expr(c, recv, b);
+      buf_printf(b, "; void *_t%d = NULL; if (_t%d && _t%d->frozen) sp_raise_frozen_array_at(_t%d, SP_BUILTIN_PTR_ARRAY);",
+                 te, tr, tr, tr);
+      if (sp_streq(name, "pop"))
+        buf_printf(b, " _t%d = sp_PtrArray_pop(_t%d);", te, tr);
+      else
+        buf_printf(b, " if (_t%d && _t%d->len > 0) { sp_gc_wb((void *)_t%d); _t%d = _t%d->data[0];"
+                      " memmove(_t%d->data, _t%d->data + 1, sizeof(void *) * (size_t)(_t%d->len - 1)); _t%d->len--; }",
+                   tr, tr, tr, te, tr, tr, tr, tr, tr);
+      buf_printf(b, " (%s *)_t%d; })", ecn, te);
+      return 1;
+    }
     if (sp_streq(name, "[]=") && argc == 2) {
       int tv = ++g_tmp;
       buf_printf(b, "({ %s *_t%d = ", ecn, tv);
