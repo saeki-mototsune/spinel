@@ -1,0 +1,44 @@
+# Verification only, for the fix PRs in saeki-mototsune/spinel; not meant for
+# upstream. Runs `make gate` on each fix branch on a GitHub-hosted runner
+# (non-root, IPv6), where the two corpus tests that need those can pass.
+name: gate-all
+on:
+  push:
+    branches: [ci/gate-all]
+jobs:
+  gate:
+    runs-on: ubuntu-latest
+    timeout-minutes: 350
+    strategy:
+      fail-fast: false
+      matrix:
+        branch:
+          - fix/sysmon-no-per-run-nudge
+          - fix/str-append-int-byte
+          - fix/obj-array-clear
+          - fix/hash-object-values
+          - fix/obj-array-self-ref
+          - fix/alloc-sites-symbols
+          - fix/to-sym-hashed
+    env:
+      LANG: C.UTF-8
+      LC_ALL: C.UTF-8
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: ${{ matrix.branch }}
+          fetch-depth: 0
+      - name: Set up Ruby
+        uses: ruby/setup-ruby@v1
+        with:
+          ruby-version: "4.0"
+      - name: Fetch libprism sources
+        run: make deps
+      - name: make gate
+        run: |
+          set -o pipefail
+          echo "uid=$(id -u) $(ruby -v) head=$(git rev-parse --short HEAD)"
+          GATE_RUBY=$(command -v ruby) make -j$(getconf _NPROCESSORS_ONLN) gate 2>&1 | tee gate.log
+      - name: Summary
+        if: always()
+        run: grep -E 'Tests:|scale-test|gate-test-shared:|gate:|Benchmarks:|checksum|FAIL' gate.log | tail -60 || true
