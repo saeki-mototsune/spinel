@@ -615,6 +615,37 @@ static int emit_io_socket_opt_call(Compiler *c, const NodeTable *nt, const char 
   return 0;
 }
 
+/* The socket reads emit_io_socket_recv_call answers, at the arity it does */
+static int socket_recv_call(const char *name, int argc) {
+  return (sp_streq(name, "recv") || sp_streq(name, "recvfrom")) && argc == 1;
+}
+
+/* recv and recvfrom of the socket in C expression r, up to the length node
+   len: the typed arm's, and a socket a block or a thread takes as its
+   parameter (a boxed handle) answers the same way. */
+static void emit_io_socket_recv_call(Compiler *c, const char *name, const char *r, int len, Buf *b) {
+  if (sp_streq(name, "recv")) {
+    buf_printf(b, "sp_sock_recv(%s, ", r); emit_int_expr(c, len, b); buf_puts(b, ")");
+    return;
+  }
+  /* recvfrom -> [payload, ["AF_INET", port, ip, ip]]; the payload and
+     the peer's address are new Strings, held while the Arrays are made */
+  int tp = ++g_tmp, ti = ++g_tmp, to = ++g_tmp, ta = ++g_tmp, tw = ++g_tmp;
+  buf_printf(b, "({ const char *_t%d = NULL; sp_int _t%d = 0;"
+                " const char *_t%d = sp_sock_recvfrom(%s, ", ti, tp, to, r);
+  emit_int_expr(c, len, b);
+  buf_printf(b, ", &_t%d, &_t%d); SP_GC_ROOT(_t%d); SP_GC_ROOT(_t%d);"
+                " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
+                " sp_PolyArray_push(_t%d, sp_box_str(strchr(_t%d, ':') ? SPL(\"AF_INET6\") : SPL(\"AF_INET\")));"
+                " sp_PolyArray_push(_t%d, sp_box_int(_t%d));"
+                " sp_PolyArray_push(_t%d, sp_box_str(_t%d));"
+                " sp_PolyArray_push(_t%d, sp_box_str(_t%d));"
+                " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
+                " sp_PolyArray_push(_t%d, sp_box_str(_t%d));"
+                " sp_PolyArray_push(_t%d, sp_box_poly_array(_t%d)); _t%d; })",
+             ti, tp, ti, to, ta, ta, ta, ti, ta, tp, ta, ti, ta, ti, tw, tw, tw, to, tw, ta, tw);
+}
+
 /* accept_nonblock as the boxed arm takes it: bare, or with a literal
    `exception: false` alone; any other keyword stays with the general
    dispatch, which words it */
@@ -630,6 +661,29 @@ static int boxed_accept_nb_ok(const NodeTable *nt, const char *name, int argc, c
 static int boxed_winsize_set(Compiler *c, const char *name, int argc, const int *argv) {
   return sp_streq(name, "winsize=") && argc == 1 && sp_feature_enabled("io/console") &&
          repr_of(c, argv[0]).elem == TY_INT;
+}
+
+static int emit_io_timeout_set(Compiler *c, int id, int recv, int value, Buf *b) {
+  int tv = ++g_tmp, ta = ++g_tmp, tf = ++g_tmp;
+  buf_puts(b, "({ ");
+  tv = hold_operand(c, recv, TY_POLY, 1, tv, 1, " ", b);
+  ta = hold_operand(c, value, TY_POLY, 1, ta, 1, " ", b);
+  buf_printf(b, "sp_File *_t%d = sp_poly_as_io(_t%d, \"timeout=\"); ", tf, tv);
+  emit_stat_handle_nomethod(tf, tv, "timeout=", b);
+  buf_printf(b, "sp_File_set_timeout(_t%d, _t%d); ", tf, ta);
+  Repr result = repr_of(c, id);
+  if (call_is_setter_assign(c->nt, id)) {
+    char arg[32]; snprintf(arg, sizeof arg, "_t%d", ta);
+    if (result.kind == RK_BOXED || result.as_ty == TY_POLY) buf_puts(b, arg);
+    else if (node_is_oint(c, id)) emit_unbox_nilable_text(c, result.as_ty, arg, b);
+    else emit_unbox_text(c, result.as_ty, arg, b);
+  }
+  else if (result.kind == RK_BOXED || result.as_ty == TY_POLY)
+    buf_printf(b, "_t%d", tv);
+  else
+    buf_printf(b, "_t%d", tf);
+  buf_puts(b, "; })");
+  return 1;
 }
 
 /* the IO methods on a poly receiver that may hold a stream (write, read, gets, puts, print, ...) */
@@ -691,6 +745,8 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
        sp_streq(name, "pos") || sp_streq(name, "pread") || sp_streq(name, "pwrite") ||
        sp_streq(name, "fsync") || sp_streq(name, "fdatasync") ||
        sp_streq(name, "sync") || sp_streq(name, "sync=") ||
+       (sp_streq(name, "timeout") && argc == 0) ||
+       (sp_streq(name, "timeout=") && argc == 1) ||
        /* the non-blocking pair: a Socket destructured out of Socket.pair, or
           read back out of a container, is a poly value like any other, and
           without an arm here `w.read_nonblock(n, exception: false)` had no
@@ -708,6 +764,10 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
        /* and its shutdown, which WEBrick calls on each listener it kept in
           an Array when a signal stops the server */
        (sp_feature_required("socket") && sp_streq(name, "shutdown") && argc <= 1 &&
+        !call_has_splat_arg(nt, argv, argc)) ||
+       /* and its reads: a socket a block or Thread.new takes as its parameter
+          is a boxed handle, as an Array element is */
+       (sp_feature_required("socket") && socket_recv_call(name, argc) &&
         !call_has_splat_arg(nt, argv, argc)) ||
        /* the readiness family: a lambda's parameter is boxed, so a handle
           passed through one reached `wait_readable` with no emitter, and in
@@ -807,6 +867,9 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       return 1;
     }
     if (!iocand) {
+      if (sp_streq(name, "timeout=") && argc == 1) {
+        return emit_io_timeout_set(c, id, recv, argv[0], b);
+      }
       /* write with an argument list (boxed_write_takes_list): the receiver
          and then the arguments are evaluated (a splat contributes its
          elements), the receiver and the list rooted, then the handle is
@@ -963,7 +1026,10 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       if (tdr) buf_printf(b, "_t%d", tdr);
       else emit_boxed(c, recv, b);
       buf_printf(b, ", \"%s\"); ", name);
-      if (sp_streq(name, "write") && argc >= 1) {
+      if (sp_streq(name, "timeout") && argc == 0) {
+        buf_printf(b, "sp_File_timeout(_t%d); })", tio2);
+      }
+      else if (sp_streq(name, "write") && argc >= 1) {
         /* Same String/non-String split as the TY_IO arm: a String knows its own
            byte count, a stringified value may be an unmarked static name. */
         int sk2 = repr_of(c, argv[0]).as_ty == TY_STRING;
@@ -1030,6 +1096,11 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
         buf_printf(b, "sp_sock_shutdown(_t%d, ", tio2);
         if (argc == 1) emit_int_expr(c, argv[0], b); else buf_puts(b, "2");
         buf_puts(b, "); })");
+      }
+      else if (socket_recv_call(name, argc)) {
+        buf_printf(b, "SP_GC_ROOT(_t%d); ", tio2);
+        emit_io_socket_recv_call(c, name, tio, argv[0], b);
+        buf_puts(b, "; })");
       }
       /* the same answers the typed arm gives: `exception: false` swaps
          IO::EAGAINWaitReadable for the :wait_readable marker */
@@ -1426,6 +1497,8 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
     return 1;
   }
   if (recv >= 0 && comp_ntype(c, recv) == TY_IO) {
+    if (sp_streq(name, "timeout=") && argc == 1)
+      return emit_io_timeout_set(c, id, recv, argv[0], b);
     const char *r = NULL;
     Buf rb = {0};
     emit_expr(c, recv, &rb);
@@ -1573,27 +1646,8 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
         buf_puts(b, "); })");
         free(rb.p); return 1;
       }
-      if (sp_streq(name, "recv") && argc == 1) {
-        buf_printf(b, "sp_sock_recv(%s, ", r); emit_int_expr(c, argv[0], b); buf_puts(b, ")");
-        free(rb.p); return 1;
-      }
-      /* recvfrom -> [payload, ["AF_INET", port, ip, ip]]; the payload and
-         the peer's address are new Strings, held while the Arrays are made */
-      if (sp_streq(name, "recvfrom") && argc == 1) {
-        int tp = ++g_tmp, ti = ++g_tmp, to = ++g_tmp, ta = ++g_tmp, tw = ++g_tmp;
-        buf_printf(b, "({ const char *_t%d = NULL; sp_int _t%d = 0;"
-                      " const char *_t%d = sp_sock_recvfrom(%s, ", ti, tp, to, r);
-        emit_int_expr(c, argv[0], b);
-        buf_printf(b, ", &_t%d, &_t%d); SP_GC_ROOT(_t%d); SP_GC_ROOT(_t%d);"
-                      " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
-                      " sp_PolyArray_push(_t%d, sp_box_str(strchr(_t%d, ':') ? SPL(\"AF_INET6\") : SPL(\"AF_INET\")));"
-                      " sp_PolyArray_push(_t%d, sp_box_int(_t%d));"
-                      " sp_PolyArray_push(_t%d, sp_box_str(_t%d));"
-                      " sp_PolyArray_push(_t%d, sp_box_str(_t%d));"
-                      " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
-                      " sp_PolyArray_push(_t%d, sp_box_str(_t%d));"
-                      " sp_PolyArray_push(_t%d, sp_box_poly_array(_t%d)); _t%d; })",
-                   ti, tp, ti, to, ta, ta, ta, ti, ta, tp, ta, ti, ta, ti, tw, tw, tw, to, tw, ta, tw);
+      if (socket_recv_call(name, argc)) {
+        emit_io_socket_recv_call(c, name, r, argv[0], b);
         free(rb.p); return 1;
       }
       if (sp_streq(name, "shutdown") && argc <= 1) {
@@ -1927,8 +1981,7 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
          written in turn, as the boxed receiver's arm does. The arms below
          read a splat as one operand and wrote the Array's inspect (#7313). */
       { int has_splat = 0, listable = !is_sw;
-        const char *wop = nt_str(nt, id, "call_operator");
-        if (wop && sp_streq(wop, "&.")) listable = 0;
+        if (nt_safe_nav(nt, id)) listable = 0;
         for (int k = 0; k < argc && listable; k++) {
           if (nt_kind(nt, argv[k]) == NK_KeywordHashNode) listable = 0;
           else if (nt_kind(nt, argv[k]) == NK_SplatNode) {

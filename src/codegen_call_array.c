@@ -1630,6 +1630,11 @@ int emit_op_array_concat(Compiler *c, const BopCtx *x, Buf *b) {
            that is no Array is CRuby's TypeError, not an empty list */
         buf_puts(b, "sp_poly_set_operand("); emit_boxed(c, argv[ai], b); buf_puts(b, ")");
       }
+      else if (comp_ntype(c, argv[ai]) == TY_VOID) {
+        /* an argument that never returns (a method that only raises):
+           run it for its raise; the empty array after it is never read */
+        buf_puts(b, "((void)("); emit_expr(c, argv[ai], b); buf_puts(b, "), sp_PolyArray_new())");
+      }
       else emit_expr(c, argv[ai], b);   /* already a poly array */
       buf_printf(b, "; SP_GC_ROOT(_t%d);", base + ai);
     }
@@ -2488,36 +2493,26 @@ int emit_call_array_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
   return 0;
 }
 
-/* methods on an array literal whose type never settled (an empty [] or an argument-less Array.new), answered against an empty poly array */
-int emit_call_untyped_array_arms(Buf *b, const NodeTable *nt, const char *name, int recv, int argc, TyKind rt) {
-  /* an empty array literal as a receiver: its node type is unknown (element
-     type is usage-folded, but a bare literal has no usage). Handle the common
-     methods directly against an empty (poly) array. */
-  if (recv >= 0 && rt == TY_UNKNOWN) {
-    const char *rty = nt_type(nt, recv);
-    int empty_recv = 0;
-    if (rty && sp_streq(rty, "ArrayNode")) {
-      int en = 0; nt_arr(nt, recv, "elements", &en);
-      empty_recv = (en == 0);
-    }
+/* methods on an empty array literal or an argument-less Array.new, answered
+   against an empty poly array. The receiver's type is unknown when it never
+   settled; one whose use gave it a kind (a marked receiver, mark_empty_array_operands)
+   answers the counts, empty?, frozen? and class the same way, since it
+   is the same empty container whatever its inferred type. */
+int emit_call_untyped_array_arms(Compiler *c, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, TyKind rt) {
+  /* the common methods, answered directly against an empty (poly) array */
+  if (recv >= 0 && (rt == TY_UNKNOWN || ty_is_array(rt))) {
     /* an argument-less `Array.new` is the same empty array, and carries the
        same unknown element type (#3613) */
-    else if (rty && sp_streq(rty, "CallNode") && nt_str(nt, recv, "name") &&
-             sp_streq(nt_str(nt, recv, "name"), "new") && nt_ref(nt, recv, "block") < 0) {
-      int arn = nt_ref(nt, recv, "receiver");
-      int aa = nt_ref(nt, recv, "arguments");
-      int aac = 0; if (aa >= 0) nt_arr(nt, aa, "arguments", &aac);
-      if (aac == 0 && arn >= 0 && nt_type(nt, arn) &&
-          sp_streq(nt_type(nt, arn), "ConstantReadNode") &&
-          nt_str(nt, arn, "name") && sp_streq(nt_str(nt, arn, "name"), "Array"))
-        empty_recv = 1;
-    }
+    int empty_recv = node_is_empty_container(nt, recv) && an_empty_container_kind(c, recv) == 1;
+    /* a receiver typed for its use answers only what no type changes */
+    int typed = rt != TY_UNKNOWN;
     {
       if (empty_recv) {
         if (is_count_alias(name) && argc == 0) { buf_puts(b, "0"); return 1; }
         if (sp_streq(name, "empty?") && argc == 0) { buf_puts(b, "1"); return 1; }
         if (sp_streq(name, "frozen?") && argc == 0) { buf_puts(b, "0"); return 1; }
         if (sp_streq(name, "class") && argc == 0) { buf_puts(b, "((sp_Class){(sp_int)-1, SPL(\"Array\")})"); return 1; }
+        if (typed) return 0;
         /* first/last type poly (boxed nil, printable as nil); min/max/pop/
            shift answer the Integer slot's nil */
         if ((is_endpoint_query(name)) && argc == 0) { buf_puts(b, "sp_box_nil()"); return 1; }
@@ -2565,7 +2560,7 @@ typedef struct { int bound, vr, vf, vi, nv, views[16]; TyKind nat; int copy, cop
 /* Bind node n, an Array subclass instance, to its Array -- the same pointer
    cast -- evaluating anything but a variable once, ahead of the call. */
 static int arysub_bind(Compiler *c, int n, TyKind k) {
-  int cid = ty_object_class(comp_ntype(c, n));
+  int cid = ty_object_class(repr_of(c, n).as_ty);
   const char *at = arysub_array_ctype(c, cid);
   NodeKind nk = nt_kind(c->nt, n);
   Buf rb; memset(&rb, 0, sizeof rb);
@@ -2642,10 +2637,10 @@ static int arysub_view_open(Compiler *c, int id, ArysubView *v) {
   int args = nt_ref(nt, id, "arguments"), an = 0;
   const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
   int want = 0;
-  for (int i = 0; i < an; i++) want |= comp_ty_ary_root(c, comp_ntype(c, av[i])) >= 0;
+  for (int i = 0; i < an; i++) want |= comp_ty_ary_root(c, repr_of(c, av[i]).as_ty) >= 0;
   if (want && comp_arysub_args_viewed(c, id, rt)) {
     for (int i = 0; i < an && v->nv < 16; i++) {
-      TyKind at = comp_ntype(c, av[i]);
+      TyKind at = repr_of(c, av[i]).as_ty;
       if (comp_ty_ary_root(c, at) < 0) continue;
       TyKind ak = comp_ary_kind(c, ty_object_class(at));
       if (ak == TY_STRBUF) ak = TY_STRING;
@@ -2667,9 +2662,9 @@ static void arysub_view_close(Compiler *c, ArysubView *v) {
 int emit_arysub_call(Compiler *c, int id, Buf *b) {
   if (!c->has_arysub) return 0;
   int ka = comp_arysub_kernel_array(c, id);
-  if (ka >= 0 && comp_ty_ary_root(c, comp_ntype(c, ka)) >= 0) { emit_expr(c, ka, b); return 1; }
+  if (ka >= 0 && comp_ty_ary_root(c, repr_of(c, ka).as_ty) >= 0) { emit_expr(c, ka, b); return 1; }
   int recv = nt_ref(c->nt, id, "receiver");
-  TyKind rt = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN;
+  TyKind rt = recv >= 0 ? repr_of(c, recv).as_ty : TY_UNKNOWN;
   /* the view below retypes the call as the Array's own: a name that answers
      its oint there (last, pop, ...) is plain to the consumer outside the
      view, which sees the subclass receiver, so the answer is unwrapped */
@@ -2742,9 +2737,13 @@ void emit_strh_elem(Compiler *c, int v, Buf *b) {
    (a method that answers the Array or nil, a parameter some call gives nil,
    an instance variable not set yet). A safe navigation guards it itself. */
 /* Can the receiver be nil, and is the call no safe navigation (which guards
-   it itself)? */
+   it itself) and its receiver not tested already? A receiver the call plan
+   tests ahead of the call (emit_nil_target_head: cplan_nil, the arguments
+   run first) is seen as tested (nil_tested) and read bare; any other, such
+   as an instance variable the plan leaves untested, is read through
+   sp_StrhArray_rnn. */
 static int strh_recv_nilable(Compiler *c, int id, int recv) {
-  return !call_is_safe_nav(c->nt, id) && repr_of(c, recv).may_nil;
+  return !nt_safe_nav(c->nt, id) && repr_of(c, recv).may_nil && !repr_of(c, recv).nil_tested;
 }
 void strh_emit_recv(Compiler *c, int id, int recv, Buf *b) {
   const char *nm = nt_str(c->nt, id, "name");

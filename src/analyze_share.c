@@ -109,7 +109,7 @@ typedef struct ShareFacts {
      pairs, then once built, per method scope its run (mb_start..mb_start+1)
      of mb_blk; blk_dyn per method scope: a block the walk does not list
      reaches its yields (a block passed as a value, a zsuper's, a dynamic
-     call's) */
+     call's), bit 2 set for the last two */
   int *mb_m, *mb_b, nmb, cmb;
   int *mb_start, *mb_blk;
   unsigned char *blk_dyn;
@@ -177,6 +177,9 @@ typedef struct ShareFacts {
   int nbucket;
   /* each node's value: -2 not yet computed, -1 none */
   int *nval, nnodes;
+  /* per node: the base sh_self_chain_base found last from it, -1 none yet
+     (a link it passed stays passable: classes only merge) */
+  int *scb;
   /* per node: a blockless builtin call answering a new String Array of
      new Strings (`s.scan(re)`, `s.split`), whose value is a class of its
      own (sh_builtin) */
@@ -341,38 +344,7 @@ static int sh_new(ShareFacts *F, int kind) {
   return e;
 }
 
-static int g_dbg_watch = -1, g_dbg_done = 0; static Compiler *g_dbg_c;
-static void sh_union_real(ShareFacts *F, int a, int b);
-static int g_dbg_n = 0;
-static void sh_dbg_desc(ShareFacts *F, int e, char *out, size_t cap) {
-  int h = e >= 0 ? F->hidx[e] : -1;
-  if (h < 0) { snprintf(out, cap, "%d(kind %d)", e, e >= 0 ? (int)F->kind[e] : -1); return; }
-  ShareHolder *H = &F->h[h];
-  snprintf(out, cap, "%d(kind %d scope %s name %s node %d line %d)", e, (int)H->kind,
-           H->scope >= 0 ? g_dbg_c->scopes[H->scope].name : "-", H->name ? H->name : "-", H->node,
-           H->node >= 0 ? (int)nt_int(g_dbg_c->nt, H->node, "line", -1) : -1);
-}
 static void sh_union(ShareFacts *F, int a, int b) {
-  if (g_dbg_watch >= 0 && !g_dbg_done && a >= 0 && b >= 0 && g_dbg_n < 40) {
-    int rw = sh_find(F, g_dbg_watch), ra = sh_find(F, a), rb = sh_find(F, b);
-    if (ra != rb && (ra == rw || rb == rw)) {
-      char da[200], db[200]; sh_dbg_desc(F, ra == rw ? b : a, da, sizeof da); sh_dbg_desc(F, ra == rw ? a : b, db, sizeof db);
-      fprintf(stderr, "GROW %d: watch-side %s  other %s\n", g_dbg_n++, db, da);
-    }
-  }
-  int before = 0;
-  if (g_dbg_watch >= 0 && !g_dbg_done && F->unknown >= 0 && a >= 0 && b >= 0)
-    before = sh_find(F, g_dbg_watch) == sh_find(F, F->unknown);
-  sh_union_real(F, a, b);
-  if (g_dbg_watch >= 0 && !g_dbg_done && F->unknown >= 0 && !before && sh_find(F, g_dbg_watch) == sh_find(F, F->unknown)) {
-    g_dbg_done = 1;
-    { int ha = F->hidx[a], hb = F->hidx[b];
-      fprintf(stderr, "JOINED-UNKNOWN a=%d(kind %d scope %s) b=%d(kind %d scope %s node %d)\n", a, (int)F->kind[a],
-              ha >= 0 && F->h[ha].scope >= 0 ? g_dbg_c->scopes[F->h[ha].scope].name : "-", b, (int)F->kind[b],
-              hb >= 0 && F->h[hb].scope >= 0 ? g_dbg_c->scopes[F->h[hb].scope].name : "-", hb >= 0 ? F->h[hb].node : -1); }
-  }
-}
-static void sh_union_real(ShareFacts *F, int a, int b) {
   if (a < 0 || b < 0) return;
   int sp = 0;
   if (F->union_stack_cap < 64) {
@@ -1565,6 +1537,10 @@ static void sh_settle_peeks(ShareFacts *F, Compiler *c) {
 
 static int sh_answers_elems_run(int share, int argc);
 /* container: 1 an Array's (or a poly receiver's) row, 2 a Hash's */
+static int sh_new_str_array(Compiler *c, int n, int share, int argc, int blk) {
+  return (share == BSH_PURE || share == BSH_ITER_FRESH_RECV || (share == BSH_LINE && argc == 0)) && blk < 0 &&
+         c->ntype[n] == TY_STR_ARRAY;
+}
 static int sh_builtin(ShareFacts *F, Compiler *c, int n, int share, int rv, int blk, int container) {
   const NodeTable *nt = c->nt;
   int args = nt_ref(nt, n, "arguments");
@@ -1576,8 +1552,7 @@ static int sh_builtin(ShareFacts *F, Compiler *c, int n, int share, int rv, int 
   /* a String's (or Kernel's) builtin answering a new String Array without
      a block (`s.split`, `s.scan(re)`): its elements are new Strings, held
      as a local's Array holds them, in a class of its own */
-  if ((share == BSH_PURE || share == BSH_ITER_FRESH_RECV || (share == BSH_LINE && argc == 0)) && !container && blk < 0 &&
-      c->ntype[n] == TY_STR_ARRAY) {
+  if (!container && sh_new_str_array(c, n, share, argc, blk)) {
     F->fresh_cont[n] = 1;
     return sh_new(F, SHK_VALUE);
   }
@@ -1623,9 +1598,14 @@ static int sh_builtin(ShareFacts *F, Compiler *c, int n, int share, int rv, int 
     return rv;
   case BSH_ELEM:
     if (container && nv >= 1) sh_lookup_key(F, rv, vals[0]);
-    /* `a[i, n]`, `a[r]`: a run of elements */
-    if (argc >= 2 || (argc == 1 && nt_kind(nt, argv[0]) == NK_RangeNode))
+    /* `a[i, n]`, `a[r]`: a run of elements, an Array of the receiver's own
+       as BSH_SUB answers. A receiver that may be another container (a
+       Hash a Range keys) may answer an element too. */
+    if (argc >= 2 || (argc == 1 && nt_kind(nt, argv[0]) == NK_RangeNode)) {
+      TyKind art = rcv >= 0 ? c->ntype[rcv] : TY_UNKNOWN;
+      if (ty_is_array(art) || art == TY_STRH_ARRAY) return rv;
       return sh_join(F, rv, sh_elem(F, rv));
+    }
     return sh_elem(F, rv);
   case BSH_ELEM_N:
     return argc >= 1 ? sh_join(F, rv, sh_elem(F, rv)) : sh_elem(F, rv);
@@ -1937,6 +1917,8 @@ static int sh_boxed_builtin_row(ShareFacts *F, Compiler *c, int n,
   /* Explicit IO rows describe boxed arms too. User targets and OpenStruct
      fields stay above; an IO's wildcard cannot prove this. */
   if (!s && !F->ostruct) { s = bop_share_boxed(TY_IO, name); if (s) family = TY_IO; }
+  /* ...and a Time's text forms, a new String each (`d.iso8601` on a box) */
+  if (!s && !F->ostruct) { s = bop_share_boxed(TY_TIME, name); if (s) { family = TY_TIME; container = 0; } }
   if (!s) return 0;
   *share_out = s;
   if (family_out) *family_out = family;
@@ -1966,7 +1948,6 @@ static TyKind sh_bop_arg_type(const void *ud, int i) {
   return i >= 0 && i < a->argc ? a->c->ntype[a->argv[i]] : TY_UNKNOWN;
 }
 
-static int sh_method_missing_reaches(Compiler *c, int call, const char *name);
 
 /* A boxed String row can replace the container default only when the
    selected typed row describes this call shape and the dispatch plan and
@@ -2013,13 +1994,11 @@ static int sh_boxed_string_row_composable(ShareFacts *F, Compiler *c, int n,
   }
   if (has_other_builtin || bop_share_named(BOP_ANY_RECV, name)) return 0;
 
-  /* Match the existing boxed-freshness exclusions for Object and dynamic
-     lookup. These routes can answer without being an ordinary user target. */
-  if (object_public_method_name(name) || comp_method_index(c, "method_missing") >= 0) return 0;
-  if (sh_method_missing_reaches(c, n, name)) return 0;
-  int missing = 0;
-  comp_cmethod_candidates(c, "method_missing", &missing);
-  if (missing) return 0;
+  /* Match the existing boxed-freshness exclusion for Object's methods,
+     which can answer without being an ordinary user target. (A
+     method_missing hook answers nothing here: Spinel never routes a call
+     to it.) */
+  if (object_public_method_name(name)) return 0;
 
   const PolyPlan *p = cplan_poly_fresh(c, n);
   if (!p || (p->ret != TY_STRING && p->ret != TY_POLY)) return 0;
@@ -2053,15 +2032,15 @@ static int sh_boxed_string_row_composable(ShareFacts *F, Compiler *c, int n,
 
 static int sh_native_placeholder(Compiler *c, const PolyCand *p, const char *name);
 /* Is call n, on a boxed receiver, of a name no program method answers
-   (no target here, no method_missing, no reader, native binding or
-   OpenStruct field of the name, no singleton accessor) and that every
+   (no target here, no reader, native binding or OpenStruct field of the
+   name, no singleton accessor) and that every
    builtin kind having it answers with a new String or no String
    (bop_share_pure_anywhere): `x.tr("-", "_")`, `x.squeeze`? The box holds
    one of those kinds, or the call raises NoMethodError. */
 static int sh_boxed_pure_name(ShareFacts *F, Compiler *c, int n) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, n, "name");
-  int argc = call_plain_argc(c, n), np = 0, missing = 0;
+  int argc = call_plain_argc(c, n), np = 0;
   /* (an answer typed poly is boxed by the dispatch's String arm as its
      bytes, a box whose copies stop naming one String once one of them is
      appended to: such a call stays in its receiver's class) */
@@ -2069,15 +2048,13 @@ static int sh_boxed_pure_name(ShareFacts *F, Compiler *c, int n) {
       object_public_method_name(name) || bop_name_has_reader(name, BOP_READ_NUMERIC | BOP_READ_CONTAINER) ||
       (ty_poly_face_owners(name, argc, 0, 1, 1) & PF_OWNERS & ~(PF_STRING | PF_INT | PF_FLOAT | PF_RANGE |
                                                                  PF_FRANGE | PF_RANDOM)) ||
-      !bop_share_pure_anywhere(name, argc, 0) || comp_method_index(c, "method_missing") >= 0)
+      !bop_share_pure_anywhere(name, argc, 0))
     return 0;
-  comp_cmethod_candidates(c, "method_missing", &missing);
-  if (missing) return 0;
   /* (a native class's empty placeholder row answers nothing) */
   const PolyCand *pc = comp_poly_candidates(c, name, &np);
   for (int i = 0; i < np; i++)
     if (!sh_native_placeholder(c, &pc[i], name)) return 0;
-  return !sh_singleton_accessor(F, c, name) && !sh_method_missing_reaches(c, n, name);
+  return !sh_singleton_accessor(F, c, name);
 }
 
 static void sh_record_boxed_fresh(ShareFacts *F, Compiler *c, int n,
@@ -2486,9 +2463,15 @@ static int sh_ostruct_call(ShareFacts *F, Compiler *c, int n, const char *name, 
    a mutation of it is one of that receiver's, direct when it is a holder's
    read; the walk gave each link its receiver's class (BSH_RECV), which the
    class test confirms. */
+/* Each link a walk passes stays passable (its row and types are fixed, and
+   two classes once joined stay joined), so a later walk from a node above
+   resumes where the last one from this node stopped (F->scb): a chain of n
+   links walked from each of them was n^2/2 steps. */
 static int sh_self_chain_base(ShareFacts *F, Compiler *c, int n) {
   const NodeTable *nt = c->nt;
-  for (n = an_unparen(nt, n); n >= 0 && nt_kind(nt, n) == NK_CallNode; ) {
+  int start = an_unparen(nt, n);
+  for (n = start; n >= 0 && nt_kind(nt, n) == NK_CallNode; ) {
+    if (n < F->nnodes && F->scb[n] >= 0 && F->scb[n] != n) { n = F->scb[n]; continue; }
     int r = an_unparen(nt, nt_ref(nt, n, "receiver"));
     TyKind rt = r >= 0 ? c->ntype[r] : TY_VOID;
     const char *nm = nt_str(nt, n, "name");
@@ -2500,6 +2483,7 @@ static int sh_self_chain_base(ShareFacts *F, Compiler *c, int n) {
       break;
     n = r;
   }
+  if (start >= 0 && start < F->nnodes) F->scb[start] = n;
   return n;
 }
 
@@ -2945,6 +2929,7 @@ static int sh_freeze_recv_assign(const Compiler *c, int n, int depth) {
   }
 }
 
+static int sh_uplus_copies(Compiler *c, int n);
 static int sh_call(ShareFacts *F, Compiler *c, int n) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, n, "name");
@@ -2956,7 +2941,10 @@ static int sh_call(ShareFacts *F, Compiler *c, int n) {
   int rv = recv >= 0 ? sh_val(F, c, recv) : -1;
   TyKind rt = recv >= 0 ? c->ntype[recv] : TY_VOID;
   int maybe_str = recv >= 0 && (rt == TY_STRING || rt == TY_STRBUF || rt == TY_POLY || rt == TY_UNKNOWN);
-  if (c->share_strings && is_identity_query(name)) {
+  /* (a String receiver whose class the program gives the name runs that
+     method, which asks no identity: `class String; def equal?(o) = ...`) */
+  if (c->share_strings && is_identity_query(name) &&
+      !((rt == TY_STRING || rt == TY_STRBUF) && share_builtin_overridden(c, "String", name))) {
     int identity = recv < 0 ? sh_self(F, c, sh_method_index(c, n)) : rv;
     if (identity >= 0) F->own[identity] |= SHE_IDENTITY | SHE_COMPARED;
     if (argc == 1 && is_equality_name(name)) {
@@ -3193,7 +3181,7 @@ static int sh_call(ShareFacts *F, Compiler *c, int n) {
       /* a block passed as a value (`&proc`, `&method(:m)`): what the method
          yields goes where the walk does not follow */
       if (blk >= 0 && nt_kind(nt, blk) != NK_BlockNode && c->scopes[tg[i]].yields) {
-        F->blk_dyn[tg[i]] = 1;
+        F->blk_dyn[tg[i]] |= 1;
         sh_union(F, sh_scope_holder(F, SHK_YIELD, tg[i]), F->unknown);
         sh_union(F, sh_scope_holder(F, SHK_BLKRET, tg[i]), F->unknown);
       }
@@ -3366,9 +3354,9 @@ static int sh_call(ShareFacts *F, Compiler *c, int n) {
     }
     /* any receiver it may be: an Array's or a Hash's row (a String's keeps
        its arguments least), or the container default */
-    int s = 0, container = 1;
-    if (sh_boxed_builtin_row(F, c, n, &s, NULL, &container))
-      return sh_builtin(F, c, n, s, rv, blk, container);
+    int s = 0, family = 0, container = 1;
+    if (sh_boxed_builtin_row(F, c, n, &s, &family, &container))
+      return sh_builtin(F, c, n, s, rv, blk, family == TY_STRING && sh_new_str_array(c, n, s, argc, blk) ? 0 : container);
     if (sh_boxed_pure_name(F, c, n)) return sh_builtin(F, c, n, BSH_PURE, rv, blk, 0);
     return sh_container_default(F, c, n, rv, blk);
   }
@@ -3389,6 +3377,13 @@ static int sh_call(ShareFacts *F, Compiler *c, int n) {
   if (rt == TY_STR_RANGE && blk < 0 && c->ntype[n] == TY_STR_ARRAY && !is_minmax_pair(name) &&
       !share_builtin_overridden(c, "Range", name))
     return sh_builtin(F, c, n, BSH_PURE, rv, blk, 0);
+  /* `+` of a builtin String constant or of a freeze's answer (frozen,
+     sh_uplus_copies) is a new String, as `+"lit"` is, not its receiver:
+     share_value_fresh says the same. Taken as its receiver, a change to the copy marked the constant's
+     class changed, and a conditional reading the constant was refused. */
+  if (name && is_unary_plus(name) && blk < 0 && call_plain_argc(c, n) == 0 && !sh_has_targets(c, n) &&
+      sh_uplus_copies(c, nt_ref(nt, n, "receiver")))
+    return -1;
   TyKind fam = sh_family(rt);
   /* an iterator that keeps none of its block's values drops the block's
      own: a call there hands its method's value to no caller. (An
@@ -3428,7 +3423,7 @@ static int sh_super(ShareFacts *F, Compiler *c, int n) {
             sh_union(F, a, m->pnames[k] ? sh_local_of(F, c, m, m->pnames[k], n) : -1);
       }
       sh_union(F, sh_scope_holder(F, SHK_YIELD, cur), sh_scope_holder(F, SHK_YIELD, tg[i]));
-      F->blk_dyn[tg[i]] = 1;
+      F->blk_dyn[tg[i]] |= 3;
       sh_fwd_edge(F, cur, tg[i]);
       sh_union(F, sh_scope_holder(F, SHK_BLKRET, cur), sh_scope_holder(F, SHK_BLKRET, tg[i]));
     }
@@ -3831,11 +3826,6 @@ static int sh_method_answers_no_string(Compiler *c, int mi) {
       for (int j = 0; j < k; j++) { if (sp >= 255) { ok = 0; break; } if (ids[j] >= 0) stack[sp++] = ids[j]; }
     }
   }
-  if (getenv("DBGNS") && m->name && sp_streq(m->name, "sub")) {
-    int bn = 0; const int *bb = nt_arr(nt, m->body, "body", &bn);
-    fprintf(stderr, "NS sub ok=%d body=%s nlast=%s val=%d\n", ok, nt_type(nt, m->body), bn ? nt_type(nt, bb[bn-1]) : "-", sh_value_no_string(c, m->body, 0));
-    if (bn && nt_kind(nt, bb[bn-1]) == NK_IfNode) { int pr = nt_ref(nt, bb[bn-1], "predicate"); fprintf(stderr, "  pred=%s %s narrows=%d\n", nt_type(nt, pr), nt_str(nt, pr, "name") ? nt_str(nt, pr, "name") : "-", sh_if_narrows_off_string(c, bb[bn-1])); }
-  }
   return ok && sh_value_no_string(c, m->body, 0);
 }
 static int sh_val(ShareFacts *F, Compiler *c, int n) {
@@ -3843,11 +3833,6 @@ static int sh_val(ShareFacts *F, Compiler *c, int n) {
   if (F->nval[n] != -2) return F->nval[n];
   F->nval[n] = -1;
   int v = sh_val_compute(F, c, n);
-  if (getenv("DBGU") && n == atoi(getenv("DBGU")) && v >= 0) { g_dbg_watch = v; g_dbg_done = 0; g_dbg_c = c; }
-  if (getenv("DBGU") && nt_kind(c->nt, n) == NK_CallNode && nt_str(c->nt, n, "name") && sp_streq(nt_str(c->nt, n, "name"), "sub")) {
-    int rv = nt_ref(c->nt, n, "receiver");
-    fprintf(stderr, "SUBV n=%d v=%d recvkind=%s recvname=%s unknown=%d ntype=%d\n", n, v, rv >= 0 ? nt_type(c->nt, rv) : "-", rv >= 0 && nt_str(c->nt, rv, "name") ? nt_str(c->nt, rv, "name") : "-", v >= 0 && F->unknown >= 0 && sh_find(F, v) == sh_find(F, F->unknown), (int)c->ntype[n]);
-  }
   /* a value whose type holds no String is none, whatever it flowed
      through (a write's target is still unified above) */
   if (v >= 0 && c->ntype[n] != TY_UNKNOWN && !sh_may_hold(c, c->ntype[n]) &&
@@ -4268,7 +4253,7 @@ static void sh_free(ShareFacts *F) {
   free(F->mb_m); free(F->mb_b); free(F->mb_start); free(F->mb_blk); free(F->blk_dyn);
   free(F->fw_from); free(F->fw_to); free(F->blk_unk); free(F->fresh_blk); free(F->fresh_call);
   free(F->kind); free(F->flags); free(F->own);
-  free(F->h); free(F->helem); free(F->bucket); free(F->hnext); free(F->nval);
+  free(F->h); free(F->helem); free(F->bucket); free(F->hnext); free(F->nval); free(F->scb);
   free(F->lend_arg); free(F->lend_par); free(F->lend_node); free(F->lend_direct); free(F->lend_done);
   free(F->dyn); free(F->union_stack);
   free(F->any_new_blk); free(F->attr_r); free(F->attr_w); free(F->blkp); free(F->ivw);
@@ -4728,7 +4713,9 @@ static ShareFacts *sh_build(Compiler *c, int closed) {
   F->any_callable = -1;
   F->nnodes = nt->count;
   F->nval = malloc(sizeof(int) * (size_t)(F->nnodes > 0 ? F->nnodes : 1));
-  for (int i = 0; i < F->nnodes; i++) F->nval[i] = -2;
+  F->scb = malloc(sizeof(int) * (size_t)(F->nnodes > 0 ? F->nnodes : 1));
+  if (!F->nval || !F->scb) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int i = 0; i < F->nnodes; i++) F->nval[i] = -2, F->scb[i] = -1;
   sh_mutable_consts(F, c);
   F->unused = calloc((size_t)(F->nnodes > 0 ? F->nnodes : 1), 1);
   F->fresh_cont = calloc((size_t)(F->nnodes > 0 ? F->nnodes : 1), 1);
@@ -4807,7 +4794,7 @@ static ShareFacts *sh_build(Compiler *c, int closed) {
     F->ret_joined[mi] = 1;
     F->blk_unk[mi] = 1;
     if (m->yields) {
-      F->blk_dyn[mi] = 1;
+      F->blk_dyn[mi] |= 3;
       sh_union(F, sh_scope_holder(F, SHK_YIELD, mi), F->unknown);
       sh_union(F, sh_scope_holder(F, SHK_BLKRET, mi), F->unknown);
     }
@@ -4825,11 +4812,6 @@ static ShareFacts *sh_build(Compiler *c, int closed) {
   sh_settle_peeks(F, c);
   sh_finalize(F);
   sh_index_blocks(F, c);
-  if (getenv("DBGU")) for (int n = 0; n < F->nnodes; n++) {
-    if (F->nval[n] < 0 || nt_kind(c->nt, n) != NK_CallNode || !nt_str(c->nt, n, "name") || !sp_streq(nt_str(c->nt, n, "name"), "sub")) continue;
-    int r = sh_find(F, F->nval[n]);
-    fprintf(stderr, "SUBEND n=%d root=%d flags=%d unkroot=%d\n", n, r, (int)F->flags[r], F->unknown >= 0 ? sh_find(F, F->unknown) : -1);
-  }
   return F;
 }
 
@@ -5047,6 +5029,13 @@ int share_node_elems_share(const Compiler *c, int n) {
   int r = sh_node_root(F, n, 1);
   return r >= 0 && repr_str_class_shares(F->flags[r], sh_class_holders(F, r));
 }
+int share_str_elem_read(Compiler *c, int n) {
+  if (!c->share || n < 0) return 0;
+  n = unwrap_parens(c, n);
+  if (!container_elem_read_p(c->nt, n)) return 0;
+  int r = nt_ref(c->nt, n, "receiver");
+  return r >= 0 && infer_type(c, r) == TY_POLY_ARRAY && share_node_elems_share(c, r);
+}
 int share_node_fresh_elems(const Compiler *c, int n) {
   const ShareFacts *F = c->share;
   return F && n >= 0 && n < F->nnodes && F->fresh_cont[n] && share_node_elems_share(c, n);
@@ -5113,6 +5102,29 @@ int share_method_blocks(const Compiler *c, int mi, const int **blocks) {
   *blocks = F->mb_blk + F->mb_start[mi];
   return F->mb_start[mi + 1] - F->mb_start[mi];
 }
+int share_method_reaching_blocks(const Compiler *c, int mi, int *out, int cap) {
+  const ShareFacts *F = c->share;
+  if (!F || !F->mb_start || mi < 0 || mi >= c->nscopes) return -1;
+  int qcap = 64, qn = 0, n = 0, q[64];
+  q[qn++] = mi;
+  for (int h = 0; h < qn; h++) {
+    int m = q[h];
+    if (F->blk_dyn[m] & 2) return -1;
+    for (int i = F->mb_start[m]; i < F->mb_start[m + 1]; i++) {
+      if (n >= cap) return -1;
+      out[n++] = F->mb_blk[i];
+    }
+    for (int e = 0; e < F->nfw; e++) {
+      if (F->fw_to[e] != m) continue;
+      int seen = 0;
+      for (int k = 0; k < qn && !seen; k++) seen = q[k] == F->fw_from[e];
+      if (seen) continue;
+      if (qn >= qcap) return -1;
+      q[qn++] = F->fw_from[e];
+    }
+  }
+  return n;
+}
 /* Native classes can appear in comp_poly_candidates as placeholders even
    when they have no binding. Skip only those empty native rows; preserve
    every Ruby candidate and every real native binding conservatively. The
@@ -5122,114 +5134,6 @@ static int sh_native_placeholder(Compiler *c, const PolyCand *p, const char *nam
   if (comp_reader_in_chain(c, p->cls, name, NULL)) return 0;
   return !comp_poly_arm_defines(c, p->cls, name);
 }
-/* Does class k answer `name` itself: a method or a reader in its chain,
-   or a native binding? */
-static int sh_class_answers(Compiler *c, int k, const char *name) {
-  return comp_method_in_chain(c, k, name, NULL) >= 0 || comp_reader_in_chain(c, k, name, NULL) ||
-         comp_poly_arm_defines(c, k, name);
-}
-/* Does class j's chain hold class or module k: j itself, a superclass, or
-   a module one of them includes or prepends (directly or through another
-   module)? Every chain holds Object, BasicObject and Kernel, and k < 0
-   stands for them. */
-static int sh_chain_holds(Compiler *c, int j, int k) {
-  if (k < 0 || (c->classes[k].name && is_object_root(c->classes[k].name))) return 1;
-  for (int a = j, d = 0; a >= 0 && a < c->nclasses && d <= c->nclasses; a = c->classes[a].parent, d++) {
-    if (a == k) return 1;
-    for (int m = 0; m < c->classes[a].nincluded_mods; m++)
-      if (comp_module_includes(c, c->classes[a].included_mods[m], k, 0)) return 1;
-  }
-  return 0;
-}
-/* Can a hook in class or module k whose instances the boxed-receiver walk
-   does not list as a class of its own (Object, a reopened builtin, a
-   builtin module; k < 0 for every object) answer call `call` of `name`?
-   Where the receiver can be a builtin value (nil, a literal, a builtin
-   class's instance: poly_recv_builtin) or the walk cannot bound it, it
-   can; otherwise only through a class the walk lists (*ks, *nk, asked once
-   for the call) whose chain holds k and lacks the name. */
-static int sh_unlisted_hook_reaches(Compiler *c, int call, const char *name, int k,
-                                    const int **ks, int *nk) {
-  if (*nk < 0) *ks = poly_recv_classes(c, call, nk);
-  if (!*ks || poly_recv_builtin(c, call)) return 1;
-  for (int x = 0; x < *nk; x++)
-    if (sh_chain_holds(c, (*ks)[x], k) && !sh_class_answers(c, (*ks)[x], name)) return 1;
-  return 0;
-}
-/* Can module mod's method_missing hook answer call `call` of `name`? The
-   hook is in the chain of each class that includes or prepends the module
-   (an object's extend makes such a class), and of its subclasses: one that
-   lacks the name reaches the hook where the receiver can be of it, by the
-   boxed-receiver walk, a singleton's always. A module included at the top
-   level, by a builtin module (Kernel, Comparable) or by a class the walk
-   does not bound (a builtin's) is in the chain of values the walk does not
-   list (sh_unlisted_hook_reaches), and one a class extends answers on the
-   class itself, which always counts. */
-static int sh_module_hook_reaches(Compiler *c, int call, const char *name, int mod,
-                                  const int **ks, int *nk) {
-  for (int t = 0; t < c->ntoplevel_includes; t++)
-    if (comp_module_includes(c, c->toplevel_includes[t], mod, 0))
-      return sh_unlisted_hook_reaches(c, call, name, -1, ks, nk);
-  for (int j = 0; j < c->nclasses; j++) {
-    ClassInfo *cj = &c->classes[j];
-    for (int e = 0; e < cj->nextended_mods; e++)
-      if (comp_module_includes(c, cj->extended_mods[e], mod, 0)) return 1;
-    if (comp_class_is_module(c, cj)) {
-      if (cj->name && is_builtin_module_name(cj->name) && comp_module_includes(c, j, mod, 0) &&
-          sh_unlisted_hook_reaches(c, call, name, j, ks, nk)) return 1;
-      continue;
-    }
-    if (!sh_chain_holds(c, j, mod) || sh_class_answers(c, j, name)) continue;
-    if (cj->is_singleton_of) return 1;
-    if ((cj->name && is_builtin_class_name(cj->name)) || !cls_fact_bounded(c, j)) {
-      if (sh_unlisted_hook_reaches(c, call, name, j, ks, nk)) return 1;
-      continue;
-    }
-    if (*nk < 0) *ks = poly_recv_classes(c, call, nk);
-    if (!*ks) return 1;
-    for (int x = 0; x < *nk; x++)
-      if ((*ks)[x] == j) return 1;
-  }
-  return 0;
-}
-/* Can a method_missing hook answer call `call` of `name`, as CRuby routes
-   a call no method of the receiver's class answers: a class whose chain
-   holds a hook (a Ruby method, a reader, a native binding) and not the
-   name, that the receiver can be? The boxed-receiver walk lists the
-   program's classes and the native classes the receiver can be
-   (poly_recv_classes, asked only once such a class turns up); a hook in
-   an object's singleton class, or for a receiver the walk cannot bound,
-   counts. A hook in a class the walk does not bound (Object, a reopened
-   builtin, an exception's) counts where the receiver can be a builtin
-   value, nil included (an element read past the end, a missing else), or
-   of a listed class below it that lacks the name
-   (sh_unlisted_hook_reaches). A module's hook counts through the classes
-   that include it (sh_module_hook_reaches). A hook that only classes
-   answering the name themselves reach, or only classes the receiver never
-   is, answers nothing here. (Spinel never routes a call to the hook; this
-   keeps CRuby's answer in view.) */
-static int sh_method_missing_reaches(Compiler *c, int call, const char *name) {
-  int n = 0, nk = -1;
-  const int *ks = NULL;
-  const PolyCand *p = comp_poly_candidates(c, "method_missing", &n);
-  for (int i = 0; i < n; i++) {
-    int k = p[i].cls;
-    if (sh_native_placeholder(c, &p[i], "method_missing") || sh_class_answers(c, k, name)) continue;
-    if (c->classes[k].is_singleton_of) return 1;
-    if (!p[i].native && !cls_fact_bounded(c, k)) {
-      if (comp_class_is_module(c, &c->classes[k]) ? sh_module_hook_reaches(c, call, name, k, &ks, &nk)
-                                                   : sh_unlisted_hook_reaches(c, call, name, k, &ks, &nk))
-        return 1;
-      continue;
-    }
-    if (nk < 0) ks = poly_recv_classes(c, call, &nk);
-    if (!ks) return 1;
-    for (int j = 0; j < nk; j++)
-      if (ks[j] == k) return 1;
-  }
-  return 0;
-}
-
 /* A boxed call's builtin arms answer a value of their own when the
    any-receiver row says so. String's receiver conversions are the
    exception to Object's row: to_s can hand its String back unchanged. */
@@ -5242,15 +5146,10 @@ static int sh_builtin_fresh(Compiler *c, int call, int ostruct) {
      other receiver raises. The arity tables already record that ownership.
      The dispatch plan must also exclude readers, native bindings and
      catch-all arms such as OpenStruct's member read. Object's public
-     method table covers the names the arity tables omit. A user-defined
-     method_missing can answer a name with no ordinary target too: a
-     top-level one for any receiver, a class's where the receiver can be of
-     a class that has the hook and not the name. */
+     method table covers the names the arity tables omit. (A method_missing
+     hook answers no name: Spinel never routes a call to it, and warns
+     where one is defined.) */
   if (object_public_method_name(name)) return 0;
-  if (comp_method_index(c, "method_missing") >= 0) return 0;
-  int missing = 0;
-  comp_cmethod_candidates(c, "method_missing", &missing);
-  if (missing) return 0;
   /* With no builtin face or dynamic fields, only the user methods can
      answer. Their freshness is checked by the caller. */
   if (!ostruct && !bop_name_has_reader(name, BOP_READ_NUMERIC | BOP_READ_CONTAINER | BOP_READ_STRING) &&
@@ -5272,9 +5171,7 @@ static int sh_builtin_fresh(Compiler *c, int call, int ostruct) {
       for (int j = 0; j < ntg; j++) if (tg[j] == p[i].mi) { found = 1; break; }
       if (!found) return 0;
     }
-    /* a class's hook is asked last: whether the receiver can be of its
-       class walks the receiver's values, and only an answer of 1 needs it */
-    if (user_methods > 0) return !sh_method_missing_reaches(c, call, name);
+    if (user_methods > 0) return 1;
   }
   return 0;
 }
@@ -5339,6 +5236,40 @@ int share_builtin_fresh(Compiler *c, int call) {
    t : s`, `H.fetch(k, s)`: ShareFacts.alt), or that goes to a place with no
    flow to show for it (a call the walk does not follow, an exception's
    message: ShareFacts.kp_e). */
+/* Is v a call whose every target answers one of its parameters
+   (scope_ret_param)? Its value is the caller's own argument, which the
+   caller's flow keeps, not the parameter: share_value_fresh asks that
+   argument. (A method answering itself by recursion joins its parameter
+   with its answer as alternatives of one conditional.) */
+static int sh_call_answers_param(Compiler *c, int v) {
+  if (v < 0 || nt_kind(c->nt, v) != NK_CallNode) return 0;
+  int tg[8];
+  int n = cplan_targets(c, v, tg, 8);
+  if (n <= 0) return 0;
+  for (int i = 0; i < n; i++) if (tg[i] < 0 || scope_ret_param(c, tg[i]) < 0) return 0;
+  return 1;
+}
+/* Is flow (kind, site, v) a parameter's read handed back to that same
+   parameter by its own method calling itself (`pass(x, n - 1)` in `def
+   pass(x, n)`)? The call's only target is the method the read is in and
+   the read binds the parameter it reads: the slot it fills is the one it
+   came from, so it keeps the String nowhere new. */
+static int sh_param_self_pass(Compiler *c, int kind, int site, int v) {
+  const NodeTable *nt = c->nt;
+  if (kind != SHFL_ARG || site < 0 || v < 0 || nt_kind(nt, site) != NK_CallNode ||
+      nt_kind(nt, v) != NK_LocalVariableReadNode) return 0;
+  Scope *m = comp_scope_of(c, v);
+  int mi = m ? (int)(m - c->scopes) : -1;
+  const char *pn = nt_str(nt, v, "name");
+  int pj = -1;
+  for (int j = 0; m && pn && j < m->nparams && pj < 0; j++)
+    if (m->pnames[j] && sp_streq(m->pnames[j], pn)) pj = j;
+  if (mi <= 0 || pj < 0 || comp_scope_of(c, site) != m) return 0;
+  int tg[2];
+  int nt2 = cplan_targets(c, site, tg, 2);
+  if (nt2 != 1 || tg[0] != mi) return 0;
+  return arg_layout_param_source(c, m, site, pj, NULL) == v;
+}
 int share_param_kept(Compiler *c, int mi, int pj) {
   ShareFacts *F = c->share;
   Scope *m = &c->scopes[mi];
@@ -5353,7 +5284,9 @@ int share_param_kept(Compiler *c, int mi, int pj) {
     if (!F->pkept) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
     for (int i = 0; i < F->nfl; i++) {
       int e = F->fl_val[i] >= 0 && F->fl_val[i] < F->nnodes ? F->nval[F->fl_val[i]] : -1;
-      if (e >= 0 && F->fl_kind[i] != SHFL_MUTATE) F->pkept[alt ? sh_alt_find(F, e) : e] = 1;
+      if (e >= 0 && F->fl_kind[i] != SHFL_MUTATE && !sh_param_self_pass(c, F->fl_kind[i], F->fl_site[i], F->fl_val[i]) &&
+          !(alt && sh_call_answers_param(c, F->fl_val[i])))
+        F->pkept[alt ? sh_alt_find(F, e) : e] = 1;
     }
     for (int i = 0; alt && i < F->nkp; i++) F->pkept[sh_alt_find(F, F->kp_e[i])] = 1;
   }
@@ -5615,12 +5548,30 @@ int share_frozen_literal(Compiler *c, int n) {
 /* share.h: is node n a frozen String, a literal (share_frozen_literal) or
    a read of a builtin String constant no constant of the program's own
    shadows (is_engine_string_const)? */
+/* Is unary `+` of n a new String: n a builtin String constant
+   (share_frozen_string), or what the builtin freeze answers, frozen
+   whatever its receiver (`+RUBY_ENGINE.freeze`, `+s.freeze`)? */
+static int sh_uplus_copies(Compiler *c, int n) {
+  const NodeTable *nt = c->nt;
+  int u = an_unparen(nt, n);
+  if (u >= 0 && nt_kind(nt, u) == NK_CallNode && is_freeze_name(nt_str(nt, u, "name")) && call_plain_argc(c, u) == 0 &&
+      nt_ref(nt, u, "receiver") >= 0 && nt_ref(nt, u, "block") < 0 && !sh_has_targets(c, u))
+    return 1;
+  return share_frozen_string(c, n);
+}
 int share_frozen_string(Compiler *c, int n) {
   const NodeTable *nt = c->nt;
   int u = an_unparen(nt, n);
   if (u >= 0 && nt_kind(nt, u) == NK_ConstantReadNode) {
     const char *nm = nt_str(nt, u, "name");
     return is_engine_string_const(nm) && !comp_const(c, nm);
+  }
+  /* (File::NULL and the separators, static literals while the program
+     has no File of its own) */
+  if (u >= 0 && nt_kind(nt, u) == NK_ConstantPathNode) {
+    int par = nt_ref(nt, u, "parent");
+    const char *pn = par >= 0 && nt_kind(nt, par) == NK_ConstantReadNode ? nt_str(nt, par, "name") : NULL;
+    return pn && sp_streq(pn, "File") && comp_class_index(c, "File") < 0 && is_file_string_const(nt_str(nt, u, "name"));
   }
   return share_frozen_literal(c, n);
 }
@@ -5656,6 +5607,17 @@ int share_value_fresh(Compiler *c, int n, int depth) {
     int mi = sh_method_index(c, n);
     return mi >= 0 && sh_blocks_fresh(c, mi, depth + 1);
   }
+  /* super answers what the method it reaches answers: a new String where
+     that method's returns joined nothing else, or each answers one, as a
+     call of it does (sh_user_call_fresh); not where it answers a
+     parameter, which zsuper hands on unseen */
+  if (k == NK_SuperNode || k == NK_ForwardingSuperNode) {
+    const CallPlan *p = cplan_user_fresh(c, n);
+    int mi = p->mi;
+    if (!c->share || p->dispatch != CP_DIRECT || mi <= 0 || mi >= c->nscopes || scope_ret_param(c, mi) >= 0)
+      return 0;
+    return !c->share->ret_joined[mi] || scope_ret_fresh(c, mi);
+  }
   if (k != NK_CallNode) return 0;
   if (sh_user_call_fresh(c, n, depth)) return 1;
   /* ENV's [] answers a new String each read; to_s, to_str, itself and
@@ -5670,7 +5632,7 @@ int share_value_fresh(Compiler *c, int n, int depth) {
       return share_value_fresh(c, rcv, depth + 1);
     /* `+` of a frozen String (a builtin String constant, share_frozen_string)
        is a new String, as `+"lit"` is */
-    if (is_unary_plus(cn) && call_plain_argc(c, n) == 0 && share_frozen_string(c, rcv)) return 1;
+    if (is_unary_plus(cn) && call_plain_argc(c, n) == 0 && sh_uplus_copies(c, rcv)) return 1;
     if (bop_share_self_answer(cn, 0)) return share_value_fresh(c, rcv, depth + 1);
     /* a proc, a lambda or a Method the walk bounds to literals */
     if (is_call_alias(cn) && sh_call_fresh(c, n, depth)) return 1;
@@ -5906,6 +5868,21 @@ static int sh_poly_to_s_self(const Compiler *c, int u) {
   }
   return dflt && p->ret == TY_POLY;
 }
+/* Is call u's one target a `def m = @iv` reader of an instance method,
+   its whole body that read, of a slot its class keeps boxed? */
+static int sh_def_reader_box(const Compiler *c, int u) {
+  const NodeTable *nt = c->nt;
+  int tg[CPT_MAX];
+  if (cplan_targets((Compiler *)c, u, tg, CPT_MAX) != 1 || tg[0] <= 0) return 0;
+  const Scope *m = &c->scopes[tg[0]];
+  if (m->is_cmethod || m->class_id < 0 || m->class_id >= c->nclasses || m->nparams != 0) return 0;
+  int n = 0;
+  const int *st = m->body >= 0 && nt_kind(nt, m->body) == NK_StatementsNode ? nt_arr(nt, m->body, "body", &n) : NULL;
+  if (n != 1 || nt_kind(nt, st[0]) != NK_InstanceVariableReadNode) return 0;
+  const ClassInfo *ci = &c->classes[m->class_id];
+  int ix = comp_ivar_index((ClassInfo *)ci, nt_str(nt, st[0], "name"));
+  return ix >= 0 && ci->ivar_types[ix] == TY_POLY;
+}
 /* The kind (share.h's SPK_*) of the route by which node n hands over the
    shared handle (or a box holding it), not a copy of its bytes, or
    SPK_NONE: the carry share_node_carries_handle checks, arm by arm; *op as
@@ -5966,6 +5943,9 @@ static int sh_carry_kind(const Compiler *c, int n, int by_repr, int lift, int *o
       int ix = comp_ivar_index(ci, ivn);
       if (ix >= 0 && ci->ivar_types[ix] == TY_POLY) return SPK_READER;
     }
+    /* ...and so does a `def m = @iv` reader, the one method the call
+       reaches, whose whole body reads the slot: it returns the box */
+    if (rn && ty_is_object(rt) && sh_def_reader_box(c, u)) return SPK_READER;
   }
   Repr r = repr_of(c, n);
   /* A boxed holder's read keeps what its incoming flows stored there. */

@@ -614,8 +614,7 @@ static int nf_derefs(Compiler *c, int n, const char *nm, int depth) {
   case NK_CallNode: {
     int r = nt_ref(nt, n, "receiver");
     const char *cn = nt_str(nt, n, "name");
-    const char *op = nt_str(nt, n, "call_operator");
-    if (r >= 0 && cn && !(op && sp_streq(op, "&.")) && nf_is_read_of(nt, r, nm) &&
+    if (r >= 0 && cn && !nt_safe_nav(nt, n) && nf_is_read_of(nt, r, nm) &&
         nt_kind(nt, nf_unparen(nt, r)) == NK_LocalVariableReadNode && !is_nil_method(cn) &&
         !nf_nil_user_method(c, cn)) return 1;
     if (r >= 0 && nf_derefs(c, r, nm, depth + 1)) return 1;
@@ -712,10 +711,10 @@ static int nf_local_guarded(NF *f, int rd, const char *nm, const LocalVar *lv) {
              nf_falsy_implies(c, nt_ref(nt, p, "left"), nm)) region = cur;
     /* not a loop that tests after its body (`begin ... end while nm`,
        Prism's begin-modifier flag): that body runs once before the test */
-    else if (pk == NK_WhileNode && !(nt_int(nt, p, "flags", 0) & 4) && cur == nt_ref(nt, p, "statements") &&
+    else if (pk == NK_WhileNode && !nt_loop_post(nt, p) && cur == nt_ref(nt, p, "statements") &&
              (nf_truthy_implies(c, nt_ref(nt, p, "predicate"), nm) || nf_derefs(c, nt_ref(nt, p, "predicate"), nm, 0)))
       region = cur;
-    else if (pk == NK_UntilNode && !(nt_int(nt, p, "flags", 0) & 4) && cur == nt_ref(nt, p, "statements") &&
+    else if (pk == NK_UntilNode && !nt_loop_post(nt, p) && cur == nt_ref(nt, p, "statements") &&
              (nf_falsy_implies(c, nt_ref(nt, p, "predicate"), nm) || nf_derefs(c, nt_ref(nt, p, "predicate"), nm, 0)))
       region = cur;
     if (region >= 0) {
@@ -796,10 +795,9 @@ static int nf_call(NF *f, int v) {
   Compiler *c = f->c;
   const NodeTable *nt = f->nt;
   const char *nm = nt_str(nt, v, "name");
-  const char *op = nt_str(nt, v, "call_operator");
   /* only a tracked value's nil: the slots it can reach are tracked */
   if (!nf_tracked(f->c, c->ntype[v])) return NFW_NONE;
-  if (op && sp_streq(op, "&.")) return NFW_SAFE_NAV;
+  if (nt_safe_nav(nt, v)) return NFW_SAFE_NAV;
   if (!nm) return NFW_OPAQUE;
   int r = nt_ref(nt, v, "receiver");
   int a = nt_ref(nt, v, "arguments"), an = 0;

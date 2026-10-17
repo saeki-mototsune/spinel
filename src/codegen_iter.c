@@ -3506,7 +3506,8 @@ void emit_block_invoke(Compiler *c, int args_node, Buf *b, int indent, int as_ex
          where the box was read (#8399) */
       if (want_poly && (ty_is_object(tt3) ||
                         (nt_kind(nt, bd3[bn3 - 1]) == NK_CallNode &&
-                         (tt3 == TY_STRING || tt3 == TY_STRBUF))))
+                         (tt3 == TY_STRING || tt3 == TY_STRBUF)) ||
+                        (tt3 == TY_STRING && strbuf_srange_arm(c, bd3[bn3 - 1]))))
         emit_boxed(c, bd3[bn3 - 1], &tb);
       else if (ywo) emit_oint_expr(c, bd3[bn3 - 1], want_ty, &tb);
       else emit_expr(c, bd3[bn3 - 1], &tb);
@@ -4927,9 +4928,8 @@ int emit_iter_value_expr(Compiler *c, int id, Buf *b) {
      nil receiver and raised where CRuby answers nil. Stand down only BEFORE
      the guard runs -- it re-enters this emission on the guarded temp with
      g_sn_skip set, and that pass has to lower normally. */
-  { const char *sop = nt_str(nt, id, "call_operator");
-    int sn_recv = nt_ref(nt, id, "receiver");
-    if (sop && sp_streq(sop, "&.") && g_sn_skip != id &&
+  { int sn_recv = nt_ref(nt, id, "receiver");
+    if (nt_safe_nav(nt, id) && g_sn_skip != id &&
         sn_recv >= 0 && repr_of(c, sn_recv).kind == RK_BOXED) return 0; }
   if (!iter_value_answers_recv(c, id)) return 0;
   int block = nt_ref(nt, id, "block");
@@ -6063,7 +6063,7 @@ static int iter_range_upto_arms(Compiler *c, int id, Buf *b, int indent, const N
     if (rnode >= 0 && nt_type(nt, rnode) && sp_streq(nt_type(nt, rnode), "RangeNode")) {
       int lo = nt_ref(nt, rnode, "left"), hi = nt_ref(nt, rnode, "right");
       if (lo >= 0 && hi >= 0 && comp_ntype(c, lo) == TY_STRING && comp_ntype(c, hi) == TY_STRING) {
-        int excl = (int)(nt_int(nt, rnode, "flags", 0) & 4) ? 1 : 0;
+        int excl = nt_range_excl(nt, rnode);
         int ta = ++g_tmp, ti = ++g_tmp;
         emit_indent(b, indent);
         buf_printf(b, "sp_StrArray *_t%d = sp_StrArray_from_string_range(", ta);
@@ -7469,9 +7469,8 @@ static int emit_iteration_stmt_body(Compiler *c, int id, Buf *b, int indent) {
      sp_poly_iter_check and raised where CRuby answers nil. Stand down only
      BEFORE the guard runs -- it re-enters this emission on the guarded temp
      with g_sn_skip set, and that pass has to lower normally. */
-  { const char *sop = nt_str(nt, id, "call_operator");
-    if (sop && sp_streq(sop, "&.") && g_sn_skip != id &&
-        recv >= 0 && repr_of(c, recv).kind == RK_BOXED) return 0; }
+  if (nt_safe_nav(nt, id) && g_sn_skip != id &&
+      recv >= 0 && repr_of(c, recv).kind == RK_BOXED) return 0;
   /* CRuby checks arity and argument classes at dispatch, before the
      iteration starts: a loop emitted here never reaches emit_call, so both
      guards run here too (3.step(4, 1, 2) { } ran the loop with the extra

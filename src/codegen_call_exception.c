@@ -213,10 +213,12 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       /* only for the name the class itself defines: #message keeps the helper,
          whose result type the call site is typed for */
       int own = sp_streq(name, "message") ? -1 : comp_method_in_chain(c, xcm, name, NULL);
-      /* #message is #to_s: an override answering something other than a String
-         cannot ride the const char * helper, so call it directly (#3868) */
+      /* #message is #to_s unless the class overrides #message itself: an
+         override answering something other than a String cannot ride the
+         const char * helper, so call it directly (#3868) */
       if (own < 0 && sp_streq(name, "message")) {
-        int mi8 = comp_method_in_chain(c, xcm, "to_s", NULL);
+        int mi8 = comp_method_in_chain(c, xcm, "message", NULL);
+        if (mi8 < 0) mi8 = comp_method_in_chain(c, xcm, "to_s", NULL);
         if (mi8 >= 0 && (TyKind)c->scopes[mi8].ret != TY_STRING &&
             (TyKind)c->scopes[mi8].ret != TY_UNKNOWN)
           own = mi8;
@@ -438,8 +440,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     /* `e.cause&.m`: the nil test is taken here, and the re-entry is past
        it, as the safe-navigation guard's own second pass is; that guard
        narrowed the boxed receiver back to the exception it had been */
-    const char *sop = nt_str(c->nt, id, "call_operator");
-    int sn = sop && sp_streq(sop, "&.");
+    int sn = nt_safe_nav(c->nt, id);
     int sv_sn = g_sn_skip;
     TyKind at = repr_of(c, id).as_ty;
     /* an Integer / Float answer is the `&.`'s oint, nil where it stops */
@@ -449,11 +450,11 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       buf_printf(b, "_t%d.tag == SP_TAG_NIL ? %s : ", tv, so ? oint_nil(at) : nv ? nv : default_value_from_compiler(c, at));
       g_sn_skip = id;
       /* past the test the call is a plain one on the boxed exception */
-      nt_node_set_str((NodeTable *)c->nt, id, "call_operator", ".");
+      nt_set_safe_nav((NodeTable *)c->nt, id, 0);
     }
     if (so) emit_oint_expr(c, id, at, b);
     else emit_expr(c, id, b);
-    if (sn) nt_node_set_str((NodeTable *)c->nt, id, "call_operator", "&.");
+    if (sn) nt_set_safe_nav((NodeTable *)c->nt, id, 1);
     g_sn_skip = sv_sn;
     exc_um_skip = sv_skip;
     view_pop(c, vw);

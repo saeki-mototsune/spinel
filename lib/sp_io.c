@@ -29,6 +29,7 @@
 #include <limits.h>  /* INT_MAX for the socket int arguments */
 #include <fcntl.h>   /* fcntl flags for #close_on_exec?, #fcntl */
 #include <poll.h>    /* POLLIN for the socket read park */
+#include <time.h>
 
 /* Per-call "do not block" for send(2). Linux honours it; Darwin and the BSDs
    accept the flag and sleep anyway once the send buffer is full, which is why
@@ -70,6 +71,64 @@ extern SP_NORETURN void sp_raise_cls(const char *cls, const char *msg);
 extern const char *sp_errno_class_name(int e);   /* lib/sp_exc.c: the Errno:: class for a C errno */
 extern const char *sp_sprintf(const char *fmt, ...);
 
+typedef struct sp_io_timeout {
+  sp_RbVal value;
+  double seconds;
+} sp_io_timeout;
+
+static void sp_io_timeout_scan(void *p) {
+  sp_mark_rbval(((sp_io_timeout *)p)->value);
+}
+
+static void sp_io_mark_static_timeouts(void) {
+  sp_gc_mark(SP_ATOMIC_LOAD(&sp_io_stdout()->timeout, __ATOMIC_ACQUIRE));
+  sp_gc_mark(SP_ATOMIC_LOAD(&sp_io_stderr()->timeout, __ATOMIC_ACQUIRE));
+  sp_gc_mark(SP_ATOMIC_LOAD(&sp_io_stdin()->timeout, __ATOMIC_ACQUIRE));
+}
+
+sp_RbVal sp_File_timeout(sp_File *f) {
+  if (f && f->mode && (strcmp(f->mode, "stat") == 0 || strcmp(f->mode, "lstat") == 0))
+    sp_raise_cls("NoMethodError", "undefined method 'timeout' for an instance of File::Stat");
+  sp_io_timeout *timeout = f ? SP_ATOMIC_LOAD(&f->timeout, __ATOMIC_ACQUIRE) : NULL;
+  return timeout ? timeout->value : sp_box_nil();
+}
+
+double sp_io_timeout_seconds(sp_File *f) {
+  sp_io_timeout *timeout = f ? SP_ATOMIC_LOAD(&f->timeout, __ATOMIC_ACQUIRE) : NULL;
+  if (!timeout) return -1.0;
+  if (timeout->value.tag == SP_TAG_BOOL)
+    sp_raise_cls("TypeError", "can't convert FalseClass into time interval");
+  return timeout->seconds;
+}
+
+sp_File *sp_io_set_timeout(sp_File *f, sp_RbVal value, double seconds) {
+  SP_GC_ROOT(f); SP_GC_ROOT_RBVAL(value);
+  if (!f) sp_raise_cls("IOError", "uninitialized stream");
+  sp_io_timeout *timeout = NULL;
+  SP_GC_ROOT(timeout);
+  if (value.tag != SP_TAG_NIL) {
+    timeout = (sp_io_timeout *)sp_gc_alloc(sizeof(*timeout), NULL, sp_io_timeout_scan);
+    timeout->value = value;
+    timeout->seconds = seconds;
+  }
+  sp_gc_wb(f);
+  if (((const unsigned char *)f)[-1] == 0xff)
+    SP_ATOMIC_STORE(&sp_gc_mark_io_timeouts_hook, sp_io_mark_static_timeouts, __ATOMIC_RELEASE);
+  SP_ATOMIC_STORE(&f->timeout, timeout, __ATOMIC_RELEASE);
+  return f;
+}
+
+static double sp_io_monotonic(void) {
+  struct timespec ts;
+  clock_gettime(CLOCK_MONOTONIC, &ts);
+  return (double)ts.tv_sec + (double)ts.tv_nsec / 1e9;
+}
+
+static double sp_io_deadline(sp_File *f) {
+  double seconds = sp_io_timeout_seconds(f);
+  return seconds < 0.0 ? -1.0 : sp_io_monotonic() + seconds;
+}
+
 /* The finalizer honors autoclose: an IO whose fd the program disowned
    (io.autoclose = false after wrapping the fd itself) flushes and abandons
    the FILE rather than closing the caller's descriptor -- the FILE structure
@@ -81,7 +140,7 @@ static void sp_File_fin(void *p) {
   if (f->no_autoclose && !f->fno_plus1) { fflush(f->fp); f->fp = NULL; return; }
   fclose(f->fp); f->fp = NULL;
 }
-static void sp_File_scan(void *p) { sp_File *f = (sp_File *)p; if (f->path) sp_mark_string(f->path); if (f->mode) sp_mark_string(f->mode); }
+static void sp_File_scan(void *p) { sp_File *f = (sp_File *)p; if (f->path) sp_mark_string(f->path); if (f->mode) sp_mark_string(f->mode); sp_io_timeout *timeout = SP_ATOMIC_LOAD(&f->timeout, __ATOMIC_ACQUIRE); if (timeout) sp_gc_mark(timeout); }
 
 /* The two-argument form is the permission form with CRuby's default bits:
    the same mode scan (which refuses "rx"), O_CLOEXEC, and the errno-named
@@ -241,6 +300,14 @@ static int sp_io_unuse(sp_File *f) {
   return r;
 }
 
+int sp_io_readiness_fd(sp_File *f, int *buffered) {
+  FILE *fp = sp_io_use(f);
+  int fd = fileno(fp);
+  if (buffered) *buffered = sp_io_stdio_buffered(fp) > 0;
+  sp_io_unuse(f);
+  return fd;
+}
+
 /* Can this handle's I/O block indefinitely? Asked once per handle, from an
    fstat on first use: a FIFO, a socket and a character device can; a regular
    file is always ready. A handle closed before it was ever asked answers yes,
@@ -259,6 +326,42 @@ static int sp_io_parkable(sp_File *f) {
     SP_ATOMIC_STORE(&f->park, k, __ATOMIC_RELAXED);
   }
   return k == 2;
+}
+
+static void sp_io_wait_deadline(sp_File *f, short events, double deadline) {
+  SP_GC_ROOT(f);
+  int fd = fileno(sp_io_use(f));
+  sp_io_unuse(f);
+  for (;;) {
+    struct pollfd p = { .fd = fd, .events = events, .revents = 0 };
+    int ready = SP_SIG_BLOCKING(poll(&p, 1, 0));
+    if (SP_ATOMIC_LOAD(&f->closed, __ATOMIC_RELAXED))
+      sp_raise_cls("IOError", "stream closed in another thread");
+    if (ready > 0) return;
+    if (ready < 0 && errno != EINTR && errno != EAGAIN)
+      sp_file_raise_errno("poll", "");
+    double remaining = deadline < 0.0 ? -1.0 : deadline - sp_io_monotonic();
+    if (deadline >= 0.0 && remaining <= 0.0)
+      sp_raise_cls("IO::TimeoutError", "Blocking operation timed out!");
+#ifdef SP_THREADS
+    extern int sp_sched_wait_io_timeout_unless(int, short, double, const unsigned char *);
+    ready = sp_sched_wait_io_timeout_unless(fd, events, remaining, &f->closed);
+    if (SP_ATOMIC_LOAD(&f->closed, __ATOMIC_RELAXED))
+      sp_raise_cls("IOError", "stream closed in another thread");
+    if (!ready && deadline >= 0.0)
+      sp_raise_cls("IO::TimeoutError", "Blocking operation timed out!");
+#else
+    extern void sp_Thread_pass(void);
+    p.revents = 0;
+    (void)SP_SIG_BLOCKING(poll(&p, 1, 1));
+    sp_Thread_pass();
+#endif
+  }
+}
+
+static void sp_io_write_wait(sp_File *f, double deadline) {
+  if (deadline < 0.0) sp_io_wait_writable(f);
+  else sp_io_wait_deadline(f, POLLOUT, deadline);
 }
 
 /* Park until the descriptor can take bytes. A write into a full pipe or socket
@@ -355,6 +458,7 @@ void sp_io_wait_readable(sp_File *f) {SP_GC_ROOT(f);
    writes. The stdio stream is never written through, so there is nothing to
    flush and no read/write switching hazard on the shared FILE*. */
 static sp_int sp_sock_write(sp_File *f, const char *s, size_t n) {
+  double deadline = n ? sp_io_deadline(f) : -1.0;
   /* the descriptor under a use (sp_io_use), let go only across the parks */
   int fd = fileno(sp_io_use(f));
   size_t off = 0;
@@ -383,7 +487,7 @@ static sp_int sp_sock_write(sp_File *f, const char *s, size_t n) {
     size_t want = n - off;
     if (!nb) {   /* frees the worker while the buffer is full */
       sp_io_unuse(f);
-      sp_io_wait_writable(f);
+      sp_io_write_wait(f, deadline);
       fd = fileno(sp_io_use(f));
     }
     if (f->is_sock) {
@@ -420,7 +524,7 @@ static sp_int sp_sock_write(sp_File *f, const char *s, size_t n) {
       if (errno == EINTR) continue;
       if ((nb || f->is_sock) && (errno == EAGAIN || errno == EWOULDBLOCK)) {
         sp_io_unuse(f);
-        sp_io_wait_writable(f);
+        sp_io_write_wait(f, deadline);
         fd = fileno(sp_io_use(f));
         continue;
       }
@@ -430,6 +534,7 @@ static sp_int sp_sock_write(sp_File *f, const char *s, size_t n) {
       sp_file_raise_errno("write", f->is_sock ? "socket" : "pipe");
     }
     off += (size_t)put;
+    if (put > 0 && off < n) deadline = sp_io_deadline(f);
   }
   sp_io_unuse(f);
   return (sp_int)n;
@@ -1223,16 +1328,20 @@ sp_int sp_sock_send(sp_File *f, const char *data, sp_int len, const char *host, 
 }
 static long sp_io_buffered(FILE *fp);
 /* #recv reads one datagram (or up to `len` stream bytes) as a String;
-   #recvfrom pairs it with the sender's address, CRuby's 4-element form. */
+   #recvfrom pairs it with the sender's address, CRuby's 4-element form.
+   The payload is BINARY in every shape, as CRuby answers it. */
 const char *sp_sock_recv(sp_File *f, sp_int len) {SP_GC_ROOT(f);
   extern int sp_net_udp_recv_from(int fd, char *buf, int cap, char *ipbuf, int ipcap, int *port_out);
   sp_sock_require(f, "recv");
-  if (len <= 0) return sp_str_from_bytes("", 0);
+  if (len < 0) sp_raise_cls("ArgumentError", "negative string size (or size too big)");
   /* bytes a read on the stream already pulled into stdio's buffer are the
      peer's next ones: served first, as readpartial does, or recv stepped
      over them (#7195) */
   long pend = sp_io_buffered(sp_io_use(f));
   sp_io_unuse(f);
+  /* a zero-length read of a stream with bytes waiting answers nil, as
+     recv(2) of none answers 0 below */
+  if (pend > 0 && len == 0) return NULL;
   if (pend > 0) {
     size_t want = (size_t)len < (size_t)pend ? (size_t)len : (size_t)pend;
     char *r = sp_str_alloc(want);
@@ -1240,14 +1349,17 @@ const char *sp_sock_recv(sp_File *f, sp_int len) {SP_GC_ROOT(f);
     sp_io_unuse(f);
     r[got] = 0;
     sp_str_set_len(r, got);
+    sp_str_mark_binary(r);
     return r;
   }
   /* park until the peer writes, as readpartial does: a close from another
      thread then wakes this one with CRuby's IOError, where a recv(2) already
      blocked in the kernel answered EBADF, or read a descriptor that was by
      then someone else's (#7555) */
+  /* (a zero-length read still waits for the peer, as CRuby's does: a
+     datagram it then takes is discarded, and a stream answers nil) */
   sp_io_wait_readable(f);
-  char *buf = (char *)malloc((size_t)len);
+  char *buf = (char *)malloc(len > 0 ? (size_t)len : 1);
   if (!buf) sp_raise_cls("NoMemoryError", "recv");
   FILE *fp = sp_io_try_use(f);
   if (!fp) { free(buf); sp_raise_cls("IOError", "stream closed in another thread"); }
@@ -1262,8 +1374,9 @@ const char *sp_sock_recv(sp_File *f, sp_int len) {SP_GC_ROOT(f);
   errno = e;
   if (n < 0) { free(buf); sp_file_raise_errno("recv", ""); }
   if (eof) { free(buf); return NULL; }
-  const char *s = sp_str_from_bytes(buf, (size_t)n);
+  char *s = (char *)sp_str_from_bytes(buf, (size_t)n);
   free(buf);
+  sp_str_mark_binary(s);
   return s;
 }
 /* Fills the caller's address slots; returns the payload. */
@@ -1272,22 +1385,19 @@ const char *sp_sock_recvfrom(sp_File *f, sp_int len, const char **ip_out, sp_int
   sp_sock_require(f, "recvfrom");
   char ipbuf[64];
   int port = 0;
-  if (len <= 0) {
-    const char *s = sp_str_from_bytes("", 0); SP_GC_ROOT_STR(s);   /* across the address's copy */
-    *ip_out = sp_str_from_bytes("", 0);
-    *port_out = 0;
-    return s;
-  }
+  if (len < 0) sp_raise_cls("ArgumentError", "negative string size (or size too big)");
+  /* (a zero-length read waits and takes a datagram too, as sp_sock_recv) */
   sp_io_wait_readable(f);   /* as sp_sock_recv (#7555) */
-  char *buf = (char *)malloc((size_t)len);
+  char *buf = (char *)malloc(len > 0 ? (size_t)len : 1);
   if (!buf) sp_raise_cls("NoMemoryError", "recvfrom");
   FILE *fp = sp_io_try_use(f);
   if (!fp) { free(buf); sp_raise_cls("IOError", "stream closed in another thread"); }
   int n = sp_net_udp_recv_from(fileno(fp), buf, (int)len, ipbuf, (int)sizeof ipbuf, &port);
   { int e = errno; sp_io_unuse(f); errno = e; }
   if (n < 0) { free(buf); sp_file_raise_errno("recvfrom", ""); }
-  const char *s = sp_str_from_bytes(buf, (size_t)n); SP_GC_ROOT_STR(s);   /* across the address's copy */
+  char *s = (char *)sp_str_from_bytes(buf, (size_t)n); SP_GC_ROOT_STR(s);   /* across the address's copy */
   free(buf);
+  sp_str_mark_binary(s);
   *ip_out = sp_str_from_bytes(ipbuf, strlen(ipbuf));
   *port_out = (sp_int)port;
   return s;
@@ -1366,6 +1476,70 @@ static int sp_io_nb_begin(sp_File *f) {
 static void sp_io_nb_end(sp_File *f, int saved) {
   if (saved >= 0 && !(saved & O_NONBLOCK)) fcntl(fileno(f->fp), F_SETFL, saved);
 }
+
+static ssize_t sp_io_read_chunk_timed(sp_File *f, char *buf, size_t count) {
+  SP_GC_ROOT(f);
+  double deadline = -2.0;
+  for (;;) {
+    FILE *fp = sp_io_use(f);
+    size_t buffered = sp_io_stdio_buffered(fp);
+    if (buffered) {
+      size_t want = buffered < count ? buffered : count;
+      size_t got = SP_SIG_BLOCKING(fread(buf, 1, want, fp));
+      sp_io_unuse(f);
+      return (ssize_t)got;
+    }
+    sp_io_unuse(f);
+    if (!sp_io_parkable(f)) {
+      (void)sp_io_timeout_seconds(f);
+      fp = sp_io_use(f);
+      size_t got = SP_SIG_BLOCKING(fread(buf, 1, count, fp));
+      sp_io_unuse(f);
+      return (ssize_t)got;
+    }
+    if (deadline == -2.0) deadline = sp_io_deadline(f);
+    sp_io_wait_deadline(f, POLLIN, deadline);
+    fp = sp_io_use(f);
+    int saved = sp_io_nb_begin(f);
+    ssize_t got = SP_SIG_BLOCKING(read(fileno(fp), buf, count));
+    int error = errno;
+    sp_io_nb_end(f, saved);
+    sp_io_unuse(f);
+    if (got >= 0) return got;
+    if (error == EINTR || error == EAGAIN || error == EWOULDBLOCK) continue;
+    errno = error;
+    sp_file_raise_errno("read", "");
+  }
+}
+
+const char *sp_File_read_timed(sp_File *f, sp_int n) {
+  SP_GC_ROOT(f);
+  SP_IO_OPEN(f);
+  if (n == 0) return sp_str_empty_binary();
+  size_t cap = n < 0 ? 8192 : (size_t)n;
+  size_t len = 0;
+  char *result = sp_str_alloc(cap);
+  SP_GC_ROOT_STR(result);
+  for (;;) {
+    if (len == cap) {
+      if (n >= 0) break;
+      if (cap > SIZE_MAX / 2) sp_oom_die();
+      char *grown = sp_str_alloc(cap * 2);
+      memcpy(grown, result, len);
+      result = grown;
+      cap *= 2;
+    }
+    ssize_t got = sp_io_read_chunk_timed(f, result + len, cap - len);
+    if (got == 0) break;
+    len += (size_t)got;
+  }
+  if (n > 0 && len == 0) return NULL;
+  result[len] = 0;
+  sp_str_set_len(result, len);
+  if (n >= 0 || sp_File_reads_binary(f)) sp_str_mark_binary(result);
+  return result;
+}
+
 static void sp_sock_nb_prepare(sp_File *f, const char *m) {SP_GC_ROOT(f);SP_GC_ROOT_STR(m);
   if (!f || !f->is_sock)
     sp_raise_cls("NoMethodError",
@@ -1942,6 +2116,7 @@ sp_File *sp_File_dup(sp_File *f, int keep_frozen) {SP_GC_ROOT(f);
   g->rev_lookup = f->rev_lookup;
   g->is_file = f->is_file;
   g->frozen = keep_frozen ? f->frozen : 0;
+  g->timeout = SP_ATOMIC_LOAD(&f->timeout, __ATOMIC_ACQUIRE);
   if (f->sync_on || f->fp == stderr) sp_File_set_sync(g, 1);
   return g;
 }

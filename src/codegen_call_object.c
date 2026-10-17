@@ -393,7 +393,12 @@ int emit_call_identity_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
         !comp_reader_in_chain(c, ty_object_class(rt), "hash", NULL) &&
         /* structs keep their dedicated value-based hash arm below */
         !c->classes[ty_object_class(rt)].is_struct))) {
+    /* The key is never nil, but a user #hash that may answer nil types every
+       boxed receiver's #hash as a nullable Integer, and the consumer of such
+       a call reads an oint: lift the key into one there. */
+    if (node_is_oint(c, id)) buf_puts(b, "sp_oint_of(");
     buf_puts(b, "sp_rbval_hash_key("); emit_boxed(c, recv, b); buf_puts(b, ")");
+    if (node_is_oint(c, id)) buf_puts(b, ")");
     return 1;
   }
 
@@ -1176,6 +1181,8 @@ static void emit_obj_struct_copy(Compiler *c, int cid, int to, int td, Buf *b) {
         !is_descendant(c, k, cid) || comp_class_is_module(c, kc)) continue;
     if (!any) buf_printf(b, "switch (_t%d->cls_id) { ", to);
     any = 1;
+    /* in a proc body, written ahead of the subclass's pool (emit_pool_fwd) */
+    emit_pool_fwd(c, k);
     buf_printf(b, "case %d: { sp_%s *_n = SP_POOL_NEW(%s, %s%s%s); *_n = *(sp_%s *)_t%d; _t%d = (sp_%s *)_n; break; } ",
                k, kc->c_name, kc->c_name, class_needs_scan(kc) ? "sp_" : "", class_needs_scan(kc) ? kc->c_name : "NULL",
                class_needs_scan(kc) ? "__gc_scan" : "", kc->c_name, to, td, cn);
@@ -2000,8 +2007,7 @@ static int sn_args_run_late(Compiler *c, int id, int recv) {
 int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv) {
   /* Safe navigation &. : nil receiver -> return nil/0; non-nil -> emit conditional */
   {
-    const char *safe_op = nt_str(nt, id, "call_operator");
-    if (recv >= 0 && safe_op && sp_streq(safe_op, "&.")) {
+    if (recv >= 0 && nt_safe_nav(nt, id)) {
       /* --share-strings: a safe-navigation route over an attribute
          assignment's handle (emit_strbuf_assign_safe_nav) runs once, as
          that handle or NULL; its value is the handle, or that handle's

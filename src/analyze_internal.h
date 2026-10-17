@@ -247,6 +247,8 @@ int struct_aset_may_reach(Compiler *c, int id);
 int an_arg_is_shared_handle(Compiler *c, int node);
 /* Last statement of a scope's body, or -1. */
 int scope_body_last(Compiler *c, int mi);
+/* ...or the begin a def's own rescue makes its body (analyze_util.c). */
+int scope_body_value(Compiler *c, int mi);
 /* The expressions whose value method scope mi answers (its body's and each
    `return`'s; see analyze_pass.c). Answers the count, or -1. */
 int method_value_leaves(Compiler *c, int mi, int *out, int cap);
@@ -473,8 +475,6 @@ int infer_numeric_call(Compiler *c, int id, TyKind rt, TyKind *out);
 /* The array a map-shaped call answers from its block's tail (analyze_infer_recv.c). */
 TyKind infer_sum_block_ty(Compiler *c, int block);
 TyKind infer_map_block_ty(Compiler *c, int id, int block);
-/* A call written `recv&.name` (analyze_infer_recv.c). */
-int call_is_safe_nav(const NodeTable *nt, int id);
 void step_kw_positional(Compiler *c, NodeTable *nt, int id, int args, int to_v, int by_v, int by_first);
 /* A range endpoint that is the infinite Float constant (analyze_infer.c). */
 int infer_end_is_float_inf(Compiler *c, int right);

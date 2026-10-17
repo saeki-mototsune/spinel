@@ -718,7 +718,9 @@ int subtree_has_side_effect(Compiler *c, int id) {
   if (sp_streq(ty, "SuperNode") || sp_streq(ty, "ForwardingSuperNode") ||
       sp_streq(ty, "YieldNode") || strstr(ty, "WriteNode"))
     return 1;
-  if (sp_streq(ty, "CallNode") && !call_is_scalar_op(c, id)) return 1;
+  /* a bare Array.new / Hash.new is as empty and as unobservable as the
+     literal `[]` / `{}`, which is no effect */
+  if (sp_streq(ty, "CallNode") && !call_is_scalar_op(c, id) && !node_is_empty_container(nt, id)) return 1;
   int nr = nt_num_refs(nt, id);
   for (int i = 0; i < nr; i++)
     if (subtree_has_side_effect(c, nt_ref_at(nt, id, i))) return 1;
@@ -974,7 +976,7 @@ static int yield_builtin_method_site_type(const Compiler *c, int id, TyKind *out
       *out = rr;
       return 1;
     } }
-  if (ty_recv_builtin_result(op, ac, ac == 1 && av ? comp_ntype(c, av[0]) : TY_UNKNOWN, rt, out)) return 1;
+  if (ty_recv_builtin_result(op, ac, ac == 1 && av ? comp_ntype(c, av[0]) : TY_UNKNOWN, rt, g_promote_mode, out)) return 1;
   /* a site the table does not answer, beside a reopen on the chain: the
      answer the analysis recorded for this site's kind */
   return an_yield_site_builtin_answer((Compiler *)c, id, rt, out);
@@ -1357,9 +1359,9 @@ int g_fiber_counter = 0;
 char **g_re_src; int *g_re_flg; int g_re_count, g_re_cap;
 int re_engine_flags(int pf) {
   int f = 0;
-  if (pf & 4) f |= 1;
-  if (pf & 8) f |= 8;
-  if (pf & 16) f |= 6;
+  if (pf & NT_RE_IGNORE_CASE) f |= 1;
+  if (pf & NT_RE_EXTENDED) f |= 8;
+  if (pf & NT_RE_MULTI_LINE) f |= 6;
   return f;
 }
 /* The RegularExpressionNode behind `nid`, or -1 when the pattern is only
@@ -1521,7 +1523,7 @@ int re_lit_index(Compiler *c, int nid) {
   if (nid < 0) return -1;
   const char *src = nt_str(c->nt, nid, "unescaped");
   if (!src) return -1;
-  int flg = re_engine_flags((int)nt_int(c->nt, nid, "flags", 0));
+  int flg = re_engine_flags(nt_regexp_opts(c->nt, nid));
   for (int i = 0; i < g_re_count; i++)
     if (g_re_flg[i] == flg && sp_streq(g_re_src[i], src)) return i;
   /* A literal is two constants, the pattern and its flags, so whether the
@@ -1558,7 +1560,7 @@ int emit_regex_pat_to_buf(Compiler *c, int nid, Buf *b) {
   if (ri >= 0) { buf_printf(b, "sp_re_pat_%d", ri); return 1; }
   const char *ty = nt_type(c->nt, nid);
   if (ty && sp_streq(ty, "InterpolatedRegularExpressionNode")) {
-    int flg = re_engine_flags((int)nt_int(c->nt, nid, "flags", 0));
+    int flg = re_engine_flags(nt_regexp_opts(c->nt, nid));
     int ts = ++g_tmp, tp = ++g_tmp;
     /* Emit the interpolated pattern into a local buffer: an embedded call that
        roots its own args pushes those decls to g_pre, which must land as whole
@@ -3569,7 +3571,7 @@ static int strbuf_bang_self_local_at(const Compiler *c, int v) {
   /* --share-strings: itself, to_s or to_str of a held chain answers its
      String (strbuf_held_chain; nil.to_s's "" aside, emit_held_handle) */
   if (repr_share_rule(c) && is_receiver_conversion(nt_str(nt, v, "name")) && call_plain_argc((Compiler *)c, v) == 0 &&
-      nt_ref(nt, v, "block") < 0 && !call_is_safe_nav(nt, v) && nt_kind(nt, unwrap_parens((Compiler *)c, r)) == NK_CallNode) {
+      nt_ref(nt, v, "block") < 0 && !nt_safe_nav(nt, v) && nt_kind(nt, unwrap_parens((Compiler *)c, r)) == NK_CallNode) {
     int ct[CPT_MAX];
     return cplan_targets((Compiler *)c, v, ct, CPT_MAX) == 0 && strbuf_held_chain(c, r);
   }
@@ -4626,11 +4628,13 @@ void emit_coerce(Compiler *c, int node, TyKind slot, int how, const char *what, 
   case CF_CHECKED_UNBOX: {
     /* a container, an object or a Bignum through the checked unbox, which
        converts or raises for a value of another class rather than reading
-       its memory, and a Class from its boxed form. A struct-valued or other
-       handle slot has no checked unbox, and is refused below. */
+       its memory, a Class from its boxed form, and a Time through its own
+       (sp_poly_as_time_chk, #9381). Another struct-valued or handle slot
+       has no checked unbox, and is refused below. */
     Buf vb; memset(&vb, 0, sizeof vb);
     emit_expr(c, node, &vb);
-    emit_unbox_nilable_text(c, slot, vb.p ? vb.p : "sp_box_nil()", b);
+    if (slot == TY_TIME) buf_printf(b, "sp_poly_as_time_chk(%s)", vb.p ? vb.p : "sp_box_nil()");
+    else emit_unbox_nilable_text(c, slot, vb.p ? vb.p : "sp_box_nil()", b);
     free(vb.p);
     RCC(CF_CHECKED_UNBOX);
     return;
@@ -4863,9 +4867,9 @@ static int plain_expr(Compiler *c, int n, int depth) {
     int recv = nt_ref(nt, n, "receiver");
     /* An Integer sum either returns a number or raises, even at INTPTR_MIN. */
     if (nm && recv >= 0 && is_sum_name(nm) && ty_is_array(repr_of(c, recv).as_ty) &&
-        !call_is_safe_nav(nt, n) && cplan_user(c, n)->dispatch == CP_NONE) return 1;
+        !nt_safe_nav(nt, n) && cplan_user(c, n)->dispatch == CP_NONE) return 1;
     if (!nm || recv < 0 || nt_ref(nt, n, "block") >= 0) return 0;
-    if (call_is_safe_nav(nt, n)) return 0;   /* nil&.+(1) is nil */
+    if (nt_safe_nav(nt, n)) return 0;   /* nil&.+(1) is nil */
     int args = nt_ref(nt, n, "arguments"), argc = 0;
     const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
     /* a collection's or String's size: a count, never nil (unless the program
@@ -7542,8 +7546,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
     /* `r&.m`: nil when r is -- except on the safe-navigation emitter's
        re-entry for the same node (g_sn_skip), which emits the plain call on
        the guarded receiver and wraps it itself */
-    const char *sop = nt_str(nt, node, "call_operator");
-    if (sop && sp_streq(sop, "&.") && g_sn_skip != node) {
+    if (nt_safe_nav(nt, node) && g_sn_skip != node) {
       /* nil when the receiver is -- only where a guard stands (a receiver
          that cannot be nil, `3&.fdiv(2)`, has neither guard nor nil) */
       if (sn_guard_pending(c, node)) return 1;
@@ -7784,7 +7787,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
       }
       if (sgc >= 0 && an2 == 0 && comp_method_in_chain(c, sgc, nm, NULL) < 0) {
         ClassInfo *sgi = &c->classes[sgc];
-        const char *rn = comp_resolve_alias(c, sgc, nm);
+        const char *rn = comp_resolve_cm_alias_at(c, sgc, nm, NULL);
         if (!rn) rn = nm;
         if (comp_is_sg_reader(sgi, rn) && comp_is_sg_civ(sgi, rn)) {
           char ivb[300]; snprintf(ivb, sizeof ivb, "@%s", rn);

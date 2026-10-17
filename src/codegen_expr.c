@@ -1034,6 +1034,7 @@ static void emit_ternary_arm(Compiler *c, int nd, TyKind res, Buf *b) {
    arm is its oint form, a nil arm its nil */
 static void emit_ternary_arm_o(Compiler *c, int nd, TyKind res, int res_o, Buf *b) {
   const NodeTable *nt = c->nt;
+  if (node_is_empty_container(nt, nd)) nd = unwrap_parens(c, nd);   /* `([])` is `[]` */
   const char *bty = nt_type(nt, nd);
   if (res_o && oint_kind(res)) { emit_oint_expr(c, nd, res, b); return; }
   if (res == TY_POLY && repr_of(c, nd).kind != RK_BOXED) { emit_boxed(c, nd, b); return; }
@@ -1596,14 +1597,11 @@ void emit_slot_orw_value_o(Compiler *c, TyKind t, int elems_handle, const char *
   free(vpre.p); free(vval.p);
 }
 
-/* NoMethodError for a non-public half of an `||=` / `&&=` pair, as an
-   ordinary call's visibility refusal raises it: the receiver (recv, of type
-   rt) rides it as NoMethodError#receiver. */
-static void emit_orw_vis_raise(Compiler *c, int vis, const char *nm, int cid, TyKind rt,
-                               const char *recv, Buf *b) {
-  char head[400];
-  snprintf(head, sizeof head, "%s method '%s' called for an instance of ",
-           vis == SP_VIS_PRIVATE ? "private" : "protected", nm);
+/* NoMethodError for a half of an `||=` / `&&=` pair, as an ordinary call
+   raises it -- head is the message up to the class name: the receiver
+   (recv, of type rt) rides it as NoMethodError#receiver. */
+static void emit_orw_raise(Compiler *c, const char *head, int cid, TyKind rt,
+                           const char *recv, Buf *b) {
   buf_puts(b, "(sp_exc_stage_recv("); emit_boxed_text(c, rt, recv, b);
   buf_puts(b, "), sp_raise_cls(\"NoMethodError\", ");
   if (anon_class_text(c, cid, head, b)) buf_puts(b, "))");
@@ -1611,6 +1609,15 @@ static void emit_orw_vis_raise(Compiler *c, int vis, const char *nm, int cid, Ty
     const char *rn = class_ruby_name(c, cid) ? class_ruby_name(c, cid) : c->classes[cid].name;
     buf_printf(b, "(&(\"\\xff\" \"%s%s\")[1])))", head, rn);
   }
+}
+
+/* ...for a non-public half */
+static void emit_orw_vis_raise(Compiler *c, int vis, const char *nm, int cid, TyKind rt,
+                               const char *recv, Buf *b) {
+  char head[400];
+  snprintf(head, sizeof head, "%s method '%s' called for an instance of ",
+           vis == SP_VIS_PRIVATE ? "private" : "protected", nm);
+  emit_orw_raise(c, head, cid, rt, recv, b);
 }
 
 int emit_call_or_write_via_methods(Compiler *c, int id, int is_or, Buf *b) {
@@ -1634,6 +1641,20 @@ int emit_call_or_write_via_methods(Compiler *c, int id, int is_or, Buf *b) {
   int self_recv = nt_kind(nt, recv) == NK_SelfNode;
   int rvis = self_recv ? SP_VIS_PUBLIC : method_vis_for_caller(c, id, cid, attr);
   int wvis = self_recv ? SP_VIS_PUBLIC : method_vis_for_caller(c, id, cid, wn);
+  /* No reader at all -- no method, no attribute, no method_missing to
+     answer it -- is the reader call's NoMethodError, raised before the
+     value runs. The field-store way below has no ivar to store into. */
+  if (rk == SP_MEMBER_NONE && comp_method_in_chain(c, cid, "method_missing", NULL) < 0) {
+    TyKind want = repr_of(c, id).as_ty;
+    if (want == TY_UNKNOWN || want == TY_VOID) want = TY_POLY;
+    int trv = ++g_tmp; char rv[32]; snprintf(rv, sizeof rv, "_t%d", trv);
+    char head[400]; snprintf(head, sizeof head, "undefined method '%s' for an instance of ", attr);
+    buf_puts(b, "({ "); emit_ctype(c, rt, b); buf_printf(b, " %s = ", rv); emit_expr(c, recv, b); buf_puts(b, "; ");
+    emit_orw_raise(c, head, cid, rt, rv, b);
+    buf_printf(b, "; %s; })", oint_kind(want) && node_is_oint(c, id) ? oint_nil(want)
+                                                                    : default_value_from_compiler(c, want));
+    return 1;
+  }
   if (rk != SP_MEMBER_METHOD && wk != SP_MEMBER_METHOD &&
       rvis == SP_VIS_PUBLIC && wvis == SP_VIS_PUBLIC) return 0;
   /* a method half takes the class that defines it, an ancestor of the
@@ -2070,6 +2091,26 @@ static void emit_if_arm_value(Compiler *c, int last, TyKind res, int res_o, int 
   else buf_puts(g_pre, le.p ? le.p : default_value_from_compiler(c, res));
   buf_puts(g_pre, ";\n");
   free(le.p);
+}
+
+/* The last statement of an arm of a multi-statement if used as a value (emit_if_expr):
+   assigned to the result temp `tr`. An empty `[]` / `{}` / bare `Array.new` /
+   `Hash.new` caches TY_UNKNOWN for a reason that is not "has no value": it has
+   no ELEMENT type until something supplies one. Running it for effect leaves
+   the slot at its default, which is how `if c then [] end` answered nil where
+   CRuby answers []. emit_ternary_arm already builds it against a result type.
+   A tail with no value is run for its effect alone. */
+static void emit_if_arm_tail(Compiler *c, int last, TyKind res, int res_o, int tr) {
+  TyKind lt = repr_of(c, last).as_ty;
+  if (lt == TY_UNKNOWN && node_is_empty_container(c->nt, last)) {
+    Buf le; memset(&le, 0, sizeof le);
+    emit_ternary_arm(c, last, res, &le);
+    emit_indent(g_pre, g_indent + 2);
+    buf_printf(g_pre, "_t%d = %s;\n", tr, le.p ? le.p : default_value_from_compiler(c, res));
+    free(le.p);
+  }
+  else if (lt == TY_NIL || lt == TY_UNKNOWN || lt == TY_VOID) emit_stmt(c, last, g_pre, g_indent + 2);
+  else emit_if_arm_value(c, last, res, res_o, tr);
 }
 
 /* The engine's String constants (RUBY_VERSION, ...) are frozen in CRuby, and
@@ -3964,7 +4005,8 @@ static int emit_array_hash_literal_expr(Compiler *c, int id, Buf *b, const NodeT
             int rn = nt_type(nt, inner) && sp_streq(nt_type(nt, inner), "RangeNode") ? inner : -1;
             int rlo = rn >= 0 ? nt_ref(nt, rn, "left") : -1;
             int rhi = rn >= 0 ? nt_ref(nt, rn, "right") : -1;
-            int rexcl = rn >= 0 ? (int)(nt_int(nt, rn, "flags", 0) & 4) : 0;
+            /* the runtime tests the argument for truth; it has always been given Prism's bit */
+            int rexcl = nt_range_excl(nt, rn) ? NT_RANGE_EXCLUDE_END : 0;
             if (rlo >= 0 && comp_ntype(c, rlo) == TY_STRING) {
               Buf lo_b; memset(&lo_b, 0, sizeof lo_b); emit_expr(c, rlo, &lo_b);
               Buf hi_b; memset(&hi_b, 0, sizeof hi_b); emit_expr(c, rhi, &hi_b);
@@ -4059,7 +4101,8 @@ else {
         if (ir.range == TY_INT || ir.range == TY_STRING) {
           int rn2 = nt_type(nt, inner) && sp_streq(nt_type(nt, inner), "RangeNode") ? inner : -1;
           int rlo2 = rn2 >= 0 ? nt_ref(nt, rn2, "left") : -1;
-          int rexcl2 = rn2 >= 0 ? (int)(nt_int(nt, rn2, "flags", 0) & 4) : 0;
+          /* the argument is Prism's bit, as above */
+          int rexcl2 = nt_range_excl(nt, rn2) ? NT_RANGE_EXCLUDE_END : 0;
           if (rlo2 >= 0 && comp_ntype(c, rlo2) == TY_STRING) {
             int rhi2 = nt_ref(nt, rn2, "right");
             Buf lo2; memset(&lo2, 0, sizeof lo2); emit_expr(c, rlo2, &lo2);
@@ -4310,10 +4353,8 @@ static int emit_if_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, const 
          the result's array kind as the unfolded pair gives it: emitted raw
          it was the default Integer array, stored into a poly array slot */
       int fempty = 0;
-      if (ln == 1 && ty_is_array(fres) && nt_kind(nt, lb[0]) == NK_ArrayNode) {
-        int fen = 0; nt_arr(nt, lb[0], "elements", &fen);
-        fempty = fen == 0;
-      }
+      if (ln == 1 && ty_is_array(fres) && node_is_empty_container(nt, lb[0]))
+        fempty = an_empty_container_kind(c, lb[0]) == 1;
       if (ln == 1) {
         if (fbox || fempty) emit_ternary_arm(c, lb[0], fres, b); else emit_expr(c, lb[0], b);
         return 1;
@@ -4435,31 +4476,7 @@ static int emit_if_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, const 
     free(cnd.p);
     /* Then branch: side-effect stmts, then assign last expr to temp. */
     for (int i = 0; i < tn - 1; i++) emit_stmt(c, tb[i], g_pre, g_indent + 2);
-    if (tn > 0) {
-      int last_then = tb[tn - 1];
-      TyKind lt = repr_of(c, last_then).as_ty;
-      /* An empty `[]` / `{}` caches TY_UNKNOWN for a reason that is not
-         "has no value": it has no ELEMENT type until something supplies
-         one. Running it for effect leaves the slot at its default, which
-         is how `if c then [] end` answered nil where CRuby answers [].
-         emit_ternary_arm already builds it against a result type. */
-      int elen = 0;
-      const char *ety = nt_type(nt, last_then);
-      int empty_lit = lt == TY_UNKNOWN && ety &&
-                      (sp_streq(ety, "ArrayNode") || sp_streq(ety, "HashNode")) &&
-                      (nt_arr(nt, last_then, "elements", &elen), elen == 0);
-      if (empty_lit) {
-        Buf le; memset(&le, 0, sizeof le);
-        emit_ternary_arm(c, last_then, res, &le);
-        emit_indent(g_pre, g_indent + 2);
-        buf_printf(g_pre, "_t%d = %s;\n", tr, le.p ? le.p : default_value_from_compiler(c, res));
-        free(le.p);
-      }
-      else if (lt == TY_NIL || lt == TY_UNKNOWN || lt == TY_VOID) {
-        emit_stmt(c, last_then, g_pre, g_indent + 2);
-      }
-      else emit_if_arm_value(c, last_then, res, res_o, tr);
-    }
+    if (tn > 0) emit_if_arm_tail(c, tb[tn - 1], res, res_o, tr);
     emit_indent(g_pre, g_indent);
     buf_puts(g_pre, "}\n");
     /* Else / elsif branch. */
@@ -4469,14 +4486,7 @@ static int emit_if_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, const 
         emit_indent(g_pre, g_indent);
         buf_puts(g_pre, "else {\n");
         for (int i = 0; i < en - 1; i++) emit_stmt(c, eb[i], g_pre, g_indent + 2);
-        if (en > 0) {
-          int last_else = eb[en - 1];
-          TyKind lt2 = repr_of(c, last_else).as_ty;
-          if (lt2 == TY_NIL || lt2 == TY_UNKNOWN || lt2 == TY_VOID) {
-            emit_stmt(c, last_else, g_pre, g_indent + 2);
-          }
-          else emit_if_arm_value(c, last_else, res, res_o, tr);
-        }
+        if (en > 0) emit_if_arm_tail(c, eb[en - 1], res, res_o, tr);
         emit_indent(g_pre, g_indent);
         buf_puts(g_pre, "}\n");
       }
@@ -4626,7 +4636,8 @@ static int emit_and_or_begin_expr(Compiler *c, int id, Buf *b, const NodeTable *
        not from its bytes. */
     int lt_hbox = repr_share_rule(c) && res == TY_POLY &&
                   (lt == TY_STRBUF ||
-                   (lt == TY_STRING && (face_str_bang_call(c, left) || strbuf_var_handle(c, left, NULL) ||
+                   (lt == TY_STRING && (face_str_bang_call(c, unwrap_parens(c, left)) ||
+                                        strbuf_var_handle(c, unwrap_parens(c, left), NULL) ||
                                         (repr_of(c, unwrap_parens(c, left)).poly_lift &&
                                          (repr_call_returns_handle(c, left) || logic_left_carries(c, left) ||
                                           share_plan_box_handle(c, unwrap_parens(c, left)))))));
@@ -5019,7 +5030,7 @@ static int emit_range_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, con
   if (!(sp_streq(ty, "RangeNode"))) return 0;
   int left = nt_ref(nt, id, "left");
   int right = nt_ref(nt, id, "right");
-  int excl = (int)(nt_int(nt, id, "flags", 0) & 4) ? 1 : 0;
+  int excl = nt_range_excl(nt, id);
   /* (:a..:e): a poly array of boxed symbols, walked by name succession
      (interning through the generated TU's own table) */
   if (left >= 0 && right >= 0 &&
@@ -5861,7 +5872,7 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
                              _ynt != TY_UNKNOWN
                                ? _ynt : g_yield_slot_ty,
                              b, 0, 1); }
-    else if (nt_str(nt, id, "call_operator") && sp_streq(nt_str(nt, id, "call_operator"), "&.")) {
+    else if (nt_safe_nav(nt, id)) {
       /* `blk&.call`: the nil parameter answers nil instead of raising (an
          Integer / Float answer is the node's oint, as `&.` always is) */
       TyKind at = repr_of(c, id).as_ty;

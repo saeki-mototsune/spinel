@@ -22,6 +22,9 @@
 #include "spinel_rt.h"
 
 #ifdef SP_CEXT
+sp_RbVal sp_cext_object_class(sp_RbVal object) {
+  return sp_box_class(sp_poly_class_val(object));
+}
 sp_RbVal sp_cext_plain_object_new(void) {
   return sp_box_obj(sp_Object_new(),SP_BUILTIN_OBJECT);
 }
@@ -479,6 +482,7 @@ const char *sp_poly_inspect(sp_RbVal v)
         case SP_BUILTIN_REGEX:     return sp_re_inspect_str(v.v.p);
         case SP_BUILTIN_MATCHDATA: return sp_MatchData_inspect((sp_MatchData *)v.v.p);
         case SP_BUILTIN_EXCEPTION: return sp_exc_inspect(v.v.p);
+        case SP_BUILTIN_IO:        return sp_File_inspect((sp_File *)v.v.p);
         case SP_BUILTIN_STR_INT_HASH:  return sp_StrIntHash_inspect((sp_StrIntHash *)v.v.p);
         case SP_BUILTIN_STR_STR_HASH:  return sp_StrStrHash_inspect((sp_StrStrHash *)v.v.p);
         case SP_BUILTIN_INT_STR_HASH:  return sp_IntStrHash_inspect((sp_IntStrHash *)v.v.p);
@@ -547,6 +551,15 @@ sp_StrStrHash *sp_StrPolyHash_to_s_values(sp_StrPolyHash *h)
     sp_StrStrHash_set(r, k, sp_poly_to_s(sp_StrPolyHash_get(h, k)));
   }
   return r;
+}
+
+/* The text sub/gsub put in for a match a Hash of any keys maps: the value
+   #[] reads for it (a default proc runs, and may store the key), as its
+   to_s, nil's "" included */
+const char *sp_PolyPolyHash_repl(sp_PolyPolyHash *h, const char *key)
+{
+  SP_GC_ROOT(h);
+  return sp_poly_to_s(sp_PolyPolyHash_get(h, sp_box_str(key)));
 }
 
 sp_SymPolyHash*sp_SymPolyHash_merge(sp_SymPolyHash*a,sp_SymPolyHash*b)

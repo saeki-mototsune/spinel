@@ -3,6 +3,7 @@
 #include "builtin_ops.h"
 #include "call_plan.h"
 #include "repr.h"
+#include "share.h"
 int callee_has_kwarg(Compiler *c, Scope *m, const char *name);
 int callee_declares_kwargs(Compiler *c, Scope *m);
 int callee_param_is_declared_kwarg(Compiler *c, Scope *m, const char *name);
@@ -2838,6 +2839,23 @@ static int push_chain_base(Compiler *c, int recv) {
 }
 
 static int value_leaves(Compiler *c, int n, int *out, int nout, int cap);
+enum { VL_NIL = 1, VL_BEGIN = 2 };
+static int value_leaves_ex(Compiler *c, int n, int *out, int nout, int cap, int nil_ok);
+static int *cext_walk_values(Compiler *c);
+/* Is one of the values `n` can answer, through parentheses, a plain begin
+   body and the arms of a conditional (an arm left out answers nil), an
+   element read out of an Array of shared Strings (share_str_elem_read)? */
+static int share_str_value_leaves(Compiler *c, int n) {
+  int small[8], *lv = small, found = 0;
+  int cnt = value_leaves_ex(c, n, lv, 0, 8, VL_NIL | VL_BEGIN);
+  if (cnt < 0) {  /* more leaves than the buffer holds: one slot per node is enough */
+    lv = cext_walk_values(c);
+    cnt = value_leaves_ex(c, n, lv, 0, c->nt->count, VL_NIL | VL_BEGIN);
+  }
+  for (int i = 0; i < cnt && !found; i++) found = share_str_elem_read(c, lv[i]);
+  if (lv != small) free(lv);
+  return found;
+}
 static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb, int *fb, LWIndex lw_ix, LWIndex ivw_ix) {
   int changed = 0;
   /* Fold container usage into the local type so an empty `[]` / `{}` gets
@@ -3212,6 +3230,19 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
     }
     if (elem_splat_index && nt_kind(nt, recv) != NK_LocalVariableReadNode) continue;
     const char *rty = nt_type(nt, recv);
+    /* --share-strings: an element read out of an Array whose Strings are
+       shared is boxed, the Array being the general one that holds their
+       handles, where the default build reads a String out of a String
+       Array. Stored into an Integer or Float array, it is the String it
+       is, and widens the array as the String would: taken as a value of
+       run-time kind, the typed store raised TypeError (#9258). An empty
+       or String array keeps the boxed reading. */
+    if (c->share_strings && vt == TY_POLY && vnode >= 0 && (is_push || is_idx_write) &&
+        share_str_value_leaves(c, vnode)) {
+      TyKind rt0 = infer_type(c, recv);
+      if (ty_is_array(rt0) && rt0 != TY_POLY_ARRAY && rt0 != TY_STR_ARRAY && rt0 != TY_STRH_ARRAY)
+        vt = TY_STRING;
+    }
     if ((is_push || is_idx_write) && !elem_splat_index &&
         arysub_container_evidence(c, id, recv, is_push, is_splice, (TyKind)kt, (TyKind)vt, &changed)) continue;
     /* `(@h ||= {})[k] = v` fills @h exactly as `@h ||= {}; @h[k] = v` does,
@@ -5618,6 +5649,9 @@ static int container_literals(Compiler *c, int n, int *out, int nout, int cap, i
     if (a >= 0) nt_arr(nt, a, "arguments", &an);
     int elem_read = (sp_streq(nm, "[]") && an == 1) || (sp_streq(nm, "fetch") && an >= 1) ||
                     ((is_endpoint_query(nm)) && an == 0);
+    /* a copy is built as the container it copies: the two widen together */
+    if (r >= 0 && an == 0 && nt_ref(nt, n, "block") < 0 && (sp_streq(nm, "dup") || sp_streq(nm, "clone")))
+      return container_literals(c, r, out, nout, cap, depth + 1);
     if (r < 0 || !elem_read || nt_ref(nt, n, "block") >= 0) return nout;
     int outer[32];
     int no = container_literals(c, r, outer, 0, 32, depth + 1);
@@ -5700,9 +5734,26 @@ static int widen_nested_literals(Compiler *c, int recv, int is_push, int is_spli
     int leaf = -1;
     if (value_leaves(c, r, &leaf, 0, 1) == 1) { r = leaf; seq = 1; }
   }
-  if (r < 0 || !(nt_kind(nt, r) == NK_CallNode || (seq && nt_kind(nt, r) == NK_ArrayNode))) return 0;
-  int lits[32];
-  int nl = container_literals(c, r, lits, 0, 32, 0);
+  int lits[32], nl = 0;
+  if (r >= 0 && nt_kind(nt, r) == NK_LocalVariableReadNode) {
+    /* a local an element read or a copy of one wrote (`r = b[:attrs].dup;
+       r["y"] = v`): the literals those calls reach, the nested one in a
+       caller's argument too. A local a literal wrote is its own slot's. */
+    const char *rn = nt_str(nt, r, "name");
+    Scope *rs = rn ? comp_scope_of(c, r) : NULL;
+    int si = rs ? (int)(rs - c->scopes) : -1;
+    for (int q = si >= 0 ? lw_shared_first(c, rn, si) : -1; q >= 0 && nl < 32; q = lw_shared_next(q)) {
+      int w = lw_shared_node(q);
+      if (nt_kind(nt, w) != NK_LocalVariableWriteNode || comp_scope_of(c, w) != rs ||
+          !sp_streq(nt_str(nt, w, "name"), rn)) continue;
+      int wv = unwrap_parens(c, nt_ref(nt, w, "value"));
+      if (wv >= 0 && nt_kind(nt, wv) == NK_CallNode) nl = container_literals(c, wv, lits, nl, 32, 0);
+    }
+  }
+  else {
+    if (r < 0 || !(nt_kind(nt, r) == NK_CallNode || (seq && nt_kind(nt, r) == NK_ArrayNode))) return 0;
+    nl = container_literals(c, r, lits, 0, 32, 0);
+  }
   int changed = 0;
   for (int q = 0; q < nl; q++) {
     int l = lits[q];
@@ -5719,6 +5770,9 @@ static int widen_nested_literals(Compiler *c, int recv, int is_push, int is_spli
       if (lt == TY_POLY_ARRAY || vt == TY_UNKNOWN || vt == TY_POLY) continue;
       if (!is_push && kt != TY_INT && kt != TY_POLY) continue;
       if (ty_is_array(lt) && vt == ty_array_elem(lt)) continue;
+      /* (a String fits an Array of Strings, which --share-strings holds as
+         their handles: a TY_STRH_ARRAY, a String handle's value a TY_STRBUF) */
+      if ((lt == TY_STR_ARRAY || lt == TY_STRH_ARRAY) && (vt == TY_STRING || vt == TY_STRBUF)) continue;
       if (!c->arr_want || l >= c->node_cap || c->arr_want[l] == TY_POLY_ARRAY) continue;
       comp_set_arr_want(c, l, TY_POLY_ARRAY);
       changed = 1;
@@ -5731,8 +5785,9 @@ static int widen_nested_literals(Compiler *c, int recv, int is_push, int is_spli
    through parentheses, the last statement, and each arm of an `if`,
    `unless` or `case`. Answers the new count, or -1 when a path has no
    such expression (an arm left out answers nil) or out[] is full. */
-/* With `nil_ok`, a path that answers nil (an arm left out, an empty body, a
-   bare `return`) adds no expression instead of answering -1. */
+/* With `nil_ok` (VL_NIL), a path that answers nil (an arm left out, an empty
+   body, a bare `return`) adds no expression instead of answering -1. VL_BEGIN
+   also reads through a plain begin; the flag is for the one caller that asks. */
 static int value_leaves_ex(Compiler *c, int n, int *out, int nout, int cap, int nil_ok) {
   const NodeTable *nt = c->nt;
   if (nout < 0) return -1;
@@ -5745,6 +5800,11 @@ static int value_leaves_ex(Compiler *c, int n, int *out, int nout, int cap, int 
   }
   if (k == NK_ParenthesesNode) return value_leaves_ex(c, nt_ref(nt, n, "body"), out, nout, cap, nil_ok);
   if (k == NK_ElseNode) return value_leaves_ex(c, nt_ref(nt, n, "statements"), out, nout, cap, nil_ok);
+  /* with VL_BEGIN, a begin without rescue, else or ensure answers its
+     body's value */
+  if ((nil_ok & VL_BEGIN) && k == NK_BeginNode && nt_ref(nt, n, "rescue_clause") < 0 &&
+      nt_ref(nt, n, "else_clause") < 0 && nt_ref(nt, n, "ensure_clause") < 0)
+    return value_leaves_ex(c, nt_ref(nt, n, "statements"), out, nout, cap, nil_ok);
   if (k == NK_IfNode || k == NK_UnlessNode) {
     int alt = nt_ref(nt, n, k == NK_IfNode ? "subsequent" : "else_clause");
     nout = value_leaves_ex(c, nt_ref(nt, n, "statements"), out, nout, cap, nil_ok);
@@ -7579,23 +7639,18 @@ static int bind_args_params(Compiler *c, int call_id, int mi, const int *argv, i
        parameter that no other call site typed, as an (empty) poly array so
        the callee's array methods dispatch. Never during the fixpoint -- a
        concrete kind from another call site must win the unification. */
-    if (g_final_bind_pass && p->type == TY_UNKNOWN && at == TY_UNKNOWN &&
-        apty && sp_streq(apty, "ArrayNode")) {
-      int en0 = 0; nt_arr(nt, anode, "elements", &en0);
-      if (en0 == 0) { slot_rule(c, p, TY_POLY_ARRAY, anode, "an empty `[]` argument and no other call site typing it: the parameter is the untyped array"); changed = 1; continue; }
+    int empty_kind = at == TY_UNKNOWN && node_is_empty_container(nt, anode) ? an_empty_container_kind(c, anode) : 0;
+    if (g_final_bind_pass && p->type == TY_UNKNOWN && empty_kind == 1) {
+      slot_rule(c, p, TY_POLY_ARRAY, anode, "an empty `[]` argument and no other call site typing it: the parameter is the untyped array"); changed = 1; continue;
     }
     /* An empty `{}` / `[]` literal carries no type of its own, so it is skipped
        by the unification below. When ANOTHER call site typed the parameter as
        the other container, though, the two cannot share one slot: the empty
        literal still emits as its own kind and the C assignment is ill-typed.
        Widen to poly, which holds either. */
-    if (at == TY_UNKNOWN && apty && p->type != TY_UNKNOWN && p->type != TY_POLY) {
-      int cross = (sp_streq(apty, "HashNode") && !ty_is_hash(p->type)) ||
-                  (sp_streq(apty, "ArrayNode") && !ty_is_array(p->type));
-      if (cross) {
-        int en1 = 0; nt_arr(nt, anode, "elements", &en1);
-        if (en1 == 0) { slot_rule(c, p, TY_POLY, anode, "an empty literal argument of one container kind where another call site passed the other: only the boxed slot holds both"); changed = 1; continue; }
-      }
+    if (empty_kind && p->type != TY_UNKNOWN && p->type != TY_POLY &&
+        ((empty_kind == 2 && !ty_is_hash(p->type)) || (empty_kind == 1 && !ty_is_array(p->type)))) {
+      slot_rule(c, p, TY_POLY, anode, "an empty literal argument of one container kind where another call site passed the other: only the boxed slot holds both"); changed = 1; continue;
     }
     /* A void arg (`sink(always_raising_method)`) is nil-ish in value position:
        bind the param poly so it is declarable; the arg is emitted via
@@ -9926,12 +9981,16 @@ static int infer_param_types_ex(Compiler *c, int settle) {
            hot method's Integer parameter was boxed by a call that could
            not reach it */
         const PolyCand *pcs = comp_poly_candidates_at(c, id, name, &npc);
+        /* a receiver of no known class: a Range among the arguments makes
+           no candidate's parameter range_held */
+        c->range_unheld = cls_fact_idx(c, recv) < 0;
         for (int pi = 0; pi < npc; pi++)
           if (pcs[pi].mi < 0 || method_takes_call_args(c, &c->scopes[pcs[pi].mi], id))
             changed |= bind_call_params(c, id, pcs[pi].mi);
         pcs = comp_cmethod_candidates(c, name, &npc);
         for (int pi = 0; pi < npc; pi++)
           changed |= bind_call_params(c, id, pcs[pi].mi);
+        c->range_unheld = 0;
       }
     }
     /* A builtin receiver's own reopening takes this call's arguments too,
@@ -10675,16 +10734,14 @@ static TyKind bs_join(TyKind a, TyKind b) {
   return u;
 }
 
-/* What value `v` binds as. An empty `[]` / `{}` literal has no type of its
+/* What value `v` binds as. An empty `[]` / `{}` literal, or a bare
+   `Array.new` / `Hash.new`, has no type of its
    own but is still built as a container, so it is not the Integer an
    unpinned parameter defaults to (#4295): poly holds either. */
 static TyKind bs_value(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
   TyKind t = v >= 0 ? infer_type(c, v) : TY_NIL;
-  if (t == TY_UNKNOWN && (nt_kind(nt, v) == NK_ArrayNode || nt_kind(nt, v) == NK_HashNode)) {
-    int en = 0; nt_arr(nt, v, "elements", &en);
-    if (en == 0) t = TY_POLY;
-  }
+  if (t == TY_UNKNOWN && node_is_empty_container(nt, v)) t = TY_POLY;
   return t;
 }
 
@@ -13458,7 +13515,6 @@ static int dfi_single_write(NodeTable *nt, int tgt, int rd) {
   nt_node_set_ref(nt, call, "receiver", recv);
   nt_node_set_ref(nt, call, "arguments", an);
   nt_node_set_ref(nt, call, "block", -1);
-  nt_node_set_str(nt, call, "call_operator", ".");
   return call;
 }
 

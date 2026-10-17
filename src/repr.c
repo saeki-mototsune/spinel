@@ -347,15 +347,35 @@ int repr_self_shared(const Compiler *c, int node) {
   return s && repr_self_handle(c, (int)(s - c->scopes));
 }
 
-/* A builtin receiver conversion on a String keeps its handle. The seal,
-   the route emitter and boxed-form prediction use the same fact. */
+/* Is every method call v reaches a String reopening's `def m = self` (no
+   parameter, and the self read its whole body)? Such a method answers its
+   receiver untouched, as the builtin conversion of its name does. */
+static int repr_user_answers_self(Compiler *c, int v) {
+  const NodeTable *nt = c->nt;
+  int tg[CPT_MAX], n = cplan_targets(c, v, tg, CPT_MAX);
+  if (n <= 0) return 0;
+  for (int i = 0; i < n; i++) {
+    const Scope *m = &c->scopes[tg[i]];
+    int body = m->body, nb = 1;
+    if (body >= 0 && nt_kind(nt, body) == NK_StatementsNode) nt_arr(nt, body, "body", &nb);
+    int last = scope_body_last(c, tg[i]);
+    if (m->def_node < 0 || m->nparams != 0 || nb != 1 || last < 0 || nt_kind(nt, last) != NK_SelfNode ||
+        share_self_holder(c, tg[i]) < 0)
+      return 0;
+  }
+  return 1;
+}
+/* A builtin receiver conversion on a String keeps its handle, and so does
+   a reopening's conversion that answers self. The seal, the route emitter
+   and boxed-form prediction use the same fact. */
 int repr_string_conversion_operand(Compiler *c, int v) {
   v = unwrap_parens(c, v);
   if (!repr_share_rule(c) || v < 0 || nt_kind(c->nt, v) != NK_CallNode) return -1;
   int r = nt_ref(c->nt, v, "receiver");
   return r >= 0 && is_receiver_conversion(nt_str(c->nt, v, "name")) &&
          call_plain_argc(c, v) == 0 && (nt_ref(c->nt, v, "block") < 0 || nt_int(c->nt, v, "dyn_arm", 0)) &&
-         comp_recv_type(c, r) == TY_STRING && cplan_user(c, v)->dispatch == CP_NONE ? r : -1;
+         comp_recv_type(c, r) == TY_STRING &&
+         (cplan_user(c, v)->dispatch == CP_NONE || repr_user_answers_self(c, v)) ? r : -1;
 }
 /* ENV copies its stored bytes, but a store answers its value operand.
    A boxed operand can still hold plain bytes: an observable alias stays
@@ -453,6 +473,12 @@ static int repr_strbuf_src(const Compiler *c, int node, TyKind t) {
   /* a reader call (or a call answering its receiver) that renders the
      handle itself */
   if (k == NK_CallNode) {
+    /* A demanded `s.to_s` over a local holding the handle boxes that
+       handle, as emit_boxed_strbuf does (an_str_conversion_local). */
+    if (c->strbuf_box[node]) {
+      int cr = an_str_conversion_local(mc, node);
+      if (cr >= 0 && comp_ntype(c, cr) == TY_STRBUF) return RS_HANDLE;
+    }
     /* A boxed receiver route keeps its handle beside fresh user answers. */
     if (repr_boxed_to_s_operand(mc, node) >= 0) return RS_HANDLE;
     /* A conversion keeps its operand's handle only where the operand has
@@ -504,7 +530,10 @@ TyKind repr_stored_type(const Compiler *c, int id, TyKind t) {
      demanded as one is stored as one, as any other demanded value is:
      `{ |t| u = t }` spliced under a demand, the write of a handle local) */
   if (t == TY_STRBUF) return c->strbuf_box[id] || (c->share_strings && c->strbuf_handle_demand[id]) ? TY_STRBUF : TY_STRING;
-  if (c->strbuf_handle_demand[id]) return TY_STRBUF;
+  /* (a boxed value is held in its box whatever is asked of it: a reader
+     whose ivar widened past a String answers the box, which a handle's
+     slot did not take, and the C did not build) */
+  if (c->strbuf_handle_demand[id] && t != TY_POLY) return TY_STRBUF;
   return t;
 }
 
@@ -647,9 +676,9 @@ ReprForm repr_box_form(const Compiler *c, Repr r) {
   (void)c;
   if (t == TY_STRING) return RF_STR;
   if (r.big) return RF_BIGINT;
-  /* an Array of pointers (objects, nested Arrays) is stamped with what its
-     elements are */
-  if (ty_is_object(r.elem) || ty_is_array(r.elem)) return RF_PTR_ARRAY;
+  /* an Array of pointers (objects, nested Arrays, a String Array's handles)
+     is stamped with what its elements are */
+  if (ty_is_object(r.elem) || ty_is_array(r.elem) || t == TY_STRH_ARRAY) return RF_PTR_ARRAY;
   if (ty_is_object(t)) return r.dyn_cls ? RF_NULLABLE_DYN : RF_NULLABLE;
   return RF_NULLABLE;
 }
@@ -718,6 +747,7 @@ int repr_store_fits(Compiler *c, TyKind from, TyKind to) {
    a constructor for. */
 static int repr_empty_lit_as(Compiler *c, int v, TyKind slot) {
   const NodeTable *nt = c->nt;
+  v = unwrap_parens(c, v);
   const char *vty = v >= 0 ? nt_type(nt, v) : NULL;
   if (!vty) return 0;
   int n = 0;
@@ -778,7 +808,7 @@ int repr_coerce_plan(Compiler *c, int node, TyKind slot, int how, TyKind *from_o
   if (from == TY_POLY && how == CO_HOLD) {
     if (repr_poly_rhs_ok(slot)) return CF_POLY_RHS;
     if (ty_is_array(slot) || ty_is_ptr_array(slot) || ty_is_hash(slot) || slot == TY_BIGINT ||
-        slot == TY_STRBUF || slot == TY_CLASS || (ty_is_object(slot) && !repr_value_obj(c, slot)))
+        slot == TY_STRBUF || slot == TY_CLASS || slot == TY_TIME || (ty_is_object(slot) && !repr_value_obj(c, slot)))
       return CF_CHECKED_UNBOX;
   }
   return repr_coerce_text_form(c, node, from, slot, how);
@@ -1228,11 +1258,51 @@ static void repr_flow_route_name(const Compiler *c, int v, char *out, size_t cap
   }
 }
 
+/* Does value v raise before it exists: a call whose receiver chain (or a
+   constant path's parents) starts at the read of a constant the program
+   defines nowhere, which codegen emits as the NameError raise (emit of a
+   ConstantReadNode), or at the parenthesized raise analyze_scope.c makes
+   of a nested name it cannot find (`(raise NameError, "uninitialized
+   constant X"; nil)`)? Such a value is handed on nowhere: `@d =
+   BCrypt::Password.create(x).to_s` with no BCrypt raises before the write. */
+static int repr_value_raises_first(Compiler *c, int v) {
+  const NodeTable *nt = c->nt;
+  for (int d = 0; d < 64 && v >= 0; d++) {
+    NodeKind k = nt_kind(nt, v);
+    /* below the value itself every link is untyped, as a chain on a
+       missing name is: ENV, ARGF and the like are untyped reads too, but
+       their methods answer typed values */
+    if (d > 0 && (k == NK_CallNode || k == NK_ConstantPathNode) && c->ntype[v] != TY_UNKNOWN) return 0;
+    if (k == NK_CallNode) { v = nt_ref(nt, v, "receiver"); continue; }
+    if (k == NK_ConstantPathNode) { v = nt_ref(nt, v, "parent"); continue; }
+    if (k == NK_ConstantReadNode) {
+      const char *nm = nt_str(nt, v, "name");
+      return d > 1 && nm && c->ntype[v] == TY_UNKNOWN && !comp_const(c, nm) && comp_class_index(c, nm) < 0 &&
+             builtin_class_id(nm) == 0 && !is_builtin_exception_name(nm) && !is_builtin_class_name(nm) &&
+             !is_builtin_module_name(nm) && !is_env_const(nm);
+    }
+    if (k != NK_ParenthesesNode) return 0;
+    int st = nt_ref(nt, v, "body");
+    if (st < 0 || nt_kind(nt, st) != NK_StatementsNode) return 0;
+    int n = 0; const int *b = nt_arr(nt, st, "body", &n);
+    for (int i = 0; b && i < n; i++) {
+      int s = unwrap_parens(c, b[i]);
+      const char *nm = s >= 0 && nt_kind(nt, s) == NK_CallNode && nt_ref(nt, s, "receiver") < 0
+                       ? nt_str(nt, s, "name") : NULL;
+      if (nm && is_raise_alias(nm) && !bare_call_class_owned(c, s) && cplan_user_fresh(c, s)->mi < 0)
+        return 1;
+    }
+    return 0;
+  }
+  return 0;
+}
+
 /* Does flow value node v need the route check: a String (or a box that may
    hold one) whose class the rule shares? */
 static int repr_flow_checked(Compiler *c, int v) {
   v = unwrap_parens(c, v);
   if (v < 0) return 0;
+  if (repr_value_raises_first(c, v)) return 0;
   NodeKind k = nt_kind(c->nt, v);
   if (k == NK_NilNode || k == NK_StringNode || k == NK_InterpolatedStringNode) return 0;
   TyKind t = c->ntype[v];
@@ -1259,9 +1329,25 @@ static void repr_flow_refuse(Compiler *c, int u, int kind) {
            "on a copy (#6765)", rn, repr_flow_kind_name(kind));
   unsupported_feature_collect(c, u, msg);
 }
+/* The values the n flows lend to a parameter that is no byref slot
+   (SHFL_LEND, whose route always carries them), marked by node; NULL
+   when there are none. */
+static unsigned char *repr_flows_lent(Compiler *c, int n) {
+  unsigned char *lent = NULL;
+  for (int j = 0; j < n; j++) {
+    int site, w;
+    if (share_flow_at(c, j, &site, &w) != SHFL_LEND || w < 0 || w >= c->nt->count) continue;
+    const ShareHolder *ph = share_holder(c, site);
+    if (!ph || ph->kind != SHK_LOCAL || c->scopes[ph->scope].locals[ph->local].byref_out) continue;
+    if (!lent && !(lent = calloc((size_t)c->nt->count, 1))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    lent[w] = 1;
+  }
+  return lent;
+}
 static void repr_share_flows_check(Compiler *c, const char *stats) {
   int nf = share_flow_count(c);
   int bad = -1, bad_kind = 0;
+  unsigned char *lent = repr_flows_lent(c, nf);
   for (int i = 0; i < nf; i++) {
     int site, v;
     int kind = share_flow_at(c, i, &site, &v);
@@ -1275,6 +1361,11 @@ static void repr_share_flows_check(Compiler *c, const char *stats) {
     }
     /* a flow in an unreachable scope is never emitted (bad_lit's rule) */
     if (v < 0 || !comp_scope_of(c, v)->reachable || !repr_flow_checked(c, v)) continue;
+    /* an argument whose parameter the walk lends it (a slot the callee
+       only reads for the length of the call, SHFL_LEND) and whose class
+       does not share is handed on as that lend is: the lend's own flow is
+       the one checked (`sig(pick(h, k, fb))`, #9258 cluster 14) */
+    if (kind == SHFL_ARG && lent && lent[v] && share_flow_dest_shares(c, i) == 0) continue;
     int u = unwrap_parens(c, v);
     int ok = strbuf_flow_carries(c, kind, site, v);
     if (stats && stats[0] == '2') {
@@ -1289,6 +1380,7 @@ static void repr_share_flows_check(Compiler *c, const char *stats) {
     if (!ok && collect_emit_anyway()) repr_flow_refuse(c, u, kind);
     else if (!ok && bad < 0) { bad = u; bad_kind = kind; }
   }
+  free(lent);
   if (bad >= 0) repr_flow_refuse(c, bad, bad_kind);
 }
 

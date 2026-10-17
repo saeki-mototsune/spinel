@@ -576,7 +576,7 @@ void slot_rule(Compiler *c, LocalVar *lv, TyKind t, int node, const char *reason
 
 int slot_set(Compiler *c, LocalVar *lv, TyKind merged, TyKind t, int node) {
   int held = 0;
-  if (!lv->range_held && (t == TY_RANGE || value_may_be_range(c, node))) { lv->range_held = 1; held = 1; }
+  if (!lv->range_held && !c->range_unheld && (t == TY_RANGE || value_may_be_range(c, node))) { lv->range_held = 1; held = 1; }
   if (merged == lv->type) {
     if (!ty_degraded(merged) && merged != TY_UNKNOWN && node >= 0) lv->last_src = node;
     return held;
@@ -849,6 +849,29 @@ int comp_cvar_owner(const Compiler *c, int cid, const char *name) {
   if (cid < 0 || !name) return cid;
   for (int p = c->classes[cid].parent; p >= 0; p = c->classes[p].parent)
     if (comp_cvar_index(&c->classes[p], name) >= 0) owner = p;
+  if (owner != cid || comp_cvar_index(&c->classes[cid], name) >= 0) return owner;
+  /* No class in the chain declares it: a module included along it may. A
+     module's method is copied into each class including it, and a class
+     variable it reads (a parameter default `x = @@x`) is the module's,
+     which the copy's own class does not name (the most recent include
+     first, as Ruby's ancestors run) */
+  for (int p = cid; p >= 0; p = c->classes[p].parent) {
+    const ClassInfo *ci = &c->classes[p];
+    for (int i = ci->nincluded_mods - 1; i >= 0; i--) {
+      int m = ci->included_mods[i];
+      if (m >= 0 && m < c->nclasses && comp_cvar_index(&c->classes[m], name) >= 0) return m;
+    }
+  }
+  /* and the modules it extends, whose methods `extend` copies in as the
+     class's class methods (`class Template; extend Handlers`): they read
+     the module's variable as well */
+  for (int p = cid; p >= 0; p = c->classes[p].parent) {
+    const ClassInfo *ci = &c->classes[p];
+    for (int i = ci->nextended_mods - 1; i >= 0; i--) {
+      int m = ci->extended_mods[i];
+      if (m >= 0 && m < c->nclasses && comp_cvar_index(&c->classes[m], name) >= 0) return m;
+    }
+  }
   return owner;
 }
 
@@ -1106,11 +1129,10 @@ static int chain_lookup(Compiler *c, int class_id, const char *name, int *def_cl
     return a[2 * class_id];
   }
   int start = class_id, mi = -1, dc = -1, bi = 0;
-  const char *rn = is_cm ? comp_resolve_cm_alias_at(c, class_id, name, &start)
-                         : resolve_alias_side(c, class_id, name, &start, &bi, 2);
+  const char *rn = resolve_alias_side(c, class_id, name, &start, &bi, is_cm ? 1 : 2);
   /* an alias that captured a builtin's method names no method of the
      program's, whatever the class defines of that name later */
-  if (bi && !is_cm && !sp_streq(rn, name)) start = -1;
+  if (bi && !sp_streq(rn, name)) start = -1;
   for (int cid = start; cid >= 0; cid = c->classes[cid].parent) {
     int m = is_cm ? comp_cmethod_in_class(c, cid, rn) : comp_method_in_class(c, cid, rn);
     if (m >= 0) { mi = m; dc = cid; break; }
@@ -1663,6 +1685,13 @@ static int const_name_resolves(Compiler *c, const char *cn) {
   if (comp_is_wellknown_const(cn)) return 1;
   return 0;
 }
+/* A constant (path) segment that resolves: by its name, as a builtin
+   class, module or builtin class's constant (Encoding::UTF_8), or as a
+   program class the path names (A::B, renamed apart from an X::B) */
+static int const_seg_resolves(Compiler *c, int seg) {
+  return const_name_resolves(c, nt_str(c->nt, seg, "name")) || const_seg_builtin(c, seg) ||
+         const_path_class(c, seg) >= 0;
+}
 
 /* Statically-false `defined?(Const)` guard: the predicate is a DefinedNode
    (or a `defined?(Const) && ...` AndNode, whose left arm short-circuits the
@@ -1689,17 +1718,20 @@ int comp_defined_guard_false(Compiler *c, int pred) {
   if (v < 0) return 0;
   const char *vt = nt_type(nt, v);
   if (vt && sp_streq(vt, "ConstantReadNode"))
-    return !const_name_resolves(c, nt_str(nt, v, "name"));
+    return !const_seg_resolves(c, v);
   if (vt && sp_streq(vt, "ConstantPathNode")) {
+    /* a leaf no member of the program class its parent names is missing,
+       though a constant of that name lives elsewhere (JSON::Coder) */
+    if (const_path_misses_member(c, v)) return 1;
     /* Walk tail-to-root; any unresolved segment kills the whole path. */
     for (int seg = v; ; ) {
-      if (!const_name_resolves(c, nt_str(nt, seg, "name"))) return 1;
+      if (!const_seg_resolves(c, seg)) return 1;
       int par = nt_ref(nt, seg, "parent");
-      if (par < 0) return !const_name_resolves_top_level(c, nt_str(nt, seg, "name"));
+      if (par < 0) return !const_name_resolves_top_level(c, nt_str(nt, seg, "name")) && !const_seg_builtin(c, seg);
       const char *pty = nt_type(nt, par);
       if (pty && sp_streq(pty, "ConstantPathNode")) { seg = par; continue; }
       if (pty && sp_streq(pty, "ConstantReadNode"))
-        return !const_name_resolves(c, nt_str(nt, par, "name"));
+        return !const_seg_resolves(c, par);
       return 0;                                  /* dynamic parent: no fold */
     }
   }
@@ -1720,9 +1752,12 @@ static int defined_path_keys(Compiler *c, int pred, const char **early, int cap)
   if (v < 0) return -1;
   NodeKind vk = nt_kind(nt, v);
   if (vk != NK_ConstantReadNode && vk != NK_ConstantPathNode) return -1;
+  /* each leaf must be a member of what its parent names, not only resolve
+     by its own name somewhere in the program */
+  if (vk == NK_ConstantPathNode && const_path_misses_member(c, v)) return -1;
   for (int seg = v; ; ) {
     const char *nm = nt_str(nt, seg, "name");
-    if (!const_name_resolves(c, nm)) return -1;
+    if (!const_seg_resolves(c, seg)) return -1;
     LocalVar *lv = comp_const(c, nm);
     if (lv && lv->const_early && ne < cap) early[ne++] = lv->name;
     else if (lv && lv->const_early) return -1;
@@ -1730,11 +1765,11 @@ static int defined_path_keys(Compiler *c, int pred, const char **early, int cap)
     int par = nt_ref(nt, seg, "parent");
     /* `::Root` anchor: the root must be defined at the TOP level, not
        through a same-named nested module (#3320) */
-    if (par < 0) return const_name_resolves_top_level(c, nm) ? ne : -1;
+    if (par < 0) return const_name_resolves_top_level(c, nm) || const_seg_builtin(c, seg) ? ne : -1;
     if (nt_kind(nt, par) == NK_ConstantPathNode) { seg = par; continue; }
     if (nt_kind(nt, par) == NK_ConstantReadNode) {
       const char *pn = nt_str(nt, par, "name");
-      if (!const_name_resolves(c, pn)) return -1;
+      if (!const_seg_resolves(c, par)) return -1;
       LocalVar *plv = comp_const(c, pn);
       if (plv && plv->const_early && ne < cap) early[ne++] = plv->name;
       else if (plv && plv->const_early) return -1;
@@ -1966,17 +2001,24 @@ int comp_resolve_member(Compiler *c, int class_id, const char *name, int want_wr
   return SP_MEMBER_METHOD;
 }
 
+/* An instance method's lookup reads the instance aliases only: a singleton
+   alias (`class << self; alias_method :stamp, :now`) names a class method,
+   and an instance call of the same name must not take it. */
 const char *comp_resolve_alias_ex(Compiler *c, int class_id, const char *name, int *start_cls, int *builtin) {
-  return resolve_alias_side(c, class_id, name, start_cls, builtin, 0);
+  return resolve_alias_side(c, class_id, name, start_cls, builtin, 2);
 }
 /* The class-method side of a class reads its singleton aliases
    (`class << self; alias a b`) and those of the modules it extends: an
    instance one names no class method (`alias name cop_name` made a class
-   method's Module#name call the class method cop_name). An instance
-   method's lookup reads the instance aliases, and a module's side every
-   alias. */
+   method's Module#name call the class method cop_name), and a module's side
+   reads the instance ones too. */
 const char *comp_resolve_cm_alias_at(Compiler *c, int class_id, const char *name, int *start_cls) {
   return resolve_alias_side(c, class_id, name, start_cls, NULL, 1);
+}
+/* ... and, for the builtin an alias captured (2: a builtin singleton method),
+   the name of it, as comp_resolve_alias_ex answers for the instance side */
+const char *comp_resolve_cm_alias_ex(Compiler *c, int class_id, const char *name, int *builtin) {
+  return resolve_alias_side(c, class_id, name, NULL, builtin, 1);
 }
 static const char *resolve_alias_side(Compiler *c, int class_id, const char *name, int *start_cls, int *builtin, int sg) {
   if (builtin) *builtin = 0;
@@ -1997,8 +2039,7 @@ static const char *resolve_alias_side(Compiler *c, int class_id, const char *nam
          instance ones too: a module's instance alias can be a module
          function as well (`alias shellwords shellsplit; module_function
          :shellwords`, or `extend self`). An instance method's lookup (2)
-         reads the instance aliases only; the other callers (0) read every
-         alias, as they always have. */
+         reads the instance aliases only. */
       /* ... but not over a class method the module defines itself */
       int mod = ci->def_node >= 0 && nt_kind(c->nt, ci->def_node) == NK_ModuleNode &&
                 !(sg == 1 && comp_cmethod_in_class(c, cid, name) >= 0);
@@ -2273,7 +2314,8 @@ int comp_reader_in_chain(Compiler *c, int class_id, const char *name, int *def_c
   return 0;
 }
 int comp_writer_in_chain(Compiler *c, int class_id, const char *name, int *def_class) {
-  name = comp_resolve_alias(c, class_id, name);
+  /* `name` is the attribute's base, and an alias of it is the reader's:
+     `alias to_s name` defines no `to_s=`, so it is not followed here */
   for (int cid = class_id; cid >= 0; cid = c->classes[cid].parent)
     if (comp_is_writer(&c->classes[cid], name)) { if (def_class) *def_class = cid; return 1; }
   return 0;
@@ -2725,7 +2767,7 @@ int comp_method_overridden(Compiler *c, int cid, const char *name, int cmeth) {
   for (int i = 0; i < nd; i++) {
     int k = ds[i];
     if (k == cid) continue;
-    if (!sp_streq(comp_resolve_alias(c, k, name), name) ||
+    if (!sp_streq(cmeth ? comp_resolve_cm_alias_at(c, k, name, NULL) : comp_resolve_alias(c, k, name), name) ||
         (cmeth ? comp_cmethod_in_class(c, k, name) : comp_method_in_class(c, k, name)) >= 0) {
       overridden = 1;
       break;
@@ -3458,7 +3500,10 @@ int comp_method_index(Compiler *c, const char *name) {
   {
     int tl = name ? comp_class_index(c, "Toplevel") : -1;
     if (tl >= 0) {
+      /* ... its instance aliases, and the main object's singleton ones
+         (`class << self; alias d c; end` at the top level) */
       const char *res = comp_resolve_alias(c, tl, name);
+      if (res && sp_streq(res, name)) res = comp_resolve_cm_alias_at(c, tl, name, NULL);
       if (res && !sp_streq(res, name)) return comp_method_index_direct(c, res);
     }
   }

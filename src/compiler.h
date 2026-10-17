@@ -1021,6 +1021,9 @@ typedef struct {
                        set of user classes its value can hold (analyze_cls.c,
                        #8530); 0 is every class. Read through cls_fact_node. */
   ClsSet *cls_pool; int ncls_pool, cls_fact_n;
+  int range_unheld; /* while the arguments of a call on a receiver of no known
+                       class bind to every method of the name: a Range among
+                       them makes no parameter range_held (slot_set) */
   /* an_send_name_is_computed's memo of the parameters a caller hands a
      computed name (#8592): one byte per (scope, parameter) slot, 0 unknown,
      1 no, 2 yes; rebuilt when the node table grew */
@@ -1290,6 +1293,7 @@ typedef struct {
   int *lazy_hoist;
   int lazy_hoist_n;
   int share_strings;
+  int has_cm_builtin_alias;   /* a singleton alias captured a builtin's class method (alias_builtin 2) */
   /* the scope + 1 whose block a yield under emit_proc_yield hands its
      arguments to (a proc form, or a method with a `&blk` it calls), or 0 */
   int proc_arg_src;
@@ -1340,6 +1344,7 @@ typedef struct {
   struct SbArgIndex *sb_args; /* settled parameter sources, built once for storage */
   unsigned share_sig;   /* the types the facts were last applied over */
   unsigned share_in_sig;   /* the types the last application started from */
+  int strh_demoted;   /* a slot left the String handle Array form after the proc-return re-derivation (share_strh_gate); an_phase_storage re-derives them again */
   /* the methods compute_byref_out_params let take a lent slot
      (an_byref_eligible_scopes), kept for the share facts built after it
      (nbyref_elig scopes; NULL before it runs) */
@@ -1507,6 +1512,7 @@ int    comp_method_index(Compiler *c, const char *name); /* -1 if none */
    top-level def (a private Object method, and so last in every ancestry) only
    as the fallback. See analyze_util.c. */
 int    comp_self_call_mi(Compiler *c, int call_node, const char *name);
+int    comp_class_self_inst_mi(Compiler *c, int class_id, const char *name);
 int    comp_cbody_call_mi(Compiler *c, int call_node, const char *name);
 /* Does the receiver of a retargeted `recv.send(:name)` (send_blind) answer
    name itself -- an instance's method or reader, a class constant's class
@@ -1598,6 +1604,12 @@ int comp_defined_guard_false(Compiler *c, int pred);
 /* the dual: statically-true defined?(Const / Const::Path) guard */
 int comp_defined_guard_true(Compiler *c, int pred);
 int comp_defined_early(Compiler *c, int pred, const char **early, int cap);
+/* a constant path whose leaf is no member of the class or module its parent
+   names (analyze_util.c) */
+int const_path_misses_member(Compiler *c, int id);
+int const_path_class(Compiler *c, int id);
+/* a segment naming a builtin class, module or constant (analyze_util.c) */
+int const_seg_builtin(Compiler *c, int id);
 
 /* Classes. */
 ClassInfo *comp_class_new(Compiler *c, const char *name, int def_node);
@@ -1883,6 +1895,8 @@ int         comp_resolve_member(Compiler *c, int class_id, const char *name, int
 const char *comp_resolve_alias(Compiler *c, int class_id, const char *name);
 const char *comp_resolve_alias_at(Compiler *c, int class_id, const char *name, int *start_cls);
 const char *comp_resolve_cm_alias_at(Compiler *c, int class_id, const char *name, int *start_cls);
+void rewrite_builtin_cm_alias_call(Compiler *c, int id);   /* analyze.c */
+const char *comp_resolve_cm_alias_ex(Compiler *c, int class_id, const char *name, int *builtin);
 int comp_name_is_sg_alias_only(Compiler *c, int class_id, const char *name);
 const char *comp_resolve_alias_ex(Compiler *c, int class_id, const char *name, int *start_cls, int *builtin);
 

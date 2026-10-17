@@ -21,6 +21,19 @@
 #endif
 #include <prism.h>
 #include "node_table.h"
+
+/* node_table.h names the node flags the passes read without including Prism;
+   each must be the value Prism's own constant has. */
+_Static_assert(NT_RANGE_EXCLUDE_END == PM_RANGE_FLAGS_EXCLUDE_END, "range exclude-end flag");
+_Static_assert(NT_LOOP_BEGIN_MODIFIER == PM_LOOP_FLAGS_BEGIN_MODIFIER, "loop begin-modifier flag");
+_Static_assert(NT_RE_IGNORE_CASE == PM_REGULAR_EXPRESSION_FLAGS_IGNORE_CASE, "regexp /i flag");
+_Static_assert(NT_RE_EXTENDED == PM_REGULAR_EXPRESSION_FLAGS_EXTENDED, "regexp /x flag");
+_Static_assert(NT_RE_MULTI_LINE == PM_REGULAR_EXPRESSION_FLAGS_MULTI_LINE, "regexp /m flag");
+_Static_assert(NT_RE_EUC_JP == PM_REGULAR_EXPRESSION_FLAGS_EUC_JP, "regexp /e flag");
+_Static_assert(NT_RE_ASCII_8BIT == PM_REGULAR_EXPRESSION_FLAGS_ASCII_8BIT, "regexp /n flag");
+_Static_assert(NT_RE_WINDOWS_31J == PM_REGULAR_EXPRESSION_FLAGS_WINDOWS_31J, "regexp /s flag");
+_Static_assert(NT_RE_UTF_8 == PM_REGULAR_EXPRESSION_FLAGS_UTF_8, "regexp /u flag");
+
 #if defined(_WIN32)
 char *sp_w32_overlay(char *content, const char *path);   /* lib/win32/sp_win32_driver.c */
 #endif
@@ -872,6 +885,39 @@ static void flatten_statements(int id, pm_node_list_t *list) {
   pm_node_list_free(&low);
 }
 
+/* The parameter node kinds: the name, an optional default, and Prism's flags,
+   whose PM_PARAMETER_FLAGS_REPEATED_PARAMETER marks a name an earlier
+   parameter of the list already bound (`def m(_, _)`; nt_param_repeated). */
+static void flatten_parameter(int id, pm_node_t *node) {
+  const char *type = NULL;
+  pm_constant_id_t name = 0;
+  pm_node_t *value = NULL;
+  switch (PM_NODE_TYPE(node)) {
+  case PM_REQUIRED_PARAMETER_NODE:
+    type = "RequiredParameterNode"; name = ((pm_required_parameter_node_t *)node)->name; break;
+  case PM_OPTIONAL_PARAMETER_NODE:
+    type = "OptionalParameterNode"; name = ((pm_optional_parameter_node_t *)node)->name;
+    value = ((pm_optional_parameter_node_t *)node)->value; break;
+  case PM_REST_PARAMETER_NODE:
+    type = "RestParameterNode"; name = ((pm_rest_parameter_node_t *)node)->name; break;
+  case PM_BLOCK_PARAMETER_NODE:
+    type = "BlockParameterNode"; name = ((pm_block_parameter_node_t *)node)->name; break;
+  case PM_BLOCK_LOCAL_VARIABLE_NODE:
+    type = "BlockLocalVariableNode"; name = ((pm_block_local_variable_node_t *)node)->name; break;
+  case PM_KEYWORD_REST_PARAMETER_NODE:
+    type = "KeywordRestParameterNode"; name = ((pm_keyword_rest_parameter_node_t *)node)->name; break;
+  case PM_REQUIRED_KEYWORD_PARAMETER_NODE:
+    type = "RequiredKeywordParameterNode"; name = ((pm_required_keyword_parameter_node_t *)node)->name; break;
+  default:
+    type = "OptionalKeywordParameterNode"; name = ((pm_optional_keyword_parameter_node_t *)node)->name;
+    value = ((pm_optional_keyword_parameter_node_t *)node)->value; break;
+  }
+  nt_put_type(out_nt, id, type);
+  emit_int(id, "flags", node->flags);
+  if (name) { char *n = cstr(name); emit_str(id, "name", n); free(n); }
+  if (value) emit_ref(id, "value", value);
+}
+
 static int flatten_node(pm_node_t *node) {
   if (!node) return -1;
 
@@ -1035,14 +1081,8 @@ static int flatten_node(pm_node_t *node) {
     R("receiver", n->receiver);
     R("arguments", n->arguments);
     R("block", n->block);
-    /* Issue #793: emit explicit call_operator for non-safe-nav calls
-       too, so codegen reads "." instead of an unset field. */
-    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) {
-      S("call_operator", "&.");
-    }
-    else {
-      S("call_operator", ".");
-    }
+    /* `recv&.name`: nt_safe_nav reads the flag, set only when it is. */
+    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) I("safe_nav", 1);
     /* A bare identifier (no receiver/parens/args) is a variable-or-method
        read: an unresolved one is CRuby's NameError, not NoMethodError. */
     if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_VARIABLE_CALL)) I("vcall", 1);
@@ -1319,9 +1359,7 @@ static int flatten_node(pm_node_t *node) {
     NAME("name", n->read_name);
     NAME("binary_operator", n->binary_operator);
     R("value", n->value);
-    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) {
-      S("call_operator", "&.");
-    }
+    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) I("safe_nav", 1);
     break;
   }
   case PM_CALL_AND_WRITE_NODE: {
@@ -1330,9 +1368,7 @@ static int flatten_node(pm_node_t *node) {
     R("receiver", n->receiver);
     NAME("name", n->read_name);
     R("value", n->value);
-    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) {
-      S("call_operator", "&.");
-    }
+    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) I("safe_nav", 1);
     break;
   }
   case PM_CALL_OR_WRITE_NODE: {
@@ -1341,9 +1377,7 @@ static int flatten_node(pm_node_t *node) {
     R("receiver", n->receiver);
     NAME("name", n->read_name);
     R("value", n->value);
-    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) {
-      S("call_operator", "&.");
-    }
+    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) I("safe_nav", 1);
     break;
   }
   case PM_GLOBAL_VARIABLE_WRITE_NODE: {
@@ -1513,8 +1547,8 @@ static int flatten_node(pm_node_t *node) {
     N("RangeNode");
     R("left", n->left);
     R("right", n->right);
-    /* PM_RANGE_FLAGS_EXCLUDE_END = 4. Codegen reads bit 2 to decide
-       whether `..` (inclusive) or `...` (exclusive). */
+    /* PM_RANGE_FLAGS_EXCLUDE_END: nt_range_excl tells `..` (inclusive)
+       from `...` (exclusive). */
     I("flags", n->base.flags);
     break;
   }
@@ -1545,9 +1579,9 @@ static int flatten_node(pm_node_t *node) {
     N("WhileNode");
     R("predicate", n->predicate);
     R("statements", n->statements);
-    /* PM_LOOP_FLAGS_BEGIN_MODIFIER = 4 (bit 2): begin..end while form,
-       which is a post-test loop (body runs at least once). The codegen
-       reads bit 2 to decide between `while (cond) {}` and `do {} while (cond);`. */
+    /* PM_LOOP_FLAGS_BEGIN_MODIFIER: begin..end while form, which is a
+       post-test loop (body runs at least once). nt_loop_post tells the codegen
+       to emit `do {} while (cond);` rather than `while (cond) {}`. */
     I("flags", n->base.flags);
     break;
   }
@@ -1707,31 +1741,16 @@ else {
     if (n->keyword_rest) R("keyword_rest", n->keyword_rest);
     break;
   }
-  case PM_REQUIRED_PARAMETER_NODE: {
-    pm_required_parameter_node_t *n = (pm_required_parameter_node_t *)node;
-    N("RequiredParameterNode");
-    NAME("name", n->name);
+  case PM_REQUIRED_PARAMETER_NODE:
+  case PM_OPTIONAL_PARAMETER_NODE:
+  case PM_REST_PARAMETER_NODE:
+  case PM_BLOCK_PARAMETER_NODE:
+  case PM_BLOCK_LOCAL_VARIABLE_NODE:
+  case PM_KEYWORD_REST_PARAMETER_NODE:
+  case PM_REQUIRED_KEYWORD_PARAMETER_NODE:
+  case PM_OPTIONAL_KEYWORD_PARAMETER_NODE:
+    flatten_parameter(id, node);
     break;
-  }
-  case PM_OPTIONAL_PARAMETER_NODE: {
-    pm_optional_parameter_node_t *n = (pm_optional_parameter_node_t *)node;
-    N("OptionalParameterNode");
-    NAME("name", n->name);
-    R("value", n->value);
-    break;
-  }
-  case PM_REST_PARAMETER_NODE: {
-    pm_rest_parameter_node_t *n = (pm_rest_parameter_node_t *)node;
-    N("RestParameterNode");
-    if (n->name) { NAME("name", n->name); }
-    break;
-  }
-  case PM_BLOCK_PARAMETER_NODE: {
-    pm_block_parameter_node_t *n = (pm_block_parameter_node_t *)node;
-    N("BlockParameterNode");
-    if (n->name) { NAME("name", n->name); }
-    break;
-  }
   case PM_BLOCK_ARGUMENT_NODE: {
     /* `&expr` in call argument position. Wraps the expression that
      * provides the proc to forward (typically a LocalVariableReadNode
@@ -1739,31 +1758,6 @@ else {
     pm_block_argument_node_t *n = (pm_block_argument_node_t *)node;
     N("BlockArgumentNode");
     R("expression", n->expression);
-    break;
-  }
-  case PM_BLOCK_LOCAL_VARIABLE_NODE: {
-    pm_block_local_variable_node_t *n = (pm_block_local_variable_node_t *)node;
-    N("BlockLocalVariableNode");
-    NAME("name", n->name);
-    break;
-  }
-  case PM_KEYWORD_REST_PARAMETER_NODE: {
-    pm_keyword_rest_parameter_node_t *n = (pm_keyword_rest_parameter_node_t *)node;
-    N("KeywordRestParameterNode");
-    if (n->name) { NAME("name", n->name); }
-    break;
-  }
-  case PM_REQUIRED_KEYWORD_PARAMETER_NODE: {
-    pm_required_keyword_parameter_node_t *n = (pm_required_keyword_parameter_node_t *)node;
-    N("RequiredKeywordParameterNode");
-    NAME("name", n->name);
-    break;
-  }
-  case PM_OPTIONAL_KEYWORD_PARAMETER_NODE: {
-    pm_optional_keyword_parameter_node_t *n = (pm_optional_keyword_parameter_node_t *)node;
-    N("OptionalKeywordParameterNode");
-    NAME("name", n->name);
-    R("value", n->value);
     break;
   }
   case PM_PARENTHESES_NODE: {
@@ -1942,8 +1936,7 @@ else if (PM_NODE_TYPE(n->parameters) != PM_NUMBERED_PARAMETERS_NODE) {
     N("RegularExpressionNode");
     emit_pm_string(id, "unescaped", &n->unescaped);
     /* Emit Prism's regex flags so the codegen can pass /i, /x, /m
-       through to the engine. PM_REGULAR_EXPRESSION_FLAGS_IGNORE_CASE=4,
-       _EXTENDED=8, _MULTI_LINE=16. */
+       through to the engine (nt_regexp_opts). */
     I("flags", n->base.flags);
     break;
   }

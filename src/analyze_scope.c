@@ -3837,8 +3837,10 @@ static int alias_target_defined_before(Compiler *c, ClassInfo *cls, int cid, con
     const char *dn = nt_kind(nt, sc->def_node) == NK_DefNode ? nt_str(nt, sc->def_node, "name") : NULL;
     if ((sc->name && sp_streq(sc->name, od)) || (dn && sp_streq(dn, od))) return 1;
   }
+  /* ... of the same side: an instance alias of the name is no singleton one */
   for (int i = 0; i < cls->naliases; i++)
-    if (cls->alias_node[i] >= 0 && cls->alias_node[i] < at && sp_streq(cls->alias_new[i], od)) return 1;
+    if (cls->alias_node[i] >= 0 && cls->alias_node[i] < at && !cls->alias_sg[i] == !singleton &&
+        sp_streq(cls->alias_new[i], od)) return 1;
   return 0;
 }
 
@@ -3885,8 +3887,10 @@ static int are_enclosing_class(Compiler *c, int n) {
 /* An alias binds for the whole program, because the method tables are static.
    Class-body code that runs between a `def a` and a later `alias a b` meets the
    def in CRuby and would meet the alias here, silently: a call of `a` made in the
-   class body before the alias is refused (#7690). */
-static void alias_refuse_early_call(Compiler *c, ClassInfo *cls, const char *nw, int alias_node) {
+   class body before the alias is refused (#7690). A singleton alias (cm)
+   rebinds a class method, so it meets the `def self.name` before it, and an
+   instance `def` of the name is none of its business. */
+static void alias_refuse_early_call(Compiler *c, ClassInfo *cls, const char *nw, int alias_node, int cm) {
   if (!nw || alias_node < 0 || !cls->name) return;
   const NodeTable *nt = c->nt;
   int cid = comp_class_index(c, cls->name);
@@ -3894,7 +3898,7 @@ static void alias_refuse_early_call(Compiler *c, ClassInfo *cls, const char *nw,
   int defn = -1;
   for (int si = 1; si < c->nscopes; si++) {
     Scope *sc = &c->scopes[si];
-    if (sc->class_id != cid || sc->is_cmethod || sc->is_proc_form || sc->def_node < 0 ||
+    if (sc->class_id != cid || !sc->is_cmethod != !cm || sc->is_proc_form || sc->def_node < 0 ||
         nt_kind(nt, sc->def_node) != NK_DefNode) continue;
     const char *dn = nt_str(nt, sc->def_node, "name");
     if (dn && sp_streq(dn, nw) && sc->def_node < alias_node && sc->def_node > defn) defn = sc->def_node;
@@ -3953,10 +3957,13 @@ static void alias_mark_sg(ClassInfo *cls, int s, int singleton) {
     if (cls->alias_node[i] == s) { cls->alias_sg[i] = 1; comp_class_shape_changed(); }
 }
 static void alias_register(Compiler *c, ClassInfo *cls, const char *nw, const char *od, int s, int singleton) {
-  alias_refuse_early_call(c, cls, nw, s);
+  alias_refuse_early_call(c, cls, nw, s, singleton);
   int cid = cls->name ? comp_class_index(c, cls->name) : -1;
   if (singleton && cid >= 0) {
-    if (builtin_cmethod_known(cls->name, od) &&
+    /* Kernel's module functions are not called through the constant as a
+       builtin: a def of the name later in the module takes the aliased
+       call too, which then calls itself */
+    if (is_kernel_module_name(cls->name) && builtin_cmethod_known(cls->name, od) &&
         comp_cmethod_in_class(c, cid, od) >= 0 &&
         !alias_target_defined_before(c, cls, cid, od, s, 1)) {
       char msg[512];
@@ -3974,7 +3981,21 @@ static void alias_register(Compiler *c, ClassInfo *cls, const char *nw, const ch
      where it read the instance methods, and an instance method of the new
      name defined later ended the alias (`class << self; alias_method :snake,
      :Camel; end` beside `def snake`, #9177) */
-  if (alias_capture_earlier_def(c, cls, nw, od, s, singleton)) { alias_mark_sg(cls, s, singleton); return; }
+  if (alias_capture_earlier_def(c, cls, nw, od, s, singleton)) {
+    alias_mark_sg(cls, s, singleton);
+    /* an alias of an alias whose own name the class defines again later
+       (`alias stamp now; alias stamp2 stamp; def stamp`) took the builtin
+       the first named */
+    for (int i = cls->naliases - 1; singleton && s >= 0 && cid >= 0 && i >= 0; i--)
+      if (cls->alias_node[i] == s && sp_streq(cls->alias_new[i], nw)) {
+        if (builtin_cmethod_known(cls->name, cls->alias_old[i]) &&
+            !alias_target_defined_before(c, cls, cid, cls->alias_old[i], s, 1)) {
+          cls->alias_builtin[i] = 2; c->has_cm_builtin_alias = 1; comp_class_shape_changed();
+        }
+        break;
+      }
+    return;
+  }
   comp_add_alias_from(cls, nw, od, s);
   alias_mark_sg(cls, s, singleton);
   /* In a reopened primitive, an alias of a name the program has not defined
@@ -3991,7 +4012,7 @@ static void alias_register(Compiler *c, ClassInfo *cls, const char *nw, const ch
        alias_prim_class(cls->name) || (ep && builtin_instance_method_known(ep, od))) &&
       !alias_target_defined_before(c, cls, cid, od, s, singleton)) {
     for (int i = cls->naliases - 1; i >= 0; i--)
-      if (cls->alias_node[i] == s && sp_streq(cls->alias_new[i], nw)) { cls->alias_builtin[i] = singleton ? 2 : 1; comp_class_shape_changed(); break; }
+      if (cls->alias_node[i] == s && sp_streq(cls->alias_new[i], nw)) { cls->alias_builtin[i] = singleton ? 2 : 1; c->has_cm_builtin_alias |= singleton; comp_class_shape_changed(); break; }
   }
   /* In a program class, of an Object / Kernel method it has not defined
      there yet: the builtin's, unless an ancestor or a module turns out to
@@ -4817,7 +4838,12 @@ void register_ffi_decls(Compiler *c) {
         c->native_methods[mi].args = arg_specs;
         c->native_methods[mi].rest = en > 0 && sp_streq(arg_specs[en - 1], "rest");
         c->native_methods[mi].nargs = c->native_methods[mi].rest ? en - 1 : en;
-        c->native_methods[mi].share = 0;
+        /* a cstring or cbinstr answer is the callee's own buffer, copied
+           onto the String heap at the call site (emit of a native call):
+           a new String each call, whatever the package declares. Under
+           --share-strings only, as a package's <name>.share.rb is read. */
+        c->native_methods[mi].share = c->share_strings && (sp_streq(ret_spec, "cstring") || sp_streq(ret_spec, "cbinstr"))
+                                      ? NSH_FRESH : 0;
         c->native_methods[mi].share_csym = NULL;
         continue;
       }
@@ -7167,8 +7193,7 @@ void rewrite_self_attr_empty_writes(Compiler *c) {
     int recv = nt_ref(nt, id, "receiver");
     if (recv < 0 || nt_kind(nt, recv) != NK_SelfNode) continue;
     if (nt_ref(nt, id, "block") >= 0) continue;
-    const char *cop = nt_str(nt, id, "call_operator");
-    if (cop && sp_streq(cop, "&.")) continue;
+    if (nt_safe_nav(nt, id)) continue;
     const char *name = nt_str(nt, id, "name");
     char base[256];
     if (!name || !name_is_plain_setter(name) || !setter_base_name(name, base, sizeof base)) continue;
@@ -7708,6 +7733,14 @@ static int cmethod_reaches_class_ivar_walk(Compiler *c, int mi, int def_cls, uns
     if (k == NK_InstanceVariableReadNode || k == NK_InstanceVariableWriteNode ||
         k == NK_InstanceVariableOperatorWriteNode || k == NK_InstanceVariableOrWriteNode ||
         k == NK_InstanceVariableAndWriteNode || k == NK_InstanceVariableTargetNode) return 1;
+    /* a super runs the parent's method of the name with self the same
+       class: its @ivars are the calling class's as well */
+    if ((k == NK_SuperNode || k == NK_ForwardingSuperNode) && c->scopes[mi].is_cmethod &&
+        c->scopes[mi].name && def_cls >= 0) {
+      int par = comp_super_parent(c, def_cls, 1), pdef = -1;
+      int pm = par >= 0 ? comp_cmethod_in_chain(c, par, c->scopes[mi].name, &pdef) : -1;
+      if (pm >= 0 && pdef >= 0 && cmethod_reaches_class_ivar_walk(c, pm, pdef, seen)) return 1;
+    }
   }
   NT_FOREACH_KIND(nt, NK_CallNode, id) {
     if (c->nscope[id] != mi) continue;
@@ -7928,26 +7961,42 @@ static const char *cls_call_name(Compiler *c, int id) {
    own method is reached (extend_class_with). Only a parent's method with no
    super of its own: the copy's super would start at own's class's parent,
    which is that method again. */
-static void specialize_super_cmethod(Compiler *c, int own) {
+static void specialize_super_cmethod(Compiler *c, int own, int snap) {
   Scope *os = &c->scopes[own];
   int ci = os->class_id;
   if (!os->is_cmethod || ci < 0 || !os->name || !scope_body_has_super(c, own) ||
       comp_super_shadow(c, os)) return;
-  int par = comp_super_parent(c, ci, 1);
-  int pdef = -1;
-  int pm = par >= 0 ? comp_cmethod_in_chain(c, par, os->name, &pdef) : -1;
-  if (pm < 0 || pdef < 0 || scope_body_has_super(c, pm) || !cmethod_reaches_class_ivar(c, pm, pdef, 0)) return;
-  char behind[256];
-  snprintf(behind, sizeof behind, "__inc %d %s", c->classes[ci].prep_shadow_count++, os->name);
-  /* aside while the copy takes the name, then back */
+  /* A copy this pass made of an inherited method for a subclass that calls
+     it (own >= snap): its super starts above the class that wrote the
+     method, not above the subclass, and still runs with self the subclass */
+  int from = ci;
+  if (own >= snap)
+    for (int o = 1; o < snap; o++)
+      if (c->scopes[o].def_node == os->def_node && c->scopes[o].is_cmethod) { from = c->scopes[o].class_id; break; }
+  /* aside while each copy takes the name, then back */
   char *own_name = os->name;
   c->scopes[own].name = strdup("\x01own");
-  specialize_cmethod_for(c, pm, pdef, ci);
-  int cp = comp_cmethod_in_class(c, ci, own_name);
-  if (cp >= 0 && cp != own) {
+  /* Up the chain: each parent's method is copied behind the one whose super
+     reaches it, and a parent's own super reaches the next copy, so every
+     method of the chain runs with self ci (Rails' LogSubscriber.attach_to
+     supers into Subscriber's, and a subclass's own supers into it). */
+  int cur = own;
+  for (int depth = 0; depth < 32; depth++) {
+    int par = comp_super_parent(c, from, 1);
+    int pdef = -1;
+    int pm = par >= 0 ? comp_cmethod_in_chain(c, par, own_name, &pdef) : -1;
+    if (pm < 0 || pdef < 0 || !cmethod_reaches_class_ivar(c, pm, pdef, 0)) break;
+    char behind[256];
+    snprintf(behind, sizeof behind, "__inc %d %s", c->classes[ci].prep_shadow_count++, own_name);
+    specialize_cmethod_for(c, pm, pdef, ci);
+    int cp = comp_cmethod_in_class(c, ci, own_name);
+    if (cp < 0 || cp == own || cp == cur) break;
     free(c->scopes[cp].name);
     c->scopes[cp].name = strdup(behind);
-    comp_cprep_chain_add(&c->classes[ci], own_name, behind);
+    comp_cprep_chain_add(&c->classes[ci], cur == own ? own_name : c->scopes[cur].name, behind);
+    if (!scope_body_has_super(c, pm)) break;
+    cur = cp;
+    from = pdef;
   }
   free(c->scopes[own].name);
   c->scopes[own].name = own_name;
@@ -8096,7 +8145,9 @@ void specialize_inherited_cls_new(Compiler *c) {
     free(tgt);
   }
   /* a class's own class method whose super reaches its parent's */
-  for (int own = 1; own < snap; own++) specialize_super_cmethod(c, own);
+  /* (the copies made above for subclasses as well: each copy's super runs
+     on its own class) */
+  for (int own = 1, end = c->nscopes; own < end; own++) specialize_super_cmethod(c, own, snap);
   did_clone = (c->nscopes > snap);
   /* Index of every CallNode with a constant receiver, built once: the
      called-direct check below otherwise rescans all nodes per shadowed cmethod
@@ -9703,6 +9754,14 @@ int poly_cls_value_reaches(Compiler *c, int call, int k) {
   for (int v = 0; v < c->nclasses; v++)
     if (cvals[v] && (v == k || is_descendant(c, v, k))) return 1;
   return 0;
+}
+/* See analyze.h. */
+int poly_cls_arm_left_out(Compiler *c, int call, int k, int kmi) {
+  if (k < 0 || k >= c->nclasses || kmi < 0 || kmi >= c->nscopes) return 0;
+  Scope *ks = &c->scopes[kmi];
+  int own_module_cmethod = ks->is_cmethod && ks->class_id == k && !ks->origin_module_ci &&
+                           !strstr(c->classes[k].name, "__reopen") && comp_class_is_module(c, &c->classes[k]);
+  return own_module_cmethod && (!comp_class_may_be_value(c, k) || !share_target_reachable(c, call, kmi));
 }
 /* See analyze.h. */
 int poly_recv_cls_method_owns(Compiler *c, int call, const char *name) {

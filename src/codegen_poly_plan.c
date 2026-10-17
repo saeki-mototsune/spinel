@@ -980,7 +980,7 @@ static int poly_user_arm_n_replay(Compiler *c, int id, const char *name, const P
     if (kslot >= 0 && L.from[kslot] != ARG_BY_NAME && ks->pnames && ks->pnames[kslot]) {
       LocalVar *kpv9 = scope_local(ks, ks->pnames[kslot]);
       TyKind kpt9 = kpv9 ? kpv9->type : TY_UNKNOWN;
-      if (ty_is_hash(kpt9) && kpt9 != (kwall_any ? TY_POLY_POLY_HASH : TY_SYM_POLY_HASH))
+      if (!kwh_param_fits(kpt9, kwall_any))
         arm_key_incompat = 1;
     } }
   if (arm_key_incompat) { arg_layout_free(&L); return 0; }
@@ -3521,6 +3521,22 @@ void emit_poly_cases_n(Compiler *c, int id, const char *name, const PolySpecials
   if (is_index) {
     emit_poly_index_cases(ret, tr, tv, idxref, plan_slot_oint(c, id, ret), b);
     if (g_plan_check) pa_observe(PA_BUILTIN, PA_KEY_BUILTIN + PB_INDEX_CASES, -1, TY_UNKNOWN, PC_SAME);
+  }
+  if (sp_streq(name, "timeout=") && argc == 1 && kwh < 0 && splat_a < 0) {
+    if (g_plan_check) pa_observe(PA_BUILTIN, PA_KEY_BUILTIN + PB_IO_TIMEOUT, -1, TY_UNKNOWN, PC_SAME);
+    int tf = ++g_tmp;
+    buf_printf(b, " case SP_BUILTIN_IO: { sp_File *_t%d = (sp_File *)_t%d.v.p; ", tf, tv);
+    emit_stat_handle_nomethod(tf, tv, name, b);
+    Buf arg = {0};
+    int held = poly_case_arg_boxed(c, T, kw, 0, &arg, b);
+    buf_printf(b, "sp_File_set_timeout(_t%d, %s); ", tf, arg.p ? arg.p : "sp_box_nil()");
+    if (held) buf_puts(b, " }");
+    free(arg.p);
+    if (!call_is_setter_assign(nt, id)) {
+      if (ret == TY_POLY) buf_printf(b, "_t%d = _t%d; ", tr, tv);
+      else if (ret == TY_IO) buf_printf(b, "_t%d = _t%d; ", tr, tf);
+    }
+    buf_puts(b, "break; }");
   }
   /* IO#write on a poly value when a user class owns the name: a Socket or
      File from Socket.pair/File.open has no user-class arm in the switch,
