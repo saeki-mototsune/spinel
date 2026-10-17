@@ -459,15 +459,26 @@ Fiber のキャプチャ構造体、そのメソッド専用の `static` ヘル�
 
 ### 4.5 決定性の修正(前提条件)
 
+> 実装済み(実装計画の 1)。表の「変更」欄が今の振る舞いで、
+> `make unit-stability-test`(`tools/unit_stability.sh`)が §1.3 の実験を
+> 回帰テストとして守る: 編集 a・b は 2 行、c は 18 行(修正前 8,418 行)。
+
 | 対象 | 変更 |
 |---|---|
-| `g_tmp`(`_tN`)、`_wbN`、その他の式一時変数カウンタ | 各トップレベル関数(メソッド、proc、dispatch)の出力開始で 0 にリセット。関数内のみで使われる名前なので衝突しない。`codegen.c:604` 等の save/restore はそのまま動く |
-| `g_proc_counter`(`_proc_N`、`_proc_cap_scan_N`、`_capv_N`) | 関数名なので TU 内で一意が要る。`_proc_<所属メソッドのC名>_<n>` とし、`n` はメソッド内の連番。トップレベル(main)の proc は `_proc_main_<n>` |
-| `_fib_cap_N` | 同上 |
-| `_fzl_N`(frozen リテラル) | 内容のハッシュ名 `_fzl_<8桁hex>`。同内容のリテラルは今も 1 つに共有されている(s400 の 408 個は内容で重複なし)ので、変わるのは名前だけ。衝突は codegen がテーブルで検出し、`_fzl_<hex>_2` で避ける |
-| `comp_node_ord`(`__fwdc_N`、`x__bpN`) | base を「builtins のメソッド」から「すべてのメソッド / クラス本体 / トップレベル文」に広げる。既存の `comp_node_base` が `nscope[k]` → `scopes[si].def_node` を見る経路を持っているので、`node_bi` を持たないノードにも同じ規則を適用する。名前は `comp_node_tag` と同じ `q<base>_<n>` 形 |
+| `g_tmp`(`_tN`)、`_wbN`、その他の式一時変数カウンタ | `unit_begin()` が各ユニット(メソッド、クラスの構築子、dispatch 群、END ブロック、main)の出力開始で 0 にリセットする。関数内のみで使われる名前なので衝突しない。投機的出力の save/restore(`codegen.c` の `sv_tmp`)は相対的なのでそのまま動く |
+| `g_proc_counter`(`_proc_N`、`_proc_cap_scan_N`、`_capv_N`、`_hashproc_N`、`_mtp_N`、`__sp_ffi_cb_N`、`_sp_hash_dproc_N`) | 関数名なので TU 内で一意が要る。`uid_new()` が `<ユニットタグ>_<n>` を返し(`_proc_Model200_label_1`)、`n` はユニット内の連番。タグはメソッドの C 名(`sp_` を除く)、構築子は `new_<Class>`、トップレベルは `main`。同じタグが二度始まれば `_dN` が付く |
+| `_fib_cap_N`、`_fiber_body_N` | 同上 |
+| `_fzl_N`(frozen リテラル) | 内容(エスケープ済みテキスト)の FNV-1a ハッシュ名 `_fzl_<8桁hex>`。同内容のリテラルは今も 1 つに共有されているので、変わるのは名前だけ。同じハッシュの別内容は出現順に `_fzl_<hex>_1` |
+| `sp_pd_N`(切り出された dispatch 関数) | 「何を dispatch するか」(メソッド名 + C シグネチャ)のハッシュ名 `sp_pd_<8桁hex>`。本体(arm)が変わっても名前は変わらないので、呼び出し側のユニットは変わらない。同名で本体が違うものは出現順に `_<n>` |
+| `comp_node_ord`(`__fwdc_N`、`x__bpN`、`StructAnon_N` …) | `comp_node_pbases()` がパース直後に木を 1 回歩き、各ノードの base を「それを含む def / class / module」にする(builtins の base と同じ仕組み)。タグは `p<baseのキー>_<n>`(`x__bpModel200_label_21`)、キーはクラス名で修飾したメソッド名(`Model200_label`、クラスメソッドは `Model200_s_make`)、24 文字を超えれば先頭 15 文字 + ハッシュ、再定義は `_dN`。書き換えで追加されたノードは所属スコープの def を base にする。どの def にも class にも入らないトップレベルのノードだけが従来どおりトップレベル内の連番 |
 | `#line` | 出力ファイルには今まで通り書く(診断・gdb のため)。**ハッシュは `#line` 行の行番号を落として計算**する(`-g` / `--debug` でないとき)。生成 C は `__LINE__` を使わない(s400 で 0 件)ので、行番号は `-g` なしの `.o` に入らない。`-g` のときは `#line` を含めてハッシュ(行シフトでミスするが、`-O0` なので cc は速い) |
 | クラス id、シンボル id | 変更しない。追加は末尾番号なので既存は動かない。`(sp_sym)N` と数値で書く 59 箇所は、名前付きの定数(`SPS_<name>` 系)に寄せられるなら寄せる(読みやすさの改善でもある) |
+| 正規表現リテラル表(`g_re_count`)、Bigint リテラル表(`sp_bigl[N]`) | 未変更。出現順の添字なので、前方に追加すると後続のユニットが変わる。リテラルごとの名前付き static にすれば直るが、頻度が低いので後回し |
+
+実装で分かった、名前以外に「文字列の長さ」で決まるものが二つある。`main` の
+分割(`_sp_main_part_N`、サイズで切る)と、dispatch の切り出し(320 バイト未満の
+領域は inline のまま)で、一時変数の桁数が変わるとどちらも判断が変わり得る。
+どちらも同じ関数の中に閉じるので、ユニットのキャッシュには影響しない。
 
 これらは **既存の出力の意味を変えない**(名前の付け替えだけ)ので、`make test`
 と `tools/cident.sh` 相当の検査で回帰を見られる。
@@ -555,7 +566,7 @@ result_cache.sh の `claim`/`release` と同じ)。prune は最終アクセス�
 PR 単位。1〜3 は `make gate` と `tools/cident.sh` で回帰を見る(出力の意味は
 変わらない)。
 
-1. **決定性**(§4.5)。カウンタのリセット、`_proc_`/`_fzl_`/node_ord の命名、
+1. **決定性**(§4.5)— 実装済み。カウンタのリセット、`_proc_`/`_fzl_`/node_ord の命名、
    `tools/unit_stability.sh` と gate の脚。この PR 単独でも ccache / sccache の
    ヒット率と `result_cache.sh` の意味が改善する(前処理後の等分ではなく)。
    触る場所: `codegen_util.c`(`g_tmp`)、`codegen.c`(`g_proc_counter`、
