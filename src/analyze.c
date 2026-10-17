@@ -12174,6 +12174,9 @@ static int oa_recv_op_ok(const char *nm, int argc, int has_block) {
   if (is_push_alias(nm) && argc >= 1) return 1;
   if (is_len_alias(nm) && argc == 0) return 1;
   if (sp_streq(nm, "empty?") && argc == 0) return 1;
+  /* clear empties the array in place and stores nothing: the element type
+     holds (its result must land in statement position, checked in step 4) */
+  if (sp_streq(nm, "clear") && argc == 0) return 1;
   if ((is_endpoint_query(nm)) && argc == 0) return 1;
   /* no-block comparisons: usable when the element class has `<=>` (the
      needs_cmp bit, checked at component resolution). sort's RESULT must
@@ -12554,7 +12557,8 @@ static int narrow_int_table_ivars(Compiler *c, int in_round) {
           /* sort/min/max need the boxed comparator, which this element kind
              has no arm for: leave those tables alone */
           if (un && (sp_streq(un, "sort") || sp_streq(un, "sort!") ||
-                     sp_streq(un, "min") || sp_streq(un, "max"))) { used = 0; break; }
+                     sp_streq(un, "min") || sp_streq(un, "max") ||
+                     sp_streq(un, "clear"))) { used = 0; break; }
           if (!oa_recv_op_ok(un, uan, nt_ref(nt, u, "block") >= 0)) { used = 0; break; }
           /* what a store puts in the table is a row: a boxed value or another
              kind would be taken as a bare sp_IntArray *. A value not typed
@@ -13430,6 +13434,11 @@ static int narrow_object_arrays(Compiler *c) {
           /* an append answers the array: like a sort result it must land
              in a modeled consumer, or a chained `a.push(x).push(y)` pushes
              an element no slot sees */
+          if (!(id < nc && value_ok[id])) sl[S].alive = 0;
+        }
+        else if (name && sp_streq(name, "clear")) {
+          /* clear answers the array, as an append does: a used result
+             (`a.clear << x`, `return a.clear`) hands it on unmodeled */
           if (!(id < nc && value_ok[id])) sl[S].alive = 0;
         }
         else if (name && sp_streq(name, "[]=") && argc == 2) {

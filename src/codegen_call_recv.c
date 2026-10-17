@@ -5194,6 +5194,15 @@ static int emit_array_call_arms(Compiler *c, int id, Buf *b) {
       buf_puts(b, "sp_PtrArray_empty("); emit_expr(c, recv, b); buf_puts(b, ")");
       return 1;
     }
+    /* clear empties it in place, as the poly array's template does, and
+       answers the array (the pass admits it only in statement position) */
+    if (sp_streq(name, "clear") && argc == 0) {
+      int tr = ++g_tmp;
+      buf_printf(b, "({ sp_PtrArray *_t%d = ", tr); emit_expr(c, recv, b);
+      buf_printf(b, "; if (_t%d && _t%d->frozen) sp_raise_frozen_array_at(_t%d, SP_BUILTIN_PTR_ARRAY);"
+                    " if (_t%d) _t%d->len = 0; _t%d; })", tr, tr, tr, tr, tr, tr);
+      return 1;
+    }
     /* no-block comparisons via the boxed comparator (user `<=>` through the
        cmp hook); the narrowing pass admits these only when the element class
        has `<=>` and (for sort) the result lands in a modeled consumer. */
