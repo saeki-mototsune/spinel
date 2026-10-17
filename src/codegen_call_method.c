@@ -1470,11 +1470,11 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     if (target >= 0) {
       Scope *tm = &c->scopes[target];
       int np = tm->nparams;
-      int tid = ++g_proc_counter;
+      const char *tid = uid_new();
       /* a bound __bam wrapper carries param[0] in the Method's self slot:
          proc arg k maps to param[k + shift] */
       int shift = method_call_param_shift(c, mn, target);
-      char mtpn[40]; snprintf(mtpn, sizeof mtpn, "_mtp_%d", tid);
+      char mtpn[UNIT_TAG_MAX + 16]; snprintf(mtpn, sizeof mtpn, "_mtp_%s", tid);
       emit_method_tramp_fn(c, tm, shift, mtpn, 0, method_node_recv_class(c, recv, tm->class_id), NULL, NULL);
       /* arity: required count (minus the self-carried wrapper param),
          negative when the signature is variadic (the Scope folds
@@ -1488,7 +1488,7 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         buf_printf(b, "({ void *_t%d = (void *)(", tcap);
         emit_expr(c, recv, b);
         buf_printf(b, "); SP_GC_ROOT(_t%d);", tcap);
-        buf_printf(b, " sp_proc_new_meta((void *)_mtp_%d, _t%d, sp_bm_cap_scan, %d, TRUE, 0, NULL, NULL); })",
+        buf_printf(b, " sp_proc_new_meta((void *)_mtp_%s, _t%d, sp_bm_cap_scan, %d, TRUE, 0, NULL, NULL); })",
                    tid, tcap, m_arity); }
       return 1;
     }
@@ -1874,10 +1874,10 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     int target_recvless = (mn >= 0 && nt_ref(nt, mn, "receiver") < 0);
     if (target >= 0 && target_recvless) {
       Scope *ts = &c->scopes[target];
-      int pid = ++g_proc_counter;
-      buf_printf(&g_proc_protos, "static sp_int _proc_%d(void *_cap, sp_int argc, sp_int *args);\n", pid);
+      const char *pid = uid_new();
+      buf_printf(&g_proc_protos, "static sp_int _proc_%s(void *_cap, sp_int argc, sp_int *args);\n", pid);
       Buf *pb = &g_procs;
-      buf_printf(pb, "static sp_int _proc_%d(void *_cap, sp_int argc, sp_int *args) {\n", pid);
+      buf_printf(pb, "static sp_int _proc_%s(void *_cap, sp_int argc, sp_int *args) {\n", pid);
       buf_puts(pb, "  (void)_cap; (void)argc; (void)args;\n");
       Buf callb; memset(&callb, 0, sizeof callb);
       emit_method_cname(c, ts, &callb);
@@ -1904,7 +1904,7 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         else emit_boxed_text(c, ts->ret, callb.p ? callb.p : "", pb);
         buf_puts(pb, ";\n  return 0;\n}\n");
         g_needs_proc_poly_argslot = 1;
-        buf_printf(b, "sp_proc_new_meta((void *)_proc_%d, NULL, NULL, %d, TRUE, 0, NULL, NULL)",
+        buf_printf(b, "sp_proc_new_meta((void *)_proc_%s, NULL, NULL, %d, TRUE, 0, NULL, NULL)",
                    pid, ts->nparams);
         free(callb.p);
         return 1;

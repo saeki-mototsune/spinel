@@ -1604,9 +1604,9 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
                       : hrr.key == TY_STRING ? "const char *" : "sp_RbVal";
     const char *kbox = hrr.key == TY_SYMBOL ? "sp_box_sym(_key)"
                      : hrr.key == TY_STRING ? "sp_box_str(_key)" : "_key";
-    int dn2 = ++g_proc_counter;
+    const char *dn2 = uid_new();
     buf_printf(&g_procs,
-      "static sp_RbVal _sp_hash_dproc_%d(sp_%sHash *_self_h, %s _key, void *_dproc_self) {\n"
+      "static sp_RbVal _sp_hash_dproc_%s(sp_%sHash *_self_h, %s _key, void *_dproc_self) {\n"
       "  return sp_penum_call2((sp_Proc *)_dproc_self,"
       " sp_box_nullable_obj((void *)_self_h, %s), %s);\n}\n",
       dn2, hn2, keyct, hash_box_cls(hrt), kbox);
@@ -1620,7 +1620,7 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
        whatever slot the expression feeds -- a Proc * one here (#3833). */
     TyKind vt2 = repr_of(c, id).as_ty;
     int ans = (vt2 == TY_PROC || vt2 == TY_POLY || vt2 == TY_UNKNOWN) ? tp2 : th2;
-    buf_printf(b, " _t%d->dproc = _sp_hash_dproc_%d; _t%d->dproc_self = (void *)_t%d;"
+    buf_printf(b, " _t%d->dproc = _sp_hash_dproc_%s; _t%d->dproc_self = (void *)_t%d;"
                   " sp_gc_wb((void *)_t%d); _t%d; })",
                th2, dn2, th2, tp2, th2, ans);
     return 1;
