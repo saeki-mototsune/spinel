@@ -65,3 +65,9 @@ How the compiler is built and where it is going. Not needed to *use* Spinel.
   thread scheduler: green threads on the fiber substrate, per-worker run queues
   and work stealing, stop-the-world GC, the preemption monitor. A working
   document, not a user guarantee (the user contract is in [thread.md](thread.md)).
+- **[internals/ext-design.md](internals/ext-design.md)** -- the extension
+  target: how a kernel becomes a `.so` CRuby can `require` (the Layer-1
+  library, the Layer-2 shim, the boundary rules as coded), what does not
+  cross today, and the design for objects, blocks and exceptions crossing
+  by handle. Part II is a design, not an implementation (the user contract
+  is in [spin.md](spin.md#extensions-a-ruby-kernel-compiled-into-a-cruby-native-extension)).
