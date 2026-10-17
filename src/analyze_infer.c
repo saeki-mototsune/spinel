@@ -6668,6 +6668,8 @@ static int infer_enum_chain_call(Compiler *c, int id, const NodeTable *nt, const
     int ecls = ty_obj_array_class(rt);
     if ((is_element_at_alias(name)) && argc == 1) { *out = ty_object(ecls); return 1; }
     if ((is_endpoint_query(name)) && argc == 0) { *out = ty_object(ecls); return 1; }
+    if ((sp_streq(name, "pop") || sp_streq(name, "shift")) && argc == 0)
+      { *out = ty_object(ecls); return 1; }
     if (sp_streq(name, "[]=") && argc == 2) { *out = ty_object(ecls); return 1; }
     if (is_push_alias(name)) { *out = rt; return 1; }
     if (is_len_alias(name) && argc == 0) { *out = TY_INT; return 1; }
