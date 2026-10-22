@@ -317,6 +317,11 @@ static int sk_in(const char *name, const char *const *set) {
   for (int i = 0; set[i]; i++) if (sp_streq(name, set[i])) return 1;
   return 0;
 }
+/* The conversions that, over a frozen literal's bytes, answer the
+   literal's own handle (sp_String_literal_slot), or box the bytes for one
+   of them to find it later. */
+static const char *const sk_literal_handles[] = { "sp_String_new_shared", "sp_String_new_fresh",
+  "SP_AS_STRING_HANDLE", "sp_poly_as_strbuf", "sp_poly_strbuf_lift", "sp_box_str", NULL };
 
 /* The unwraps: the calls that read a handle's or a box's bytes, and how
    (a copy that publishes the handle (2), a view of its live buffer (3), a
@@ -645,11 +650,17 @@ static void sk_read_mark(Compiler *c, struct ShareAgree *A, Buf *b, const char *
     role = SPR_TEST;
     form = (form & SK_LIVE) | SPF_BYTES;
   }
+  /* the bytes of a call that answers a String literal are the literal's
+     own: a handle sp_String_new_shared or sp_String_new_fresh makes over
+     them, or over a box of them, is the literal's handle
+     (SP_SHARE_STRING_LITERALS), no copy */
+  int lit = (kind == SKC_WRAP || kind == SKC_BOX) && sk_in(A->helper, sk_literal_handles) &&
+            share_plan_call_answers_literal(c, (int)v);
   sk_plan_note(A, v, role,
-               kind == SKC_WRAP ? SKE_WRAP : kind != SKC_NONE ? SKE_BYTES
+               lit ? SKE_HANDLE : kind == SKC_WRAP ? SKE_WRAP : kind != SKC_NONE ? SKE_BYTES
                : bytes && !A->published ? SKE_READ : SKE_HANDLE,
                form);
-  if (fresh == 2 || (fresh && kind != SKC_BOX)) kind = SKC_NONE;
+  if (lit || fresh == 2 || (fresh && kind != SKC_BOX)) kind = SKC_NONE;
   if (kind == SKC_NONE || A->seen[v]) return;
   A->seen[v] = 1;
   static const char *const kn[] = { "", "bytes wrapped into a new handle", "boxed as bytes",
@@ -836,7 +847,9 @@ void share_check_report(Compiler *c) {
                SHN_FRESH): a copy is fine because the String is new
                (need-new), its class has one holder (need-one-name), the
                rule does not share its class (need-unshared), or it is
-               ARGV's or ENV's (need-argv-env, both frozen in CRuby);
+               ARGV's or ENV's (need-argv-env, both frozen in CRuby), or
+               a conditional whose every arm is one of these or nil
+               (need-arms: new or frozen, which check=new accepts);
      elems     share_node_fresh_elems: a new Array of new Strings;
      ret-new   scope_ret_fresh, no ret_param: the method answers a new
                String or nil;
@@ -883,6 +896,7 @@ void share_claims_report(Compiler *c) {
     if (fresh || node) sk_claim(f, c, "need-new", "new", n, -1, NULL);
     else if (share_node_one_name(c, n)) sk_claim(f, c, "need-one-name", "one-name", n, -1, NULL);
     else if (!share_node_shares(c, n)) sk_claim(f, c, "need-unshared", "unshared", n, -1, NULL);
+    else if (strbuf_flow_unseen_arms(c, n)) sk_claim(f, c, "need-arms", "new", n, -1, NULL);
     else sk_claim(f, c, "need-argv-env", "frozen", n, -1, NULL);
   }
   for (int n = 0; n < nt->count; n++)

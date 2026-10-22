@@ -43,8 +43,8 @@ enum re_opcode {
                     RE_CHAR. */
   RE_ANY,        /* match any character (. without DOTALL) */
   RE_ANY_NL,     /* match any character including newline (. with DOTALL) */
-  RE_CLASS,      /* match character class: operand = class_id */
-  RE_NCLASS,     /* match negated character class: operand = class_id */
+  RE_CLASS,      /* match character class: offset = class_id */
+  RE_NCLASS,     /* match negated character class: offset = class_id */
   RE_MATCH,      /* successful match */
   RE_JMP,        /* unconditional jump: operand = target offset */
   RE_SPLIT,      /* fork: operand = target offset (greedy: try next first) */
@@ -174,11 +174,14 @@ enum re_opcode {
 #define RE_LB_BYTES(offset) ((int)((offset) >> 8))
 #define RE_LB_CHARS(offset) ((int)((offset) & 0xff))
 
-/* Bytecode instruction (4 bytes each for alignment) */
+/* Bytecode instruction, 8 bytes: a jump target, a class id or another
+   extended operand takes 32 bits, so a program may hold more than 65535
+   instructions (a table of a few thousand words compiles to more). Searches
+   measured no slower than with the 16-bit field the 4-byte instruction had. */
 typedef struct {
   uint8_t op;
-  uint8_t a;       /* small operand or class id */
-  uint16_t offset;  /* jump target or extended operand */
+  uint8_t a;       /* small operand */
+  uint32_t offset;  /* jump target or extended operand */
 } re_inst;
 
 /* Character class bitmap (ASCII range) */
@@ -281,8 +284,28 @@ typedef struct mrb_regexp_pattern {
                               alone under RE_ANCHOR_BOT */
   uint8_t loop_depth;      /* deepest nesting of repetitions whose body can
                               match empty (see RE_MAX_PASS) */
-  /* Cached VM state for pike_vm (avoids malloc per mrb_re_exec call) */
+  uint8_t end_anchor;      /* the end assertion every path reaches within
+                              end_reach bytes of where its attempt began, the
+                              weakest across paths: RE_END_EOT for \z,
+                              RE_END_EOTNL for \Z, RE_END_EOL for $, or
+                              RE_END_NONE. An attempt that begins further than
+                              that from every place the assertion can pass
+                              cannot match, so the engines start no attempt
+                              there; see skip_to_end_window(). */
+  uint32_t end_reach;      /* the most bytes any path consumes before it
+                              reaches that assertion */
+  uint8_t *required;       /* bytes every match holds somewhere at or after
+                              where its attempt began (or NULL): a subject
+                              that holds them nowhere past the search's start
+                              holds no match, which is answered without a
+                              single attempt; see compute_required() */
+  uint8_t required_len;
+  /* Cached VM state for pike_vm (avoids malloc per mrb_re_exec call), NULL
+     until the first search that uses it takes it (spinel) */
   uint32_t *cached_visited;     /* generation-based visited array */
+  uint32_t cached_gen;          /* the highest key a search has marked
+                                   cached_visited with: the next search's
+                                   keys start above it */
   void *cached_threads[2];      /* curr/next thread lists */
   int cached_list_capa;         /* capacity of cached thread lists */
   mrb_bool cache_in_use;        /* re-entrancy guard */
@@ -293,6 +316,13 @@ typedef struct mrb_regexp_pattern {
 #define RE_ANCHOR_NONE 0
 #define RE_ANCHOR_BOL  1  /* every branch passes ^ first: line starts only */
 #define RE_ANCHOR_BOT  2  /* every branch passes \A first: string start only */
+
+/* mrb_regexp_pattern::end_anchor. Ordered by how little each says about
+   where the assertion can pass, so the weakest across paths is their max. */
+#define RE_END_NONE  0
+#define RE_END_EOT   1  /* \z: at the end of the subject alone */
+#define RE_END_EOTNL 2  /* \Z: there, or before a \n that ends the subject */
+#define RE_END_EOL   3  /* $: at the end of any line */
 
 /* Regexp flags */
 #define RE_FLAG_IGNORECASE  1
@@ -452,8 +482,8 @@ typedef struct {
 #define RE_PASS_SPAN(depth) \
   ((uint32_t)((depth) < RE_MAX_PASS ? (depth) : RE_MAX_PASS) + 1)
 
-/* Capacity of one pike_vm thread list, shared by the VM and by the cache the
-   compiler pre-allocates for it so the two cannot drift. An instruction
+/* Capacity of one pike_vm thread list, shared by the VM and by the cache it
+   takes for the pattern so the two cannot drift. An instruction
    enqueues at most one thread per pass, and threads waiting on a later sp are
    carried over from the previous step on top of that. */
 #define RE_LIST_CAPA(code_len, depth) \

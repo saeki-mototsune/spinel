@@ -11,6 +11,7 @@
 #define SPINEL_BUILTIN_NAMES_H
 
 int is_zip_name(const char *n);       /* zip: tuple-yielding iteration */
+int is_dig_name(const char *n);       /* dig: a path through containers */
 int is_call_alias(const char *n);     /* call () []: a Proc/Method's invocation */
 int is_method_invoke(const char *n);  /* call () [] ===: Method invocation */
 int is_bind_call(const char *n);  /* bind_call: an UnboundMethod bound and called in one */
@@ -74,6 +75,8 @@ int is_quantifier_or_count(const char *n);  /* all? any? none? one? count: is_qu
 int is_push_unshift(const char *n);   /* << push append unshift: is_push_alias's names and unshift */
 int is_identity_query(const char *n); /* equal? object_id __id__ frozen?: tells an object from its copy */
 int is_len_alias(const char *n);      /* length size */
+int is_length_spelling(const char *n); /* size count empty? */
+int is_difference_spelling(const char *n); /* difference */
 int is_str_each_iter(const char *n);  /* each_char each_line each_byte each_codepoint: String's element iterators */
 int is_freeze_name(const char *n);    /* freeze */
 int is_enum_step_name(const char *n); /* next peek size: an Enumerator stepped from outside */
@@ -112,6 +115,7 @@ int is_element_at_alias(const char *n); /* [] at */
 int is_map_bang_alias(const char *n); /* collect! map! */
 int is_each_or_pair(const char *n); /* each each_pair */
 int is_proc_constructor(const char *n); /* lambda proc */
+int is_lambda_constructor(const char *n); /* lambda */
 
 int is_inspect_print(const char *n); /* p pp */
 int is_then_alias(const char *n); /* then yield_self */
@@ -147,6 +151,7 @@ int is_byte_codepoint_each(const char *n); /* each_byte each_codepoint */
 int is_with_index_alias(const char *n); /* each_with_index with_index */
 int is_freeze_family(const char *n); /* freeze frozen? */
 int is_bivar_access(const char *n);  /* __bivar_get __bivar_set __bivar_defined */
+int is_ivar_reflection_name(const char *n); /* instance_variable_get/set/defined?, instance_variables, remove_instance_variable */
 int is_object_copy(const char *n);   /* dup clone */
 int is_ivar_set_name(const char *n); /* instance_variable_set */
 int is_marshal_dump(const char *recv, const char *meth); /* Marshal.dump */
@@ -171,6 +176,7 @@ int is_encoding_mutator(const char *n); /* encode! force_encoding */
 int encoding_mutator_max_argc(const char *n);
 int is_range_end_reader(const char *n); /* end last */
 int is_raise_alias(const char *n); /* fail raise */
+int is_exception_factory(const char *n); /* exception */
 int is_exc_message_name(const char *n); /* message full_message detailed_message */
 int is_unary_plus(const char *n); /* +@ */
 int is_loop_name(const char *n); /* loop */
@@ -303,6 +309,13 @@ int is_string_read_only_method(const char *name);
 int str_mutator_str_args(const char *n, int argc, int *int_ok); /* the arguments a String mutator takes as Strings */
 
 int builtin_module_owns(const char *cls, const char *name); /* included ahead of Object */
+int is_include_name(const char *n);
+int is_prepend_name(const char *n);
+int is_comparable_module_name(const char *n);
+int is_enumerable_module_name(const char *n);
+int is_comparable_builtin_name(const char *n);
+typedef enum { BDC_BUILTIN, BDC_IDENTITY, BDC_EQUAL } BuiltinDefaultCmp;
+BuiltinDefaultCmp builtin_default_cmp(int family);
 int builtin_comparable_owns(const char *cls, const char *name); /* Comparable's, on a class including it */
 int builtin_comparable_arity(const char *name);
 int builtin_numeric_owns(const char *cls, const char *name); /* Numeric's, on Integer or Float */
@@ -356,6 +369,7 @@ int is_aref_name(const char *n);         /* []: an element read */
 int is_shovel_name(const char *n);       /* <<: an append, a chain's link */
 
 const char *dir_surface_alias(const char *n, int blockless_iter);
+int is_dir_blockless_iter(const char *n);  /* foreach each_child: an Enumerator without a block */
 
 int is_kernel_module_name(const char *n);
 int is_kernel_module_function(const char *n);
@@ -398,4 +412,19 @@ int is_first_name(const char *n);             /* first */
 
 
 const char *encoding_const_name(const char *nm);  /* Encoding::NM's encoding name, or NULL */
+const char *builtin_operator_delegate(const char *name);
+int is_mul_op(const char *n); /* * */
+int is_pow_op(const char *n); /* ** */
+int is_minus_op(const char *n); /* - */
+int is_clone_name(const char *n); /* clone */
+int is_cover_name(const char *n); /* cover? */
+int is_flatten_name(const char *n); /* flatten */
+int is_hash_name(const char *n); /* hash */
+int is_puts_name(const char *n); /* puts */
+int is_to_f_name(const char *n); /* to_f */
+int is_to_i_name(const char *n); /* to_i */
+int is_intersect_name(const char *n); /* intersect? */
+/* size, length, count, empty?: names the containers answer and an
+   OpenStruct does not define, so its member (or nil) answers them */
+int ostruct_member_name(const char *n);
 #endif

@@ -22,12 +22,17 @@
 #include <openssl/ssl.h>
 #include <openssl/err.h>
 #include <openssl/x509v3.h>
+#include <openssl/pem.h>
 #include <openssl/ec.h>
 #include <openssl/bn.h>
 #include <openssl/objects.h>
 #include <openssl/evp.h>
 #include <openssl/ecdsa.h>
 #include <openssl/rsa.h>
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
+# include <openssl/decoder.h>
+#endif
+#include <limits.h>
 #include <string.h>
 #include <fcntl.h>
 
@@ -72,7 +77,7 @@ typedef struct {
   SSL     *ssl;
   SSL_CTX *ctx;
   int      fd;
-  int      in_use;
+  int      in_use;        /* 0 free, 2 claimed and being filled, 1 live */
   int      nonblock;      /* O_NONBLOCK armed by the first non-blocking read */
 } sp_ssl_conn;
 
@@ -108,15 +113,37 @@ const char *sp_ssl_last_error(void) {
   return sp_str_dup_external(sp_ssl_errbuf[0] ? sp_ssl_errbuf : "");
 }
 
+/* A free slot, claimed in the same step that finds it. Threads run native
+   calls on parallel workers, so two connections set up at the same moment
+   are two searches at once, and a search that only looked left both of them
+   the same slot: the second connection overwrote the first, and two
+   SSLSockets drove one SSL. A claimed slot reads 2 until its connection is
+   in it and it is published as 1, so sp_ssl_at never answers one half
+   filled. */
 static int sp_ssl_slot(void) {
-  for (int i = 0; i < SP_SSL_MAX; i++) if (!sp_ssl_tab[i].in_use) return i;
+  for (int i = 0; i < SP_SSL_MAX; i++) {
+    int free_slot = 0;
+    if (SP_ATOMIC_CAS(&sp_ssl_tab[i].in_use, &free_slot, 2, 0,
+                      __ATOMIC_ACQ_REL, __ATOMIC_RELAXED))
+      return i;
+  }
   return -1;
 }
 
 static sp_ssl_conn *sp_ssl_at(sp_int h) {
   if (h < 0 || h >= SP_SSL_MAX) return NULL;
   sp_ssl_conn *c = &sp_ssl_tab[h];
-  return c->in_use ? c : NULL;
+  return SP_ATOMIC_LOAD(&c->in_use, __ATOMIC_ACQUIRE) == 1 ? c : NULL;
+}
+
+/* Empty a slot and make it free again, the free last: a slot another thread
+   can claim has nothing of this connection left in it. */
+static void sp_ssl_vacate(sp_ssl_conn *c) {
+  c->ssl = NULL;
+  c->ctx = NULL;
+  c->fd = -1;
+  c->nonblock = 0;
+  SP_ATOMIC_STORE(&c->in_use, 0, __ATOMIC_RELEASE);
 }
 
 /* Give a slot back, whatever stage it reached. */
@@ -124,7 +151,7 @@ static void sp_ssl_release(int i) {
   sp_ssl_conn *c = &sp_ssl_tab[i];
   if (c->ssl) SSL_free(c->ssl);
   if (c->ctx) SSL_CTX_free(c->ctx);
-  memset(c, 0, sizeof *c);
+  sp_ssl_vacate(c);
 }
 
 /* ---- X509::Store ---- */
@@ -165,6 +192,176 @@ int sp_X509_Store_set_default_paths(sp_X509_Store *s) {
   return X509_STORE_set_default_paths(s->store);
 }
 
+/* store.add_cert's half: the certificate as the DER a Ruby
+   X509::Certificate holds, and the store takes a reference of its own. 1
+   when it is in the store, 0 with the reason in sp_ssl_last_error. */
+sp_int sp_x509_store_add(sp_RbVal store, const char *der) {
+  sp_X509_Store *s = store.tag != SP_TAG_NIL ? (sp_X509_Store *)store.v.p : NULL;
+  const unsigned char *p = (const unsigned char *)der;
+  size_t len = sp_str_byte_len(der);
+  X509 *x;
+  int ok;
+
+  sp_ssl_errbuf[0] = 0;
+  if (!s || !s->store) { sp_ssl_note("X509_STORE"); return 0; }
+  if (len > (size_t)INT_MAX || !(x = d2i_X509(NULL, &p, (long)len))) {
+    sp_ssl_note("certificate");
+    return 0;
+  }
+  ok = X509_STORE_add_cert(s->store, x);
+  X509_free(x);
+  if (!ok) sp_ssl_note("X509_STORE_add_cert");
+  return ok ? 1 : 0;
+}
+
+/* ---- X509::Certificate ---- */
+/* A certificate is its DER, the way a key is its bytes: PEM is parsed here,
+   where it crosses the boundary, and no X509 * outlives the call. Ruby holds
+   the DER, and to_pem encodes it again when asked. */
+
+/* Each entry point answers into a buffer of its own, grown to fit. A chain
+   is a few kilobytes and nothing bounds it, so the fixed-size buffers the EC
+   calls use do not fit here. */
+typedef struct { char *p; size_t cap; } sp_x509_out;
+static SP_TLS sp_x509_out sp_x509_der_out, sp_x509_load_out, sp_x509_pem_out;
+
+static char *sp_x509_room(sp_x509_out *o, size_t n) {
+  if (n > o->cap) {
+    char *q = (char *)realloc(o->p, n);
+    if (!q) return NULL;
+    o->p = q;
+    o->cap = n;
+  }
+  return o->p;
+}
+
+/* An empty answer plus a reason in sp_ssl_last_error, as the EC calls answer;
+   the Ruby side raises OpenSSL::X509::CertificateError with it. No DER or PEM
+   is empty, so "empty" is unambiguously the failure. */
+static const char *sp_x509_fail(const char *what) {
+  sp_ssl_note(what);
+  sp_ffi_bin_len = 0;
+  return "";
+}
+
+/* BIO_new_mem_buf takes an int length and sp_ffi_bin_len publishes one, so
+   input past half of INT_MAX is refused here rather than narrowed. Half
+   leaves room for what the answers add to it: a 4-byte length per
+   certificate, and PEM's growth over the DER it encodes. */
+static int sp_x509_too_big(const char *data) {
+  return sp_str_byte_len(data) > (size_t)INT_MAX / 2;
+}
+
+/* DER first, then PEM, the order CRuby's Certificate.new and .load try them
+   in: DER is binary and can hold bytes that look like a PEM header, while
+   PEM never parses as DER. */
+static X509 *sp_x509_from_der(const char *data) {
+  const unsigned char *p = (const unsigned char *)data;
+  X509 *x = d2i_X509(NULL, &p, (long)sp_str_byte_len(data));
+  if (!x) ERR_clear_error();
+  return x;
+}
+
+/* Append one certificate as a 4-byte big-endian length and its DER. */
+static int sp_x509_append(sp_x509_out *o, size_t *at, X509 *x) {
+  int n = i2d_X509(x, NULL);
+  unsigned char *p;
+  if (n <= 0 || !sp_x509_room(o, *at + 4 + (size_t)n)) return 0;
+  p = (unsigned char *)o->p + *at;
+  p[0] = (unsigned char)(n >> 24);
+  p[1] = (unsigned char)(n >> 16);
+  p[2] = (unsigned char)(n >> 8);
+  p[3] = (unsigned char)n;
+  p += 4;
+  if (i2d_X509(x, &p) != n) return 0;
+  *at += 4 + (size_t)n;
+  return 1;
+}
+
+/* Certificate.new: one certificate, PEM or DER, answered as its DER. */
+const char *sp_x509_der(const char *data) {
+  X509 *x;
+  BIO *bio;
+  size_t at = 0;
+  int ok;
+
+  sp_ssl_errbuf[0] = 0;
+  if (sp_x509_too_big(data)) return sp_x509_fail("certificate data too large");
+  if (!(x = sp_x509_from_der(data))) {
+    if (!(bio = BIO_new_mem_buf(data, (int)sp_str_byte_len(data))))
+      return sp_x509_fail("BIO_new_mem_buf");
+    x = PEM_read_bio_X509(bio, NULL, NULL, NULL);
+    BIO_free(bio);
+    if (!x) return sp_x509_fail("PEM_read_bio_X509");
+  }
+  ok = sp_x509_append(&sp_x509_der_out, &at, x);
+  X509_free(x);
+  if (!ok) return sp_x509_fail("i2d_X509");
+  sp_ffi_bin_len = (int)at - 4;
+  return sp_x509_der_out.p + 4;
+}
+
+/* Certificate.load: every certificate in a PEM string, in order, or the one
+   in a DER string, each as a 4-byte length and its DER. As in CRuby, the PEM
+   read ends at the first place no further BEGIN line is found; any other
+   failure is a certificate that did not parse, and the whole load fails
+   rather than answering the ones before it. */
+const char *sp_x509_load(const char *data) {
+  X509 *x;
+  BIO *bio;
+  size_t at = 0;
+  int ok = 1;
+
+  sp_ssl_errbuf[0] = 0;
+  if (sp_x509_too_big(data)) return sp_x509_fail("certificate data too large");
+  if ((x = sp_x509_from_der(data))) {
+    ok = sp_x509_append(&sp_x509_load_out, &at, x);
+    X509_free(x);
+    if (!ok) return sp_x509_fail("i2d_X509");
+    sp_ffi_bin_len = (int)at;
+    return sp_x509_load_out.p;
+  }
+  if (!(bio = BIO_new_mem_buf(data, (int)sp_str_byte_len(data))))
+    return sp_x509_fail("BIO_new_mem_buf");
+  while (ok && (x = PEM_read_bio_X509(bio, NULL, NULL, NULL))) {
+    ok = sp_x509_append(&sp_x509_load_out, &at, x);
+    X509_free(x);
+  }
+  BIO_free(bio);
+  if (!ok) return sp_x509_fail("i2d_X509");
+  if (at == 0) {
+    ERR_clear_error();
+    return sp_x509_fail("Could not detect format of certificate data!");
+  }
+  if (ERR_GET_REASON(ERR_peek_last_error()) != PEM_R_NO_START_LINE)
+    return sp_x509_fail("PEM_read_bio_X509");
+  ERR_clear_error();
+  sp_ffi_bin_len = (int)at;
+  return sp_x509_load_out.p;
+}
+
+/* Certificate#to_pem: the DER Ruby holds, written as OpenSSL writes it. */
+const char *sp_x509_pem(const char *der) {
+  X509 *x = sp_x509_from_der(der);
+  BIO *bio = NULL;
+  char *mem = NULL;
+  long n = 0;
+
+  sp_ssl_errbuf[0] = 0;
+  if (!x) return sp_x509_fail("d2i_X509");
+  if ((bio = BIO_new(BIO_s_mem())) && PEM_write_bio_X509(bio, x))
+    n = BIO_get_mem_data(bio, &mem);
+  X509_free(x);
+  if (n <= 0 || !sp_x509_room(&sp_x509_pem_out, (size_t)n)) {
+    BIO_free(bio);
+    return sp_x509_fail("PEM_write_bio_X509");
+  }
+  memcpy(sp_x509_pem_out.p, mem, (size_t)n);
+  BIO_free(bio);
+  sp_ffi_bin_len = (int)n;
+  return sp_x509_pem_out.p;
+}
+
 /* Everything a client connection needs EXCEPT the handshake: the slot, the
    context, the SSL object and the descriptor. Kept apart from the handshake,
    which Ruby drives one step at a time, so the verify and SNI setup has one
@@ -172,10 +369,14 @@ int sp_X509_Store_set_default_paths(sp_X509_Store *s) {
    step with. Answers the slot index with the slot claimed, or -1 with the
    reason in sp_ssl_last_error.
    `cert_store` is an optional Ruby X509::Store object; if non-NIL, its
-   native X509_STORE is referenced by the SSL_CTX (SSL_CTX_set1_cert_store, so the store stays the handle's and is reusable). */
-static int sp_ssl_setup(sp_int fd, const char *hostname, sp_int verify, sp_RbVal cert_store) {
-  int i = sp_ssl_slot();
-  if (i < 0) { sp_ssl_note("too many TLS connections"); return -1; }
+   native X509_STORE is referenced by the SSL_CTX (SSL_CTX_set1_cert_store, so the store stays the handle's and is reusable).
+   `chain`, `curve` and `priv` are the client's own certificate and key, laid
+   out as for a server (sp_ssl_use_chain below), and all three empty when the
+   context has none; OpenSSL sends them only to a server that asks. */
+static int sp_ssl_use_chain(SSL_CTX *ctx, const char *chain, const char *curve, const char *priv);
+
+static int sp_ssl_setup(sp_int fd, const char *hostname, sp_int verify, sp_RbVal cert_store,
+                        const char *chain, const char *curve, const char *priv) {
   sp_ssl_errbuf[0] = 0;
 
   SSL_CTX *ctx = SSL_CTX_new(TLS_client_method());
@@ -211,9 +412,13 @@ else {
       SSL_CTX_set1_cert_store(ctx, store->store);
     }
   }
+  if (!sp_ssl_use_chain(ctx, chain, curve, priv)) { SSL_CTX_free(ctx); return -1; }
 
   SSL *ssl = SSL_new(ctx);
   if (!ssl) { sp_ssl_note("SSL_new"); SSL_CTX_free(ctx); return -1; }
+  /* The handshake step is SSL_do_handshake, which a server's connection
+     shares; this is what makes it a client's. */
+  SSL_set_connect_state(ssl);
   if (hostname && hostname[0]) {
     SSL_set_tlsext_host_name(ssl, hostname);     /* SNI */
     if (verify) {
@@ -232,11 +437,19 @@ else {
     SSL_free(ssl); SSL_CTX_free(ctx);
     return -1;
   }
+  /* The slot is claimed last, once there is a connection to put in it, so
+     no failure above has one to give back. */
+  int i = sp_ssl_slot();
+  if (i < 0) {
+    sp_ssl_note("too many TLS connections");
+    SSL_free(ssl); SSL_CTX_free(ctx);
+    return -1;
+  }
   sp_ssl_tab[i].ssl = ssl;
   sp_ssl_tab[i].ctx = ctx;
   sp_ssl_tab[i].fd  = (int)fd;
   sp_ssl_tab[i].nonblock = 0;
-  sp_ssl_tab[i].in_use = 1;
+  SP_ATOMIC_STORE(&sp_ssl_tab[i].in_use, 1, __ATOMIC_RELEASE);
   return i;
 }
 
@@ -254,11 +467,13 @@ sp_int sp_ssl_want(void) { return sp_ssl_want_state; }
    sp_ssl_want what it wants next: 0 finished, 1 wait until readable, 2 wait
    until writable, 4 a real failure with the reason in sp_ssl_last_error.
    The two directions are separate because a handshake genuinely needs both,
-   and a caller waiting on the wrong one waits forever. */
+   and a caller waiting on the wrong one waits forever. The same step drives
+   a client's handshake and a server's: the connection was set up as one or
+   the other. */
 static void sp_ssl_handshake_step(sp_ssl_conn *c) {
   sp_ssl_errbuf[0] = 0;
   sp_ssl_want_state = 0;
-  int r = SSL_connect(c->ssl);
+  int r = SSL_do_handshake(c->ssl);
   if (r == 1) return;
   switch (SSL_get_error(c->ssl, r)) {
     case SSL_ERROR_WANT_READ:  sp_ssl_want_state = 1; break;
@@ -281,8 +496,9 @@ static void sp_ssl_handshake_step(sp_ssl_conn *c) {
    exists -- the handshake may well be unfinished, and sp_ssl_want says so --
    or -1 when the connection could not be built. The handle is kept across
    calls so the handshake can be resumed. */
-sp_int sp_ssl_connect_nb(sp_int fd, const char *hostname, sp_int verify, sp_RbVal cert_store) {
-  int i = sp_ssl_setup(fd, hostname, verify, cert_store);
+sp_int sp_ssl_connect_nb(sp_int fd, const char *hostname, sp_int verify, sp_RbVal cert_store,
+                         const char *chain, const char *curve, const char *priv) {
+  int i = sp_ssl_setup(fd, hostname, verify, cert_store, chain, curve, priv);
   if (i < 0) { sp_ssl_want_state = 4; return -1; }
   sp_ssl_conn *c = &sp_ssl_tab[i];
   int fl = fcntl(c->fd, F_GETFL, 0);
@@ -292,10 +508,10 @@ sp_int sp_ssl_connect_nb(sp_int fd, const char *hostname, sp_int verify, sp_RbVa
   return i;
 }
 
-/* Resume a handshake begun by sp_ssl_connect_nb. 1 when it is done, 0 when
-   it is not, with sp_ssl_want carrying which of the two waits, or the
-   failure. */
-sp_int sp_ssl_connect_cont(sp_int h) {
+/* Resume a handshake begun by sp_ssl_connect_nb or sp_ssl_accept_nb. 1 when
+   it is done, 0 when it is not, with sp_ssl_want carrying which of the two
+   waits, or the failure. */
+sp_int sp_ssl_handshake_cont(sp_int h) {
   sp_ssl_conn *c = sp_ssl_at(h);
   if (!c) { sp_ssl_want_state = 4; sp_ssl_note("closed TLS connection"); return 0; }
   sp_ssl_handshake_step(c);
@@ -412,7 +628,7 @@ sp_int sp_ssl_close(sp_int h) {
   SSL_shutdown(c->ssl);
   SSL_free(c->ssl);
   SSL_CTX_free(c->ctx);
-  c->ssl = NULL; c->ctx = NULL; c->fd = -1; c->in_use = 0;
+  sp_ssl_vacate(c);
   return 0;
 }
 
@@ -903,6 +1119,251 @@ sp_int sp_ec_check_point(const char *curve, const char *pub) {
   return 1;
 }
 
+/* ---------- PKey.read: an EC or RSA key out of PEM or DER ----------
+   The key is parsed here, where it crosses the boundary, and what comes back
+   is what the Ruby key is made of. For an EC key that is the curve's name and
+   the key's bytes: one byte for the half it carries (1 private, 0 public),
+   one for the length of the curve's name, the name, and then the private
+   scalar, field-width, or the public point in uncompressed form. An RSA key
+   answers as sp_pkey_rsa_answer lays it out. openssl/pkey.rb builds the key
+   from those, so a key read here is the same object as one built from
+   bytes. */
+static SP_TLS char sp_pkey_read_buf[2 + 64 + SP_EC_MAX_POINT];
+
+/* No passphrase is ever supplied. OpenSSL's default callback would prompt on
+   the terminal for an encrypted PEM; this makes that PEM a key that does not
+   parse. */
+static int sp_pkey_no_pass(char *buf, int size, int rwflag, void *u) {
+  (void)buf; (void)size; (void)rwflag; (void)u;
+  return -1;
+}
+
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
+/* One decoder try, as CRuby's ossl_pkey_read makes it: a decoder of its own
+   for the input type and selection, moved on PEM block by PEM block. */
+static EVP_PKEY *sp_pkey_decode(BIO *bio, const char *type, int selection) {
+  EVP_PKEY *k = NULL;
+  OSSL_DECODER_CTX *d = OSSL_DECODER_CTX_new_for_pkey(&k, type, NULL, NULL,
+                                                      selection, NULL, NULL);
+  int pos = 0, at;
+
+  if (d) {
+    OSSL_DECODER_CTX_set_pem_password_cb(d, sp_pkey_no_pass, NULL);
+    while (OSSL_DECODER_from_bio(d, bio) != 1 && !BIO_eof(bio)) {
+      at = BIO_tell(bio);
+      if (at < 0 || at <= pos) break;
+      pos = at;
+    }
+    OSSL_DECODER_CTX_free(d);
+  }
+  (void)BIO_reset(bio);
+  return k;
+}
+#endif
+
+/* CRuby's last tries, for input none of the above reads: parameters with no
+   key in them (DH PARAMETERS, EC PARAMETERS), and a public key in another
+   form (a PKCS#1 RSA PUBLIC KEY). CRuby answers a key for those, so they are
+   read the same way here, to be named in the error rather than called
+   unparsable. On OpenSSL 3.0 and later CRuby asks the decoder for parameters
+   and then for a public key, never for any selection at once, which fails on
+   some 3.0 and 3.1 releases. Before 3.0 its last try is
+   PEM_read_bio_Parameters, which does not read an RSA PUBLIC KEY, so that is
+   read here with PEM_read_bio_RSAPublicKey: the error names RSA on every
+   version. */
+static EVP_PKEY *sp_pkey_parse_any(const char *data, long n) {
+  EVP_PKEY *k = NULL;
+  BIO *bio = BIO_new_mem_buf(data, (int)n);
+
+  if (!bio) return NULL;
+#if !defined(LIBRESSL_VERSION_NUMBER) && OPENSSL_VERSION_NUMBER >= 0x30000000L
+  static const char *const types[] = { "DER", "PEM" };
+  for (int i = 0; i < 2 && !k; i++)
+    if (!(k = sp_pkey_decode(bio, types[i], EVP_PKEY_KEY_PARAMETERS)))
+      k = sp_pkey_decode(bio, types[i], EVP_PKEY_PUBLIC_KEY);
+#else
+  RSA *rsa;
+
+  if (!(k = PEM_read_bio_Parameters(bio, NULL))) {
+    (void)BIO_reset(bio);
+    if ((rsa = PEM_read_bio_RSAPublicKey(bio, NULL, sp_pkey_no_pass, NULL)) &&
+        (!(k = EVP_PKEY_new()) || EVP_PKEY_assign_RSA(k, rsa) != 1)) {
+      EVP_PKEY_free(k);
+      k = NULL;
+      RSA_free(rsa);
+    }
+  }
+#endif
+  BIO_free(bio);
+  return k;
+}
+
+/* DER before PEM, and a private key before a public one: the order CRuby's
+   PKey.read tries them in. *priv says which half was found, and is -1 for
+   what sp_pkey_parse_any found, where the key has to be asked. */
+static EVP_PKEY *sp_pkey_parse(const char *data, int *priv) {
+  long n = (long)sp_str_byte_len(data);
+  const unsigned char *p = (const unsigned char *)data;
+  EVP_PKEY *k = NULL;
+  BIO *bio;
+
+  if ((k = d2i_AutoPrivateKey(NULL, &p, n))) { *priv = 1; return k; }
+  p = (const unsigned char *)data;
+  if ((k = d2i_PUBKEY(NULL, &p, n))) { *priv = 0; return k; }
+  if ((bio = BIO_new_mem_buf(data, (int)n))) {
+    if ((k = PEM_read_bio_PrivateKey(bio, NULL, sp_pkey_no_pass, NULL))) *priv = 1;
+    BIO_free(bio);
+  }
+  if (!k && (bio = BIO_new_mem_buf(data, (int)n))) {
+    if ((k = PEM_read_bio_PUBKEY(bio, NULL, sp_pkey_no_pass, NULL))) *priv = 0;
+    BIO_free(bio);
+  }
+  if (!k && (k = sp_pkey_parse_any(data, n))) *priv = -1;
+  return k;
+}
+
+/* An RSA key for PKey.read: a byte for the half it carries (3 private, 2
+   public), the modulus and the exponent each as a 4-byte big-endian length
+   and its bytes, and for a private key its PKCS#1 DER after them, which holds
+   the CRT components and is what sp_rsa_sign and an accept read back. Into a
+   buffer of its own, grown to fit: an RSA key does not fit the EC answer's.
+   *priv is -1 for a key sp_pkey_parse_any found, and the key is asked. */
+static SP_TLS sp_x509_out sp_pkey_rsa_out;
+
+static const char *sp_pkey_rsa_answer(EVP_PKEY *k, int priv) {
+  const BIGNUM *n = NULL, *e = NULL, *d = NULL;
+  int nl, el, dl = 0;
+  unsigned char *o, *q;
+  size_t total;
+  RSA *rsa;
+
+#if defined(__GNUC__) || defined(__clang__)
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+  if (!(rsa = EVP_PKEY_get1_RSA(k))) return sp_ec_fail("RSA key without its key bytes");
+  RSA_get0_key(rsa, &n, &e, &d);
+  if (priv < 0) priv = d != NULL;
+  if (!n || !e || (priv && !d)) { RSA_free(rsa); return sp_ec_fail("RSA key without its key bytes"); }
+  nl = BN_num_bytes(n);
+  el = BN_num_bytes(e);
+  if (priv && (dl = i2d_RSAPrivateKey(rsa, NULL)) <= 0) {
+    RSA_free(rsa);
+    return sp_ec_fail("i2d_RSAPrivateKey");
+  }
+  total = 1 + 4 + (size_t)nl + 4 + (size_t)el + (size_t)dl;
+  if (!(o = (unsigned char *)sp_x509_room(&sp_pkey_rsa_out, total))) {
+    RSA_free(rsa);
+    return sp_ec_fail("out of memory");
+  }
+  o[0] = (unsigned char)(priv ? 3 : 2);
+  o[1] = (unsigned char)(nl >> 24); o[2] = (unsigned char)(nl >> 16);
+  o[3] = (unsigned char)(nl >> 8);  o[4] = (unsigned char)nl;
+  BN_bn2bin(n, o + 5);
+  q = o + 5 + nl;
+  q[0] = (unsigned char)(el >> 24); q[1] = (unsigned char)(el >> 16);
+  q[2] = (unsigned char)(el >> 8);  q[3] = (unsigned char)el;
+  BN_bn2bin(e, q + 4);
+  q += 4 + el;
+  if (dl && i2d_RSAPrivateKey(rsa, &q) != dl) {
+    OPENSSL_cleanse(o, total);
+    RSA_free(rsa);
+    return sp_ec_fail("i2d_RSAPrivateKey");
+  }
+  RSA_free(rsa);
+#if defined(__GNUC__) || defined(__clang__)
+# pragma GCC diagnostic pop
+#endif
+  sp_ffi_bin_len = (int)total;
+  return (const char *)o;
+}
+
+/* What CRuby would have answered for a key this does not read, for the
+   message: its class name where it has one of its own. */
+static const char *sp_pkey_kind(int id) {
+  switch (id) {
+    case EVP_PKEY_RSA: return "RSA";
+    case EVP_PKEY_DSA: return "DSA";
+    case EVP_PKEY_DH:  return "DH";
+    default: { const char *sn = OBJ_nid2sn(id); return sn ? sn : "unknown"; }
+  }
+}
+
+const char *sp_pkey_read(const char *data) {
+  unsigned char *out = (unsigned char *)sp_pkey_read_buf;
+  const EC_KEY *ec;
+  const EC_GROUP *g = NULL;
+  const char *curve = NULL;
+  size_t clen = 0, n = 0;
+  int priv = 0, flen = 0, nid = NID_undef;
+  EVP_PKEY *k;
+
+  sp_ssl_errbuf[0] = 0;
+  /* BIO_new_mem_buf takes an int length: refused rather than narrowed, the
+     bound the X509 calls use. */
+  if (sp_str_byte_len(data) > (size_t)INT_MAX / 2) return sp_ec_fail("key data too large");
+  if (!(k = sp_pkey_parse(data, &priv))) {
+    ERR_clear_error();
+    return sp_ec_fail("Could not parse PKey");
+  }
+  if (EVP_PKEY_base_id(k) == EVP_PKEY_RSA) {
+    const char *r = sp_pkey_rsa_answer(k, priv);
+    EVP_PKEY_free(k);
+    ERR_clear_error();
+    return r;
+  }
+  if (EVP_PKEY_base_id(k) != EVP_PKEY_EC) {
+    char why[128];
+    snprintf(why, sizeof why, "unsupported key type: %s (this package reads EC and RSA keys)",
+             sp_pkey_kind(EVP_PKEY_base_id(k)));
+    EVP_PKEY_free(k);
+    ERR_clear_error();
+    return sp_ec_fail(why);
+  }
+  /* EVP_PKEY_get0_EC_KEY and the EC_KEY getters are deprecated in OpenSSL
+     3.0, and the replacements (EVP_PKEY_get_bn_param) are not in the 1.1.0
+     this file compiles against; the same trade sp_rsa_verify makes. */
+#if defined(__GNUC__) || defined(__clang__)
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+  if ((ec = EVP_PKEY_get0_EC_KEY(k)) && (g = EC_KEY_get0_group(ec)))
+    nid = EC_GROUP_get_curve_name(g);
+  if (priv < 0) priv = ec && EC_KEY_get0_private_key(ec) ? 1 : 0;
+  if (nid != NID_undef && (curve = OBJ_nid2sn(nid)) && (clen = strlen(curve)) < 64) {
+    flen = (EC_GROUP_get_degree(g) + 7) / 8;
+    if (flen <= 0 || flen > SP_EC_MAX_FIELD) curve = NULL;
+  }
+  if (curve) {
+    out[0] = (unsigned char)priv;
+    out[1] = (unsigned char)clen;
+    memcpy(out + 2, curve, clen);
+    if (priv) {
+      const BIGNUM *d = EC_KEY_get0_private_key(ec);
+      if (d && BN_bn2binpad(d, out + 2 + clen, flen) == flen) n = 2 + clen + (size_t)flen;
+    }
+    else {
+      const EC_POINT *q = EC_KEY_get0_public_key(ec);
+      size_t want = (size_t)(1 + 2 * flen);
+      if (q && EC_POINT_point2oct(g, q, POINT_CONVERSION_UNCOMPRESSED,
+                                  out + 2 + clen, want, NULL) == want)
+        n = 2 + clen + want;
+    }
+  }
+#if defined(__GNUC__) || defined(__clang__)
+# pragma GCC diagnostic pop
+#endif
+  EVP_PKEY_free(k);
+  if (!n) {
+    OPENSSL_cleanse(sp_pkey_read_buf, sizeof sp_pkey_read_buf);
+    ERR_clear_error();
+    return sp_ec_fail(curve ? "EC key without its key bytes" : "EC key on a curve without a name");
+  }
+  ERR_clear_error();
+  sp_ffi_bin_len = (int)n;
+  return sp_pkey_read_buf;
+}
+
 /* RSA signature verification over a public key given as its two halves, the
    big-endian modulus and exponent bytes: the form every protocol that names
    an RSA key carries it in (a COSE key's n and e, a JWK's). `md_name` is the
@@ -970,4 +1431,273 @@ sp_int sp_rsa_verify(const char *n_bytes, const char *e_bytes, const char *md_na
   ERR_clear_error();
   if (!rc) sp_ssl_note("signature did not verify");
   return rc;
+}
+
+/* An EVP_PKEY from the PKCS#1 DER a private PKey::RSA holds, or NULL: what
+   sp_rsa_sign signs with, and what a context's RSA key is loaded from. */
+static EVP_PKEY *sp_rsa_evp_private(const char *der) {
+  const unsigned char *p = (const unsigned char *)der;
+  size_t len = sp_str_byte_len(der);
+
+  if (len == 0 || len > (size_t)INT_MAX) return NULL;
+  return d2i_PrivateKey(EVP_PKEY_RSA, NULL, &p, (long)len);
+}
+
+/* RSA signing, the mirror of sp_rsa_verify, with the private key as the
+   PKCS#1 DER PKey.read answers: PKCS#1 v1.5 (pss 0), or PSS with MGF1 over
+   `mgf1_name` and the salt length `saltlen` (-1 the digest's length, -3 the
+   most that fits, else that many bytes), which are CRuby's
+   `sign(md, data)` and `sign_pss(md, data, salt_length:, mgf1_hash:)`.
+   Answers the signature, or "" with the reason in last_error, which starts
+   "unsupported digest algorithm" when a digest name resolves to nothing. */
+static SP_TLS sp_x509_out sp_rsa_sig_out;
+
+const char *sp_rsa_sign(const char *der, const char *md_name, const char *data, sp_int pss,
+                        const char *mgf1_name, sp_int saltlen) {
+  const EVP_MD *md = EVP_get_digestbyname(md_name);
+  const EVP_MD *mgf1 = pss ? EVP_get_digestbyname(mgf1_name) : md;
+  EVP_PKEY *pkey = NULL;
+  EVP_MD_CTX *ctx = NULL;
+  EVP_PKEY_CTX *pctx = NULL;
+  size_t n = 0;
+  int ok = 0;
+
+  sp_ssl_errbuf[0] = 0;
+  if (!md || !mgf1) {
+    snprintf(sp_ssl_errbuf, sizeof sp_ssl_errbuf, "unsupported digest algorithm: %s",
+             md ? mgf1_name : md_name);
+    sp_ffi_bin_len = 0;
+    return "";
+  }
+  if (!(pkey = sp_rsa_evp_private(der))) { ERR_clear_error(); return sp_ec_fail("RSA private key"); }
+  if ((ctx = EVP_MD_CTX_new()) &&
+      EVP_DigestSignInit(ctx, &pctx, md, NULL, pkey) == 1 &&
+      (!pss || (EVP_PKEY_CTX_set_rsa_padding(pctx, RSA_PKCS1_PSS_PADDING) > 0 &&
+                EVP_PKEY_CTX_set_rsa_pss_saltlen(pctx, (int)saltlen) > 0 &&
+                EVP_PKEY_CTX_set_rsa_mgf1_md(pctx, mgf1) > 0)) &&
+      EVP_DigestSign(ctx, NULL, &n, (const unsigned char *)data, sp_str_byte_len(data)) == 1 &&
+      n <= (size_t)INT_MAX && sp_x509_room(&sp_rsa_sig_out, n) &&
+      EVP_DigestSign(ctx, (unsigned char *)sp_rsa_sig_out.p, &n,
+                     (const unsigned char *)data, sp_str_byte_len(data)) == 1)
+    ok = 1;
+  if (!ok) sp_ssl_note("EVP_DigestSign");
+  EVP_MD_CTX_free(ctx);
+  EVP_PKEY_free(pkey);
+  ERR_clear_error();
+  if (!ok) { sp_ffi_bin_len = 0; return ""; }
+  sp_ffi_bin_len = (int)n;
+  return sp_rsa_sig_out.p;
+}
+
+/* A public RSA key's to_der, as CRuby answers it: the SubjectPublicKeyInfo
+   DER a PUBLIC KEY PEM holds, from the modulus and exponent bytes. "" with
+   the reason in last_error. */
+static SP_TLS sp_x509_out sp_rsa_pub_out;
+
+const char *sp_rsa_public_der(const char *n_bytes, const char *e_bytes) {
+  BIGNUM *n = BN_bin2bn((const unsigned char *)n_bytes, (int)sp_str_byte_len(n_bytes), NULL);
+  BIGNUM *e = BN_bin2bn((const unsigned char *)e_bytes, (int)sp_str_byte_len(e_bytes), NULL);
+  unsigned char *q;
+  RSA *rsa = NULL;
+  int len = 0;
+
+  sp_ssl_errbuf[0] = 0;
+#if defined(__GNUC__) || defined(__clang__)
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+  if (n && e && (rsa = RSA_new()) && RSA_set0_key(rsa, n, e, NULL)) {
+    n = NULL; e = NULL;                  /* the RSA owns them now */
+    if ((len = i2d_RSA_PUBKEY(rsa, NULL)) > 0 && sp_x509_room(&sp_rsa_pub_out, (size_t)len)) {
+      q = (unsigned char *)sp_rsa_pub_out.p;
+      if (i2d_RSA_PUBKEY(rsa, &q) != len) len = 0;
+    }
+    else len = 0;
+  }
+  RSA_free(rsa);
+#if defined(__GNUC__) || defined(__clang__)
+# pragma GCC diagnostic pop
+#endif
+  BN_free(n);
+  BN_free(e);
+  if (len <= 0) { ERR_clear_error(); return sp_ec_fail("i2d_RSA_PUBKEY"); }
+  sp_ffi_bin_len = len;
+  return sp_rsa_pub_out.p;
+}
+
+/* ---------- The server half ----------
+
+   A server's SSL_CTX is built per accept from the certificate and key bytes
+   the Ruby SSLContext holds (#9341, 2a), the way a client's is built per
+   connect: it lives in the connection's slot and goes with it at close, so
+   nothing here outlives a connection. That costs about 120 us an accept on
+   an M1, near what the handshake's own P-256 arithmetic costs, and a session
+   cannot resume across two accepts, a limit the client side already has.
+
+   `chain` is the certificates as sp_x509_load lays them out, a 4-byte
+   big-endian length before each DER: the leaf, then what is sent with it.
+   `curve` and `priv` are an EC key's curve name and private scalar, or for
+   an RSA key an empty name and its PKCS#1 DER. All three are empty for a
+   context with no certificate and key, and the handshake then fails as
+   CRuby's does there, with "no shared cipher". */
+
+/* An EVP_PKEY for SSL_CTX_use_PrivateKey, from the two things a PKey::EC
+   holds. The public point is derived here, as sp_ec_public_bytes derives
+   it, rather than trusted from the caller. */
+static EVP_PKEY *sp_ec_evp_private(const char *curve, const char *priv) {
+  int flen = 0;
+  EC_GROUP *g = sp_ec_group(curve, &flen);
+  BIGNUM *d = NULL;
+  EC_POINT *q = NULL;
+  EC_KEY *ec = NULL;
+  EVP_PKEY *k = NULL;
+  int ok = 0;
+
+  if (!g) return NULL;
+  if ((d = sp_ec_scalar(g, priv, flen)) && (q = EC_POINT_new(g)) &&
+      EC_POINT_mul(g, q, d, NULL, NULL, NULL)) {
+    /* EC_KEY is deprecated in OpenSSL 3.0, and EVP_PKEY_fromdata, which
+       replaces it, is not in the 1.1.0 this file compiles against; the same
+       trade sp_pkey_read makes. */
+#if defined(__GNUC__) || defined(__clang__)
+# pragma GCC diagnostic push
+# pragma GCC diagnostic ignored "-Wdeprecated-declarations"
+#endif
+    if ((ec = EC_KEY_new()) && EC_KEY_set_group(ec, g) &&
+        EC_KEY_set_private_key(ec, d) && EC_KEY_set_public_key(ec, q) &&
+        (k = EVP_PKEY_new()) && EVP_PKEY_assign_EC_KEY(k, ec)) {
+      ec = NULL;                       /* the EVP_PKEY owns it now */
+      ok = 1;
+    }
+    EC_KEY_free(ec);
+#if defined(__GNUC__) || defined(__clang__)
+# pragma GCC diagnostic pop
+#endif
+  }
+  if (!ok) { EVP_PKEY_free(k); k = NULL; }
+  EC_POINT_free(q);
+  BN_clear_free(d);
+  EC_GROUP_free(g);
+  return k;
+}
+
+/* A context's own certificates and key, a server's or a client's: the
+   certificate before the key, so SSL_CTX_use_PrivateKey is the call that
+   finds a key that is not the certificate's, with CRuby's reason for it.
+   Empty is no certificate. Answers 1, or 0 with the reason in
+   sp_ssl_last_error. */
+static int sp_ssl_use_chain(SSL_CTX *ctx, const char *chain, const char *curve, const char *priv) {
+  size_t len = sp_str_byte_len(chain), at = 0;
+
+  while (at < len) {
+    const unsigned char *p = (const unsigned char *)chain + at, *der = p + 4;
+    size_t n;
+    X509 *x = NULL;
+    int ok;
+
+    if (len - at < 4) break;
+    n = ((size_t)p[0] << 24) | ((size_t)p[1] << 16) | ((size_t)p[2] << 8) | p[3];
+    if (n > len - at - 4 || n > (size_t)INT_MAX || !(x = d2i_X509(NULL, &der, (long)n))) {
+      sp_ssl_note("certificate");
+      return 0;
+    }
+    if (at == 0) {
+      ok = SSL_CTX_use_certificate(ctx, x);      /* takes its own reference */
+      X509_free(x);
+      if (ok && (curve[0] || sp_str_byte_len(priv))) {
+        EVP_PKEY *k = curve[0] ? sp_ec_evp_private(curve, priv) : sp_rsa_evp_private(priv);
+        ok = k && SSL_CTX_use_PrivateKey(ctx, k);
+        EVP_PKEY_free(k);
+        if (!ok) { sp_ssl_note("SSL_CTX_use_PrivateKey"); return 0; }
+        /* A key of another kind than the certificate's goes into a slot of
+           its own rather than failing, and this is the call that finds it:
+           the slot the key went into has no certificate. */
+        if (!SSL_CTX_check_private_key(ctx)) { sp_ssl_note("SSL_CTX_check_private_key"); return 0; }
+      }
+    }
+    else {
+      ok = SSL_CTX_add_extra_chain_cert(ctx, x);  /* owns x once it succeeds */
+      if (!ok) X509_free(x);
+    }
+    if (!ok) { sp_ssl_note("SSL_CTX_use_certificate"); return 0; }
+    at += 4 + n;
+  }
+  if (at != len) { sp_ssl_note("certificate"); return 0; }
+  return 1;
+}
+
+/* Answers the context, or NULL with the reason in sp_ssl_last_error. It asks
+   for no client certificate; sp_ssl_accept_nb sets what verify_mode says. */
+static SSL_CTX *sp_ssl_server_ctx(const char *chain, const char *curve, const char *priv) {
+  SSL_CTX *ctx = SSL_CTX_new(TLS_server_method());
+
+  if (!ctx) { sp_ssl_note("SSL_CTX_new"); return NULL; }
+  /* The client side's floor and mode, for the same reasons. */
+  SSL_CTX_set_min_proto_version(ctx, TLS1_2_VERSION);
+  SSL_CTX_set_mode(ctx, SSL_MODE_ACCEPT_MOVING_WRITE_BUFFER);
+  SSL_CTX_set_verify(ctx, SSL_VERIFY_NONE, NULL);
+  if (!sp_ssl_use_chain(ctx, chain, curve, priv)) { SSL_CTX_free(ctx); return NULL; }
+  return ctx;
+}
+
+/* Begin a server connection on an accepted descriptor without waiting for
+   the handshake, the mirror of sp_ssl_connect_nb: O_NONBLOCK is armed here,
+   the first step is taken, and sp_ssl_want says what the next one waits for.
+   Ruby's accept and accept_nonblock both start here, so a client that
+   connects and never sends a ClientHello parks a green thread rather than
+   holding an OS worker. Answers the handle, or -1 when the connection could
+   not be built.
+   `verify` is the SSL_VERIFY_* bits a server's verify_mode holds, 0 unless
+   the program set it (4a in #9341): with SSL_VERIFY_PEER the server asks
+   for a client certificate and validates one against `cert_store`, which
+   is empty when the context has none, as CRuby's is. */
+sp_int sp_ssl_accept_nb(sp_int fd, const char *chain, const char *curve, const char *priv,
+                        sp_int verify, sp_RbVal cert_store) {
+  SSL_CTX *ctx;
+  SSL *ssl;
+  int i;
+
+  sp_ssl_want_state = 4;
+  sp_ssl_errbuf[0] = 0;
+  if (!(ctx = sp_ssl_server_ctx(chain, curve, priv))) return -1;
+  SSL_CTX_set_verify(ctx, (int)verify, NULL);
+  if (cert_store.tag != SP_TAG_NIL) {
+    sp_X509_Store *store = (sp_X509_Store *)cert_store.v.p;
+    if (store && store->store) SSL_CTX_set1_cert_store(ctx, store->store);
+  }
+  if (!(ssl = SSL_new(ctx))) { sp_ssl_note("SSL_new"); SSL_CTX_free(ctx); return -1; }
+  SSL_set_accept_state(ssl);
+  if (!SSL_set_fd(ssl, (int)fd)) {
+    sp_ssl_note("SSL_set_fd");
+    SSL_free(ssl); SSL_CTX_free(ctx);
+    return -1;
+  }
+  /* Claimed last, as sp_ssl_setup claims it. */
+  if ((i = sp_ssl_slot()) < 0) {
+    sp_ssl_note("too many TLS connections");
+    SSL_free(ssl); SSL_CTX_free(ctx);
+    return -1;
+  }
+  sp_ssl_conn *c = &sp_ssl_tab[i];
+  c->ssl = ssl;
+  c->ctx = ctx;
+  c->fd  = (int)fd;
+  c->nonblock = 1;
+  SP_ATOMIC_STORE(&c->in_use, 1, __ATOMIC_RELEASE);
+  int fl = fcntl(c->fd, F_GETFL, 0);
+  if (fl >= 0) fcntl(c->fd, F_SETFL, fl | O_NONBLOCK);
+  sp_ssl_handshake_step(c);
+  return i;
+}
+
+/* add_certificate's check, made when it is called, as CRuby makes it: the
+   context an accept would build is built and dropped. 1 when the key is the
+   certificate's, 0 with the reason in sp_ssl_last_error. */
+sp_int sp_ssl_server_check(const char *chain, const char *curve, const char *priv) {
+  SSL_CTX *ctx;
+
+  sp_ssl_errbuf[0] = 0;
+  if (!(ctx = sp_ssl_server_ctx(chain, curve, priv))) return 0;
+  SSL_CTX_free(ctx);
+  return 1;
 }

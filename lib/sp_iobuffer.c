@@ -40,8 +40,25 @@ static SP_NORETURN void iob_arg(const char *msg) { sp_raise_cls("ArgumentError",
    each with its own message (matched against CRuby empirically; note the
    lock also survives an exception out of the block). */
 static void iob_readable(sp_IOBuffer *b) { (void)b; }
-static void iob_writable(sp_IOBuffer *b) {
+static int iob_slice_invalid(sp_IOBuffer *b);
+/* CRuby's io_buffer_get_bytes_for_writing: a read-only buffer, then an
+   invalidated slice, which a WRITE reports as "Buffer is invalid!" (a read
+   says "Buffer has been invalidated!", iob_ptr). Every writing operation
+   calls this before it touches the bytes, even for a zero-length write, at
+   the point CRuby does: set_value / set_values first of all, set_string /
+   copy / clear after their argument checks and before the range checks,
+   and!/or!/xor! after the mask checks. read / pread are the exception:
+   CRuby validates them as reads (iob_io_span). The typed setters split it
+   (iob_value_wptr) so that a write looks at the slice once. */
+static void iob_readonly(sp_IOBuffer *b) {
   if (b->flags & SP_IOB_READONLY) sp_raise_cls("IO::Buffer::AccessError", "Buffer is not writable!");
+}
+static void iob_writable_slice(sp_IOBuffer *b) {
+  if (iob_slice_invalid(b)) sp_raise_cls("IO::Buffer::InvalidatedError", "Buffer is invalid!");
+}
+static void iob_writable(sp_IOBuffer *b) {
+  iob_readonly(b);
+  iob_writable_slice(b);
 }
 
 /* the value's Ruby spelling for TypeError messages (nil/true/false read as
@@ -140,6 +157,26 @@ static uint8_t *iob_value_ptr(sp_IOBuffer *b, int64_t off, int width) {
     iob_arg(sp_sprintf("Type extends beyond end of buffer! (offset=%lld > size=%lld)",
                        (long long)off, (long long)b->size));
   return iob_ptr(b) + off;
+}
+/* The same for a write, past iob_readonly. CRuby looks at an invalidated
+   slice before the offset; this looks at it once, where the bytes are
+   taken, and ahead of the range error only when there is one -- the order
+   CRuby raises in, without a second look on every write. */
+static int iob_value_oob(sp_IOBuffer *b, int64_t off, int width) {
+  return off < 0 || b->size < width || off > b->size - width;
+}
+static SP_NORETURN void iob_value_range_error(sp_IOBuffer *b, int64_t off) {
+  if (off < 0) iob_arg("Offset can't be negative!");
+  iob_arg(sp_sprintf("Type extends beyond end of buffer! (offset=%lld > size=%lld)",
+                     (long long)off, (long long)b->size));
+}
+static uint8_t *iob_value_wptr(sp_IOBuffer *b, int64_t off, int width) {
+  if (iob_value_oob(b, off, width)) {
+    iob_writable_slice(b);
+    iob_value_range_error(b, off);
+  }
+  iob_writable_slice(b);
+  return iob_base(b) + off;
 }
 
 /* ---- raw loads/stores (byte-assembled: host-endian agnostic) ---- */
@@ -278,10 +315,13 @@ static sp_RbVal iob_get_core(sp_IOBuffer *b, int ty, int64_t off) {
   return sp_box_int((sp_int)raw);
 }
 
+/* Answers the offset just past the value, as CRuby does (set_values
+   chains it). CRuby checks the buffer -- read-only, then an invalidated
+   slice -- before the offset and the value. */
 static sp_int iob_set_core(sp_IOBuffer *b, int ty, int64_t off, sp_RbVal val) {
   const IobType *t = &iob_types[ty];
-  iob_writable(b);
-  uint8_t *p = iob_value_ptr(b, off, t->width);
+  iob_readonly(b);
+  uint8_t *p = iob_value_wptr(b, off, t->width);
   if (t->flt) {
     double f = iob_float_operand(val);
     uint64_t raw;
@@ -292,7 +332,7 @@ static sp_int iob_set_core(sp_IOBuffer *b, int ty, int64_t off, sp_RbVal val) {
   else {
     iob_store(p, t->width, t->be, iob_int_operand(ty, val));
   }
-  return t->width;
+  return off + t->width;
 }
 
 /* ---- constructors ---- */
@@ -301,8 +341,17 @@ static void iob_scan(void *p) {
   sp_IOBuffer *b = (sp_IOBuffer *)p;
   if (b->source) sp_gc_mark(b->source);
 }
+/* The bytes this buffer's own malloc holds: a slice's data is NULL, a
+   mapping is the file's pages, not the heap's. They are counted to the
+   header (sp_gc_payload_resize) as a String's or a Hash's are: uncounted,
+   a buffer weighed its header alone, so a program churning large buffers
+   grew by gigabytes without a collection. */
+static size_t iob_owned(sp_IOBuffer *b) {
+  return b->data && !b->map_base ? (size_t)b->size : 0;
+}
 /* Give the allocation back: munmap for a mapped file, free otherwise. */
 static void iob_release(sp_IOBuffer *b) {
+  sp_gc_payload_resize(b, iob_owned(b), 0);
   if (b->map_base) { munmap(b->map_base, b->map_len); b->map_base = NULL; b->map_len = 0; }
   else free(b->data);
   b->data = NULL;
@@ -335,6 +384,7 @@ static void iob_allocate(sp_IOBuffer *b, int64_t size, uint32_t flags, int flags
   if (size > 0) {
     b->data = (uint8_t *)calloc(1, (size_t)size);
     if (!b->data) sp_oom_die();
+    sp_gc_payload_resize(b, 0, (size_t)size);
   }
 }
 
@@ -364,6 +414,7 @@ sp_IOBuffer *sp_IOBuffer_become_for(sp_IOBuffer *b, const char *s) {
   b->source = NULL;
   b->off = 0;
   b->size = (int64_t)n;
+  sp_gc_payload_resize(b, 0, n);
   b->flags = SP_IOB_EXTERNAL | SP_IOB_READONLY | SP_IOB_SLICE;
   return b;
 }
@@ -373,8 +424,16 @@ sp_IOBuffer *sp_IOBuffer_become_for(sp_IOBuffer *b, const char *s) {
 sp_RbVal sp_IOBuffer_get_value(sp_IOBuffer *b, sp_RbVal type, sp_int off) {
   return iob_get_core(b, iob_decode_type(type), off);
 }
+/* CRuby checks the buffer before the type name: a bad name looks at it
+   first, and a good one leaves it to iob_set_core, once */
 sp_int sp_IOBuffer_set_value(sp_IOBuffer *b, sp_RbVal type, sp_int off, sp_RbVal val) {
-  return iob_set_core(b, iob_decode_type(type), off, val);
+  int ty = type.tag == SP_TAG_SYM && sp_sym_name_fn
+         ? sp_IOBuffer_type_of(sp_sym_name_fn((sp_sym)type.v.i)) : -1;
+  if (ty < 0) {
+    iob_writable(b);
+    iob_arg("Invalid type name!");
+  }
+  return iob_set_core(b, ty, off, val);
 }
 
 sp_int sp_IOBuffer_get_i(sp_IOBuffer *b, sp_int ty, sp_int off) {
@@ -409,6 +468,13 @@ sp_int sp_IOBuffer_set_f(sp_IOBuffer *b, sp_int ty, sp_int off, double v) {
 sp_int sp_IOBuffer_set_v(sp_IOBuffer *b, sp_int ty, sp_int off, sp_RbVal v) {
   return iob_set_core(b, ty, off, v);
 }
+/* set_values (packages/io/io/buffer.rb) checks the buffer before its
+   arguments, as CRuby does, so an empty or malformed call on a read-only
+   buffer or an invalidated slice still raises */
+sp_IOBuffer *sp_IOBuffer_check_writable(sp_IOBuffer *b) {
+  iob_writable(b);
+  return b;
+}
 
 /* ---- strings ---- */
 
@@ -437,13 +503,13 @@ const char *sp_IOBuffer_get_string1(sp_IOBuffer *b, sp_int off) { return iob_get
 const char *sp_IOBuffer_get_string2(sp_IOBuffer *b, sp_int off, sp_int len) { return iob_get_string(b, off, len, 1); }
 
 static sp_int iob_set_string(sp_IOBuffer *b, const char *s, int64_t off, int64_t len, int64_t soff, int len_given) {
-  iob_writable(b);
   int64_t slen = (int64_t)sp_str_byte_len(s);
   if (off < 0) iob_arg("Offset can't be negative!");
   if (soff < 0) iob_arg("Source offset can't be negative!");
   if (soff > slen) iob_arg("The given source offset is bigger than the source itself!");
   if (!len_given) len = slen - soff;
   if (len < 0) iob_arg("Length can't be negative!");
+  iob_writable(b);
   /* destination range before source range, as CRuby orders them */
   if (off > b->size || len > b->size - off) iob_arg("Specified offset+length is bigger than the buffer size!");
   if (len > slen - soff) iob_arg("The computed source range exceeds the size of the source buffer!");
@@ -481,36 +547,44 @@ sp_IOBuffer *sp_IOBuffer_resize(sp_IOBuffer *b, sp_int size) {
     b->off = 0;
     b->data = d;
     b->size = size;
+    sp_gc_payload_resize(b, 0, iob_owned(b));
     b->flags = SP_IOB_INTERNAL | (b->flags & SP_IOB_READONLY);
     return b;
   }
   if (size == 0) {
-    free(b->data);
-    b->data = NULL;
+    iob_release(b);
     b->size = 0;
     return b;
   }
+  size_t was = iob_owned(b);
   uint8_t *d = (uint8_t *)realloc(b->data, (size_t)size);
   if (!d) sp_oom_die();
   if (size > b->size) memset(d + b->size, 0, (size_t)(size - b->size));
   b->data = d;
   b->size = size;
+  sp_gc_payload_resize(b, was, (size_t)size);
   if (!(b->flags & (SP_IOB_INTERNAL | SP_IOB_MAPPED))) b->flags |= SP_IOB_INTERNAL;
   return b;
 }
 
-static sp_IOBuffer *iob_clear(sp_IOBuffer *b, int64_t v, int64_t off, int64_t len) {
+/* An offset past the end names the offset only when the length was
+   defaulted, as in get_string; the buffer is checked after the arguments. */
+static sp_IOBuffer *iob_clear(sp_IOBuffer *b, int64_t v, int64_t off, int64_t len, int len_given) {
+  if (off < 0) iob_arg("Offset can't be negative!");
+  if (!len_given) {
+    if (off > b->size) iob_arg("The given offset is bigger than the buffer size!");
+    len = b->size - off;
+  }
+  if (len < 0) iob_arg("Length can't be negative!");
   iob_writable(b);
   iob_range(b, off, len);
   if (len > 0) memset(iob_ptr(b) + off, (int)(uint8_t)v, (size_t)len);
   return b;
 }
-sp_IOBuffer *sp_IOBuffer_clear0(sp_IOBuffer *b) { return iob_clear(b, 0, 0, b->size); }
-sp_IOBuffer *sp_IOBuffer_clear1(sp_IOBuffer *b, sp_int v) { return iob_clear(b, v, 0, b->size); }
-sp_IOBuffer *sp_IOBuffer_clear2(sp_IOBuffer *b, sp_int v, sp_int off) {
-  return iob_clear(b, v, off, off <= b->size ? b->size - off : 0);
-}
-sp_IOBuffer *sp_IOBuffer_clear3(sp_IOBuffer *b, sp_int v, sp_int off, sp_int len) { return iob_clear(b, v, off, len); }
+sp_IOBuffer *sp_IOBuffer_clear0(sp_IOBuffer *b) { return iob_clear(b, 0, 0, 0, 0); }
+sp_IOBuffer *sp_IOBuffer_clear1(sp_IOBuffer *b, sp_int v) { return iob_clear(b, v, 0, 0, 0); }
+sp_IOBuffer *sp_IOBuffer_clear2(sp_IOBuffer *b, sp_int v, sp_int off) { return iob_clear(b, v, off, 0, 0); }
+sp_IOBuffer *sp_IOBuffer_clear3(sp_IOBuffer *b, sp_int v, sp_int off, sp_int len) { return iob_clear(b, v, off, len, 1); }
 
 static sp_IOBuffer *iob_other(sp_IOBuffer *b, sp_RbVal v) {
   if (v.tag == SP_TAG_OBJ && v.v.p && v.cls_id == (int)b->cls_id) return (sp_IOBuffer *)v.v.p;
@@ -520,13 +594,17 @@ static sp_IOBuffer *iob_other(sp_IOBuffer *b, sp_RbVal v) {
 
 static sp_int iob_copy(sp_IOBuffer *b, sp_RbVal srcv, int64_t off, int64_t len, int64_t soff, int len_given) {
   sp_IOBuffer *src = iob_other(b, srcv);
-  iob_writable(b);
   iob_readable(src);
+  /* CRuby takes the source's bytes for reading before anything else: an
+     invalidated source raises the read message ahead of every argument
+     and destination check */
+  (void)iob_ptr(src);
   if (off < 0) iob_arg("Offset can't be negative!");
   if (soff < 0) iob_arg("Source offset can't be negative!");
   if (soff > src->size) iob_arg("The given source offset is bigger than the source itself!");
   if (!len_given) len = src->size - soff;
   if (len < 0) iob_arg("Length can't be negative!");
+  iob_writable(b);
   /* destination range before source range, as CRuby orders them */
   if (off > b->size || len > b->size - off) iob_arg("Specified offset+length is bigger than the buffer size!");
   if (len > src->size - soff)
@@ -563,6 +641,9 @@ sp_IOBuffer *sp_IOBuffer_transfer(sp_IOBuffer *b) {
   if (b->flags & SP_IOB_LOCKED)
     sp_raise_cls("IO::Buffer::LockedError", "Cannot transfer ownership of locked buffer!");
   sp_IOBuffer *t = iob_alloc_obj(b->cls_id);
+  size_t owned = iob_owned(b);
+  sp_gc_payload_resize(b, owned, 0);
+  sp_gc_payload_resize(t, 0, owned);
   t->data = b->data;
   t->source = b->source;
   t->off = b->off;
@@ -601,6 +682,7 @@ sp_IOBuffer *sp_IOBuffer_dup_m(sp_IOBuffer *b) {
     if (!d->data) sp_oom_die();
     if (b->size > 0) memcpy(d->data, base, (size_t)b->size);
     d->size = b->size;
+    sp_gc_payload_resize(d, 0, (size_t)d->size);
     d->flags = SP_IOB_INTERNAL;
   }
   return d;
@@ -786,6 +868,7 @@ static sp_IOBuffer *iob_bitop(sp_IOBuffer *b, sp_RbVal otherv, iob_bop op) {
     const uint8_t *pa = iob_ptr(b), *pb = iob_ptr(o);
     for (int64_t i = 0; i < n; i++) r->data[i] = op(pa[i], pb[i % o->size]);
     r->size = n;
+    sp_gc_payload_resize(r, 0, (size_t)n);
     r->flags = SP_IOB_INTERNAL;
   }
   return r;
@@ -803,6 +886,7 @@ sp_IOBuffer *sp_IOBuffer_not(sp_IOBuffer *b) {
     const uint8_t *p = iob_base(b);
     for (int64_t i = 0; i < b->size; i++) r->data[i] = (uint8_t)~p[i];
     r->size = b->size;
+    sp_gc_payload_resize(r, 0, (size_t)r->size);
     r->flags = SP_IOB_INTERNAL;
   }
   return r;
@@ -810,9 +894,9 @@ sp_IOBuffer *sp_IOBuffer_not(sp_IOBuffer *b) {
 
 static sp_IOBuffer *iob_bitop_ip(sp_IOBuffer *b, sp_RbVal otherv, iob_bop op) {
   sp_IOBuffer *o = iob_other(b, otherv);
-  iob_writable(b);
   iob_readable(o);
   if (o->size == 0) sp_raise_cls("IO::Buffer::MaskError", "Zero-length mask given!");
+  iob_writable(b);
   uint8_t *pa = iob_ptr(b);
   const uint8_t *pb = iob_ptr(o);
   for (int64_t i = 0; i < b->size; i++) pa[i] = op(pa[i], pb[i % o->size]);
@@ -844,9 +928,10 @@ sp_IOBuffer *sp_IOBuffer_unlock(sp_IOBuffer *b) {
    An IO::Buffer passed to an ffi_func pointer argument hands C its base
    address, as CRuby's rb_io_buffer_get_bytes_for_reading / _for_writing do:
    NULL for a null buffer (freed, or zero-sized), InvalidatedError for a
-   slice whose source was freed or shrunk under it, and AccessError for a
-   read-only buffer in a slot other than :buffer_in. A nil (a buffer-typed
-   local that holds none) is NULL, as it is for :ptr. */
+   slice whose source was freed or shrunk under it ("Buffer is invalid!" in
+   a writing slot, "Buffer has been invalidated!" in :buffer_in), and
+   AccessError for a read-only buffer in a slot other than :buffer_in. A
+   nil (a buffer-typed local that holds none) is NULL, as it is for :ptr. */
 void *sp_IOBuffer_ffi_base(sp_IOBuffer *b, sp_int writing) {
   if (!b) return NULL;
   if (writing) iob_writable(b);
@@ -903,12 +988,21 @@ static sp_File *iob_io(sp_RbVal io) {
   }
   sp_raise_cls("TypeError", sp_sprintf("wrong argument type %s (expected IO)", iob_val_name(io)));
 }
-/* the span [offset, offset+length) of the buffer, length < 0 meaning nil */
+/* the span [offset, offset+length) of the buffer, length < 0 meaning nil.
+   CRuby's read / pread validate it as a READ ("Buffer has been
+   invalidated!") before the range, and refuse a read-only one after it. */
 static uint8_t *iob_io_span(sp_IOBuffer *b, sp_int *length, sp_int offset, int writing) {
-  if (writing) iob_writable(b);
+  if (offset < 0) iob_arg("Offset can't be negative!");
+  uint8_t *base = iob_ptr(b);
+  if (*length < 0 && offset > b->size) iob_arg("The given offset is bigger than the buffer size!");
   if (*length < 0) *length = b->size - offset;
   iob_range(b, offset, *length);
-  uint8_t *base = iob_ptr(b);
+  /* CRuby moves the span from offset to the end of the buffer whatever
+     length says (io_buffer_read: a read of size - offset bytes): length
+     only bounds the check, so `b.read(io, 5)` into a 16-byte buffer reads
+     16, and `b.write(io, 5)` from an 11-byte one writes 11 */
+  *length = b->size - offset;
+  if (writing && (b->flags & SP_IOB_READONLY)) sp_raise_cls("IO::Buffer::AccessError", "Buffer is not writable!");
   if (!base) sp_raise_cls("IO::Buffer::AccessError", "Buffer is not allocated!");
   return base + offset;
 }
@@ -949,7 +1043,7 @@ sp_int sp_IOBuffer_write_io(sp_IOBuffer *b, sp_RbVal io, sp_int length, sp_int o
 sp_int sp_IOBuffer_pread_io(sp_IOBuffer *b, sp_RbVal io, sp_int from, sp_int length, sp_int offset) {
   SP_GC_ROOT(b); SP_GC_ROOT_RBVAL(io);
   sp_File *f = iob_io(io);
-  if (from < 0) iob_arg("Position can't be negative!");
+  if (from < 0) return -(sp_int)EINVAL;   /* the syscall's answer, as CRuby hands it on */
   uint8_t *at = iob_io_span(b, &length, offset, 1);
   if (length == 0) return 0;
   ssize_t n;
@@ -959,7 +1053,7 @@ sp_int sp_IOBuffer_pread_io(sp_IOBuffer *b, sp_RbVal io, sp_int from, sp_int len
 sp_int sp_IOBuffer_pwrite_io(sp_IOBuffer *b, sp_RbVal io, sp_int from, sp_int length, sp_int offset) {
   SP_GC_ROOT(b); SP_GC_ROOT_RBVAL(io);
   sp_File *f = iob_io(io);
-  if (from < 0) iob_arg("Position can't be negative!");
+  if (from < 0) return -(sp_int)EINVAL;   /* the syscall's answer, as CRuby hands it on */
   uint8_t *at = iob_io_span(b, &length, offset, 0);
   if (length == 0) return 0;
   if (fflush(f->fp) != 0) return -(sp_int)errno;

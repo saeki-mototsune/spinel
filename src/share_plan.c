@@ -98,6 +98,7 @@
 #include "call_plan.h"
 #include "repr.h"
 #include "share.h"
+#include "value_pos.h"
 
 int share_plan_form(int need, int supply) {
   if (need == SPN_BYTES) return SPF_BYTES;
@@ -123,12 +124,16 @@ static int share_plan_self_recv(Compiler *c, int v) {
   int nb = strbuf_narrowed_box_conversion(c, v);
   if (nb >= 0) return nb;
   const char *nm = nt_str(nt, v, "name");
-  int r = unwrap_parens(c, nt_ref(nt, v, "receiver")), tg[CPT_MAX];
+  int r = nt_paren_single(nt, nt_ref(nt, v, "receiver")), tg[CPT_MAX];
   int any_recv = nm && ((sp_streq(nm, "itself") && call_plain_argc(c, v) == 0 && nt_ref(nt, v, "block") < 0) ||
                         (is_tap_name(nm) && nt_ref(nt, v, "block") >= 0));
   if (!nm || r < 0 || (c->ntype[r] != TY_STRING && c->ntype[r] != TY_STRBUF && !(any_recv && c->ntype[r] == TY_POLY)))
     return -1;
-  if (!any_recv && !(bop_answers_self(TY_STRING, nm, call_plain_argc(c, v), nt_ref(nt, v, "block") >= 0) &
+  /* (a String's to_s or to_str answers the String itself where it is no
+     subclass's instance, BOPF_SELF_EXACT: a bang's on a boxed receiver,
+     the box's String or nil, whose handle emit_strbuf_value takes) */
+  int exact = (sp_streq(nm, "to_s") || sp_streq(nm, "to_str")) && face_str_bang_call(c, r);
+  if (!any_recv && !exact && !(bop_answers_self(TY_STRING, nm, call_plain_argc(c, v), nt_ref(nt, v, "block") >= 0) &
                      (BOPF_SELF | BOPF_SELF_OR_NIL)))
     return -1;
   return cplan_targets(c, v, tg, CPT_MAX) == 0 ? r : -1;
@@ -197,7 +202,7 @@ static int share_plan_producer_core(Compiler *c, int v, int *op, int unlifted) {
   if (share_frozen_string(c, v)) return SPK_FROZEN;
   /* (a chain whose base is held as its handle where a mutator takes it,
      strbuf_held_chain: that held handle, SPK_SELF with no operand) */
-  if (strbuf_held_chain(c, an_unparen(nt, v))) return SPK_SELF;
+  if (strbuf_held_chain(c, nt_paren_single(nt, v))) return SPK_SELF;
   int rv = share_plan_self_recv(c, v);
   if (rv >= 0) { *op = rv; return SPK_SELF; }
   if (face_str_bang_call(c, v)) { *op = nt_ref(nt, v, "receiver"); return SPK_BANG_BOX; }
@@ -210,7 +215,7 @@ static int share_plan_producer_core(Compiler *c, int v, int *op, int unlifted) {
   if (share_plan_exc_super(c, v)) return SPK_EXC_SUPER;
   /* (a call whose answer the C picks up after it, the handle its targets
      publish: that pickup, whatever route the call is besides) */
-  { int u = an_unparen(nt, v);
+  { int u = nt_paren_single(nt, v);
     if (u >= 0 && nt_kind(nt, u) == NK_CallNode && strbuf_call_picks_up(c, u)) return SPK_PUBLISHED; }
   int k = unlifted ? share_node_carry_kind_unlifted(c, v, op) : share_node_carry_kind(c, v, op);
   if (k != SPK_NONE) return k;
@@ -239,6 +244,12 @@ const char *share_plan_kind_name(int kind) {
                                        "sequence", "lift" };
   _Static_assert(sizeof names / sizeof names[0] == SPK__COUNT, "a name for each producer kind");
   return kind >= 0 && kind < SPK__COUNT ? names[kind] : "?";
+}
+
+int share_plan_producer_unlifted(Compiler *c, int v, int *operand) {
+  int rv, k = share_plan_producer_core(c, v, &rv, 1);
+  if (operand) *operand = rv;
+  return k;
 }
 
 int share_plan_producer(Compiler *c, int v, int *operand) {
@@ -307,111 +318,74 @@ static int share_plan_body_ok(Compiler *c, int body, NodeKind k, int foreign, in
 /* Does conditional (or begin, or rescue modifier) v hand on what each of
    its arms supplies: is every arm a leaf that gives the consumer what it
    needs? `l && r` answers r where l is a String (l is truthy), and l only
-   where l is nil or false, so l is no String leaf. */
-static int share_plan_arms_ok(Compiler *c, int v, int depth) {
+   where l is nil or false, so l is no String leaf. The arms are read through
+   the iterator (a begin is a leaf of it, which share_plan_arm_bad takes
+   apart, arm by arm, as a body's last statement); `+g` answers g itself, or
+   a new String where g is frozen, so its arms are g's. */
+typedef struct { Compiler *c; int depth; } SharePlanArms;
+static int share_plan_arms_ok(Compiler *c, int v, int depth);
+static int share_plan_arm_bad(const VpLeaf *lf, void *ud) {
+  const SharePlanArms *a = ud;
+  Compiler *c = a->c;
   const NodeTable *nt = c->nt;
-  if (v < 0) return 1;
-  if (depth > 16) return 0;
-  switch (nt_kind(nt, v)) {
-  case NK_ParenthesesNode:
-    return share_plan_arms_ok(c, nt_ref(nt, v, "body"), depth + 1);
-  case NK_StatementsNode: {
-    int n = 0;
-    const int *bb = nt_arr(nt, v, "body", &n);
-    return n == 0 || share_plan_arms_ok(c, bb[n - 1], depth + 1);
-  }
-  case NK_ElseNode:
-    return share_plan_arms_ok(c, nt_ref(nt, v, "statements"), depth + 1);
-  case NK_IfNode: case NK_UnlessNode:
-    return share_plan_arms_ok(c, nt_ref(nt, v, "statements"), depth + 1) &&
-           share_plan_arms_ok(c, nt_ref(nt, v, nt_kind(nt, v) == NK_IfNode ? "subsequent" : "else_clause"), depth + 1);
-  case NK_OrNode:
-    return share_plan_arms_ok(c, nt_ref(nt, v, "left"), depth + 1) && share_plan_arms_ok(c, nt_ref(nt, v, "right"), depth + 1);
-  case NK_AndNode:
-    return share_plan_arms_ok(c, nt_ref(nt, v, "right"), depth + 1);
-  case NK_CaseNode: case NK_CaseMatchNode: {
-    int nw = 0;
-    const int *whens = nt_arr(nt, v, "conditions", &nw);
-    for (int w = 0; w < nw; w++)
-      if (!share_plan_arms_ok(c, nt_ref(nt, whens[w], "statements"), depth + 1)) return 0;
-    return share_plan_arms_ok(c, nt_ref(nt, v, "else_clause"), depth + 1);
-  }
-  case NK_RescueModifierNode:
-    return share_plan_arms_ok(c, nt_ref(nt, v, "expression"), depth + 1) &&
-           share_plan_arms_ok(c, nt_ref(nt, v, "rescue_expression"), depth + 1);
-  case NK_BeginNode: {
+  int v = lf->node, depth = a->depth;
+  if (lf->kind == VPK_NIL) return 0;
+  if (lf->kind == VPK_GAVE_UP) return 1;
+  if (nt_kind(nt, v) == NK_BeginNode) {
     int el = nt_ref(nt, v, "else_clause");
     /* (the body's value is the begin's only when no else follows it) */
-    if (el < 0 && !share_plan_body_ok(c, nt_ref(nt, v, "statements"), NK_NONE, 0, depth)) return 0;
+    if (el < 0 && !share_plan_body_ok(c, nt_ref(nt, v, "statements"), NK_NONE, 0, depth)) return 1;
     for (int rc = nt_ref(nt, v, "rescue_clause"); rc >= 0; rc = nt_ref(nt, rc, "subsequent"))
-      if (!share_plan_body_ok(c, nt_ref(nt, rc, "statements"), NK_NONE, 0, depth)) return 0;
-    return el < 0 || share_plan_body_ok(c, nt_ref(nt, el, "statements"), NK_NONE, 0, depth);
+      if (!share_plan_body_ok(c, nt_ref(nt, rc, "statements"), NK_NONE, 0, depth)) return 1;
+    return el >= 0 && !share_plan_body_ok(c, nt_ref(nt, el, "statements"), NK_NONE, 0, depth);
   }
-  case NK_CallNode: {
+  if (nt_kind(nt, v) == NK_CallNode) {
     /* `+g` answers g itself, or a new String where g is frozen */
     const char *nm = nt_str(nt, v, "name");
     int r = nt_ref(nt, v, "receiver");
-    if (nm && is_unary_plus(nm) && r >= 0 && nt_ref(nt, v, "arguments") < 0) return share_plan_arms_ok(c, r, depth + 1);
-    return share_plan_leaf_ok(c, v, 0, depth);
+    if (nm && is_unary_plus(nm) && r >= 0 && nt_ref(nt, v, "arguments") < 0) return !share_plan_arms_ok(c, r, depth + 1);
   }
-  default:
-    return share_plan_leaf_ok(c, v, 0, depth);
-  }
+  return !share_plan_leaf_ok(c, v, 0, depth);
+}
+static int share_plan_arms_ok(Compiler *c, int v, int depth) {
+  SharePlanArms a = { c, depth };
+  return !for_each_value_position(c->nt, v, VPS_IF | VPS_UNLESS | VPS_CASE | VPS_CASE_IN | VPS_RESCUE_MOD | VPS_LOGIC,
+                                  share_plan_arm_bad, &a);
 }
 
 /* Does the handle face render a spliced block's value a, a tail or a
    `next`'s, as the handle it names, where the splice reads it under the
-   handle demand (emit_block_invoke)? Every producer kind but a few: a bang
-   on a runtime element of a container a builtin made, whose answer is a
-   new String the container never sees, and a call answering its own
-   block's value that is no route the face takes (strbuf_tail_plain). The
-   value's other kinds and a chain over one of these can, and a conditional
-   each of whose arms is one. */
-static int share_plan_tail_renders(Compiler *c, int a, int depth) {
+   handle demand (emit_block_invoke)? Every producer kind but a call
+   answering its own block's value that is no route the face takes
+   (strbuf_tail_plain). The value's other kinds and a chain over one of
+   these can, and a conditional each of whose arms is one. */
+static int share_plan_tail_renders(Compiler *c, int a);
+static int share_plan_tail_unrendered(const VpLeaf *lf, void *ud) {
+  Compiler *c = ud;
   const NodeTable *nt = c->nt;
-  a = an_unparen(nt, a);
-  if (a < 0) return 1;
-  if (depth > 16) return 0;
-  switch (nt_kind(nt, a)) {
-  case NK_IfNode: case NK_UnlessNode:
-    return share_plan_tail_renders(c, nt_ref(nt, a, "statements"), depth + 1) &&
-           share_plan_tail_renders(c, nt_ref(nt, a, nt_kind(nt, a) == NK_IfNode ? "subsequent" : "else_clause"), depth + 1);
-  case NK_OrNode: case NK_AndNode:
-    return share_plan_tail_renders(c, nt_ref(nt, a, "left"), depth + 1) &&
-           share_plan_tail_renders(c, nt_ref(nt, a, "right"), depth + 1);
-  case NK_ElseNode:
-    return share_plan_tail_renders(c, nt_ref(nt, a, "statements"), depth + 1);
-  case NK_StatementsNode: {
-    int n = 0;
-    const int *bb = nt_arr(nt, a, "body", &n);
-    return n == 0 || share_plan_tail_renders(c, bb[n - 1], depth + 1);
-  }
-  case NK_CaseNode: case NK_CaseMatchNode: {
-    int nw = 0;
-    const int *whens = nt_arr(nt, a, "conditions", &nw);
-    for (int w = 0; w < nw; w++)
-      if (!share_plan_tail_renders(c, nt_ref(nt, whens[w], "statements"), depth + 1)) return 0;
-    return share_plan_tail_renders(c, nt_ref(nt, a, "else_clause"), depth + 1);
-  }
-  default: break;
-  }
-  if (face_bang_on_runtime_elems(c, a)) return 0;
+  int a = lf->node;
+  if (lf->kind == VPK_NIL) return 0;
+  if (lf->kind == VPK_GAVE_UP) return 1;
   int o, k = share_plan_producer_at(c, a, &o);
   if (k == SPK_LIFT) k = share_plan_producer_core(c, a, &o, 1);
   switch (k) {
   case SPK_BLOCK_VALUE:
-    return strbuf_tail_plain(c, a);
+    return !strbuf_tail_plain(c, a);
   case SPK_OPERAND: {
     /* (tap answers its receiver through its own block) */
     const char *nm = nt_kind(nt, a) == NK_CallNode ? nt_str(nt, a, "name") : NULL;
-    if (nm && is_tap_name(nm) && nt_ref(nt, a, "block") >= 0) return 0;
-    return o < 0 || share_plan_tail_renders(c, o, depth + 1);
+    if (nm && is_tap_name(nm) && nt_ref(nt, a, "block") >= 0) return 1;
+    return o >= 0 && !share_plan_tail_renders(c, o);
   }
   case SPK_SELF: case SPK_SEQUENCE:
-    return o < 0 || share_plan_tail_renders(c, o, depth + 1);
+    return o >= 0 && !share_plan_tail_renders(c, o);
   default:
-    return 1;
+    return 0;
   }
+}
+static int share_plan_tail_renders(Compiler *c, int a) {
+  return !for_each_value_position(c->nt, a, VP_AND_LEFT | VPS_IF | VPS_UNLESS | VPS_CASE | VPS_CASE_IN | VPS_LOGIC,
+                                  share_plan_tail_unrendered, c);
 }
 
 /* Does call v, which answers its literal block's value (SPK_BLOCK_VALUE),
@@ -422,7 +396,7 @@ static int share_plan_tail_renders(Compiler *c, int a, int depth) {
    value no block gives (sum, an ENV store) is the route's own. */
 static int share_plan_block_ok(Compiler *c, int v, int depth) {
   const NodeTable *nt = c->nt;
-  int u = an_unparen(nt, v), blk = u >= 0 && nt_kind(nt, u) == NK_CallNode ? nt_ref(nt, u, "block") : -1;
+  int u = nt_paren_single(nt, v), blk = u >= 0 && nt_kind(nt, u) == NK_CallNode ? nt_ref(nt, u, "block") : -1;
   if (blk < 0 || nt_kind(nt, blk) != NK_BlockNode) return 1;
   int body = nt_ref(nt, blk, "body");
   /* (the block's tail is read where the block is spliced in, under the
@@ -430,7 +404,7 @@ static int share_plan_block_ok(Compiler *c, int v, int depth) {
      share_plan_tail_renders) */
   int bn = 0;
   const int *bb = body >= 0 && nt_kind(nt, body) == NK_StatementsNode ? nt_arr(nt, body, "body", &bn) : NULL;
-  if (!strbuf_route_loop(c, u) && bn > 0 && !share_plan_tail_renders(c, bb[bn - 1], 0)) return 0;
+  if (!strbuf_route_loop(c, u) && bn > 0 && !share_plan_tail_renders(c, bb[bn - 1])) return 0;
   if (strbuf_route_loop(c, u)) return share_plan_jumps_ok(c, body, NK_BreakNode, 0, depth);
   if (strbuf_route_ie(c, u)) return share_plan_body_ok(c, body, NK_NONE, 1, depth);
   if (strbuf_route_inline_call(c, u)) {
@@ -474,7 +448,7 @@ static int share_plan_yield_supply(Compiler *c, int v, int depth) {
   for (int i = 0; i < n; i++) {
     int body = nt_ref(c->nt, blocks[i], "body"), bn = 0;
     const int *bb = body >= 0 && nt_kind(c->nt, body) == NK_StatementsNode ? nt_arr(c->nt, body, "body", &bn) : NULL;
-    if ((bn > 0 && !share_plan_tail_renders(c, bb[bn - 1], 0)) || !share_plan_body_ok(c, body, NK_NextNode, 0, depth + 1))
+    if ((bn > 0 && !share_plan_tail_renders(c, bb[bn - 1])) || !share_plan_body_ok(c, body, NK_NextNode, 0, depth + 1))
       return 0;
   }
   return 1;
@@ -505,9 +479,143 @@ static int share_plan_poly_base(Compiler *c, int v) {
 static int share_plan_supply_at(Compiler *c, int v, int *op, int depth) {
   return share_plan_supply_kind(c, v, share_plan_producer_at(c, v, op), op, depth);
 }
+/* Does an instance of some class the program makes, or a builtin value
+   (whose class a reopening such as `class Object` reaches), reach
+   instance method mi as its `name`? */
+static int share_plan_method_reached(Compiler *c, int mi, const char *name) {
+  for (int k = 0; k < c->nclasses; k++)
+    if ((c->classes[k].instantiated || c->classes[k].is_builtin_const) &&
+        comp_method_in_chain(c, k, name, NULL) == mi) return 1;
+  return 0;
+}
+/* Is call u an exception's message or to_s, whose targets the plan lists
+   as the overrides of the exception classes it may reach
+   (ct_exception_text)? */
+static int share_plan_exc_text_call(Compiler *c, int u) {
+  const char *nm = nt_str(c->nt, u, "name");
+  int recv = nt_ref(c->nt, u, "receiver");
+  if (!nm || !is_exception_message(nm) || recv < 0) return 0;
+  TyKind rt = comp_ntype(c, recv);
+  int cid = ty_is_object(rt) ? ty_object_class(rt) : -1;
+  return rt == TY_EXCEPTION || (cid >= 0 && class_is_exc_subclass(c, cid));
+}
+/* Does each class or value of class cid or below it that the program has
+   (made by `new`, or a builtin's) answer `name` by a method of the
+   program's own? One whose chain has none answers by a builtin method or
+   raises, which no target the plan lists covers. */
+static int share_plan_below_has(Compiler *c, int cid, const char *name) {
+  for (int k = 0; k < c->nclasses; k++) {
+    if (k != cid && !is_descendant(c, k, cid)) continue;
+    if (!c->classes[k].instantiated && !c->classes[k].is_builtin_const) continue;
+    if (comp_method_in_chain(c, k, name, NULL) < 0) return 0;
+  }
+  return 1;
+}
+/* Does every value the receiver of call u can be (self for a receiverless
+   call) answer `name` by a method of the program's own, so the call's
+   targets (cplan_targets, which lists those methods only) are all it can
+   reach? A boxed receiver that may hold a builtin value, or whose classes
+   the analysis cannot bound, may not. Another receiver (a builtin's, a
+   class method's self) is taken as its targets say. */
+static int share_plan_recv_answers_by_targets(Compiler *c, int u, const char *name) {
+  int recv = nt_ref(c->nt, u, "receiver");
+  if (recv < 0) {
+    Scope *s = comp_scope_of(c, u);
+    return !s || s->is_cmethod || s->class_id < 0 || share_plan_below_has(c, s->class_id, name);
+  }
+  TyKind rt = comp_ntype(c, recv);
+  if (rt == TY_POLY) {
+    if (poly_recv_builtin(c, u)) return 0;
+    int nc = 0;
+    const int *cls = poly_recv_classes(c, u, &nc);
+    if (!cls) return 0;
+    for (int i = 0; i < nc; i++)
+      if (comp_method_in_chain(c, cls[i], name, NULL) < 0) return 0;
+    return 1;
+  }
+  return !ty_is_object(rt) || share_plan_below_has(c, ty_object_class(rt), name);
+}
+/* See share.h. The pickup resets the side channel before the call and
+   takes what is there after it, else a new handle of the bytes, which for
+   a literal is the literal's own. Such a target publishes nothing, and
+   neither does anything that runs between the reset and its return: no
+   argument, no receiver but self, a body that computes nothing (a
+   condition or a call may publish another String's handle, which the
+   pickup would then read as this target's answer). */
+int share_plan_literal_pickup_clean(Compiler *c, int v, int mi) {
+  const NodeTable *nt = c->nt;
+  int u = nt_paren_single(nt, v);
+  if (u < 0 || nt_kind(nt, u) != NK_CallNode) return 0;
+  int recv = nt_ref(nt, u, "receiver");
+  const char *nm = nt_str(nt, u, "name");
+  if ((recv >= 0 && nt_kind(nt, recv) != NK_SelfNode) || nt_ref(nt, u, "arguments") >= 0 ||
+      nt_ref(nt, u, "block") >= 0 || !nm || mi <= 0 || mi >= c->nscopes || !scope_ret_str_literal(c, mi))
+    return 0;
+  int b = c->scopes[mi].body, bn = 1;
+  const int *bv = &b;
+  if (b >= 0 && nt_kind(nt, b) == NK_StatementsNode) bv = nt_arr(nt, b, "body", &bn);
+  return bv && bn == 1 && bv[0] >= 0 && nt_kind(nt, bv[0]) == NK_StringNode &&
+         share_plan_recv_answers_by_targets(c, u, nm);
+}
+/* See share.h. */
+int share_plan_targets_cover(Compiler *c, int u) {
+  const char *nm = u >= 0 && nt_kind(c->nt, u) == NK_CallNode ? nt_str(c->nt, u, "name") : NULL;
+  return nm && share_plan_recv_answers_by_targets(c, u, nm) && !share_plan_exc_text_call(c, u);
+}
+/* Is v a call every target of which answers a String literal on every
+   path (scope_ret_str_literal)? A frozen literal keeps one identity: its
+   bytes are the literal's own, and a handle made over them is the
+   literal's (SP_SHARE_STRING_LITERALS, which the share rule sets), so
+   what the call hands on is the object. See share.h. */
+int share_plan_call_answers_literal(Compiler *c, int v) {
+  if (!repr_share_rule(c)) return 0;
+  int u = nt_paren_single(c->nt, v);
+  if (u < 0 || nt_kind(c->nt, u) != NK_CallNode || nt_ref(c->nt, u, "block") >= 0) return 0;
+  int tg[CPT_MAX], n = cplan_targets(c, u, tg, CPT_MAX);
+  const char *nm = nt_str(c->nt, u, "name");
+  if (n > 0) {
+    /* the targets are the program's methods only: a receiver that may be
+       a value whose class has none answers by a builtin method instead,
+       and an exception's message or to_s by the builtin text of an
+       exception class that overrides neither (ct_exception_text lists
+       only the overrides) */
+    if (!nm || !share_plan_recv_answers_by_targets(c, u, nm) || share_plan_exc_text_call(c, u)) return 0;
+    /* (a target no value can reach -- a base class's method that every
+       class made overrides -- answers nothing) */
+    int any = 0;
+    for (int i = 0; i < n; i++) {
+      /* (a method of a class the receiver never holds, its class fact,
+         answers nothing here: share_target_armed) */
+      if (!share_target_armed(c, u, tg[i])) continue;
+      if (scope_ret_str_literal(c, tg[i])) { any = 1; continue; }
+      if (!nm || c->scopes[tg[i]].is_cmethod || share_plan_method_reached(c, tg[i], nm)) return 0;
+    }
+    return any;
+  }
+  /* a receiverless call in an instance method the plan cannot list
+     (`cop_name` in a base class that only its subclasses define): self is
+     the class or one below it, and each of those made answers by the
+     method its chain has; one whose chain has none answers by a builtin
+     (Exception#message) or raises, which the plan does not tell apart,
+     so it supplies nothing. A builtin class among them (a reopened
+     `class Object`) holds values the program does not make by `new`, so
+     it counts as made */
+  Scope *s = comp_scope_of(c, u);
+  if (!nm || nt_ref(c->nt, u, "receiver") >= 0 || nt_ref(c->nt, u, "arguments") >= 0 ||
+      !s || s->is_cmethod || s->class_id < 0) return 0;
+  int any = 0;
+  for (int k = 0; k < c->nclasses; k++) {
+    if (k != s->class_id && !is_descendant(c, k, s->class_id)) continue;
+    if (!c->classes[k].instantiated && !c->classes[k].is_builtin_const) continue;
+    int mi = comp_method_in_chain(c, k, nm, NULL);
+    if (mi < 0 || !scope_ret_str_literal(c, mi)) return 0;
+    any = 1;
+  }
+  return any;
+}
 static int share_plan_supply_kind(Compiler *c, int v, int k, int *op, int depth) {
   switch (k) {
-  case SPK_NONE: return 0;
+  case SPK_NONE: return share_plan_call_answers_literal(c, v);
   /* a call answering its receiver hands on its receiver's supply, but the
      face renders a chain over a boxed receiver's call whose arms answer a
      String (SPK_POLY_ARMS) as that call's bytes: no handle (the change
@@ -520,7 +628,7 @@ static int share_plan_supply_kind(Compiler *c, int v, int k, int *op, int depth)
      up after the call, only if every target publishes it on each path
      (strbuf_pickup_published); else the pickup falls back to a new one */
   case SPK_PUBLISHED: {
-    int u = an_unparen(c->nt, v);
+    int u = nt_paren_single(c->nt, v);
     return !(u >= 0 && nt_kind(c->nt, u) == NK_CallNode && strbuf_call_picks_up(c, u)) || strbuf_pickup_published(c, u);
   }
   case SPK_OPERAND: {
@@ -541,7 +649,7 @@ static int share_plan_supply_kind(Compiler *c, int v, int k, int *op, int depth)
      box's to_s, the box's own String (strbuf_poly_to_s) */
   case SPK_LIFT: {
     int k2 = share_plan_producer_core(c, v, op, 1);
-    if (k2 == SPK_NONE) return strbuf_poly_to_s(c, v);
+    if (k2 == SPK_NONE) return strbuf_poly_to_s(c, v) || share_plan_call_answers_literal(c, v);
     if (k2 == SPK_SEQUENCE && *op >= 0 && share_plan_poly_base(c, *op)) return 0;
     return k2 != SPK_LIFT && share_plan_supply_kind(c, v, k2, op, depth);
   }
@@ -712,7 +820,7 @@ static int share_plan_fresh_handle(Compiler *c, int v, int role) {
   if (taken == SPT_BOXED)
     return nt_kind(c->nt, v) == NK_ParenthesesNode && share_plan_role_need(c, v, SPR_BOX, SPN_NEW) == SPN_NEW;
   if (taken == SPT_RECV) return 0;
-  int u = an_unparen(c->nt, v), op, k;
+  int u = nt_paren_single(c->nt, v), op, k;
   if (u >= 0 && nt_kind(c->nt, u) == NK_CallNode && (strbuf_call_picks_up(c, u) || repr_boxed_to_s_operand(c, u) >= 0))
     return 1;
   k = share_node_carry_kind(c, v, &op);
@@ -728,7 +836,7 @@ static int share_plan_emits_handle_kind(Compiler *c, int e) {
   for (int depth = 0; depth < 16; depth++) {
     int o, k = share_plan_producer(c, e, &o);
     if (k == SPK_SEQUENCE && o >= 0) { e = o; continue; }
-    int u = an_unparen(c->nt, e);
+    int u = nt_paren_single(c->nt, e);
     const char *nm = u >= 0 && nt_kind(c->nt, u) == NK_CallNode ? nt_str(c->nt, u, "name") : NULL;
     /* (a call answering its receiver gives it as the handle unless it
        changes it in place; inject answers its block's text) */
@@ -832,8 +940,10 @@ SharePlan share_plan_with_need(Compiler *c, int v, int role, int need) {
      so no other consumer has it */
   if (role == SPR_IDENTITY && p.supply == SPS_BYTES && exc_message_identity_operand(c, v)) p.supply = SPS_HANDLE;
   /* (an identity is the handle or the bytes' pointer; a frozen String's
-     is its bytes' pointer, which every handle of it names too) */
-  int bytes_id = role == SPR_IDENTITY && (p.supply == SPS_BYTES || share_frozen_string(c, v));
+     is its bytes' pointer, which every handle of it names too, and so is
+     a call's that answers a literal) */
+  int bytes_id = role == SPR_IDENTITY &&
+                 (p.supply == SPS_BYTES || share_frozen_string(c, v) || share_plan_call_answers_literal(c, v));
   p.form = (unsigned char)(bytes_id ? SPF_BYTES : share_plan_form(p.need, p.supply));
   return p;
 }
@@ -854,45 +964,17 @@ int share_plan_return_box(Compiler *c, int v) {
 
 /* Does an arm of conditional (or begin, `||`, `&&`) v, or v itself where it
    is a call, answer by a route boxes cannot render (strbuf_box_unrendered)?
-   The arms are those share_plan_arms_ok takes. */
-static int share_plan_arms_unrendered(Compiler *c, int v, int depth) {
-  const NodeTable *nt = c->nt;
-  if (v < 0 || depth > 16) return 0;
-  switch (nt_kind(nt, v)) {
-  case NK_ParenthesesNode:
-    return share_plan_arms_unrendered(c, nt_ref(nt, v, "body"), depth + 1);
-  case NK_StatementsNode: {
-    int n = 0;
-    const int *bb = nt_arr(nt, v, "body", &n);
-    return n > 0 && share_plan_arms_unrendered(c, bb[n - 1], depth + 1);
-  }
-  case NK_ElseNode:
-    return share_plan_arms_unrendered(c, nt_ref(nt, v, "statements"), depth + 1);
-  case NK_IfNode: case NK_UnlessNode:
-    return share_plan_arms_unrendered(c, nt_ref(nt, v, "statements"), depth + 1) ||
-           share_plan_arms_unrendered(c, nt_ref(nt, v, nt_kind(nt, v) == NK_IfNode ? "subsequent" : "else_clause"), depth + 1);
-  case NK_OrNode: case NK_AndNode:
-    return share_plan_arms_unrendered(c, nt_ref(nt, v, "left"), depth + 1) ||
-           share_plan_arms_unrendered(c, nt_ref(nt, v, "right"), depth + 1);
-  case NK_CaseNode: {
-    int nw = 0;
-    const int *whens = nt_arr(nt, v, "conditions", &nw);
-    for (int w = 0; w < nw; w++)
-      if (share_plan_arms_unrendered(c, nt_ref(nt, whens[w], "statements"), depth + 1)) return 1;
-    return share_plan_arms_unrendered(c, nt_ref(nt, v, "else_clause"), depth + 1);
-  }
-  case NK_BeginNode: {
-    int el = nt_ref(nt, v, "else_clause");
-    if (share_plan_arms_unrendered(c, el >= 0 ? el : nt_ref(nt, v, "statements"), depth + 1)) return 1;
-    for (int rc = nt_ref(nt, v, "rescue_clause"); rc >= 0; rc = nt_ref(nt, rc, "subsequent"))
-      if (share_plan_arms_unrendered(c, nt_ref(nt, rc, "statements"), depth + 1)) return 1;
-    return 0;
-  }
-  case NK_CallNode:
-    return strbuf_box_unrendered(c, v);
-  default:
-    return 0;
-  }
+   The arms are an `if`, `unless`, `case` and begin's, and both operands of
+   `||` and `&&`; share_plan_arms_ok also takes a `case`/`in` and a rescue
+   modifier, and the right operand of `&&` only. */
+static int share_plan_arm_unrendered(const VpLeaf *lf, void *ud) {
+  Compiler *c = ud;
+  if (lf->kind == VPK_GAVE_UP) return 1;
+  return lf->kind != VPK_NIL && nt_kind(c->nt, lf->node) == NK_CallNode && strbuf_box_unrendered(c, lf->node);
+}
+static int share_plan_arms_unrendered(Compiler *c, int v) {
+  return for_each_value_position(c->nt, v, VP_AND_LEFT | VPS_IF | VPS_UNLESS | VPS_CASE | VPS_BEGIN | VPS_LOGIC,
+                                 share_plan_arm_unrendered, c);
 }
 
 /* (see share.h) The plan names the handle as the form of a box of v's String
@@ -901,7 +983,7 @@ static int share_plan_arms_unrendered(Compiler *c, int v, int depth) {
    arm of a conditional) boxes as it did, from its bytes. */
 int share_plan_box_handle(Compiler *c, int v) {
   if (repr_share_rule(c) && c->share && v >= 0 && strbuf_self_chain_base(c, v) >= 0) return 1;
-  if (!repr_share_rule(c) || !c->share || v < 0 || share_plan_arms_unrendered(c, v, 0) ||
+  if (!repr_share_rule(c) || !c->share || v < 0 || share_plan_arms_unrendered(c, v) ||
       share_plan_with_need(c, v, SPR_BOX, SPN_OBJECT).form != SPF_HANDLE)
     return 0;
   /* ...and a route the emitters take: a value that hands on its handle, or
@@ -954,8 +1036,8 @@ static void share_plan_role_mark(Compiler *c, int n, int role) {
    literals splatted in it (`a, b = *[s, t]`) -- stores into its targets. */
 static void share_plan_masgn_stores(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
-  v = an_unparen(nt, v);
-  if (v >= 0 && nt_kind(nt, v) == NK_SplatNode) v = an_unparen(nt, nt_ref(nt, v, "expression"));
+  v = nt_paren_single(nt, v);
+  if (v >= 0 && nt_kind(nt, v) == NK_SplatNode) v = nt_paren_single(nt, nt_ref(nt, v, "expression"));
   if (v < 0 || nt_kind(nt, v) != NK_ArrayNode) return;
   int en = 0;
   const int *el = nt_arr(nt, v, "elements", &en);
@@ -995,7 +1077,7 @@ static void share_plan_identity_roles(Compiler *c, int n) {
 static int share_plan_freeze_read(Compiler *c, int n) {
   const NodeTable *nt = c->nt;
   const char *nm = nt_str(nt, n, "name");
-  int recv = an_unparen(nt, nt_ref(nt, n, "receiver")), tg[CPT_MAX];
+  int recv = nt_paren_single(nt, nt_ref(nt, n, "receiver")), tg[CPT_MAX];
   if (!nm || recv < 0 || !is_freeze_name(nm) || nt_ref(nt, n, "arguments") >= 0 || nt_ref(nt, n, "block") >= 0)
     return 0;
   NodeKind k = nt_kind(nt, recv);

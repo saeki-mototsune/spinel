@@ -261,7 +261,8 @@ static int emit_op_array_first(Compiler *c, const BopCtx *x, Buf *b) {
     buf_printf(b, "sp_%sArray_oget(%s, 0)", ak ? ak : "", r);
     if (!node_is_oint(c, x->id)) buf_puts(b, ")");
   }
-  else buf_printf(b, "sp_%sArray_get(%s, 0)", ak ? ak : "", r);
+  else if (recv_never_nil(c, x->recv)) buf_printf(b, "sp_%sArray_get(%s, 0)", ak ? ak : "", r);
+  else buf_printf(b, "sp_%sArray_get(sp_nil_recv_named(%s, \"first\"), 0)", ak ? ak : "", r);   /* first, not the [] the read names */
   free(r);
   return 1;
 }
@@ -304,6 +305,19 @@ static int emit_op_pstatus_eq(Compiler *c, const BopCtx *x, Buf *b) {
   return 1;
 }
 
+/* an argument's kind, for a row's argument guard */
+typedef struct { const Compiler *c; const int *argv; } BopArgs;
+static TyKind bop_arg_ntype(const void *ud, int i) {
+  const BopArgs *a = ud;
+  return comp_ntype(a->c, a->argv[i]);
+}
+
+/* The same empty-literal seed kind that inference supplied to the row. */
+static TyKind bop_seed_ntype(const void *ud, int i) {
+  const BopArgs *a = ud;
+  return fold_seed_kind(bop_arg_ntype(ud, i), nt_type(a->c->nt, a->argv[i]));
+}
+
 /* --plan-check: the row codegen emitted the call with should be the row
    inference answered it with (the same receiver kind, name and result; a
    row guarded on its first argument stands for its unguarded sibling).
@@ -322,6 +336,16 @@ static int emit_op_pstatus_eq(Compiler *c, const BopCtx *x, Buf *b) {
 static void plan_check_observe(Compiler *c, int id, TyKind rt, const BuiltinOp *op) {
   if (view_depth() > 0 || id < 0 || id >= c->node_cap) return;
   const BuiltinOp *inf = c->bop_inf[id];
+  /* A call on a yield's value is emitted once per site of the yield, its
+     receiver typed per site, and inference keeps the last site's row (or
+     none, when a later pass erased it). The copy is compared with the row
+     inference finds for its own site's kind; a copy whose site has no row,
+     or another, still reports below. */
+  if (!inf || inf->recv != op->recv) {
+    int yv = nt_ref(c->nt, id, "receiver");
+    TyKind sk;
+    if (yv >= 0 && sp_yield_site_type(c, yv, &sk)) inf = an_bop_row_for_kind(c, id, rt);
+  }
   /* A row flagged BOPF_INFERRED says inference types the call in a rule of
      its own; inference records no row for it (an_bop_find), so answering
      without one is what the row says. The call still has to have been
@@ -331,18 +355,40 @@ static void plan_check_observe(Compiler *c, int id, TyKind rt, const BuiltinOp *
      it (a String bang's value form runs the plain method), so the row
      inference chose for the original name says nothing about this one. */
   if (inf && !sp_streq(inf->name, op->name)) return;
+  /* a row whose result turns on the arguments' kinds states it for the
+     arguments the call has */
+  int argc = 0;
+  const int *argv = call_args(c->nt, id, &argc);
+  BopArgs ba = { c, argv };
+  BopArgKind arg_of = op->result == BOPR_ARRAY_SUM_SEED ? bop_seed_ntype : bop_arg_ntype;
+  int facts = an_bop_facts(c, op, id);
   if (inf && inf->recv == op->recv && sp_streq(inf->name, op->name) &&
-      bop_result(inf, rt) == bop_result(op, rt)) return;
+      bop_result_args(inf, rt, argc, arg_of, &ba, facts) == bop_result_args(op, rt, argc, arg_of, &ba, facts)) return;
+  /* inference answered from a row that stands for a boxed receiver
+     (BOPF_BOXED), and codegen emitted the call typed (the box respecialized,
+     a face): the call answers the same whatever the box holds, so the row of
+     the kind it was emitted with agrees when it states the same result */
+  if (inf && (inf->flags & BOPF_BOXED) && inf->recv != op->recv &&
+      bop_result_args(inf, rt, argc, arg_of, &ba, facts) == bop_result_args(op, rt, argc, arg_of, &ba, facts)) return;
+  /* a call over a String Range that a pass reached through a `to_a` hop
+     (srange_member_hop): inference answered it on the hop's Array of
+     Strings, codegen emits the Range's own row. They agree when the two rows
+     state the same result */
+  if (inf && inf->recv != op->recv) {
+    int hv = nt_ref(c->nt, id, "receiver");
+    if (hv >= 0 && srange_member_hop(c, hv) >= 0 &&
+        bop_result_args(inf, TY_STR_ARRAY, argc, arg_of, &ba, facts) == bop_result_args(op, rt, argc, arg_of, &ba, facts)) return;
+  }
   if (inf && inf->recv != op->recv)
     fprintf(stderr, "plan-check: respecialized: node %d %s#%s: codegen row %s, inference row %s\n",
             id, ty_name(rt), op->name, ty_name(op->recv), ty_name(inf->recv));
   else if (inf)
     fprintf(stderr, "plan-check: conflict: node %d %s#%s: codegen row %d..%d -> %s, inference row %s#%s -> %s\n",
-            id, ty_name(rt), op->name, op->argc_min, op->argc_max, ty_name(bop_result(op, rt)),
-            ty_name(inf->recv), inf->name, ty_name(bop_result(inf, rt)));
+            id, ty_name(rt), op->name, op->argc_min, op->argc_max, ty_name(bop_result_args(op, rt, argc, arg_of, &ba, facts)),
+            ty_name(inf->recv), inf->name, ty_name(bop_result_args(inf, rt, argc, arg_of, &ba, facts)));
   else
     fprintf(stderr, "plan-check: unrecorded: node %d %s#%s: codegen row %d..%d -> %s, inference answered without a row\n",
-            id, ty_name(rt), op->name, op->argc_min, op->argc_max, ty_name(bop_result(op, rt)));
+            id, ty_name(rt), op->name, op->argc_min, op->argc_max, ty_name(bop_result_args(op, rt, argc, arg_of, &ba, facts)));
 }
 
 static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *) = {
@@ -356,6 +402,7 @@ static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *)
   [BOPE_FLOAT_RATIONALIZE] = emit_op_float_rationalize,
   [BOPE_STRING_SCAN_CHECKED] = emit_op_string_scan_checked,
   [BOPE_STRING_SLICE] = emit_op_string_slice,
+  [BOPE_STRING_DEDUP] = emit_op_string_dedup,
   [BOPE_STRING_SCRUB_BLOCK] = emit_op_string_scrub_block,
   [BOPE_THREAD_RAISE] = emit_op_thread_raise,
   [BOPE_THREAD_TLS] = emit_op_thread_tls,
@@ -391,6 +438,7 @@ static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *)
   [BOPE_HASH_INVERT] = emit_op_hash_invert,
   [BOPE_HASH_FLATTEN] = emit_op_hash_flatten,
   [BOPE_HASH_TO_A] = emit_op_hash_to_a,
+  [BOPE_HASH_NIL_RECV] = emit_op_hash_nil_recv,
   [BOPE_HASH_SORT] = emit_op_hash_sort,
   [BOPE_HASH_FIRST] = emit_op_hash_first,
   [BOPE_HASH_TAKE] = emit_op_hash_take,
@@ -420,6 +468,7 @@ static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *)
   [BOPE_ARRAY_PUSH] = emit_op_array_push,
   [BOPE_ARRAY_INSERT_N] = emit_op_array_insert_n,
   [BOPE_ARRAY_TRANSPOSE] = emit_op_array_transpose,
+  [BOPE_ARRAY_NIL_RECV] = emit_op_array_nil_recv,
   [BOPE_ARRAY_ASSOC] = emit_op_array_assoc,
   [BOPE_ARRAY_COMBINATION] = emit_op_array_combination,
   [BOPE_ARRAY_PRODUCT] = emit_op_array_product,
@@ -448,15 +497,8 @@ static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *)
   [BOPE_ARRAY_PRED_CLASS] = emit_op_array_pred_class,
 };
 
-/* an argument's kind, for a row's argument guard */
-typedef struct { const Compiler *c; const int *argv; } BopArgs;
-static TyKind bop_arg_ntype(const void *ud, int i) {
-  const BopArgs *a = ud;
-  return comp_ntype(a->c, a->argv[i]);
-}
-
 static int emit_builtin_op_ex(Compiler *c, int id, int recv, TyKind rt, const char *name,
-                              const char *rtext, int t0, int stage, Buf *b) {
+                              const char *rtext, int t0, int stage, BopArgKind arg_of, Buf *b) {
   if (recv < 0) return 0;
   /* a Hash or Array receiver of any variant reads its family's rows */
   TyKind lk = bop_family_of(rt);
@@ -465,7 +507,7 @@ static int emit_builtin_op_ex(Compiler *c, int id, int recv, TyKind rt, const ch
   const int *argv = call_args(c->nt, id, &argc);
   BopArgs a = { c, argv };
   const BuiltinOp *op = bop_find_stage(lk, name, argc, nt_ref(c->nt, id, "block") >= 0,
-                                       bop_arg_ntype, &a, stage);
+                                       arg_of, &a, stage);
   if (!op || op->emit == BOPE_NONE || !bop_emitters[op->emit]) return 0;
   BopCtx x = { id, recv, argc, rt, name, op, rtext, t0 };
   if (!bop_emitters[op->emit](c, &x, b)) return 0;
@@ -475,19 +517,27 @@ static int emit_builtin_op_ex(Compiler *c, int id, int recv, TyKind rt, const ch
 
 int emit_builtin_op_text(Compiler *c, int id, int recv, TyKind rt, const char *name,
                          const char *rtext, Buf *b) {
-  return emit_builtin_op_ex(c, id, recv, rt, name, rtext, 0, 0, b);
+  return emit_builtin_op_ex(c, id, recv, rt, name, rtext, 0, 0, bop_arg_ntype, b);
 }
 
 int emit_builtin_op_tmp(Compiler *c, int id, int recv, TyKind rt, const char *name,
                         int t0, Buf *b) {
-  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, t0, 0, b);
+  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, t0, 0, bop_arg_ntype, b);
 }
 
 int emit_builtin_op(Compiler *c, int id, int recv, TyKind rt, const char *name, Buf *b) {
-  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, 0, 0, b);
+  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, 0, 0, bop_arg_ntype, b);
 }
 
 int emit_builtin_op_stage(Compiler *c, int id, int recv, TyKind rt, const char *name,
                           int stage, Buf *b) {
-  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, 0, stage, b);
+  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, 0, stage, bop_arg_ntype, b);
+}
+
+/* The call emitted through the row of its name that guards no argument kind,
+   whatever the arguments are read as: a boxed index that may be a Range is
+   viewed as an Integer to emit the element branch, and the row of an
+   Integer index would state a result the held branch does not take. */
+int emit_builtin_op_unguarded(Compiler *c, int id, int recv, TyKind rt, const char *name, Buf *b) {
+  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, 0, -1, NULL, b);
 }

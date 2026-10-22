@@ -32,6 +32,18 @@ void sbuf_set(sbuf_t *s, const char *src, size_t n);
 void known_names_add(const char *name, size_t n);
 bool known_names_has(const char *name);
 
+/* The type aliases declared (`type name = T`), by qualified name
+ * ("_"-joined, as the classes are), each with the seed tag its type maps
+ * to once that is known. A reference resolves among the declared names
+ * and maps to the tag; a name not declared is out of the subset, and a
+ * declared one with no tag yet is unresolved (the flag is set, and the
+ * caller may try again later). alias_count is the aliases with a tag. */
+void alias_declare(const char *name);
+void alias_add(const char *name, const char *tag);
+const char *alias_find(const char *name);
+size_t alias_count(void);
+extern bool g_alias_unresolved;
+
 /* The qualified name of the declaration whose members are being mapped;
  * an unqualified type name resolves against it first. */
 extern const char *g_self_scope;

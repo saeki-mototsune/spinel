@@ -57,6 +57,15 @@ typedef struct {
   unsigned poly_lift:1;   /* a poly read lifted to the shared handle */
   unsigned dyn_cls:1;     /* an object of a class with subclasses: its box
                              reads the class id from the object */
+  unsigned exc:1;         /* held as an sp_Exception, or as a user exception
+                             subclass's struct, whose leading members mirror
+                             sp_Exception's: the layout a (sp_Exception *)
+                             cast reads. Which class the value is stays the
+                             type's: as_ty is TY_EXCEPTION for the builtin
+                             and an object type for a subclass */
+  unsigned opt_producer:1; /* a scalar producer returns its optional form;
+                              a narrowed leaf can still have RK_OPT from
+                              its slot without returning that form */
   unsigned nil_scalar:1;  /* an Integer or Float whose box reads its nil
                              (sp_box_oint / sp_box_ofloat) */
   unsigned nil_tested:1;  /* a call's nil arm has tested this receiver for
@@ -147,6 +156,8 @@ typedef enum {
 int repr_handle_apart(Compiler *c, int v, Repr r);
 /* Does a call's settled return route hand back a shared String handle? */
 int repr_call_returns_handle(Compiler *c, int v);
+int scope_always_raises(Compiler *c, int mi);
+const NativeMethod *repr_super_native_keeps(Compiler *c, int n); /* super into a native keeps binding (#9258) */
 /* The native binding whose handle a boxed call's arm for class k publishes. */
 const NativeMethod *repr_native_arm_handle(Compiler *c, int v, int k);
 /* A builtin receiver conversion's String operand, or -1. */
@@ -179,6 +190,11 @@ int repr_hash_is(Repr r, TyKind key, TyKind val);
 /* Called once the analysis is final (the end of analyze_program): from here
    on the flags repr_of reads no longer change. */
 void repr_seal(Compiler *c);
+/* Whether the leaf slot holds an optional scalar. */
+int repr_leaf_slot_is_opt(Compiler *c, int node);
+/* The scalar kind of an sp_oint / sp_ofloat value, or TY_UNKNOWN when
+   its representation has no nil beside a scalar. */
+TyKind repr_opt_kind(const Compiler *c, int node);
 /* Whether an Integer or Float node's box has to read its nil (emit_boxed's
    sp_box_oint / sp_box_ofloat): the node has an sp_oint form of its own. */
 int repr_nil_scalar(const Compiler *c, int node, TyKind t);

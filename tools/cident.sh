@@ -19,6 +19,11 @@
 # CIDENT_FLAGS=--int-overflow=promote); the reference cache is kept per
 # flag set.
 #
+# A reference of the same revision and flags built for another corpus is
+# reused: only the programs the change of corpus can reach are compiled
+# again. CIDENT_REF_ONLY=1 builds the reference and stops; CIDENT_KEEP (20)
+# is how many references are kept.
+#
 # Exit status: 0 identical, 1 some file differs, 2 infrastructure error.
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
@@ -41,9 +46,9 @@ list() {
 # marker where the compiler refuses it. Paths stay relative so that the
 # compiler's own tree resolves lib/ and packages/.
 emit() {
-  local sp=$1 tree=$2 out=$3
+  local sp=$1 tree=$2 out=$3 only=${4-}
   mkdir -p "$out"
-  list | xargs -P "$JOBS" -I{} sh -c '
+  { if [ -n "$only" ]; then cat "$only"; else list; fi; } | xargs -P "$JOBS" -I{} sh -c '
     f="$1"; sp="$2"; tree="$3"; out="$4"
     key=$(printf "%s" "$f" | tr "/" "_")
     if (cd "$tree" && ulimit -v 16000000 2>/dev/null; $CIDENT_TO "$sp" -c --no-line-map $CIDENT_FLAGS "$f" -o "$out/$key.c" >/dev/null 2>&1); then :
@@ -68,7 +73,8 @@ CORPUSKEY=$({
   printf '%s\n' "$CORPUS"
   printf '%s\n' "$CORPUS" | git hash-object --stdin-paths
 } | git hash-object --stdin)
-REFDIR=$ROOT/build/cident/$SHA${FLAGKEY:+-$FLAGKEY}-$CORPUSKEY
+REFBASE=$ROOT/build/cident/$SHA${FLAGKEY:+-$FLAGKEY}
+REFDIR=$REFBASE-$CORPUSKEY
 # A cold cache has one builder. Hold the lock through comparison so no
 # other run can remove or read its outputs while they are being written.
 # The lock is flock(2) on fd 9, which the kernel drops once no process
@@ -107,19 +113,78 @@ if [ ! -f "$REFDIR/.done" ]; then
   # The reference compiles this tree's corpus, so a test added by the change
   # under test is compared too (it is reported if the reference refuses it).
   rm -rf "$REFDIR"; mkdir -p "$REFDIR"
+  # The corpus as the reference saw it: each file's blob and path
+  MANIFEST=$(mktemp "${TMPDIR:-/tmp}/spinel-cident-man.XXXXXX")
+  paste -d' ' <(printf '%s\n' "$CORPUS" | git hash-object --stdin-paths) <(printf '%s\n' "$CORPUS") > "$MANIFEST"
+  # A reference of the same revision and flags for another corpus (each
+  # cycle's tests change it) keeps the C of every program the change of
+  # corpus cannot reach: only a program that is new or changed, or that names
+  # a file that is new or changed (require_relative, a compile-time read), is
+  # compiled again. Its .expected files are not read by the compiler.
+  # (only this flag set's: the corpus key is hex, and another set's name
+  # goes on with its flags, `<sha>-__int_overflow=promote-<key>`)
+  # The pattern opens with its own parenthesis: bash 3.2, macOS's /bin/bash,
+  # otherwise ends the command substitution at the pattern's closing one.
+  PREV=$(ls -dt "$REFBASE"-*/ 2>/dev/null | while read -r d; do
+           d=${d%/}; case ${d#"$REFBASE"-} in (*[!0-9a-f]*) continue;; esac
+           [ "$d" != "$REFDIR" ] && [ -f "$d/.done" ] && [ -f "$d/.manifest" ] && { echo "$d"; break; }; done)
+  ONLY=
+  if [ -n "$PREV" ]; then
+    ONLY=$(mktemp "${TMPDIR:-/tmp}/spinel-cident-only.XXXXXX")
+    # added, changed or removed, either side of the two manifests
+    CHANGED=$(LC_ALL=C comm -3 <(LC_ALL=C sort "$PREV/.manifest") <(LC_ALL=C sort "$MANIFEST") |
+              sed 's/^\t//' | cut -d' ' -f2- | grep -v '\.expected$' | LC_ALL=C sort -u)
+    {
+      list | LC_ALL=C sort > "$ONLY.all"
+      printf '%s\n' "$CHANGED" | LC_ALL=C comm -12 - "$ONLY.all"
+      # a program that names the file, or a directory it is in (a
+      # require_relative, a literal read, an autoload directory)
+      printf '%s\n' "$CHANGED" | while read -r ch; do
+        [ -n "$ch" ] || continue
+        b=$(basename "$ch"); set -- "${b%.*}"
+        for part in $(dirname "$ch" | tr '/' ' '); do
+          case $part in test|benchmark|packages|.) ;; *) set -- "$@" "$part";; esac
+        done
+        for w in "$@"; do grep -lF -- "$w" $(cat "$ONLY.all") 2>/dev/null; done
+      done
+      rm -f "$ONLY.all"
+    } | LC_ALL=C sort -u > "$ONLY"
+    # the rest from the earlier reference, which keeps their C as it was
+    list | LC_ALL=C sort | LC_ALL=C comm -23 - "$ONLY" | while read -r f; do
+      key=$(printf "%s" "$f" | tr "/" "_")
+      [ -f "$PREV/$key.c" ] && cp "$PREV/$key.c" "$REFDIR/"
+      [ -f "$PREV/$key.refused" ] && cp "$PREV/$key.refused" "$REFDIR/"
+    done
+    echo "cident: reference C of $(git rev-parse --short "$SHA") reused from an earlier corpus, $(grep -c . "$ONLY") program(s) compiled again" >&2
+  fi
   # Only the programs: the reference keeps its own lib/, builtins and
   # package sources, which are part of what is being compared.
   cp -r test benchmark "$WT/" 2>/dev/null
   for d in packages/*/test; do mkdir -p "$WT/$d" && cp -r "$d/." "$WT/$d/"; done
   [ -f "$OC" ] && mkdir -p "$WT/build" && cp "$OC" "$WT/$OC"
-  emit "$WT/bin/spinel" "$WT" "$REFDIR"
-  # no sed -i: BSD sed takes its argument as a backup suffix
+  emit "$WT/bin/spinel" "$WT" "$REFDIR" "$ONLY"
+  # no sed -i: BSD sed takes its argument as a backup suffix (a reused file
+  # names $ROOT already and is left as it is)
   for c in "$REFDIR"/*.c; do
-    [ -f "$c" ] && LC_ALL=C sed "s|$WT|$ROOT|g" "$c" > "$c.tmp" && mv "$c.tmp" "$c"
+    [ -f "$c" ] && grep -qF "$WT" "$c" && LC_ALL=C sed "s|$WT|$ROOT|g" "$c" > "$c.tmp" && mv "$c.tmp" "$c"
   done
   git worktree remove --force "$WT" >/dev/null 2>&1
+  mv "$MANIFEST" "$REFDIR/.manifest"; [ -n "$ONLY" ] && rm -f "$ONLY"
   : > "$REFDIR/.done"
+  # Keep the newest references (CIDENT_KEEP, 20): each holds the C of the
+  # whole corpus, and a lane machine filled its disk with them. One another
+  # run holds the lock of is left alone.
+  ls -dt "$ROOT"/build/cident/*/ 2>/dev/null | tail -n +"$(( ${CIDENT_KEEP:-20} + 1 ))" | while read -r d; do
+    d=${d%/}
+    [ "$d" = "$REFDIR" ] && continue
+    perl -MFcntl=:flock -e 'open(my $fh, ">>", $ARGV[0]) or exit 1; flock($fh, LOCK_EX|LOCK_NB) or exit 1;
+      system("rm", "-rf", $ARGV[1]); unlink $ARGV[0]' "$d.lock" "$d"
+  done
 fi
+
+# CIDENT_REF_ONLY=1: only the reference, cached for the runs to come (built
+# right after a push, for the master the next change is compared with)
+[ -n "${CIDENT_REF_ONLY-}" ] && { echo "cident: reference of $(git rev-parse --short "$SHA") ready"; exit 0; }
 
 NEWDIR=$(mktemp -d "${TMPDIR:-/tmp}/spinel-cident-new.XXXXXX")
 emit "$NEW" "$ROOT" "$NEWDIR"

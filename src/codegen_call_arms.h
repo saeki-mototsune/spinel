@@ -35,12 +35,14 @@ int emit_call_regexp_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
 int emit_call_regexp_class_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_symbol_bool_string_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
 int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
+int emit_marshal_value_call(Compiler *c, int id, Buf *b);   /* codegen_call_module.c */
 int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv);
 int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
+int emit_io_select(Compiler *c, int argc, const int *argv, Buf *b);
 int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_append_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_store_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
@@ -145,11 +147,17 @@ void emit_ffi_callback_arg(Compiler *c, int cbidx, int argnode, Buf *out);
 void emit_ffi_num_arg(Compiler *c, int arg, TyKind at, const char *spec, int dbl, Buf *b);
 int emit_or_take_back(Compiler *c, int id, Buf *b, int (*fn)(Compiler *, int, Buf *));
 int emit_sg_accessor(Compiler *c, int id, int ci, const char *cn, const char *name, int argc, const int *argv, Buf *b);
+/* Does a value of class k answer `name` by a `class << self` accessor ahead
+   of any class method of the name? And the arms of those classes in the
+   class-tag ternary over the boxed value in _t<tv>. */
+int cls_sg_accessor_first(Compiler *c, int k, const char *name, int argc);
+void emit_boxed_cls_sg_first_arms(Compiler *c, int id, const char *name, int argc, const int *argv, int tv, Buf *b);
+int cls_value_sg_accessor_named(Compiler *c, const char *name, int argc);
+int emit_cls_value_sg_accessor_of(Compiler *c, int id, int recv, const char *ktext, const char *name, int argc,
+                                  const int *argv, Buf *b);
 void ffi_check_buffer_bounds(Compiler *c, int id, int arg, const char *kind, int off, const char *dir);
 extern int g_setter_value_inner;
 int emit_cmethod_setter_assign(Compiler *c, int id, Buf *b);
-int call_has_keyword_args(const NodeTable *nt, const int *argv, int argc);
-int call_has_splat_arg(const NodeTable *nt, const int *argv, int argc);
 int ctor_alloc_decl(Compiler *c, int cid, Buf *b);
 void ctor_arity_add(CtorArityArms *g, int ci, const char *msg);
 void ctor_arity_emit(CtorArityArms *g, Buf *b);
@@ -169,6 +177,7 @@ void emit_ctor_arm_param(Compiler *c, Scope *is, int j, const ArgLayout *L, cons
 void emit_ctor_block_slot(Compiler *c, int id, int initm, const char *lead, Buf *b);
 int emit_ctor_splice_arm(Compiler *c, int id, int ci, int initm, int rt2, Buf *b);
 void emit_exc_msg_arg(Compiler *c, int arg, Buf *b);
+void emit_exc_new_msg(Compiler *c, const char *cn, int arg, Buf *b);
 int emit_exc_sub_new_arm(Compiler *c, int ci, int argc, const int *atmp, int rt2, Buf *b);
 int emit_syserr_family_new(Compiler *c, int id, const char *cn, int argc, const int *argv, Buf *b);
 int emit_user_new_arm(Compiler *c, int id, int ci, int argc, const int *atmp, int hoisted, int rt2, Buf *b);
@@ -176,7 +185,8 @@ extern int g_ctor_blk_tmp;
 int hoist_ctor_block(Compiler *c, int id, Buf *b);
 int struct_nil_fills(const ClassInfo *k);
 int cls_arm_takes_argc(Scope *s, int argc, int splat);
-int collect_class_constants(Compiler *c, int ci, int inherit, const char **out, int max, int n, int depth);
+int collect_class_constants(Compiler *c, int ci, int inherit, const char **out, const char **shown,
+                            int max, int n, int depth);
 void emit_class_id_is(Compiler *c, const char *cname, const char *expr, Buf *b);
 int emit_reopen_arm_test(Compiler *c, int kmi, const char *name, const char *cls, const char *raise, Buf *b);
 extern int g_cls_value_recv;
@@ -253,6 +263,7 @@ int boxed_write_takes_list(Compiler *c, int id, const int *argv, int argc);
 int class_method_named(Compiler *c, const char *name);
 void emit_gets_sep_args(Compiler *c, const int *argv, int argc, Buf *b);
 void emit_io_wait(Compiler *c, const char *name, int argc, const int *argv, const char *r, Buf *b);
+void emit_io_socket_send_call(Compiler *c, const char *r, int argc, const int *argv, Buf *b);
 void emit_push_arg_list(Compiler *c, const int *argv, int argc, int tpa, Buf *b);
 void emit_stat_handle_nomethod(int th, int tv, const char *name, Buf *b);
 void emit_stat_handle_only(int th, const char *name, Buf *b);
@@ -285,6 +296,11 @@ int builtin_method_arity(const char *cls, const char *m, int *out);
 int builtin_method_known(const char *cls, const char *m);
 int core_method_vis(const char *cls, const char *m, int inherit);   /* codegen_call_class.c */
 int refl_builtin_vis(Compiler *c, int ci, const char *m, int inherit);   /* codegen_call_class.c */
+const char *core_class_ancestors(const char *cls);   /* codegen_call_class.c */
+void core_own_methods_each(const char *cls, size_t cl, void (*f)(void *, const char *, int), void *ud);
+int emit_value_methods_reflection(Compiler *c, int id, Buf *b);   /* codegen_call.c */
+void emit_value_methods_helpers(Compiler *c, const char *const *texts, int ntexts, Buf *protos,
+                                Buf *defs);   /* codegen_call.c */
 int builtin_comparable_owns(const char *cls, const char *m);
 int builtin_comparable_arity(const char *m);
 int builtin_numeric_owns(const char *cls, const char *m);
@@ -309,7 +325,7 @@ int emit_reopen_recv_args(Compiler *c, int id, int mi, int recv, int boxed, cons
 int emit_reopen_recv_in_order(Compiler *c, int id, int mi, int recv, int boxed, const char *box_fn, size_t at, Buf *b);
 void emit_reopen_self_arg(Compiler *c, int id, int mi, Buf *b);
 int str_fresh_value(Compiler *c, int n);
-int implicit_self_plan_mi(Compiler *c, int id, int dispatch_cid);
+const CallPlan *implicit_self_plan(Compiler *c, int id, int dispatch_cid);
 
 int emit_send_blind(Compiler *c, int id, Buf *b);
 

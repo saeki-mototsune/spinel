@@ -59,6 +59,13 @@ typedef struct {
      exactly the edits that can change which node carries which name. Caches
      keyed on node identity or name can revalidate against it. */
   unsigned version;
+  /* The parts of version that a local variable read appended by
+     nt_new_local_read, a call renamed by nt_node_swap_str or
+     nt_node_restore_str (nt_stamp_holds), and a subtree appended by
+     nt_clone_subtree bumped: a clone touches no node below the count it
+     found, so an index of the nodes by name extends over the clones when
+     every bump since its build was one (an_calls_named_first). */
+  unsigned read_version, rename_version, clone_version;
   /* Bumped by every edit of a node, an int, ref or array field's included,
      which version leaves out. infer_type keeps an earlier query's answers
      only while neither it nor version has moved (#8852). */
@@ -328,6 +335,20 @@ void nt_node_set_int(NodeTable *nt, int id, const char *key, long long val);
 void nt_node_set_ref(NodeTable *nt, int id, const char *key, int child);
 void nt_node_set_arr(NodeTable *nt, int id, const char *key, const int *ids, int n);
 int  nt_new_int(NodeTable *nt, long long v);                     /* a new IntegerNode */
+/* Are the nodes appended at or after id `from` all local variable reads?
+   Such a read is a leaf, so a whole-tree index built before it was appended
+   (one that reads no local variable read) is still the index of the table. */
+int  nt_appended_only_local_reads(const NodeTable *nt, int from);
+/* A new local variable read of name, counted in read_version. */
+int  nt_new_local_read(NodeTable *nt, const char *name);
+/* The table's version when an index was built, with its two counted parts.
+   nt_stamp_holds answers whether every version bump since was a local
+   variable read appended (nt_new_local_read) or, with renames, a call's name
+   swapped or restored: an index that reads neither (nor, with renames, any
+   call's name) is then still the index of the table. */
+typedef struct { unsigned version, reads, renames; } NtStamp;
+NtStamp nt_stamp(const NodeTable *nt);
+int  nt_stamp_holds(const NodeTable *nt, NtStamp s, int renames);
 
 /* Accessors. id must be in [0, nt->count). Out-of-range ids return the
    given defaults so callers can walk freely without bounds checks. */
@@ -422,6 +443,49 @@ static inline int nt_safe_nav(const NodeTable *nt, int id) {
 static inline void nt_set_safe_nav(NodeTable *nt, int id, int on) {
   if (on || nt_safe_nav(nt, id)) nt_node_set_int(nt, id, "safe_nav", on ? 1 : 0);
 }
+/* PM_CALL_NODE_FLAGS_VARIABLE_CALL: the call is a bare identifier (`foo`,
+   no receiver, no parentheses, no arguments), which Ruby resolves as a local
+   variable first and only then as a method. The parser exports it as the
+   `vcall` flag, set only when Prism set it, and a desugar that gives the call
+   a receiver clears it with nt_set_vcall. A node without the field is not a
+   variable call. */
+static inline int nt_vcall(const NodeTable *nt, int id) {
+  return nt_int(nt, id, "vcall", 0) != 0;
+}
+static inline void nt_set_vcall(NodeTable *nt, int id, int on) {
+  if (on || nt_vcall(nt, id)) nt_node_set_int(nt, id, "vcall", on ? 1 : 0);
+}
+/* PM_CALL_NODE_FLAGS_IGNORE_VISIBILITY: a receiverless call or a literal
+   `self` receiver may call a private method. Parenthesized self does not.
+   Index targets deny it: CRuby refuses private []= in masgn and for.
+   Desugars preserve this permission when spelling the same call differently,
+   set it for a synthesized self call, and clear it for a different receiver. */
+static inline int nt_ignore_visibility(const NodeTable *nt, int id) {
+  return nt_int(nt, id, "ignore_visibility", 0) != 0;
+}
+static inline void nt_set_ignore_visibility(NodeTable *nt, int id, int on) {
+  nt_node_set_int(nt, id, "ignore_visibility", on ? 1 : 0);
+}
+/* A synthesized implicit-self call spells its receiver explicitly while
+   retaining the private-call permission of the receiverless form. An
+   explicit denial from a public_send rewrite stays denied. */
+static inline void nt_set_self_receiver(NodeTable *nt, int id, int receiver) {
+  nt_node_set_ref(nt, id, "receiver", receiver);
+  nt_set_ignore_visibility(nt, id, nt_ignore_visibility(nt, id));
+}
+/* PM_CALL_NODE_FLAGS_ATTRIBUTE_WRITE: the call is written as an assignment,
+   `recv.name = v`, `recv.name=(v)` or `recv[i] = v`, so its value is the
+   argument whatever the writer returns. The parser exports it as the
+   `attr_write` flag, set only when Prism set it, and a desugar that builds
+   such an assignment sets it with nt_set_attr_write (a desugar that makes
+   the call plain clears it). `recv.send(:name=, v)` and `recv.[]=(i, v)` are
+   not assignments, and a node without the field is not one. */
+static inline int nt_attr_write(const NodeTable *nt, int id) {
+  return nt_int(nt, id, "attr_write", 0) != 0;
+}
+static inline void nt_set_attr_write(NodeTable *nt, int id, int on) {
+  if (on || nt_attr_write(nt, id)) nt_node_set_int(nt, id, "attr_write", on ? 1 : 0);
+}
 static inline int nt_ref(const NodeTable *nt, int id, const char *key) {
   NT_WORK();
   if (id < 0 || id >= nt->count) return -1;
@@ -443,6 +507,123 @@ static inline const int *nt_arr(const NodeTable *nt, int id, const char *key, in
       return nd->a[j].ids;
     }
   return NULL;
+}
+/* ---- an argument list's shape ----
+   Prism sets ArgumentsNodeFlags on an ArgumentsNode (CONTAINS_SPLAT,
+   CONTAINS_MULTIPLE_SPLATS, CONTAINS_KEYWORDS, CONTAINS_KEYWORD_SPLAT,
+   CONTAINS_FORWARDING). The table does not keep them: the desugars rewrite
+   argument lists (a `foo(*a)` turned into a literal list, arguments added by
+   a splice, a SplatNode retyped), so a bit exported at parse time would
+   describe the list as written, not as it is. These predicates ask the list
+   itself, each time, so they answer from its current children after any
+   rewrite and keep nothing to invalidate. A list is a few elements, and the
+   scan costs what reading a cached field would: a lookup of the node's
+   array, then one kind load per element. A cache on the ArgumentsNode
+   would also answer for the whole list, where callers ask about a prefix
+   or a tail of it, and would have to be dropped by every edit of the
+   array and every retyping of an argument node.
+
+   They take the list the caller already holds, an `arguments` array and its
+   length (a call's `arguments`, a yield's, a super's, an index write's; also
+   a slice of one), and answer 0 for a missing list. A call's `&blk` is not
+   in the list: it is the call's `block`, a BlockArgumentNode
+   (nt_call_has_block_arg), except `&:name` for a word-character name or a
+   unary operator, which the parser makes a literal block; `&:+`, `&:&` and
+   the other binary operators stay a BlockArgumentNode. */
+#define NT_ARG_SPLAT 1        /* SplatNode: `*a`, and the anonymous `*` */
+#define NT_ARG_KEYWORDS 2     /* KeywordHashNode: `k: v`, `**h` (a trailing hash without braces) */
+#define NT_ARG_BLOCK 4        /* BlockArgumentNode as a list element: defensive, Prism and the desugars put `&blk` on the call's block, and the loops that tested for one keep asking */
+#define NT_ARG_FORWARDING 8   /* ForwardingArgumentsNode: `...` */
+static inline unsigned nt_arg_shape(NodeKind k) {
+  switch (k) {
+  case NK_SplatNode: return NT_ARG_SPLAT;
+  case NK_KeywordHashNode: return NT_ARG_KEYWORDS;
+  case NK_BlockArgumentNode: return NT_ARG_BLOCK;
+  case NK_ForwardingArgumentsNode: return NT_ARG_FORWARDING;
+  default: return 0;
+  }
+}
+/* Is any of argv[0..argc) one of the shapes (a mask of NT_ARG_*)? The single
+   shapes below name the common questions; a caller that asks for several
+   at once ("no splat, keyword or block argument") passes the mask. */
+static inline int nt_argv_has(const NodeTable *nt, const int *argv, int argc, unsigned shapes) {
+  if (!argv) return 0;
+  for (int i = 0; i < argc; i++)
+    if (nt_arg_shape(nt_kind(nt, argv[i])) & shapes) return 1;
+  return 0;
+}
+/* PM_ARGUMENTS_NODE_FLAGS_CONTAINS_SPLAT: does the call spread an array into
+   its positionals (`*args`)? */
+static inline int nt_argv_has_splat(const NodeTable *nt, const int *argv, int argc) {
+  return nt_argv_has(nt, argv, argc, NT_ARG_SPLAT);
+}
+/* How many of the arguments are splats (CONTAINS_MULTIPLE_SPLATS is
+   `> 1`). */
+static inline int nt_argv_splat_count(const NodeTable *nt, const int *argv, int argc) {
+  int n = 0;
+  for (int i = 0; argv && i < argc; i++)
+    if (nt_kind(nt, argv[i]) == NK_SplatNode) n++;
+  return n;
+}
+/* CONTAINS_KEYWORDS: does the call pass keyword arguments -- a literal
+   `k: v` or a `**h`? A sole keyword hash counts too (the Struct/Data member
+   form, `d.class.new(x: 1)`, is built as the static `D.new(x: 1)` is). */
+static inline int nt_argv_has_keywords(const NodeTable *nt, const int *argv, int argc) {
+  return nt_argv_has(nt, argv, argc, NT_ARG_KEYWORDS);
+}
+/* CONTAINS_FORWARDING: does the call forward `...`? */
+static inline int nt_argv_has_forwarding(const NodeTable *nt, const int *argv, int argc) {
+  return nt_argv_has(nt, argv, argc, NT_ARG_FORWARDING);
+}
+/* The trailing keyword hash of the arguments (`f(a, k: 1)`), or -1. Prism
+   puts the keywords after the positionals, so it is the last element. */
+static inline int nt_argv_kwh(const NodeTable *nt, const int *argv, int argc) {
+  return argv && argc > 0 && nt_kind(nt, argv[argc - 1]) == NK_KeywordHashNode ? argv[argc - 1] : -1;
+}
+/* Is the argument list exactly `(...)`? */
+static inline int nt_argv_only_forwarding(const NodeTable *nt, const int *argv, int argc) {
+  return argv && argc == 1 && nt_kind(nt, argv[0]) == NK_ForwardingArgumentsNode;
+}
+/* Does a Hash or KeywordHash literal spread another hash (`**h`)? */
+static inline int nt_hash_has_splat(const NodeTable *nt, int hash) {
+  int n = 0; const int *el = hash >= 0 ? nt_arr(nt, hash, "elements", &n) : NULL;
+  for (int e = 0; e < n; e++)
+    if (nt_kind(nt, el[e]) == NK_AssocSplatNode) return 1;
+  return 0;
+}
+/* CONTAINS_KEYWORD_SPLAT: does an argument's keyword hash carry a `**h`? */
+static inline int nt_argv_has_kwsplat(const NodeTable *nt, const int *argv, int argc) {
+  for (int i = 0; argv && i < argc; i++)
+    if (nt_kind(nt, argv[i]) == NK_KeywordHashNode && nt_hash_has_splat(nt, argv[i])) return 1;
+  return 0;
+}
+/* The call's `&blk` or `&`: its block when that is a BlockArgumentNode, -1
+   for a literal block or none. */
+static inline int nt_call_block_arg(const NodeTable *nt, int call) {
+  int b = nt_ref(nt, call, "block");
+  return nt_kind(nt, b) == NK_BlockArgumentNode ? b : -1;
+}
+static inline int nt_call_has_block_arg(const NodeTable *nt, int call) {
+  return nt_call_block_arg(nt, call) >= 0;
+}
+/* The expression inside a run of parentheses that each hold exactly one
+   statement: `((x))` is x. It answers the syntactic question, "is this one
+   wrapped expression, and which?", so parentheses holding anything else
+   (`()`, `(a; b)`) are not peeled and the answer is the ParenthesesNode
+   itself, and any other node comes back as it is: a node never turns into -1.
+   It says nothing of the expression's value, which `(a; b)` takes from b and
+   `()` from nil; a caller that asks that does not use this. The statements
+   are counted rather than read from Prism's MULTIPLE_STATEMENTS flag: a
+   desugar builds ParenthesesNodes the parser never saw and edits a body in
+   place, and the flag is not exported. */
+static inline int nt_paren_single(const NodeTable *nt, int n) {
+  while (nt_kind(nt, n) == NK_ParenthesesNode) {
+    int body = nt_ref(nt, n, "body"), cnt = 0;
+    const int *stmts = body >= 0 ? nt_arr(nt, body, "body", &cnt) : NULL;
+    if (cnt != 1) break;
+    n = stmts[0];
+  }
+  return n;
 }
 const char *nt_content(const NodeTable *nt, int id);
 

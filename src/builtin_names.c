@@ -10,6 +10,10 @@ int is_zip_name(const char *n) {
   return sp_streq(n, "zip");
 }
 
+int is_dig_name(const char *n) {
+  return sp_streq(n, "dig");
+}
+
 /* the match name that takes a start position (match?(pattern, pos)) */
 int is_match_p_name(const char *n) {
   return sp_streq(n, "match?");
@@ -216,6 +220,15 @@ int is_int_step(const char *n) {
   return sp_streq(n, "times") || sp_streq(n, "upto") || sp_streq(n, "downto");
 }
 
+/* The builtin protocol's next method when the receiver has no override. */
+const char *builtin_operator_delegate(const char *name) {
+  if (sp_streq(name, "!=") || sp_streq(name, "===")) return "==";
+  if (sp_streq(name, "==") || sp_streq(name, "<") || sp_streq(name, "<=") ||
+      sp_streq(name, ">") || sp_streq(name, ">=") || sp_streq(name, "between?") ||
+      sp_streq(name, "clamp")) return "<=>";
+  return NULL;
+}
+
 int is_equality_name(const char *n) {
   return sp_streq(n, "equal?") || sp_streq(n, "eql?") || sp_streq(n, "==");
 }
@@ -308,6 +321,18 @@ int is_identity_query(const char *n) {
 
 int is_len_alias(const char *n) {
   return sp_streq(n, "length") || sp_streq(n, "size");
+}
+
+/* The named spelling of Array#-: its functions raise under - (#9347). */
+int is_difference_spelling(const char *n) {
+  return sp_streq(n, "difference");
+}
+
+/* The spellings of an Array's or Hash's length whose function names length
+   (sp_*Array_length_m): a nil receiver raises under the name as written, which
+   is length's own only for length itself (#9347). */
+int is_length_spelling(const char *n) {
+  return sp_streq(n, "size") || sp_streq(n, "count") || sp_streq(n, "empty?");
 }
 
 int is_add_sub_mul(const char *n) {
@@ -405,6 +430,10 @@ int is_mul_or_pow(const char *n) {
 
 int is_proc_constructor(const char *n) {
   return sp_streq(n, "proc") || sp_streq(n, "lambda");
+}
+
+int is_lambda_constructor(const char *n) {
+  return sp_streq(n, "lambda");
 }
 
 int is_lazy_force(const char *n) {
@@ -667,7 +696,9 @@ int is_ivar_presence_read(const char *n) {
    (desugar_builtin_ivars), and one whose values are all frozen: an ivar
    of theirs reads nil and a write raises FrozenError */
 int is_bivar_keyed_class(const char *n) {
-  return sp_streq(n, "Array") || sp_streq(n, "Hash") || sp_streq(n, "Random");
+  /* (a String's table is keyed by its shared handle: the share walk gives
+     a String an instance variable is kept on that identity) */
+  return sp_streq(n, "Array") || sp_streq(n, "Hash") || sp_streq(n, "Random") || sp_streq(n, "String");
 }
 int is_string_class_name(const char *n) {
   return sp_streq(n, "String");
@@ -681,6 +712,12 @@ int is_frozen_value_class(const char *n) {
 /* desugar_builtin_ivars' access to an ivar of a builtin class's self */
 int is_bivar_access(const char *n) {
   return sp_streq(n, "__bivar_get") || sp_streq(n, "__bivar_set") || sp_streq(n, "__bivar_defined");
+}
+/* the reflection that reads or writes an object's instance variables by name */
+int is_ivar_reflection_name(const char *n) {
+  return sp_streq(n, "instance_variable_get") || sp_streq(n, "instance_variable_set") ||
+         sp_streq(n, "instance_variable_defined?") || sp_streq(n, "instance_variables") ||
+         sp_streq(n, "remove_instance_variable");
 }
 
 int is_attr_reader_family(const char *n) {
@@ -904,6 +941,11 @@ int is_raise_alias(const char *n) {
 /* the Exception methods that answer the message (the share walk's sh_exc) */
 int is_exc_message_name(const char *n) {
   return sp_streq(n, "message") || sp_streq(n, "full_message") || sp_streq(n, "detailed_message");
+}
+/* Exception.exception(m) and e.exception(m): an exception that keeps m as its
+   message, as new does */
+int is_exception_factory(const char *n) {
+  return sp_streq(n, "exception");
 }
 /* +s alone: a route that answers its String operand unless frozen
    (--share-strings, emit_strbuf_route) */
@@ -1179,6 +1221,33 @@ static int builtin_name_in(const char *name, const char *const *names) {
   return 0;
 }
 
+int is_include_name(const char *n) { return sp_streq(n, "include"); }
+int is_prepend_name(const char *n) { return sp_streq(n, "prepend"); }
+
+int is_enumerable_module_name(const char *n) {
+  return n && sp_streq(n, "Enumerable");
+}
+
+int is_comparable_module_name(const char *n) {
+  return n && sp_streq(n, "Comparable");
+}
+
+int is_comparable_builtin_name(const char *n) {
+  return sp_streq(n, "String") || sp_streq(n, "Numeric") ||
+         is_numeric_class_name(n) || sp_streq(n, "Rational") ||
+         sp_streq(n, "Complex") || sp_streq(n, "Time") || sp_streq(n, "Symbol");
+}
+
+/* Numeric's default <=> tests identity, ignoring even a program ==.
+   Object's default can call a program == ahead of Comparable; builtin ==
+   below Comparable is shadowed by its recursive, false equality answer.
+   String and Time instances use their builtin representation and comparator. */
+BuiltinDefaultCmp builtin_default_cmp(int family) {
+  if (family == builtin_class_id("String") || family == builtin_class_id("Time")) return BDC_BUILTIN;
+  if (family == builtin_class_id("Numeric")) return BDC_IDENTITY;
+  return BDC_EQUAL;
+}
+
 /* The modules a builtin class includes ahead of Object, with their own
    public methods as CRuby 4.0 lists them: Integer and Float are Numeric and
    Comparable, String and Symbol Comparable, Array, Hash and Range
@@ -1187,7 +1256,7 @@ static int builtin_name_in(const char *name, const char *const *names) {
    Float, String and Symbol. */
 int builtin_comparable_owns(const char *cls, const char *m) {
   static const char *const cmp[] = { "<", "<=", "==", ">", ">=", "between?", "clamp", NULL };
-  return (is_numeric_class_name(cls) || sp_streq(cls, "String") || sp_streq(cls, "Symbol")) &&
+  return is_comparable_builtin_name(cls) &&
          builtin_name_in(m, cmp);
 }
 
@@ -1227,7 +1296,7 @@ int builtin_module_owns(const char *cls, const char *m) {
 int is_gated_exception_accessor(const char *n) {
   static const char *const names[] = {
     "key", "receiver", "args", "private_call?", "reason", "exit_value", "tag",
-    "value", "status", "success?", "signo", "signm", "name", "errno", "result", NULL };
+    "value", "status", "success?", "signo", "signm", "name", "errno", "error_code", "result", NULL };
   if (!n) return 0;
   for (int i = 0; names[i]; i++) if (sp_streq(n, names[i])) return 1;
   return 0;
@@ -1393,6 +1462,11 @@ const char *dir_surface_alias(const char *n, int blockless_iter) {
   }
   return NULL;
 }
+/* Dir.foreach and Dir.each_child: without a block each answers an Enumerator
+   over the entries (see sp_dir_foreach_enum). */
+int is_dir_blockless_iter(const char *n) {
+  return dir_surface_alias(n, 1) != NULL;
+}
 
 int is_kernel_module_name(const char *n) { return n && sp_streq(n, "Kernel"); }
 
@@ -1409,6 +1483,7 @@ int is_kernel_module_function(const char *m) {
     "rand", "srand", "sleep", "gets", "loop", "lambda", "proc",
     "block_given?", "catch", "throw", "caller", "binding", "__method__",
     "require", "require_relative", "load", "warn", "system", "exec", "spawn",
+    "select",
     "Integer", "Float", "String", "Array", "Hash", "Rational", "Complex",
     NULL
   };
@@ -1506,3 +1581,29 @@ int is_frozen_query(const char *n) { return n && sp_streq(n, "frozen?"); }
 int is_pop_name(const char *n) { return n && sp_streq(n, "pop"); }
 
 int is_first_name(const char *n) { return n && sp_streq(n, "first"); }
+
+int is_mul_op(const char *n) { return n && sp_streq(n, "*"); }
+
+int is_pow_op(const char *n) { return n && sp_streq(n, "**"); }
+
+int is_minus_op(const char *n) { return n && sp_streq(n, "-"); }
+
+int is_clone_name(const char *n) { return n && sp_streq(n, "clone"); }
+
+int is_cover_name(const char *n) { return n && sp_streq(n, "cover?"); }
+
+int is_flatten_name(const char *n) { return n && sp_streq(n, "flatten"); }
+
+int is_hash_name(const char *n) { return n && sp_streq(n, "hash"); }
+
+int is_puts_name(const char *n) { return n && sp_streq(n, "puts"); }
+
+int is_to_f_name(const char *n) { return n && sp_streq(n, "to_f"); }
+
+int is_to_i_name(const char *n) { return n && sp_streq(n, "to_i"); }
+
+int is_intersect_name(const char *n) { return n && sp_streq(n, "intersect?"); }
+
+int ostruct_member_name(const char *n) {
+  return n && (sp_streq(n, "size") || sp_streq(n, "length") || sp_streq(n, "count") || sp_streq(n, "empty?"));
+}

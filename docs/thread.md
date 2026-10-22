@@ -15,10 +15,16 @@ is a user guarantee.
 
 ## The execution model
 
-- **N OS workers.** Worker count is `min(online cores, SPINEL_WORKERS)`.
-  Set `SPINEL_WORKERS=1` to force the single-worker cooperative model, or a
-  fixed number to cap parallelism. Absent the env var, Spinel autodetects the
-  number of online cores.
+- **N OS workers.** `SPINEL_WORKERS=N` is the number of OS threads that run
+  Ruby code, the main thread among them: N-1 helper workers run the other
+  threads beside main. Set `SPINEL_WORKERS=1` to force the single-worker
+  cooperative model: main runs every thread itself, giving each runnable one
+  a timeslice whenever its own code has run a slice, as in CRuby. One OS
+  thread runs them all, so a call that blocks in the OS rather than in the
+  scheduler (`flock` waiting for a lock, a blocking extension call) stops
+  every thread until it returns; I/O, sleeps and Queue / Mutex waits park in
+  the scheduler and do not. A fixed N above 1 caps parallelism. Absent the env var, Spinel autodetects the
+  number of online cores and runs a helper per core beside main.
 - **Real parallelism, no GVL.** Two threads run Ruby code on two cores
   simultaneously. There is no implicit per-object lock, so unsynchronized
   shared mutation is a data race (see [By design](#by-design) below).
@@ -32,10 +38,15 @@ is a user guarantee.
   The same is true of a worker inside an `ffi_func` declared `blocking: true`
   (see [FFI.md](FFI.md)).
 - **Preemption.** A monitor thread timeslices CPU-bound threads (~10 ms
-  quantum) so a thread that loops without yielding cannot starve its siblings.
+  quantum, `RUBY_THREAD_TIMESLICE`) so a thread that loops without yielding
+  cannot starve its siblings.
   Preemption is taken at **safepoint polls** (loop back-edges): a thread that
   spends a long time inside a single runtime call with no poll yields only when
-  that call returns. The preemption signal is `SIGURG`, overridable with
+  that call returns. A loop nested in another that counts `i` up to
+  `a.length` over an array it stores no element of, and runs no other code,
+  polls at the enclosing loop's back-edge instead of its own, so it yields up
+  to one pass over that array late, as a runtime call over the array would.
+  The preemption signal is `SIGURG`, overridable with
   `SPINEL_PREEMPT_SIGNAL`.
 - **The single-threaded archive is unchanged.** A program that never uses
   `Thread` compiles and runs byte-identically to before; none of the scheduler
@@ -123,11 +134,15 @@ These are deliberate consequences of real parallelism, listed in
     see one field from one write and another field from another: a `Range`
     ivar written concurrently reads back with `first` and `last` from
     different assignments.
-  - **Containers can crash the process.** `Array` and `Hash` have no such
-    guarantee. Concurrent `<<` on one Array reaches the growth path, where a
-    reallocation races with another thread's element store, and the observed
-    outcomes are silently dropped elements, a heap-corruption abort, and
-    SIGSEGV. A shared container needs a `Mutex`, or a `Queue`, which is
+  - **Containers can crash the process.** `Array`, `Hash` and `IO::Buffer`
+    have no such guarantee. Concurrent `<<` on one Array reaches the growth
+    path, where a reallocation races with another thread's element store, and
+    the observed outcomes are silently dropped elements, a heap-corruption
+    abort, and SIGSEGV. An `IO::Buffer` freed, resized or transferred while
+    another thread reads it is the same race: the reader can be left holding
+    memory already given back. A loop may keep an array's or a buffer's data
+    across its iterations and see another thread's change only at its next
+    safepoint. A shared container needs a `Mutex`, or a `Queue`, which is
     itself thread-safe.
 - **A green thread's C stack is fixed.** Every thread, Fiber and generator
   Enumerator body runs on its own C stack, 256 KB by default (half of
@@ -157,6 +172,8 @@ These are deliberate consequences of real parallelism, listed in
 |---|---|
 | `SPINEL_WORKERS` | number of OS workers; overrides the online-core autodetect (min 1). Read at the first `Thread.new`, so a program can set it itself: `ENV["SPINEL_WORKERS"] = "1"` before spawning caps its own pool, and `... = "1" unless ENV["SPINEL_WORKERS"]` declares a default the environment still overrides |
 | `SPINEL_PREEMPT_SIGNAL` | the signal the monitor uses to preempt a busy worker (default `SIGURG`) |
+| `RUBY_THREAD_TIMESLICE` | the timeslice in milliseconds, as CRuby reads it (default 10; CRuby's is 100). A thread woken onto a worker that runs more CPU-bound threads waits behind their timeslices: a shorter one lets it run sooner, but costs those threads throughput whether anything wakes or not. Read at the first `Thread.new` |
+| `SPINEL_WAKE_PREEMPT` | `1` puts a woken thread at the front of its worker's queue, behind any woken before it, and the thread running there yields to it at its next safepoint, instead of the woken one waiting out the timeslices ahead of it. Off by default: it costs nothing where nothing wakes, but where wakes are frequent the threads it preempts lose throughput. Read at the first `Thread.new` |
 | `SPINEL_FIBER_STACK_CACHE` | how many freed fiber stacks are kept for reuse (default 32; `0` maps and unmaps one per fiber, as before). A thread's stack goes back when its body returns, and the next thread or fiber of the same size takes it with its guard still in place, so `Thread.new` does not map a stack at all in a steady state. A kept stack keeps the pages its last fiber touched, so the cache holds at most that many stacks' worth of memory, and less than leaving every finished thread's stack mapped until the next collection, as before. Off under AddressSanitizer |
 | `SPINEL_SCHED_STATS` | `1` prints, at exit, what the scheduler's monitor did (turns, polls, readiness arms). `2` also prints every five seconds three histograms of what a green thread waited for: on a run queue after being readied, in `Mutex#lock`, and in `ConditionVariable#wait`, plus how the live threads are pinned across the workers. These are the numbers a tail latency is made of when the CPU is not the bottleneck |
 | `SPINEL_GC_MINOR` | `0` turns the generational object mark off: every collection then marks the whole live heap. On by default since 2026-09-12: a minor cycle marks the young objects plus what the write barrier remembered of the old ones, and a full cycle runs on the cadence the survival ratio sets (`SPINEL_GC_FULL_INTERVAL=N` pins it). `SPINEL_GC_VERIFY_GEN=1` re-marks the whole heap after every minor and names any holder the barrier missed |

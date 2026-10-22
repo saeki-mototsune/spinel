@@ -24,6 +24,7 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #include <sys/un.h>
+#include <netdb.h>  /* gai_strerror for Socket::ResolutionError */
 #include <sys/time.h> /* utimes() for File.utime */
 #include <errno.h>
 #include <limits.h>  /* INT_MAX for the socket int arguments */
@@ -198,6 +199,17 @@ sp_File *sp_io_fdopen_ex(int fd, const char *mode, int owns_fd) {SP_GC_ROOT_STR(
 }
 sp_File *sp_io_fdopen(int fd, const char *mode) { return sp_io_fdopen_ex(fd, mode, 1); }
 
+/* When the -1 a socket helper of lib/sp_net.c answered was a lookup that
+   failed, CRuby's Socket::ResolutionError: `what` and the resolver's text,
+   as CRuby words it. Otherwise it returns, and the caller raises the Errno
+   the socket call left. */
+static void sp_sock_raise_if_unresolved(const char *what) {
+  extern int sp_net_take_resolution_error(void);
+  extern SP_NORETURN void sp_raise_resolution_error(int code, const char *msg);
+  int rc = sp_net_take_resolution_error();
+  if (rc != 0) sp_raise_resolution_error(rc, sp_sprintf("%s: %s", what, gai_strerror(rc)));
+}
+
 /* BasicSocket.do_not_reverse_lookup: true unless the program changes it; a
    socket takes it when it is made, and keeps its own copy after that */
 sp_bool sp_sock_dnrl_default = 1;
@@ -207,7 +219,12 @@ sp_bool sp_sock_dnrl_default = 1;
    see sp_sock_write below -- so a response is on the wire immediately, like
    CRuby sockets' sync = true default. `kind` lands in ->mode for #class. */
 sp_File *sp_io_fdopen_sock(int fd, const char *kind) {SP_GC_ROOT_STR(kind);
-  if (fd < 0) sp_raise_cls("Errno::ECONNREFUSED", "Connection refused");
+  if (fd < 0) {
+    /* TCPSocket.new names the call by its man page section; TCPServer.new
+       does not */
+    sp_sock_raise_if_unresolved(strcmp(kind, "tcp") == 0 ? "getaddrinfo(3)" : "getaddrinfo");
+    sp_raise_cls("Errno::ECONNREFUSED", "Connection refused");
+  }
   /* The scheduler-aware accept/connect helpers may hand us a non-blocking
      fd; the stdio read side must BLOCK (fgets treats EAGAIN as EOF), so
      clear O_NONBLOCK. Green threads still yield: every read entry point
@@ -992,6 +1009,9 @@ sp_int sp_sock_const(const char *n) {
 #ifdef MSG_PEEK
     { "MSG_PEEK", MSG_PEEK },
 #endif
+#ifdef SOMAXCONN
+    { "SOMAXCONN", SOMAXCONN },
+#endif
 #ifdef MSG_WAITALL
     { "MSG_WAITALL", MSG_WAITALL },
 #endif
@@ -1036,6 +1056,20 @@ sp_File *sp_sock_unix_connect(const char *path) {SP_GC_ROOT_STR(path);
   int fd = sp_net_unix_connect(path);
   if (fd < 0) sp_file_raise_errno("connect", path ? path : "");
   return sp_io_fdopen_sock(fd, SPL("unix"));
+}
+/* Socket.unix(path) and Socket.tcp(host, port), CRuby's convenience
+   constructors: the same connection as UNIXSocket.new and TCPSocket.new,
+   answered as a Socket, the class these return (#9934) */
+sp_File *sp_sock_unix_socket(const char *path) {SP_GC_ROOT_STR(path);
+  sp_File *f = sp_sock_unix_connect(path);
+  f->mode = SPL("socket");
+  return f;
+}
+sp_File *sp_sock_tcp_socket(const char *host, sp_int port) {SP_GC_ROOT_STR(host);
+  extern int sp_net_connect(const char *host, int port);
+  sp_File *f = sp_io_fdopen_sock(sp_net_connect(host, (int)port), SPL("tcp"));
+  f->mode = SPL("socket");
+  return f;
 }
 
 /* BasicSocket#do_not_reverse_lookup and its writer: a socket's own, so a
@@ -1092,7 +1126,10 @@ sp_PolyArray *sp_sock_tcp_server_sockets(const char *host, sp_int port) {SP_GC_R
   int fds[16];
   const char *op = NULL;
   int n = sp_net_listen_all(host, sp_sock_int_arg(port), fds, 16, &op);
-  if (n < 0) sp_raise_cls("SocketError", sp_sprintf("getaddrinfo: %s", op));
+  if (n < 0) {
+    sp_sock_raise_if_unresolved("getaddrinfo");
+    sp_raise_cls("SocketError", sp_sprintf("getaddrinfo: %s", op));
+  }
   if (n == 0) {
     int e = errno;
     sp_raise_cls(sp_errno_class_name(e),
@@ -1131,11 +1168,25 @@ sp_File *sp_sock_pair_end(sp_int domain, sp_int type, sp_int proto, sp_int which
   return sp_io_fdopen_sock(fd, SPL("socket"));
 }
 
+/* A family or socket type named by a String or Symbol, with or without its
+   AF_ or PF_ (SOCK_) prefix, as CRuby reads the name. An unknown name is
+   CRuby's SocketError, which names it. */
+sp_int sp_sock_named_const(const char *name, sp_int is_family) {SP_GC_ROOT_STR(name);
+  const char *bare = name;
+  if (is_family && (strncmp(bare, "AF_", 3) == 0 || strncmp(bare, "PF_", 3) == 0)) bare += 3;
+  else if (!is_family && strncmp(bare, "SOCK_", 5) == 0) bare += 5;
+  if (is_family && strcmp(bare, "UNSPEC") == 0) return 0;
+  char full[64];
+  snprintf(full, sizeof full, "%s%s", is_family ? "AF_" : "SOCK_", bare);
+  sp_int r = sp_sock_const(full);
+  if (r < 0)
+    sp_raise_cls("SocketError", sp_sprintf("unknown socket %s: %s", is_family ? "domain" : "type", name));
+  return r;
+}
 /* Socket.getaddrinfo: one row per resolution, in CRuby's 7-element shape. */
 /* A family or socktype argument of Socket.getaddrinfo: nil is 0
-   (unrestricted), an Integer as given, a String or Symbol by name with or
-   without its AF_ / SOCK_ prefix, as CRuby reads it. An unknown name is CRuby's
-   SocketError. */
+   (unrestricted), an Integer as given, a String or Symbol by name
+   (sp_sock_named_const). */
 sp_int sp_sock_addrinfo_hint(sp_RbVal v, sp_int is_family) {
   v = sp_rbval_str(v);
   if (v.tag == SP_TAG_NIL) return 0;
@@ -1144,15 +1195,7 @@ sp_int sp_sock_addrinfo_hint(sp_RbVal v, sp_int is_family) {
   if (v.tag == SP_TAG_STR) name = v.v.s;
   else if (v.tag == SP_TAG_SYM && sp_sym_name_fn) name = sp_sym_name_fn((sp_sym)v.v.i);
   if (!name) sp_raise_cls("TypeError", "no implicit conversion into Integer");
-  const char *prefix = is_family ? "AF_" : "SOCK_";
-  size_t pl = strlen(prefix);
-  if (strncmp(name, prefix, pl) == 0) name += pl;
-  if (is_family && strcmp(name, "UNSPEC") == 0) return 0;
-  char full[64];
-  snprintf(full, sizeof full, "%s%s", prefix, name);
-  sp_int r = sp_sock_const(full);
-  if (r < 0) sp_raise_cls("SocketError", is_family ? "unknown socket domain" : "unknown socket type");
-  return r;
+  return sp_sock_named_const(name, is_family);
 }
 
 /* Socket.getaddrinfo(host, port [, family [, socktype]]): a family or socktype
@@ -1167,7 +1210,10 @@ sp_PolyArray *sp_sock_getaddrinfo(const char *host, sp_int port, sp_int family, 
     int fam = 0, stype = 0, proto = 0, p = 0;
     char ip[64];
     if (sp_net_getaddrinfo_at(host, (int)port, (int)family, (int)socktype, i, &fam, &stype, &proto,
-                              ip, (int)sizeof ip, &p) != 0) break;
+                              ip, (int)sizeof ip, &p) != 0) {
+      sp_sock_raise_if_unresolved("getaddrinfo");
+      break;
+    }
     const char *ips = sp_str_from_bytes(ip, strlen(ip));
     SP_GC_ROOT_STR(ips);   /* held across the row's allocation */
     sp_PolyArray *row = sp_PolyArray_new();
@@ -1183,6 +1229,19 @@ sp_PolyArray *sp_sock_getaddrinfo(const char *host, sp_int port, sp_int family, 
   return out;
 }
 
+/* IPSocket.getaddress(host): the first address the name resolves to, as
+   CRuby answers it; Socket::ResolutionError when the name does not resolve */
+const char *sp_sock_getaddress(const char *host) {SP_GC_ROOT_STR(host);
+  extern int sp_net_getaddress(const char *host, char *ipbuf, int ipcap, const char **err);
+  char ip[64];
+  const char *err = NULL;
+  if (sp_net_getaddress(host, ip, (int)sizeof ip, &err) != 0) {
+    sp_sock_raise_if_unresolved("getaddrinfo");
+    sp_raise_cls("SocketError", sp_sprintf("getaddrinfo: %s", err ? err : ""));
+  }
+  return sp_str_from_bytes(ip, strlen(ip));
+}
+
 /* Socket.sockaddr_in(port, host) / Socket.pack_sockaddr_in: the packed
    sockaddr, as a byte string. It carries NUL bytes (a zero port octet, the
    sin_zero padding, an address with a zero octet), so it is built with
@@ -1192,9 +1251,11 @@ const char *sp_sock_pack_sockaddr_in(sp_int port, const char *host) {SP_GC_ROOT_
   extern int sp_net_pack_sockaddr_in(const char *host, int port, void *out, int cap);
   char buf[128];
   int n = sp_net_pack_sockaddr_in(host, (int)port, buf, (int)sizeof buf);
-  if (n < 0)
+  if (n < 0) {
+    sp_sock_raise_if_unresolved("getaddrinfo");
     sp_raise_cls("SocketError",
                  sp_sprintf("getaddrinfo: Name or service not known - %s", host ? host : ""));
+  }
   return sp_str_from_bytes(buf, (size_t)n);
 }
 
@@ -1308,22 +1369,63 @@ static void sp_sock_require(sp_File *f, const char *m) {SP_GC_ROOT(f);SP_GC_ROOT
 sp_int sp_sock_bind(sp_File *f, const char *host, sp_int port) {SP_GC_ROOT(f);SP_GC_ROOT_STR(host);
   extern int sp_net_udp_bind(int fd, const char *host, int port);
   sp_sock_require(f, "bind");
-  if (sp_net_udp_bind(fileno(f->fp), host, (int)port) != 0)
+  if (sp_net_udp_bind(fileno(f->fp), host, (int)port) != 0) {
+    sp_sock_raise_if_unresolved("getaddrinfo");
     sp_file_raise_errno("bind", host ? host : "");
+  }
   return 0;
 }
 sp_int sp_sock_connect(sp_File *f, const char *host, sp_int port) {SP_GC_ROOT(f);SP_GC_ROOT_STR(host);
   extern int sp_net_udp_connect(int fd, const char *host, int port);
   sp_sock_require(f, "connect");
-  if (sp_net_udp_connect(fileno(f->fp), host, (int)port) != 0)
+  if (sp_net_udp_connect(fileno(f->fp), host, (int)port) != 0) {
+    sp_sock_raise_if_unresolved("getaddrinfo");
     sp_file_raise_errno("connect", host ? host : "");
+  }
   return 0;
 }
-sp_int sp_sock_send(sp_File *f, const char *data, sp_int len, const char *host, sp_int port) {SP_GC_ROOT(f);SP_GC_ROOT_STR(data);SP_GC_ROOT_STR(host);
-  extern int sp_net_udp_send_to(int fd, const char *data, int len, const char *host, int port);
+/* Socket#bind / #connect(sockaddr): the address already packed (the binary
+   String Socket.sockaddr_in or Addrinfo#to_sockaddr answers), copied out
+   aligned, as sp_sock_connect_nb_sa copies it. Only a Socket takes it: a
+   UDPSocket's pair takes a host and a port, and the other socket classes
+   have neither. */
+static void sp_sock_sa_prepare(sp_File *f, const char *m, const char *sa, sp_int salen,
+                               struct sockaddr_storage *out) {SP_GC_ROOT(f);SP_GC_ROOT_STR(m);SP_GC_ROOT_STR(sa);
+  const char *k = sp_io_kind_name(f);
+  if (strcmp(k, "UDPSocket") == 0)
+    sp_raise_cls("ArgumentError", "wrong number of arguments (given 1, expected 2)");
+  if (strcmp(k, "Socket") != 0)
+    sp_raise_cls("NoMethodError", sp_sprintf("undefined method '%s' for an instance of %s", m, k));
+  SP_IO_OPEN(f);
+  if (!sa || salen <= 0 || salen > (sp_int)sizeof(struct sockaddr_storage)) {
+    errno = EINVAL;
+    sp_file_raise_errno(m, "");
+  }
+  memcpy(out, sa, (size_t)salen);
+}
+sp_int sp_sock_bind_sa(sp_File *f, const char *sa, sp_int salen) {SP_GC_ROOT(f);SP_GC_ROOT_STR(sa);
+  struct sockaddr_storage aligned_sa;
+  sp_sock_sa_prepare(f, "bind", sa, salen, &aligned_sa);
+  if (bind(fileno(f->fp), (const struct sockaddr *)&aligned_sa, (socklen_t)salen) != 0)
+    sp_file_raise_errno("bind", "");
+  return 0;
+}
+sp_int sp_sock_connect_sa(sp_File *f, const char *sa, sp_int salen) {SP_GC_ROOT(f);SP_GC_ROOT_STR(sa);
+  extern int sp_net_connect_sa(int fd, const void *sa, int len);
+  struct sockaddr_storage aligned_sa;
+  sp_sock_sa_prepare(f, "connect", sa, salen, &aligned_sa);
+  if (sp_net_connect_sa(fileno(f->fp), &aligned_sa, (int)salen) != 0)
+    sp_file_raise_errno("connect", "");
+  return 0;
+}
+sp_int sp_sock_send(sp_File *f, const char *data, sp_int len, sp_int flags, const char *host, sp_int port) {SP_GC_ROOT(f);SP_GC_ROOT_STR(data);SP_GC_ROOT_STR(host);
+  extern int sp_net_udp_send_to(int fd, const char *data, int len, int flags, const char *host, int port);
   sp_sock_require(f, "send");
-  int n = sp_net_udp_send_to(fileno(f->fp), data, (int)len, host, (int)port);
-  if (n < 0) sp_file_raise_errno("send", host ? host : "");
+  int n = sp_net_udp_send_to(fileno(f->fp), data, (int)len, sp_sock_int_arg(flags), host, (int)port);
+  if (n < 0) {
+    sp_sock_raise_if_unresolved("getaddrinfo");
+    sp_file_raise_errno("send", host ? host : "");
+  }
   return (sp_int)n;
 }
 static long sp_io_buffered(FILE *fp);
@@ -1622,7 +1724,24 @@ const char *sp_File_readpartial(sp_File *f, sp_int n) {
   return r;
 }
 
+/* readpartial checks its count before the stream, as CRuby does; sysread
+   words a negative count as the String it cannot make. */
+const char *sp_File_readpartial_checked(sp_File *f, sp_int n) {SP_GC_ROOT(f);
+  if (n < 0) sp_raise_cls("ArgumentError", sp_sprintf("negative length %lld given", (long long)n));
+  return sp_File_readpartial(f, n);
+}
+
+const char *sp_File_sysread_checked(sp_File *f, sp_int n) {SP_GC_ROOT(f);
+  if (n < 0) sp_raise_cls("ArgumentError", "negative string size (or size too big)");
+  return sp_File_readpartial(f, n);
+}
+
 const char *sp_sock_read_nb(sp_File *f, sp_int len, sp_bool exc, sp_bool is_recv, sp_bool *eof) {SP_GC_ROOT(f);
+  /* a negative count is an ArgumentError ahead of the stream, with or
+     without `exception: false`, as CRuby's; it answered "" */
+  if (len < 0)
+    sp_raise_cls("ArgumentError", is_recv ? "negative string size (or size too big)"
+                                          : sp_sprintf("negative length %lld given", (long long)len));
   if (eof) *eof = 0;
   if (is_recv) sp_sock_nb_prepare(f, "recv_nonblock");
   else SP_IO_OPEN(f);
@@ -1702,6 +1821,7 @@ sp_oint sp_sock_connect_nb(sp_File *f, const char *host, sp_int port, sp_bool ex
   sp_io_nb_end(f, saved);
   errno = ce;
   if (rc == 0) return sp_oint_of(0);
+  sp_sock_raise_if_unresolved("getaddrinfo");
   if (errno == EINPROGRESS || errno == EALREADY) {
     if (!exc) return sp_oint_nil();
     sp_raise_cls("IO::EINPROGRESSWaitWritable", "operation in progress - connect(2) would block");

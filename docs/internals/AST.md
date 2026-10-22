@@ -108,6 +108,16 @@ S 4 content hi
 A call written `recv&.name` also carries `I 2 safe_nav 1` (Prism's
 safe-navigation flag, on the call-operator write nodes too); an ordinary
 call carries no such field, and `nt_safe_nav` answers 0 for it.
+A call written as an assignment (`recv.name = v`, `recv.name=(v)`,
+`recv[i] = v`) carries `I 2 attr_write 1`, Prism's attribute-write flag;
+`recv.send(:name=, v)` does not. A desugar that builds such an assignment
+sets it, and `nt_attr_write` answers 0 for a node without the field.
+An ArgumentsNode carries none of Prism's ArgumentsNodeFlags: the desugars
+rewrite argument lists, so a bit set when the list was parsed would go
+stale. What those flags say (a splat, keywords, a keyword splat, `...`) is
+asked of the list itself through the `nt_argv_*` predicates, which answer
+from its current elements; a call's `&blk` is its `block` field
+(`nt_call_block_arg`).
 
 Node ids are assigned in DFS pre-order during parse, so a child's id is
 greater than its parent's id, except for the StatementsNode made for an
@@ -184,7 +194,7 @@ disambiguating field is `name`, plus the recv / args / block triple.
 
 | Node                | Fields used                                          | Notes                                       |
 |---------------------|------------------------------------------------------|---------------------------------------------|
-| `CallNode`          | `name` (S), `receiver` (R), `arguments` (R), `block` (R), `flags` (I) | Universal method call. `flags` bit 0 = `&.` safe navigation. |
+| `CallNode`          | `name` (S), `receiver` (R), `arguments` (R), `block` (R), `safe_nav` (I), `attr_write` (I), `vcall` (I) | Universal method call. `safe_nav` is 1 for `recv&.name`, `attr_write` is 1 for `recv.name = v`, `recv.name=(v)` and `recv[i] = v`, and `vcall` is 1 for a bare identifier; each is present only when Prism set the flag (a desugar that writes an assignment sets `attr_write`). |
 | `ArgumentsNode`     | `arguments` (A)                                      | Positional + keyword + splat args.          |
 | `KeywordHashNode`   | `elements` (A)                                       | Trailing keyword hash literal.              |
 | `AssocNode`         | `key` (R), `value` (R)                               | One key=>value pair inside a Hash or kwargs.|

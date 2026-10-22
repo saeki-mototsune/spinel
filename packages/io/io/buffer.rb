@@ -77,6 +77,7 @@ module IOBufferPackage
   native_method :__set_i,   [:int, :int, :int], :int, "sp_IOBuffer_set_i"
   native_method :__set_f,   [:int, :int, :float], :int, "sp_IOBuffer_set_f"
   native_method :__set_v,   [:int, :int, :any], :int, "sp_IOBuffer_set_v"
+  native_method :__check_writable, [], :self, "sp_IOBuffer_check_writable"
   native_method :__lock,    [], :self, "sp_IOBuffer_lock"
   native_method :__unlock,  [], :self, "sp_IOBuffer_unlock"
   native_method :__become_for, [:string], :self, "sp_IOBuffer_become_for"
@@ -120,9 +121,11 @@ class IO::Buffer
     new(0).__become_for(string)
   end
 
-  # IO::Buffer.map(file, size = nil, offset = 0, flags = READONLY): a view
-  # of the file through mmap (munmap'd by the finalizer; resize refused).
-  def self.map(file, size = nil, offset = 0, flags = READONLY)
+  # IO::Buffer.map(file, size = nil, offset = 0, flags = 0): a view of the
+  # file through mmap (munmap'd by the finalizer; resize refused). As in
+  # CRuby the default is a writable shared mapping, so a file opened
+  # read-only needs READONLY.
+  def self.map(file, size = nil, offset = 0, flags = 0)
     new(0).__become_map(file, size.nil? ? -1 : size, offset, flags)
   end
 
@@ -249,22 +252,27 @@ class IO::Buffer
     acc
   end
 
+  # Answers the offset past the last value, as set_value does. The buffer
+  # is checked first (read-only, an invalidated slice), then the types, the
+  # offset (so an empty list at a negative one raises too) and the values,
+  # in CRuby's order.
   def set_values(types, offset, values)
+    __check_writable
     unless types.is_a?(Array)
       raise ArgumentError, "Argument buffer_types should be an array!"
     end
+    raise ArgumentError, "Offset can't be negative!" if offset < 0
     unless values.is_a?(Array)
       raise ArgumentError, "Argument values should be an array!"
     end
     if types.size != values.size
       raise ArgumentError, "Argument buffer_types and values should have the same length!"
     end
-    total = 0
     i = 0
     while i < types.size
-      total += set_value(types[i], offset + total, values[i])
+      offset = set_value(types[i], offset, values[i])
       i += 1
     end
-    total
+    offset
   end
 end

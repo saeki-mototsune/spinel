@@ -243,7 +243,7 @@ sp_int sp_re_match(mrb_regexp_pattern *pat, const char *str) {SP_GC_ROOT_STR(str
   int64_t slen = (int64_t)sp_str_byte_len(str);
   int ncaps = 32, at;
   /* the start of the attempt, which is group 0's but for a \K: `=~`
-     answers it, and `start_with?` asks it to be 0; `index` reads group 0 */
+     answers it; `index` reads group 0 */
   int n = re_exec_attempt(pat, str, slen, 0, sp_re_caps, ncaps, sp_str_is_binary(str), &at);
   if (n > 0) { sp_re_last_pat = pat; sp_re_set_captures(str, sp_re_caps, n/2); return at; }
   /* Issue #848: clear backrefs on no-match so a subsequent `$1`
@@ -255,6 +255,17 @@ sp_int sp_re_match(mrb_regexp_pattern *pat, const char *str) {SP_GC_ROOT_STR(str
   sp_re_match_post = NULL;
   sp_re_pp_span[0] = sp_re_pp_span[1] = -1;
   return -1;
+}
+/* String#start_with?(re): whether the pattern matches at index 0. A match
+   that begins later is no answer, and leaves `$~` nil as a miss does: CRuby
+   tries the pattern at the start only. */
+sp_bool sp_re_start_with(mrb_regexp_pattern *pat, const char *str) {SP_GC_ROOT_STR(str);
+  if (!str) return FALSE;
+  int at;
+  int n = re_exec_attempt(pat, str, (int64_t)sp_str_byte_len(str), 0, sp_re_caps, 32, sp_str_is_binary(str), &at);
+  if (n > 0 && at == 0) { sp_re_last_pat = pat; sp_re_set_captures(str, sp_re_caps, n/2); return TRUE; }
+  sp_re_clear_last_match();
+  return FALSE;
 }
 /* Like sp_re_match, but search from byte offset `pos` in the FULL string so a
    zero-width anchor (`\b`, a lookbehind) sees the preceding context -- passing
@@ -462,6 +473,25 @@ sp_bool sp_re_case_eq(mrb_regexp_pattern *pat, sp_RbVal v) {SP_GC_ROOT_RBVAL(v);
 /* The pattern behind a boxed value: a Regexp box is one already, and a String
    is compiled the way `str.match?("b")` compiles its argument. Answers NULL for
    anything else. Used by the poly-receiver match forms below (#3961). */
+/* Noted once each at startup, before any thread runs, and only read after:
+   a handful, so a list does. A note that cannot grow the list is out of
+   memory, as an allocation is. */
+static const mrb_regexp_pattern **sp_re_literals = NULL;
+static size_t sp_re_nliterals = 0, sp_re_cliterals = 0;
+void sp_re_note_literal(const mrb_regexp_pattern *pat) {
+  if (!pat) return;
+  if (sp_re_nliterals == sp_re_cliterals) {
+    size_t nc = sp_re_cliterals ? sp_re_cliterals * 2 : 16;
+    const mrb_regexp_pattern **nl = (const mrb_regexp_pattern **)realloc((void *)sp_re_literals, nc * sizeof *nl);
+    if (!nl) { fputs("spinel: out of memory\n", stderr); exit(1); }
+    sp_re_literals = nl; sp_re_cliterals = nc;
+  }
+  sp_re_literals[sp_re_nliterals++] = pat;
+}
+int sp_re_noted_literal_p(const void *pat) {
+  for (size_t i = 0; i < sp_re_nliterals; i++) if ((const void *)sp_re_literals[i] == pat) return 1;
+  return 0;
+}
 mrb_regexp_pattern *sp_poly_as_pattern(sp_RbVal v) {SP_GC_ROOT_RBVAL(v);
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_REGEX) return (mrb_regexp_pattern *)v.v.p;
   const char *s = NULL;
@@ -515,8 +545,15 @@ sp_bool sp_poly_match_p_at(sp_RbVal a, sp_RbVal b, sp_int pos) {SP_GC_ROOT_RBVAL
 }
 sp_MatchData *sp_poly_match_data(sp_RbVal a, sp_RbVal b) {SP_GC_ROOT_RBVAL(a);SP_GC_ROOT_RBVAL(b);
   mrb_regexp_pattern *p; const char *s;
-  if (!sp_poly_match_pair(a, b, &p, &s)) return NULL;
+  if (!sp_poly_match_pair(a, b, &p, &s)) { sp_re_clear_last_match(); return NULL; }
   return sp_re_matchdata(p, s);
+}
+/* match(pattern, pos) with a boxed operand: the pair, from character
+   position pos of the subject, as the typed sp_re_matchdata_at takes it */
+sp_MatchData *sp_poly_match_data_at(sp_RbVal a, sp_RbVal b, sp_int pos) {SP_GC_ROOT_RBVAL(a);SP_GC_ROOT_RBVAL(b);
+  mrb_regexp_pattern *p; const char *s;
+  if (!sp_poly_match_pair(a, b, &p, &s)) { sp_re_clear_last_match(); return NULL; }
+  return sp_re_matchdata_at(p, s, pos);
 }
 sp_oint sp_poly_match_index(sp_RbVal a, sp_RbVal b) {SP_GC_ROOT_RBVAL(a);SP_GC_ROOT_RBVAL(b);
   mrb_regexp_pattern *p; const char *s;
@@ -524,7 +561,28 @@ sp_oint sp_poly_match_index(sp_RbVal a, sp_RbVal b) {SP_GC_ROOT_RBVAL(a);SP_GC_R
   if (a.tag == SP_TAG_OBJ && a.cls_id == SP_BUILTIN_REGEX) b = sp_box_str(sp_re_operand(b, 1));
   if (!sp_poly_match_pair(a, b, &p, &s)) return sp_oint_nil();
   sp_int r = sp_re_match(p, s);
-  return r < 0 ? sp_oint_nil() : sp_oint_of(r);
+  /* a character position, as the typed form answers: sp_re_match's is a
+     byte offset, which is not one past a multibyte character */
+  return r < 0 ? sp_oint_nil() : sp_oint_of(sp_str_byte_to_char(s, r));
+}
+/* The group a name reads after a match. A name may repeat across
+   alternation branches; CRuby (Onigmo's onig_name_to_backref_number) then
+   reads the last of its groups that took part in the match, and the last
+   declared only when none did. Taking the last declared always made
+   `md[:name]` and a replacement's \k<name> read an empty group when an
+   earlier branch matched. `caps` holds `ncaps` positions, a begin/end pair
+   per group. -1 when the pattern has no group of that name. */
+int sp_re_name_group(const mrb_regexp_pattern *pat, const char *name, const int *caps, int ncaps) {
+  int last = re_named_group(pat, name);
+  if (last < 0) return -1;
+  int n = re_num_named(pat);
+  for (int k = n - 1; k >= 0; k--) {
+    int g = -1;
+    const char *nm = re_named_name(pat, k, &g);
+    if (!nm || strcmp(nm, name) != 0) continue;
+    if ((g * 2) + 1 < ncaps && caps[g * 2] >= 0) return g;
+  }
+  return last;
 }
 void sp_re_expand_rep(const mrb_regexp_pattern *pat,
                              char **out_io, size_t *olen_io, size_t *cap_io,
@@ -600,7 +658,7 @@ void sp_re_expand_rep(const mrb_regexp_pattern *pat,
           }
           memcpy(name, rep + i + 3, nlen);
           name[nlen] = '\0';
-          int gi = re_named_group(pat, name);
+          int gi = sp_re_name_group(pat, name, caps, ncaps);
           if (gi < 0) {
            /* Build the message before freeing the name, then release the
               scratch buffer: sp_raise_cls longjmps, so the caller's free()
@@ -891,7 +949,7 @@ sp_RbVal sp_re_match_poly(mrb_regexp_pattern *pat, const char *str) {SP_GC_ROOT_
    ask only once the pattern matched, so a failed match stays nil. */
 const char *sp_re_named_capture(const mrb_regexp_pattern *pat, const char *name) {
   if (!pat || !name || !sp_re_last_str) return NULL;
-  int g = re_named_group(pat, name);
+  int g = sp_re_name_group(pat, name, sp_re_caps, sp_re_last_ncap * 2 < 64 ? sp_re_last_ncap * 2 : 64);
   if (g < 0) sp_raise_cls("IndexError", sp_sprintf("undefined group name reference: %s", name));
   if ((g * 2) + 1 >= 64) return NULL;
   int b = sp_re_caps[g * 2], e = sp_re_caps[(g * 2) + 1];
@@ -977,7 +1035,8 @@ mrb_regexp_pattern *sp_re_union_array(sp_PolyArray *a) {SP_GC_ROOT(a);
   const char *joined = NULL;
   SP_GC_ROOT_STR(joined);
   for (sp_int i = 0; i < a->len; i++) {
-    sp_RbVal v = sp_PolyArray_get(a, i);
+    /* (a String a variable shares is its handle's box: read as its bytes) */
+    sp_RbVal v = sp_rbval_str(sp_PolyArray_get(a, i));
     const char *part;
     if (v.tag == SP_TAG_STR) part = sp_re_escape(v.v.s ? v.v.s : "");
     else if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_REGEX) part = sp_re_to_s_str(v.v.p);
@@ -1160,7 +1219,7 @@ sp_MatchData *sp_re_matchdata_at(mrb_regexp_pattern *pat, const char *str, sp_in
   if (!str) return NULL;
   sp_int cl = sp_str_length(str);
   if (cpos < 0) cpos += cl;
-  if (cpos < 0 || cpos > cl) return NULL;
+  if (cpos < 0 || cpos > cl) { sp_re_clear_last_match(); return NULL; }
   size_t boff = sp_utf8_byte_offset(str, cpos);
   int64_t slen = (int64_t)sp_str_byte_len(str);
   int caps[64];
@@ -1201,7 +1260,7 @@ const char *sp_MatchData_aref(sp_MatchData *m, sp_int i) {SP_GC_ROOT(m);
    is unknown or the group did not participate). */
 const char *sp_MatchData_aref_name(sp_MatchData *m, const char *name) {SP_GC_ROOT(m);SP_GC_ROOT_STR(name);
   if (!m || !name) return NULL;
-  int g = re_named_group(m->pat, name);
+  int g = sp_re_name_group(m->pat, name, m->caps, m->ncap * 2);
   if (g < 0) sp_raise_cls("IndexError", sp_sprintf("undefined group name reference: %s", name));
   return sp_MatchData_aref(m, g);
 }
@@ -1367,7 +1426,7 @@ sp_IntArray *sp_MatchData_byteoffset(sp_MatchData *m, sp_int i) {SP_GC_ROOT(m);
    name to its group index like MatchData#[], then defer to the index form. An
    unknown name raises IndexError, matching MRI. */
 static int sp_md_group_by_name(sp_MatchData *m, const char *name) {SP_GC_ROOT_STR(name);
-  int g = m ? re_named_group(m->pat, name) : -1;
+  int g = m ? sp_re_name_group(m->pat, name, m->caps, m->ncap * 2) : -1;
   if (g < 0) sp_raise_cls("IndexError", sp_sprintf("undefined group name reference: %s", name));
   return g;
 }

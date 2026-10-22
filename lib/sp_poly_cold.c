@@ -19,6 +19,7 @@
 #define sp_sym_to_s sp_poly_cold_sym_to_s
 #define sp_class_to_s sp_poly_cold_class_to_s
 #define sp_sym_intern sp_poly_cold_sym_intern
+#define sp_sym_intern_n sp_poly_cold_sym_intern_n
 #include "spinel_rt.h"
 
 #ifdef SP_CEXT
@@ -41,6 +42,8 @@ void sp_cext_hash_set(sp_RbVal hash, sp_RbVal key, sp_RbVal value) {
 
 const char *(*sp_class_name_fn)(sp_Class);
 const char *(*sp_class_display_fn)(sp_Class);
+const char *(*sp_class_user_to_s_fn)(sp_Class);
+const char *(*sp_class_user_inspect_fn)(sp_Class);
 /* the hooks the generated unit installs for this unit (SP_INSTALL_HOOK) */
 sp_user_binop_fn sp_user_binop_hook_lib;
 sp_obj_eq_fn sp_obj_eq_hook_lib;
@@ -51,6 +54,11 @@ sp_RbVal (*sp_bsub_dup_hook_lib)(sp_RbVal, int, sp_bool *);
 /* the symbol interner is generated per program too; a keyword name that is not
    a known symbol reaches it through the hook the generated unit installs */
 sp_sym sp_poly_cold_sym_intern(const char *s) { return sp_json_sym_intern_fn ? sp_json_sym_intern_fn(s) : (sp_sym)0; }
+/* and a counted name, for sp_thread_local_key: this unit compiles the
+   header's sp_poly_has_key and sp_poly_index_poly (slice's key walk), whose
+   Thread arms call it. The hook takes a C string, so a key interns up to its
+   first NUL byte. */
+sp_sym sp_poly_cold_sym_intern_n(const char *s, size_t n) { (void)n; return sp_poly_cold_sym_intern(s); }
 const char *sp_poly_cold_sym_to_s(sp_sym id) { return sp_sym_name_fn ? sp_sym_name_fn(id) : sp_str_empty; }
 const char *sp_poly_cold_class_to_s(sp_Class c) {
   if (c.name) return c.name;
@@ -84,7 +92,7 @@ void sp_poly_puts(sp_RbVal v)
     case SP_TAG_NIL: putchar('\n'); break;
     case SP_TAG_SYM: { const char *_ss = sp_sym_to_s((sp_sym)v.v.i); fputs(_ss, stdout); putchar('\n'); break; }
     case SP_TAG_ENCODING: { const char *_es = v.v.s ? v.v.s : sp_str_empty; fputs(_es, stdout); putchar('\n'); break; }
-    case SP_TAG_CLASS: { fputs(sp_class_val_display(v), stdout); putchar('\n'); break; }
+    case SP_TAG_CLASS: { fputs(sp_class_val_user(v, sp_class_user_to_s_fn), stdout); putchar('\n'); break; }
     case SP_TAG_BIGINT: { const char *_bs = sp_bigint_to_s((sp_Bigint *)v.v.p); if (_bs) fputs(_bs, stdout); putchar('\n'); break; }
     case SP_TAG_OBJ: {
       /* MRI's `puts arr` iterates an Array, printing one element per
@@ -171,7 +179,7 @@ const char *sp_poly_to_s(sp_RbVal v)
     case SP_TAG_BOOL: return v.v.b ? sp_str_frozen_true : sp_str_frozen_false;
     case SP_TAG_NIL: return sp_str_frozen_empty;
     case SP_TAG_SYM: return sp_sym_to_s_chilled((sp_sym)v.v.i);
-    case SP_TAG_CLASS: return sp_class_val_display(v);
+    case SP_TAG_CLASS: return sp_class_val_user(v, sp_class_user_to_s_fn);
     case SP_TAG_ENCODING: return v.v.s ? v.v.s : sp_str_empty;
     case SP_TAG_BIGINT: return sp_bigint_to_s((sp_Bigint *)v.v.p);
     case SP_TAG_OBJ:
@@ -453,7 +461,7 @@ const char *sp_poly_inspect(sp_RbVal v)
     case SP_TAG_NIL:  return SPL("nil");
     case SP_TAG_SYM:  return sp_sym_inspect((sp_sym)v.v.i);
     case SP_TAG_ENCODING: return sp_encoding_inspect_name(v.v.s ? v.v.s : "");
-    case SP_TAG_CLASS: return sp_class_val_display(v);
+    case SP_TAG_CLASS: return sp_class_val_user(v, sp_class_user_inspect_fn);
     case SP_TAG_BIGINT: return sp_bigint_to_s((sp_Bigint *)v.v.p);
     case SP_TAG_OBJ:
  /* Built-in container / value-type tags get their typed inspect
@@ -532,10 +540,10 @@ sp_StrPolyHash*sp_StrPolyHash_merge(sp_StrPolyHash*a,sp_StrPolyHash*b)
 {SP_GC_ROOT(a);SP_GC_ROOT(b);sp_StrPolyHash*r=sp_StrPolyHash_new();r->default_v=a->default_v;r->dproc=a->dproc;r->dproc_self=a->dproc_self;for(sp_int i=0;i<a->len;i++)sp_StrPolyHash_set(r,a->order[i],sp_StrPolyHash_get(a,a->order[i]));for(sp_int i=0;i<b->len;i++)sp_StrPolyHash_set(r,b->order[i],sp_StrPolyHash_get(b,b->order[i]));return r;}
 
 sp_StrPolyHash*sp_StrPolyHash_dup(sp_StrPolyHash*h)
-{SP_GC_ROOT(h);sp_StrPolyHash*r=sp_StrPolyHash_new();r->default_v=h->default_v;r->dproc=h->dproc;r->dproc_self=h->dproc_self;for(sp_int i=0;i<h->len;i++)sp_StrPolyHash_set(r,h->order[i],sp_StrPolyHash_get(h,h->order[i]));return r;}
+{if(!h)return NULL;SP_GC_ROOT(h);sp_StrPolyHash*r=sp_StrPolyHash_new();r->default_v=h->default_v;r->dproc=h->dproc;r->dproc_self=h->dproc_self;for(sp_int i=0;i<h->len;i++)sp_StrPolyHash_set(r,h->order[i],sp_StrPolyHash_get(h,h->order[i]));return r;}
 
 void sp_StrPolyHash_clear(sp_StrPolyHash*h)
-{ sp_gc_wb((void*)h);if(!h)return;for(sp_int i=0;i<h->cap;i++)h->keys[i]=NULL;h->len=0;}
+{ sp_gc_wb((void*)h);if (SP_UNLIKELY(!h)) sp_nil_recv("clear");for(sp_int i=0;i<h->cap;i++)h->keys[i]=NULL;h->len=0;}
 
 const char*sp_StrPolyHash_inspect(sp_StrPolyHash*h)
 {return h?sp_inspect_container(sp_box_obj(h,SP_BUILTIN_STR_POLY_HASH)):SPL("nil");}
@@ -599,19 +607,19 @@ const char *sp_OpenStruct_inspect(sp_OpenStruct *o)
 }
 
 sp_SymPolyHash*sp_SymPolyHash_dup(sp_SymPolyHash*h)
-{sp_SymPolyHash*r=sp_SymPolyHash_new();r->default_v=h->default_v;r->dproc=h->dproc;r->dproc_self=h->dproc_self;for(sp_int i=0;i<h->len;i++)sp_SymPolyHash_set(r,h->order[i],sp_SymPolyHash_get(h,h->order[i]));return r;}
+{if(!h)return NULL;sp_SymPolyHash*r=sp_SymPolyHash_new();r->default_v=h->default_v;r->dproc=h->dproc;r->dproc_self=h->dproc_self;for(sp_int i=0;i<h->len;i++)sp_SymPolyHash_set(r,h->order[i],sp_SymPolyHash_get(h,h->order[i]));return r;}
 
 void sp_SymPolyHash_clear(sp_SymPolyHash*h)
-{if(!h)return;for(sp_int i=0;i<h->cap;i++)h->keys[i]=-1;h->len=0;}
+{if (SP_UNLIKELY(!h)) sp_nil_recv("clear");for(sp_int i=0;i<h->cap;i++)h->keys[i]=-1;h->len=0;}
 
 const char*sp_SymPolyHash_inspect(sp_SymPolyHash*h)
 {return h?sp_inspect_container(sp_box_obj(h,SP_BUILTIN_SYM_POLY_HASH)):SPL("nil");}
 
 sp_PolyPolyHash*sp_PolyPolyHash_merge(sp_PolyPolyHash*a,sp_PolyPolyHash*b)
-{SP_GC_ROOT(a);SP_GC_ROOT(b);sp_PolyPolyHash*r=sp_PolyPolyHash_new();SP_GC_ROOT(r);if(a){r->default_v=a->default_v;r->dproc=a->dproc;r->dproc_self=a->dproc_self;for(sp_int i=0;i<a->len;i++){sp_int idx=a->order[i];sp_PolyPolyHash_set(r,a->keys[idx],a->vals[idx]);}}if(b){for(sp_int i=0;i<b->len;i++){sp_int idx=b->order[i];sp_PolyPolyHash_set(r,b->keys[idx],b->vals[idx]);}}return r;}
+{SP_GC_ROOT(a);SP_GC_ROOT(b);if (SP_UNLIKELY(!a)) sp_nil_recv("merge");sp_PolyPolyHash*r=sp_PolyPolyHash_new();SP_GC_ROOT(r);r->default_v=a->default_v;r->dproc=a->dproc;r->dproc_self=a->dproc_self;for(sp_int i=0;i<a->len;i++){sp_int idx=a->order[i];sp_PolyPolyHash_set(r,a->keys[idx],a->vals[idx]);}if(b){for(sp_int i=0;i<b->len;i++){sp_int idx=b->order[i];sp_PolyPolyHash_set(r,b->keys[idx],b->vals[idx]);}}return r;}
 
 void sp_PolyPolyHash_clear(sp_PolyPolyHash*h)
-{if(!h)return;for(sp_int i=0;i<h->cap;i++)h->occ[i]=0;h->len=0;}
+{if (SP_UNLIKELY(!h)) sp_nil_recv("clear");for(sp_int i=0;i<h->cap;i++)h->occ[i]=0;h->len=0;}
 
 sp_RbVal sp_poly_clear(sp_RbVal v)
 {
@@ -621,6 +629,7 @@ sp_RbVal sp_poly_clear(sp_RbVal v)
      the box untouched. */
   if (v.tag == SP_TAG_STR) { sp_str_check_mutable(v.v.s); return sp_box_str(sp_str_from_bytes("", 0)); }
   sp_poly_coll_chk(v, "clear");
+  sp_poly_hash_check_mutable(v);
   if (v.tag != SP_TAG_OBJ || !v.v.p) return v;
   switch (v.cls_id) {
     case SP_BUILTIN_INT_ARRAY:      ((sp_IntArray *)v.v.p)->len = 0; break;
@@ -1057,7 +1066,7 @@ void sp_kw_merge_any(sp_PolyPolyHash *dst, sp_RbVal h)
 }
 
 sp_PolyPolyHash*sp_PolyPolyHash_dup(sp_PolyPolyHash*h)
-{SP_GC_ROOT(h);sp_PolyPolyHash*r=sp_PolyPolyHash_new();SP_GC_ROOT(r);r->default_v=h->default_v;r->dproc=h->dproc;r->dproc_self=h->dproc_self;r->ident=h->ident;for(sp_int i=0;i<h->len;i++)sp_PolyPolyHash_set(r,h->keys[h->order[i]],h->vals[h->order[i]]);return r;}
+{if(!h)return NULL;SP_GC_ROOT(h);sp_PolyPolyHash*r=sp_PolyPolyHash_new();SP_GC_ROOT(r);r->default_v=h->default_v;r->dproc=h->dproc;r->dproc_self=h->dproc_self;r->ident=h->ident;for(sp_int i=0;i<h->len;i++)sp_PolyPolyHash_set(r,h->keys[h->order[i]],h->vals[h->order[i]]);return r;}
 
 const char*sp_PolyPolyHash_inspect(sp_PolyPolyHash*h)
 {return h?sp_inspect_container(sp_box_obj(h,SP_BUILTIN_POLY_POLY_HASH)):SPL("nil");}
@@ -1307,4 +1316,331 @@ const char *sp_pm_len_msg(sp_RbVal arr, sp_int want, int at_least) {
   const char *s = sp_poly_inspect(arr); SP_GC_ROOT_STR(s);
   return sp_sprintf("%s length mismatch (given %lld, expected %lld%s)", s,
                     (long long)sp_poly_length(arr), (long long)want, at_least ? "+" : "");
+}
+
+/* format(*args) with boxed arguments (spinel_rt.h) */
+const char *sp_str_format_polyarr(const char *fmt, sp_PolyArray *a) {
+  size_t cap = strlen(fmt) + 64;
+  char *buf = (char *)malloc(cap);
+  if (!buf) { perror("malloc"); exit(1); }
+  size_t out = 0; sp_int idx = 0; const char *p = fmt;
+  /* CRuby refuses to mix numbered (%1$s), sequential (%s) and named (%<a>d)
+     references in one format string (#3723) */
+  sp_bool used_numbered = FALSE, used_sequential = FALSE, used_named = FALSE;
+  while (*p) {
+    if (*p != '%') {
+      if (out + 1 >= cap) { cap = cap * 2; buf = (char *)realloc(buf, cap); }
+      buf[out++] = *p++; continue;
+    }
+    if (p[1] == '%') {
+      if (out + 1 >= cap) { cap = cap * 2; buf = (char *)realloc(buf, cap); }
+      buf[out++] = '%'; p += 2; continue;
+    }
+    char spec[64]; size_t sl = 0; spec[sl++] = *p++;
+    sp_bool this_numbered = FALSE;
+    /* positional argument reference: %N$conv selects the Nth (1-based) arg */
+    {
+      const char *q = p; sp_int argnum = 0; sp_bool overflow = FALSE;
+      while (*q >= '0' && *q <= '9') {
+        if (sp_int_mul_overflow_p(argnum, 10, &argnum) ||
+            sp_int_add_overflow_p(argnum, *q - '0', &argnum)) { overflow = TRUE; break; }
+        q++;
+      }
+      if (!overflow && argnum > 0 && *q == '$') {
+        idx = argnum - 1; p = q + 1;
+        if (used_sequential || used_named) { free(buf); sp_raise_cls("ArgumentError", "numbered(1) after unnumbered(1)"); }
+        used_numbered = TRUE; this_numbered = TRUE;
+      }
+    }
+    /* %<name>conv / %{name}: named reference into the format's hash argument,
+       which may stand anywhere among the flags and width (`%-5<s>s`,
+       `%0<n>5d`). %<name> substitutes the value for the conversion that
+       follows; %{name} is the conversion itself, the value's to_s, padded as
+       a %s when flags came before it. */
+    sp_RbVal named_v = sp_box_nil(); sp_bool have_named = FALSE, brace_named = FALSE;
+    while (*p && sl < sizeof(spec) - 8) {
+      char c = *p;
+      if (c == '*') {
+        /* dynamic width / precision: the next positional argument supplies the
+           number (a negative width left-justifies, like printf) */
+        if (idx >= a->len) { free(buf); sp_raise_cls("ArgumentError", "too few arguments"); }
+        sp_RbVal wv = a->data[idx]; idx++;
+        if (wv.tag == SP_TAG_FLT && !(wv.v.f >= (sp_float)INTPTR_MIN && wv.v.f < -(sp_float)INTPTR_MIN)) {
+          free(buf); sp_float_arg_check(wv.v.f);
+        }
+        long long wnum = (wv.tag == SP_TAG_INT) ? (long long)wv.v.i
+                       : (wv.tag == SP_TAG_FLT) ? (long long)wv.v.f : 0;
+        /* an Integer past what a C int holds is CRuby's RangeError, not a size */
+        if (wv.tag == SP_TAG_INT && (wnum > INT32_MAX || wnum < INT32_MIN)) {
+          free(buf);
+          sp_raise_cls("RangeError", sp_sprintf("integer %lld too %s to convert to 'int'",
+                                                wnum, wnum < 0 ? "small" : "big"));
+        }
+        /* a negative PRECISION is ignored (a negative width left-justifies) */
+        if (wnum < 0 && sl > 0 && spec[sl - 1] == '.') { sl--; p++; continue; }
+        char wbuf[24]; int wl = snprintf(wbuf, sizeof wbuf, "%lld", wnum);
+        if (sl + (size_t)wl < sizeof(spec) - 8) { memcpy(spec + sl, wbuf, (size_t)wl); sl += (size_t)wl; }
+        p++;
+      }
+      else if (c == '-' || c == '+' || c == ' ' || c == '#' || c == '0' || c == '.' || (c >= '0' && c <= '9')) { spec[sl++] = c; p++; }
+      else if ((c == '<' || c == '{') && !have_named) {
+        char nclose = (c == '<') ? '>' : '}';
+        char nm[64]; size_t nl = 0; const char *q = p + 1;
+        while (*q && *q != nclose && nl < sizeof nm - 1) nm[nl++] = *q++;
+        nm[nl] = 0;
+        if (*q != nclose) break;
+        p = q + 1;
+        if (used_numbered || used_sequential) { free(buf); sp_raise_cls("ArgumentError", sp_sprintf("named%c%s%c after unnumbered(1)", c, nm, nclose)); }
+        named_v = sp_fmt_named_ref(a, nm, nclose, buf);
+        have_named = TRUE;
+        used_named = TRUE;
+        if (nclose == '}') { brace_named = TRUE; break; }
+      }
+      else break;
+    }
+    if (brace_named && sl == 0) {
+      const char *sv2 = sp_poly_to_s(named_v);
+      size_t svl = sv2 ? strlen(sv2) : 0;
+      if (out + svl + 1 >= cap) { cap = (out + svl) * 2 + 64; buf = (char *)realloc(buf, cap); }
+      if (svl) memcpy(buf + out, sv2, svl);
+      out += svl;
+      continue;
+    }
+    /* a trailing bare `%` is a malformed format, not a literal (#3723) */
+    if (!brace_named && !*p) { free(buf); sp_raise_cls("ArgumentError", "incomplete format specifier; use %% (double %) instead"); }
+    char conv = brace_named ? 's' : *p++; spec[sl++] = conv;
+    /* Ruby's %u is %d: it prints a negative as -N rather than wrapping */
+    if (conv == 'u') { conv = 'd'; spec[sl - 1] = 'd'; }
+    char fmt_use[80];
+    if (conv == 'd' || conv == 'i') {
+      memcpy(fmt_use, spec, sl - 1);
+      fmt_use[sl - 1] = 'l'; fmt_use[sl] = 'l'; fmt_use[sl + 1] = conv; fmt_use[sl + 2] = 0;
+    }
+else {
+      memcpy(fmt_use, spec, sl); fmt_use[sl] = 0;
+    }
+    char tmp[256]; int wn = 0;
+    char *wide = NULL;   /* a field longer than tmp, formatted again into the heap */
+    sp_RbVal v;
+    if (have_named) v = named_v;
+    else {
+      /* CRuby raises rather than padding a missing argument with nil/0 */
+      if (idx >= a->len) { free(buf); sp_raise_cls("ArgumentError", "too few arguments"); }
+      if (!this_numbered) {
+        if (used_named) { free(buf); sp_raise_cls("ArgumentError", "unnumbered(1) mixed with named"); }
+        if (used_numbered) { free(buf); sp_raise_cls("ArgumentError", "unnumbered(1) mixed with numbered"); }
+        used_sequential = TRUE;
+      }
+      v = a->data[idx]; idx++;
+    }
+    /* A mutable String arrives as a shared handle, not a plain String:
+       `%c` of one printed nothing and `%d` and `%f` refused it as no String,
+       where CRuby reads the String. Every conversion reads the handle as its
+       value, as %s did through sp_poly_to_s. */
+    if (sp_poly_is_strbuf(v)) v = sp_poly_strbuf_deref(v);
+    if (conv == 'd' || conv == 'i' || conv == 'x' || conv == 'X' || conv == 'o' ||
+        conv == 'b' || conv == 'B') {
+      long long lv = 0;
+      /* A BIGNUM does not fit the long long the conversions below format, and
+         truncating it printed 0 for every value past 64 bits. Render its own
+         digits in the requested base and pass them through the spec as a
+         string, which keeps the width and left-justify flags (#4010). */
+      if (v.tag == SP_TAG_BIGINT && v.v.p) {
+        sp_int base = (conv == 'x' || conv == 'X') ? 16 : (conv == 'o') ? 8
+                    : (conv == 'b' || conv == 'B') ? 2 : 10;
+        const char *bs = sp_bigint_to_s_base((sp_Bigint *)v.v.p, base);
+        if (!bs) bs = "0";
+        /* a non-decimal base goes through the binary formatter: a negative
+           one is shown as its two's complement, as an Integer's is */
+        if (base != 10) {
+          wn = sp_fmt_binary_big(spec, sl, conv, bs, tmp, sizeof(tmp));
+          for (size_t wsz = sizeof(tmp) * 2; wn >= (int)(wsz / 2) && wsz <= ((size_t)1 << 30); wsz *= 2) {
+            char *w2 = (char *)realloc(wide, wsz);
+            if (!w2) { wn = (int)sizeof(tmp); free(wide); wide = NULL; break; }
+            wide = w2;
+            wn = sp_fmt_binary_big(spec, sl, conv, bs, wide, wsz);
+          }
+        }
+        else {
+        /* The sign and base flags belong to the digits, not to the %s that
+           carries the width: compose them in, then keep only the width and
+           left-justify flags in the spec printf sees. */
+        int neg_b = bs[0] == '-';
+        char pre[8]; int pl = 0;
+        if (!neg_b) for (int fi = 1; fi < sl - 1; fi++) {
+          if (spec[fi] == '+') { pre[pl++] = '+'; break; }
+          if (spec[fi] == ' ') { pre[pl++] = ' '; break; }
+          if (spec[fi] != '-' && spec[fi] != '#' && spec[fi] != '0') break;
+        }
+        for (int fi = 1; fi < sl - 1; fi++) {
+          if (spec[fi] == '#') {
+            if (base == 16) { pre[pl++] = '0'; pre[pl++] = (conv == 'X') ? 'X' : 'x'; }
+            else if (base == 8) pre[pl++] = '0';
+            else if (base == 2) { pre[pl++] = '0'; pre[pl++] = (conv == 'B') ? 'B' : 'b'; }
+            break;
+          }
+          if (spec[fi] < '0' || spec[fi] > '9') continue;
+          break;
+        }
+        pre[pl] = 0;
+        char digits[512];
+        snprintf(digits, sizeof digits, "%s%s%s", neg_b ? "-" : "", pre, bs + (neg_b ? 1 : 0));
+        char bfmt[80]; int bl = 0;
+        bfmt[bl++] = '%';
+        for (int fi = 1; fi < sl - 1; fi++)
+          if (spec[fi] == '-' || (spec[fi] >= '0' && spec[fi] <= '9' && !(bl == 1 && spec[fi] == '0')))
+            bfmt[bl++] = spec[fi];
+        bfmt[bl++] = 's'; bfmt[bl] = 0;
+        wn = snprintf(tmp, sizeof(tmp), bfmt, digits);
+        if (wn >= (int)sizeof(tmp) && (wide = (char *)malloc((size_t)wn + 1)) != NULL)
+          snprintf(wide, (size_t)wn + 1, bfmt, digits);
+        else if (wn >= (int)sizeof(tmp)) wn = (int)sizeof(tmp) - 1;
+        if (conv == 'X') for (char *q = wide ? wide : tmp; *q; q++) if (*q >= 'a' && *q <= 'f') *q -= 32;
+        }
+      }
+      else {
+      if (v.tag == SP_TAG_FLT && !(v.v.f >= (sp_float)INTPTR_MIN && v.v.f < -(sp_float)INTPTR_MIN)) {
+        free(buf); (void)sp_float_to_i_checked(v.v.f);
+      }
+      if (v.tag == SP_TAG_INT) lv = (long long)v.v.i;
+      else if (v.tag == SP_TAG_FLT) lv = (long long)v.v.f;
+      /* a String argument converts the way Integer() does, so unparseable text
+         is an ArgumentError rather than a silent zero (#3554) */
+      else if (v.tag == SP_TAG_STR && v.v.s) lv = (long long)sp_str_to_i_strict(v.v.s);
+      /* Anything else is not a number at all, and formatting it as 0 was a
+         quiet wrong answer where CRuby refuses (#4010). Same wording and same
+         value spelling as Integer() uses. */
+      else { free(buf); sp_raise_cls("TypeError", sp_sprintf("can't convert %s into Integer", sp_convert_src_name(v))); }
+      /* the non-decimal bases go through our own formatter: C's printf drops
+         the '+' and ' ' flags on them and has no two's-complement form */
+      if (conv == 'd' || conv == 'i') {
+        wn = snprintf(tmp, sizeof(tmp), fmt_use, lv);
+        if (wn >= (int)sizeof(tmp) && (wide = (char *)malloc((size_t)wn + 1)) != NULL)
+          snprintf(wide, (size_t)wn + 1, fmt_use, lv);
+        else if (wn >= (int)sizeof(tmp)) wn = (int)sizeof(tmp) - 1;
+      }
+      else {
+        wn = sp_fmt_binary(spec, sl, conv, lv, tmp, sizeof(tmp));
+        /* it stops at the buffer's end: a wider field is formatted again */
+        for (size_t wsz = sizeof(tmp) * 2; wn >= (int)(wsz / 2) && wsz <= ((size_t)1 << 30); wsz *= 2) {
+          char *w2 = (char *)realloc(wide, wsz);
+          if (!w2) { wn = (int)sizeof(tmp); free(wide); wide = NULL; break; }
+          wide = w2;
+          wn = sp_fmt_binary(spec, sl, conv, lv, wide, wsz);
+        }
+      }
+      }
+    }
+else if (conv == 'f' || conv == 'e' || conv == 'E' || conv == 'g' || conv == 'G' ||
+         conv == 'a' || conv == 'A') {
+      double dv = 0;
+      if (v.tag == SP_TAG_FLT) dv = v.v.f;
+      else if (v.tag == SP_TAG_INT) dv = (double)v.v.i;
+      else if (sp_poly_is_rational(v)) dv = sp_poly_to_f_with_rational(v);
+      else if (v.tag == SP_TAG_BIGINT) dv = sp_poly_to_f(v);
+      /* a String converts the way Float() does; anything else is not a number
+         and CRuby refuses rather than formatting a zero (#4010) */
+      else if (v.tag == SP_TAG_STR) dv = (double)sp_str_to_f_strict(v.v.s ? v.v.s : sp_str_empty);
+      /* a user object converts through its #to_f, which may allocate */
+      else if (sp_poly_is_user_obj(v)) {
+        SP_GC_ROOT(a); SP_GC_ROOT_STR(fmt);
+        dv = sp_poly_Float_ex(v, 1).v;
+      }
+      else { free(buf); sp_raise_cls("TypeError", sp_sprintf("can't convert %s into Float", sp_convert_src_name(v))); }
+      /* Ruby prints non-finite floats as Inf/-Inf/NaN (C printf lowercases) */
+      if (!isfinite(dv)) wn = snprintf(tmp, sizeof(tmp), "%s", isnan(dv) ? "NaN" : dv > 0 ? "Inf" : "-Inf");
+      /* pinned "C" locale so the decimal point is always '.', not the process
+         locale's separator (the printf field/flag machinery stays libc's) */
+      else wn = sp_snprintf_ruby_float(tmp, sizeof(tmp), fmt_use, dv);
+      /* `%.2f` of 1e300 is over 300 characters: snprintf answered the full
+         length and tmp held only its first 255, and the copy below read past
+         it (DBL_MAX printed stack bytes) */
+      if (wn >= (int)sizeof(tmp) && isfinite(dv)) {
+        wide = (char *)malloc((size_t)wn + 1);
+        if (wide) sp_snprintf_ruby_float(wide, (size_t)wn + 1, fmt_use, dv);
+        else wn = (int)sizeof(tmp) - 1;
+      }
+    }
+else if (conv == 's' || conv == 'p') {
+      /* %s is to_s, %p is inspect -- for every tag (symbols, arrays, hashes,
+         booleans, user objects), not just the scalar three. Hash/Array to_s
+         is its inspect, which sp_poly_to_s already returns. %p is the same
+         conversion over the inspect text (C's %p is a pointer). */
+      const char *sv = (conv == 's') ? sp_poly_to_s(v) : sp_poly_inspect(v);
+      if (!sv) sv = "";
+      /* The field is composed by hand: snprintf's %s counts BYTES, so a width
+         or a precision fell in the middle of a multibyte character (`%.1s` of
+         "日本" cut it in half, `%-6s` padded it by its byte count), it stops at
+         an embedded NUL, and a field wider than the 256-byte buffer it wrote
+         into was copied out of that buffer whole. CRuby's width and precision
+         count characters, as String#length does; the value's length in bytes
+         is its own (an embedded NUL is a byte of the string, #4632). The '0',
+         '+', ' ' and '#' flags mean nothing to a String. */
+      size_t svl = sp_str_byte_len(sv);
+      int left = 0, width = 0, prec = -1, in_prec = 0;
+      for (size_t fi = 1; fi + 1 < sl; fi++) {
+        char fc = spec[fi];
+        if (fc == '-') left = 1;
+        else if (fc == '.') { in_prec = 1; prec = 0; }
+        else if (fc >= '0' && fc <= '9') {
+          int *np = in_prec ? &prec : &width;
+          if (*np > (INT32_MAX - (fc - '0')) / 10) {
+            free(buf);
+            sp_raise_cls("ArgumentError", in_prec ? "precision too big" : "width too big");
+          }
+          *np = *np * 10 + (fc - '0');
+        }
+      }
+      sp_int nch = sp_str_length(sv);
+      if (prec >= 0 && prec < nch) { svl = sp_utf8_byte_offset(sv, prec); nch = prec; }
+      size_t pad = (sp_int)width > nch ? (size_t)((sp_int)width - nch) : 0;
+      if (out + svl + pad + 1 >= cap) { cap = (out + svl + pad) * 2 + 64; buf = (char *)realloc(buf, cap); }
+      if (!left) { memset(buf + out, ' ', pad); out += pad; }
+      memcpy(buf + out, sv, svl); out += svl;
+      if (left) { memset(buf + out, ' ', pad); out += pad; }
+      continue;
+    }
+else if (conv == 'c') {
+      /* an Integer is a codepoint (UTF-8 encoded), a String contributes its
+         first whole character -- not a single truncated byte (#3083) */
+      char cbuf[8]; int clen = 0;
+      if (v.tag == SP_TAG_INT) clen = sp_utf8_encode((uint32_t)v.v.i, cbuf);
+      else if (v.tag == SP_TAG_STR && v.v.s && v.v.s[0]) {
+        clen = sp_utf8_advance(v.v.s);
+        if (clen > 8) clen = 8;
+        memcpy(cbuf, v.v.s, (size_t)clen);
+      }
+      /* the character occupies one column; honor a width and the '-' flag */
+      int left = 0, width = 0;
+      for (size_t fi = 1; fi + 1 < sl; fi++) {
+        char fc = spec[fi];
+        if (fc == '-') left = 1;
+        else if (fc >= '0' && fc <= '9') width = width * 10 + (fc - '0');
+      }
+      int pad = width > 1 ? width - 1 : 0;
+      if ((size_t)(clen + pad) >= sizeof(tmp)) pad = (int)sizeof(tmp) - clen - 1;
+      if (pad < 0) pad = 0;
+      int o2 = 0;
+      if (!left) for (int i = 0; i < pad; i++) tmp[o2++] = ' ';
+      memcpy(tmp + o2, cbuf, (size_t)clen); o2 += clen;
+      if (left) for (int i = 0; i < pad; i++) tmp[o2++] = ' ';
+      tmp[o2] = 0;
+      wn = o2;
+    }
+else {
+      /* CRuby: an unknown / truncated conversion is a hard error */
+      free(buf);
+      if (conv)
+        sp_raise_cls("ArgumentError", sp_sprintf("malformed format string - %%%c", conv));
+      else
+        sp_raise_cls("ArgumentError", "incomplete format specifier; use %% (double %) instead");
+      return "";
+    }
+    if (wn < 0) { free(wide); continue; }
+    if (out + (size_t)wn + 1 >= cap) { cap = ((out + wn) * 2) + 64; buf = (char *)realloc(buf, cap); }
+    memcpy(buf + out, wide ? wide : tmp, wn); out += wn;
+    free(wide);
+  }
+  buf[out] = 0;
+  char *r = sp_str_alloc(out); memcpy(r, buf, out); free(buf); return r;
 }

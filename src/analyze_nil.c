@@ -50,6 +50,7 @@
 
 #include "analyze_internal.h"
 #include "call_plan.h"
+#include "value_pos.h"
 
 /* a memo entry whose value is being computed */
 #define NF_BUSY 0xff
@@ -841,6 +842,11 @@ static int nf_call(NF *f, int v) {
   if (r >= 0 && (rt == TY_STRING || rt == TY_STRBUF || (rt == TY_POLY && c->ntype[v] == TY_STRING)) &&
       ty_str_typed_bang_flags(nm) && !(ty_str_typed_bang_flags(nm) & PF_STR_SELF))
     return NFW_NIL;
+  /* a removal from an object Array: a queue or a stack the program empties,
+     whose nil a call on the element then meets */
+  if (r >= 0 && ty_is_obj_array(rt) &&
+      (sp_streq(nm, "pop") || sp_streq(nm, "shift") || sp_streq(nm, "delete_at")))
+    return NFW_TAKEN;
   /* an element read that can miss, a pick that finds nothing */
   if (r >= 0 && nf_container(rt)) {
     static const char *const picks[] = { "find", "detect", "first", "last", "min", "max", "min_by",
@@ -896,7 +902,7 @@ static int nf_elem_tracked(TyKind t) {
 /* a nil the program writes, as cplan_nil reads one */
 static int nf_written_nil(int why) {
   return why == NFW_NIL || why == NFW_NO_ELSE || why == NFW_SAFE_NAV || why == NFW_UNSET ||
-         why == NFW_ELEM_NIL;
+         why == NFW_ELEM_NIL || why == NFW_TAKEN;
 }
 
 /* An ivar's element flag sits on the topmost class of the family that
@@ -995,10 +1001,15 @@ static void nf_elem_mark(NF *f, int slot_node, int why) {
 }
 
 static void nf_elem_mark_back(NF *f, int v, int depth);
-static void nf_elem_back_list(NF *f, int st, int depth) {
-  if (st < 0 || nt_kind(f->nt, st) != NK_StatementsNode) { nf_elem_mark_back(f, st, depth); return; }
-  int n = 0; const int *b = nt_arr(f->nt, st, "body", &n);
-  if (n > 0) nf_elem_mark_back(f, b[n - 1], depth);
+
+/* One value position of a conditional or a sequence: the slots the Array there
+   is read out of, at the next level. A walk that gave up marks only the node it
+   stopped at. */
+typedef struct { NF *f; int depth; } NfBackArms;
+static int nf_back_arm(const VpLeaf *leaf, void *ud) {
+  NfBackArms *a = ud;
+  if (leaf->kind != VPK_NIL) nf_elem_mark_back(a->f, leaf->node, a->depth + 1);
+  return 0;
 }
 
 /* An Array is a reference: a nil stored through one name of it (`b = a;
@@ -1013,17 +1024,13 @@ static void nf_elem_mark_back(NF *f, int v, int depth) {
   const NodeTable *nt = f->nt;
   if (v < 0 || v >= nt->count || depth > 8) return;
   switch (nt_kind(nt, v)) {
-  case NK_ParenthesesNode: nf_elem_back_list(f, nt_ref(nt, v, "body"), depth + 1); return;
-  case NK_StatementsNode: nf_elem_back_list(f, v, depth + 1); return;
-  case NK_ElseNode: nf_elem_back_list(f, nt_ref(nt, v, "statements"), depth + 1); return;
-  case NK_IfNode: case NK_UnlessNode:
-    nf_elem_back_list(f, nt_ref(nt, v, "statements"), depth + 1);
-    nf_elem_mark_back(f, nt_ref(nt, v, nt_kind(nt, v) == NK_IfNode ? "subsequent" : "else_clause"), depth + 1);
+  case NK_ParenthesesNode: case NK_StatementsNode: case NK_ElseNode: case NK_IfNode: case NK_UnlessNode:
+  case NK_CaseNode: case NK_CaseMatchNode: case NK_BeginNode: case NK_RescueModifierNode:
+  case NK_AndNode: case NK_OrNode: {
+    NfBackArms a = { f, depth };
+    for_each_value_position(nt, v, VP_AND_LEFT | VPS_ALL, nf_back_arm, &a);
     return;
-  case NK_AndNode: case NK_OrNode:
-    nf_elem_mark_back(f, nt_ref(nt, v, "left"), depth + 1);
-    nf_elem_mark_back(f, nt_ref(nt, v, "right"), depth + 1);
-    return;
+  }
   case NK_LocalVariableWriteNode: case NK_InstanceVariableWriteNode: case NK_GlobalVariableWriteNode:
   case NK_ClassVariableWriteNode: case NK_ConstantWriteNode:
     (void)nf_elem_slot_op(f, v, NF_EL_HOLDS | NF_EL_STORED);
@@ -1032,20 +1039,15 @@ static void nf_elem_mark_back(NF *f, int v, int depth) {
   case NK_CallNode: {
     if (nf_elem_slot_op(f, v, NF_EL_HOLDS | NF_EL_STORED) >= 0) return;
     int pmi = nf_plan(f, v, NULL, NULL);
-    if (pmi >= 0) { nf_elem_back_list(f, f->c->scopes[pmi].body, depth + 1); return; }
+    /* the depth is passed unchanged: a method body is a structure node (a
+       StatementsNode, a BeginNode, parentheses), which costs the level */
+    if (pmi >= 0) { nf_elem_mark_back(f, f->c->scopes[pmi].body, depth); return; }
     if (mutated_array(f->c, v) != v) nf_elem_mark_back(f, nt_ref(nt, v, "receiver"), depth + 1);
     return;
   }
   default:
     (void)nf_elem_slot_op(f, v, NF_EL_HOLDS | NF_EL_STORED);
   }
-}
-
-static int nf_elem(NF *f, int v, int depth);
-static int nf_elem_list(NF *f, int st, int depth) {
-  if (st < 0 || nt_kind(f->nt, st) != NK_StatementsNode) return nf_elem(f, st, depth);
-  int n = 0; const int *b = nt_arr(f->nt, st, "body", &n);
-  return n > 0 ? nf_elem(f, b[n - 1], depth) : 0;
 }
 
 /* Can an element of the Array node v's value be nil (NFW_ELEM_NIL, else
@@ -1063,19 +1065,24 @@ static int nf_elem(NF *f, int v, int depth) {
   f->ememo[v] = r ? 2 : 1;
   return r;
 }
+/* One value position of a conditional or a sequence: whether the Array there
+   can hold a nil, at the next level. A walk that gave up can. */
+typedef struct { NF *f; int depth; } NfElemArms;
+static int nf_elem_arm(const VpLeaf *leaf, void *ud) {
+  NfElemArms *a = ud;
+  if (leaf->kind == VPK_NIL) return 0;
+  return leaf->kind == VPK_GAVE_UP || nf_elem(a->f, leaf->node, a->depth + 1);
+}
 static int nf_elem_uncached(NF *f, int v, int depth) {
   const NodeTable *nt = f->nt;
   switch (nt_kind(nt, v)) {
-  case NK_ParenthesesNode: return nf_elem_list(f, nt_ref(nt, v, "body"), depth + 1);
-  case NK_StatementsNode: return nf_elem_list(f, v, depth + 1);
-  case NK_ElseNode: return nf_elem_list(f, nt_ref(nt, v, "statements"), depth + 1);
-  case NK_IfNode: case NK_UnlessNode:
-    return nf_elem_list(f, nt_ref(nt, v, "statements"), depth + 1) ||
-           nf_elem(f, nt_ref(nt, v, nt_kind(nt, v) == NK_IfNode ? "subsequent" : "else_clause"), depth + 1)
+  case NK_ParenthesesNode: case NK_StatementsNode: case NK_ElseNode: case NK_IfNode: case NK_UnlessNode:
+  case NK_CaseNode: case NK_CaseMatchNode: case NK_BeginNode: case NK_RescueModifierNode:
+  case NK_AndNode: case NK_OrNode: {
+    NfElemArms a = { f, depth };
+    return for_each_value_position(nt, v, VP_AND_LEFT | VPS_ALL, nf_elem_arm, &a)
            ? NFW_ELEM_NIL : 0;
-  case NK_AndNode: case NK_OrNode:
-    return nf_elem(f, nt_ref(nt, v, "left"), depth + 1) || nf_elem(f, nt_ref(nt, v, "right"), depth + 1)
-           ? NFW_ELEM_NIL : 0;
+  }
   case NK_LocalVariableWriteNode: case NK_InstanceVariableWriteNode: case NK_GlobalVariableWriteNode:
   case NK_ClassVariableWriteNode: case NK_ConstantWriteNode:
     return nf_elem(f, nt_ref(nt, v, "value"), depth + 1);
@@ -1145,15 +1152,20 @@ static void nf_elem_writes(NF *f) {
     NT_FOREACH_KIND(nt, wk[q], w) {
       int val = nt_ref(nt, w, "value");
       /* `Array.new(n) { ... }` whose block can answer nil is typed a
-         PolyArray where the slot it fills settles a pointer one */
-      if (val < 0 || !(nf_elem_tracked(c->ntype[val]) || c->ntype[val] == TY_POLY_ARRAY)) continue;
-      nf_elem_mark(f, w, nf_elem(f, val, 0));
+         PolyArray where the slot it fills settles a pointer one; a boxed
+         value (a choice between an Array and nil) carries no element fact
+         of its own, but a nil stored through its slot still lands in the
+         Array it was chosen from */
+      int boxed = val >= 0 && c->ntype[val] == TY_POLY;
+      if (val < 0 || !(nf_elem_tracked(c->ntype[val]) || c->ntype[val] == TY_POLY_ARRAY || boxed)) continue;
+      if (!boxed) nf_elem_mark(f, w, nf_elem(f, val, 0));
       int wf = nf_elem_slot_op(f, w, 0);
       if (wf > 0 && (wf & NF_EL_STORED)) nf_elem_mark_back(f, val, 0);
     }
   NT_FOREACH_KIND(nt, NK_CallNode, id) {
     int recv = mutated_array(c, nt_ref(nt, id, "receiver"));
-    if (recv < 0 || !nf_elem_tracked(c->ntype[recv])) continue;
+    /* a boxed receiver stores into whichever Array it holds */
+    if (recv < 0 || !(nf_elem_tracked(c->ntype[recv]) || c->ntype[recv] == TY_POLY)) continue;
     int from, to, elems;
     int g = array_mutation_stores(c, id, 1, &from, &to, &elems);
     if (g < 0) continue;
@@ -1210,8 +1222,7 @@ static void nf_bind_yield_elems(NF *f, int id, int blk, int mi, int from_recv, i
       else {
         int ya = nt_ref(nt, yields[mi][y], "arguments"), yn = 0;
         const int *yv = ya >= 0 ? nt_arr(nt, ya, "arguments", &yn) : NULL;
-        int splat = 0;
-        for (int j = 0; j < yn; j++) if (nt_kind(nt, yv[j]) == NK_SplatNode) splat = 1;
+        int splat = nt_argv_has_splat(nt, yv, yn);
         if (!splat && !(yn == 1 && block_param_name(f->c, blk, 1)) && i < yn) src = yv[i];
       }
       if (src < 0) continue;
@@ -1489,12 +1500,13 @@ static void nf_bind_params(NF *f, int id, int mi, const int *av, int an) {
   int open = 0;
   for (int k = 0; k < m->nparams && !open; k++) {
     LocalVar *p = m->pnames[k] ? scope_local(m, m->pnames[k]) : NULL;
-    open = p && ((nf_open(p->obj_may_nil) && nf_tracked(f->c, p->type)) || nf_elem_tracked(p->type));
+    open = p && ((nf_open(p->obj_may_nil) && nf_tracked(f->c, p->type)) || nf_elem_tracked(p->type) ||
+                 (p->type == TY_POLY && (p->obj_elem_may_nil & NF_EL_STORED)));
   }
   if (!open) return;
   ArgLayout L;
   call_layout(c, m, av, an, &L);
-  int kwh = an > 0 && nt_kind(nt, av[an - 1]) == NK_KeywordHashNode ? av[an - 1] : -1;
+  int kwh = nt_argv_kwh(nt, av, an);
   for (int k = 0; k < m->nparams; k++) {
     LocalVar *p = m->pnames[k] ? scope_local(m, m->pnames[k]) : NULL;
     if (!p) continue;
@@ -1503,10 +1515,11 @@ static void nf_bind_params(NF *f, int id, int mi, const int *av, int an) {
     /* an Array argument that can hold nil makes an Array parameter one,
        and a nil the method stores through the parameter lands in the
        argument's Array */
-    if (nf_elem_tracked(p->type)) {
+    if (nf_elem_tracked(p->type) || p->type == TY_POLY) {
       int a = from == ARG_NODE ? layout_plain_arg(c, m, av, &L, k) : from == ARG_DEFAULT ? dflt
               : from == ARG_BY_NAME ? ie_kwhash_value(c, kwh, m->pnames[k]) : -1;
-      if (a >= 0 && !(p->obj_elem_may_nil & NF_EL_HOLDS) && nf_elem(f, a, 0)) nf_elem_add(f, &p->obj_elem_may_nil, NF_EL_HOLDS);
+      if (a >= 0 && p->type != TY_POLY && !(p->obj_elem_may_nil & NF_EL_HOLDS) && nf_elem(f, a, 0))
+        nf_elem_add(f, &p->obj_elem_may_nil, NF_EL_HOLDS);
       if (a >= 0 && (p->obj_elem_may_nil & NF_EL_STORED)) nf_elem_mark_back(f, a, 0);
     }
     if (!nf_open(p->obj_may_nil) || !nf_tracked(f->c, p->type)) continue;
@@ -1520,6 +1533,7 @@ static void nf_bind_params(NF *f, int id, int mi, const int *av, int an) {
       int a = ie_kwhash_value(c, kwh, m->pnames[k]);
       why = a >= 0 ? nf_expr(f, a) : dflt >= 0 ? nf_expr(f, dflt) : NFW_OPAQUE;
     }
+    else if (from == ARG_REST) continue;   /* the rest Array the layout gathers is never nil */
     else why = NFW_OPAQUE;   /* a splat's element, a gathered value */
     nf_set(f, &p->obj_may_nil, why);
   }
@@ -1590,14 +1604,31 @@ static void nf_bind_block(NF *f, int id, int blk, int mi, int **yields, int *nyi
       for (int y = 0; y < nyields[mi] && why != NFW_NIL; y++) {
         int ya = nt_ref(nt, yields[mi][y], "arguments"), yn = 0;
         const int *yv = ya >= 0 ? nt_arr(nt, ya, "arguments", &yn) : NULL;
-        int splat = 0;
-        for (int j = 0; j < yn; j++) if (nt_kind(nt, yv[j]) == NK_SplatNode) splat = 1;
+        int splat = nt_argv_has_splat(nt, yv, yn);
         if (splat || (yn == 1 && block_param_name(c, blk, 1))) why = nf_or(why, NFW_OPAQUE);   /* spread */
         else why = nf_or(why, i >= yn ? NFW_NIL : nf_expr(f, yv[i]));
       }
       if (nyields[mi] == 0) why = NFW_CALLER;
     }
     nf_set(f, &lv->obj_may_nil, why);
+  }
+}
+
+/* The parameters of a lambda literal (`->(v) { }`): its callers are not seen,
+   so each object parameter may be nil, as a proc's are (nf_bind_block). */
+static void nf_bind_lambda(NF *f, int lam) {
+  const NodeTable *nt = f->nt;
+  int pn = nt_ref(nt, lam, "parameters");
+  if (pn < 0 || nt_kind(nt, pn) != NK_ParametersNode) return;
+  static const char *const kinds[] = { "requireds", "optionals", "posts", "keywords", NULL };
+  int body = nt_ref(nt, lam, "body");
+  for (int o = 0; kinds[o]; o++) {
+    int n = 0; const int *ps = nt_arr(nt, pn, kinds[o], &n);
+    for (int i = 0; i < n; i++) {
+      const char *nm = nt_str(nt, ps[i], "name");
+      LocalVar *lv = nm ? nf_local_of(f, body >= 0 ? body : lam, nm) : NULL;
+      if (lv && nf_open(lv->obj_may_nil) && nf_tracked(f->c, lv->type)) nf_set(f, &lv->obj_may_nil, NFW_CALLER);
+    }
   }
 }
 
@@ -1680,9 +1711,8 @@ static void nf_calls(NF *f, int **yields, int *nyields) {
       }
     }
     /* an attr writer: its ivar */
-    size_t cl = strlen(cn);
-    if (mi < 0 && an == 1 && cl > 1 && cl < 250 && cn[cl - 1] == '=' && r >= 0 && ty_is_object(c->ntype[r])) {
-      char base[256]; memcpy(base, cn, cl - 1); base[cl - 1] = 0;
+    char base[256];
+    if (mi < 0 && an == 1 && r >= 0 && ty_is_object(c->ntype[r]) && setter_base_name(cn, base, sizeof base)) {
       int dc = -1;
       if (comp_writer_in_chain(c, ty_object_class(c->ntype[r]), base, &dc) && dc >= 0) {
         char ivn[260]; snprintf(ivn, sizeof ivn, "@%s", base);
@@ -1698,6 +1728,7 @@ static void nf_calls(NF *f, int **yields, int *nyields) {
       nf_set(f, &f->yield_nil[mi], nt_kind(nt, blk) != NK_BlockNode ? NFW_CALLER
              : nf_or(nf_list(f, nt_ref(nt, blk, "body")), nf_next_nil(f, nt_ref(nt, blk, "body"), 0)));
   }
+  NT_FOREACH_KIND(nt, NK_LambdaNode, id) nf_bind_lambda(f, id);
   /* `super(args)` binds the parent's, a bare `super` hands on the method's own */
   NT_FOREACH_KIND(nt, NK_SuperNode, id) {
     int mi = nf_plan(f, id, NULL, NULL);
@@ -1863,8 +1894,12 @@ void an_nil_facts(Compiler *c) {
     for (int k = 0; k < m->nlocals; k++) {
       LocalVar *lv = &m->locals[k];
       if (!nf_tracked(c, lv->type)) continue;
+      /* the Array a *rest gathers and the Hash a **kwrest does are never nil, whoever calls */
+      int gathers = lv->is_param && lv->name &&
+                    ((m->rest_idx >= 0 && m->pnames[m->rest_idx] && sp_streq(lv->name, m->pnames[m->rest_idx])) ||
+                     (m->kwrest_idx >= 0 && m->pnames[m->kwrest_idx] && sp_streq(lv->name, m->pnames[m->kwrest_idx])));
       if (lv->is_param && lv->obj_nilable) nf_set(&f, &lv->obj_may_nil, NFW_NIL);
-      if (lv->is_param && unseen) nf_set(&f, &lv->obj_may_nil, NFW_CALLER);
+      if (lv->is_param && unseen && !gathers) nf_set(&f, &lv->obj_may_nil, NFW_CALLER);
       if (lv->or_written && !lv->is_param && !lv->is_block_param) nf_set(&f, &lv->obj_may_nil, NFW_UNSET);
     }
   }
@@ -1970,7 +2005,7 @@ int nil_fact_why(const Compiler *c, int node) {
 }
 
 const char *nil_fact_why_name(int why) {
-  static const char *const names[] = { "none", "nil", "no-else", "safe-nav", "unset", "elem-nil", "elem",
+  static const char *const names[] = { "none", "nil", "no-else", "safe-nav", "unset", "elem-nil", "taken", "elem",
     "global", "ivar", "caller", "opaque", "guarded" };
   return why >= 0 && why < (int)(sizeof names / sizeof *names) ? names[why] : "?";
 }

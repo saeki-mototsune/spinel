@@ -174,8 +174,10 @@ int sp_io_pick_class(sp_File *f, const char *const *names, const int *idx);
 sp_bool sp_io_instance_of(sp_File *f, const char *cls);
 sp_File *sp_sock_udp_new(sp_int family);
 const char *sp_sock_gethostname(void);
+sp_int sp_sock_named_const(const char *name, sp_int is_family);
 sp_int sp_sock_addrinfo_hint(sp_RbVal v, sp_int is_family);
 sp_PolyArray *sp_sock_getaddrinfo(const char *host, sp_int port, sp_int family, sp_int socktype);
+const char *sp_sock_getaddress(const char *host);
 sp_Addrinfo *sp_sock_address(sp_File *f, sp_int peer);
 const char *sp_sock_getname(sp_File *f, sp_int peer);
 /* BasicSocket.do_not_reverse_lookup (shared by every socket class) and the
@@ -197,9 +199,15 @@ sp_File *sp_sock_for_fd(sp_int fd, sp_int kind);
 sp_File *sp_sock_pair_end(sp_int domain, sp_int type, sp_int proto, sp_int which);
 sp_File *sp_sock_unix_server(const char *path);
 sp_File *sp_sock_unix_connect(const char *path);
+/* Socket.unix(path) / Socket.tcp(host, port): the connection as a Socket */
+sp_File *sp_sock_unix_socket(const char *path);
+sp_File *sp_sock_tcp_socket(const char *host, sp_int port);
 sp_int sp_sock_bind(sp_File *f, const char *host, sp_int port);
 sp_int sp_sock_connect(sp_File *f, const char *host, sp_int port);
-sp_int sp_sock_send(sp_File *f, const char *data, sp_int len, const char *host, sp_int port);
+/* Socket#bind / #connect with a packed sockaddr */
+sp_int sp_sock_bind_sa(sp_File *f, const char *sa, sp_int salen);
+sp_int sp_sock_connect_sa(sp_File *f, const char *sa, sp_int salen);
+sp_int sp_sock_send(sp_File *f, const char *data, sp_int len, sp_int flags, const char *host, sp_int port);
 sp_int sp_sock_shutdown(sp_File *f, sp_int how);
 sp_int sp_sock_const(const char *n);
 const char *sp_sock_recv(sp_File *f, sp_int len);

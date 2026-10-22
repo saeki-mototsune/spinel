@@ -412,10 +412,164 @@ else {
     return true;
 }
 
+/* ---- type aliases ------------------------------------------ */
+
+/* `type patch_t = Array[untyped]`, by qualified name, with the tag the
+ * aliased type maps to. The extractor declares every alias name first
+ * and fills the tags before its emit pass; a reference (`Array[patch_t]`)
+ * then maps as the aliased type would. A name resolves among the DECLARED
+ * aliases, so a nearer declaration wins over an outer one whatever the
+ * order the files are read in; a declared alias whose tag is not known
+ * yet is unresolved (g_alias_unresolved), not an outer one of its name.
+ * The inline RBS reader declares none, so a reference stays out of the
+ * subset there, as before. */
+typedef struct { char *name; char *tag; } alias_entry_t;
+static alias_entry_t *aliases = NULL;
+static size_t aliases_len = 0;
+static size_t aliases_cap = 0;
+bool g_alias_unresolved = false;
+
+static alias_entry_t *alias_entry(const char *name) {
+    for (size_t i = 0; i < aliases_len; i++) {
+        if (strcmp(aliases[i].name, name) == 0) return &aliases[i];
+    }
+    return NULL;
+}
+
+void alias_declare(const char *name) {
+    if (alias_entry(name) != NULL) return;
+    if (aliases_len >= aliases_cap) {
+        size_t ncap = aliases_cap == 0 ? 16 : aliases_cap * 2;
+        alias_entry_t *nbuf = (alias_entry_t *) realloc(aliases, ncap * sizeof(alias_entry_t));
+        if (nbuf == NULL) {
+            fprintf(stderr, "spinel_rbs_extract: out of memory\n");
+            exit(1);
+        }
+        aliases = nbuf;
+        aliases_cap = ncap;
+    }
+    aliases[aliases_len].name = strdup(name);
+    aliases[aliases_len].tag = NULL;
+    if (aliases[aliases_len].name == NULL) {
+        fprintf(stderr, "spinel_rbs_extract: out of memory\n");
+        exit(1);
+    }
+    aliases_len++;
+}
+
+void alias_add(const char *name, const char *tag) {
+    alias_declare(name);
+    alias_entry_t *e = alias_entry(name);
+    if (e->tag != NULL) return;
+    e->tag = strdup(tag);
+    if (e->tag == NULL) {
+        fprintf(stderr, "spinel_rbs_extract: out of memory\n");
+        exit(1);
+    }
+}
+
+const char *alias_find(const char *name) {
+    alias_entry_t *e = alias_entry(name);
+    return e != NULL ? e->tag : NULL;
+}
+
+size_t alias_count(void) {
+    size_t n = 0;
+    for (size_t i = 0; i < aliases_len; i++) {
+        if (aliases[i].tag != NULL) n++;
+    }
+    return n;
+}
+
+static bool alias_declared(const char *name) {
+    return alias_entry(name) != NULL;
+}
+
+/* Resolve a type name as a constant is looked up: an absolute one
+ * (`::A::B`) as written; else against the declaration's own namespace
+ * (`Inner::row` in a body of `Outer` is `Outer::Inner::row`, as its
+ * first segment resolves there), then the enclosing scopes innermost
+ * outward, then the top level. The first candidate `has` knows wins;
+ * false when none does. `name` is the "_"-joined form. */
+static bool resolve_known_name(const char *name, size_t len, bool absolute,
+                               const char *enclosing_scope, bool (*has)(const char *), sbuf_t *out) {
+    if (absolute) {
+        sbuf_set(out, name, len);
+        return has(out->buf);
+    }
+    if (g_self_scope != NULL && g_self_scope[0] != '\0') {
+        sbuf_set(out, g_self_scope, strlen(g_self_scope));
+        sbuf_append_cstr(out, "_");
+        sbuf_append(out, name, len);
+        if (has(out->buf)) return true;
+    }
+    if (enclosing_scope != NULL && enclosing_scope[0] != '\0') {
+        size_t plen = strlen(enclosing_scope);
+        while (plen > 0) {
+            sbuf_set(out, enclosing_scope, plen);
+            sbuf_append_cstr(out, "_");
+            sbuf_append(out, name, len);
+            if (has(out->buf)) return true;
+            while (plen > 0 && enclosing_scope[plen - 1] != '_') plen--;
+            if (plen > 0) plen--;
+        }
+    }
+    sbuf_set(out, name, len);
+    return has(out->buf);
+}
+
+/* `patch_t` or `Inner::row`: the tag of the alias the name resolves to.
+ * A generic alias (`listed[Integer]`) and a name no declaration gives are
+ * out of the subset. A declared alias whose tag is not known yet is out
+ * of it for now, and says so in g_alias_unresolved: the extractor's
+ * collection then leaves the alias that referenced it for a later round
+ * rather than registering what a fallback (`T | nil` to poly) gave. */
+static bool map_alias(rbs_parser_t *p, rbs_types_alias_t *a, const char *enclosing_scope, sbuf_t *out) {
+    if (a->args != NULL && a->args->length > 0) return false;
+    sbuf_t name, qualified;
+    sbuf_init(&name);
+    sbuf_init(&qualified);
+    name_of_type_name(p, a->name, &name);
+    bool absolute = a->name != NULL && a->name->rbs_namespace != NULL && a->name->rbs_namespace->absolute;
+    bool found = resolve_known_name(name.buf, name.len, absolute, enclosing_scope, alias_declared, &qualified);
+    if (found) {
+        const char *tag = alias_find(qualified.buf);
+        if (tag != NULL) sbuf_set(out, tag, strlen(tag));
+        else { g_alias_unresolved = true; found = false; }
+    }
+    sbuf_free(&qualified);
+    sbuf_free(&name);
+    return found;
+}
+
+/* `{ name: String, ?age: Integer }`: a Hash keyed by the field names,
+ * which are Symbols (`name:`, `:name =>`) or Strings (`"name" =>`), with
+ * values of several types: the poly-valued Hash kind of that key class.
+ * Keys of another class, or of both, have no kind of their own: poly, as
+ * a union is. */
+static bool map_record(rbs_types_record_t *r, sbuf_t *out) {
+    bool sym = true, str = true;
+    if (r->all_fields != NULL) {
+        for (rbs_hash_node_t *f = r->all_fields->head; f != NULL; f = f->next) {
+            if (f->key != NULL && f->key->type == RBS_AST_SYMBOL) str = false;
+            else if (f->key != NULL && f->key->type == RBS_AST_STRING) sym = false;
+            else { sym = false; str = false; }
+        }
+    }
+    if (sym) sbuf_set(out, "sym_poly_hash", 13);
+    else if (str) sbuf_set(out, "str_poly_hash", 13);
+    else sbuf_set(out, "poly", 4);
+    return true;
+}
+
 bool map_type(rbs_parser_t *p, rbs_node_t *node,
                      const char *enclosing_scope, sbuf_t *out) {
     if (node == NULL) return false;
     switch (node->type) {
+        case RBS_TYPES_ALIAS:
+            return map_alias(p, (rbs_types_alias_t *) node, enclosing_scope, out);
+        case RBS_TYPES_RECORD:
+            return map_record((rbs_types_record_t *) node, out);
         case RBS_TYPES_BASES_BOOL:
             sbuf_set(out, "bool", 4);
             return true;
@@ -518,8 +672,7 @@ else {
         default:
             /* Out of subset: Self / Top / Bottom / Any / Instance /
              * Class / Block / Function / Interface / Intersection /
-             * Literal / Proc / Record / RecordFieldType / Tuple /
-             * UntypedFunction / Variable / Alias. */
+             * Literal / Proc / Tuple / UntypedFunction / Variable. */
             return false;
     }
 }

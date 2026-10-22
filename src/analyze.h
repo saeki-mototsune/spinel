@@ -19,6 +19,14 @@ int poly_ivar_set_reaches(Compiler *c, int call, int k);
    of them, or NULL when the analysis cannot bound them (analyze_scope.c) */
 /* Kernel#String uses its argument as the conversion's implicit receiver. */
 const int *poly_recv_classes(Compiler *c, int call, int *n);
+/* Does an instantiated class of the program that the boxed receiver of `call`
+   can be (any, when the walk does not bound it) define a method `name`? */
+int poly_recv_defines(Compiler *c, int call, const char *name);
+/* Does a method of the program answer the call `call` (the builtin reflection
+   it names, a program's method of that name in its receiver's class chain)? A
+   boxed receiver is asked by the classes it can be, a typed one by the call
+   plan's targets. */
+int call_reaches_program_method(Compiler *c, int call);
 /* The classes and modules the same receiver can be ITSELF, as a value (a
    constant naming one, `{b: Integer}`), marked in a set over the class
    table, or NULL when the walk cannot bound the receiver's values */
@@ -65,6 +73,9 @@ void strbuf_arg_index_free(Compiler *c);
    exactly what promote mode is asking us to avoid. Off (0) for raise/wrap, so
    the default gates and optcarrot (which pins wrap) see no behavior change. */
 extern int g_promote_mode;
+void an_rat_boxed_mark(int id);
+int an_rat_boxed(int id);
+int an_rat_value(Compiler *c, int n);
 extern int g_exc_abort;   /* --exceptions=abort (src/main.c) */
 /* is a def's value (the Symbol it names) used? par: an_parent_map */
 int an_def_value_used(const NodeTable *nt, const int *par, int v);
@@ -115,6 +126,9 @@ enum {
   NFW_ELEM_NIL,  /* an element of an Array the program stores nil into or
                     leaves a gap in (a block parameter an iteration over it
                     binds, an element read or pick out of it) */
+  NFW_TAKEN,     /* a pop, shift or delete_at of an object Array, which
+                    answers nil once the Array is empty or the index is
+                    outside it */
   NFW_ELEM,      /* an element read or a pick that can miss (Array, Hash,
                     String) */
   NFW_GLOBAL,    /* a global, or the main object's ivar, read where no write
@@ -154,6 +168,11 @@ void analyze_program(Compiler *c);
    (0 or 1) defs of that name: read ahead of the desugars, by absence. */
 int an_prog_never_gives(const char *nm, int defs);
 int an_prog_names_method(const char *nm);
+/* 1 or -1 when `id` is that Integer literal, parenthesized or not; 0 otherwise */
+int an_unit_int_literal(const NodeTable *nt, int id);
+/* a push onto a typed Array a builtin call just built, given an element of
+   another kind: it answers the general Array (analyze_infer.c) */
+int an_push_widens_fresh(Compiler *c, int id);
 /* True if a regex source contains a capturing group: an unescaped '(' that
    isn't the start of a non-capturing/extension group '(?...'. scan returns
    nested arrays for capturing patterns, which the str_array path can't model. */
@@ -171,6 +190,14 @@ int an_tail_answers_nil(Compiler *c, int mi);
    the methods are defined in; after it, the facts as decided. */
 int scope_ret_handle(Compiler *c, int mi);
 int scope_ret_fresh(Compiler *c, int mi);
+/* Does call's iterator drop what its block answers: one of the each family,
+   builtin, or every program method of the name yields only where the value
+   is dropped and hands its block on only to such an iterator? */
+int an_iter_discards_block(Compiler *c, int call);
+/* Does method mi answer a String literal on every path (no `return`)? A
+   frozen literal keeps one identity, the handle its site has
+   (SP_SHARE_STRING_LITERALS), which a handle made over its bytes finds. */
+int scope_ret_str_literal(Compiler *c, int mi);
 int scope_ret_param(Compiler *c, int mi);
 /* A String `||` or `&&` over a String left operand: a tail whose operands
    are its arms (an_tail_is_shared_handle, emit_tail_value). */
@@ -216,6 +243,10 @@ void dyn_blk_params(Compiler *c, int mi, int k, DynParams *out);
 int dyn_open_site(Compiler *c, int n, int *shift);
 void dyn_open_reach(Compiler *c, int n, int k, DynReach *r);
 int dyn_method_appends(Compiler *c, int mi, int j);
+/* The code under node may append to local vn in place, or hand it to a
+   parameter that is lent (a byref slot or the handle): 1 also for a
+   subtree too deep to be walked to the bottom */
+int an_subtree_may_lend_local(Compiler *c, int node, const char *vn);
 int an_local_array_changed_x(Compiler *c, const char *xn, Scope *xs);
 int an_local_array_stores_unshared(Compiler *c, const char *xn, Scope *xs);
 /* 1 appends, 0 does not, -1 cannot tell (refused as appending) */
@@ -255,6 +286,7 @@ TyKind infer_type(Compiler *c, int id);
    one of these names, which the one-shot rewrites that actually type
    them never reach (K-026 cause A). */
 int enum_builtin_responds(Compiler *c, const char *name, TyKind rt);
+int enum_unrename(NodeTable *nt, int id);
 /* empty infer_type's memo of earlier queries' answers: the start or end of
    a pass whose writes are not all counted (#8852) */
 void infer_memo_boundary(void);
@@ -303,6 +335,8 @@ int hash_vals_nullable(Compiler *c, int node);
 int nullable_int_value_raw(Compiler *c, int id);
 /* `@x = v` at write node id leaves @x's nil bit clear, as it already was */
 int nn_ivar_write_keeps_clear(Compiler *c, int id);
+/* is position pos of a multiple assignment's value, read from a constant Array of a proven length, within it and no nil (a position from the end is not asked)? */
+int masgn_const_elem_in_range(Compiler *c, int value, long long pos);
 int scalar_nil_only_call(Compiler *c, int id, TyKind rt);
 int nullable_scalar_nil_only_call(Compiler *c, int id);
 int nullable_int_elem_array(Compiler *c, int node);
@@ -438,6 +472,7 @@ TyKind ewo_memo_elem_type(Compiler *c, int callid);
 int curry_apply_info(Compiler *c, int node, int *out_complete, TyKind *out_ret);
 int curry_count_max(Compiler *c, int recv);
 int an_program_builds_methods(Compiler *c);   /* the program builds Method objects at all */
+int an_program_makes_bsearch_enum(Compiler *c);   /* Array#bsearch without a block, anywhere */
 int an_zero_arg_builtin_shadowed(Compiler *c, const char *name, int argc);
 int an_user_recv_defines_method(Compiler *c, const char *name);
 /* obj.methods / public_methods / singleton_methods on an instance of `cid`
@@ -446,6 +481,9 @@ int an_object_methods_listable(Compiler *c, int cid, const char *name);
 int an_module_methods_listable(Compiler *c, int m, const char *name);
 int an_module_defines(Compiler *c, int m, const char *nm, int *vis);
 int an_object_methods_all_arg(Compiler *c, int cid, int argc, const int *argv);
+/* obj.methods / public_methods on a builtin value: the core class it lists as */
+const char *an_value_methods_class(Compiler *c, int recv, TyKind rt, const char *name, int argc,
+                                   const int *argv);
 int an_class_singleton_methods_listable(Compiler *c, int cid);
 int ewo_memo_passed_to_callable_at(Compiler *c, int callid, int pidx);
 

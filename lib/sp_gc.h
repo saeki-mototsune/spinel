@@ -55,7 +55,13 @@
                                          so it was neither a Range nor
                                          enumerable through a poly slot (#3619) */
 #define SP_BUILTIN_OPENSTRUCT  (-41)  /* OpenStruct: dynamic symbol->value members */
-typedef struct { int tag; int cls_id; union { sp_int i; const char *s; sp_float f; sp_bool b; void *p; } v; } sp_RbVal;
+/* b is the whole word, not a _Bool: sp_box_bool writes 0 or 1 into i, and a
+   read of b where the box holds another member (which the C only does behind
+   a tag test) must not be a trap representation. gcc speculated such a read
+   through a _Bool, took its value as 0 or 1, and `(tag != BOOL) | b` over a
+   returned Integer 7 came out 7: `n&.info(x) ? 1 : 2` answered -5 at -O2
+   once IPA-SRA passed the value in registers. */
+typedef struct { int tag; int cls_id; union { sp_int i; const char *s; sp_float f; sp_int b; void *p; } v; } sp_RbVal;
 
 /* ---- Collector globals shared with the generated TU ----
  * Only the globals touched by both the kept hot path (sp_gc_alloc, the
@@ -364,6 +370,22 @@ static inline void sp_gc_bytes_sub(size_t n) {
   sp_gc_bytes = sp_gc_bytes >= n ? sp_gc_bytes - n : 0;
 }
 #endif
+
+/* A container's payload -- the buffers it holds outside its own slot --
+   went from `from` bytes to `to`: the object's header carries it, so the
+   mark's live total (which a full collection resets the counter to) includes
+   it, and the counter moves by the difference, so the trigger sees it, as
+   sp_PolyArray_grow counts its elements. `obj` is the object, or a container
+   embedded at the start of one (#7449), whose header is the enclosing one's.
+   A Hash's tables never were counted: one grown to megabytes and dropped
+   moved the counter by its header alone, so a program churning large Hashes
+   grew without a collection. */
+static inline void sp_gc_payload_resize(void *obj, size_t from, size_t to) {
+  sp_gc_hdr *h = (sp_gc_hdr *)((char *)obj - sizeof(sp_gc_hdr));
+  h->size = h->size - from + to;
+  if (to >= from) sp_gc_bytes_add(to - from);
+  else sp_gc_bytes_sub(from - to);
+}
 
 /* Push a header onto the shared sp_gc_heap list. Under SP_THREADS this is a
    lock-free CAS push so callers that hold no lock (the pool-hit relink) stay

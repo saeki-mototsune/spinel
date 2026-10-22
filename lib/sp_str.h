@@ -180,6 +180,8 @@ sp_oint sp_str_byterindex(const char*s,const char*sub);
 sp_oint sp_str_byterindex_from(const char*s,const char*sub,sp_int pos);
 const char*sp_str_sub_range(const char*s,sp_int start,sp_int len);
 const char*sp_str_char_at_or_nil(const char*s,sp_int i);
+size_t sp_str_char_width(const char*s,size_t blen,size_t at);
+const char*sp_str_char_step(const char*s,size_t blen,size_t*at);
 const char*sp_str_sub_range_len(const char*s,sp_int cl,sp_int start,sp_int len);
 const char*sp_str_sub_range_r(const char*s,sp_int start,sp_int end_,sp_int excl);
 const char*sp_str_sub_range_len_r(const char*s,sp_int cl,sp_int start,sp_int end_,sp_int excl);
@@ -246,6 +248,19 @@ static inline int sp_str_eq(const char*a,const char*b){
   if(sp_str_is_binary(a)==sp_str_is_binary(b))return 1;
   for(size_t i=0;i<la;i++)if((unsigned char)a[i]>=0x80)return 0;
   return 1;
+}
+/* `s == "lit"` for a literal of n ASCII bytes, none of them NUL, that the
+   compiler knows: an inline byte loop where sp_str_eq calls strcmp. The loop
+   stops at a's terminator (the literal has no NUL to match it), so it reads
+   no further than strcmp would; only a full match reads a's length, as
+   sp_str_eq does, to tell a longer string with an embedded NUL apart, and a
+   foreign C string without a marker byte gets no header read it did not get
+   before. An ASCII literal equals any string of the same bytes, whatever
+   that string's encoding tag; nil (NULL) equals none. */
+static inline int sp_str_eq_lit(const char*a,const char*lit,size_t n){
+  if(!a)return 0;
+  for(size_t i=0;i<n;i++)if(a[i]!=lit[i])return 0;
+  return a[n]=='\0'&&sp_str_byte_len(a)==n;
 }
 /* Compare a spinel string against a PLAIN C string (a stack buffer, a literal
    with no marker byte). sp_str_eq reads a marker in front of BOTH operands to

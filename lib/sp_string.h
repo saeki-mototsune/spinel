@@ -34,7 +34,12 @@ typedef struct sp_StringLiteral {
 } sp_StringLiteral;
 static inline sp_StringLiteral *sp_String_literal_slot(const char *s) {
   if (!s || ((const unsigned char *)s)[-1] != 0xf1) return NULL;
-  uintptr_t p = (uintptr_t)(((const sp_str_hdr *)(s - 1)) - 1)->next;
+  const sp_str_hdr *h = ((const sp_str_hdr *)(s - 1)) - 1;
+  /* a slab string's link is never written (its chunk's bitmaps hold what
+     the link would): a frozen one keeps its slot's last occupant's first
+     word there, which may be odd */
+  if (sp_slab_owns(h)) return NULL;
+  uintptr_t p = (uintptr_t)h->next;
   return p & 1 ? (sp_StringLiteral *)(p - 1) : NULL;
 }
 sp_String *sp_String_literal_handle(sp_StringLiteral *slot, const char *s);
@@ -158,7 +163,7 @@ static inline sp_String*sp_String_new_inline_len(const char*s,int64_t len){
 /* Shared append core: `tl` is the operand byte length (strlen for the
    bare-literal-safe entry, sp_str_byte_len for the binary one). */
 static inline void sp_fd_append_len(sp_String*s,const char*t,int64_t tl){if(!sp_fd_grow(s,s->len+tl))return;memcpy(s->data+s->len,t,tl);s->len+=tl;s->data[s->len]=0;sp_fd_publish(s);}
-static inline void sp_String_append(sp_String*s,const char*t){if(!s||!t)return;if(sp_String_is_frozen(s)){sp_raise_frozen_str(s->data);return;}sp_fd_append_len(s,t,(int64_t)strlen(t));}
+static inline void sp_String_append(sp_String*s,const char*t){if (SP_UNLIKELY(!s)) sp_nil_recv("<<"); if (!t)return;if(sp_String_is_frozen(s)){sp_raise_frozen_str(s->data);return;}sp_fd_append_len(s,t,(int64_t)strlen(t));}
 /* Binary-safe append: sizes the operand with the header length so an embedded
    NUL is preserved (Ruby String#<< / concat on a marked spinel string). */
 /* Replace the buffer contents in place (the handle stays stable, so every
@@ -177,11 +182,11 @@ static inline void sp_String_set_bin_enc(sp_String*s,const char*t){
   else if(s->binary){s->binary=0;sp_str_as_text(s->data);sp_fd_publish(s);}
 }
 /* the first tl bytes of t: the append form of an interpolation (emit_interp_append) */
-static inline void sp_String_append_n(sp_String*s,const char*t,size_t tl){if(!s||!t)return;if(sp_String_is_frozen(s)){sp_raise_frozen_str(s->data);return;}sp_fd_append_len(s,t,(int64_t)tl);}
+static inline void sp_String_append_n(sp_String*s,const char*t,size_t tl){if (SP_UNLIKELY(!s)) sp_nil_recv("<<"); if (!t)return;if(sp_String_is_frozen(s)){sp_raise_frozen_str(s->data);return;}sp_fd_append_len(s,t,(int64_t)tl);}
 /* append_as_bytes preserves the handle's encoding as well as embedded NULs. */
-static inline void sp_String_append_bytes(sp_String*s,const char*t){if(!s||!t)return;if(sp_String_is_frozen(s)){sp_raise_frozen_str(s->data);return;}sp_fd_append_len(s,t,(int64_t)sp_str_byte_len(t));}
+static inline void sp_String_append_bytes(sp_String*s,const char*t){if (SP_UNLIKELY(!s)) sp_nil_recv("<<"); if (!t)return;if(sp_String_is_frozen(s)){sp_raise_frozen_str(s->data);return;}sp_fd_append_len(s,t,(int64_t)sp_str_byte_len(t));}
 static inline void sp_String_append_bin(sp_String*s,const char*t){
-  if(!s||!t)return;
+  if (SP_UNLIKELY(!s)) sp_nil_recv("<<"); if (!t)return;
   if(sp_String_is_frozen(s)){sp_raise_frozen_str(s->data);return;}
   if (s->binary && !sp_str_is_binary(t) &&
       !sp_str_ascii_only(t) && sp_str_ascii_only(s->data)) {
@@ -287,6 +292,9 @@ static inline sp_String*sp_String_force_encoding(sp_String*s,int mode){
   return s;
 }
 static inline const char*sp_String_cstr(sp_String*s){return s->data;}
+/* the bytes of a handle that can be nil, NULL for nil, as its copying read
+   (sp_strbuf_read) answers */
+static inline const char*sp_String_cstr_nil(sp_String*s){return s?s->data:NULL;}
 static inline int64_t sp_String_length(sp_String*s){return s->len;}
 
 /* A String no other name holds, boxed for something that keeps the box:
@@ -305,6 +313,17 @@ static inline sp_RbVal sp_box_str_new(const char *v) {
        String the call made (`"" * 2`): nil.to_s's frozen one is not this */
     if (v == sp_str_empty) return sp_box_obj(sp_String_new_fresh(v), SP_BUILTIN_STRBUF);
   }
+#endif
+  return sp_box_str(v);
+}
+
+/* A new String a call answers in bytes it may share with others (Integer#chr
+   answers a one-character table's), boxed for something that keeps the box:
+   with SP_SHARE_BOX_HANDLES a new handle over a copy of them, which an
+   append through any copy of the box changes; else the bytes (sp_box_str). */
+static inline sp_RbVal sp_box_str_fresh(const char *v) {
+#ifdef SP_SHARE_BOX_HANDLES
+  if (v) return sp_box_obj(sp_String_new_fresh(v), SP_BUILTIN_STRBUF);
 #endif
   return sp_box_str(v);
 }

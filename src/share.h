@@ -117,6 +117,8 @@ int share_elem_holder(const Compiler *c, int h);
 int share_class_count(const Compiler *c);
 int share_holder_class(const Compiler *c, int h);
 int share_node_class(const Compiler *c, int n);
+/* n is inside a method the program never names: the walk left it out (sh_dead_nodes) */
+int share_node_dead(const Compiler *c, int n);
 
 /* The facts of holder h's class. */
 unsigned share_class_flags(const Compiler *c, int h);
@@ -170,6 +172,11 @@ ShareRoute share_route(int site, int value, int elems);
 /* Is node n's value a String the walk reached and found no identity in (a
    fresh one no other name holds)? */
 int share_node_fresh(const Compiler *c, int n);
+/* Does method scope mi answer no String: each expression its value can be
+   (a nil among them) is none a String can be, by its type or form or by what
+   is written to an instance variable it reads? Asked of the final facts; a
+   method whose values the walk does not follow answers 0. */
+int share_scope_answers_no_string(Compiler *c, int mi);
 /* Does the rule share the elements of node n's value (a container)? */
 int share_node_elems_share(const Compiler *c, int n);
 /* Is node n an element read (`a[i]`, `a.first`) out of a general Array
@@ -179,10 +186,6 @@ int share_str_elem_read(Compiler *c, int n);
    the rule does not share it, and it meets nothing the walk does not
    follow? */
 int share_node_elems_local(const Compiler *c, int n);
-/* Can node n's String be an element of a container a builtin call made (its
-   class is, or the facts do not place it)? The runtime boxes such an
-   element as its bytes, never as its handle. */
-int share_node_runtime_elems(Compiler *c, int n);
 /* Is node n a blockless builtin's new Array of new Strings whose elements
    the rule shares? Its one evaluation is the only source of those Strings,
    so where it is consumed each can be wrapped as a handle of its own. */
@@ -261,6 +264,10 @@ int share_param_kept(Compiler *c, int mi, int pj);
    class reaching it by that name can be a value (comp_class_may_be_value):
    no box ever holds that class object. */
 int share_target_reachable(Compiler *c, int call, int mi);
+/* Is user method mi, a target cplan_targets lists for boxed call `call`,
+   one its dispatch arms: does a class the receiver's class fact keeps reach
+   it (comp_poly_candidates_at)? */
+int share_target_armed(Compiler *c, int call, int mi);
 /* Can block node blk hand control back to the call that yields to it: does
    its body fall off its end, or hold a `next` of its own (not a nested
    block's, lambda's, method's or loop's)? A body whose last statement is a
@@ -269,6 +276,15 @@ int share_target_reachable(Compiler *c, int call, int mi);
 int share_block_returns(const Compiler *c, int blk);
 /* The builtin arms of a boxed call, before checking its user targets. */
 int share_builtin_fresh(Compiler *c, int call);
+/* The methods call can run where its plan lists no members -- more than
+   CPT_MAX, or a receiver of no settled type -- and the walk sees every
+   method of its name (no method_missing, no computed definer, no String
+   evaluated, the name no alias's, singleton def's or module_function's):
+   their count into out (at most cap), or -1 (#9258). */
+int share_name_targets(Compiler *c, int call, int *out, int cap);
+/* Does method mi answer a new String or none: every way out raises, or it
+   is an inspect or to_s ending in a bare super that reaches Object's own? */
+int an_target_answers_new(Compiler *c, int mi);
 /* Is node n's String a new one no name holds yet, by where it comes from: a
    String literal, a method answering only its own locals' Strings, or an
    element read of a temporary container of new Strings (an Array literal of
@@ -442,6 +458,25 @@ const char *share_plan_form_name(int form);
    node whose supply an SPK_SELF, SPK_OPERAND or SPK_SEQUENCE value hands
    on, the receiver whose box an SPK_BANG_BOX call answers, else -1. */
 int share_plan_producer(Compiler *c, int v, int *operand);
+/* ...asked as if no store lifted v into a handle (poly_strbuf_lift): the
+   route v hands its String on by itself */
+int share_plan_producer_unlifted(Compiler *c, int v, int *operand);
+/* Are the targets the plan lists for call u all it can reach: every value
+   its receiver can be answers the name by a method of the program's own,
+   and it is no exception's builtin message or to_s? */
+int share_plan_targets_cover(Compiler *c, int u);
+/* Is v a call every target of which answers a String literal on every
+   path, whose bytes are the literal's own: a handle made over them, or a
+   box of them, is the literal's handle (SP_SHARE_STRING_LITERALS), and
+   its identity is its bytes' pointer, as a frozen String's is? */
+int share_plan_call_answers_literal(Compiler *c, int v);
+/* Is target mi of call v one answering a String literal whose answer the
+   pickup after the call renders as the literal itself, among targets that
+   publish their handle: a method whose body is one String literal
+   (`def tag_name = "Group/SectionName"`), called on self with no
+   arguments or block, every value of whose receiver answers the name by
+   the program's own methods? */
+int share_plan_literal_pickup_clean(Compiler *c, int v, int mi);
 const char *share_plan_role_name(int role);
 /* Is node v, a tail of a method whose value is a String, a box whose String
    the plan gives a taker as its handle (a taker needs the handle where its

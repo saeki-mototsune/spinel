@@ -1,0 +1,25 @@
+# A format chosen through a `begin`, every value position of which is a
+# constant or a read out of a slot. The choice was not read, so the format
+# was taken for a String made where it is written, and put in a temp of its
+# own and rooted. Every position is read now, and the format is held by what
+# holds it. The rescue arm runs for one row and answers a format made there
+# (`G.dup`), which the choice has to keep alive while the arguments are built.
+# spinel: gc-stress
+F = "%d-%s"
+G = "[%d:%s]"
+class Row
+  attr_reader :fmt
+  def initialize(id); @id = id; @fmt = "<%d|%s>"; end
+  def id; @id; end
+end
+
+[1, 2, 3].each do |id|
+  row = Row.new(id)
+  puts (begin
+           row.id
+           raise ArgumentError if id == 2
+           F
+         rescue ArgumentError
+           G.dup
+         end) % [id, "z"]
+end

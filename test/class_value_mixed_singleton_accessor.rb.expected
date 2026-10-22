@@ -1,0 +1,34 @@
+"s"
+"W"
+42
+"t"
+"X"
+"t"
+"X"
+42
+"Sym!"
+"WORD!"
+4
+"shape"
+"c"
+nil
+"shape"
+"d"
+"c"
+["s", "q"]
+"badge"
+"medal"
+"medal"
+nil
+"plate"
+"cup"
+"plate"
+"lid:l"
+"c"
+[:tag]
+[:mark=]
+[:tag, :tag=]
+[:mark, :mark=]
+"seal:s"
+"seal:t"
+"wax"

@@ -9,6 +9,14 @@
 #include "codegen_call_arms.h"
 #include "repr.h"
 
+/* A Rational rounding call's digit count is a plain Integer (or a Bignum,
+   which the Integer conversion takes): any other kind is boxed for
+   sp_rational_digits, which raises CRuby's "not an integer" for it. */
+static int rat_digits_plain(Compiler *c, int node) {
+  TyKind t = comp_ntype(c, node);
+  return (t == TY_INT && !node_is_oint(c, node)) || t == TY_BIGINT;
+}
+
 /* Rational#round / #floor / #ceil / #truncate with a digit count, a
    `half:` keyword, or both. The arm reads the shape of the arguments (a
    keyword hash, an Integer literal), not their kinds. */
@@ -25,8 +33,7 @@ int emit_op_rational_round(Compiler *c, const BopCtx *x, Buf *b) {
      alongside the keyword had no arm at all (#3047). One reader, shared
      with the Float, Integer and boxed arms, settles what the call said;
      the mode reaches the runtime as the value it was written as. */
-  if ((argc == 1 || argc == 2) && nt_type(nt, argv[argc - 1]) &&
-      sp_streq(nt_type(nt, argv[argc - 1]), "KeywordHashNode") &&
+  if ((argc == 1 || argc == 2) && nt_argv_kwh(nt, argv, argc) >= 0 &&
       is_round_family(name)) {
     RoundKw kw; round_kw_read(c, argv[argc - 1], &kw);
     /* the class the call answers, chosen exactly as infer_type's Rational
@@ -44,9 +51,14 @@ int emit_op_rational_round(Compiler *c, const BopCtx *x, Buf *b) {
                                   : "(sp_int)0";
     int tr = ++g_tmp, tn = -1;
     buf_printf(b, "({ sp_Rational _t%d = ", tr); emit_expr(c, recv, b); buf_puts(b, "; ");
+    int dplain = argc != 2 || rat_digits_plain(c, argv[0]);
     if (argc == 2) {
       tn = ++g_tmp;
-      buf_printf(b, "sp_int _t%d = ", tn); emit_int_expr(c, argv[0], b); buf_puts(b, "; ");
+      if (dplain) { buf_printf(b, "sp_int _t%d = ", tn); emit_int_expr(c, argv[0], b); buf_puts(b, "; "); }
+      else {
+        buf_printf(b, "sp_RbVal _t%d = ", tn); emit_boxed(c, argv[0], b);
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); ", tn);
+      }
     }
     /* only #round takes a tie-break mode. CRuby's words for a Rational
        are its own -- `not an integer`, not the Float and Integer paths'
@@ -66,7 +78,7 @@ int emit_op_rational_round(Compiler *c, const BopCtx *x, Buf *b) {
     }
     int tm = emit_round_kw_binds(c, &kw, b);
     buf_printf(b, "%s(_t%d, ", fn, tr);
-    if (tn >= 0) buf_printf(b, "_t%d", tn); else buf_puts(b, "0");
+    if (tn >= 0) buf_printf(b, dplain ? "_t%d" : "sp_rational_digits(_t%d)", tn); else buf_puts(b, "0");
     if (tm >= 0) buf_printf(b, ", _t%d); })", tm);
     else buf_puts(b, ", sp_box_nil()); })");
     return 1;
@@ -96,7 +108,9 @@ int emit_op_rational_round(Compiler *c, const BopCtx *x, Buf *b) {
        an integer at all -- the generated C stopped compiling the moment
        the argument widened to poly (the same cast Rational()'s own
        constructor had to give up, #3184). */
-    buf_printf(b, "; sp_int _t%d = ", tn); emit_int_expr(c, argv[0], b);
+    buf_printf(b, "; sp_int _t%d = ", tn);
+    if (rat_digits_plain(c, argv[0])) emit_int_expr(c, argv[0], b);
+    else { buf_puts(b, "sp_rational_digits("); emit_boxed(c, argv[0], b); buf_puts(b, ")"); }
     buf_printf(b, "; _t%d > 0 ? sp_box_rational(sp_rational_%s_prec(_t%d, _t%d))"
                   " : sp_box_int(sp_rational_%s_prec(_t%d, _t%d).num); })",
                tn, fn, tr, tn, fn, tr, tn);
@@ -544,9 +558,9 @@ int emit_call_range_literal_arms(Compiler *c, Buf *b, const NodeTable *nt, const
   /* A string-range LITERAL is the distinct sp_StrRange value type now, served
      by emit_range_call; this arm is left for the shapes that still type as the
      int TY_RANGE (a mixed or beginless/endless string range). (#3064) */
-  if (recv >= 0 && rt == TY_RANGE && nt_type(nt, unwrap_parens(c, recv)) &&
-      sp_streq(nt_type(nt, unwrap_parens(c, recv)), "RangeNode")) {
-    int rnode = unwrap_parens(c, recv);
+  if (recv >= 0 && rt == TY_RANGE && nt_type(nt, nt_paren_single(c->nt, recv)) &&
+      sp_streq(nt_type(nt, nt_paren_single(c->nt, recv)), "RangeNode")) {
+    int rnode = nt_paren_single(c->nt, recv);
     int lo = nt_ref(nt, rnode, "left"), hi = nt_ref(nt, rnode, "right");
     if (lo >= 0 && hi >= 0 && repr_of(c, lo).as_ty == TY_STRING && repr_of(c, hi).as_ty == TY_STRING) {
       int excl = nt_range_excl(nt, rnode);
@@ -577,14 +591,15 @@ int emit_call_range_literal_arms(Compiler *c, Buf *b, const NodeTable *nt, const
 /* Is the receiver of a times / upto / downto form held as an sp_int, or boxed
    (an Integer parameter under promote mode)? */
 static int int_or_boxed_operand(Compiler *c, int node) {
-  TyKind t = repr_of(c, node).as_ty;
-  return t == TY_INT || t == TY_POLY;
+  Repr tr = repr_of(c, node);
+  TyKind t = tr.as_ty;
+  return t == TY_INT || tr.kind == RK_BOXED;
 }
 
 /* Is a limit a boxed or Bignum value, which the step forms read by its kind? */
 static int boxed_or_big_operand(Compiler *c, int node) {
   Repr r = repr_of(c, node);
-  return r.as_ty == TY_POLY || r.big;
+  return r.kind == RK_BOXED || r.big;
 }
 
 /* the Integer and Range iterators in expression position: range.step(n) { }, times / upto / downto / step with a block (answering the receiver), and the blockless forms that answer a Range */
@@ -608,7 +623,7 @@ int emit_call_iter_expr_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
           in expression position (#4763) */
        (is_step_call(name) &&
         (repr_of(c, recv).as_ty == TY_RATIONAL || repr_of(c, recv).as_ty == TY_FLOAT ||
-         repr_of(c, recv).big)))) {
+         repr_of(c, recv).big || an_rat_value(c, recv))))) {
     /* the receiver is read twice, by the loop and as the answer: one that
        acts (`next_n.times { }`) is bound once */
     int bound = iter_recv_bind_once(c, recv);
@@ -705,35 +720,57 @@ int emit_call_iter_expr_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
   return 0;
 }
 
+/* Float#rationalize(eps), shared by the typed route (emit_op_float_rationalize)
+   and a nullable Float's: CRuby reads eps.abs. An epsilon of a number kind,
+   or boxed, converts; any other raises NoMethodError for #abs (a user
+   object's own abs is not called), not a conversion's TypeError. */
+int rationalize_eps_is_number(TyKind et) {
+  return et == TY_RATIONAL || et == TY_COMPLEX || et == TY_INT || et == TY_FLOAT ||
+         et == TY_BIGINT || et == TY_POLY || et == TY_UNKNOWN;
+}
+void emit_rationalize_eps_raise(Compiler *c, int arg, Buf *b) {
+  buf_puts(b, "sp_raise_nomethod(sp_nomethod_msg(\"abs\", ");
+  emit_boxed(c, arg, b);
+  buf_puts(b, "));");
+}
+/* The epsilon as the float sp_float_rationalize takes. emit_float_expr casts
+   a Rational with (sp_float)(<struct>), which the C compiler rejects, so a
+   Rational goes through sp_rational_to_f (#3224). */
+void emit_rationalize_eps_float(Compiler *c, int arg, TyKind et, Buf *b) {
+  if (et == TY_RATIONAL) { buf_puts(b, "sp_rational_to_f("); emit_expr(c, arg, b); buf_puts(b, ")"); }
+  else if (et == TY_COMPLEX) { buf_puts(b, "sp_complex_abs("); emit_expr(c, arg, b); buf_puts(b, ")"); }
+  else if (et == TY_POLY || et == TY_UNKNOWN) {
+    int t = ++g_tmp;
+    buf_puts(b, "({ "); t = hold_operand(c, arg, TY_POLY, 1, t, 1, " ", b);
+    buf_printf(b, "sp_poly_to_f_with_rational(sp_poly_abs(_t%d)); })", t);
+  }
+  else emit_float_expr(c, arg, b);
+}
+
 int emit_op_float_rationalize(Compiler *c, const BopCtx *x, Buf *b) {
   int argc;
   const int *argv = call_args(c->nt, x->id, &argc);
   int arg = argv[0];
-  const char *r = x->rtext;
-  /* The epsilon must reach sp_float_rationalize as a float. emit_float_expr
-     casts a Rational arg with (sp_float)(<struct>), which the C compiler
-     rejects; convert it through sp_rational_to_f instead (#3224). */
+  /* the receiver as a float: a Float, or a Rational's value (the Rational
+     row of the same name ends here too) */
+  Buf rf; memset(&rf, 0, sizeof rf);
+  if (x->rt == TY_RATIONAL) buf_puts(&rf, "sp_rational_to_f(");
+  if (x->rtext) buf_puts(&rf, x->rtext);
+  else emit_expr(c, x->recv, &rf);
+  if (x->rt == TY_RATIONAL) buf_puts(&rf, ")");
+  const char *r = rf.p ? rf.p : "";
   TyKind et = repr_of(c, arg).as_ty;
-  /* an epsilon that is no number: CRuby asks it for its #abs, which
-     it does not answer -- NoMethodError, not a conversion's TypeError */
-  if (et != TY_RATIONAL && et != TY_COMPLEX && et != TY_INT && et != TY_FLOAT && et != TY_BIGINT && et != TY_POLY &&
-      et != TY_UNKNOWN) {
-    buf_printf(b, "({ (void)(%s); sp_raise_nomethod(sp_nomethod_msg(\"abs\", ", r);
-    emit_boxed(c, arg, b);
-    buf_puts(b, ")); sp_float_rationalize0(0.0); })");
+  if (!rationalize_eps_is_number(et)) {
+    buf_printf(b, "({ (void)(%s); ", r);
+    emit_rationalize_eps_raise(c, arg, b);
+    buf_puts(b, " sp_float_rationalize0(0.0); })");
   }
   else {
     buf_printf(b, "sp_float_rationalize(%s, ", r);
-    if (et == TY_RATIONAL) { buf_puts(b, "sp_rational_to_f("); emit_expr(c, arg, b); buf_puts(b, ")"); }
-    else if (et == TY_COMPLEX) { buf_puts(b, "sp_complex_abs("); emit_expr(c, arg, b); buf_puts(b, ")"); }
-    else if (et == TY_POLY || et == TY_UNKNOWN) {
-      int t = ++g_tmp;
-      buf_puts(b, "({ "); t = hold_operand(c, arg, TY_POLY, 1, t, 1, " ", b);
-      buf_printf(b, "sp_poly_to_f_with_rational(sp_poly_abs(_t%d)); })", t);
-    }
-    else emit_float_expr(c, arg, b);
+    emit_rationalize_eps_float(c, arg, et, b);
     buf_puts(b, ")");
   }
+  free(rf.p);
   return 1;
 }
 

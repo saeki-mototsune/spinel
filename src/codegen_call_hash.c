@@ -196,14 +196,15 @@ int emit_op_hash_aref(Compiler *c, const BopCtx *x, Buf *b) {
   const char *hn = ty_hash_cname(rt);
   int argc;
   const int *argv = call_args(c->nt, x->id, &argc);
-  TyKind arg_kt = comp_ntype(c, argv[0]);
+  Repr arg_ktr = repr_of(c, argv[0]);
+  TyKind arg_kt = arg_ktr.as_ty;
   TyKind hash_kt = ty_hash_key(rt);
   /* key type mismatch: sym key on str-keyed hash (or vice versa) -- the key
      can never exist in the hash, so always return the hash's default
      value. A Symbol on a String-keyed hash was excepted here and
      coerced to its name; that was an older Hash.new{} model (#4531). */
   if (hash_kt != TY_POLY && hash_kt != TY_UNKNOWN &&
-      arg_kt != TY_POLY && arg_kt != TY_UNKNOWN && arg_kt != hash_kt &&
+      arg_ktr.kind != RK_BOXED && arg_kt != TY_UNKNOWN && arg_kt != hash_kt &&
       !(hash_kt == TY_STRING && arg_kt == TY_STRBUF) &&
       !hash_nil_key_stored(c, argv[0], hash_kt)) {
     TyKind vt = ty_hash_val(rt);
@@ -376,13 +377,44 @@ int emit_op_hash_fetch(Compiler *c, const BopCtx *x, Buf *b) {
     buf_printf(b, "); sp_raise_key_not_found(_t%d); %s; })", tk, miss_v);
     return 1;
   }
-  buf_printf(b, "; %s _t%d = ", c_type_name(ty_hash_key(rt)), tk); emit_hash_key(c, argv[0], ty_hash_key(rt), b);
-  buf_printf(b, "; sp_%sHash_has_key(_t%d, _t%d) ? sp_%sHash_%s(_t%d, _t%d) : (",
-             hn, th, tk, hn, vo ? "vget" : "get", th, tk);
+  /* a boxed key on a typed table: the KeyError names the key as it was,
+     not its conversion to the table's key kind (a Rational or a Symbol
+     looked up in a String-keyed table read as nil) */
+  TyKind kt = ty_hash_key(rt);
+  int tb = -1;
+  if (repr_of(c, argv[0]).kind == RK_BOXED && kt != TY_POLY && (kt == TY_STRING || kt == TY_SYMBOL)) {
+    tb = ++g_tmp;
+    buf_printf(b, "; sp_RbVal _t%d = ", tb); emit_boxed(c, argv[0], b);
+    buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); %s _t%d = ({ sp_RbVal _hk = _t%d; ", tb, c_type_name(kt), tk, tb);
+    if (kt == TY_STRING) buf_puts(b, "_hk = sp_poly_strbuf_deref(_hk); _hk.tag == SP_TAG_STR ? _hk.v.s : (const char *)0; })");
+    else buf_puts(b, "_hk.tag == SP_TAG_SYM ? (sp_sym)_hk.v.i : (sp_sym)-1; })");
+  }
+  /* ...and on an Integer-keyed table, a key that may be nil or another
+     class goes through the _okey ops (hash_okey_form), where it misses as
+     CRuby's lookup does: converted, a nil key raised TypeError where
+     CRuby's KeyError names it */
+  else if (hash_okey_form(c, argv[0], kt) && repr_of(c, argv[0]).kind == RK_BOXED) {
+    tb = ++g_tmp;
+    buf_printf(b, "; sp_RbVal _t%d = ", tb); emit_boxed(c, argv[0], b);
+    buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_oint _t%d = ", tb, tk);
+    char tbn[32]; snprintf(tbn, sizeof tbn, "_t%d", tb);
+    emit_opw_okey_read(tbn, b);
+  }
+  else {
+    buf_printf(b, "; %s _t%d = ", hash_key_ctype(c, argv[0], kt), tk); emit_hash_key_o(c, argv[0], kt, b);
+  }
+  const char *ks = hash_okey_sfx(c, argv[0], kt);
+  if (vo && ks[0])
+    buf_printf(b, "; sp_%sHash_has_key_okey(_t%d, _t%d) ? sp_%sHash_vget(_t%d, _t%d.v) : (", hn, th, tk, hn, th, tk);
+  else
+    buf_printf(b, "; sp_%sHash_has_key%s(_t%d, _t%d) ? sp_%sHash_%s%s(_t%d, _t%d) : (",
+               hn, ks, th, tk, hn, vo ? "vget" : "get", vo ? "" : ks, th, tk);
   buf_puts(b, "sp_exc_stage_recv(");
   emit_boxed_text(c, rt, htmp, b);
   buf_puts(b, "), sp_raise_key_not_found(");
-  emit_boxed_text(c, ty_hash_key(rt), keytmp, b);
+  if (tb >= 0) buf_printf(b, "_t%d", tb);
+  else if (ks[0]) buf_printf(b, "%s(_t%d)", oint_box(kt), tk);
+  else emit_boxed_text(c, kt, keytmp, b);
   buf_printf(b, "), %s); })", miss_v);
   return 1;
 }
@@ -787,12 +819,76 @@ int emit_op_hash_flatten(Compiler *c, const BopCtx *x, Buf *b) {
   return 1;
 }
 
-/* to_a / entries: the [key, value] pairs */
+/* Hash#length, size, count and empty?: the length of a Hash that can be nil
+   raises under the name as written, where the shared length function could
+   only say length (and only the Integer Hash's said it: the other kinds'
+   dereferenced the NULL) (#9347). A
+   receiver the nil fact says is never nil keeps the plain read. */
+int emit_op_hash_nil_recv(Compiler *c, const BopCtx *x, Buf *b) {
+  const char *hn = ty_hash_cname(x->rt);
+  if (!hn) return 0;
+  int empty = sp_streq(x->name, "empty?");
+  int named = !recv_never_nil(c, x->recv) && !nt_safe_nav(c->nt, x->id);
+  /* a length where the call's slot holds its nil is lifted, as the template did */
+  int lift = !empty && node_is_oint(c, x->id);
+  if (lift) buf_printf(b, "%s(", oint_of(TY_INT));
+  if (empty) buf_puts(b, "(");
+  buf_printf(b, "sp_%sHash_length(%s", hn, named ? "sp_nil_recv_named(" : "");
+  if (x->rtext) buf_puts(b, x->rtext);
+  else emit_expr(c, x->recv, b);
+  if (named) buf_printf(b, ", \"%s\")", x->name);
+  buf_puts(b, ")");
+  if (empty) buf_puts(b, " == 0)");
+  if (lift) buf_puts(b, ")");
+  return 1;
+}
+
+/* Hash#value? and has_value?: the function names value?, so has_value? on a
+   receiver that can be nil must raise under its own name, once the argument
+   has run (#9347); value? takes the same block, which names the call as
+   written. A receiver the nil fact says is never nil keeps the plain call. */
+int emit_hash_has_value(Compiler *c, int recv, int arg, TyKind rt, const char *hn, int poly,
+                        const char *name, Buf *b) {
+  if (!recv_never_nil(c, recv)) {
+    Buf rx = expr_buf(c, recv);
+    char ct[48]; snprintf(ct, sizeof ct, "sp_%sHash *", hn);
+    int t = nil_recv_open(c, recv, rx.p ? rx.p : "", ct, NULL, subtree_may_allocate(c->nt, arg), b);
+    free(rx.p);
+    int ta = ++g_tmp;
+    buf_printf(b, "%s _t%d = ", poly ? "sp_RbVal" : c_type_name(ty_hash_val(rt)), ta);
+    if (poly) emit_boxed(c, arg, b); else emit_expr(c, arg, b);
+    buf_puts(b, "; "); nil_recv_check(name, t, b);
+    buf_printf(b, " sp_%sHash_has_value(_t%d, _t%d); })", hn, t, ta);
+    return 1;
+  }
+  buf_printf(b, "sp_%sHash_has_value(", hn);
+  emit_expr(c, recv, b); buf_puts(b, ", ");
+  if (poly) emit_boxed(c, arg, b); else emit_expr(c, arg, b);
+  buf_puts(b, ")");
+  return 1;
+}
+
+/* to_a / entries: the [key, value] pairs. The pairs loop reads the table's
+   length, so a receiver that can be nil (NULL) is answered ahead of it:
+   nil.to_a is [], and nil has no entries (#9347). */
 int emit_op_hash_to_a(Compiler *c, const BopCtx *x, Buf *b) {
   int recv = x->recv;
   TyKind rt = x->rt;
   const char *hn = ty_hash_cname(rt);
+  if (recv_never_nil(c, recv)) {
+    emit_hash_pairs_expr(c, recv, rt, hn, b);
+    return 1;
+  }
+  int th = ++g_tmp;
+  buf_printf(b, "({ sp_%sHash *_t%d = ", hn, th); emit_expr(c, recv, b);
+  buf_printf(b, "; _t%d == NULL ? ", th);
+  if (sp_streq(x->name, "entries")) buf_puts(b, "(sp_nil_recv(\"entries\"), (sp_PolyArray *)NULL)");
+  else buf_puts(b, "sp_PolyArray_new()");
+  buf_puts(b, " : ");
+  int slot = view_bind(recv, "_t%d", th);
   emit_hash_pairs_expr(c, recv, rt, hn, b);
+  view_unbind(slot);
+  buf_puts(b, "; })");
   return 1;
 }
 
@@ -1040,19 +1136,14 @@ int emit_call_openstruct_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       return 1;
     }
     /* a member writer `o.k = v` (parsed as name "k=") */
-    {
-      size_t nl = strlen(name);
-      if (nl > 1 && name[nl - 1] == '=' && argc == 1 &&
-          name[0] != '=' && name[0] != '<' && name[0] != '>' && name[0] != '!') {
-        char mem[256];
-        if (nl - 1 < sizeof mem) {
-          memcpy(mem, name, nl - 1); mem[nl - 1] = 0;
-          int tv = ++g_tmp;
-          buf_printf(b, "({ sp_RbVal _v%d = ", tv); emit_boxed(c, argv[0], b);
-          buf_printf(b, "; SP_GC_ROOT_RBVAL(_v%d); sp_OpenStruct_set(", tv); emit_expr(c, recv, b);
-          buf_printf(b, ", sp_sym_intern(\"%s\"), _v%d); _v%d; })", mem, tv, tv);
-          return 1;
-        }
+    if (argc == 1 && name_is_plain_setter(name)) {
+      char mem[256];
+      if (setter_base_name(name, mem, sizeof mem)) {
+        int tv = ++g_tmp;
+        buf_printf(b, "({ sp_RbVal _v%d = ", tv); emit_boxed(c, argv[0], b);
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_v%d); sp_OpenStruct_set(", tv); emit_expr(c, recv, b);
+        buf_printf(b, ", sp_sym_intern(\"%s\"), _v%d); _v%d; })", mem, tv, tv);
+        return 1;
       }
     }
     /* freeze / frozen? carry the GC-header frozen bit, like the container and
@@ -1099,10 +1190,11 @@ int emit_call_hash_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
        (sp_streq(name, "[]") && argc == 1))) {
     int dn = hash_new_default_arg(c, recv);
     if (dn >= 0) {
-      TyKind dt = repr_of(c, dn).as_ty;
+      Repr dtr = repr_of(c, dn);
+      TyKind dt = dtr.as_ty;
       int t = ++g_tmp;
       buf_puts(b, "({ ");
-      emit_ctype(c, dt, b);
+      emit_ctype(c, dtr.kind == RK_BOXED ? TY_POLY : dt, b);
       buf_printf(b, " _t%d = ", t);
       emit_expr(c, dn, b);
       buf_puts(b, "; ");
@@ -1113,7 +1205,7 @@ int emit_call_hash_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
           buf_puts(b, "(void)("); emit_boxed(c, argv[a], b); buf_puts(b, "); ");
           char dv[24]; snprintf(dv, sizeof dv, "_t%d", t);
           buf_printf(b, "sp_PolyArray_push(_t%d, ", ta);
-          if (dt == TY_POLY) buf_puts(b, dv); else emit_boxed_text(c, dt, dv, b);
+          if (dtr.kind == RK_BOXED) buf_puts(b, dv); else emit_boxed_text(c, dt, dv, b);
           buf_puts(b, "); ");
         }
         buf_printf(b, "_t%d; })", ta);

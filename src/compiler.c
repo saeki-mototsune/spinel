@@ -4,6 +4,7 @@
 #include "analyze.h"
 #include "builtin_names.h"
 #include "codegen_poly.h"
+#include "value_pos.h"
 
 #include <stdio.h>
 #include <stdlib.h>
@@ -284,10 +285,10 @@ void comp_free(Compiler *c) {
   pivs_facts_free(c);
   strbuf_arg_index_free(c);
   free(c->vs_head); free(c->vs_site); free(c->vs_var); free(c->vs_next); free(c->vs_kind);
-  free(c->vs_rparent); free(c->vs_dropped); free(c->vs_whead); free(c->vs_wnext);
+  free(c->vs_rparent); free(c->vs_whead); free(c->vs_wnext);
   c->vs_head = c->vs_site = c->vs_var = c->vs_next = c->vs_rparent = NULL;
   c->vs_whead = c->vs_wnext = NULL;
-  c->vs_dropped = c->vs_kind = NULL;
+  c->vs_kind = NULL;
   c->vs_count = c->vs_cap = 0;
   c->vs_built = 0;
   free(c->cg_parent);
@@ -313,7 +314,7 @@ void comp_free(Compiler *c) {
   c->pres_names = NULL; c->pres_flags = NULL; c->npres = c->cpres = 0;
   free(c->nil_fact);
   free(c->nil_elem_fact);
-  free(c->cls_fact); free(c->cls_pool);
+  free(c->cls_fact); free(c->cls_pool); free(c->cls_kind);
   free(c->send_param_memo);
   free(c->node_ord); free(c->node_base);
   for (int k = 0; k < c->bi_base_cap; k++) free(c->bi_base_key[k]);
@@ -324,6 +325,7 @@ void comp_free(Compiler *c) {
     free(sc->name);
     for (int i = 0; i < sc->nlocals; i++) free(sc->locals[i].name);
     free(sc->locals);
+    free(sc->lidx);
     for (int i = 0; i < sc->nparams; i++) free(sc->pnames[i]);
     free(sc->pnames);
     free(sc->pdefault);
@@ -342,6 +344,8 @@ void comp_free(Compiler *c) {
     free(c->classes[i].rbs_pin_ivars);
     for (int j = 0; j < c->classes[i].nreaders; j++) free(c->classes[i].readers[j]);
     free(c->classes[i].readers);
+    for (int j = 0; j < c->classes[i].nown_readers; j++) free(c->classes[i].own_readers[j]);
+    free(c->classes[i].own_readers);
     for (int j = 0; j < c->classes[i].nwriters; j++) free(c->classes[i].writers[j]);
     free(c->classes[i].writers);
     for (int j = 0; j < c->classes[i].nundefs; j++) free(c->classes[i].undefs[j]);
@@ -548,7 +552,7 @@ Scope *comp_scope_new(Compiler *c, const char *name, int def_node) {
   *(TyKind *)&s->ret = TY_UNKNOWN;
   comp_ty_edits++;    /* a new scope is a change of the tables */
   scope_set_ret_noblock(s, TY_UNKNOWN);
-  scope_set_ret_withblock(s, TY_UNKNOWN);
+  scope_set_ret_pin_guard(s, -1);
   why_reset(&s->ret_why);
   s->dm_subst_node = -1;
   return s;
@@ -612,42 +616,41 @@ int local_range_held(Compiler *c, int node) {
   return lv && lv->range_held;
 }
 
+/* One value position of a value that may be a Range: a Range-typed value, a
+   read of a slot one was written into, a Range literal, or a call of a method
+   whose value can be one (Scope.ret_range). A walk that gave up, which a tree
+   cannot cause, may be one. */
+static int range_value_arm(const VpLeaf *leaf, void *ud) {
+  Compiler *c = ud;
+  const NodeTable *nt = c->nt;
+  if (leaf->kind == VPK_GAVE_UP) return 1;
+  if (leaf->kind != VPK_EXPR) return 0;
+  int node = leaf->node;
+  if (comp_ntype(c, node) == TY_RANGE) return 1;
+  switch (nt_kind(nt, node)) {
+  case NK_LocalVariableReadNode: return local_range_held(c, node);
+  case NK_RangeNode: return 1;
+  case NK_CallNode: {
+    const char *nm = nt_str(nt, node, "name");
+    int recv = nt_ref(nt, node, "receiver"), mi = -1;
+    if (recv < 0 || nt_kind(nt, recv) == NK_SelfNode) mi = comp_self_call_mi(c, node, nm);
+    else if (ty_is_object(comp_ntype(c, recv))) mi = comp_method_in_chain(c, ty_object_class(comp_ntype(c, recv)), nm, NULL);
+    return mi >= 0 && mi < c->nscopes && c->scopes[mi].ret_range;
+  }
+  default: return 0;
+  }
+}
+
 /* Can node's value be a Range, by its form: a Range-typed value, a read of
    a slot one was written into, an arm of a conditional, or a call of a
-   method whose value can be one (Scope.ret_range)? */
+   method whose value can be one (Scope.ret_range)? Read through the
+   iterator with every shape (if, unless, case, case/in, begin, the rescue
+   modifier and `||`/`&&`, both sides), which has no limit on the length of an
+   `elsif` ladder or of a chain of `||`. */
 int value_may_be_range(Compiler *c, int node) {
-  const NodeTable *nt = c->nt;
-  for (int d = 0; node >= 0 && d < 32; d++) {
-    if (comp_ntype(c, node) == TY_RANGE) return 1;
-    switch (nt_kind(nt, node)) {
-    case NK_LocalVariableReadNode: return local_range_held(c, node);
-    case NK_RangeNode: return 1;
-    case NK_ParenthesesNode: node = nt_ref(nt, node, "body"); break;
-    case NK_ElseNode: node = nt_ref(nt, node, "statements"); break;
-    case NK_StatementsNode: {
-      int n = 0; const int *b = nt_arr(nt, node, "body", &n);
-      node = n > 0 ? b[n - 1] : -1;
-      break;
-    }
-    case NK_IfNode: case NK_UnlessNode:
-      if (value_may_be_range(c, nt_ref(nt, node, "statements"))) return 1;
-      node = nt_ref(nt, node, nt_kind(nt, node) == NK_IfNode ? "subsequent" : "else_clause");
-      break;
-    case NK_OrNode: case NK_AndNode:
-      if (value_may_be_range(c, nt_ref(nt, node, "left"))) return 1;
-      node = nt_ref(nt, node, "right");
-      break;
-    case NK_CallNode: {
-      const char *nm = nt_str(nt, node, "name");
-      int recv = nt_ref(nt, node, "receiver"), mi = -1;
-      if (recv < 0 || nt_kind(nt, recv) == NK_SelfNode) mi = comp_self_call_mi(c, node, nm);
-      else if (ty_is_object(comp_ntype(c, recv))) mi = comp_method_in_chain(c, ty_object_class(comp_ntype(c, recv)), nm, NULL);
-      return mi >= 0 && mi < c->nscopes && c->scopes[mi].ret_range;
-    }
-    default: return 0;
-    }
-  }
-  return 0;
+  if (node < 0) return 0;
+  if (comp_ntype(c, node) == TY_RANGE) return 1;
+  return for_each_value_position(c->nt, node, VP_AND_LEFT | VPS_ALL, range_value_arm, c);
 }
 
 /* Runtime typedefs `sp_<X>` a user class name could redefine. A user class whose
@@ -707,6 +710,7 @@ ClassInfo *comp_class_new(Compiler *c, const char *name, int def_node) {
   c->anon_struct_ids_valid = 0;
   memset(ci, 0, sizeof(*ci));
   ci->ctor_reachable = 1;   /* conservatively, until compute_instantiated's early pass has looked */
+  ci->ctor_site = 1;
   ci->name = name ? strdup(name) : NULL;
   ci->c_name = sp_class_c_name(name);
   ci->is_builtin_const = is_builtin_class_name(name) || is_builtin_module_const_name(name);
@@ -1076,18 +1080,21 @@ int comp_cmethod_in_class(Compiler *c, int class_id, const char *name) {
 static unsigned cmc_shape = 0;
 void comp_class_shape_changed(void) { cmc_shape++; }
 static char **cmc_name; static unsigned char *cmc_cm; static int **cmc_ans;
+static int **cmc_resp; static int *cmc_nresp;   /* per slot: the responders (comp_name_responders), -1 unbuilt */
 static int cmc_cap = 0, cmc_n = 0;
+static unsigned cmc_epoch;   /* bumped when a slot's index can move: a clear, a growth */
 static const Compiler *cmc_c; static unsigned cmc_gen, cmc_shape_at;
 static int cmc_nscopes = -1, cmc_nclasses = -1;
 static void cmc_clear(void) {
-  for (int i = 0; i < cmc_cap; i++) if (cmc_name && cmc_name[i]) { free(cmc_name[i]); free(cmc_ans[i]); }
-  free(cmc_name); free(cmc_cm); free(cmc_ans);
-  cmc_name = NULL; cmc_cm = NULL; cmc_ans = NULL; cmc_cap = cmc_n = 0;
+  for (int i = 0; i < cmc_cap; i++) if (cmc_name && cmc_name[i]) { free(cmc_name[i]); free(cmc_ans[i]); free(cmc_resp[i]); }
+  free(cmc_name); free(cmc_cm); free(cmc_ans); free(cmc_resp); free(cmc_nresp);
+  cmc_name = NULL; cmc_cm = NULL; cmc_ans = NULL; cmc_resp = NULL; cmc_nresp = NULL; cmc_cap = cmc_n = 0;
+  cmc_epoch++;
 }
-/* The answers for (name, is_cm), two ints per class (-2 while unasked), or
-   NULL when the memo cannot be trusted now. */
-static int *cmc_slot(Compiler *c, const char *name, int is_cm) {
-  if (!sm_frozen || mv_n || !name || c->nclasses <= 0) return NULL;
+/* The slot of (name, is_cm), made when missing, or -1 when the memo cannot
+   be trusted now. */
+static int cmc_slot_idx(Compiler *c, const char *name, int is_cm) {
+  if (!sm_frozen || mv_n || !name || c->nclasses <= 0) return -1;
   if (cmc_c != c || cmc_gen != sm_gen || cmc_shape_at != cmc_shape ||
       cmc_nscopes != c->nscopes || cmc_nclasses != c->nclasses) {
     cmc_clear();
@@ -1096,30 +1103,59 @@ static int *cmc_slot(Compiler *c, const char *name, int is_cm) {
   }
   if (cmc_n * 2 >= cmc_cap) {
     int ocap = cmc_cap; char **on = cmc_name; unsigned char *ocm = cmc_cm; int **oa = cmc_ans;
+    int **orp = cmc_resp; int *onr = cmc_nresp;
     cmc_cap = ocap ? ocap * 2 : 256;
     cmc_name = calloc((size_t)cmc_cap, sizeof(char *));
     cmc_cm = calloc((size_t)cmc_cap, 1);
     cmc_ans = calloc((size_t)cmc_cap, sizeof(int *));
-    if (!cmc_name || !cmc_cm || !cmc_ans) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    cmc_resp = calloc((size_t)cmc_cap, sizeof(int *));
+    cmc_nresp = malloc(sizeof(int) * (size_t)cmc_cap);
+    if (!cmc_name || !cmc_cm || !cmc_ans || !cmc_resp || !cmc_nresp) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < cmc_cap; i++) cmc_nresp[i] = -1;
     for (int i = 0; i < ocap; i++) {
       if (!on[i]) continue;
       unsigned j = (sp_strhash(on[i]) ^ ocm[i]) & (unsigned)(cmc_cap - 1);
       while (cmc_name[j]) j = (j + 1) & (unsigned)(cmc_cap - 1);
-      cmc_name[j] = on[i]; cmc_cm[j] = ocm[i]; cmc_ans[j] = oa[i];
+      cmc_name[j] = on[i]; cmc_cm[j] = ocm[i]; cmc_ans[j] = oa[i]; cmc_resp[j] = orp[i]; cmc_nresp[j] = onr[i];
     }
-    free(on); free(ocm); free(oa);
+    free(on); free(ocm); free(oa); free(orp); free(onr);
+    cmc_epoch++;
   }
+  /* The last asks' slots: a pass asking every class about one name asks
+     it once per class (1,299 times on a Rails program), each a hash and
+     a probe of the table, and the name is the same string each time. The
+     slot's own name is compared too, so a string reused at the address
+     answers from the table. Four of them: the passes that ask every
+     class ask two or three keys per class (the instance method, the
+     class method, a reader, a writer's name), and one entry missed every
+     time between them. */
+  enum { CMC_LAST = 4 };
+  static struct { const char *name; int cm, j; unsigned epoch; } last[CMC_LAST];
+  static int last_at;
+  for (int i = 0; i < CMC_LAST; i++)
+    if (last[i].name == name && last[i].cm == is_cm && last[i].epoch == cmc_epoch && cmc_name[last[i].j] && sp_streq(cmc_name[last[i].j], name))
+      return last[i].j;
   unsigned j = (sp_strhash(name) ^ (unsigned)is_cm) & (unsigned)(cmc_cap - 1);
   while (cmc_name[j]) {
-    if (cmc_cm[j] == is_cm && sp_streq(cmc_name[j], name)) return cmc_ans[j];
+    if (cmc_cm[j] == is_cm && sp_streq(cmc_name[j], name)) break;
     j = (j + 1) & (unsigned)(cmc_cap - 1);
   }
-  int *a = malloc(sizeof(int) * 2 * (size_t)c->nclasses);
-  cmc_name[j] = strdup(name);
-  if (!a || !cmc_name[j]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  for (int k = 0; k < 2 * c->nclasses; k++) a[k] = -2;
-  cmc_cm[j] = (unsigned char)is_cm; cmc_ans[j] = a; cmc_n++;
-  return a;
+  if (!cmc_name[j]) {
+    int *a = malloc(sizeof(int) * 2 * (size_t)c->nclasses);
+    cmc_name[j] = strdup(name);
+    if (!a || !cmc_name[j]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int k = 0; k < 2 * c->nclasses; k++) a[k] = -2;
+    cmc_cm[j] = (unsigned char)is_cm; cmc_ans[j] = a; cmc_resp[j] = NULL; cmc_nresp[j] = -1; cmc_n++;
+  }
+  last[last_at].name = name; last[last_at].cm = is_cm; last[last_at].j = (int)j; last[last_at].epoch = cmc_epoch;
+  last_at = (last_at + 1) % CMC_LAST;
+  return (int)j;
+}
+/* The answers for (name, is_cm), two ints per class (-2 while unasked), or
+   NULL when the memo cannot be trusted now. */
+static int *cmc_slot(Compiler *c, const char *name, int is_cm) {
+  int j = cmc_slot_idx(c, name, is_cm);
+  return j < 0 ? NULL : cmc_ans[j];
 }
 static const char *resolve_alias_side(Compiler *c, int class_id, const char *name, int *start_cls, int *builtin, int sg);
 static int chain_lookup(Compiler *c, int class_id, const char *name, int *def_class, int is_cm) {
@@ -1137,6 +1173,14 @@ static int chain_lookup(Compiler *c, int class_id, const char *name, int *def_cl
     int m = is_cm ? comp_cmethod_in_class(c, cid, rn) : comp_method_in_class(c, cid, rn);
     if (m >= 0) { mi = m; dc = cid; break; }
   }
+  /* A class-side alias of an inherited method resumes at the ancestor that
+     owned it, but the receiver's own copy of that body (one made for a class
+     below, which runs it with that class as self) is the same method */
+  for (int cid = class_id; is_cm && mi >= 0 && start != class_id && cid >= 0 && cid != start;
+       cid = c->classes[cid].parent) {
+    int m = comp_cmethod_in_class(c, cid, rn);
+    if (m >= 0 && c->scopes[m].def_node == c->scopes[mi].def_node) { mi = m; dc = cid; break; }
+  }
   if (a) { a[2 * class_id] = mi; a[2 * class_id + 1] = dc; }
   if (mi >= 0 && def_class) *def_class = dc;
   return mi;
@@ -1147,6 +1191,32 @@ int comp_cmethod_in_chain(Compiler *c, int class_id, const char *name, int *def_
 
 int comp_method_in_chain(Compiler *c, int class_id, const char *name, int *def_class) {
   return chain_lookup(c, class_id, name, def_class, 0);
+}
+
+/* See compiler.h. Built on the first ask from the memo's slot, which the
+   walk fills for every class, and kept with it. The walk can move the slot:
+   a chain lookup inserts names (this one, an alias it resolves), and an
+   insertion grows and rehashes the table, so the slot is found again before
+   the list is stored, or the list would land under another name. */
+const int *comp_name_responders(Compiler *c, const char *name, int is_cm, int *n) {
+  int j = cmc_slot_idx(c, name, is_cm);
+  if (j < 0) { *n = -1; return NULL; }
+  if (cmc_nresp[j] < 0) {
+    int cap = 8, cnt = 0, *r = malloc(sizeof(int) * 2 * (size_t)cap);
+    if (!r) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int k = 0; k < c->nclasses; k++) {
+      int mi = chain_lookup(c, k, name, NULL, is_cm);
+      if (mi < 0) continue;
+      if (cnt == cap) { cap *= 2; r = realloc(r, sizeof(int) * 2 * (size_t)cap); if (!r) { fprintf(stderr, "spinel: out of memory\n"); exit(1); } }
+      r[2 * cnt] = k; r[2 * cnt + 1] = mi; cnt++;
+    }
+    j = cmc_slot_idx(c, name, is_cm);
+    if (j < 0) { free(r); *n = -1; return NULL; }
+    if (cmc_nresp[j] < 0) { cmc_resp[j] = r; cmc_nresp[j] = cnt; }
+    else free(r);
+  }
+  *n = cmc_nresp[j];
+  return cmc_resp[j];
 }
 
 int comp_ary_root(Compiler *c, int cid) {
@@ -1236,15 +1306,10 @@ int comp_arysub_name_is_array(Compiler *c, int cid, const char *n) {
   if (comp_ary_root(c, cid) < 0 || !n) return 0;
   /* a method of the builtin's reopen is the builtin's */
   int dc = -1, ro = comp_arysub_reopen(c, cid);
-  if ((comp_method_in_chain(c, cid, n, &dc) >= 0 && (ro < 0 || dc != ro)) ||
-      comp_reader_in_chain(c, cid, n, NULL)) return 0;
-  size_t l = strlen(n);
-  if (l > 1 && n[l - 1] == '=' && n[l - 2] != '=' && n[l - 2] != '!' && n[l - 2] != '<' &&
-      n[l - 2] != '>' && n[l - 2] != '[') {
-    char base[256];
-    snprintf(base, sizeof base, "%.*s", (int)(l - 1), n);
-    if (comp_writer_in_chain(c, cid, base, NULL)) return 0;
-  }
+  if (((comp_method_in_chain(c, cid, n, &dc) >= 0 && (ro < 0 || dc != ro)) ||
+       comp_reader_in_chain(c, cid, n, NULL)) && !comp_enum_answers_first(c, cid, n)) return 0;
+  char base[256];
+  if (setter_base_name(n, base, sizeof base) && comp_writer_in_chain(c, cid, base, NULL)) return 0;
   return !is_arysub_object_name(n) && comp_arysub_builtin_name(c, cid, n);
 }
 /* Whether call `id` on a receiver of type rt, an Array subclass instance, is
@@ -1534,8 +1599,7 @@ int comp_sg_const_candidates(Compiler *c, int class_id, const char *base, int *o
         if (!ty || !sp_streq(ty, "CallNode")) continue;
         const char *nm = nt_str(nt, id, "name");
         if (!nm) continue;
-        size_t nl = strlen(nm);
-        if (nl == 0 || nm[nl - 1] != '=') continue;
+        if (!name_is_plain_setter(nm)) continue;
         int recv = nt_ref(nt, id, "receiver");
         if (recv < 0) continue;
         const char *rty = nt_type(nt, recv);
@@ -1588,8 +1652,7 @@ int comp_sg_reader_const(Compiler *c, int call_id) {
   if (nt_ref(nt, call_id, "arguments") >= 0) return -1;
   const char *nm = nt_str(nt, call_id, "name");
   if (!nm) return -1;
-  size_t nl = strlen(nm);
-  if (nl > 0 && nm[nl - 1] == '=') return -1;
+  if (name_is_plain_setter(nm)) return -1;
   int recv = nt_ref(nt, call_id, "receiver");
   if (recv < 0) return -1;
   const char *rty = nt_type(nt, recv);
@@ -1611,8 +1674,7 @@ int comp_sg_reader_candidates(Compiler *c, int call_id, int *out, int max) {
   if (nt_ref(nt, call_id, "arguments") >= 0) return 0;
   const char *nm = nt_str(nt, call_id, "name");
   if (!nm) return 0;
-  size_t nl = strlen(nm);
-  if (nl > 0 && nm[nl - 1] == '=') return 0;
+  if (name_is_plain_setter(nm)) return 0;
   int recv = nt_ref(nt, call_id, "receiver");
   if (recv < 0) return 0;
   const char *rty = nt_type(nt, recv);
@@ -1855,6 +1917,11 @@ void comp_add_writer(ClassInfo *ci, const char *name) {
   name_add(&ci->writers, &ci->nwriters, &ci->cwriters, name);
 }
 int comp_is_reader(ClassInfo *ci, const char *name) { return name_list_has(ci->readers, ci->nreaders, name); }
+void comp_add_own_reader(ClassInfo *ci, const char *name) {
+  comp_add_reader(ci, name);
+  name_add(&ci->own_readers, &ci->nown_readers, &ci->cown_readers, name);
+}
+int comp_is_own_reader(ClassInfo *ci, const char *name) { return name_list_has(ci->own_readers, ci->nown_readers, name); }
 int comp_is_writer(ClassInfo *ci, const char *name) { return name_list_has(ci->writers, ci->nwriters, name); }
 
 /* A plain setter name: `x=`, but not the operators that also end in `=`
@@ -1865,15 +1932,32 @@ int name_is_plain_setter(const char *name) {
   char p = name[ln - 2];
   return p != '=' && p != '!' && p != '<' && p != '>' && p != ']';
 }
+/* A copy of name, and of "attr=" (the setter name an attribute's writer is
+   called by), each made as long as the name needs; the caller frees it. */
+char *name_dup(const char *name) {
+  size_t n = strlen(name);
+  char *s = malloc(n + 1);
+  if (!s) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  memcpy(s, name, n + 1);
+  return s;
+}
+char *setter_name_of(const char *attr) {
+  size_t n = strlen(attr);
+  char *s = malloc(n + 2);
+  if (!s) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  memcpy(s, attr, n);
+  s[n] = '=';
+  s[n + 1] = '\0';
+  return s;
+}
 /* Is CallNode `id` a setter written as an assignment (`obj.x = v`), whose
-   value is the argument whatever the writer returns? A call the send desugar
-   retargeted (`obj.send(:x=, v)`, marked send_blind / vis_enforce) is a plain
-   method call: its value is what the method returns (#4921). */
+   value is the argument whatever the writer returns? Prism flags it
+   (nt_attr_write), and a desugar that writes one sets the flag. A call the
+   send desugar retargeted (`obj.send(:x=, v)`) is a plain method call, not
+   flagged: its value is what the method returns (#4921). `[]=` has its own
+   value form, so it is no plain setter. */
 int call_is_setter_assign(const NodeTable *nt, int id) {
-  if (id < 0 || !name_is_plain_setter(nt_str(nt, id, "name"))) return 0;
-  const char *sb = nt_str(nt, id, "send_blind");
-  const char *ve = nt_str(nt, id, "vis_enforce");
-  return !(sb && sb[0] == '1') && !(ve && ve[0] == '1');
+  return id >= 0 && nt_attr_write(nt, id) && name_is_plain_setter(nt_str(nt, id, "name"));
 }
 /* The view a `parameters(lambda: v)` call asks for when v is the literal
    true (1), false (0) or nil (-1, the receiver's own): -2 for any other
@@ -1919,11 +2003,24 @@ void comp_add_sg_reader(ClassInfo *ci, const char *name) {
 void comp_add_sg_writer(ClassInfo *ci, const char *name) {
   name_add(&ci->sg_writers, &ci->nsg_writers, &ci->csg_writers, name);
 }
+void comp_add_sg_decl(ClassInfo *ci, const char *base, int writer, int node) {
+  char nm[260];
+  if (snprintf(nm, sizeof nm, "%s%s", base, writer ? "=" : "") >= (int)sizeof nm) return;
+  int n0 = ci->nsg_decl, cap0 = ci->csg_decl;
+  name_add(&ci->sg_decl, &ci->nsg_decl, &ci->csg_decl, nm);
+  if (ci->csg_decl != cap0 || !ci->sg_decl_node) {
+    ci->sg_decl_node = realloc(ci->sg_decl_node, sizeof(int) * (size_t)(ci->csg_decl > 0 ? ci->csg_decl : 1));
+    if (!ci->sg_decl_node) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  if (ci->nsg_decl > n0) { ci->sg_decl_node[ci->nsg_decl - 1] = node; return; }
+  /* declared again: the latest declaration is the one in force */
+  for (int i = 0; i < ci->nsg_decl; i++)
+    if (sp_streq(ci->sg_decl[i], nm) && node > ci->sg_decl_node[i]) ci->sg_decl_node[i] = node;
+}
 void comp_add_sg_civ(ClassInfo *ci, const char *name) {
   if (name) name_add(&ci->sg_civ, &ci->nsg_civ, &ci->csg_civ, name);
 }
 int comp_is_sg_civ(ClassInfo *ci, const char *name) { return name_list_has(ci->sg_civ, ci->nsg_civ, name); }
-int comp_is_sg_inh(ClassInfo *ci, const char *name) { return name_list_has(ci->sg_inh, ci->nsg_inh, name); }
 void comp_add_sg_inh(ClassInfo *ci, const char *name) {
   if (name_list_has(ci->sg_inh, ci->nsg_inh, name)) return;
   if (ci->nsg_inh >= ci->csg_inh) {
@@ -2015,10 +2112,30 @@ const char *comp_resolve_alias_ex(Compiler *c, int class_id, const char *name, i
 const char *comp_resolve_cm_alias_at(Compiler *c, int class_id, const char *name, int *start_cls) {
   return resolve_alias_side(c, class_id, name, start_cls, NULL, 1);
 }
+/* Does class `k` have the `class << self` writer that setter `name` (`x=`,
+   or an alias of one) reaches? Its attribute name (`x`) goes to `base`. */
+int comp_sg_writer_reached(Compiler *c, int k, const char *name, char *base, size_t cap) {
+  const char *rn = comp_resolve_cm_alias_at(c, k, name, NULL);
+  return setter_base_name(rn ? rn : name, base, cap) && comp_is_sg_writer(&c->classes[k], base);
+}
 /* ... and, for the builtin an alias captured (2: a builtin singleton method),
    the name of it, as comp_resolve_alias_ex answers for the instance side */
 const char *comp_resolve_cm_alias_ex(Compiler *c, int class_id, const char *name, int *builtin) {
   return resolve_alias_side(c, class_id, name, NULL, builtin, 1);
+}
+/* Does class `d` declare the `class << self` accessor `name` (`x`, or `x=`)
+   itself? A subclass's lists hold its ancestors' accessors as well, so the
+   declarations are kept apart (a redeclared one is in both). */
+static int sg_accessor_own(Compiler *c, int d, const char *name) {
+  ClassInfo *ci = &c->classes[d];
+  return name_list_has(ci->sg_decl, ci->nsg_decl, name);
+}
+int comp_sg_accessor_own(Compiler *c, int d, const char *name) { return sg_accessor_own(c, d, name); }
+int comp_sg_accessor_decl_node(Compiler *c, int d, const char *name) {
+  ClassInfo *ci = &c->classes[d];
+  for (int i = 0; name && i < ci->nsg_decl; i++)
+    if (sp_streq(ci->sg_decl[i], name)) return ci->sg_decl_node ? ci->sg_decl_node[i] : -1;
+  return -1;
 }
 static const char *resolve_alias_side(Compiler *c, int class_id, const char *name, int *start_cls, int *builtin, int sg) {
   if (builtin) *builtin = 0;
@@ -2052,7 +2169,7 @@ static const char *resolve_alias_side(Compiler *c, int class_id, const char *nam
              location`). Asked only once an alias is found, which most
              lookups never do. */
           for (int d = from; d >= 0 && d != cid; d = c->classes[d].parent)
-            if (sg == 1 ? comp_cmethod_in_class(c, d, name) >= 0
+            if (sg == 1 ? comp_cmethod_in_class(c, d, name) >= 0 || sg_accessor_own(c, d, name)
                         : comp_method_in_class(c, d, name) >= 0 || comp_is_reader(&c->classes[d], name)) return name;
           next = ci->alias_old[i];
           /* An alias of an INHERITED method names the body that was in effect
@@ -2100,8 +2217,7 @@ int comp_name_is_sg_alias_only(Compiler *c, int class_id, const char *name) {
   int sg = 0;
   /* a writer is listed by the name it assigns (`x` for `x=`) */
   char wbase[256] = "";
-  size_t nl = strlen(name);
-  if (nl > 1 && nl < sizeof wbase && name[nl - 1] == '=') { memcpy(wbase, name, nl - 1); wbase[nl - 1] = '\0'; }
+  setter_base_name(name, wbase, sizeof wbase);
   for (int cid = class_id; cid >= 0 && cid < c->nclasses; cid = c->classes[cid].parent) {
     ClassInfo *ci = &c->classes[cid];
     for (int i = 0; i < ci->naliases; i++) {
@@ -2190,7 +2306,12 @@ int comp_native_method_find(Compiler *c, int class_id, const char *name, int arg
    answers it first. -1 for an arm of the program's methods. */
 int comp_native_binding_class(Compiler *c, int k, const char *name) {
   if (k < 0 || k >= c->nclasses) return -1;
-  if (c->classes[k].is_native_class) return k;
+  /* a Ruby-side def on a native class answers for the class's objects the
+     program makes (#9903); with no construction of them in reachable code
+     the class contributes its bindings alone, as before: the def is not
+     emitted then, and its arm stood the builtin arms down (#9931, #4504) */
+  if (c->classes[k].is_native_class)
+    return comp_method_in_chain(c, k, name, NULL) >= 0 && c->classes[k].ctor_site ? -1 : k;
   int r = comp_native_answer_class(c, k, name);
   return r >= 0 && comp_native_method_find(c, r, name, 0, 0) >= 0 ? r : -1;
 }
@@ -2204,18 +2325,17 @@ int comp_native_answer_class(Compiler *c, int cid, const char *name) {
   int r = c->classes[cid].nsub_root - 1;
   if (r < 0 || !name) return -1;
   if (comp_method_in_chain(c, cid, name, NULL) >= 0 || comp_reader_in_chain(c, cid, name, NULL)) return -1;
+  /* (nor an attribute writer of the program's) */
+  char base[256];
+  if (setter_base_name(name, base, sizeof base) && comp_writer_in_chain(c, cid, base, NULL)) return -1;
   return r;
 }
 
 /* Whether class `k` contributes a poly-dispatch arm for instance calls of
-   `name`. A native class contributes only through its declared BINDINGS
-   (#4504): a Ruby-side def on it (IO::Buffer#values, StringIO#each_line) is
-   reachable through a typed receiver alone and gets no arm in the cls_id
-   switch -- so a candidate counter that tallied those stood the builtin
-   arms down for every poly receiver, and merely loading IO::Buffer turned
-   `h.values` on a poly Hash into NoMethodError. Every "does any user class
-   define this name" loop that feeds the poly dispatch asks through here so
-   the analyzer, the emitters, and the switch count the same arms. */
+   `name`. Native bindings and Ruby-side definitions use the same owner
+   decision as arm emission: an explicit Ruby override must also receive
+   the native class's boxed objects. Every candidate counter asks here so
+   inference, builtin gates and emitted switches count the same arms. */
 int comp_poly_arm_defines(Compiler *c, int k, const char *name) {
   int nk = comp_native_binding_class(c, k, name);
   if (nk >= 0)
@@ -2313,12 +2433,131 @@ int comp_reader_in_chain(Compiler *c, int class_id, const char *name, int *def_c
     if (comp_is_reader(&c->classes[cid], name)) { if (def_class) *def_class = cid; return 1; }
   return 0;
 }
+/* Whether a strict subclass of class_id answers `name` with a method or a
+   reader of its own chain: a slot typed class_id may hold that subclass,
+   so a call there dispatches at run time (#4023). */
+int comp_subclass_answers(Compiler *c, int class_id, const char *name) {
+  if (class_id < 0) return 0;
+  for (int k = 0; k < c->nclasses; k++) {
+    if (k == class_id) continue;
+    int anc = 0;
+    for (int p2 = c->classes[k].parent; p2 >= 0; p2 = c->classes[p2].parent)
+      if (p2 == class_id) { anc = 1; break; }
+    if (anc && (comp_method_in_chain(c, k, name, NULL) >= 0 ||
+                comp_reader_in_chain(c, k, name, NULL))) return 1;
+  }
+  return 0;
+}
 int comp_writer_in_chain(Compiler *c, int class_id, const char *name, int *def_class) {
   /* `name` is the attribute's base, and an alias of it is the reader's:
      `alias to_s name` defines no `to_s=`, so it is not followed here */
   for (int cid = class_id; cid >= 0; cid = c->classes[cid].parent)
     if (comp_is_writer(&c->classes[cid], name)) { if (def_class) *def_class = cid; return 1; }
   return 0;
+}
+
+/* Whether the program answers `name` at one level of the lookup, class or
+   module k itself: a def of its own (not a copy an include made), a reader
+   its own body declared, or an alias. */
+static int mixin_level_answers(Compiler *c, int k, const char *name) {
+  ClassInfo *ci = &c->classes[k];
+  int mi = comp_method_in_class(c, k, name);
+  if (mi >= 0 && (!c->scopes[mi].is_include_copy || c->scopes[mi].is_prepend_copy)) return 1;
+  if (comp_is_own_reader(ci, name)) return 1;
+  for (int a = 0; a < ci->naliases; a++)
+    if ((!ci->alias_sg || !ci->alias_sg[a]) && sp_streq(ci->alias_new[a], name)) return 1;
+  return 0;
+}
+/* Ruby's lookup from level k: 1 when the program answers first, 2 when
+   Enumerable does, 0 when neither does at k or below the modules it
+   includes (the last included first, Enumerable at its place among them).
+   `own_enum` is whether the Enumerable k brings, its own include or that of
+   a module it includes, counts: it does not where a superclass has it among
+   its ancestors already (the include is then a no-op). */
+/* The same positions and walker also answer Comparable membership and equality
+   precedence; neither query reconstructs includes from the node table. */
+/* Whether Enumerable is among the ancestors class or module k brings: it
+   includes (or prepends) it, or includes a module that does. */
+static int mixin_reaches(Compiler *c, int k, int comparable, int depth) {
+  ClassInfo *ci = &c->classes[k];
+  if (comparable ? (ci->cmp_inc_at || ci->cmp_prepended) :
+                   (ci->enum_inc_at || ci->enum_prepended)) return 1;
+  for (int j = 0; j < ci->nincluded_mods && depth < (comparable ? c->nclasses : 16); j++) {
+    int m = ci->included_mods[j];
+    if (m >= 0 && m < c->nclasses && m != k && mixin_reaches(c, m, comparable, depth + 1)) return 1;
+  }
+  return 0;
+}
+static int mixin_level_walk(Compiler *c, int k, const char *name, int own_enum, int comparable, int depth) {
+  ClassInfo *ci = &c->classes[k];
+  /* A prepended module's method precedes its includes. Its transplanted
+     scope records the module whose own lookup supplies that order. */
+  if (comparable && ci->cmp_prepended == 2) {
+    int mi = comp_method_in_class(c, k, name);
+    if (mi >= 0 && c->scopes[mi].is_prepend_copy && depth < c->nclasses) {
+      int m = c->scopes[mi].origin_module_ci - 1;
+      if (m >= 0 && m != k) {
+        int r = mixin_level_walk(c, m, name, own_enum, comparable, depth + 1);
+        if (r) return r;
+      }
+    }
+    return 2;
+  }
+  if (comparable ? ci->cmp_prepended == 1 : ci->enum_prepended) return 2;   /* in front of the class's own */
+  if (mixin_level_answers(c, k, name)) return 1;
+  int pos = comparable ? ci->cmp_inc_at : ci->enum_inc_at;
+  int at = own_enum && pos ? pos - 1 : -1;
+  for (int j = ci->nincluded_mods - 1; ; j--) {
+    if (at >= 0 && j == at - 1) return 2;
+    if (j < 0) return 0;
+    int m = ci->included_mods[j];
+    if (m < 0 || m >= c->nclasses || m == k || depth >= (comparable ? c->nclasses : 16)) continue;
+    int r = mixin_level_walk(c, m, name, own_enum, comparable, depth + 1);
+    if (r) return r;
+  }
+}
+static int mixin_answers_first(Compiler *c, int cid, const char *name, int comparable) {
+  /* what master answers: the program's method or reader anywhere in the chain */
+  int master = comp_method_in_chain(c, cid, name, NULL) < 0 && !comp_reader_in_chain(c, cid, name, NULL);
+  if (cid < 0 || cid >= c->nclasses || !name) return master;
+  /* a name Enumerable does not have (each, join, index ...): the program's alone */
+  if (core_method_vis(comparable ? "Comparable" : "Enumerable", name, 0) <= 0) return master;
+  /* the topmost class that has Enumerable among its ancestors, by an include
+     of its own or of a module: below it the include is a no-op. A Struct, an Array or a native class has Enumerable of its
+     own, at a place the includes do not show: master's answer there. */
+  int top = -1, n = 0;
+  for (int k = cid; k >= 0 && k < c->nclasses && n < 256; k = c->classes[k].parent, n++) {
+    ClassInfo *ci = &c->classes[k];
+    if (!comparable && (ci->is_struct || ci->is_native_class || ci->nsub_root > 0 || comp_ary_root(c, k) >= 0)) {
+      /* only a prepended Enumerable is placed: in front of the class it is
+         prepended to, behind the ones below it */
+      for (int j = cid, g = 0; g < 256; j = c->classes[j].parent, g++) {
+        if (c->classes[j].enum_prepended) return 1;
+        if (mixin_level_answers(c, j, name)) return 0;
+        if (j == k || c->classes[j].parent < 0) break;
+      }
+      return master;
+    }
+    if (mixin_reaches(c, k, comparable, 0)) top = k;
+    if (k == ci->parent) break;
+  }
+  n = 0;
+  for (int k = cid; k >= 0 && k < c->nclasses && n < 256; k = c->classes[k].parent, n++) {
+    int r = mixin_level_walk(c, k, name, k == top, comparable, 0);
+    if (r) return r == 2;
+    if (k == c->classes[k].parent) break;
+  }
+  return master;
+}
+
+int comp_enum_answers_first(Compiler *c, int cid, const char *name) {
+  return mixin_answers_first(c, cid, name, 0);
+}
+int comp_comparable_answers_first(Compiler *c, int cid, const char *name) {
+  return mixin_answers_first(c, cid, name, 1);
+}
+int comp_comparable_reaches(Compiler *c, int cid) {
+  return cid >= 0 && cid < c->nclasses && mixin_reaches(c, cid, 1, 0);
 }
 
 /* ---- Poly-dispatch candidates by method name ----
@@ -2697,6 +2936,12 @@ static void cv_build(Compiler *c) {
 }
 int comp_class_may_be_value(Compiler *c, int k) {
   if (k < 0 || k >= c->nclasses || !c->nt) return 1;
+  /* A writer's value temporary (emit_setter_assign_value) appends a local
+     variable read at each site it emits, and rebuilding over the whole
+     table for each of them made this most of a large program's codegen. */
+  if (c->cls_value && c->cls_value_n == c->nclasses && c->cls_value_nodes < c->nt->count &&
+      nt_appended_only_local_reads(c->nt, c->cls_value_nodes))
+    c->cls_value_nodes = c->nt->count;
   if (!c->cls_value || c->cls_value_n != c->nclasses || c->cls_value_nodes != c->nt->count) cv_build(c);
   return c->cls_value[k];
 }
@@ -2909,9 +3154,17 @@ static void lvw_build(Compiler *c) {
     c->lvw_head[b] = w;
   }
   c->lvw_version = c->nt->version;
+  c->lvw_stamp = nt_stamp(c->nt);
   c->lvw_built = 1;
 }
 int comp_lvw_first(Compiler *c, const char *name) {
+  /* a local variable read appended, or a call renamed, moves no write: the
+     emitters do both for each of thousands of sites (a writer's value
+     temporary, a re-entry under another name), and each rebuilt the index */
+  if (c->lvw_built && c->lvw_version != c->nt->version && nt_stamp_holds(c->nt, c->lvw_stamp, 1)) {
+    c->lvw_version = c->nt->version;
+    c->lvw_stamp = nt_stamp(c->nt);
+  }
   if (!c->lvw_built || c->lvw_version != c->nt->version) lvw_build(c);
   if (!c->lvw_built) return -1;
   return c->lvw_head[sp_strhash(name) & (unsigned)(c->lvw_nbuckets - 1)];
@@ -2946,9 +3199,15 @@ static void lvws_build(Compiler *c) {
     c->lvws_head[b] = w;
   }
   c->lvws_version = c->nt->version;
+  c->lvws_stamp = nt_stamp(c->nt);
   c->lvws_built = 1;
 }
 int comp_lvw_first_sc(Compiler *c, int scope_idx, const char *name) {
+  /* (as comp_lvw_first) */
+  if (c->lvws_built && c->lvws_version != c->nt->version && nt_stamp_holds(c->nt, c->lvws_stamp, 1)) {
+    c->lvws_version = c->nt->version;
+    c->lvws_stamp = nt_stamp(c->nt);
+  }
   if (!c->lvws_built || c->lvws_version != c->nt->version) lvws_build(c);
   if (!c->lvws_built) return -1;
   unsigned b = (sp_strhash(name) ^ ((unsigned)scope_idx * 2654435761u)) & (unsigned)(c->lvws_nbuckets - 1);
@@ -3224,10 +3483,8 @@ static int vsite_is_read(const NodeTable *nt, int n) {
    receiver, `x.to_s << y`) or call any method on it (VS_RECV: the call whose
    receiver it is), one entry per (kind, site), chained by (kind, variable)
    in node order. The refusals asked each of those by walking a
-   node kind per candidate. Beside the chains, two per-node lookups the
-   same walk fills: the call whose receiver a node is (comp_recv_parent),
-   and whether it is a statement the next statement follows
-   (comp_value_dropped). Chains
+   node kind per candidate. Beside the chains, a per-node lookup the same
+   walk fills: the call whose receiver a node is (comp_recv_parent). Chains
    carry hash collisions: callers keep their kind/name/key filters
    (comp_vsite_var is the read or write naming an entry's variable).
    Revalidated against nt->version, the scope index's generation and the
@@ -3258,13 +3515,12 @@ static void vsite_build(Compiler *c, int toplevel) {
   int nb = 16;
   while (nb < n && nb < (1 << 22)) nb <<= 1;
   size_t sz = (size_t)(n > 0 ? n : 1);
-  free(c->vs_head); free(c->vs_rparent); free(c->vs_dropped); free(c->vs_whead); free(c->vs_wnext);
+  free(c->vs_head); free(c->vs_rparent); free(c->vs_whead); free(c->vs_wnext);
   c->vs_head = malloc(sizeof(int) * (size_t)nb);
   c->vs_rparent = malloc(sz * sizeof(int));
-  c->vs_dropped = calloc(sz, 1);
   c->vs_whead = malloc(sz * sizeof(int));
   c->vs_wnext = malloc(sz * sizeof(int));
-  if (!c->vs_head || !c->vs_rparent || !c->vs_dropped || !c->vs_whead || !c->vs_wnext) {
+  if (!c->vs_head || !c->vs_rparent || !c->vs_whead || !c->vs_wnext) {
     fprintf(stderr, "spinel: out of memory\n");
     exit(1);
   }
@@ -3285,13 +3541,6 @@ static void vsite_build(Compiler *c, int toplevel) {
     if (vsite_is_read(nt, u)) vsite_add(c, VS_READ, u, u);
     else if (k == NK_LocalVariableWriteNode || k == NK_InstanceVariableWriteNode || k == NK_GlobalVariableWriteNode)
       vsite_add(c, VS_WRITE, u, u);
-    else if (k == NK_StatementsNode) {
-      int bn = 0; const int *bb = nt_arr(nt, u, "body", &bn);
-      for (int i = 0; i + 1 < bn; i++) {
-        int v = an_unparen(nt, bb[i]);
-        if (v >= 0 && v < n) c->vs_dropped[v] = 1;
-      }
-    }
     else if (k == NK_CallNode && nt_ref(nt, u, "receiver") >= 0) {
       int r = nt_ref(nt, u, "receiver"), ru = an_unparen(nt, r);
       const char *un = nt_str(nt, u, "name");
@@ -3302,8 +3551,8 @@ static void vsite_build(Compiler *c, int toplevel) {
           nt_kind(nt, ru) == NK_ClassVariableReadNode)
         vsite_add(c, VS_RECV, u, ru);
       if (un && sp_str_mutator(un, SP_MUT_LOCAL)) {
-        while (str_self_call(nt, an_unparen(nt, r))) r = nt_ref(nt, an_unparen(nt, r), "receiver");
-        int base = an_unparen(nt, r);
+        while (str_self_call(nt, nt_paren_single(nt, r))) r = nt_ref(nt, nt_paren_single(nt, r), "receiver");
+        int base = nt_paren_single(nt, r);
         if (vsite_is_read(nt, base)) vsite_add(c, VS_MUT, u, base);
       }
     }
@@ -3349,11 +3598,6 @@ int comp_lwrite_of_value(Compiler *c, int n) {
 }
 int comp_lwrite_next(const Compiler *c, int w) {
   return w >= 0 && w < c->vs_nodes ? c->vs_wnext[w] : -1;
-}
-int comp_value_dropped(Compiler *c, int n) {
-  vsite_sync(c);
-  n = an_unparen(c->nt, n);
-  return n >= 0 && n < c->vs_nodes && c->vs_dropped[n];
 }
 
 /* Every node of one kind, chained in node order. The string-promotion passes
@@ -3568,10 +3812,53 @@ int comp_included_method_index(Compiler *c, const char *name, int call_id) {
   return -1;
 }
 
+/* A scope's locals by name. A short table is scanned; a longer one is read
+   through an index of the names' hashes (`lidx`), since the scan compared
+   the asked name with every local's, and the lowered names of a large
+   program share long prefixes (the arms of a computed-name send, the
+   wrappers of a `method(:m)`), so each compare ran far into both: on a
+   Rails program late in its fixpoint the scan was 8% of a sampled window,
+   from a thousand distinct callers. The index holds each local's slot + 1
+   at its hash, probing linearly, and is built by the first ask that wants
+   it; an append adds to it, and the one removal (codegen's escape of a
+   copied argument) drops it. */
+enum { SCOPE_LIDX_MIN = 6 };
+static void scope_lidx_add(Scope *s, int i) {
+  unsigned m = (unsigned)(s->lidx_cap - 1), h = sp_strhash(s->locals[i].name) & m;
+  while (s->lidx[h]) h = (h + 1) & m;
+  s->lidx[h] = i + 1;
+}
+static void scope_lidx_build(Scope *s) {
+  int cap = 16;
+  while (cap < s->nlocals * 2) cap *= 2;
+  if (s->lidx_cap != cap) { free(s->lidx); s->lidx = malloc(sizeof(int) * (size_t)cap); s->lidx_cap = cap; }
+  if (!s->lidx) { s->lidx_cap = 0; return; }
+  memset(s->lidx, 0, sizeof(int) * (size_t)cap);
+  for (int i = 0; i < s->nlocals; i++) scope_lidx_add(s, i);
+}
 LocalVar *scope_local(Scope *s, const char *name) {
+  if (s->nlocals >= SCOPE_LIDX_MIN) {
+    if (!s->lidx || s->nlocals * 2 > s->lidx_cap) scope_lidx_build(s);
+    if (s->lidx) {
+      unsigned m = (unsigned)(s->lidx_cap - 1), h = sp_strhash(name) & m;
+      for (int k; (k = s->lidx[h]) != 0; h = (h + 1) & m)
+        if (sp_streq(s->locals[k - 1].name, name)) return &s->locals[k - 1];
+      return NULL;
+    }
+  }
   for (int i = 0; i < s->nlocals; i++)
     if (sp_streq(s->locals[i].name, name)) return &s->locals[i];
   return NULL;
+}
+/* The index after a local is appended to (kept) or removed from the table
+   (dropped: the slots after it moved). */
+void scope_locals_appended(Scope *s) {
+  if (!s->lidx) return;
+  if (s->nlocals * 2 > s->lidx_cap) { free(s->lidx); s->lidx = NULL; s->lidx_cap = 0; }
+  else scope_lidx_add(s, s->nlocals - 1);
+}
+void scope_locals_removed(Scope *s) {
+  free(s->lidx); s->lidx = NULL; s->lidx_cap = 0;
 }
 
 LocalVar *scope_local_intern(Scope *s, const char *name) {
@@ -3624,6 +3911,7 @@ LocalVar *scope_local_intern(Scope *s, const char *name) {
   lv->store_val_src = 0;
   lv->store_elems_src = 0;
   lv->store_rest_src = 0;
+  scope_locals_appended(s);
   return lv;
 }
 
@@ -3987,6 +4275,25 @@ int comp_class_anonymous(Compiler *c, int ci) {
 
 /* The table that prints a class value for to_s and inspect: a Class.new class
    has a display form of its own, and every other program reads the one name table. */
-const char *comp_class_display_fn(Compiler *c) {
+const char *comp_class_base_display_fn(Compiler *c) {
   return c->has_anonymous_classes ? "sp_class_display" : "sp_class_to_s";
+}
+/* A class method to_s / inspect (nm) of class k's own, taking no arguments
+   and answering a String: what prints the class (sp_class_user_to_s and
+   _inspect); -1 when the class has none. */
+int cls_user_display_mi(Compiler *c, int k, const char *nm) {
+  if (k < 0 || k >= c->nclasses || is_builtin_reopen(c->classes[k].name)) return -1;
+  int mi = comp_cmethod_in_chain(c, k, nm, NULL);
+  if (mi < 0) return -1;
+  const Scope *s = &c->scopes[mi];
+  if (s->nparams > 0 || s->yields || (s->blk_param && s->blk_param[0]) || (TyKind)s->ret != TY_STRING) return -1;
+  return mi;
+}
+int prog_has_cls_user_display(Compiler *c, const char *nm) {
+  for (int k = 0; k < c->nclasses; k++) if (cls_user_display_mi(c, k, nm) >= 0) return 1;
+  return 0;
+}
+/* ... and for to_s, the table behind the program's own class method to_s */
+const char *comp_class_display_fn(Compiler *c) {
+  return prog_has_cls_user_display(c, "to_s") ? "sp_class_to_s_disp" : comp_class_base_display_fn(c);
 }

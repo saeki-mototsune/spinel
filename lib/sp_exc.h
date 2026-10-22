@@ -108,6 +108,7 @@ const char *sp_exc_msg_plain(const char *m);   /* a frozen counted message as fr
 const char *sp_exc_cat(int n, ...);   /* parts joined by byte length, NULs kept */
 const char *sp_exc_full_text(volatile sp_Exception *e, const char *msg);       /* "Class: msg" */
 const char *sp_exc_detailed_text(volatile sp_Exception *e, const char *msg);   /* "msg (Class)" */
+const char *sp_exc_detailed_highlight(volatile sp_Exception *e, const char *msg);
 /* m is a Spinel String here (the generated code gives only those), so its header's
    length is safe to read; a NUL inside it travels as a counted message (#7556). */
 static inline const char *sp_exc_msg_given(const char *m) {
@@ -162,6 +163,8 @@ sp_Exception *sp_exc_cause(volatile sp_Exception *ve);
 sp_RbVal sp_exc_result(volatile sp_Exception *ve);
 const char *sp_errno_class_name(int e);   /* "Errno::ENOENT" for ENOENT; the parent for an unlisted one */
 sp_RbVal sp_exc_errno_acc(sp_Exception *e);   /* SystemCallError#errno */
+sp_RbVal sp_exc_error_code_acc(sp_Exception *e);   /* Socket::ResolutionError#error_code */
+SP_NORETURN void sp_raise_resolution_error(int code, const char *msg);
 enum { SP_SYSERR_NONE, SP_SYSERR_NUM, SP_SYSERR_BASE, SP_SYSERR_BARE };
 int sp_syserr_kind(const char *cls, sp_int *num);   /* where cls stands in the SystemCallError family */
 const char *sp_syserr_text(int has_num, sp_int num, const char *func, const char *msg);

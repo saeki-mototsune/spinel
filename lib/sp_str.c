@@ -326,7 +326,7 @@ const char*sp_str_substr(const char*s,sp_int start,sp_int len){SP_GC_ROOT_STR(s)
 const char*sp_str_chr(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("chr");if(*s==0)return sp_str_empty;int n=sp_utf8_advance(s);char*r=sp_str_alloc_raw((size_t)n+1);memcpy(r,s,(size_t)n);r[n]=0;sp_str_set_len(r,(size_t)n);return r;}
 /* The character index at byte offset `byteoff`; preserves -1 (no match) and 0.
    Used to report a regexp match position in characters, not bytes (#3056). */
-sp_int sp_str_byte_to_char(const char*s,sp_int byteoff){if(byteoff<=0||!s)return byteoff;sp_int bl=(sp_int)sp_str_byte_len(s);sp_int ci=0;for(sp_int i=0;i<byteoff&&i<bl;ci++)i+=sp_utf8_advance(s+i);/* to the byte length, not the first NUL (#4527) */return ci;}
+sp_int sp_str_byte_to_char(const char*s,sp_int byteoff){if(byteoff<=0||!s)return byteoff;sp_int bl=(sp_int)sp_str_byte_len(s);/* a BINARY string's characters are its bytes, whatever they spell in UTF-8 */if(sp_str_is_binary(s))return byteoff<bl?byteoff:bl;sp_int ci=0;for(sp_int i=0;i<byteoff&&i<bl;ci++)i+=sp_utf8_advance(s+i);/* to the byte length, not the first NUL (#4527) */return ci;}
 /* Issue #797: NULL guards on receiver + needle for the chunk of
    string functions that read directly into a non-checked strlen. */
 sp_bool sp_str_include(const char*s,const char*sub){if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");if(!s)sp_nil_recv("include?");return sp_bytestr(s,sp_str_byte_len(s),sub,sp_str_byte_len(sub))!=NULL;}
@@ -335,6 +335,7 @@ sp_bool sp_str_end_with(const char*s,const char*suf){if(!suf)sp_raise_cls("TypeE
 /* partition: [before, sep, after] at the first sep; no match -> [s, "", ""]. */
 /* partition: [before, sep, after] at the first sep; no match -> [s, "", ""]. */
 sp_StrArray *sp_str_partition(const char *s, const char *sep) {
+  if (!s) sp_nil_recv("partition");
   if (!sep) sp_raise_cls("TypeError", "wrong argument type nil (expected Regexp)");
   SP_GC_ROOT_STR(s); SP_GC_ROOT_STR(sep);
   sp_StrArray *r = sp_StrArray_new();
@@ -353,6 +354,7 @@ sp_StrArray *sp_str_partition(const char *s, const char *sep) {
 /* rpartition: split at the last sep; no match -> ["", "", s]. */
 /* rpartition: split at the last sep; no match -> ["", "", s]. */
 sp_StrArray *sp_str_rpartition(const char *s, const char *sep) {
+  if (!s) sp_nil_recv("rpartition");
   if (!sep) sp_raise_cls("TypeError", "wrong argument type nil (expected Regexp)");
   SP_GC_ROOT_STR(s); SP_GC_ROOT_STR(sep);
   sp_StrArray *r = sp_StrArray_new();
@@ -394,7 +396,7 @@ sp_StrArray*sp_str_lines_sep_chomp(const char*s,const char*sep){SP_GC_ROOT_STR(s
   }
   return a;
 }
-sp_StrArray*sp_str_lines_sep(const char*s,const char*sep){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(sep);sp_StrArray*a=sp_StrArray_new();SP_GC_ROOT(a);if(!s)return a;if(!sep){sp_StrArray_push(a,sp_str_bin_like(s,(char*)sp_str_dup(s)));return a;}if(!sp_str_byte_len(s))return a;size_t sl=sp_str_byte_len(sep);/* an empty separator is CRuby's paragraph mode: split after each run of two
+sp_StrArray*sp_str_lines_sep(const char*s,const char*sep){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(sep);sp_StrArray*a=sp_StrArray_new();SP_GC_ROOT(a);if (SP_UNLIKELY(!s)) sp_nil_recv("lines");if(!sep){sp_StrArray_push(a,sp_str_bin_like(s,(char*)sp_str_dup(s)));return a;}if(!sp_str_byte_len(s))return a;size_t sl=sp_str_byte_len(sep);/* an empty separator is CRuby's paragraph mode: split after each run of two
    or more newlines, keeping the run with the paragraph (#3546) */
 if(sl==0)return sp_str_paragraphs(s,0);const char*end=s+sp_str_byte_len(s);const char*p=s;while(p<end){const char*hit=sp_bytestr(p,(size_t)(end-p),sep,sl);size_t n=hit?(size_t)(hit-p)+sl:(size_t)(end-p);char*r=sp_str_alloc_raw(n+1);memcpy(r,p,n);r[n]=0;sp_str_set_len(r,n);sp_StrArray_push(a,sp_str_bin_like(s,r));if(!hit)break;p=hit+sl;}return a;}
 sp_StrArray*sp_str_lines(const char*s){SP_GC_ROOT_STR(s);sp_StrArray*a=sp_StrArray_new();size_t bl=sp_str_byte_len(s);if(bl==0)return a;SP_GC_ROOT(a);const char*end=s+bl;const char*p=s;while(p<end){const char*nl=memchr(p,'\n',(size_t)(end-p));size_t n=nl?(size_t)(nl-p+1):(size_t)(end-p);char*r=sp_str_alloc_raw(n+1);memcpy(r,p,n);r[n]=0;sp_str_set_len(r,n);sp_StrArray_push(a,sp_str_bin_like(s,r));if(!nl)break;p=nl+1;}return a;}
@@ -615,6 +617,30 @@ sp_int sp_str_length(const char*s){
 sp_int sp_str_ord(const char*s){if(!s)sp_nil_recv("ord");
   if(sp_str_byte_len(s)==0)sp_raise_cls("ArgumentError","empty string");
   uint32_t cp;sp_utf8_decode(s,&cp);return(sp_int)cp;}
+/* The byte offset of character char_idx of a valid UTF-8 string: that of its
+   lead byte, the one every character has and no continuation byte (10xxxxxx)
+   is. Counted eight bytes at a time, as CRuby counts: stepping one character
+   at a time made s[i] four to seven times slower than CRuby's on any string
+   that is not all ASCII. */
+static size_t sp_utf8_valid_byte_offset(const char *s, size_t blen, sp_int char_idx) {
+  const unsigned char *p = (const unsigned char *)s, *end = p + blen;
+  while ((size_t)(end - p) >= 8) {   /* no pointer past the end is formed */
+    uint64_t w;
+    memcpy(&w, p, sizeof(w));
+    uint64_t cont = w & ~(w << 1) & 0x8080808080808080ULL;
+    sp_int leads = 8 - (sp_int)(((cont >> 7) * 0x0101010101010101ULL) >> 56);
+    /* the lead byte sought lies past this word */
+    if (leads > char_idx) break;
+    char_idx -= leads;
+    p += 8;
+  }
+  for (; p < end; p++) {
+    if ((*p & 0xC0) == 0x80) continue;
+    if (char_idx == 0) break;
+    char_idx--;
+  }
+  return (size_t)(p - (const unsigned char *)s);
+}
 size_t sp_utf8_byte_offset(const char*s,sp_int char_idx){
   if (!s || char_idx <= 0) return 0;
   /* one unit per byte on a binary string, so indexing and slicing agree with
@@ -625,11 +651,14 @@ size_t sp_utf8_byte_offset(const char*s,sp_int char_idx){
     size_t bl = sp_str_byte_len(s), off = (size_t)char_idx;
     return off > bl ? bl : off;
   }
+  /* fewer characters than bytes in the length cache: the walk that counted
+     them found valid UTF-8 (an invalid byte makes it count bytes) */
+  int valid = 0;
   if (sp_str_cacheable(s)) {
     unsigned h = sp_str_lcache_hash(s);
     for (unsigned w = 0; w < SP_STR_LCACHE_WAYS; w++) {
       if (sp_str_lcache[h + w].s != s) continue;
-      if ((size_t)sp_str_lcache[h + w].char_len != sp_str_lcache[h + w].byte_len) break;
+      if ((size_t)sp_str_lcache[h + w].char_len != sp_str_lcache[h + w].byte_len) { valid = 1; break; }
       size_t off = (size_t)char_idx;
       return off > sp_str_lcache[h + w].byte_len ? sp_str_lcache[h + w].byte_len : off;
     }
@@ -644,6 +673,7 @@ size_t sp_utf8_byte_offset(const char*s,sp_int char_idx){
   size_t blen = sp_str_byte_len(s);
   const char *p = s;
   const char *end = s + blen;
+  if (valid) return sp_utf8_valid_byte_offset(s, blen, char_idx);
   while (char_idx > 0 && p < end) {
     p += sp_utf8_advance(p);
     char_idx--;
@@ -923,14 +953,44 @@ const char*sp_str_sub_range(const char*s,sp_int start,sp_int len){SP_GC_ROOT_STR
 /* Single-character `s[i]`. Returns NULL on out-of-bounds so the caller can
    yield CRuby's `"hello"[20] -> nil`. */
 const char*sp_str_char_at_or_nil(const char*s,sp_int i){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("[]");sp_int cl=sp_str_length(s);if(i<0)i+=cl;if(i<0||i>=cl)return NULL;return sp_str_sub_range(s,i,1);}
+/* The width in bytes of the character at byte `at` of s, which ends at
+   byte blen: one on a BINARY string, as #chars counts. */
+size_t sp_str_char_width(const char*s,size_t blen,size_t at){
+  size_t n = sp_str_is_binary(s) ? 1 : (size_t)sp_utf8_advance(s + at);
+  return at + n > blen ? blen - at : n;
+}
+/* each_char's step: the character at byte *at of s, and *at moved past it.
+   Walking by byte keeps the loop linear; indexing the i-th character counted
+   from the start of the string on every turn once a multibyte character made
+   it not fixed width. The result is what s[i] answers for that character. */
+const char*sp_str_char_step(const char*s,size_t blen,size_t*at){
+  SP_GC_ROOT_STR(s);
+  size_t off = *at, n = sp_str_char_width(s, blen, off);
+  *at = off + n;
+  int bin = sp_str_is_binary(s);
+  unsigned char c = (unsigned char)s[off];
+  if (n == 1 && bin) return sp_bin_char(c);
+  if (n == 1 && c != 0) {
+    if (!sp_char_cache_init) {
+      for (int i = 0; i < 256; i++) { sp_char_cache[i][0] = (char)0xff; sp_char_cache[i][1] = (char)i; sp_char_cache[i][2] = 0; }
+      sp_char_cache_init = 1;
+    }
+    return &sp_char_cache[c][1];
+  }
+  char *r = sp_str_alloc_raw(n + 1);
+  memcpy(r, s + off, n); r[n] = 0;
+  sp_str_set_len(r, n);
+  if (bin) sp_str_mark_binary(r);
+  return r;
+}
 const char*sp_str_sub_range_len(const char*s,sp_int cl,sp_int start,sp_int len){SP_GC_ROOT_STR(s);if(start<0)start+=cl;if(start<0||start>cl||len<0)return NULL;if(start==cl||len==0){return sp_str_is_binary(s)?sp_str_empty_binary():&("\xff" "")[1];}if(len>cl-start)len=cl-start;size_t _fb;int fixed=sp_str_fixed_width(s,&_fb);int bin=fixed?sp_str_is_binary(s):0;size_t boff=fixed?(size_t)start:sp_utf8_byte_offset(s,start);size_t blen_total=fixed?_fb:sp_str_byte_len(s);size_t bp=boff;sp_int rem=len;while(rem>0&&bp<blen_total){bp+=fixed?1:sp_utf8_advance(s+bp);rem--;}if(bp>blen_total)bp=blen_total;size_t bend=bp;size_t blen=bend-boff;if(bin&&len==1&&blen==1)return sp_bin_char((unsigned char)s[boff]);if(!bin&&len==1&&blen==1){unsigned char c=(unsigned char)s[boff];if(c!=0){if(!sp_char_cache_init){for(int i=0;i<256;i++){sp_char_cache[i][0]=(char)0xff;sp_char_cache[i][1]=(char)i;sp_char_cache[i][2]=0;}sp_char_cache_init=1;}return &sp_char_cache[c][1];}}char*r=sp_str_alloc_raw(blen+1);memcpy(r,s+boff,blen);r[blen]=0;sp_str_set_len(r,blen);if(bin)sp_str_mark_binary(r);return r;}
 const char*sp_str_sub_range_r(const char*s,sp_int start,sp_int end_,sp_int excl){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("[]");sp_int cl=sp_str_length(s);if(end_<0)end_+=cl;if(start<0)start+=cl;if(start<0)return NULL;if(end_>=cl){end_=cl;excl=1;}sp_int n=end_-start+(excl?0:1);if(n<0)n=0;return sp_str_sub_range_len(s,cl,start,n);}
 const char*sp_str_sub_range_len_r(const char*s,sp_int cl,sp_int start,sp_int end_,sp_int excl){SP_GC_ROOT_STR(s);if(end_<0)end_+=cl;if(start<0)start+=cl;if(start<0)return NULL;if(end_>=cl){end_=cl;excl=1;}sp_int n=end_-start+(excl?0:1);if(n<0)n=0;return sp_str_sub_range_len(s,cl,start,n);}
 /* walks by INDEX to the header length: `while(*p)` stopped at an embedded NUL
    and reversed only the prefix */
 const char*sp_str_reverse(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("reverse");size_t bl=sp_str_byte_len(s);char*r=sp_str_alloc_raw(bl+1);size_t end=bl;for(size_t i=0;i<bl;){int cn=sp_utf8_advance(s+i);if(cn<1)cn=1;if((size_t)cn>bl-i)cn=(int)(bl-i);end-=(size_t)cn;memcpy(r+end,s+i,(size_t)cn);i+=(size_t)cn;}r[bl]=0;sp_str_set_len(r,bl);return sp_str_bin_like(s,r);}
-sp_int sp_str_count(const char*s,const char*chars){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(chars);if(!chars)sp_raise_cls("TypeError","no implicit conversion of nil into String");int negate;size_t setn;uint32_t*set=sp_str_charset(s,chars,&negate,&setn);sp_int c=0;const char*p=s;const char*end=s+sp_str_byte_len(s);int bin=sp_str_is_binary(s);while(p<end){uint32_t cp;p+=sp_str_cp_at(p,&cp,bin);int in_set=sp_utf8_set_has(set,setn,cp);if(negate)in_set=!in_set;if(in_set)c++;}free(set);return c;}
-sp_int sp_str_count_n(const char*s,const char**chars,sp_int n){SP_GC_ROOT_STR(s);if(n<=0)return 0;size_t*setns=(size_t*)malloc(n*sizeof(size_t));uint32_t**sets=(uint32_t**)malloc(n*sizeof(uint32_t*));int*negs=(int*)malloc(n*sizeof(int));for(sp_int i=0;i<n;i++){if(!chars[i])sp_raise_cls("TypeError","no implicit conversion of nil into String");sets[i]=sp_str_charset(s,chars[i],&negs[i],&setns[i]);}sp_int c=0;const char*p=s;const char*end=s+sp_str_byte_len(s);int bin=sp_str_is_binary(s);while(p<end){uint32_t cp;p+=sp_str_cp_at(p,&cp,bin);int all=1;for(sp_int i=0;i<n;i++){int in_set=sp_utf8_set_has(sets[i],setns[i],cp);if(negs[i])in_set=!in_set;if(!in_set){all=0;break;}}if(all)c++;}for(sp_int i=0;i<n;i++)free(sets[i]);free(sets);free(setns);free(negs);return c;}
+sp_int sp_str_count(const char*s,const char*chars){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(chars);if(!s)sp_nil_recv("count");if(!chars)sp_raise_cls("TypeError","no implicit conversion of nil into String");int negate;size_t setn;uint32_t*set=sp_str_charset(s,chars,&negate,&setn);sp_int c=0;const char*p=s;const char*end=s+sp_str_byte_len(s);int bin=sp_str_is_binary(s);while(p<end){uint32_t cp;p+=sp_str_cp_at(p,&cp,bin);int in_set=sp_utf8_set_has(set,setn,cp);if(negate)in_set=!in_set;if(in_set)c++;}free(set);return c;}
+sp_int sp_str_count_n(const char*s,const char**chars,sp_int n){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("count");if(n<=0)return 0;size_t*setns=(size_t*)malloc(n*sizeof(size_t));uint32_t**sets=(uint32_t**)malloc(n*sizeof(uint32_t*));int*negs=(int*)malloc(n*sizeof(int));for(sp_int i=0;i<n;i++){if(!chars[i])sp_raise_cls("TypeError","no implicit conversion of nil into String");sets[i]=sp_str_charset(s,chars[i],&negs[i],&setns[i]);}sp_int c=0;const char*p=s;const char*end=s+sp_str_byte_len(s);int bin=sp_str_is_binary(s);while(p<end){uint32_t cp;p+=sp_str_cp_at(p,&cp,bin);int all=1;for(sp_int i=0;i<n;i++){int in_set=sp_utf8_set_has(sets[i],setns[i],cp);if(negs[i])in_set=!in_set;if(!in_set){all=0;break;}}if(all)c++;}for(sp_int i=0;i<n;i++)free(sets[i]);free(sets);free(setns);free(negs);return c;}
 /* The codepoints walked to the recorded byte length, as sp_str_chars walks:
    a BINARY String's are its bytes, and a NUL is a character like any other.
    String#codepoints with a block yields these. */
@@ -999,8 +1059,8 @@ const char*sp_str_delete(const char*s,const char*chars){SP_GC_ROOT_STR(s);SP_GC_
 const char*sp_str_squeeze(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("squeeze");size_t bl=sp_str_byte_len(s);char*r=sp_str_alloc_raw(bl+1);size_t n=0;uint32_t prev=0xFFFFFFFFu;const char*p=s,*pe=s+bl;int bin=sp_str_is_binary(s);while(p<pe){uint32_t cp;int cn=sp_str_cp_at(p,&cp,bin);if(cp!=prev){memcpy(r+n,p,cn);n+=cn;prev=cp;}p+=cn;}r[n]=0;sp_str_set_len(r,n);return sp_str_bin_like(s,r);}
 const char*sp_str_squeeze_chars(const char*s,const char*cs){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(cs);if(!s)sp_nil_recv("squeeze");if(!cs)return sp_str_squeeze(s);int negate;size_t fn;uint32_t*fcps=sp_str_charset(s,cs,&negate,&fn);size_t bl=sp_str_byte_len(s);char*r=sp_str_alloc_raw(bl+1);size_t n=0;uint32_t prev=0xFFFFFFFFu;const char*p=s,*pe=s+bl;int bin=sp_str_is_binary(s);while(p<pe){uint32_t cp;int cn=sp_str_cp_at(p,&cp,bin);int in_set=0;for(size_t j=0;j<fn;j++)if(fcps[j]==cp){in_set=1;break;}if(negate)in_set=!in_set;if(!in_set){memcpy(r+n,p,cn);n+=cn;prev=0xFFFFFFFFu;}
 else if(cp!=prev){memcpy(r+n,p,cn);n+=cn;prev=cp;}p+=cn;}r[n]=0;sp_str_set_len(r,n);free(fcps);return sp_str_bin_like(s,r);}
-const char*sp_str_delete_n(const char*s,const char**chars,sp_int n){SP_GC_ROOT_STR(s);if(!s)return sp_str_empty;if(n<=0)return s;size_t*setns=(size_t*)malloc(n*sizeof(size_t));uint32_t**sets=(uint32_t**)malloc(n*sizeof(uint32_t*));int*negs=(int*)malloc(n*sizeof(int));for(sp_int i=0;i<n;i++){if(!chars[i])sp_raise_cls("TypeError","no implicit conversion of nil into String");sets[i]=sp_str_charset(s,chars[i],&negs[i],&setns[i]);}size_t bl=sp_str_byte_len(s);char*buf=(char*)malloc(bl+1);if(!buf)sp_oom_die();size_t m=0;const char*p=s,*pe=s+bl;int bin=sp_str_is_binary(s);while(p<pe){uint32_t cp;int cn=sp_str_cp_at(p,&cp,bin);int all=1;for(sp_int i=0;i<n;i++){int in_set=sp_utf8_set_has(sets[i],setns[i],cp);if(negs[i])in_set=!in_set;if(!in_set){all=0;break;}}if(!all){memcpy(buf+m,p,cn);m+=cn;}p+=cn;}buf[m]=0;for(sp_int i=0;i<n;i++)free(sets[i]);free(sets);free(setns);free(negs);char*r=sp_str_alloc(m);memcpy(r,buf,m+1);free(buf);return sp_str_bin_like(s,r);}
-const char*sp_str_squeeze_n(const char*s,const char**chars,sp_int n){SP_GC_ROOT_STR(s);if(!s)return sp_str_empty;if(n<=0)return sp_str_squeeze(s);size_t*setns=(size_t*)malloc(n*sizeof(size_t));uint32_t**sets=(uint32_t**)malloc(n*sizeof(uint32_t*));int*negs=(int*)malloc(n*sizeof(int));for(sp_int i=0;i<n;i++){if(!chars[i])sp_raise_cls("TypeError","no implicit conversion of nil into String");sets[i]=sp_str_charset(s,chars[i],&negs[i],&setns[i]);}size_t bl=sp_str_byte_len(s);char*r=sp_str_alloc_raw(bl+1);size_t m=0;uint32_t prev=0xFFFFFFFFu;const char*p=s,*pe=s+bl;int bin=sp_str_is_binary(s);while(p<pe){uint32_t cp;int cn=sp_str_cp_at(p,&cp,bin);int all=1;for(sp_int i=0;i<n;i++){int in_set=sp_utf8_set_has(sets[i],setns[i],cp);if(negs[i])in_set=!in_set;if(!in_set){all=0;break;}}if(!all){memcpy(r+m,p,cn);m+=cn;prev=0xFFFFFFFFu;}
+const char*sp_str_delete_n(const char*s,const char**chars,sp_int n){SP_GC_ROOT_STR(s);if (SP_UNLIKELY(!s)) sp_nil_recv("delete");if(n<=0)return s;size_t*setns=(size_t*)malloc(n*sizeof(size_t));uint32_t**sets=(uint32_t**)malloc(n*sizeof(uint32_t*));int*negs=(int*)malloc(n*sizeof(int));for(sp_int i=0;i<n;i++){if(!chars[i])sp_raise_cls("TypeError","no implicit conversion of nil into String");sets[i]=sp_str_charset(s,chars[i],&negs[i],&setns[i]);}size_t bl=sp_str_byte_len(s);char*buf=(char*)malloc(bl+1);if(!buf)sp_oom_die();size_t m=0;const char*p=s,*pe=s+bl;int bin=sp_str_is_binary(s);while(p<pe){uint32_t cp;int cn=sp_str_cp_at(p,&cp,bin);int all=1;for(sp_int i=0;i<n;i++){int in_set=sp_utf8_set_has(sets[i],setns[i],cp);if(negs[i])in_set=!in_set;if(!in_set){all=0;break;}}if(!all){memcpy(buf+m,p,cn);m+=cn;}p+=cn;}buf[m]=0;for(sp_int i=0;i<n;i++)free(sets[i]);free(sets);free(setns);free(negs);char*r=sp_str_alloc(m);memcpy(r,buf,m+1);free(buf);return sp_str_bin_like(s,r);}
+const char*sp_str_squeeze_n(const char*s,const char**chars,sp_int n){SP_GC_ROOT_STR(s);if (SP_UNLIKELY(!s)) sp_nil_recv("squeeze");if(n<=0)return sp_str_squeeze(s);size_t*setns=(size_t*)malloc(n*sizeof(size_t));uint32_t**sets=(uint32_t**)malloc(n*sizeof(uint32_t*));int*negs=(int*)malloc(n*sizeof(int));for(sp_int i=0;i<n;i++){if(!chars[i])sp_raise_cls("TypeError","no implicit conversion of nil into String");sets[i]=sp_str_charset(s,chars[i],&negs[i],&setns[i]);}size_t bl=sp_str_byte_len(s);char*r=sp_str_alloc_raw(bl+1);size_t m=0;uint32_t prev=0xFFFFFFFFu;const char*p=s,*pe=s+bl;int bin=sp_str_is_binary(s);while(p<pe){uint32_t cp;int cn=sp_str_cp_at(p,&cp,bin);int all=1;for(sp_int i=0;i<n;i++){int in_set=sp_utf8_set_has(sets[i],setns[i],cp);if(negs[i])in_set=!in_set;if(!in_set){all=0;break;}}if(!all){memcpy(r+m,p,cn);m+=cn;prev=0xFFFFFFFFu;}
 else if(cp!=prev){memcpy(r+m,p,cn);m+=cn;prev=cp;}p+=cn;}r[m]=0;sp_str_set_len(r,m);for(sp_int i=0;i<n;i++)free(sets[i]);free(sets);free(setns);free(negs);return sp_str_bin_like(s,r);}
 static const char*sp_str_strip_sets(const char*s,const char**chars,sp_int n,int mode){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv(mode==1?"lstrip":mode==2?"rstrip":"strip");size_t*setns=(size_t*)malloc(n*sizeof(size_t));uint32_t**sets=(uint32_t**)malloc(n*sizeof(uint32_t*));int*negs=(int*)malloc(n*sizeof(int));for(sp_int i=0;i<n;i++){if(!chars[i])sp_raise_cls("TypeError","no implicit conversion of nil into String");sets[i]=sp_str_charset(s,chars[i],&negs[i],&setns[i]);}size_t bl=sp_str_byte_len(s),a=bl,e=0;const char*p=s,*pe=s+bl;int bin=sp_str_is_binary(s);while(p<pe){uint32_t cp;int cn=sp_str_cp_at(p,&cp,bin);int all=1;for(sp_int i=0;i<n;i++){int in_set=sp_utf8_set_has(sets[i],setns[i],cp);if(negs[i])in_set=!in_set;if(!in_set){all=0;break;}}if(!all){if(a==bl)a=(size_t)(p-s);e=(size_t)(p-s)+cn;}p+=cn;}for(sp_int i=0;i<n;i++)free(sets[i]);free(sets);free(setns);free(negs);if(mode==1)e=bl;else if(mode==2)a=0;if(e<a)e=a;size_t m=e-a;char*r=sp_str_alloc(m);memcpy(r,s+a,m);r[m]=0;if(sp_str_is_binary(s))sp_str_mark_binary(r);return r;}
 const char*sp_str_strip_n(const char*s,const char**chars,sp_int n){return sp_str_strip_sets(s,chars,n,3);}
@@ -1011,7 +1071,7 @@ const char*sp_str_rstrip_n(const char*s,const char**chars,sp_int n){return sp_st
    with nothing to scrub comes back unchanged (#3338). */
 const char *sp_str_scrub_bang(const char *s, const char *repl) {
   SP_GC_ROOT_STR(s); SP_GC_ROOT_STR(repl);
-  if (!s) return s;
+  if (SP_UNLIKELY(!s)) sp_nil_recv("scrub!");
   const char *r = sp_str_scrub(s, repl);
   if (r == s || sp_str_eq(r, s)) return s;
   sp_str_check_mutable(s);

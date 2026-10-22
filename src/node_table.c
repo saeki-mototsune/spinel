@@ -268,7 +268,7 @@ int nt_clone_subtree(NodeTable *nt, int root) {
   }
   int newroot = map[root];
   nt->count = base + sn;
-  nt->version++; nt->edits++;
+  nt->version++; nt->edits++; nt->clone_version++;
   nt->node_cap = nt->count;  /* realloc above sized the array exactly */
   free(list); free(map);
   return newroot;
@@ -305,6 +305,28 @@ int nt_new_node(NodeTable *nt, const char *type) {
   memset(nd, 0, sizeof(SpNode));
   if (type) node_set_type(nd, type, strlen(type));
   return id;
+}
+int nt_appended_only_local_reads(const NodeTable *nt, int from) {
+  if (from < 0) return 0;
+  for (int n = from; n < nt->count; n++)
+    if (nt_kind(nt, n) != NK_LocalVariableReadNode) return 0;
+  return 1;
+}
+int nt_new_local_read(NodeTable *nt, const char *name) {
+  unsigned v = nt->version;
+  int id = nt_new_node(nt, "LocalVariableReadNode");
+  nt_node_set_str(nt, id, "name", name);
+  nt->read_version += nt->version - v;
+  return id;
+}
+NtStamp nt_stamp(const NodeTable *nt) {
+  NtStamp s = { nt->version, nt->read_version, nt->rename_version };
+  return s;
+}
+int nt_stamp_holds(const NodeTable *nt, NtStamp s, int renames) {
+  unsigned counted = nt->read_version - s.reads;
+  if (renames) counted += nt->rename_version - s.renames;
+  return nt->version - s.version == counted;
 }
 int nt_new_int(NodeTable *nt, long long v) {
   int n = nt_new_node(nt, "IntegerNode");
@@ -354,6 +376,7 @@ char *nt_node_swap_str(NodeTable *nt, int id, const char *key, const char *val) 
   SpNode *nd = (SpNode *)node_at(nt, id);
   if (!nd) return NULL;
   nt->version++;
+  if (nt_kind(nt, id) == NK_CallNode && sp_streq(key, "name")) nt->rename_version++;
   size_t vlen = strlen(val);
   for (int j = 0; j < nd->ns; j++)
     if (sp_streq(nd->s[j].key, key)) {
@@ -369,6 +392,7 @@ void nt_node_restore_str(NodeTable *nt, int id, const char *key, char *held) {
   SpNode *nd = (SpNode *)node_at(nt, id);
   if (!nd) { free(held); return; }
   nt->version++;
+  if (nt_kind(nt, id) == NK_CallNode && sp_streq(key, "name")) nt->rename_version++;
   for (int j = 0; j < nd->ns; j++)
     if (sp_streq(nd->s[j].key, key)) {
       free(nd->s[j].val);
@@ -623,11 +647,7 @@ int nt_call_args_plain(const NodeTable *nt, int id) {
   if (args < 0) return 1;
   int argc = 0;
   const int *argv = nt_arr(nt, args, "arguments", &argc);
-  for (int i = 0; i < argc; i++) {
-    const char *ty = nt_type(nt, argv[i]);
-    if (ty && (sp_streq(ty, "SplatNode") || sp_streq(ty, "BlockArgumentNode"))) return 0;
-  }
-  return 1;
+  return !nt_argv_has(nt, argv, argc, NT_ARG_SPLAT | NT_ARG_BLOCK);
 }
 
 /* Copy the subtree at `root` of `src` into `dst` (every field, children

@@ -4,6 +4,7 @@
 #ifndef SPINEL_ANALYZE_INTERNAL_H
 #define SPINEL_ANALYZE_INTERNAL_H
 #include "analyze.h"
+#include "value_pos.h"
 #include "ffi_spec.h"
 
 #include <stdio.h>
@@ -17,6 +18,13 @@
 __attribute__((noreturn)) void unsupported_feature(Compiler *c, int id, const char *msg);
 void unsupported_feature_collect(Compiler *c, int id, const char *msg);
 int defer_refusals(void); /* codegen_util.c: explicit opt-in to runtime refusals */
+/* (codegen_util.c) a refusal kept as a check where its value arrives,
+   reported and counted as a deferred one; and whether the identity Set's
+   proof marked any node for that check or a refusal where it is emitted
+   (refuse_set_identity_members), with the words they raise */
+void refusal_note_deferred(Compiler *c, int id, const char *msg);
+extern int g_idset_marks;
+extern const char *const g_sid_refusal_msg;
 int ie_class_of(Compiler *c, int node);
 int attr_reader_ty(Compiler *c, int cid, const char *name, TyKind *out);
 int ie_poly_classes_at(Compiler *c, int node, int *out, int max);
@@ -104,6 +112,15 @@ typedef struct { int *pos; char *done; } DUPos;
 int *du_parent_map(const NodeTable *nt);
 int du_read_maybe_unset(const NodeTable *nt, const int *par, DUPos *dp, int rd, const char *nm);
 void du_memo_free(void);
+/* The edges an_value_dropped (and cow_user_block_value, which asks of the
+   block it ends at) climbs: where a value is passed on to the statement or
+   the block that holds it. */
+enum { AN_DROP_CLIMB = VPS_ALL };
+/* The edges the String handle Array walkers climb (strh_value_returned,
+   strh_value_ignored): `if`, `unless`, `case`, `case`/`in` and a begin, its
+   body beside an else too (the answer errs on the side of an Array that
+   escapes). */
+enum { STRH_CLIMB = VPS_IF | VPS_UNLESS | VPS_CASE | VPS_CASE_IN | VPS_BEGIN | VP_BEGIN_BOTH };
 int an_value_dropped(const NodeTable *nt, const int *parent, int node);
 int cow_user_block_value(Compiler *c, const int *parent, int id);
 /* The methods the default build may lend a String parameter's slot by
@@ -146,7 +163,10 @@ int is_builtin_exception_name(const char *n);
 const char *superclass_builtin_exc_name(const NodeTable *nt, int sc);   /* analyze_util.c */
 int is_syserr_family_name(const char *n);           /* analyze_util.c */
 int builtin_method_known(const char *cls, const char *m);
+int builtin_method_known_any(const char *m);   /* codegen_call.c */
+int builtin_object_method_known(const char *m);   /* codegen_call.c */
 int core_method_vis(const char *cls, const char *m, int inherit);   /* codegen_call_class.c */
+const char *core_class_ancestors(const char *cls);   /* codegen_call_class.c */
 int builtin_method_arity(const char *cls, const char *m, int *out);
 int builtin_cmethod_known(const char *cls, const char *name);
 int builtin_super_cmethod_known(const char *cls, const char *name);
@@ -171,6 +191,9 @@ int builtin_object_method_known(const char *m);
 int core_method_name(const char *n);   /* analyze_desugar.c: a core class's public method */
 int object_public_method_name(const char *n); /* analyze_desugar.c: one of Object's public instance methods */
 int class_inherits_builtin_exception(Compiler *c, int ci);
+/* 1 if super node n, in instance method mi `inspect` / `to_s` of a plain
+   class, reaches Kernel's, which builds a new String each call. */
+int an_super_object_text(Compiler *c, int n, int mi);
 int an_user_defines_or_reads(Compiler *c, const char *name);
 /* The universal "what a receiver answers" table (analyze_infer.c) and the
    lookup its consumers use. See the note on AN_POLY_RAW. */
@@ -253,11 +276,21 @@ int scope_body_value(Compiler *c, int mi);
    `return`'s; see analyze_pass.c). Answers the count, or -1. */
 int method_value_leaves(Compiler *c, int mi, int *out, int cap);
 int method_value_leaves_or_nil(Compiler *c, int mi, int *out, int cap);
+int method_value_leaves_or_nil_narrow(Compiler *c, int mi, int *out, int cap);
 int block_given_tail_then_last(Compiler *c, int last);
 int super_forwards_caller_block(Compiler *c, int id);
 /* 1 if `node` is `<&block-param>.call(...)` / .() / [] for method mi -- the
    explicit-call equivalent of `yield`, inlined the same way. */
 int is_blk_param_call(Compiler *c, int node, int mi);
+/* 1 if `node` is an instance_eval / instance_exec handing the method's own block on
+   as the value the method ends with: inlined, it answers each site's block value. */
+int ie_forwards_block_tail(Compiler *c, int node);
+/* 1 if the `return` is written in a lambda, which it leaves instead of the method. */
+int return_in_lambda(Compiler *c, int rid);
+/* 1 if scope `si` returns, other than at `guard_ret`, before it. */
+int return_before(Compiler *c, int si, int guard_ret);
+/* A proc-typed local's proc_ret: the join of the answers of the procs it is written. 1 on a change. */
+int join_local_proc_rets(Compiler *c);
 /* Scan a subtree for BreakNode values and return their unified type.
    Stops at DefNode/BlockNode boundaries (inner blocks have their own break scope). */
 TyKind scan_break_type(Compiler *c, int id, int depth);
@@ -450,6 +483,7 @@ int ty_runs_no_code(TyKind t);  /* codegen_call.c: a builtin reading such a valu
 int refl_member_of_struct_superclass(Compiler *c, int ci, const char *m);  /* codegen_call.c */
 int subtree_reads_match_globals(Compiler *c, int root);  /* codegen_call_recv.c: $~, $1.. read there */
 int rest_packable_arm(Compiler *c, Scope *s);                    /* codegen_fold.c */
+int class_is_comparable(Compiler *c, int cid);                   /* codegen_call.c */
 /* The type a READ of ivar slot `iv` yields (a shared-mutable string slot
    reads as a plain String). Shared with the receiver-face helpers. */
 TyKind ivar_value_ty(ClassInfo *ci, int iv);
@@ -465,6 +499,19 @@ int infer_hash_call(Compiler *c, int id, TyKind rt, TyKind *out);
 struct BuiltinOp;
 const struct BuiltinOp *an_bop_find(Compiler *c, int id, TyKind rt, const char *name,
                                     int argc, int has_block);
+/* an_bop_find for the BOPF_BOXED row of kind rt (bop_find_boxed) */
+const struct BuiltinOp *an_bop_find_boxed(Compiler *c, int id, TyKind rt, const char *name,
+                                          int argc, int has_block);
+/* an_bop_find with the call's arguments' kinds (inferred), so the rows that
+   guard an argument are read too */
+const struct BuiltinOp *an_bop_find_arg(Compiler *c, int id, TyKind rt, const char *name,
+                                        int argc, const int *argv, int has_block);
+/* the row inference finds for call `id` on a receiver of kind `rt`, recording nothing */
+const struct BuiltinOp *an_bop_row_for_kind(Compiler *c, int id, TyKind rt);
+/* bop_result_args with the call's arguments' kinds (inferred) */
+TyKind an_bop_result(Compiler *c, const struct BuiltinOp *op, TyKind rt, int id, int argc, const int *argv);
+/* the facts bop_result_args reads beside the operands' kinds (BOPX_*) */
+int an_bop_facts(Compiler *c, const struct BuiltinOp *op, int id);
 /* method_call_ret(c, mi, id) for a call an arm of infer_call bound to the
    user method mi, recording the binding (via UC_*, the class owner_ci whose
    chain was searched) under --plan-check */
@@ -472,6 +519,14 @@ TyKind an_user_call(Compiler *c, int id, int mi, int via, int owner_ci);
 /* the record alone, for an arm that answers the bound call another way */
 void an_user_call_record(Compiler *c, int id, int mi, int via, int owner_ci);
 int infer_numeric_call(Compiler *c, int id, TyKind rt, TyKind *out);
+/* arg1's kind (TY_UNKNOWN when there is no second argument) and whether a
+   one-argument Range literal's own left/right bound is Float-typed (0
+   otherwise) -- the two extra pieces ty_recv_builtin_result's clamp arms
+   need beyond arg0, computed the same comp_ntype-based way both of its
+   callers already compute arg0. const-safe (comp_ntype only reads an
+   already-settled cache), so codegen's const Compiler* can call it too. */
+void ty_recv_call_extra_args(const Compiler *c, const int *av, int argc,
+                              TyKind *arg1, int *range_has_float_bound);
 /* The array a map-shaped call answers from its block's tail (analyze_infer_recv.c). */
 TyKind infer_sum_block_ty(Compiler *c, int block);
 TyKind infer_map_block_ty(Compiler *c, int id, int block);
@@ -589,6 +644,7 @@ int desugar_safe_nav_attr_write(Compiler *c);
 int desugar_body_self_call(Compiler *c);
 int desugar_body_module_eval(Compiler *c);
 int desugar_extend_self(Compiler *c);
+int block_body_breaks(const NodeTable *nt, int node);   /* a break that leaves this block */
 int desugar_kernel_reopen(Compiler *c);
 int desugar_singleton_class_mixin(Compiler *c);
 int desugar_explicit_receiver_mixin(Compiler *c);
@@ -599,6 +655,8 @@ int desugar_constant_path_self_alias(Compiler *c);
 int desugar_dynamic_const_get_arms(Compiler *c);
 int desugar_reopen_implicit_self(Compiler *c);
 int desugar_handle_attr_accessor(Compiler *c);
+int desugar_handle_ivars(Compiler *c);
+int desugar_fiber_prepended_init(Compiler *c);
 int desugar_handle_reopen_self_recv(Compiler *c);
 int desugar_call_or_write_reopen(Compiler *c);
 int desugar_static_class_eval(Compiler *c);
@@ -676,6 +734,7 @@ int desugar_alias_method_values(Compiler *c);
 int desugar_inherited_aliases(Compiler *c);
 int desugar_builtin_alias_calls(Compiler *c);
 int desugar_reader_aliases_before_redef(Compiler *c);
+int desugar_readers_over_inherited_defs(Compiler *c);
 int desugar_reassigned_block_params(Compiler *c);
 int desugar_inline_struct_blocks(Compiler *c);
 int desugar_singleton_class_meta(Compiler *c);
@@ -706,6 +765,12 @@ int anh_has(const ANameHash *st, const char *nm);
 int anh_find(const ANameHash *st, const char *nm);   /* insertion index, or -1 */
 void anh_add(ANameHash *st, const char *nm);
 void anh_free(ANameHash *st);
+/* The scopes of a name, ascending: the first, and the next after s (-1 at
+   the end); from a table while the scope index is frozen, else a scan
+   (analyze.c). A pass walking every scope for a name's methods per call
+   asks these instead. */
+int an_scopes_named_first(Compiler *c, const char *nm);
+int an_scopes_named_next(Compiler *c, const char *nm, int s);
 int a_nested_block(const char *ty);
 int a_is_local_node(const char *ty);
 int a_is_write_node(const char *ty);
@@ -714,6 +779,8 @@ void a_collect_used(Compiler *c, int id, ANameSet *out);
 int a_proc_params_node(Compiler *c, int create);
 int a_proc_body(Compiler *c, int create);
 int a_block_is_lifted(Compiler *c, int id);
+/* 1 if scope `si` creates a proc whose `return` leaves it (codegen.c): the method needs a proc-return frame. */
+int scope_creates_returning_proc(Compiler *c, int si);
 int a_proc_create_or_lifted(Compiler *c, int id);
 void mark_proc_captures(Compiler *c);
 void bigint_scan_body(const NodeTable *nt, int id, char ***names, int *n, int *cap);

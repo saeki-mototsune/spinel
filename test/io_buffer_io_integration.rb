@@ -1,3 +1,6 @@
+# spinel: not-cruby -- the pipe and socket parts park the green thread until
+# bytes arrive; CRuby's read answers -EAGAIN there. The file parts answer as
+# CRuby 4.0 does: each call moves the span from offset to the buffer's end.
 # IO::Buffer's IO integration (#4474, makenowjust): read / write / pread /
 # pwrite against an IO handle, one syscall each answering the byte count (0
 # at EOF, -errno on failure), coordinated with the handle's stdio buffer
@@ -110,7 +113,7 @@ end
 # writable view that writes through, a private one that does not
 File.binwrite(path, "mapped file contents")
 File.open(path, "rb") do |f|
-  m = IO::Buffer.map(f)
+  m = IO::Buffer.map(f, nil, 0, IO::Buffer::READONLY)
   p m.size, m.mapped?, m.readonly?, m.shared?
   p m.get_string(0, 6)
   begin
@@ -123,7 +126,7 @@ File.open(path, "rb") do |f|
   rescue IO::Buffer::AccessError => e
     p e.message
   end
-  p IO::Buffer.map(f, 4, 7).get_string
+  p IO::Buffer.map(f, 4, 7, IO::Buffer::READONLY).get_string
   p m.slice(7, 4).get_string
   p m.get_value(:U8, 0)
 end

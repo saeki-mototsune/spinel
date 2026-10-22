@@ -130,6 +130,10 @@ static const BuiltinClass BUILTIN_CLASSES[] = {
   { "GC",                           0,     BC_CLASS | BC_MODULE },
   { "IO::EAGAINWaitReadable",       0,     BC_EXCEPTION },
   { "IO::TimeoutError",            0,     BC_EXCEPTION },
+  /* the socket library's: lib/sp_exc.c gives them their parents, so
+     `rescue SocketError` catches a failed lookup's Socket::ResolutionError */
+  { "SocketError",                  0,     BC_EXCEPTION },
+  { "Socket::ResolutionError",      0,     BC_EXCEPTION },
   { "IO::EAGAINWaitWritable",       0,     BC_EXCEPTION },
   { "IO::EINPROGRESSWaitReadable",  0,     BC_EXCEPTION },
   { "IO::EINPROGRESSWaitWritable",  0,     BC_EXCEPTION },
@@ -138,6 +142,7 @@ static const BuiltinClass BUILTIN_CLASSES[] = {
   { "IO::WaitReadable",             0,     BC_EXCEPTION },
   { "IO::WaitWritable",             0,     BC_EXCEPTION },
   { "LoadError",                    0,     BC_EXCEPTION },
+  { "Marshal",                      0,     BC_CLASS | BC_MODULE },
   { "Method",                       0,     BC_CLASS },
   { "NoMemoryError",                0,     BC_EXCEPTION },
   { "ObjectSpace",                  0,     BC_CLASS | BC_MODULE },
@@ -725,42 +730,58 @@ const char *an_regex_lit_src(Compiler *c, int nid) {
    must still check the node, which a re-point since the build may have
    changed; the list only narrows the walk. */
 static ANameHash g_cn_names;
-static int *g_cn_first, *g_cn_next, g_cn_cap;
+static int *g_cn_first, *g_cn_next, *g_cn_last, g_cn_cap;
 static const NodeTable *g_cn_nt;
-static unsigned g_cn_ver;
+static unsigned g_cn_ver, g_cn_clones;
 static int g_cn_cnt = -1;
 static int g_cn_empty = -1;
+/* call `id` onto its name's chain, at the end: the chains are ascending */
+static void cn_add(const NodeTable *nt, int id) {
+  const char *nm = nt_str(nt, id, "name");
+  if (!nm) return;
+  g_cn_next[id] = -1;
+  int k = anh_find(&g_cn_names, nm);
+  if (k < 0) {
+    anh_add(&g_cn_names, nm); k = g_cn_names.n - 1;
+    if (k >= g_cn_cap) {
+      g_cn_cap *= 2;
+      g_cn_first = realloc(g_cn_first, sizeof(int) * (size_t)g_cn_cap);
+      g_cn_last = realloc(g_cn_last, sizeof(int) * (size_t)g_cn_cap);
+      if (!g_cn_first || !g_cn_last) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    g_cn_first[k] = id;
+  }
+  else g_cn_next[g_cn_last[k]] = id;
+  g_cn_last[k] = id;
+}
 int an_calls_named_first(Compiler *c, const char *name) {
   const NodeTable *nt = c->nt;
   if (!name) return -1;
+  if (g_cn_nt == nt && nt->count > g_cn_cnt && g_cn_ver != nt->version &&
+      nt->version - g_cn_ver == nt->clone_version - g_cn_clones) {
+    /* Only subtrees were cloned since the build, onto the end of the
+       table: the nodes indexed are as they were, and the clones' calls go
+       onto their chains. make_yield_proc_forms asks for the calls of each
+       yielding method's name and clones between the asks, and each ask
+       rebuilt the index over every call of the program (600k on a Rails
+       program, 85% of a sampled window). */
+    int *grown = realloc(g_cn_next, sizeof(int) * (size_t)nt->count);
+    if (!grown) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    g_cn_next = grown;
+    for (int id = g_cn_cnt; id < nt->count; id++)
+      if (nt_kind(nt, id) == NK_CallNode) cn_add(nt, id);
+    g_cn_ver = nt->version; g_cn_clones = nt->clone_version; g_cn_cnt = nt->count;
+  }
   if (g_cn_nt != nt || g_cn_ver != nt->version || g_cn_cnt != nt->count) {
     anh_free(&g_cn_names); memset(&g_cn_names, 0, sizeof g_cn_names);
-    free(g_cn_first); free(g_cn_next);
+    free(g_cn_first); free(g_cn_next); free(g_cn_last);
     g_cn_cap = 64;
     g_cn_first = malloc(sizeof(int) * (size_t)g_cn_cap);
+    g_cn_last = malloc(sizeof(int) * (size_t)g_cn_cap);
     g_cn_next = malloc(sizeof(int) * (size_t)(nt->count > 0 ? nt->count : 1));
-    int *last = malloc(sizeof(int) * (size_t)g_cn_cap);
-    if (!g_cn_first || !g_cn_next || !last) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-    for (int id = comp_kind_first(c, NK_CallNode); id >= 0; id = comp_kind_next(c, id)) {
-      const char *nm = nt_str(nt, id, "name");
-      if (!nm) continue;
-      g_cn_next[id] = -1;
-      int k = anh_find(&g_cn_names, nm);
-      if (k < 0) {
-        anh_add(&g_cn_names, nm); k = g_cn_names.n - 1;
-        if (k >= g_cn_cap) {
-          g_cn_cap *= 2;
-          g_cn_first = realloc(g_cn_first, sizeof(int) * (size_t)g_cn_cap);
-          last = realloc(last, sizeof(int) * (size_t)g_cn_cap);
-          if (!g_cn_first || !last) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-        }
-        g_cn_first[k] = id;
-      }
-      else g_cn_next[last[k]] = id;
-      last[k] = id;
-    }
-    free(last);
-    g_cn_nt = nt; g_cn_ver = nt->version; g_cn_cnt = nt->count;
+    if (!g_cn_first || !g_cn_next || !g_cn_last) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int id = comp_kind_first(c, NK_CallNode); id >= 0; id = comp_kind_next(c, id)) cn_add(nt, id);
+    g_cn_nt = nt; g_cn_ver = nt->version; g_cn_clones = nt->clone_version; g_cn_cnt = nt->count;
   }
   int k = anh_find(&g_cn_names, name);
   return k >= 0 ? g_cn_first[k] : -1;
@@ -1012,6 +1033,14 @@ int class_recv_static_ci(Compiler *c, int node) {
   return class_var_static_ci(c, node);
 }
 
+/* The class method `name` the program defines for the class a class-valued
+   receiver names at compile time (class_recv_static_ci), up its ancestors;
+   -1 when there is none or the class is known only at run time. */
+int class_recv_user_cmethod(Compiler *c, int node, const char *name) {
+  int ci = class_recv_static_ci(c, node);
+  return ci >= 0 ? comp_cmethod_in_chain(c, ci, name, NULL) : -1;
+}
+
 /* The literal symbol behind a symbol-typed expression: a SymbolNode itself,
    or a local variable whose only write (in its scope, plain write) is one.
    Lets inject(:op)-style operator selection see through `s = :+; a.inject(s)`.
@@ -1072,10 +1101,7 @@ int str_self_call(const NodeTable *nt, int id) {
   int a = nt_ref(nt, id, "arguments");
   int ac = 0;
   const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &ac) : NULL;
-  for (int i = 0; i < ac; i++) {
-    NodeKind k = nt_kind(nt, av[i]);
-    if (k == NK_SplatNode || k == NK_BlockArgumentNode || k == NK_KeywordHashNode) return 0;
-  }
+  if (nt_argv_has(nt, av, ac, NT_ARG_SPLAT | NT_ARG_BLOCK | NT_ARG_KEYWORDS)) return 0;
   if (ac == 0 && (sp_streq(nm, "to_s") || sp_streq(nm, "to_str") || sp_streq(nm, "itself") ||
                   sp_streq(nm, "freeze") || sp_streq(nm, "clear") || sp_streq(nm, "reverse!")))
     return 1;
@@ -1485,21 +1511,83 @@ static const char *cn_body_const_key(const NodeTable *nt, int root, const char *
   }
   return NULL;
 }
+/* The ClassNodes and ModuleNodes of each name, ascending, and the body
+   answers const_value_owned_key gave per (class, constant) pair, kept while
+   the node table is unchanged (no node added, no field rewritten). A
+   runtime-name const_get is one literal arm per constant, and an arm on a
+   receiver known only at run time asks every class and each of its
+   ancestors: each ask walked the whole table. */
+static ANameHash g_cvo_names;          /* class or module name -> chain */
+static int *g_cvo_first, *g_cvo_next, *g_cvo_ids;
+static ANameHash g_cvo_memo;           /* "class\001constant" -> answer */
+static const char **g_cvo_ans;
+static const NodeTable *g_cvo_nt;
+static unsigned g_cvo_ver;
+static unsigned long g_cvo_edits;
+static int g_cvo_cnt = -1;
+static void cvo_reset(void) {
+  anh_free(&g_cvo_names); memset(&g_cvo_names, 0, sizeof g_cvo_names);
+  for (int i = 0; i < g_cvo_memo.n; i++) free((char *)g_cvo_memo.key[i]);
+  anh_free(&g_cvo_memo); memset(&g_cvo_memo, 0, sizeof g_cvo_memo);
+  free(g_cvo_first); free(g_cvo_next); free(g_cvo_ids); free(g_cvo_ans);
+  g_cvo_first = g_cvo_next = g_cvo_ids = NULL; g_cvo_ans = NULL;
+}
+static void cvo_build(const NodeTable *nt) {
+  cvo_reset();
+  int ncl = 0, nmo = 0;
+  const int *cl = nt_nodes_of_kind(nt, NK_ClassNode, &ncl);
+  const int *mo = nt_nodes_of_kind(nt, NK_ModuleNode, &nmo);
+  size_t n = (size_t)(ncl + nmo > 0 ? ncl + nmo : 1);
+  g_cvo_ids = malloc(sizeof(int) * n);
+  g_cvo_next = malloc(sizeof(int) * n);
+  g_cvo_first = malloc(sizeof(int) * n);
+  int *last = malloc(sizeof(int) * n);
+  if (!g_cvo_ids || !g_cvo_next || !g_cvo_first || !last) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  /* both kinds merged in id order, the order a walk of the table meets them */
+  for (int i = 0, j = 0, p = 0; p < ncl + nmo; p++) {
+    int id = j >= nmo || (i < ncl && cl[i] < mo[j]) ? cl[i++] : mo[j++];
+    g_cvo_ids[p] = id; g_cvo_next[p] = -1;
+    /* a ClassNode carries its name through constant_path, not a name field */
+    int cp = nt_ref(nt, id, "constant_path");
+    const char *nm = cp >= 0 ? nt_str(nt, cp, "name") : nt_str(nt, id, "name");
+    if (!nm) continue;
+    int k = anh_find(&g_cvo_names, nm);
+    if (k < 0) { anh_add(&g_cvo_names, nm); k = g_cvo_names.n - 1; g_cvo_first[k] = p; }
+    else g_cvo_next[last[k]] = p;
+    last[k] = p;
+  }
+  free(last);
+  g_cvo_nt = nt; g_cvo_ver = nt->version; g_cvo_edits = nt->edits; g_cvo_cnt = nt->count;
+}
+/* The key of the first value constant CONSTNAME written directly in the body
+   of a `class`/`module CLSNAME`, or NULL. */
+static const char *cvo_body_key(const NodeTable *nt, const char *clsname, const char *constname) {
+  if (g_cvo_nt != nt || g_cvo_ver != nt->version || g_cvo_edits != nt->edits || g_cvo_cnt != nt->count)
+    cvo_build(nt);
+  size_t cl = strlen(clsname), kl = strlen(constname);
+  char *mk = malloc(cl + kl + 2);
+  if (!mk) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  memcpy(mk, clsname, cl); mk[cl] = '\001'; memcpy(mk + cl + 1, constname, kl + 1);
+  int m = anh_find(&g_cvo_memo, mk);
+  if (m >= 0) { free(mk); return g_cvo_ans[m]; }
+  const char *key = NULL;
+  int k = anh_find(&g_cvo_names, clsname);
+  for (int p = k >= 0 ? g_cvo_first[k] : -1; p >= 0 && !key; p = g_cvo_next[p]) {
+    int body = nt_ref(nt, g_cvo_ids[p], "body");
+    key = body >= 0 ? cn_body_const_key(nt, body, constname, 1) : NULL;
+  }
+  anh_add(&g_cvo_memo, mk);
+  g_cvo_ans = realloc(g_cvo_ans, sizeof(char *) * (size_t)g_cvo_memo.cap);
+  if (!g_cvo_ans) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  g_cvo_ans[g_cvo_memo.n - 1] = key;
+  return key;
+}
 /* The key of value constant CONSTNAME written directly in the body of class
    or module CLSNAME, or NULL when it holds none. */
 static const char *const_value_owned_key(Compiler *c, const char *clsname, const char *constname) {
   const NodeTable *nt = c->nt;
-  for (int id = 0; id < nt->count; id++) {
-    NodeKind k = nt_kind(nt, id);
-    if (k != NK_ClassNode && k != NK_ModuleNode) continue;
-    /* a ClassNode carries its name through constant_path, not a name field */
-    int cp = nt_ref(nt, id, "constant_path");
-    const char *n = cp >= 0 ? nt_str(nt, cp, "name") : nt_str(nt, id, "name");
-    if (!n || !sp_streq(n, clsname)) continue;
-    int body = nt_ref(nt, id, "body");
-    const char *key = body >= 0 ? cn_body_const_key(nt, body, constname, 1) : NULL;
-    if (key) return key;
-  }
+  const char *key = cvo_body_key(nt, clsname, constname);
+  if (key) return key;
   /* ... or a path write through it (`Base::N = v`, or through an alias of
      it), under the key the constant qualifier gave it. The qualifier
      resolved the whole path (qc_owner): `Left::Base` is not a top-level
@@ -1521,11 +1609,54 @@ static const char *const_value_owned_key(Compiler *c, const char *clsname, const
 static int const_value_owned(Compiler *c, const char *clsname, const char *constname) {
   return const_value_owned_key(c, clsname, constname) != NULL;
 }
+/* The classes of each name's leaf, ascending, while a caller asks const_get
+   of every class in turn (const_get_leaves_begin .. _end): the class table
+   does not change in that stretch, and each ask walked every class once per
+   ancestor. Outside it the walks below run as they are. */
+static ANameHash g_cgl_leaves;
+static int *g_cgl_first, *g_cgl_next;
+static const Compiler *g_cgl_c;
+void const_get_leaves_begin(Compiler *c) {
+  const_get_leaves_end();
+  size_t n = (size_t)(c->nclasses > 0 ? c->nclasses : 1);
+  g_cgl_first = malloc(sizeof(int) * n);
+  g_cgl_next = malloc(sizeof(int) * n);
+  int *last = malloc(sizeof(int) * n);
+  if (!g_cgl_first || !g_cgl_next || !last) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int k = 0; k < c->nclasses; k++) {
+    g_cgl_next[k] = -1;
+    const char *rn = class_ruby_name(c, k), *l = rn ? strrchr(rn, ':') : NULL;
+    if (!rn) continue;
+    const char *leaf = l ? l + 1 : rn;
+    int h = anh_find(&g_cgl_leaves, leaf);
+    if (h < 0) { anh_add(&g_cgl_leaves, leaf); h = g_cgl_leaves.n - 1; g_cgl_first[h] = k; }
+    else g_cgl_next[last[h]] = k;
+    last[h] = k;
+  }
+  free(last);
+  g_cgl_c = c;
+}
+void const_get_leaves_end(void) {
+  anh_free(&g_cgl_leaves); memset(&g_cgl_leaves, 0, sizeof g_cgl_leaves);
+  free(g_cgl_first); free(g_cgl_next);
+  g_cgl_first = g_cgl_next = NULL;
+  g_cgl_c = NULL;
+}
+/* The first class of leaf LEAF, -1 for none, while the index is up. */
+static int cgl_first(const char *leaf) {
+  int h = anh_find(&g_cgl_leaves, leaf);
+  return h >= 0 ? g_cgl_first[h] : -1;
+}
 /* The class nested directly in class or module O under the leaf LEAF (its
    key may be qualified, `O__LEAF`, when another constant or class shares the
    leaf), or -1. */
 static int class_nested_leaf(Compiler *c, int o, const char *leaf) {
   if (o < 0) return -1;
+  if (g_cgl_c == c) {
+    for (int k = cgl_first(leaf); k >= 0; k = g_cgl_next[k])
+      if (c->classes[k].enclosing_class == o) return k;
+    return -1;
+  }
   for (int k = 0; k < c->nclasses; k++) {
     if (c->classes[k].enclosing_class != o) continue;
     const char *rn = class_ruby_name(c, k), *l = rn ? strrchr(rn, ':') : NULL;
@@ -1535,6 +1666,7 @@ static int class_nested_leaf(Compiler *c, int o, const char *leaf) {
 }
 /* Is any class or module of the program named LEAF, at any nesting? */
 static int class_leaf_any(Compiler *c, const char *leaf) {
+  if (g_cgl_c == c) return cgl_first(leaf) >= 0;
   for (int k = 0; k < c->nclasses; k++) {
     const char *rn = class_ruby_name(c, k), *l = rn ? strrchr(rn, ':') : NULL;
     if (rn && sp_streq(l ? l + 1 : rn, leaf)) return 1;
@@ -1615,6 +1747,35 @@ static const char *const_get_resolve(Compiler *c, const char *rnm, const char *c
 int const_defined_known(Compiler *c, const char *rnm, const char *cgn) {
   if (comp_const(c, cgn) || comp_class_index(c, cgn) >= 0 || comp_is_wellknown_const(cgn)) return 1;
   return rnm && const_get_class_index(c, rnm, cgn) >= 0;
+}
+/* Does class or module K see constant CGN as `K.const_defined?(CGN)` looks:
+   K, its ancestors and the modules they include. (A top-level constant,
+   Object's, every class sees: the caller asks that first.) */
+int const_seen_by_class(Compiler *c, int k, const char *cgn) {
+  static int depth = 0;
+  if (depth > 8) return 0;
+  for (int n = 0; k >= 0 && k < c->nclasses && n < 64; k = c->classes[k].parent, n++) {
+    if (c->classes[k].name && const_owned_by_class(c, c->classes[k].name, cgn)) return 1;
+    for (int i = 0; i < c->classes[k].nincluded_mods; i++) {
+      depth++;
+      int seen = const_seen_by_class(c, c->classes[k].included_mods[i], cgn);
+      depth--;
+      if (seen) return 1;
+    }
+  }
+  return 0;
+}
+/* `R.const_defined?(:N)` with R's name: N known to the program and seen
+   from R. The table is flat, keyed by the leaf, so a constant another class
+   holds answered for every receiver (#9876). A receiver the class table
+   lacks (a builtin module), a qualified N and a top-level N keep the
+   answer the flat table gives. */
+int const_defined_from(Compiler *c, const char *rnm, const char *cgn) {
+  if (!const_defined_known(c, rnm, cgn)) return 0;
+  if (!rnm || !cgn || strstr(cgn, "::") || const_name_resolves_top_level(c, cgn)) return 1;
+  int rk = comp_class_index(c, rnm);
+  if (rk < 0) return 1;
+  return const_seen_by_class(c, rk, cgn);
 }
 /* `R.const_get(:N)` with N both a class and a value constant of the program
    (constants live in one flat namespace, keyed by the leaf): the value when
@@ -1738,6 +1899,64 @@ int is_blk_param_call(Compiler *c, int node, int mi) {
   const char *bp = c->scopes[mi].blk_param;
   return rn && bp && bp[0] && sp_streq(rn, bp);
 }
+/* Is the `return` written in a lambda (`-> { return 1 }`, `lambda { return 1 }`)?
+   It leaves the lambda, not the method the lambda is written in. */
+int return_in_lambda(Compiler *c, int rid) {
+  const NodeTable *nt = c->nt;
+  const int *par = comp_parent_map(c);
+  for (int n = par[rid]; n >= 0; n = par[n]) {
+    NodeKind k = nt_kind(nt, n);
+    if (k == NK_DefNode) return 0;
+    if (k == NK_LambdaNode) return 1;
+    if (k == NK_BlockNode && par[n] >= 0 && nt_kind(nt, par[n]) == NK_CallNode) {
+      const char *cn = nt_str(nt, par[n], "name");
+      if (cn && is_lambda_constructor(cn) && nt_ref(nt, par[n], "receiver") < 0) return 1;
+    }
+  }
+  return 0;
+}
+/* Is node `a` written before node `b`? By the place the parser stamped on
+   them (a line and a column of one file), which the nodes a desugar clones
+   keep: their ids come after those of every statement of the method. Where a
+   node has none, by id. */
+static int written_before(const NodeTable *nt, int a, int b) {
+  long long fa = nt_int(nt, a, "node_file", -1), fb = nt_int(nt, b, "node_file", -1);
+  long long la = nt_int(nt, a, "node_line", 0), lb = nt_int(nt, b, "node_line", 0);
+  if (la > 0 && lb > 0 && fa == fb) {
+    long long ca = nt_int(nt, a, "node_col", 0), cb = nt_int(nt, b, "node_col", 0);
+    if (la != lb) return la < lb;
+    if (ca != cb) return ca < cb;
+  }
+  return a < b;
+}
+/* Is there a `return` of scope `si` other than `guard_ret`, written before it
+   (an early `return 0 if @a.nil?` before `return to_enum(:m) unless
+   block_given?`)? The guard then does not stop every blockless call. */
+int return_before(Compiler *c, int si, int guard_ret) {
+  NT_FOREACH_KIND(c->nt, NK_ReturnNode, rid)
+    if (rid != guard_ret && c->nscope[rid] == si && written_before(c->nt, rid, guard_ret) &&
+        !return_in_lambda(c, rid)) return 1;
+  return 0;
+}
+/* Is `node` an instance_eval / instance_exec that hands the method's own
+   block on (`instance_exec(*args, &block)`) as the value the method falls off
+   its end with? The inlined method answers the value that block has at each
+   call site, as a tail `yield` does. */
+int ie_forwards_block_tail(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  if (node < 0 || nt_kind(nt, node) != NK_CallNode) return 0;
+  const char *nm = nt_str(nt, node, "name");
+  if (!nm || !is_instance_eval_family(nm)) return 0;
+  int blk = nt_ref(nt, node, "block");
+  if (blk < 0 || nt_kind(nt, blk) != NK_BlockArgumentNode || !call_forwards_own_block(c, node)) return 0;
+  /* on self, or on a receiver of one known class, whose self the block takes
+     (a boxed receiver is dispatched by class at run time: the block's value
+     there is that of each class's body) */
+  int recv = nt_ref(nt, node, "receiver");
+  if (recv >= 0 && nt_kind(nt, recv) != NK_SelfNode && !ty_is_object(infer_type(c, recv))) return 0;
+  Scope *sc = comp_scope_of(c, node);
+  return sc && node_is_scope_tail(c, (int)(sc - c->scopes), node);
+}
 int g_yvt_mi[MAX_YVT_DEPTH];
 int g_yvt_depth = 0;
 /* set by yield_value_diverges to make yield_value_type unify all call sites
@@ -1810,7 +2029,7 @@ static int *yvt_ids = NULL, *yvt_sup_ids = NULL;
 static int yvt_call_forwards_block(const NodeTable *nt, int cid) {
   int a = nt_ref(nt, cid, "arguments");
   int an = 0; const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
-  return an == 1 && av && nt_kind(nt, av[0]) == NK_ForwardingArgumentsNode;
+  return nt_argv_only_forwarding(nt, av, an);
 }
 /* Could block-passing call site `cid` reach method `mi` at all? A callee is
    found by name: the call's own name, that name through an `alias`, or `new`
@@ -2160,8 +2379,7 @@ TyKind yield_value_type(Compiler *c, int mi) {
        method rather than passing a literal. The value `mi` yields is then
        whatever that forwarded block produces -- the enclosing method's
        own yield value. */
-    const char *blkty = blk >= 0 ? nt_type(nt, blk) : NULL;
-    if (fwd_args || (blkty && sp_streq(blkty, "BlockArgumentNode"))) {
+    if (fwd_args || nt_call_has_block_arg(nt, cid)) {
       Scope *encl = comp_scope_of(c, cid);
       int emi = encl ? (int)(encl - c->scopes) : -1;
       /* `mi(&some_proc)`: a first-class Proc / lambda / Method value, not the
@@ -2270,8 +2488,7 @@ int yield_block_tails(Compiler *c, int mi, int *out, int max) {
     int fwd_args = yvt_fwd ? yvt_fwd[ii] : yvt_call_forwards_block(nt, cid);
     if ((int)(comp_scope_of(c, cid) - c->scopes) == mi) continue;
     if (!yvt_reaches(c, cid, mi)) continue;
-    const char *blkty = blk >= 0 ? nt_type(nt, blk) : NULL;
-    if (fwd_args || (blkty && sp_streq(blkty, "BlockArgumentNode"))) {
+    if (fwd_args || nt_call_has_block_arg(nt, cid)) {
       /* a proc value of the call's own: a literal's tail, as a literal
          block's; any other arrives boxed, with no scalar nil to carry */
       if (!call_forwards_own_block(c, cid)) {
@@ -2536,6 +2753,29 @@ int an_user_defines_method(Compiler *c, const char *name) {
   }
   if (!ans) ans = comp_method_index(c, name) >= 0;
   if (again >= 0) { udm_ans[again] = (signed char)ans; return ans; }
+  /* a full memo grows, and its buckets with it (as an_user_defines_or_reads'
+     does): past 4,096 names it stopped recording, and every later name
+     walked every class again at each ask */
+  if (udm_cap && udm_n == udm_cap) {
+    int ncap = udm_cap * 2;
+    char **nn = realloc(udm_names, sizeof(char *) * (size_t)ncap);
+    signed char *na = realloc(udm_ans, (size_t)ncap);
+    int *nx = realloc(udm_next, sizeof(int) * (size_t)ncap);
+    int *nh = realloc(udm_head, sizeof(int) * (size_t)ncap);
+    if (nn) udm_names = nn;
+    if (na) udm_ans = na;
+    if (nx) udm_next = nx;
+    if (nh) udm_head = nh;
+    if (nn && na && nx && nh) {
+      udm_cap = ncap;
+      for (int i = 0; i < udm_cap; i++) udm_head[i] = -1;
+      for (int i = 0; i < udm_n; i++) {
+        unsigned h = sp_strhash(udm_names[i]) & (unsigned)(udm_cap - 1);
+        udm_next[i] = udm_head[h]; udm_head[h] = i;
+      }
+      b = sp_strhash(name) & (unsigned)(udm_cap - 1);
+    }
+  }
   if (udm_cap && udm_n < udm_cap) {
     udm_names[udm_n] = strdup(name);
     if (udm_names[udm_n]) {
@@ -2588,7 +2828,9 @@ static int method_block_presence(Compiler *c, int mi) {
   const NodeTable *nt = c->nt;
   const char *mn = c->scopes[mi].name;
   int with = 0, without = 0, mixed = 0;
-  for (int cid = 0; cid < nt->count && !mixed; cid++) {
+  /* the calls of the method's name, not every node: asked per call of a
+     method whose answer depends on its block */
+  for (int cid = mn ? an_calls_named_first(c, mn) : -1; cid >= 0 && !mixed; cid = an_calls_named_next(cid)) {
     if (nt_kind(nt, cid) != NK_CallNode) continue;
     const char *cn = nt_str(nt, cid, "name");
     if (!cn || !mn || !sp_streq(cn, mn)) continue;
@@ -2645,6 +2887,32 @@ static TyKind method_yield_ret(Compiler *c, int mi, TyKind ret) {
   return ret;
 }
 
+/* The values of a method pinned to its guard's Enumerator (Scope.ret_pin_guard)
+   other than the guard's, joined: what a call with a block answers. 0 when
+   the walk of its values gives up or there are none (the pin stands);
+   otherwise 1, with *out the join, TY_UNKNOWN while a value is not typed yet. */
+static int pinned_block_form_ret(Compiler *c, int mi, TyKind *out) {
+  int lv[16];
+  int n = method_value_leaves_or_nil(c, mi, lv, 16);
+  TyKind acc = TY_UNKNOWN;
+  int any = 0, nil = 0;
+  for (int i = 0; i < n; i++) {
+    if (lv[i] == c->scopes[mi].ret_pin_guard || return_in_lambda(c, lv[i])) continue;   /* a lambda's return leaves the lambda */
+    TyKind t = infer_type(c, lv[i]);
+    any = 1;
+    if (t == TY_UNKNOWN) { *out = TY_UNKNOWN; return 1; }
+    if (t == TY_VOID) t = TY_NIL;
+    nil |= t == TY_NIL;
+    acc = ty_unify(acc, t);
+  }
+  /* a path that answers nil (a bare `return`, an arm left out) adds no value to the walk, but it is one */
+  if (any && n >= 0 && method_value_leaves(c, mi, lv, 16) < 0) { nil = 1; acc = ty_unify(acc, TY_NIL); }
+  /* an Integer or a Float beside a nil is boxed: the nil flag of a call's slot is a mark that settles later */
+  if (nil && (acc == TY_INT || acc == TY_FLOAT)) acc = TY_POLY;
+  *out = acc;
+  return any;
+}
+
 TyKind method_call_ret(Compiler *c, int mi, int call_id) {
   int last = scope_body_last(c, mi);
   /* `if block_given? ... yield ... else ... end`: the call with a block
@@ -2680,14 +2948,13 @@ TyKind method_call_ret(Compiler *c, int mi, int call_id) {
     return c->scopes[mi].ret;
   /* A yield-tailed inlined method, or a tail that calls the &block param:
      the block is spliced per call site, so use that site's block body type. */
-  if (is_yield || is_blk_param_call(c, last, mi)) {
+  if (is_yield || is_blk_param_call(c, last, mi) || ie_forwards_block_tail(c, last)) {
     int blk = nt_ref(c->nt, call_id, "block");
-    const char *bty = blk >= 0 ? nt_type(c->nt, blk) : NULL;
     /* `callee(&b)` / `callee(...)` forwards the block active in the enclosing
        method (a `...` forward carries it implicitly, with no block node), so
        the value `callee` yields is whatever that forwarded block produces --
        i.e. the enclosing method's own per-call-site yield value. */
-    int fwd = (bty && sp_streq(bty, "BlockArgumentNode"));
+    int fwd = nt_call_has_block_arg(c->nt, call_id);
     if (!fwd && blk < 0) fwd = yvt_call_forwards_block(c->nt, call_id);
     /* `callee(&lp)` with a proc of the call's own: the yield runs that
        proc, so the call answers its value, as the yield is typed. Read
@@ -2728,11 +2995,13 @@ TyKind method_call_ret(Compiler *c, int mi, int call_id) {
     }
   }
   /* a pinned `return enum_for(:m) unless block_given?` method called with
-     a block of its own answers its `self` tail (Scope.ret_withblock) */
-  if (c->scopes[mi].ret_withblock != TY_UNKNOWN) {
+     a block of its own answers what the rest of its body does */
+  if (c->scopes[mi].ret_pin_guard >= 0) {
     int blk = nt_ref(c->nt, call_id, "block");
-    if (blk >= 0 && nt_kind(c->nt, blk) == NK_BlockNode && !nt_int(c->nt, blk, "fwd_yield", 0))
-      return c->scopes[mi].ret_withblock;
+    if (blk >= 0 && nt_kind(c->nt, blk) == NK_BlockNode && !nt_int(c->nt, blk, "fwd_yield", 0)) {
+      TyKind t;
+      if (pinned_block_form_ret(c, mi, &t)) return t;
+    }
   }
   /* `return x unless block_given?`: a blockless call site reads the value
      of that return, one with a block the value of the body proper */
@@ -2970,7 +3239,7 @@ TyKind proc_node_ret(Compiler *c, int create) {
        forwarded proc, whose return is unknowable here (a block param's
        actual block lives at the caller). TY_UNKNOWN maps to the boxed poly
        return at the .call site instead of a silent nil. */
-    if (blk >= 0 && nt_type(nt, blk) && sp_streq(nt_type(nt, blk), "BlockArgumentNode"))
+    if (nt_call_has_block_arg(nt, create))
       return TY_UNKNOWN;
     body = blk >= 0 ? nt_ref(nt, blk, "body") : -1;
   }
@@ -3569,7 +3838,7 @@ int local_sole_range_node(Compiler *c, int recv) {
       return -1;
     val = nt_ref(nt, w, "value");
   }
-  val = an_unparen(nt, val);
+  val = nt_paren_single(nt, val);
   if (val < 0 || nt_kind(nt, val) != NK_RangeNode) return -1;
   /* callers re-emit the endpoints at the use site (take/first prefix loops),
      so both must be pure: literals or constant reads only */
@@ -3913,8 +4182,7 @@ const char *time_strict_parser_call(Compiler *c, int id) {
   int an = 0;
   const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
   if (an != 1) return NULL;
-  NodeKind ak = nt_kind(nt, av[0]);
-  if (ak == NK_SplatNode || ak == NK_KeywordHashNode || ak == NK_BlockArgumentNode) return NULL;
+  if (nt_argv_has(nt, av, an, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_BLOCK)) return NULL;
   int tci = comp_class_index(c, "Time");
   if (tci >= 0 && comp_cmethod_in_chain(c, tci, name, NULL) >= 0) return NULL;
   return fn;
@@ -3935,6 +4203,16 @@ const int *comp_parent_map(Compiler *c) {
   return c->cg_parent;
 }
 
+/* Is node n a statement the next statement follows, so that its value is
+   thrown away? Climbs from n through parentheses and statement lists
+   (vp_climb over the wrappers alone) to a statement before its list's last.
+   A conditional's arm, a loop's body and the like end the climb: the
+   callers that ask for those use an_value_dropped. */
+int comp_value_dropped(Compiler *c, int n) {
+  VpUp up;
+  return n >= 0 && n < c->nt->count && vp_climb(c->nt, comp_parent_map(c), n, VPS_NONE, &up) == VPU_DROPPED;
+}
+
 /* Is the value of method m only ever taken where a call node reads it, and
    its type free to be the form? A method the runtime or a protocol calls
    (deconstruct, to_s, an extension entry, a proc form) has it taken where no
@@ -3947,33 +4225,16 @@ int strh_method_open(const Scope *m) {
 /* Is node n, a read of an Array of handles, the value its method answers: the
    body's last statement (an `if`'s arm, a begin's body and parentheses
    included) or the one argument of a `return`? The caller's name for it is
-   the method's value (a SHK_RET holder of its class). */
+   the method's value (a SHK_RET holder of its class). Climbs from the node
+   (vp_climb), so its cost is the nesting depth. */
 int strh_value_returned(Compiler *c, const int *par, int n) {
   const NodeTable *nt = c->nt;
-  for (int depth = 0; depth < 8 && n >= 0 && n < nt->count; depth++) {
-    int p = par[n];
-    if (p < 0) return 0;
-    NodeKind pk = nt_kind(nt, p);
-    if (is_arguments_node_type(nt_type(nt, p))) {
-      int g = par[p], an = 0;
-      const int *av = nt_arr(nt, p, "arguments", &an);
-      return g >= 0 && nt_kind(nt, g) == NK_ReturnNode && an == 1 && an_unparen(nt, av[0]) == n &&
-             comp_scope_of(c, g)->def_node >= 0 && strh_method_open(comp_scope_of(c, g));
-    }
-    if (pk == NK_StatementsNode) {
-      int bn = 0, g = par[p];
-      const int *bb = nt_arr(nt, p, "body", &bn);
-      if (bn < 1 || bb[bn - 1] != n || g < 0) return 0;
-      if (nt_kind(nt, g) == NK_DefNode) return nt_ref(nt, g, "body") == p && strh_method_open(comp_scope_of(c, n));
-      NodeKind gk = nt_kind(nt, g);
-      if (gk != NK_IfNode && gk != NK_UnlessNode && gk != NK_ElseNode && gk != NK_BeginNode) return 0;
-      n = g;
-    }
-    else if (pk == NK_ParenthesesNode || pk == NK_ElseNode || pk == NK_BeginNode) n = p;
-    else if ((pk == NK_IfNode || pk == NK_UnlessNode) && nt_ref(nt, p, "predicate") != n) n = p;
-    else return 0;
-  }
-  return 0;
+  if (n < 0 || n >= nt->count) return 0;
+  VpUp up;
+  VpUpKind ended = vp_climb(nt, par, n, STRH_CLIMB | VP_FOLLOW_RETURN, &up);
+  if (ended == VPU_JUMP)
+    return comp_scope_of(c, up.parent)->def_node >= 0 && strh_method_open(comp_scope_of(c, up.parent));
+  return vp_up_def(nt, &up) >= 0 && strh_method_open(comp_scope_of(c, n));
 }
 /* Is Array literal n where a variable can hold it: a local's, an instance
    variable's, a global's, a class variable's or a constant's write, an
@@ -3987,7 +4248,7 @@ int strh_literal_held(Compiler *c, int n) {
   if (p < 0) return 0;
   NodeKind pk = nt_kind(c->nt, p);
   if ((pk == NK_InstanceVariableWriteNode || pk == NK_GlobalVariableWriteNode || pk == NK_ClassVariableWriteNode ||
-       pk == NK_ConstantWriteNode) && an_unparen(c->nt, nt_ref(c->nt, p, "value")) == n)
+       pk == NK_ConstantWriteNode) && nt_paren_single(c->nt, nt_ref(c->nt, p, "value")) == n)
     return 1;
   /* an argument of a call or a yield, the value of a method */
   if (is_arguments_node_type(nt_type(c->nt, p)) && par[p] >= 0 &&
@@ -4037,10 +4298,7 @@ int strh_call_op_in(Compiler *c, int call, TyKind rt, int unknown_ok) {
   const char *nm = nt_str(nt, call, "name");
   int ca = nt_ref(nt, call, "arguments"), argc = 0, blk = nt_ref(nt, call, "block");
   const int *av = ca >= 0 ? nt_arr(nt, ca, "arguments", &argc) : NULL;
-  for (int k = 0; k < argc; k++) {
-    NodeKind ak = nt_kind(nt, av[k]);
-    if (ak == NK_SplatNode || ak == NK_KeywordHashNode || ak == NK_BlockArgumentNode) return STRH_NONE;
-  }
+  if (nt_argv_has(nt, av, argc, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_BLOCK)) return STRH_NONE;
   int op = strh_op(nm, argc, blk < 0 ? 0 : nt_kind(nt, blk) == NK_BlockNode ? 1 : 2);
   if (op == STRH_EACH && !strh_plain_block_params(c, blk)) return STRH_NONE;
   if ((op == STRH_ELEM && argc == 1) || op == STRH_STORE)

@@ -67,7 +67,9 @@ static inline TyKind ty_ref_set(TyRef r, TyKind t) {
   return t;
 }
 
-typedef struct { unsigned char all, n, bv; int cls[CLS_SET_MAX]; } ClsSet;
+/* bv: a builtin value with no class of the program's; os: an OpenStruct,
+   whose members answer any name (size, length, count, empty?) */
+typedef struct { unsigned char all, n, bv, os; int cls[CLS_SET_MAX]; } ClsSet;
 
 typedef struct {
   int node;      /* the argument, written value or returned value whose type degraded the slot; -1 = untraced */
@@ -355,6 +357,7 @@ static inline int lv_set_proc_ret(LocalVar *lv, int t) {
    container store lifts (any other mark is 1) */
 #define STRBUF_LIFT_FRESH_CALL 2
 
+enum { RBS_CONT_HASH = 1, RBS_CONT_ARRAY = 2 };   /* Scope.ret_rbs_cont: the class a container return seed checks */
 typedef struct {
   char *name;       /* method name; NULL for the top-level scope */
   char *c_name;     /* optional unique C symbol for a method without changing its Ruby name */
@@ -363,6 +366,10 @@ typedef struct {
   int class_id;     /* owning class index, or -1 for free functions */
   int yields;       /* body contains a YieldNode (inlined at call sites) */
   int reachable;    /* method name is referenced somewhere (else dead code) */
+  unsigned char cand_bound; /* a call on a poly receiver bound its arguments
+                               here as one of the methods it may reach
+                               (analyze_pass.c): what its parameters hold is
+                               what that call hands, should it reach this one */
   int is_cmethod;   /* `def self.foo`: a class (singleton) method, no instance self */
   int is_module_function; /* `module_function`: ALSO a private instance method of
                              every includer. The body cannot depend on the
@@ -436,6 +443,17 @@ typedef struct {
   int kwrest_idx;   /* index in pnames[] of **kwrest param, -1 if none */
   int fwd_target1;  /* a `def m(...)` the __fwd_N model binds (#1288): the
                        scope its `...` reaches, plus one; 0 if none */
+  /* What the def's parameter list says, read off its ParametersNode by
+     scope_param_shape (codegen_fold.c) and kept while the node table has
+     no edit: a call's layout asks it of every candidate the call may reach. */
+  const void *ps_nt;      /* the table it was read from; NULL until read */
+  unsigned long ps_edits; /* ... at its edit count */
+  int ps_def;             /* ... for this def_node */
+  int ps_pn;              /* the parameters node, or -1 */
+  int ps_nkw;             /* the declared keywords, ps_kws */
+  const int *ps_kws;
+  int ps_fwd;             /* a `...` keyword rest: every name binds by keyword */
+  int ps_obr;             /* an optional with posts beside it; -1: no list says */
 
   SP_TY_FIELD TyKind ret;     /* inferred return type */
   SlotWhy ret_why;  /* how `ret` came to be untyped, if it is */
@@ -449,21 +467,35 @@ typedef struct {
                           (which the inliner specializes, folding the guard
                           away) reads the value of the body proper. UNKNOWN
                           when the method has no such guard. */
-  SP_TY_FIELD TyKind ret_withblock; /* a method whose `ret` was pinned to the Enumerator
-                          its `return enum_for(:m) unless block_given?`
-                          answers, and whose body ends in `self`: the value
-                          of a call WITH a block, the receiver's class.
-                          UNKNOWN otherwise. */
+  int ret_pin_guard;   /* a method whose `ret` was pinned to the Enumerator its
+                          `return enum_for(:m) unless block_given?` answers: the
+                          node of that call, whose value a call WITH a block
+                          does not answer (method_call_ret reads the other
+                          values instead). -1 otherwise. */
   int is_ext_entry;    /* designated --ext-entry: emitted non-static, a DCE
                           root, declared in the emitted extension header (#M1
                           of docs/internals/ext-design.md) */
   int ret_rbs_seeded;  /* ret pinned from an --rbs advisory seed: the fixpoint
                           must not recompute it from the body */
+  int ret_elems_shared; /* --share-strings: that seed was Array[String], and the
+                          Strings the method answers are shared, so the return
+                          settled in its poly form, the boxes holding the
+                          handles (share_default_apply), as a local's does
+                          (LocalVar.elems_shared); the same Ruby type in its
+                          shared C form, not a contradiction of the seed (#9626) */
   int ret_pub_fresh;   /* --share-strings: a deep-return pickup takes this
                           method's value, and a tail of it answers a fresh
                           String (share_node_fresh) beside the handle reads
                           the others publish: that tail clears the side
                           channel (emit_tail_value), so the caller wraps it */
+  unsigned char ret_rbs_cont; /* a container return seed (RBS_CONT_HASH, a
+                          Hash; RBS_CONT_ARRAY, an Array) gave way to the box
+                          the body answers (ret_seed_holds): the slot stays
+                          boxed, the return is checked to be a container of
+                          that class in any form, once and always
+                          (emit_rbs_cont_ret_wrapper), and a call of the
+                          method answers no proc or Method */
+  unsigned char ret_rbs_cont_nil; /* that seed was nilable (`Hash[..]?`): nil passes */
   int ret_rbs_nilable; /* that seed was RBS's nilable form (`Integer?`), and the
                           pinned kind is an unboxed scalar: the return can be
                           nil (an oint), so a caller boxing it has to answer
@@ -487,6 +519,10 @@ typedef struct {
                                  the bang's as its handle's read, as for
                                  ret_pub_fresh */
   unsigned char ret_channel_check; /* --repr-check: the earlier pickup proof succeeded */
+  unsigned char ret_unread; /* a String method no call reads the value of: every
+                               call of its name drops it (an_mark_unread_returns),
+                               so its body runs as statements and builds no value
+                               -- a tail `@out << x` read the whole buffer out */
   unsigned char ret_fresh; /* the same return-tail walk proves a new String
                               (or nil) on every path; no incoming handle */
   int ret_param;       /* --share-strings: every non-fresh return reads this
@@ -519,6 +555,12 @@ typedef struct {
 
   LocalVar *locals; /* params + body locals */
   int nlocals, clocals;
+  int *lidx;        /* scope_local's index of `locals` by name: open
+                       addressing over the names' hashes, slot + 1 per
+                       entry, 0 empty. NULL until the table is long enough
+                       to want one; dropped by whatever removes a local
+                       (scope_local_intern keeps it over an append) */
+  int lidx_cap;     /* a power of two, at least twice nlocals */
 } Scope;
 
 static inline TyKind scope_set_ret(Scope *s, TyKind t) {
@@ -529,8 +571,8 @@ static inline TyKind scope_set_ret_noblock(Scope *s, TyKind t) {
   if (s->ret_noblock != t) { *(TyKind *)&s->ret_noblock = t; comp_ty_edits++; }
   return t;
 }
-static inline TyKind scope_set_ret_withblock(Scope *s, TyKind t) {
-  if (s->ret_withblock != t) { *(TyKind *)&s->ret_withblock = t; comp_ty_edits++; }
+static inline int scope_set_ret_pin_guard(Scope *s, int t) {
+  if (s->ret_pin_guard != t) { *(int *)&s->ret_pin_guard = t; comp_ty_edits++; }
   return t;
 }
 static inline int scope_set_ret_proc_ret(Scope *s, int t) {
@@ -671,6 +713,11 @@ typedef struct {
      (resolve_parents copies them in): reflection lists them only with all */
   char **sg_inh;
   int nsg_inh, csg_inh;
+  /* the singleton accessors this class's own body declares, by method name
+     (`x`, `x=`): an inherited one of the same name is in the lists too */
+  char **sg_decl;
+  int nsg_decl, csg_decl;
+  int *sg_decl_node;     /* by entry of sg_decl: the declaring call, the latest */
   char **alias_new;    /* `alias new old`: alias_new[i] redirects to alias_old[i] */
   char **alias_old;
   int   *alias_cls;    /* class the lookup resumes from (an alias of an
@@ -770,6 +817,12 @@ typedef struct {
                           fixpoint): a construction site of this class sits in
                           reachable code, or nothing can tell. Read only by the
                           poly-receiver return-type union, for native classes. */
+  int ctor_site;       /* a construction of this class (`.new`, `.allocate`, a
+                          bare `new` in its class method, `raise Cls`) sits in
+                          reachable code, or nothing can tell: what the census
+                          saw before a native or Struct class is held live
+                          regardless. Read for a native class's Ruby-side defs
+                          (comp_native_binding_class). */
   int instantiated;    /* a value with this exact cls_id can come into existence
                           somewhere: `.new`/`.allocate`/`raise Cls`/Struct, or a
                           Marshal.load that can mint any class. When clear, no
@@ -799,6 +852,21 @@ typedef struct {
      includes that module. */
   int *included_mods;
   int nincluded_mods, cincluded_mods;
+  /* Where Enumerable sits among this class's own includes: 0 when its bodies
+     do not include it, else 1 + the number of program modules included
+     before it (a later include goes in front in Ruby's lookup). Set where
+     the includes are processed (process_include_body). */
+  int enum_inc_at;
+  int cmp_inc_at;       /* Comparable uses the same include order facts;
+                          1 also marks a builtin Comparable superclass. */
+  int cmp_prepended;    /* 1: direct prepend Comparable; 2: a prepended module
+                          reaches it, behind that module's own methods. */
+  int enum_prepended;   /* its bodies `prepend Enumerable`: in front of the class itself */
+  /* The attr_reader / attr_accessor names this class's own bodies declare,
+     as against readers[], which also holds those a module it includes and a
+     superclass bring. */
+  char **own_readers;
+  int nown_readers, cown_readers;
   /* Modules this class extends (class indices), in the order register_extends
      meets them: its singleton's ancestors, which `Klass.is_a?(M)` asks. */
   int *extended_mods;
@@ -1021,6 +1089,11 @@ typedef struct {
                        set of user classes its value can hold (analyze_cls.c,
                        #8530); 0 is every class. Read through cls_fact_node. */
   ClsSet *cls_pool; int ncls_pool, cls_fact_n;
+  unsigned char *cls_kind; /* [cls_fact_n] per node, in a program that calls
+                       compare_by_identity: the CK_* kinds its value, and
+                       (shifted by CK_CONTENTS) the elements of the
+                       containers it holds, can be (cls_fact_kinds) */
+  int cls_kind_n;
   int range_unheld; /* while the arguments of a call on a receiver of no known
                        class bind to every method of the name: a Range among
                        them makes no parameter range_held (slot_set) */
@@ -1080,6 +1153,7 @@ typedef struct {
   int *lvw_next;        /* [lvw_count] next write id sharing the bucket */
   int lvw_nbuckets, lvw_count;
   unsigned lvw_version; /* nt->version the index was built for */
+  NtStamp lvw_stamp;
   int lvw_built;
 
   /* local-write-by-(scope,name) index; see comp_lvw_first_sc */
@@ -1087,6 +1161,7 @@ typedef struct {
   int *lvws_next;       /* [lvws_count] next write id sharing the bucket */
   int lvws_nbuckets, lvws_count;
   unsigned lvws_version;
+  NtStamp lvws_stamp;
   int lvws_built;
 
   /* node-by-kind chains; see comp_kind_first */
@@ -1140,7 +1215,6 @@ typedef struct {
   unsigned char *vs_kind; /* [vs_count] an entry's site kind (VsKind) */
   int *vs_rparent;      /* [vs_nodes] the call whose receiver a node is, or -1 */
   int *vs_whead, *vs_wnext; /* [vs_nodes] the local writes whose value a node is, in node order */
-  unsigned char *vs_dropped; /* [vs_nodes] a statement the next statement follows */
   int vs_nbuckets, vs_count, vs_cap, vs_nodes, vs_toplevel;
   unsigned vs_version, vs_gen;
   int vs_built;
@@ -1248,6 +1322,7 @@ typedef struct {
      and installs the conversion bridge (sp_obj_conv_sw) only then, so a
      program that never converts an object carries no extra dispatch. */
   int uses_kconv;
+  int gen_comparable; /* program needs the boxed Comparable membership callback */
   /* the program has a `**` operand and defines #to_hash: the bridge carries
      the #to_hash row a boxed operand converts through (sp_kw_splat_conv). */
   int uses_kw_to_hash;
@@ -1493,14 +1568,14 @@ int comp_vsite_first(Compiler *c, VsKind k, NodeKind kind, const char *name, int
 int comp_vsite_next(const Compiler *c, int e);
 int comp_vsite_node(const Compiler *c, int e);
 int comp_vsite_var(const Compiler *c, int e);
-/* The call whose receiver node `n` is (through parentheses), or -1; and
-   whether it is a statement the next statement follows, so its value is
-   dropped. */
+/* The call whose receiver node `n` is (through parentheses), or -1. */
 int comp_recv_parent(Compiler *c, int n);
 /* The local-variable writes whose value is node n, ascending: for (w =
    comp_lwrite_of_value(c, n); w >= 0; w = comp_lwrite_next(c, w)). */
 int comp_lwrite_of_value(Compiler *c, int n);
 int comp_lwrite_next(const Compiler *c, int w);
+/* Is node n a statement the next statement follows (through parentheses),
+   so its value is dropped? (analyze_util.c, on vp_climb) */
 int comp_value_dropped(Compiler *c, int n);
 int comp_kind_first(Compiler *c, int kind);
 int comp_kind_next(const Compiler *c, int id);
@@ -1552,6 +1627,8 @@ void why_reset(SlotWhy *w);
 int ty_degraded(TyKind t);   /* poly, or a container of poly */
 extern int g_infer_round;    /* the fixpoint round in progress, for SlotWhy.round */
 LocalVar *scope_local_intern(Scope *s, const char *name);
+void scope_locals_appended(Scope *s);  /* scope_local's index, after an append */
+void scope_locals_removed(Scope *s);   /* ... after a local is taken out of `locals` */
 
 /* Symbol intern table. comp_sym_intern returns the symbol's id. */
 int comp_sym_intern(Compiler *c, const char *name);
@@ -1626,8 +1703,12 @@ static inline int singleton_visible_ci(Compiler *c, int ci) {
 int        comp_class_anonymous(Compiler *c, int ci);
 int        comp_has_sclass_values(Compiler *c);
 const char *comp_class_display_fn(Compiler *c);
+const char *comp_class_base_display_fn(Compiler *c);
+int cls_user_display_mi(Compiler *c, int k, const char *nm);
+int prog_has_cls_user_display(Compiler *c, const char *nm);
 int        class_var_static_ci(Compiler *c, int node);  /* local holding one class const */
 int        class_recv_static_ci(Compiler *c, int node); /* constant or local naming one class */
+int        class_recv_user_cmethod(Compiler *c, int node, const char *name); /* its user class method of the name */
 int        dynamic_new_may_reach(Compiler *c, int call_id, int cid);  /* k.new can build cid */
 int        anon_struct_ci_for_value(Compiler *c, int val);  /* k = Struct.new(...) value node */
 const char *struct_call_dup_member(Compiler *c, int callnode);  /* first duplicate member sym name, or NULL */
@@ -1675,7 +1756,11 @@ int        const_get_takes_value(Compiler *c, const char *rnm, const char *cgn);
 const char *const_get_value_key(Compiler *c, const char *rnm, const char *cgn);
 int        const_get_class_index(Compiler *c, const char *rnm, const char *cgn);
 const char *const_get_lookup(Compiler *c, const char *rnm, const char *cgn, int *cls);
+void       const_get_leaves_begin(Compiler *c);  /* index the class leaves while the class table holds still */
+void       const_get_leaves_end(void);
 int        const_defined_known(Compiler *c, const char *rnm, const char *cgn);
+int        const_defined_from(Compiler *c, const char *rnm, const char *cgn);   /* ... and seen from R: R, its ancestors, their modules, or top level (#9876) */
+int        const_seen_by_class(Compiler *c, int k, const char *cgn);
 int        qc_const_qualified(const char *qn);
 int        qc_leaf_qualified(const char *leaf);
 const char *time_strict_parser_call(Compiler *c, int id);
@@ -1739,6 +1824,31 @@ int        io_family_descends(Compiler *c, int k, int owner);
 /* Like comp_method_in_class but walks the superclass chain. On success,
    *def_class (if non-NULL) is set to the class that defines the method. */
 int        comp_method_in_chain(Compiler *c, int class_id, const char *name, int *def_class);
+/* The classes whose chain answers (name, is_cm) -- comp_method_in_chain's
+   or comp_cmethod_in_chain's -- ascending, two ints per class (the class,
+   the scope its chain finds), *n their count. NULL with *n -1 while the
+   chain memo cannot be trusted (the index unfrozen, a scope moved): the
+   caller then asks class by class. A pass asking whether any class's
+   method of a name answers so-and-so walked every class and hashed the
+   name for each; at every boxed comparison site, every round, that was a
+   third of a Rails program's re-narrow round (1,299 classes). */
+const int *comp_name_responders(Compiler *c, const char *name, int is_cm, int *n);
+/* does class_id's chain define the method call id names, and does the call reach it? A call
+   marked builtin_only (the super of a program's own reflection, rewritten to
+   self's builtin) does not. */
+static inline int comp_object_defines(Compiler *c, const char *name) {
+  int oc = comp_class_index(c, "Object");
+  return oc >= 0 && comp_method_in_chain(c, oc, name, NULL) >= 0;
+}
+/* does Object's program method of the name answer call id for the receivers no class arm of its
+   dispatch took (builtin values, instances of classes without a method of their own)? */
+static inline int comp_call_reaches_own_any(Compiler *c, int id, const char *name) {
+  return !nt_int(c->nt, id, "builtin_only", 0) && comp_object_defines(c, name);
+}
+static inline int comp_call_reaches_own(Compiler *c, int id, int class_id, const char *name) {
+  if (nt_int(c->nt, id, "builtin_only", 0)) return 0;
+  return comp_method_in_chain(c, class_id, name, NULL) >= 0 || comp_object_defines(c, name);
+}
 int        send_def_just_supers(Compiler *c, int mi);          /* analyze_desugar.c */
 int        send_family_program_owns(Compiler *c, const char *name);
 /* Array subclasses (#7449, ClassInfo.ary_root): the root of class cid's
@@ -1816,9 +1926,26 @@ int cls_fact_bounded(Compiler *c, int k);
    known, k is bounded, and k is not in it? A call on recv then never
    reaches k's method, so the binding and the dispatch may leave it out. */
 int cls_fact_excludes(Compiler *c, int recv, int k);
+/* May node's value be an OpenStruct (an OpenStruct.new reaches it, or the
+   walk has no answer for it), in a program that requires "ostruct"? */
+int cls_fact_may_ostruct(Compiler *c, int node);
 /* the fact's own index for recv's set, which names the set uniquely: 0 or -1
    for every class (nothing to filter by) */
 int cls_fact_idx(Compiler *c, int node);
+/* What else than an object of a class of the program's node's value can be,
+   as the same walk follows it (analyze_cls.c), in a program that calls
+   compare_by_identity: CK_UNSAFE a value whose identity is not CRuby's here
+   or one the walk cannot name (a number, a Range, a builtin's answer, a
+   value from code it does not see), CK_LIT a String literal (one object
+   per text here), CK_STR a String made afresh (an interpolation, a dup, a
+   unary plus, String.new). A Symbol, nil, true, false, a container literal
+   or a Proc adds nothing. cls_fact_kinds answers for the value,
+   cls_fact_contents_kinds for the elements of the containers it holds;
+   CK_UNSAFE for a node the walk has no answer for. */
+enum { CK_UNSAFE = 1, CK_LIT = 2, CK_STR = 4, CK_CONTENTS = 3 };
+void an_cls_kinds(Compiler *c);   /* the walk, once: before the first ask */
+int cls_fact_kinds(Compiler *c, int node);
+int cls_fact_contents_kinds(Compiler *c, int node);
 
 typedef struct { int cls; int mi; int rdcls; int native; } PolyCand;
 const PolyCand *comp_poly_candidates(Compiler *c, const char *name, int *n);
@@ -1843,9 +1970,20 @@ void comp_descendants_reset(void);
 /* Walk the chain for an attr reader/writer; returns 1 and the owning class. */
 int        comp_reader_in_chain(Compiler *c, int class_id, const char *name, int *def_class);
 int        comp_writer_in_chain(Compiler *c, int class_id, const char *name, int *def_class);
+/* A strict subclass answers `name` (a method or a reader in its chain). */
+int        comp_subclass_answers(Compiler *c, int class_id, const char *name);
 void       comp_add_reader(ClassInfo *ci, const char *name);
 void       comp_add_writer(ClassInfo *ci, const char *name);
 int        comp_is_reader(ClassInfo *ci, const char *name);
+void       comp_add_own_reader(ClassInfo *ci, const char *name);
+int        comp_is_own_reader(ClassInfo *ci, const char *name);
+/* Whether a call named `name` on an instance of class cid, which has an
+   #each, is Enumerable's: no method or reader of the program's comes before
+   Enumerable in Ruby's lookup order. 0 when the program's answers first. */
+int        comp_enum_answers_first(Compiler *c, int cid, const char *name);
+int        comp_comparable_answers_first(Compiler *c, int cid, const char *name);
+int        comp_comparable_reaches(Compiler *c, int cid);
+int        core_method_vis(const char *cls, const char *m, int inherit);   /* codegen_call_class.c */
 int        comp_is_writer(ClassInfo *ci, const char *name);
 int        name_is_plain_setter(const char *name);
 int        call_is_setter_assign(const NodeTable *nt, int id);
@@ -1857,6 +1995,8 @@ int        attr_decl_call(Compiler *c, int id);
 enum { VIS_DECL_NIL = 1, VIS_DECL_SYM, VIS_DECL_ARRAY, VIS_DECL_SELF };
 int        vis_decl_call(Compiler *c, int id);
 int        setter_base_name(const char *name, char *out, size_t cap);
+char      *name_dup(const char *name);
+char      *setter_name_of(const char *attr);
 void       comp_add_undef(ClassInfo *ci, const char *name);
 int        comp_is_undeffed_in_chain(Compiler *c, int class_id, const char *name);
 void       comp_add_sg_reader(ClassInfo *ci, const char *name);
@@ -1867,8 +2007,8 @@ void       comp_add_alias(ClassInfo *ci, const char *new_name, const char *old_n
 void       comp_add_alias_from(ClassInfo *ci, const char *new_name, const char *old_name, int from_cls);
 void       comp_add_sg_civ(ClassInfo *ci, const char *name);
 int        comp_is_sg_civ(ClassInfo *ci, const char *name);
-int        comp_is_sg_inh(ClassInfo *ci, const char *name);
 void       comp_add_sg_inh(ClassInfo *ci, const char *name);
+void       comp_add_sg_decl(ClassInfo *ci, const char *base, int writer, int node);
 /* Prepend-chain helpers. */
 void        comp_prep_chain_add(ClassInfo *ci, const char *from, const char *to);
 const char *comp_prep_chain_target(Compiler *c, int class_id, const char *name);
@@ -1895,6 +2035,12 @@ int         comp_resolve_member(Compiler *c, int class_id, const char *name, int
 const char *comp_resolve_alias(Compiler *c, int class_id, const char *name);
 const char *comp_resolve_alias_at(Compiler *c, int class_id, const char *name, int *start_cls);
 const char *comp_resolve_cm_alias_at(Compiler *c, int class_id, const char *name, int *start_cls);
+int comp_sg_writer_reached(Compiler *c, int k, const char *name, char *base, size_t cap);
+/* Does class d declare the `class << self` accessor `name` (`x`, or `x=`)
+   itself, rather than inherit it? */
+int comp_sg_accessor_own(Compiler *c, int d, const char *name);
+/* The node of class d's own latest declaration of that accessor, or -1 */
+int comp_sg_accessor_decl_node(Compiler *c, int d, const char *name);
 void rewrite_builtin_cm_alias_call(Compiler *c, int id);   /* analyze.c */
 const char *comp_resolve_cm_alias_ex(Compiler *c, int class_id, const char *name, int *builtin);
 int comp_name_is_sg_alias_only(Compiler *c, int class_id, const char *name);

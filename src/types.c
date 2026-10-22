@@ -384,18 +384,92 @@ TyKind ty_array_elem(TyKind arr) {
 static int ty_recv_is_plain_array(TyKind t) {
   return t == TY_INT_ARRAY || t == TY_FLOAT_ARRAY || t == TY_STR_ARRAY;
 }
-int ty_recv_builtin_result(const char *name, int argc, TyKind arg0, TyKind recv, int promote, TyKind *out) {
+/* bop_find_arg's BopArgKind callback: ud points at a two-element array
+   holding arg0 and arg1, so a row guarded on either argument's kind
+   (bop_find_stage checks both) can still be matched -- a lookup that
+   only ever supplied arg0 found the first unguarded row instead of a
+   row guarded on arg1, e.g. a two-argument IO#set_encoding row. */
+static TyKind bop_arg01_kind(const void *ud, int i) {
+  return i == 0 || i == 1 ? ((const TyKind *)ud)[i] : TY_UNKNOWN;
+}
+/* g_promote_mode gates a scattered, open-ended set of arms across
+   analyze_infer.c/analyze.c for a numeric scalar receiver -- pred, the
+   div/divmod/modulo family (Integer with a Float or poly argument, and
+   Float's own div), pow, to_i, <<, and others, found piecemeal rather
+   than from one table. An earlier version of this guard denylisted
+   names by hand and missed pred and the div family outright, a fresh
+   review found the miss by running those exact calls through a yield
+   receiver under --int-overflow=promote and comparing to CRuby directly
+   (four programs that matched CRuby on the unfixed compiler started
+   raising RangeError once this generic path started answering them with
+   the row's plain, non-promoting result). A name denylist cannot be
+   trusted to enumerate every such arm as new ones are added elsewhere;
+   gating by receiver kind instead is structural and can't miss one:
+   none of the names this generic path was written to answer
+   (sort!/reverse!/rotate/shuffle/sample/take/drop/first(n)/last(n)/fetch)
+   ever operate on a scalar numeric receiver, and clamp -- the only
+   numeric-receiver name reaching this function at all -- is answered by
+   its own hand-written arm above, which always returns before this
+   check runs. Excluding every numeric scalar receiver under promote
+   mode here therefore loses nothing this generic path exists for. */
+static int bop_result_excluded_for_promote(TyKind recv, int promote) {
+  return promote && (recv == TY_INT || recv == TY_FLOAT || recv == TY_BIGINT);
+}
+/* The names the generic bop_rows fallback below may answer for -- each
+   verified with its own RED (compile failure on differing-kind yield
+   sites) then GREEN test, not merely "the table has a concrete row for
+   it". A name not on this list never reaches the fallback, however
+   concrete its own bop_rows row looks; see the fallback's own comment
+   for why that distinction matters (inspect has a concrete row too, and
+   broke a real program once let through unverified). */
+static int bop_result_fallback_allowed(const char *name) {
+  return !strcmp(name, "sort!") || !strcmp(name, "reverse!") ||
+         !strcmp(name, "rotate") || !strcmp(name, "shuffle") ||
+         !strcmp(name, "first") || !strcmp(name, "last") ||
+         !strcmp(name, "take") || !strcmp(name, "drop") ||
+         !strcmp(name, "fetch") || !strcmp(name, "sample");
+}
+/* Whether a yield site answers `name` on a receiver of kind recv from the
+   builtin-op rows rather than from a rule of its own: 1 for a listed pair,
+   0 for a listed name whose receiver is not one of its kinds (the site keeps
+   the yield's single typing), -1 for a name not listed. This list, not the
+   rows, is the set of pairs a yield may widen to poly: the rows answer
+   kinds beyond these (a poly Array's `first`, Complex#abs), and widening
+   those sites would change what is emitted. Every listed pair has a row
+   that states its kind. */
+static int yield_site_listed(const char *name, TyKind recv) {
+  int num = recv == TY_INT || recv == TY_FLOAT;
+  if (!strcmp(name, "abs") || !strcmp(name, "magnitude")) return num;
+  /* String#-@ is the deduplicated frozen String, so a String site belongs
+     here too; a String has no abs or magnitude. */
+  if (!strcmp(name, "-@")) return num || recv == TY_STRING;
+  if (!strcmp(name, "itself") || !strcmp(name, "dup") || !strcmp(name, "clone") ||
+      !strcmp(name, "freeze"))
+    return num || recv == TY_STRING || recv == TY_SYMBOL || ty_recv_is_plain_array(recv);
+  if (!strcmp(name, "sort") || !strcmp(name, "reverse") || !strcmp(name, "uniq") ||
+      !strcmp(name, "compact") || !strcmp(name, "to_a") || !strcmp(name, "first") ||
+      !strcmp(name, "last") || !strcmp(name, "min") || !strcmp(name, "max") ||
+      !strcmp(name, "pop") || !strcmp(name, "shift"))
+    return ty_recv_is_plain_array(recv);
+  return -1;
+}
+int ty_recv_builtin_result(const char *name, int argc, TyKind arg0, TyKind arg1,
+                            int range_has_float_bound, TyKind recv, int promote, TyKind *out,
+                            const struct BuiltinOp **row) {
   if (!name) return 0;
+  if (row) *row = NULL;
   if (argc == 0) {
-    if (!strcmp(name, "abs") || !strcmp(name, "magnitude")) {
-      if (recv != TY_INT && recv != TY_FLOAT) return 0;
-      *out = recv; return 1;
-    }
-    /* String#-@ is the deduplicated frozen String, so a String site belongs
-       here too; a String has no abs or magnitude. */
-    if (!strcmp(name, "-@")) {
-      if (recv != TY_INT && recv != TY_FLOAT && recv != TY_STRING) return 0;
-      *out = recv; return 1;
+    /* A listed name answers from its row: the receiver's own kind for the
+       copies, the identities and the reorderings, the element for the
+       element readers. */
+    int listed = yield_site_listed(name, recv);
+    if (listed == 0) return 0;
+    if (listed > 0) {
+      const BuiltinOp *op = bop_find(bop_family_of(recv), name, 0, 0);
+      TyKind r = op ? bop_result(op, recv) : TY_UNKNOWN;
+      if (r == TY_UNKNOWN) return 0;
+      *out = r; if (row) *row = op;
+      return 1;
     }
     /* succ: a String or Symbol site always answers its own kind (String's
        and Symbol's own `succ` bop rows are a fixed result type, no
@@ -406,10 +480,15 @@ int ty_recv_builtin_result(const char *name, int argc, TyKind arg0, TyKind recv,
        call: an Integer local read back from an array answers poly under
        promote). */
     if (!strcmp(name, "succ")) {
-      if (recv == TY_STRING) { *out = TY_STRING; return 1; }
-      if (recv == TY_SYMBOL) { *out = TY_SYMBOL; return 1; }
-      if (recv == TY_INT) { *out = promote ? TY_POLY : TY_INT; return 1; }
-      return 0;
+      if (recv == TY_STRING) *out = TY_STRING;
+      else if (recv == TY_SYMBOL) *out = TY_SYMBOL;
+      else if (recv == TY_INT) *out = promote ? TY_POLY : TY_INT;
+      else return 0;
+      /* the kind's row, where it states that answer (not an Integer's under
+         promote, which the row does not know) */
+      const BuiltinOp *op = bop_find(recv, name, 0, 0);
+      if (row && op && bop_result(op, recv) == *out) *row = op;
+      return 1;
     }
     /* sum (no seed, no block -- the only shape a yield receiver's inlined
        call takes): fold_sum_type already names this exactly, with the
@@ -424,36 +503,143 @@ int ty_recv_builtin_result(const char *name, int argc, TyKind arg0, TyKind recv,
        binary), so it is answered here rather than declined like a truly
        unresolvable pair. */
     if (!strcmp(name, "sum") && ty_recv_is_plain_array(recv)) {
-      *out = fold_sum_type(TY_INT, ty_array_elem(recv), promote); return 1;
+      *out = fold_sum_type(TY_INT, ty_array_elem(recv), promote);
+      /* the kind's row is the call's: it states every kind's answer but an
+         Integer Array's, which it leaves to the mode (bop_result) */
+      const BuiltinOp *op = bop_find(bop_family_of(recv), name, 0, 0);
+      if (row && op && op->result == BOPR_ARRAY_SUM) *row = op;
+      return 1;
     }
-    if (!strcmp(name, "itself") || !strcmp(name, "dup") || !strcmp(name, "clone") ||
-        !strcmp(name, "freeze")) {
-      if (recv != TY_INT && recv != TY_FLOAT && recv != TY_STRING && recv != TY_SYMBOL &&
-          !ty_recv_is_plain_array(recv)) return 0;
-      *out = recv; return 1;
-    }
-    if (!strcmp(name, "sort") || !strcmp(name, "reverse") || !strcmp(name, "uniq") ||
-        !strcmp(name, "compact") || !strcmp(name, "to_a")) {
-      if (!ty_recv_is_plain_array(recv)) return 0;
-      *out = recv; return 1;
-    }
-    if (!strcmp(name, "first") || !strcmp(name, "last") || !strcmp(name, "min") ||
-        !strcmp(name, "max") || !strcmp(name, "pop") || !strcmp(name, "shift")) {
-      if (!ty_recv_is_plain_array(recv)) return 0;
-      *out = ty_array_elem(recv); return 1;
-    }
-    return 0;
+    /* No hand-written arm above matched this argc=0 name: fall through
+       (instead of returning 0 here) to the generic bop_rows-backed check
+       below, which also answers argc=0 names (sort!, reverse!, rotate,
+       shuffle, sample). The dig/[] checks right after this block
+       self-guard on argc>=1, so they simply no-op for an argc=0 name that
+       reaches here. */
   }
   /* Unlike succ/sum above, dig ignores `promote`: a one-index dig answers
      the same nilable element `[]` does (below), and `[]` is itself
      promote-independent -- an Integer Array's indexed read stays Integer
      under promote (only arithmetic results that could overflow become
      poly), so dig at one index follows it rather than succ/sum's rule. */
-  if (!strcmp(name, "dig") && argc >= 1 && ty_recv_is_plain_array(recv)) {
-    *out = (argc == 1) ? ty_array_elem(recv) : TY_POLY; return 1;
+  /* fetch(i, default) (the 2-argument, with-default form): the element
+     kind when the default's own type is unknown or already agrees with
+     it, poly when it disagrees -- mirrors analyze_infer_recv.c's fetch
+     arm exactly (the 1-arg form above, in the generic fallback via
+     bop_rows, has no such dependence; this is why the two forms are
+     split into separate rows there). A fresh review found this form was
+     never actually exercised by the probing that found the rest of this
+     family broken, and an earlier ledger ruling wrongly concluded it was
+     untouched by this change -- it was broken on both sides, just never
+     tested; this arm closes it now that arg1 exists. */
+  if (!strcmp(name, "fetch") && argc == 2 && ty_recv_is_plain_array(recv)) {
+    TyKind et = ty_array_elem(recv);
+    *out = (arg1 == TY_UNKNOWN || arg1 == et) ? et : TY_POLY;
+    return 1;
   }
+  if (!strcmp(name, "dig") && argc >= 1 && ty_recv_is_plain_array(recv)) {
+    /* one index is the element, two or more are poly: the Array rows state
+       both, for any count of indexes */
+    const BuiltinOp *op = bop_find(bop_family_of(recv), name, argc, 0);
+    if (op) {
+      *out = bop_result(op, recv);
+      if (row) *row = op;
+      return 1;
+    }
+  }
+  /* sample(n): tells a count (arg0 == TY_INT, answers a subarray -- the
+     receiver's own kind) apart from a random: keyword hash (arg0 is a
+     Hash kind, answers one element) purely from arg0's own TyKind --
+     confirmed empirically (--emit-types on a direct sample(random: r)):
+     a KeywordHashNode literal's inferred type is a Hash kind, not TY_INT,
+     so no AST-shape inspection is needed, unlike it first looked. */
+  if (!strcmp(name, "sample") && argc == 1 && ty_recv_is_plain_array(recv)) {
+    *out = ty_is_hash(arg0) ? ty_array_elem(recv) : recv; return 1;
+  }
+  /* clamp(lo, hi): has no bop_rows row at all for Integer/Float -- its
+     answer is 100% hand-written, split across two files and two separate
+     receiver-specific rules (found by a fresh review after an earlier,
+     wrong version of this arm claimed to mirror them "line by line" but
+     missed both: an Integer receiver with a Float OR poly bound
+     (analyze_infer.c's clamp arm, inside its `rt == TY_INT` block) is
+     poly, not the Integer receiver this arm used to answer; a Float
+     receiver with a poly bound (confirmed empirically via --emit-types,
+     since analyze_infer_recv.c's own Float-receiver rule explicitly
+     excludes a poly bound from its own condition and falls through
+     elsewhere) is also poly, not the Float this arm used to answer).
+     Either bound TY_NIL keeps the receiver's own class boxed regardless
+     of receiver kind (analyze_infer_recv.c, checked for both TY_INT and
+     TY_FLOAT together).
+
+     Written as an allowlist ("both bounds match the receiver's own
+     kind"), not a blocklist of the bound kinds known to force poly: a
+     second review round (CodeRabbit, upstream) found the earlier
+     blocklist version (poly only for FLOAT or POLY bounds) left a
+     Bignum or Rational bound answering the receiver's own kind, where
+     a non-constant receiver (confirmed via --emit-types -- a yield's
+     receiver is never a compile-time constant, so it always takes this
+     general path, never the constant-folded one a literal receiver
+     can take) answers poly for ANY bound kind other than its own. */
+  if (!strcmp(name, "clamp") && argc == 2 && (recv == TY_INT || recv == TY_FLOAT)) {
+    if (arg0 == TY_NIL || arg1 == TY_NIL) { *out = TY_POLY; return 1; }
+    *out = (arg0 == recv && arg1 == recv) ? recv : TY_POLY;
+    return 1;
+  }
+  /* clamp(range): confirmed empirically (--emit-types on direct calls)
+     that the only case answering the receiver's own kind is an Integer
+     receiver with a plain (non-mixed-bound) Range; every other
+     combination -- a Float receiver with ANY Range, or either receiver
+     with a TY_FLOAT_RANGE or a mixed-bound Range literal -- is poly. The
+     mixed-bound case needs range_has_float_bound (the Range literal's own
+     left/right child types), since TY_RANGE alone does not distinguish a
+     plain Int range from a mixed one. */
+  if (!strcmp(name, "clamp") && argc == 1 && (recv == TY_INT || recv == TY_FLOAT) &&
+      (arg0 == TY_RANGE || arg0 == TY_FLOAT_RANGE)) {
+    *out = (recv == TY_INT && arg0 == TY_RANGE && !range_has_float_bound) ? TY_INT : TY_POLY;
+    return 1;
+  }
+  /* [] with an Integer index: the element, from the row that guards the
+     Integer. A Range or any other index kind is not answered here. */
   if (argc == 1 && !strcmp(name, "[]") && arg0 == TY_INT && ty_recv_is_plain_array(recv)) {
-    *out = ty_array_elem(recv); return 1;
+    TyKind ak[2] = { arg0, arg1 };
+    const BuiltinOp *op = bop_find_arg(bop_family_of(recv), name, argc, 0, bop_arg01_kind, ak);
+    TyKind r = op ? bop_result(op, recv) : TY_UNKNOWN;
+    if (r == TY_UNKNOWN) return 0;
+    *out = r; if (row) *row = op;
+    return 1;
+  }
+  /* Every name above answers from its own hand-written rule, several of
+     them mode-gated (succ/sum) or needing more than the receiver's kind
+     to answer (clamp). Below is a generic fallback, delegating to
+     builtin_ops.c's bop_rows table (a fixed TyKind or a BOPR_* result
+     derived purely from the receiver's kind, via the existing pure
+     bop_find_arg/bop_result) instead of hand-writing another arm --
+     closes sort!, reverse!, rotate, shuffle, first(n), last(n), take,
+     drop, fetch(1-arg) and sample(0-arg) with no per-name code.
+
+     Deliberately an ALLOWLIST (bop_result_fallback_allowed), not every
+     name the table happens to answer concretely: a first version of
+     this let any name through and answered `inspect` too (its own row
+     has a concrete TY_STRING result), which a fresh review found
+     breaking test/string_encode_arguments.rb -- the wider bop_rows
+     table's "concrete result" promise is about what a DIRECT call
+     answers, not about what's safe to answer per SITE across a
+     yield's diverging call sites, and only the ten names below were
+     ever verified for that second, stricter property. A future name
+     needs the same verification (a RED test with differing-kind sites,
+     confirmed GREEN) before joining the list, not just a concrete row. */
+  if (bop_result_fallback_allowed(name) &&
+      !bop_result_excluded_for_promote(recv, promote)) {
+    /* bop_find_arg looks rows up by their exact key, and plain-array rows
+       are keyed BOP_ANY_ARRAY (a family, not a real TyKind) -- a concrete
+       recv (TY_INT_ARRAY, ...) must be mapped to its family first, the
+       same way every other bop_rows caller (infer_array_call,
+       an_bop_find's own callers) already does, or the lookup finds
+       nothing for every plain-array name despite the row existing. */
+    TyKind ak[2] = { arg0, arg1 };
+    const BuiltinOp *op = bop_find_arg(bop_family_of(recv), name, argc,
+                                        /*has_block=*/0, bop_arg01_kind, ak);
+    if (op && op->result != TY_UNKNOWN) { *out = bop_result(op, recv); if (row) *row = op; return 1; }
   }
   return 0;
 }
@@ -691,6 +877,15 @@ int ty_object_protocol_answers(TyKind rt, TyKind at, const char *name, int argc)
 const TyTraits ty_traits[TY_TRAITS_N] = {
 #include "ty_traits.inc"
 };
+/* --int-overflow=promote holds a Rational boxed (infer_type), and a value
+   rendered as one may be the box already, a big Rational's: boxed through
+   sp_promote_rat_box, which boxes an sp_Rational and passes a box on. The
+   rest of the row is the table's. */
+int g_traits_promote = 0;
+const TyTraits ty_traits_promote_rational = {
+  "sp_Rational", "(sp_Rational){0}", "(sp_Rational){0}", NULL, "sp_promote_rat_box", NULL,
+  "sp_promote_rat_box($e)", NULL, NULL, "(*(sp_Rational *)($e).v.p)", "(*(sp_Rational *)($e).v.p)",
+  NULL, NULL, NULL, NULL, 0, 0, 1, 1, 3, 10 };
 
 /* A builtin value's type, which lays out no instance variables: a String,
    a number, true, false, nil, a Symbol, a Range (of any endpoints), a Random,
@@ -708,5 +903,5 @@ int ty_builtin_ivar_less(TyKind t) {
    it dispatches by the runtime class (emit_exc_ivar_call), and only a copy
    of it reads this predicate. */
 int ty_bivar_keyed(TyKind t) {
-  return t == TY_RANDOM || t == TY_EXCEPTION || ty_is_array(t) || ty_is_hash(t);
+  return t == TY_RANDOM || t == TY_EXCEPTION || t == TY_STRING || t == TY_STRBUF || ty_is_array(t) || ty_is_hash(t);
 }

@@ -98,6 +98,7 @@ typedef enum {
   BOPE_HASH_INVERT,       /* Hash#invert */
   BOPE_HASH_FLATTEN,      /* Hash#flatten, #flatten(depth) */
   BOPE_HASH_TO_A,         /* to_a / entries */
+  BOPE_HASH_NIL_RECV,     /* length / size / count / empty?: a receiver that may be nil is tested under the name as written */
   BOPE_HASH_SORT,         /* sort, no block */
   BOPE_HASH_FIRST,        /* first, no block */
   BOPE_HASH_TAKE,         /* first(n) / take(n), no block */
@@ -128,6 +129,7 @@ typedef enum {
   BOPE_ARRAY_PUSH,        /* Array#push / << / append of one value (poly) */
   BOPE_ARRAY_INSERT_N,    /* Array#insert(i, v...) (poly) */
   BOPE_ARRAY_TRANSPOSE,   /* Array#transpose (poly) */
+  BOPE_ARRAY_NIL_RECV,    /* Array#length / size / count / empty? / to_a / entries: a receiver that may be nil is tested */
   BOPE_ARRAY_ASSOC,       /* Array#assoc / #rassoc (poly) */
   BOPE_ARRAY_COMBINATION, /* Array#combination / #permutation and the repeated forms, blockless */
   BOPE_ARRAY_PRODUCT,     /* Array#product without a block */
@@ -158,6 +160,7 @@ typedef enum {
   BOPE_FLOAT_RATIONALIZE,
   BOPE_STRING_SCAN_CHECKED,
   BOPE_STRING_SLICE,     /* String#slice!: lvalue and pattern-dependent */
+  BOPE_STRING_DEDUP,     /* String#dedup: -@ under the name a nil receiver is raised with */
   BOPE_STRING_SCRUB_BLOCK, /* String#scrub with a block */
   BOPE__COUNT
 } BopEmit;
@@ -178,7 +181,7 @@ typedef struct BuiltinOp {
   const char *arg;        /* BOPE_TEMPLATE's C text */
   BopKinds arg0, arg1;    /* the kinds the first and second argument may
                              have (BOP_K), or 0 for any */
-  unsigned char flags;    /* BOPF_* */
+  unsigned short flags;   /* BOPF_* */
   unsigned char stage;    /* the codegen lookup that emits the row: 0, the
                              default, is the one each family has always had;
                              a family whose arms sit at several distant
@@ -189,7 +192,12 @@ typedef struct BuiltinOp {
 
 /* The row answers for a boxed (poly) receiver too, behind a run-time class
    check: emit_poly_builtin_method emits these names unboxed, so inference
-   types the call with the row's result (bop_find_boxed). */
+   types the call with the row's result (bop_find_boxed). A String row
+   carries it for a name that answers the same kind whatever the box holds
+   (inspect, include?): the String row stands for the boxed value, and
+   --plan-check accepts it for the row of the kind codegen emits the call
+   typed with (a yield read per call site, a face) when both state the same
+   result. */
 #define BOPF_BOXED 1
 /* The call answers its receiver: the same object, not a copy, and so an
    instance of a subclass answers that instance (<<, push, concat, replace,
@@ -239,12 +247,37 @@ typedef struct BuiltinOp {
    kinds, and they cover only the first two arguments. */
 #define BOPF_ARGS_BUILTIN 64
 /* The row's result is TY_UNKNOWN because inference types the call in a rule
-   of its own (Method#receiver is the type of the Method's bound receiver,
-   which a result kind cannot say), and the row only gives codegen its
-   emitter. --plan-check expects inference to have answered such a call
-   without a row, as long as the call was typed; a TY_UNKNOWN row without
-   the flag is a call the table does not type yet. */
+   of its own, from a fact of this call that no kind carries, and the row
+   only gives codegen its emitter. Method#receiver is the type of the
+   Method's bound receiver expression; a Float range's begin, first, min and
+   last are the endpoint the Range literal wrote ((1..2.5).begin is the
+   Integer 1); String#scan reads the pattern literal's source for capture
+   groups and String#unpack1 the format literal; Rational#round, truncate,
+   floor and ceil with a digit count answer an Integer or a Rational by the
+   value of the Integer literal that gives it (a positive count keeps the
+   Rational; a count that is no literal is boxed). A call whose answer is a
+   function of the receiver's and the arguments' kinds does not belong
+   here: it states its kind. --plan-check expects inference to have
+   answered such a call without a row, as long as the call was typed; a
+   TY_UNKNOWN row without the flag is a call the table does not type yet.
+
+   Only those rows set it: most TY_UNKNOWN rows whose answer genuinely is
+   hand-written elsewhere (`[]`, `slice`, `[]=`, `==`, `fetch`'s 2-arg
+   form, ...) were never given the flag either, so its absence is not
+   reliable evidence that a row is unfinished rather than a deliberate defer
+   -- check what reads the row (an arm in
+   infer_array_call/infer_numeric_call/infer_hash_call, or a plan-check
+   expectation) before assuming a bare TY_UNKNOWN is a gap to close. */
 #define BOPF_INFERRED 128
+
+/* A blockless row that answers the call unless the call is the receiver of
+   a call with a block (`arr.select.with_index { }`; `.each { }` excepted,
+   which runs the method the Enumerator came from): the chain emitters own
+   that shape and the inner call is answered by the rules after the lookup,
+   so inference does not read the row for it. The row states what the call
+   answers anywhere else, an Enumerator. Only the rows that carry the flag
+   pay for the test, which walks the calls. */
+#define BOPF_NOT_CHAIN_RECV 256
 
 /* A row's recv may name a family of kinds rather than one; a caller looks
    the family up with the family's value. Not a TyKind any value has. */
@@ -270,8 +303,43 @@ typedef struct BuiltinOp {
                                            Str or Float array's boxed (nil on a miss),
                                            any other's an Integer */
 #define BOPR_ARRAY_TUPLES ((TyKind)-19) /* blockless combination & co.: a poly array
-                                           materializes the tuples, any other array
-                                           answers an Enumerator */
+                                           whose position keeps the tuples (BOPX_KEPT)
+                                           materializes them, any other call answers an
+                                           Enumerator */
+#define BOPR_ARRAY_PLUS  ((TyKind)-20)  /* Array#+(other): bop_result_args. An Array
+                                           of the receiver's kind or an untyped one
+                                           (an empty literal) keeps the receiver's
+                                           kind, another Array's gives a poly array,
+                                           a boxed operand is boxed; any other
+                                           operand states no kind */
+#define BOPR_ARRAY_SETOP ((TyKind)-21)  /* Array#& | - and union, intersection and
+                                           difference, folded over every operand:
+                                           the receiver's kind when each keeps it,
+                                           else a poly array if each is an Array
+                                           or boxed, else no kind */
+#define BOPR_ASSOC       ((TyKind)-22)  /* Array#assoc / #rassoc(v): a poly array's
+                                           matching sub-array is a poly array; an
+                                           Integer, Float, String, Symbol or boolean
+                                           array holds none to match, the boxed nil;
+                                           any other array states no kind */
+#define BOPR_ARG0        ((TyKind)-23)  /* the first argument's kind (Hash#default=:
+                                           it answers the value it was given) */
+#define BOPR_ARG1        ((TyKind)-24)  /* the second argument's kind
+                                           (instance_variable_set(name, value)) */
+#define BOPR_HASH_REPLACE ((TyKind)-25) /* Hash#replace(other): the receiver's kind
+                                           when other is the same Hash kind, else
+                                           the general hash. replace returns self,
+                                           but self's slot widens to the general
+                                           hash when other is another variant or a
+                                           boxed one (which holds whichever variant
+                                           the value really is), so a `r = h.replace(o)`
+                                           capture agrees from the first fixpoint
+                                           round (#2374, #3975) */
+#define BOPR_HASH_STORE  ((TyKind)-26)  /* Hash#[]= and store(key, value): the
+                                           value's kind unified with the Hash's
+                                           value kind */
+#define BOPR_ARRAY_SUM_SEED ((TyKind)-27) /* blockless Array#sum(seed): the seed
+                                           and element kinds, in the build mode */
 
 /* argc_max of a row that takes any number of arguments */
 #define BOP_ARGC_ANY 127
@@ -315,6 +383,20 @@ TyKind bop_family_of(TyKind rt);
 /* What the call answers on a receiver of kind rt: the row's result, with a
    derived result (BOPR_*) worked out from rt. */
 TyKind bop_result(const BuiltinOp *op, TyKind rt);
+/* bop_result for the rows whose answer also turns on the call's operands'
+   kinds (BOPR_ARRAY_PLUS, BOPR_ARRAY_SETOP, BOPR_ARG0, BOPR_ARG1,
+   BOPR_HASH_REPLACE, BOPR_HASH_STORE); any other row answers as bop_result
+   does. arg_of(ud, i) answers argument i's kind, as for
+   bop_find_arg, and is called only for those rows. TY_UNKNOWN where the row
+   states no kind for these operands. It reads no node: the caller brings
+   the kinds. BOPR_ARRAY_SUM_SEED reads the seed through fold_seed_kind at
+   the caller and takes the integer overflow mode, and BOPR_ARRAY_TUPLES
+   whether the call keeps its tuples, through facts (BOPX_*). */
+TyKind bop_result_args(const BuiltinOp *op, TyKind rt, int argc, BopArgKind arg_of, const void *ud, int facts);
+/* Facts about the call that no operand's kind carries, for bop_result_args */
+#define BOPX_PROMOTE 1  /* --int-overflow=promote */
+#define BOPX_KEPT    2  /* a blockless combination & co. whose position keeps
+                           the tuples as an Array (an_blockless_tuples_kept) */
 
 /* The BOPF_BOXED row of kind rt for `name`, or NULL. */
 const BuiltinOp *bop_find_boxed(TyKind rt, const char *name, int argc, int has_block);
@@ -435,6 +517,14 @@ int bop_share_pure_anywhere(const char *name, int argc, int has_block);
 int builtin_ops_share_check(void);
 /* Exact name lookup, including iterator contracts. */
 int bop_share_named(TyKind fam, const char *name);
+/* the share row every builtin receiver agrees on for the name: Object's own
+   row, else the String, Array and Hash rows when all three have one and
+   they agree; 0 when they differ or any is missing */
+int bop_share_uniform(const char *name);
+/* The distinct share kinds of `name` across Object's row and the String,
+   Array and Hash rows, whichever of those the receiver turns out to be:
+   written to out[0..max), their count answered, 0 when no row names it. */
+int bop_share_kinds(const char *name, int *out, int max);
 /* Hand and iterator contracts only: generated observations cover typed receivers. */
 int bop_share_boxed(TyKind fam, const char *name);
 /* A String method whose value is its receiver, or nil: a bang method that

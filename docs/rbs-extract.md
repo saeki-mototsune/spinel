@@ -207,9 +207,27 @@ the field layouts coincide by construction.
 | `Hash[Symbol, <any>]`                  | `sym_poly_hash`                       |
 | `T?`                                   | `<T>?`  (recursive)                   |
 | `T \| nil` / `nil \| T`                | `<T>?`                                |
+| `name` of a `type name = T`            | what `T` maps to                      |
+| `{ name: T, ... }` (a record)          | `sym_poly_hash`                       |
+| `{ "name" => T, ... }`                 | `str_poly_hash`                       |
 
 The analyzer has one Symbol-keyed Hash kind, the poly-valued one, so every
 `Hash[Symbol, V]` maps to it and the values stay boxed.
+
+A type alias (`type patch_t = Array[untyped]`, at the top level or in a
+class or module) stands for its type wherever its name is referenced,
+in the file that declares it or another: the extractor declares every
+alias, then maps their types to a fixpoint, before it reads a signature,
+so an alias whose type names another alias follows it, and a name
+resolves to the nearest declaration (as a class name does, below)
+whatever the order of the declarations or the files. A generic alias
+(`type listed[T] = Array[T]`), an alias whose type is out of the subset
+and an alias in a cycle stay out of it.
+
+A record is the Hash its fields make: Symbol-keyed for `name:` and
+`:name =>` fields, String-keyed for `"name" =>` fields, with the values
+boxed whatever the field types say, as `Hash[Symbol, V]` is. A record
+with keys of another class, or of both, maps to `poly`.
 
 ### `Array[Array[Integer]]` and `Array[Array[Float]]` on an instance variable
 
@@ -255,11 +273,11 @@ symbol arrays, object arrays, or of tables.
 
 `obj_Foo_ptr_array` is a request, not a pin. The unboxed object array
 (`sp_PtrArray`) has emitters for only a few operations -- `[]`, `[]=`,
-`push`/`<<`, `length`/`size`, `empty?`, `first`/`last`, and the no-block
-`min`/`max`/`sort` when `Foo` has `<=>` -- so the compiler narrows an ivar to
-it only when every use is one of those, from the class's own instance
-methods or through its `attr_reader` on a receiver statically of that
-class. That analysis runs with or without the seed (a `@items = Array.new(n)
+`push`/`<<`, `pop`, `shift`, `delete_at`, `clear`, `length`/`size`, `empty?`,
+`first`/`last`, and the no-block `min`/`max`/`sort` when `Foo` has `<=>` --
+so the compiler narrows an ivar to it only when every use is one of those,
+from the class's own instance methods or through its `attr_reader` on a
+receiver statically of that class. That analysis runs with or without the seed (a `@items = Array.new(n)
 { Foo.new }` read as `h.items[i]` in a loop narrows on its own); the seed's
 effect is a warning when the request cannot be honoured, naming the ivar,
 so the boxed fallback is never silent.
@@ -314,6 +332,41 @@ reads), and the `self` of a `def self?.` method is both, so `-`. In a
 module `self` and `instance` are the including object, which the seed
 cannot name, so `-`.
 
+### A container return whose body answers a boxed value
+
+A container return seed (`-> Hash[String, String]`, `-> Array[Integer]`,
+`Hash[..]?` and `Array[..]?` too) whose body answers a value only the run
+time types -- a read out of a Hash of mixed values, say -- keeps the box:
+the container it holds has a form (`Hash[String, String]` can be held with
+String values, or with boxed keys; `Array[Integer]` can be an Array built
+with mixed values that holds only Integers) the compiler cannot know, and
+unboxing it into the seed's form would be a copy, a different object from
+the one the method answers. What the seed still says is that the value is
+a Hash (an Array), and that is checked:
+
+```ruby
+CONF = { "a" => { "x" => "1" }, "b" => 2 }
+
+class Cfg
+  #: (String) -> Hash[String, String]
+  def for(key) = CONF[key]
+end
+
+Cfg.new.for("a")["x"]   # => "1"
+Cfg.new.for("b")        # TypeError: the return value of Cfg#for is declared a Hash but is Integer
+```
+
+The check runs on every return of the method, explicit or not, in every
+build: with or without `-DSP_RBS_CHECK`, a value that is no Hash (no Array,
+for an Array seed; nil passes only for `Hash[..]?` and `Array[..]?`)
+raises `TypeError`. A container of any form passes, and stays the object
+the body answered. A parameter seeded a container that is handed a box
+keeps the box too, the caller's object, unchecked. The analysis then takes a call of
+the method to answer no proc or Method, so a String handed to `[]` on its
+result is not refused as one a proc might append to. A body whose Hashes
+the compiler does know keeps the seed's form, as before; a yielding
+method, which can be spliced into its caller, keeps the box unchecked.
+
 A method that only entry points call (the public method of a library,
 with no call site in the program) has no call site to bind its
 parameters, so without a seed each of them widens to untyped. Dropping
@@ -342,9 +395,8 @@ stands on its own.
 - Interfaces (`_Foo`)
 - Intersections (`T & U`)
 - Literal types (`:foo`, `42`, `"x"`)
-- Type aliases
+- Generic type aliases (`type listed[T] = Array[T]`)
 - Type variables (generics with parameters)
-- Records (`{ name: T, ... }`)
 - Tuples (`[T, U]`)
 - Proc types (`^(T) -> U`)
 - `Hash[K, V]` where K is not `String` or `Symbol`
@@ -404,4 +456,5 @@ OriPekelman/tep#6):
 - Multi-overload resolution
 - Generics with type variables
 - Mixin ancestry from `include` / `extend`
-- Return-type pinning where the body would otherwise cascade-widen
+- Return-type pinning where the body would otherwise cascade-widen, other
+  than a Hash return's check (above)

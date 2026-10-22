@@ -8,6 +8,7 @@
 #include "codegen_poly.h"
 #include "builtin_ops.h"
 #include "call_plan.h"
+#include "value_pos.h"
 #include "codegen_call_arms.h"
 
 /* a Regexp literal's match / match? / ===, the match family on a String, gsub, and String#% */
@@ -89,6 +90,14 @@ static void emit_match_block_body(Compiler *c, const int *body, int n, int tr, B
     if (sval.p) buf_puts(b, sval.p);
     free(spre.p); free(sval.p);
   }
+}
+
+/* A `match` the String arms answer: its MatchData (or NULL), boxed where
+   the call itself is typed boxed (a receiver known only at run time, whose
+   slot took the box), as the value's other readers take it. */
+static void emit_matchdata_as_call(Compiler *c, int id, const char *md, Buf *b) {
+  if (repr_of(c, id).kind == RK_BOXED) emit_boxed_text(c, TY_MATCHDATA, md ? md : "NULL", b);
+  else buf_puts(b, md ? md : "NULL");
 }
 
 int emit_call_regexp_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt, TyKind a0) {
@@ -347,9 +356,27 @@ no_gsub_enum:
        (emit_poly_cls_value_builtin), where it handed the class to the
        matcher as its String */
     if (are >= 0 && sp_streq(name, "match?") && rt == TY_STRING) {
-      if (argc == 1) { buf_printf(b, "sp_re_match_p(sp_re_pat_%d, ", are); emit_expr(c, recv, b); buf_puts(b, ")"); return 1; }
-      buf_printf(b, "sp_str_re_match_p_at(sp_re_pat_%d, ", are); emit_expr(c, recv, b);
-      buf_puts(b, ", "); emit_expr(c, argv[1], b); buf_puts(b, ")");
+      /* the matcher takes a NULL subject for no match, as Regexp#match?(nil)
+         answers: a receiver that can be nil raises nil's NoMethodError first */
+      int nn = !recv_never_nil(c, recv);
+      if (argc == 1) {
+        buf_printf(b, "sp_re_match_p(sp_re_pat_%d, %s", are, nn ? "sp_nil_recv_named(" : "");
+        emit_expr(c, recv, b); buf_puts(b, nn ? ", \"match?\"))" : ")");
+        return 1;
+      }
+      /* a position that runs code runs ahead of the test, as CRuby runs the
+         arguments ahead of the missing method: the receiver and it are held */
+      if (nn && subtree_has_side_effect(c, argv[1]) && !arg_ran_first(argv[1], 0)) {
+        int tr = ++g_tmp, tp = ++g_tmp;
+        buf_printf(b, "({ const char *_t%d = ", tr); emit_expr(c, recv, b); buf_puts(b, "; ");
+        if (operand_may_allocate(c, argv[1])) buf_printf(b, "SP_GC_ROOT_STR(_t%d); ", tr);
+        buf_printf(b, "sp_int _t%d = ", tp); emit_int_expr(c, argv[1], b); buf_puts(b, "; ");
+        nil_recv_check("match?", tr, b);
+        buf_printf(b, " sp_str_re_match_p_at(sp_re_pat_%d, _t%d, _t%d); })", are, tr, tp);
+        return 1;
+      }
+      buf_printf(b, "sp_str_re_match_p_at(sp_re_pat_%d, %s", are, nn ? "sp_nil_recv_named(" : ""); emit_expr(c, recv, b);
+      buf_puts(b, nn ? ", \"match?\"), " : ", "); emit_int_expr(c, argv[1], b); buf_puts(b, ")");
       return 1;
     }
     /* a program class answers match itself: the boxed dispatch has its arm,
@@ -374,15 +401,18 @@ no_gsub_enum:
       return 1;
     }
     if (are >= 0 && sp_streq(name, "match")) {
+      Buf mb; memset(&mb, 0, sizeof mb);
       if (argc == 1) {
         /* recv is the subject string; emit_str_expr coerces a poly/nilable
            receiver (`@message.subject.match(/re/)`) to the const char* slot */
-        buf_printf(b, "sp_re_matchdata(sp_re_pat_%d, ", are); emit_str_expr(c, recv, b); buf_puts(b, ")");
+        buf_printf(&mb, "sp_re_matchdata(sp_re_pat_%d, ", are); emit_str_expr(c, recv, &mb); buf_puts(&mb, ")");
       }
       else {
-        buf_printf(b, "sp_re_matchdata_at(sp_re_pat_%d, ", are); emit_str_expr(c, recv, b);
-        buf_puts(b, ", "); emit_int_expr(c, argv[1], b); buf_puts(b, ")");
+        buf_printf(&mb, "sp_re_matchdata_at(sp_re_pat_%d, ", are); emit_str_expr(c, recv, &mb);
+        buf_puts(&mb, ", "); emit_int_expr(c, argv[1], &mb); buf_puts(&mb, ")");
       }
+      emit_matchdata_as_call(c, id, mb.p, b);
+      free(mb.p);
       return 1;
     }
     /* String#match?/#match with a String pattern argument: CRuby treats the
@@ -393,10 +423,19 @@ no_gsub_enum:
         (sp_streq(name, "match?") || sp_streq(name, "match"))) {
       int ts = ++g_tmp;
       const char *fn = sp_streq(name, "match?") ? "sp_re_match_p" : "sp_re_matchdata";
+      /* (match? with a receiver that can be nil holds it and tests it once
+         the pattern has run, ahead of the compile: nil's NoMethodError, not
+         the pattern's RegexpError) */
+      int tr = sp_streq(name, "match?") && !recv_never_nil(c, recv) ? ++g_tmp : 0;
+      if (tr) { buf_printf(b, "({ const char *_t%d = ", tr); emit_expr(c, recv, b); buf_printf(b, "; SP_GC_ROOT_STR(_t%d); ", tr); }
       buf_printf(b, "({ const char *_t%d = ", ts); emit_str_expr(c, argv[0], b);
-      buf_printf(b, "; mrb_regexp_pattern *_t%dp = re_compile(_t%d, (int64_t)(_t%d ? sp_str_byte_len(_t%d) : 0), 0); ",
+      buf_puts(b, "; ");
+      if (tr) { nil_recv_check("match?", tr, b); buf_puts(b, " "); }
+      buf_printf(b, "mrb_regexp_pattern *_t%dp = re_compile(_t%d, (int64_t)(_t%d ? sp_str_byte_len(_t%d) : 0), 0); ",
                  ts, ts, ts, ts);
-      buf_printf(b, "%s(_t%dp, ", fn, ts); emit_expr(c, recv, b); buf_puts(b, "); })");
+      buf_printf(b, "%s(_t%dp, ", fn, ts);
+      if (tr) buf_printf(b, "_t%d); }); })", tr);
+      else { emit_expr(c, recv, b); buf_puts(b, "); })"); }
       return 1;
     }
   }
@@ -468,9 +507,13 @@ no_gsub_enum:
       int is_regex_val_arg = !is_interp_arg && argc >= 1 && comp_ntype(c, argv[0]) == TY_REGEX
                              && a0nt && !sp_streq(a0nt, "RegularExpressionNode")
                              && !ty_is_object(rt);
-      /* a boxed receiver's match? that a class answers too (StringScanner's)
-         is the boxed dispatch's, as for a literal pattern above */
-      int poly_claimed = rt == TY_POLY && sp_streq(name, "match?") && poly_name_user_claimed(c, name, argc);
+      /* a boxed receiver's match? or match that a class answers too
+         (StringScanner's match?, OptionParser::Completion's match) is the
+         boxed dispatch's, as for a literal pattern above: the String arm
+         converted a receiver of that class to a String (TypeError) */
+      int poly_claimed = rt == TY_POLY &&
+                         (sp_streq(name, "match?") || sp_streq(name, "match")) &&
+                         poly_name_user_claimed(c, name, argc);
       /* Only the match family is answered below. The pattern's setup goes
          ahead of the statement as it is emitted, so building it for any other
          name (sub, gsub, scan, ...) and then declining left it there: an
@@ -517,11 +560,32 @@ no_gsub_enum:
             /* emit_str_expr, not emit_expr: a poly receiver (a String read out
                of a widened container) needs coercing into the const char* slot
                the same way the precompiled-literal arms do it (#3389). */
-            else if (argc == 1) { buf_printf(b, "sp_re_match_p(%s, ", rp.p); emit_str_expr(c, recv, b); buf_puts(b, ")"); }
+            /* (a String receiver that can be nil raises, as the literal
+               pattern's arm has it: held with the pattern and the position
+               when one of them runs code, and tested once they have run) */
+            else if (rt == TY_STRING && !recv_never_nil(c, recv) &&
+                     ((subtree_has_side_effect(c, argv[0]) && !arg_ran_first(argv[0], 0)) ||
+                      (argc == 2 && subtree_has_side_effect(c, argv[1]) && !arg_ran_first(argv[1], 0)))) {
+              int tr = ++g_tmp, tq = ++g_tmp, tp = argc == 2 ? ++g_tmp : 0;
+              buf_printf(b, "({ const char *_t%d = ", tr); emit_str_expr(c, recv, b); buf_puts(b, "; ");
+              if (operand_may_allocate(c, argv[0]) || (tp && operand_may_allocate(c, argv[1])))
+                buf_printf(b, "SP_GC_ROOT_STR(_t%d); ", tr);
+              buf_printf(b, "mrb_regexp_pattern *_t%d = %s; ", tq, rp.p);
+              if (tp) { buf_printf(b, "sp_int _t%d = ", tp); emit_int_expr(c, argv[1], b); buf_puts(b, "; "); }
+              nil_recv_check("match?", tr, b);
+              if (tp) buf_printf(b, " sp_str_re_match_p_at(_t%d, _t%d, _t%d); })", tq, tr, tp);
+              else buf_printf(b, " sp_re_match_p(_t%d, _t%d); })", tq, tr);
+            }
+            else if (argc == 1) {
+              int nn = rt == TY_STRING && !recv_never_nil(c, recv);
+              buf_printf(b, "sp_re_match_p(%s, %s", rp.p, nn ? "sp_nil_recv_named(" : "");
+              emit_str_expr(c, recv, b); buf_puts(b, nn ? ", \"match?\"))" : ")");
+            }
             /* match?(re, pos) starts the scan at pos */
             else {
-              buf_printf(b, "sp_str_re_match_p_at(%s, ", rp.p); emit_str_expr(c, recv, b);
-              buf_puts(b, ", "); emit_int_expr(c, argv[1], b); buf_puts(b, ")");
+              int nn = rt == TY_STRING && !recv_never_nil(c, recv);
+              buf_printf(b, "sp_str_re_match_p_at(%s, %s", rp.p, nn ? "sp_nil_recv_named(" : ""); emit_str_expr(c, recv, b);
+              buf_puts(b, nn ? ", \"match?\"), " : ", "); emit_int_expr(c, argv[1], b); buf_puts(b, ")");
             }
             if (bx) buf_puts(b, ")");
             free(rp.p); return 1;
@@ -564,11 +628,14 @@ no_gsub_enum:
           if (sp_streq(name, "match") && (argc == 1 || argc == 2)) {
             /* emit_str_expr, not emit_expr: a poly receiver needs coercing into
                the const char* slot, as the precompiled-literal arms do (#3389) */
-            if (argc == 1) { buf_printf(b, "sp_re_matchdata(%s, ", rp.p); emit_str_expr(c, recv, b); buf_puts(b, ")"); }
+            Buf mb; memset(&mb, 0, sizeof mb);
+            if (argc == 1) { buf_printf(&mb, "sp_re_matchdata(%s, ", rp.p); emit_str_expr(c, recv, &mb); buf_puts(&mb, ")"); }
             else {
-              buf_printf(b, "sp_re_matchdata_at(%s, ", rp.p); emit_str_expr(c, recv, b);
-              buf_puts(b, ", "); emit_int_expr(c, argv[1], b); buf_puts(b, ")");
+              buf_printf(&mb, "sp_re_matchdata_at(%s, ", rp.p); emit_str_expr(c, recv, &mb);
+              buf_puts(&mb, ", "); emit_int_expr(c, argv[1], &mb); buf_puts(&mb, ")");
             }
+            emit_matchdata_as_call(c, id, mb.p, b);
+            free(mb.p);
             free(rp.p); return 1;
           }
         }
@@ -781,7 +848,7 @@ no_gsub_enum:
       /* the one-element list is held by `_fa` alone while an argument that
          allocates is built (`"%5s|" % ("q" + i.to_s)`); one that already
          ran into a temp was built before the list */
-      int an = arg_ran_first(argv[0], 0) ? argv[0] : unwrap_parens(c, argv[0]);
+      int an = arg_ran_first(argv[0], 0) ? argv[0] : nt_paren_single(c->nt, argv[0]);
       /* not asked of a statement left alone, and the walk of the argument
          (subtree_is_pure_read) last */
       int runs = !(!fend && str_format_left_alone(c, recv, argv[0])) &&
@@ -902,8 +969,8 @@ int emit_call_regexp_class_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
      A String operand is regexp-escaped; a Regexp operand (literal or a constant
      bound to one) contributes its source wrapped in CRuby's `(?on-off:src)` option
      group so its flags survive; a single Array argument is expanded into its
-     elements. A runtime Regexp value has no recoverable source (patterns compile
-     to bytecode), so that lone form still loud-rejects. */
+     elements. A Regexp built at run time (`Regexp.compile(s)`, a value held
+     in a variable) keeps its source too, and joins by the same #to_s form. */
   if (recv >= 0 && argc >= 0 && sp_streq(name, "union") &&
       nt_type(nt, recv) && sp_streq(nt_type(nt, recv), "ConstantReadNode") &&
       nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Regexp")) {
@@ -946,11 +1013,24 @@ int emit_call_regexp_class_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
        flags verbatim, no option-group wrapper). */
     if (nops == 1 && re_lit_src(c, ops[0]) && emit_regex_pat_to_buf(c, ops[0], b))
       return 1;
+    /* a lone Regexp built at run time is the answer itself, as a literal is */
+    if (nops == 1 && !re_lit_src(c, ops[0]) && repr_of(c, ops[0]).kind != RK_BOXED &&
+        repr_of(c, ops[0]).as_ty == TY_REGEX) {
+      emit_expr(c, ops[0], b);
+      return 1;
+    }
     /* a lone boxed element is told apart at run time as the lone argument
        is; `*[v]` is the argument v itself, so an Array there joins too */
     if (nops == 1 && !re_lit_src(c, ops[0]) && repr_of(c, ops[0]).kind == RK_BOXED) {
       buf_puts(b, nt_kind(nt, argv[0]) == NK_SplatNode ? "sp_re_union_boxed(" : "sp_re_union_one(");
       emit_expr(c, ops[0], b); buf_puts(b, ")");
+      return 1;
+    }
+    /* ...and so is a lone operand of another kind, boxed for the check: a
+       Symbol is escaped by name, anything else is the TypeError */
+    if (nops == 1 && !re_lit_src(c, ops[0]) && repr_of(c, ops[0]).as_ty != TY_STRING &&
+        nt_kind(nt, ops[0]) != NK_SplatNode) {
+      buf_puts(b, "sp_re_union_one("); emit_boxed(c, ops[0], b); buf_puts(b, ")");
       return 1;
     }
     int ts = ++g_tmp, tp = ++g_tmp;
@@ -971,9 +1051,14 @@ int emit_call_regexp_class_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
       else {
         Repr ar = repr_of(c, ops[i]);
         TyKind at = ar.as_ty;
-        if (at != TY_STRING && ar.kind != RK_BOXED)
-          unsupported(c, id, "Regexp.union operand without a compile-time source (runtime Regexp or non-String value)");
+        if (nt_kind(nt, ops[i]) == NK_SplatNode)
+          unsupported(c, id, "Regexp.union operand splatted beside others");
         if (ar.kind == RK_BOXED) { buf_puts(&ab, "sp_re_union_operand("); emit_expr(c, ops[i], &ab); buf_puts(&ab, ")"); }
+        /* any other kind is checked boxed: a Symbol or a number among
+           several operands is CRuby's TypeError */
+        else if (at != TY_STRING && at != TY_REGEX) { buf_puts(&ab, "sp_re_union_operand("); emit_boxed(c, ops[i], &ab); buf_puts(&ab, ")"); }
+        /* a Regexp built at run time: its (?on-off:src) form, as a literal's */
+        else if (at == TY_REGEX) { buf_puts(&ab, "sp_re_to_s_str((void *)("); emit_expr(c, ops[i], &ab); buf_puts(&ab, "))"); }
         else { buf_puts(&ab, "sp_re_escape("); emit_expr(c, ops[i], &ab); buf_puts(&ab, ")"); }
       }
       emit_indent(g_pre, g_indent);
@@ -1126,7 +1211,7 @@ int emit_call_symbol_bool_string_arms(Compiler *c, int id, Buf *b, const NodeTab
       int tl = ++g_tmp;
       /* chomp: true keyword arg uses the _chomp variant */
       int eline_chomp = 0, cv = -1;
-      int kwh = argc >= 1 && argv && nt_type(nt, argv[argc - 1]) && sp_streq(nt_type(nt, argv[argc - 1]), "KeywordHashNode") ? argv[argc - 1] : -1;
+      int kwh = nt_argv_kwh(nt, argv, argc);
       if (kwh >= 0) {
         cv = struct_kwarg_value(c, kwh, "chomp");
         eline_chomp = kw_flag_static(c, cv);
@@ -1183,12 +1268,20 @@ int emit_call_symbol_bool_string_arms(Compiler *c, int id, Buf *b, const NodeTab
       }
     }
     else {
-      buf_printf(b, "for (sp_int _t%d = 0; _t%d < sp_str_length(_t%d); _t%d++) { ", ti, ti, ts, ti);
+      /* walked by byte offset, each turn stepping over one character: taking
+         the i-th character counted the string from its start every turn once
+         a multibyte character made it not fixed width, quadratic in its length */
+      int tn = ++g_tmp;
+      buf_printf(b, "size_t _t%d = sp_str_byte_len(_t%d); ", tn, ts);
+      buf_printf(b, "for (size_t _t%d = 0; _t%d < _t%d; ) { ", ti, ti, tn);
       if (p0) {
-        if (p0_box_poly_ech) buf_printf(b, "lv_%s = sp_box_str(sp_str_char_at_or_nil(_t%d, _t%d)); ", p0, ts, ti);
-        else if (p0_handle_ech) buf_printf(b, "lv_%s = sp_String_new_shared(sp_str_char_at_or_nil(_t%d, _t%d)); ", p0, ts, ti);
-        else buf_printf(b, "lv_%s = sp_str_char_at_or_nil(_t%d, _t%d); ", p0, ts, ti);
+        char step[96];
+        snprintf(step, sizeof step, "sp_str_char_step(_t%d, _t%d, &_t%d)", ts, tn, ti);
+        if (p0_box_poly_ech) buf_printf(b, "lv_%s = sp_box_str(%s); ", p0, step);
+        else if (p0_handle_ech) buf_printf(b, "lv_%s = sp_String_new_shared(%s); ", p0, step);
+        else buf_printf(b, "lv_%s = %s; ", p0, step);
       }
+      else buf_printf(b, "_t%d += sp_str_char_width(_t%d, _t%d, _t%d); ", ti, ts, tn, ti);
     }
     emit_iter_loop_stmts(c, body, b, 0);
     if (p0 && tsv_ech > 0) buf_printf(b, " lv_%s = _t%d;", p0, tsv_ech);
@@ -1307,7 +1400,7 @@ int emit_str_append_chain_handle(Compiler *c, int id, Buf *b) {
   if (recv < 0 || argc < 1 || nt_ref(nt, id, "block") >= 0) return 0;
   TyKind rt = comp_ntype(c, recv);
   if (rt != TY_STRING && rt != TY_STRBUF) return 0;
-  int first = unwrap_parens(c, recv);
+  int first = nt_paren_single(c->nt, recv);
   Repr rp = repr_of(c, first);
   if (rp.handle && rp.kind == RK_STRBUF) return 0;
   int links[64], nlinks = 0, cur = recv, calls = 0;
@@ -1378,7 +1471,7 @@ int emit_string_handle_append(Compiler *c, int id, Buf *b, const char *name, int
   if (repr_share_rule(c) && argc == 0 && is_string_append_or_prepend(name) &&
       bop_answers_self(TY_STRING, name, argc, 0) == BOPF_SELF) {
     Buf ref; memset(&ref, 0, sizeof ref);
-    if (strbuf_recv_handle(c, id, unwrap_parens(c, recv), &ref)) {
+    if (strbuf_recv_handle(c, id, nt_paren_single(c->nt, recv), &ref)) {
       int t = ++g_tmp;
       buf_printf(b, "({ sp_String *_t%d = %s; if (sp_String_is_frozen(_t%d)) "
                     "sp_raise_frozen_str(sp_String_cstr(_t%d)); ", t, ref.p, t, t);
@@ -1394,7 +1487,7 @@ int emit_string_handle_append(Compiler *c, int id, Buf *b, const char *name, int
        below would emit an invalid assignment (#2020). prepend replaces the
        buffer with args-then-contents, keeping the handle stable (#3227). */
     { Buf sref0; memset(&sref0, 0, sizeof sref0);
-      int sr = unwrap_parens(c, recv);
+      int sr = nt_paren_single(c->nt, recv);
       const char *sn = nt_kind(nt, sr) == NK_CallNode ? nt_str(nt, sr, "name") : NULL;
       Repr rp = repr_of(c, sr);
       int chain_handle = sn && is_append_concat(sn) && rp.handle && rp.kind == RK_STRBUF;
@@ -1467,11 +1560,7 @@ int emit_op_poly_case_options(Compiler *c, const BopCtx *x, Buf *b) {
      literal :ascii alone picks the ASCII mapping and needs no check. With no
      arm the call raised NoMethodError naming String. */
   if (!user_defines_or_reads(c, name)) {
-    int plain_args = 1;
-    for (int i = 0; i < argc; i++) {
-      NodeKind ak = nt_kind(nt, argv[i]);
-      if (ak == NK_SplatNode || ak == NK_KeywordHashNode || ak == NK_BlockArgumentNode) plain_args = 0;
-    }
+    int plain_args = !nt_argv_has(nt, argv, argc, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_BLOCK);
     if (plain_args) {
       const char *sfx = argc == 1 ? case_map_suffix(c, argc, argv) : "";
       int tv = ++g_tmp;
@@ -1547,7 +1636,11 @@ static int emit_string_slice_poly(Compiler *c, int id, int arg, Buf *b) {
    variable's String. */
 static int str_self_chain_root(Compiler *c, int n) {
   const NodeTable *nt = c->nt;
-  n = an_unparen(nt, n);
+  switch (vp_one(nt, n, VPS_NONE | VP_PARENS_ONLY, &n)) {
+  case VP1_NODE: break;
+  case VP1_NIL: return -1;
+  case VP1_MANY: return -1;
+  }
   while (n >= 0 && nt_kind(nt, n) == NK_CallNode) {
     int r = nt_ref(nt, n, "receiver");
     const char *nm = nt_str(nt, n, "name");
@@ -1555,7 +1648,11 @@ static int str_self_chain_root(Compiler *c, int n) {
     if (!nm || (rt != TY_STRING && rt != TY_STRBUF) || comp_builtin_kind_reopen_mi(c, TY_STRING, nm) >= 0 ||
         !(bop_answers_self(TY_STRING, nm, call_plain_argc(c, n), nt_ref(nt, n, "block") >= 0) & BOPF_SELF))
       return -1;
-    n = an_unparen(nt, r);
+    switch (vp_one(nt, r, VPS_NONE | VP_PARENS_ONLY, &n)) {
+    case VP1_NODE: break;
+    case VP1_NIL: return -1;
+    case VP1_MANY: return -1;
+    }
     if (str_mut_var_recv(c, n) || sb_shadowed_reader(n)) return n;
   }
   return -1;
@@ -1568,7 +1665,11 @@ static int str_self_chain_root(Compiler *c, int n) {
    nobody. */
 int str_fresh_value(Compiler *c, int n) {
   const NodeTable *nt = c->nt;
-  n = an_unparen(nt, n);
+  switch (vp_one(nt, n, VPS_NONE | VP_PARENS_ONLY, &n)) {
+  case VP1_NODE: break;
+  case VP1_NIL: return 0;
+  case VP1_MANY: return 0;
+  }
   if (nt_kind(nt, n) == NK_InterpolatedStringNode) return 1;
   if (nt_kind(nt, n) != NK_CallNode || nt_ref(nt, n, "block") >= 0 || comp_ntype(c, n) != TY_STRING) return 0;
   int r = nt_ref(nt, n, "receiver");
@@ -1576,8 +1677,26 @@ int str_fresh_value(Compiler *c, int n) {
   if (r < 0 || !nm || comp_ntype(c, r) != TY_STRING || comp_builtin_kind_reopen_mi(c, TY_STRING, nm) >= 0)
     return 0;
   int self = bop_answers_self(TY_STRING, nm, call_plain_argc(c, n), 0);
-  if (self & BOPF_SELF_CLASS) return nt_kind(nt, an_unparen(nt, r)) == NK_StringNode;
+  if (self & BOPF_SELF_CLASS) {
+    switch (vp_one(nt, r, VPS_NONE | VP_PARENS_ONLY, &r)) {
+    case VP1_NODE: return nt_kind(nt, r) == NK_StringNode;
+    case VP1_NIL: return 0;
+    case VP1_MANY: return 0;
+    }
+  }
   return (self == 0 || self == BOPF_COPY_CLASS) && !str_self_call(nt, n) && bop_share(TY_STRING, nm) == BSH_PURE;
+}
+
+/* String#dedup is -@, and sp_str_uminus_val raises under -@: a nil
+   receiver raises under dedup (#9347). The receiver the nil fact says is
+   never nil keeps the plain call. */
+int emit_op_string_dedup(Compiler *c, const BopCtx *x, Buf *b) {
+  int named = !recv_never_nil(c, x->recv);
+  buf_printf(b, "sp_str_uminus_val(%s", named ? "sp_nil_recv_named(" : "");
+  if (x->rtext) buf_puts(b, x->rtext);
+  else emit_expr(c, x->recv, b);
+  buf_printf(b, "%s)", named ? ", \"dedup\")" : "");
+  return 1;
 }
 
 int emit_op_string_slice(Compiler *c, const BopCtx *x, Buf *b) {

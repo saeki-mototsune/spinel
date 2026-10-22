@@ -507,6 +507,7 @@ static pm_node_t *sp_made_call(pm_node_t *recv, pm_constant_id_t name, pm_node_t
   c->receiver = recv;
   c->name = name;
   if (vcall) c->base.flags |= PM_CALL_NODE_FLAGS_VARIABLE_CALL;
+  if (!recv || PM_NODE_TYPE(recv) == PM_SELF_NODE) c->base.flags |= PM_CALL_NODE_FLAGS_IGNORE_VISIBILITY;
   if (arg) {
     c->arguments = sp_made(PM_ARGUMENTS_NODE, sizeof *c->arguments, at);
     sp_append(&c->arguments->arguments, arg);
@@ -553,10 +554,20 @@ static int sp_word_char(char ch) {
    (`&:-@`, `&:+@`, `&:~`) is the same call, `-_spx` (#4300). NULL for any
    other block argument: a binary operator (`&:+`) is left to the
    arithmetic reduce/inject lowering, the rest to the analysis. */
+static size_t sp_quoted_recv_sym(const pm_node_t *n, const char **s);
 static pm_node_t *sp_sym_proc_block(pm_node_t *node) {
   if (PM_NODE_TYPE(node) != PM_BLOCK_ARGUMENT_NODE) return NULL;
   const char *s;
-  size_t n = sp_plain_sym(((pm_block_argument_node_t *)node)->expression, &s);
+  /* the Symbol written in parentheses (`&(:to_s)`) or quoted (`&:"to_s"`)
+     is the same block: left a BlockArgumentNode, a Symbol took no block */
+  const pm_node_t *e = ((pm_block_argument_node_t *)node)->expression;
+  while (e && PM_NODE_TYPE(e) == PM_PARENTHESES_NODE) {
+    const pm_node_t *pb = ((const pm_parentheses_node_t *)e)->body;
+    if (!pb || PM_NODE_TYPE(pb) != PM_STATEMENTS_NODE || ((const pm_statements_node_t *)pb)->body.size != 1) { e = NULL; break; }
+    e = ((const pm_statements_node_t *)pb)->body.nodes[0];
+  }
+  size_t n = sp_plain_sym(e, &s);
+  if (!n) n = sp_quoted_recv_sym(e, &s);
   int word = n > 0;
   for (size_t i = 0; i < n; i++)
     if (!sp_word_char(s[i]) && s[i] != '?' && s[i] != '!' && (unsigned char)s[i] < 0x80) word = 0;
@@ -647,6 +658,7 @@ static pm_node_t *sp_fw_def(const char *r, size_t rl, const char *meth, size_t m
     memcpy(tn, meth, tl);
     tn[tl] = '=';
     body = sp_made_call(sp_fw_recv(r, rl, at), sp_made_id(tn, tl + 1), sp_made_lvar("_fw_v", at), 0, at);
+    body->flags |= PM_CALL_NODE_FLAGS_ATTRIBUTE_WRITE;   /* written as the assignment */
     free(tn);
   }
   else {
@@ -918,6 +930,26 @@ static void flatten_parameter(int id, pm_node_t *node) {
   if (value) emit_ref(id, "value", value);
 }
 
+/* The Prism flags of a CallNode that the passes read by name, each written
+   only when Prism set it: `recv&.name` (nt_safe_nav); `recv.name = v`,
+   `recv.name=(v)` and `recv[i] = v`, which `recv.send(:name=, v)` is not
+   (nt_attr_write); and a bare identifier (no receiver/parens/args), a
+   variable-or-method read whose unresolved form is CRuby's NameError, not
+   NoMethodError (vcall). Private calls use Prism's receiverless or literal
+   self permission (nt_ignore_visibility). */
+static void emit_call_flags(int id, const pm_node_t *node) {
+  if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_IGNORE_VISIBILITY)) emit_int(id, "ignore_visibility", 1);
+  if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) emit_int(id, "safe_nav", 1);
+  if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_ATTRIBUTE_WRITE)) emit_int(id, "attr_write", 1);
+  if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_VARIABLE_CALL)) emit_int(id, "vcall", 1);
+}
+static void emit_index_write_fields(int id, const pm_node_t *node, pm_node_t *receiver,
+                                    pm_arguments_node_t *arguments, pm_node_t *value) {
+  emit_ref(id, "receiver", receiver);
+  emit_ref(id, "arguments", (pm_node_t *)arguments);
+  emit_ref(id, "value", value);
+  emit_call_flags(id, node);
+}
 static int flatten_node(pm_node_t *node) {
   if (!node) return -1;
 
@@ -1081,11 +1113,7 @@ static int flatten_node(pm_node_t *node) {
     R("receiver", n->receiver);
     R("arguments", n->arguments);
     R("block", n->block);
-    /* `recv&.name`: nt_safe_nav reads the flag, set only when it is. */
-    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) I("safe_nav", 1);
-    /* A bare identifier (no receiver/parens/args) is a variable-or-method
-       read: an unresolved one is CRuby's NameError, not NoMethodError. */
-    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_VARIABLE_CALL)) I("vcall", 1);
+    emit_call_flags(id, node);
     /* `__dir__` in a required file is that file's directory: carry the file
        for the compile-time folds, which otherwise see only the entry script */
     if (!n->receiver && !n->arguments) {
@@ -1242,6 +1270,7 @@ static int flatten_node(pm_node_t *node) {
     N("CallTargetNode");
     NAME("name", n->name);
     R("receiver", n->receiver);
+    emit_call_flags(id, node);
     break;
   }
   case PM_CONSTANT_TARGET_NODE: {
@@ -1324,30 +1353,25 @@ static int flatten_node(pm_node_t *node) {
     pm_index_operator_write_node_t *n = (pm_index_operator_write_node_t *)node;
     N("IndexOperatorWriteNode");
     NAME("binary_operator", n->binary_operator);
-    R("receiver", n->receiver);
-    R("arguments", n->arguments);
-    R("value", n->value);
+    emit_index_write_fields(id, node, n->receiver, n->arguments, n->value);
     break;
   }
   case PM_INDEX_AND_WRITE_NODE: {
     pm_index_and_write_node_t *n = (pm_index_and_write_node_t *)node;
     N("IndexAndWriteNode");
-    R("receiver", n->receiver);
-    R("arguments", n->arguments);
-    R("value", n->value);
+    emit_index_write_fields(id, node, n->receiver, n->arguments, n->value);
     break;
   }
   case PM_INDEX_OR_WRITE_NODE: {
     pm_index_or_write_node_t *n = (pm_index_or_write_node_t *)node;
     N("IndexOrWriteNode");
-    R("receiver", n->receiver);
-    R("arguments", n->arguments);
-    R("value", n->value);
+    emit_index_write_fields(id, node, n->receiver, n->arguments, n->value);
     break;
   }
   case PM_INDEX_TARGET_NODE: {
     pm_index_target_node_t *n = (pm_index_target_node_t *)node;
     N("IndexTargetNode");
+    /* CRuby refuses private []= on masgn and for targets, even on self. */
     R("receiver", n->receiver);
     R("arguments", n->arguments);
     break;
@@ -1359,7 +1383,7 @@ static int flatten_node(pm_node_t *node) {
     NAME("name", n->read_name);
     NAME("binary_operator", n->binary_operator);
     R("value", n->value);
-    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) I("safe_nav", 1);
+    emit_call_flags(id, node);
     break;
   }
   case PM_CALL_AND_WRITE_NODE: {
@@ -1368,7 +1392,7 @@ static int flatten_node(pm_node_t *node) {
     R("receiver", n->receiver);
     NAME("name", n->read_name);
     R("value", n->value);
-    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) I("safe_nav", 1);
+    emit_call_flags(id, node);
     break;
   }
   case PM_CALL_OR_WRITE_NODE: {
@@ -1377,7 +1401,7 @@ static int flatten_node(pm_node_t *node) {
     R("receiver", n->receiver);
     NAME("name", n->read_name);
     R("value", n->value);
-    if (PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION)) I("safe_nav", 1);
+    emit_call_flags(id, node);
     break;
   }
   case PM_GLOBAL_VARIABLE_WRITE_NODE: {
@@ -2434,13 +2458,11 @@ static int source_references_io_buffer(const char *src) {
    sp_feature_enabled(). Definitions here (spinel_parse.c includes no project
    headers); declared extern in compiler.h. */
 int g_require_gate = 0;
-/* --share-strings, as main.c exports it: on only when SPINEL_SHARE_STRINGS
-   is set to something, empty and "0" being off. The compiler's flag and the
-   parser's read of a package's share declarations ask this one test. */
-int sp_share_strings_env(void) {
-  const char *e = getenv("SPINEL_SHARE_STRINGS");
-  return e && *e && strcmp(e, "0") != 0;
-}
+/* A String is shared by reference, as CRuby shares it (#6765): the one
+   mode, with no switch to copy. The compiler's flag and the parser's read
+   of a package's share declarations ask this one test; `--share-strings`
+   is still accepted and changes nothing. */
+int sp_share_strings_env(void) { return 1; }
 int g_require_gate_cli = 0;   /* --require-gate */
 static char **sp_req_feats = NULL;
 static int sp_req_feats_n = 0;
@@ -3308,8 +3330,11 @@ static char *sp_rewrite_computed_requires(const char *source, const char *dir) {
    the require in place; in a required file it answers nil there, and the
    requires go at the end of the file -- after the module body the autoload
    sits in, which the loaded file usually reopens. A path that starts with
-   `#{__dir__}/` is literal enough: it is a require_relative. A receiver
-   form (`Mod.autoload`) or any other computed path is left as it was. */
+   `#{__dir__}/` is literal enough: it is a require_relative, and so is
+   `File.expand_path('path', __dir__)`. In a required file the name may be a
+   local (`%w[A B].each { |n| autoload n, ... }`): loaded eagerly, the file
+   is the same whatever name it was asked for. A receiver form
+   (`Mod.autoload`) or any other computed path is left as it was. */
 static int sp_autoload_is_main = 0;
 /* the autoload's file beside the one naming it (lib/foo.rb autoloading
    "foo/bar" is lib/foo/bar.rb, the gem layout): reached without a load path */
@@ -3354,8 +3379,13 @@ static char *sp_rewrite_autoloads(const char *source, const char *dir) {
       int paren = 0;
       while (*q == ' ' || *q == '\t') q++;
       if (*q == '(') { paren = 1; q++; while (*q == ' ' || *q == '\t') q++; }
-      if (*q == ':') {
-        q++;
+      /* the name: a Symbol, or -- in a required file, whose requires go
+         at its end -- a local naming it (`%w[A B].each { |n| autoload n,
+         ... }`): the file is loaded once whatever names it holds */
+      int named = 0;
+      if (*q == ':') { q++; named = 1; }
+      else if (!sp_autoload_is_main && ((*q >= 'a' && *q <= 'z') || *q == '_')) named = 1;
+      if (named) {
         const char *ns = q;
         while (sp_req_ident_char(*q)) q++;
         if (q > ns) {
@@ -3363,6 +3393,31 @@ static char *sp_rewrite_autoloads(const char *source, const char *dir) {
           if (*q == ',') {
             q++;
             while (*q == ' ' || *q == '\t') q++;
+            /* `File.expand_path('path', __dir__)` names the file beside this
+               one, as `"#{__dir__}/path"` does */
+            int xp = 0;
+            if (strncmp(q, "File.expand_path(", 17) == 0) {
+              const char *xq = q + 17;
+              while (*xq == ' ' || *xq == '\t') xq++;
+              if (*xq == '"' || *xq == '\'') {
+                char xc = *xq;
+                const char *xe = xq + 1;
+                while (*xe && *xe != xc && *xe != '\n' && *xe != '#' && *xe != '\\') xe++;
+                if (*xe == xc) {
+                  const char *xt = xe + 1;
+                  while (*xt == ' ' || *xt == '\t') xt++;
+                  if (*xt == ',') {
+                    xt++;
+                    while (*xt == ' ' || *xt == '\t') xt++;
+                    if (strncmp(xt, "__dir__", 7) == 0 && !sp_req_ident_char(xt[7])) {
+                      xt += 7;
+                      while (*xt == ' ' || *xt == '\t') xt++;
+                      if (*xt == ')') { xp = 1; q = xq; }
+                    }
+                  }
+                }
+              }
+            }
             if (*q == '"' || *q == '\'') {
               char qq = *q++;
               /* `"#{__dir__}/path"` (the gem layout: lib/rdoc.rb autoloading
@@ -3371,13 +3426,15 @@ static char *sp_rewrite_autoloads(const char *source, const char *dir) {
                  requiring file's own directory, so the call is
                  `require_relative "path"`. Any other `#{` is a computed path
                  and leaves the call as it was. */
-              int dir_rel = 0;
-              if (qq == '"' && strncmp(q, "#{__dir__}/", 11) == 0) { q += 11; dir_rel = 1; }
+              int dir_rel = xp;
+              if (!xp && qq == '"' && strncmp(q, "#{__dir__}/", 11) == 0) { q += 11; dir_rel = 1; }
               const char *fs = q;
               while (*q && *q != qq && *q != '\n' && *q != '#' ) q++;
               if (*q == qq) {
                 size_t flen = (size_t)(q - fs);
                 q++;
+                /* past the expand_path call's `, __dir__)` */
+                if (xp) { while (*q && *q != ')') q++; if (*q == ')') q++; }
                 while (*q == ' ' || *q == '\t') q++;
                 if (!paren || *q == ')') {
                   if (paren) q++;
@@ -4137,9 +4194,16 @@ static int sp_require_tolerated(const char *name) {
      :string/:pointer/... types, extend FFI::Library as a no-op).
      "rational" / "complex": both classes are built in, so the require has
      nothing to load and nothing to warn about -- CRuby satisfies them
-     silently for the same reason (#3455). */
+     silently for the same reason (#3455).
+     "rbconfig" / "rubygems": the parser splices builtins/rbconfig.rb and
+     builtins/gem.rb into a program that names RbConfig or Gem, and CRuby has
+     both loaded before the program starts, so the require answers false.
+     Refused under --require-gate, they broke every spin build using the
+     bundled optparse, which requires rbconfig (#9441). ("gem" is no library
+     in CRuby either: its require stays a LoadError there.) */
   static const char *const tolerated[] = { "thread", "enumerator", "fiber", "ffi",
-                                           "rational", "complex", "io/wait", NULL };
+                                           "rational", "complex", "io/wait",
+                                           "rbconfig", "rubygems", NULL };
   for (int i = 0; tolerated[i]; i++) {
     if (strcmp(name, tolerated[i]) == 0) return 1;
   }
@@ -4382,6 +4446,27 @@ static char *sp_splice_named_builtin(char *source, const char *exe_path, const c
   return sp_prepend_require(source, exe_path, head, fsl, fsl_n);
 }
 
+/* builtins/monitor_mixin.rb: MonitorMixin, for a program that names it in
+   code (`include MonitorMixin`, `MonitorMixin::ConditionVariable`) and does
+   not define it -- named, not called through, so the Gem-style test of a
+   `.`/`::` after the name does not ask the right question */
+static char *sp_splice_monitor_mixin(char *source, const char *exe_path,
+                                     unsigned char **fsl, size_t *fsl_n) {
+  static const char w[] = "MonitorMixin";
+  size_t wl = sizeof w - 1;
+  int named = 0;
+  for (const char *p = strstr(source, w); p && !named; p = strstr(p + 1, w)) {
+    char prev = p == source ? 0 : p[-1];
+    if (sp_req_ident_char(prev) || prev == '@' || prev == '$' || sp_req_ident_char(p[wl])) continue;
+    const char *bol = p;
+    while (bol > source && bol[-1] != '\n') bol--;
+    while (*bol == ' ' || *bol == '\t') bol++;
+    if (*bol != '#') named = 1;
+  }
+  if (!named || sp_src_defines_module(source, w)) return source;
+  return sp_prepend_require(source, exe_path, "require \"builtins/monitor_mixin\"\n", fsl, fsl_n);
+}
+
 /* builtins/object_space.rb: the finalizer API. Only for a program that names
    it -- the rest of ObjectSpace stays the refusal it is
    (docs/limitations.md). Names it in code, that is: the file holds procs in
@@ -4542,7 +4627,13 @@ static char *sp_splice_builtins(char *source, const char *exe_path,
 static char *sp_splice_builtin_enumerator(char *source, const char *exe_path,
                                           unsigned char **fsl, size_t *fsl_n) {
   if (getenv("SPINEL_NO_BUILTINS")) return source;
-  if (!strstr(source, "break")) return source;
+  /* a String's piece walk with an index (str.each_char.with_index { }),
+     which builtins/enumerator.rb's __enumw_str_*_with_index serve when the
+     String is no variable to read again after the walk */
+  int str_walk = sp_source_mentions_method(source, "with_index") &&
+                 (sp_source_mentions_method(source, "each_char") || sp_source_mentions_method(source, "each_line") ||
+                  sp_source_mentions_method(source, "each_byte") || sp_source_mentions_method(source, "each_codepoint"));
+  if (!str_walk && !strstr(source, "break")) return source;
   static const char *const names[] = {
     "map", "collect", "select", "filter", "reject", "filter_map", "each_with_object", "with_object",
     "inject", "reduce", "each_slice", "each_cons", "each_entry", "with_index", NULL
@@ -4551,7 +4642,7 @@ static char *sp_splice_builtin_enumerator(char *source, const char *exe_path,
   for (int i = 0; names[i] && !any; i++) if (sp_source_mentions_method(source, names[i])) any = 1;
   if (!any) return source;
   /* the keyword, not the word in a string or a comment */
-  { SpSrcLex *lx = sp_src_lex_of(source); if (!lx->brk && !lx->evals) return source; }
+  { SpSrcLex *lx = sp_src_lex_of(source); if (!str_walk && !lx->brk && !lx->evals) return source; }
   char lib_dir[1024], gp[1200];
   sp_lib_dir(exe_path, lib_dir, sizeof lib_dir);
   int base_len = (int)strlen(lib_dir);
@@ -5272,6 +5363,7 @@ static NodeTable *sp_parse_emit(const char *source_file, const char *argv0) {
   source = sp_splice_named_builtin(source, argv0, "Gem", "builtins/gem", &fsl, &fsl_n);
   source = sp_splice_named_builtin(source, argv0, "RbConfig", "builtins/rbconfig", &fsl, &fsl_n);
   source = sp_splice_named_builtin(source, argv0, "ThreadGroup", "builtins/thread_group", &fsl, &fsl_n);
+  source = sp_splice_monitor_mixin(source, argv0, &fsl, &fsl_n);
   source = sp_splice_object_space(source, argv0, &fsl, &fsl_n);
   source = sp_splice_process_detach(source, argv0, &fsl, &fsl_n);
   source = sp_splice_system_spawn(source, argv0, &fsl, &fsl_n);

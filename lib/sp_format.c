@@ -194,8 +194,33 @@ sp_Rational sp_rational_new(sp_int n, sp_int d) {
 }
 /* Kernel#Rational(String): unlike String#to_r, the whole string must be a
    rational literal -- trailing text, an empty string and a second `/` are all
-   ArgumentError, and an exponent is honoured (#3720). */
-sp_Rational sp_str_to_r_strict(const char *s) {SP_GC_ROOT_STR(s);
+   ArgumentError, and an exponent is honoured (#3720). The value is built in
+   sp_int while it fits; a literal whose digits, scale or exponent do not
+   (`Rational("1/12345678901234567890123")`, which wrapped) is valued by
+   String#to_r's reader over its text without the `_`s, which answers it
+   exactly where the reduced value fits and raises RangeError where not. */
+static int sp_rstrict_mul_add(sp_int *v, sp_int mul, sp_int add) {
+  intptr_t r;
+  if (sp_ckd_mul_iptr(*v, mul, &r) || sp_ckd_add_iptr(r, add, &r)) return 1;
+  *v = (sp_int)r;
+  return 0;
+}
+static sp_Rational sp_str_to_r_strict_wide(const char *s) {
+  size_t n = strlen(s);
+  char buf[256], *t = n < sizeof buf ? buf : malloc(n + 1);
+  if (!t) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  size_t k = 0;
+  for (size_t i = 0; i < n; i++) if (s[i] != '_') t[k++] = s[i];
+  t[k] = 0;
+  sp_Rational r = sp_str_to_r(t);
+  if (t != buf) free(t);
+  return r;
+}
+sp_Rational sp_str_to_r_strict(const char *s) { return sp_str_to_r_strict_ex(s, NULL); }
+/* ...and with `ovf`, a literal whose value overflows sets *ovf and answers
+   0/1 rather than being valued here: --int-overflow=promote values it as
+   a big Rational (sp_str_to_r_strict_v) */
+sp_Rational sp_str_to_r_strict_ex(const char *s, int *ovf_out) {SP_GC_ROOT_STR(s);
   const char *p = s;
   if (!p) sp_raise_cls("TypeError", "can't convert nil into Rational");
   while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f' || *p == '\v') p++;
@@ -203,11 +228,20 @@ sp_Rational sp_str_to_r_strict(const char *s) {SP_GC_ROOT_STR(s);
   if (*p == '+') p++;
   else if (*p == '-') { sign = -1; p++; }
   sp_int num = 0, den = 1;
-  int any = 0;
-  while ((*p >= '0' && *p <= '9') || *p == '_') { if (*p != '_') { num = num * 10 + (*p - '0'); any = 1; } p++; }
+  int any = 0, ovf = 0;
+  while ((*p >= '0' && *p <= '9') || *p == '_') {
+    if (*p != '_') { ovf |= !ovf && sp_rstrict_mul_add(&num, 10, *p - '0'); any = 1; }
+    p++;
+  }
   if (*p == '.') {
     p++;
-    while ((*p >= '0' && *p <= '9') || *p == '_') { if (*p != '_') { num = num * 10 + (*p - '0'); den *= 10; any = 1; } p++; }
+    while ((*p >= '0' && *p <= '9') || *p == '_') {
+      if (*p != '_') {
+        ovf |= !ovf && (sp_rstrict_mul_add(&num, 10, *p - '0') || sp_rstrict_mul_add(&den, 10, 0));
+        any = 1;
+      }
+      p++;
+    }
   }
   if (!any) {
     if (sp_convert_soft) { sp_convert_failed = 1; return sp_rational_new(0, 1); }
@@ -218,22 +252,27 @@ sp_Rational sp_str_to_r_strict(const char *s) {SP_GC_ROOT_STR(s);
     sp_int esign = 1;
     if (*q == '+') q++; else if (*q == '-') { esign = -1; q++; }
     sp_int ev = 0; int anye = 0;
-    while (*q >= '0' && *q <= '9') { ev = ev * 10 + (*q - '0'); q++; anye = 1; }
+    while (*q >= '0' && *q <= '9') { ovf |= !ovf && sp_rstrict_mul_add(&ev, 10, *q - '0'); q++; anye = 1; }
     if (anye) {
-      for (sp_int k = 0; k < ev; k++) { if (esign > 0) num *= 10; else den *= 10; }
+      for (sp_int k = 0; k < ev && !ovf; k++) ovf = sp_rstrict_mul_add(esign > 0 ? &num : &den, 10, 0);
       p = q;
     }
   }
   if (*p == '/') {
     p++;
-    sp_int d2 = 0; int anyd = 0;
-    while ((*p >= '0' && *p <= '9') || *p == '_') { if (*p != '_') { d2 = d2 * 10 + (*p - '0'); anyd = 1; } p++; }
+    sp_int d2 = 0; int anyd = 0, z = 1;
+    while ((*p >= '0' && *p <= '9') || *p == '_') {
+      if (*p != '_') { ovf |= !ovf && sp_rstrict_mul_add(&d2, 10, *p - '0'); z &= *p == '0'; anyd = 1; }
+      p++;
+    }
     if (!anyd) sp_raise_cls("ArgumentError", sp_sprintf("invalid value for Rational(): \"%s\"", s));
-    if (d2 == 0) sp_raise_cls("ZeroDivisionError", "divided by 0");
-    den *= d2;
+    if (z) sp_raise_cls("ZeroDivisionError", "divided by 0");
+    if (!ovf && sp_rstrict_mul_add(&den, d2, 0)) ovf = 1;
   }
   while (*p == ' ' || *p == '\t' || *p == '\n' || *p == '\r' || *p == '\f' || *p == '\v') p++;
   if (*p) sp_raise_cls("ArgumentError", sp_sprintf("invalid value for Rational(): \"%s\"", s));
+  if (ovf && ovf_out) { *ovf_out = 1; return sp_rational_new(0, 1); }
+  if (ovf) return sp_str_to_r_strict_wide(s);
   return sp_rational_new(sign * num, den);
 }
 /* The products of two sp_int fit a 128-bit integer on the 64-bit build and a
@@ -472,6 +511,31 @@ sp_Rational sp_rational_div(sp_Rational a, sp_Rational b) {
   if (b.num == 0) sp_raise_cls("ZeroDivisionError", "divided by 0");
   return sp_rational_new_wide(SP_RAT_MUL(a.num, b.den), SP_RAT_MUL(a.den, b.num));
 }
+/* The + - * / of two small Rationals (op 0..3) into *out, answering 0
+   rather than raising where the reduced result does not fit sp_int: under
+   --int-overflow=promote the boxed arithmetic then goes on as a big
+   Rational. A zero divisor still raises. */
+int sp_rational_op_ck(int op, sp_Rational a, sp_Rational b, sp_Rational *out) {
+  sp_rat_wide n, d;
+  switch (op) {
+  case 0: n = SP_RAT_ADD(SP_RAT_MUL(a.num, b.den), SP_RAT_MUL(b.num, a.den)); d = SP_RAT_MUL(a.den, b.den); break;
+  case 1: n = SP_RAT_SUB(SP_RAT_MUL(a.num, b.den), SP_RAT_MUL(b.num, a.den)); d = SP_RAT_MUL(a.den, b.den); break;
+  case 2: n = SP_RAT_MUL(a.num, b.num); d = SP_RAT_MUL(a.den, b.den); break;
+  default:
+    if (b.num == 0) sp_raise_cls("ZeroDivisionError", "divided by 0");
+    n = SP_RAT_MUL(a.num, b.den); d = SP_RAT_MUL(a.den, b.num); break;
+  }
+  sp_rat_uwide x = n < 0 ? (sp_rat_uwide)0 - (sp_rat_uwide)n : (sp_rat_uwide)n;
+  sp_rat_uwide y = d < 0 ? (sp_rat_uwide)0 - (sp_rat_uwide)d : (sp_rat_uwide)d;
+  sp_rat_uwide g = x, h = y;
+  while (h) { sp_rat_uwide t = h; h = g % h; g = t; }
+  x /= g; y /= g;
+  int neg = (n < 0) != (d < 0);
+  if (y > (sp_rat_uwide)INTPTR_MAX || x > (sp_rat_uwide)INTPTR_MAX + (sp_rat_uwide)neg) return 0;
+  out->num = (sp_int)(neg ? (uintptr_t)0 - (uintptr_t)x : (uintptr_t)x);
+  out->den = (sp_int)y;
+  return 1;
+}
 sp_Rational sp_rational_neg(sp_Rational a) { if (a.num == INTPTR_MIN) sp_raise_cls("RangeError", "Rational out of sp_int range"); a.num = -a.num; return a; }
 sp_Rational sp_rational_abs(sp_Rational a) { if (a.num == INTPTR_MIN) sp_raise_cls("RangeError", "Rational out of sp_int range"); if (a.num < 0) a.num = -a.num; return a; }
 sp_int sp_rational_cmp(sp_Rational a, sp_Rational b) {
@@ -493,11 +557,44 @@ static sp_rat_wide sp_rat_pow2(int e) {
   }
   return r;
 }
+/* The best rational approximation of |x| whose terms fit in sp_int: the last
+   convergent of x's continued fraction that fits, or the semiconvergent past
+   it when that is the closer one (the bounded best approximation). x is
+   positive and below INTPTR_MAX. */
+static sp_Rational sp_rat_best_bounded(long double x) {
+  const long double lim = (long double)INTPTR_MAX;
+  long double h0 = 0, h1 = 1, k0 = 1, k1 = 0;     /* convergents h1/k1 (current), h0/k0 (previous) */
+  long double v = x;
+  for (int i = 0; i < 128; i++) {
+    long double a = floorl(v);
+    long double h2 = a * h1 + h0, k2 = a * k1 + k0;
+    if (h2 > lim || k2 > lim) {
+      /* the largest t with t*h1+h0 and t*k1+k0 in range, a semiconvergent */
+      long double t = floorl((lim - h0) / (h1 > 0 ? h1 : 1));
+      long double tk = k1 > 0 ? floorl((lim - k0) / k1) : t;
+      if (tk < t) t = tk;
+      if (t >= 1) {
+        long double hs = t * h1 + h0, ks = t * k1 + k0;
+        if (fabsl(x - hs / ks) < fabsl(x - h1 / k1)) { h1 = hs; k1 = ks; }
+      }
+      break;
+    }
+    h0 = h1; k0 = k1; h1 = h2; k1 = k2;
+    long double fr = v - a;
+    if (fr == 0 || h1 / k1 == x) break;
+    v = 1 / fr;
+  }
+  sp_Rational r; r.num = (sp_int)h1; r.den = (sp_int)k1;
+  return r;
+}
 /* Float#to_r : the exact rational value of the double. A finite double equals
-   m * 2^e for a 53-bit integer mantissa m, so the conversion is exact. When the
-   exact numerator/denominator does not fit in sp_int (huge magnitude or a tiny
-   subnormal), it raises RangeError -- spinel's Rational is int64/int64 and does
-   not promote to a Bignum (matching the existing Rational-overflow behavior). */
+   m * 2^e for a 53-bit integer mantissa m, so the conversion is exact where its
+   terms fit in sp_int. A denominator past sp_int (a fraction finer than
+   1/2^63, or than 1/2^31 on a 32-bit build, as 0.1 is) has no exact form here:
+   spinel's Rational does not promote to a Bignum outside --int-overflow=promote,
+   so it answers the closest rational whose terms fit (sp_rat_best_bounded:
+   0.1 is 1/10 there, a value below the finest step 0). A magnitude past sp_int
+   raises RangeError, as the Integer it would be does. */
 sp_Rational sp_float_to_rational(sp_float f) {
   if (isnan(f) || isinf(f)) sp_raise_cls("FloatDomainError", isnan(f) ? "NaN" : "Infinity");
   if (f == 0.0) { sp_Rational z; z.num = 0; z.den = 1; return z; }
@@ -514,7 +611,12 @@ sp_Rational sp_float_to_rational(sp_float f) {
       sp_raise_cls("RangeError", "Rational out of sp_int range");
     return sp_rational_new_wide(num * p, 1);
   }
-  return sp_rational_new_wide(num, sp_rat_pow2(-e));
+  /* the reduced exact form when it fits: num odd over 2^-e */
+  while (e < 0 && (num & 1) == 0) { num /= 2; e++; }
+  if (-e < (int)(sizeof(sp_int) * 8 - 1)) return sp_rational_new_wide(num, sp_rat_pow2(-e));
+  sp_Rational r = sp_rat_best_bounded(fabsl((long double)f));
+  if (f < 0) r.num = -r.num;
+  return r;
 }
 /* Simplest p/q with lo <= p/q <= hi, for 0 < lo <= hi. Classic continued-fraction
    "simplest rational in an interval" recursion; the convergent depth is bounded by

@@ -55,7 +55,6 @@ typedef struct {
   const struct PolyPlan_s *plan;   /* the dispatch's plan (cplan_poly_arms) */
 } PolyUserArgs;
 void emit_poly_user_arms_n(Compiler *c, int id, const char *name, const PolyUserArgs *U, Buf *b);
-unsigned poly_form_check(int id, const char *name, const char *site, int served, unsigned form, unsigned oform);
 void emit_poly_arm_args(Compiler *c, Scope *m, Scope *ms, const ArgLayout *L, const PolyArgs *A, const char *selfd, const char *lead, Buf *pre, Buf *cb);
 int poly_native_arm_call(Compiler *c, int k, const char *name, int n, const int *argv, const int *atmp, const TyKind *atmp_ty, int tv, Buf *cb, TyKind *mret);
 int emit_poly_native_arm_stmt(Compiler *c, const char *call, TyKind mret, TyKind ret, int so, int tr, int is_setter_val, Buf *b);
@@ -71,6 +70,7 @@ void emit_poly_index_cases(TyKind ret, int tr, int tv, const char *idxref, int s
 int  poly_pred_kind(const char *name, int argc);
 int  poly_exc_cand(Compiler *c, const char *name);
 int  hoist_block_proc(Compiler *c, int cblk);
+int  hoist_call_block_proc(Compiler *c, int id);
 int  hoist_dispatch_blk_proc(Compiler *c, int id, int cblk);
 void emit_trailing_blk_arg(Compiler *c, const Scope *m, int id, int blk_tmp, Buf *b);
 /* what a zero-argument poly dispatch answers beside its user arms, and its
@@ -151,7 +151,7 @@ int  emit_poly_prearms0_blk(Compiler *c, int id, const char *name, const PolySpe
                             int tv, int tr, Buf *b);
 int  emit_poly_callable_prearm(Compiler *c, const char *name, int argc,
                                const int *atmp, const TyKind *atmp_ty, const char *guard,
-                               int tv, int tr, TyKind ret, int kwpos, Buf *b);
+                               int tv, int tr, TyKind ret, int kwpos, int tblk, Buf *b);
 int  emit_poly_cls_value_prearm(Compiler *c, int id, const char *name, int argc,
                                 const int *atmp, const TyKind *atmp_ty, const int *htmp,
                                 const PolyKw *kw, int tv, int tr, TyKind ret, int blk_tmp, Buf *b);

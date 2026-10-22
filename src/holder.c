@@ -108,6 +108,12 @@ int holder_of_node_in(const Compiler *c, int node, int body, HolderRef *out) {
     break;
   }
   case HK_CONST:
+    /* `File::SEPARATOR`: a builtin's own constant, or a path the top level
+       alone defines, is no slot of a program constant of the leaf's name
+       (emit_constant_expr reads it so) */
+    if (nt_kind(c->nt, node) == NK_ConstantPathNode &&
+        (const_path_in_closed_builtin(mc, node) || const_path_misses_toplevel(mc, node)))
+      return 0;
     out->lv = comp_const(mc, nm);
     if (!out->lv) return 0;
     break;
@@ -175,7 +181,7 @@ int holder_slot_buf(Compiler *c, const HolderRef *h, Buf *b) {
 
 int holder_static_handle_buf(Compiler *c, int node, Buf *b) {
   HolderRef h;
-  if ((!c->share_strings && !c->n_cext_extensions) || !holder_static_node(nt_kind(c->nt, node)) || !holder_of_node(c, node, &h) || (!h.r.share && !(c->n_cext_extensions && h.r.handle)))
+  if (!holder_static_node(nt_kind(c->nt, node)) || !holder_of_node(c, node, &h) || (!h.r.share && !(c->n_cext_extensions && h.r.handle)))
     return 0;
   return holder_slot_buf(c, &h, b);
 }

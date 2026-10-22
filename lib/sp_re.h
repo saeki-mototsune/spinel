@@ -36,6 +36,7 @@ int re_exec_attempt(const mrb_regexp_pattern *pat, const char *str, int64_t len,
 int re_num_named(const mrb_regexp_pattern *pat);
 const char *re_named_name(const mrb_regexp_pattern *pat, int i, int *group_out);
 int re_named_group(const mrb_regexp_pattern *pat, const char *name);
+int sp_re_name_group(const mrb_regexp_pattern *pat, const char *name, const int *caps, int ncaps);
 
 /* `caps` holds ncap*2 positions and lives in the SAME block as the struct, so
    a MatchData costs what its match needs rather than what the widest one
@@ -80,6 +81,7 @@ void sp_re_set_last_match(const mrb_regexp_pattern *pat, const char *str, const 
 void sp_re_set_lit_match(const char *str, sp_int beg, sp_int end);
 sp_int sp_re_match(mrb_regexp_pattern *pat, const char *str);
 sp_int sp_re_match_at(mrb_regexp_pattern *pat, const char *str, sp_int pos);
+sp_bool sp_re_start_with(mrb_regexp_pattern *pat, const char *str);
 sp_int sp_re_match_next(mrb_regexp_pattern *pat, const char *str, sp_int pos);
 sp_int sp_re_rindex(mrb_regexp_pattern *pat, const char *str);
 sp_StrArray *sp_re_rpartition(mrb_regexp_pattern *pat, const char *str);
@@ -88,9 +90,15 @@ sp_bool sp_re_match_p_at(mrb_regexp_pattern *pat, const char *str, sp_int pos);
 sp_bool sp_re_case_eq(mrb_regexp_pattern *pat, sp_RbVal v);
 /* poly-operand match forms: either side may carry the pattern (#3961) */
 mrb_regexp_pattern *sp_poly_as_pattern(sp_RbVal v);
+/* The literals the program compiled at startup, noted there when an
+   identity Set's value is checked where it arrives (sp_idset_check): a
+   literal is one object per text here, one per literal in CRuby */
+void sp_re_note_literal(const mrb_regexp_pattern *pat);
+int sp_re_noted_literal_p(const void *pat);
 sp_bool sp_poly_match_p(sp_RbVal a, sp_RbVal b);
 sp_bool sp_poly_match_p_at(sp_RbVal a, sp_RbVal b, sp_int pos);
 sp_MatchData *sp_poly_match_data(sp_RbVal a, sp_RbVal b);
+sp_MatchData *sp_poly_match_data_at(sp_RbVal a, sp_RbVal b, sp_int pos);
 sp_oint sp_poly_match_index(sp_RbVal a, sp_RbVal b);   /* =~: the position, nil on a miss */
 const char *sp_re_operand(sp_RbVal v, int strict);   /* a boxed matcher operand (reg_operand) */
 void sp_re_expand_rep(const mrb_regexp_pattern *pat, char **out_io, size_t *olen_io, size_t *cap_io, const char *rep, size_t rlen, const char *src, int *caps, int ncaps);

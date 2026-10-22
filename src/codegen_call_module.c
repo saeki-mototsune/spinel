@@ -46,35 +46,57 @@ static void emit_file_realdirpath2(Compiler *c, const int *argv, Buf *b) {
 }
 
 /* the class methods of File / FileTest, Dir and Time */
-/* A `File.read` options hash that only names UTF-8 as the encoding
-   (`encoding:`, `external_encoding:`, `internal_encoding:` with
-   Encoding::UTF_8 or "UTF-8"): Spinel's text is UTF-8 already, so it reads
-   as the call without it does. */
-static int kwh_utf8_only(const NodeTable *nt, int kwh) {
-  if (kwh < 0 || nt_kind(nt, kwh) != NK_KeywordHashNode) return 0;
+/* The encoding a `File.read` options hash names, when that is all it
+   names (`encoding:`, `external_encoding:`, `internal_encoding:`):
+   KWH_ENC_UTF8 for Encoding::UTF_8 or "UTF-8" -- Spinel's text is UTF-8
+   already, so it reads as the call without it does -- and KWH_ENC_BINARY
+   for an external Encoding::BINARY / ASCII_8BIT or "BINARY" / "ASCII-8BIT",
+   which reads as File.binread does. KWH_ENC_NONE for any other hash. */
+enum { KWH_ENC_NONE, KWH_ENC_UTF8, KWH_ENC_BINARY };
+
+static int kwh_enc_value(const NodeTable *nt, int v) {
+  if (v < 0) return KWH_ENC_NONE;
+  NodeKind vk = nt_kind(nt, v);
+  if (vk == NK_StringNode) {
+    const char *sv = nt_str(nt, v, "content");
+    if (!sv) return KWH_ENC_NONE;
+    if (strcasecmp(sv, "UTF-8") == 0) return KWH_ENC_UTF8;
+    if (strcasecmp(sv, "BINARY") == 0 || strcasecmp(sv, "ASCII-8BIT") == 0)
+      return KWH_ENC_BINARY;
+    return KWH_ENC_NONE;
+  }
+  if (vk == NK_ConstantPathNode) {
+    int par = nt_ref(nt, v, "parent");
+    const char *cn = nt_str(nt, v, "name");
+    if (!cn || par < 0 || nt_kind(nt, par) != NK_ConstantReadNode ||
+        !sp_streq(nt_str(nt, par, "name"), "Encoding")) return KWH_ENC_NONE;
+    if (sp_streq(cn, "UTF_8")) return KWH_ENC_UTF8;
+    if (sp_streq(cn, "BINARY") || sp_streq(cn, "ASCII_8BIT"))
+      return KWH_ENC_BINARY;
+  }
+  return KWH_ENC_NONE;
+}
+
+static int kwh_read_encoding(const NodeTable *nt, int kwh) {
+  if (kwh < 0 || nt_kind(nt, kwh) != NK_KeywordHashNode) return KWH_ENC_NONE;
   int en = 0; const int *els = nt_arr(nt, kwh, "elements", &en);
-  if (en == 0) return 0;
+  if (en == 0) return KWH_ENC_NONE;
+  int enc = KWH_ENC_NONE;
   for (int i = 0; i < en; i++) {
-    if (nt_kind(nt, els[i]) != NK_AssocNode) return 0;
+    if (nt_kind(nt, els[i]) != NK_AssocNode) return KWH_ENC_NONE;
     int k = nt_ref(nt, els[i], "key"), v = nt_ref(nt, els[i], "value");
     const char *kn = k >= 0 && nt_kind(nt, k) == NK_SymbolNode ? nt_str(nt, k, "value") : NULL;
     if (!kn || (!sp_streq(kn, "encoding") && !sp_streq(kn, "external_encoding") &&
-                !sp_streq(kn, "internal_encoding"))) return 0;
-    if (v < 0) return 0;
-    NodeKind vk = nt_kind(nt, v);
-    if (vk == NK_StringNode) {
-      const char *sv = nt_str(nt, v, "content");
-      if (!sv || strcasecmp(sv, "UTF-8") != 0) return 0;
-    }
-    else if (vk == NK_ConstantPathNode) {
-      int par = nt_ref(nt, v, "parent");
-      const char *cn = nt_str(nt, v, "name");
-      if (!cn || !sp_streq(cn, "UTF_8") || par < 0 || nt_kind(nt, par) != NK_ConstantReadNode ||
-          !sp_streq(nt_str(nt, par, "name"), "Encoding")) return 0;
-    }
-    else return 0;
+                !sp_streq(kn, "internal_encoding"))) return KWH_ENC_NONE;
+    int e = kwh_enc_value(nt, v);
+    /* an internal BINARY transcodes; only the external one retags */
+    if (e == KWH_ENC_BINARY && sp_streq(kn, "internal_encoding"))
+      return KWH_ENC_NONE;
+    if (e == KWH_ENC_NONE || (enc != KWH_ENC_NONE && e != enc))
+      return KWH_ENC_NONE;
+    enc = e;
   }
-  return 1;
+  return enc;
 }
 
 int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
@@ -96,10 +118,22 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       buf_puts(b, "sp_file_basename2("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
       emit_str_expr(c, argv[1], b); buf_puts(b, ")"); return 1;
     }
-    if (sp_streq(name, "read") && argc >= 2 && kwh_utf8_only(nt, argv[argc - 1])) argc--;
+    int read_bin = 0;
+    if (sp_streq(name, "read") && argc >= 2 &&
+        nt_kind(nt, argv[argc - 1]) == NK_KeywordHashNode) {
+      int enc = kwh_read_encoding(nt, argv[argc - 1]);
+      if (enc == KWH_ENC_NONE) {
+        unsupported_feature(c, id, "File.read with options other than an "
+                            "encoding (UTF-8 or BINARY) is not supported");
+        buf_puts(b, "\"\"");
+        return 1;
+      }
+      read_bin = enc == KWH_ENC_BINARY;
+      argc--;
+    }
     if ((sp_streq(name, "read") || sp_streq(name, "binread")) && argc == 1) {
       /* binread answers BYTES (CRuby names them ASCII-8BIT); read answers text */
-      int bin_r = sp_streq(name, "binread");
+      int bin_r = sp_streq(name, "binread") || read_bin;
       if (bin_r) buf_puts(b, "sp_str_as_binary(");
       buf_puts(b, "sp_file_read("); emit_path_expr(c, argv[0], b); buf_puts(b, ")");
       if (bin_r) buf_puts(b, ")");
@@ -111,7 +145,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
        evaluated into temporaries in source order: C leaves the order of
        a call's arguments unspecified. */
     if ((sp_streq(name, "read") || sp_streq(name, "binread")) && (argc == 2 || argc == 3)) {
-      int bin_r = sp_streq(name, "binread");
+      int bin_r = sp_streq(name, "binread") || read_bin;
       int tp = ++g_tmp, tl = ++g_tmp, to = ++g_tmp;
       if (bin_r) buf_puts(b, "sp_str_as_binary(");
       buf_printf(b, "({ const char *_t%d = ", tp); emit_path_expr(c, argv[0], b);
@@ -138,6 +172,20 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       buf_puts(b, "sp_file_size_q("); emit_path_expr(c, argv[0], b); buf_puts(b, ")"); return 1;
     }
     if (sp_streq(name, "pipe?") && argc == 1) {
+      /* an IO value is tested by its descriptor, as CRuby's rb_stat does once
+         #to_io has given it one (an object with #to_io is not converted here) */
+      TyKind pt = comp_ntype(c, argv[0]);
+      if (pt == TY_IO) {
+        buf_puts(b, "sp_file_pipe_io("); emit_expr(c, argv[0], b); buf_puts(b, ")"); return 1;
+      }
+      if (pt == TY_POLY || yield_site_type(c, argv[0]) == TY_POLY) {
+        int tv = ++g_tmp;
+        buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_boxed(c, argv[0], b);
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_IO"
+                      " ? sp_file_pipe_io((sp_File *)_t%d.v.p) : sp_file_pipe(sp_poly_arg_path(_t%d)); })",
+                   tv, tv, tv, tv, tv);
+        return 1;
+      }
       buf_puts(b, "sp_file_pipe("); emit_path_expr(c, argv[0], b); buf_puts(b, ")"); return 1;
     }
     if (sp_streq(name, "identical?") && argc == 2) {
@@ -435,8 +483,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     if (is_open_constructor(name)) {
       int block = nt_ref(nt, id, "block");
       int kw_mode = -1;
-      if (argc >= 2 && nt_type(nt, argv[argc - 1]) &&
-          sp_streq(nt_type(nt, argv[argc - 1]), "KeywordHashNode"))
+      if (argc >= 2 && nt_argv_kwh(nt, argv, argc) >= 0)
         kw_mode = struct_kwarg_value(c, argv[argc - 1], "mode");
       /* the mode is the `mode:` keyword's value or the second positional;
          an Integer flag word, or an object answering #to_int (CRuby asks it
@@ -447,8 +494,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
                      (comp_ntype(c, mnode) == TY_INT ||
                       obj_conv_method(c, comp_ntype(c, mnode), "to_int", TY_INT, NULL) >= 0);
       int perm = -1;
-      if (argc >= 1 && nt_type(nt, argv[argc - 1]) &&
-          sp_streq(nt_type(nt, argv[argc - 1]), "KeywordHashNode"))
+      if (nt_argv_kwh(nt, argv, argc) >= 0)
         perm = struct_kwarg_value(c, argv[argc - 1], "perm");
       if (perm < 0 && kw_mode < 0 && argc >= 3 &&
           !(nt_type(nt, argv[2]) && sp_streq(nt_type(nt, argv[2]), "KeywordHashNode")))
@@ -503,7 +549,8 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       const char *frn = fp ? rename_local(fp) : NULL;
       int bbody = nt_ref(nt, block, "body");
       int bn = 0; const int *bb = bbody >= 0 ? nt_arr(nt, bbody, "body", &bn) : NULL;
-      TyKind res = repr_of(c, id).as_ty;
+      Repr rr = repr_of(c, id);
+      TyKind res = rr.as_ty;
       int rv = ++g_tmp, tf = ++g_tmp;
       int scalar = is_scalar_ret(res) && res != TY_VOID && res != TY_NIL && res != TY_UNKNOWN;
       buf_puts(b, "({ ");
@@ -531,12 +578,12 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         snprintf(result, sizeof result, "_t%d", rv);
         if (scalar) {
           emit_ctype(c, res, b); buf_printf(b, " %s = ", result);
-          buf_puts(b, res == TY_POLY ? "sp_box_nil()" : default_value_from_compiler(c, res));
+          buf_puts(b, rr.kind == RK_BOXED ? "sp_box_nil()" : default_value_from_compiler(c, res));
           buf_puts(b, "; ");
           emit_gc_root_tmp_refs(c, res, rv, b);
         }
         g_ie_next_var = g_loop_break_var = scalar ? result : NULL;
-        g_ie_res_poly = res == TY_POLY; g_ie_next_ty = res; g_ie_next_oint = 0;
+        g_ie_res_poly = rr.kind == RK_BOXED; g_ie_next_ty = res; g_ie_next_oint = 0;
         g_brk_ser_var = NULL;
         g_loop_exc_base = g_exc_frame_depth; g_loop_rescue_base = g_rescue_save_depth;
         g_loop_ensure_base = g_ensure_depth;
@@ -545,7 +592,8 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       }
       for (int k = 0; k < bn - 1; k++) emit_stmt(c, bb[k], b, 0);
       if (bn > 0) {
-        TyKind lty = repr_of(c, bb[bn-1]).as_ty;
+        Repr ltyr = repr_of(c, bb[bn-1]);
+        TyKind lty = ltyr.as_ty;
         /* Emit last stmt as expression when it has a usable non-void value.
            For void/nil/unknown side-effecting calls (e.g. f.print), emit_stmt
            handles g_pre correctly; then synthesize a return value. */
@@ -562,7 +610,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
           Buf fval; memset(&fval, 0, sizeof fval);
           Buf *sv_fp = g_pre; int sv_fi = g_indent;
           g_pre = &fpre; g_indent = 0;
-          if (res == TY_POLY && lty != TY_POLY) emit_boxed(c, bb[bn-1], &fval);
+          if (rr.kind == RK_BOXED && ltyr.kind != RK_BOXED) emit_boxed(c, bb[bn-1], &fval);
           else emit_expr(c, bb[bn-1], &fval);
           g_pre = sv_fp; g_indent = sv_fi;
           if (fpre.p) buf_puts(b, fpre.p);
@@ -576,7 +624,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
           emit_stmt(c, bb[bn-1], b, 0);
           if (scalar && !wrap) {
             emit_ctype(c, res, b); buf_printf(b, " _t%d = ", rv);
-            if (res == TY_POLY) buf_puts(b, "sp_box_nil()");
+            if (rr.kind == RK_BOXED) buf_puts(b, "sp_box_nil()");
             else buf_puts(b, default_value_from_compiler(c, res));
             buf_puts(b, "; ");
           }
@@ -595,7 +643,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
          block (`File.open(p, "a") { |f| }`) in a poly-returning method emitted
          an int where an sp_RbVal was expected (#3385). */
       if (scalar && bn > 0) buf_printf(b, "_t%d; })", rv);
-      else if (scalar && res == TY_POLY) buf_puts(b, "sp_box_nil(); })");
+      else if (scalar && rr.kind == RK_BOXED) buf_puts(b, "sp_box_nil(); })");
       else if (scalar) { buf_puts(b, default_value_from_compiler(c, res)); buf_puts(b, "; })"); }
       else buf_puts(b, "0; })");
       return 1;
@@ -631,7 +679,8 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       const char *dpn = dp0 ? rename_local(dp0) : NULL;
       int dbody = nt_ref(nt, dblk, "body");
       int dbn = 0; const int *dbb = dbody >= 0 ? nt_arr(nt, dbody, "body", &dbn) : NULL;
-      TyKind dres = repr_of(c, id).as_ty;
+      Repr dresr = repr_of(c, id);
+      TyKind dres = dresr.as_ty;
       int dscalar = is_scalar_ret(dres) && dres != TY_VOID && dres != TY_NIL && dres != TY_UNKNOWN;
       int td = ++g_tmp, tdv = ++g_tmp;
       buf_puts(b, "({ ");
@@ -641,7 +690,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       for (int k = 0; k < dbn - 1; k++) emit_stmt(c, dbb[k], b, 0);
       if (dbn > 0 && dscalar) {
         emit_ctype(c, dres, b); buf_printf(b, " _t%d = ", tdv);
-        if (dres == TY_POLY && repr_of(c, dbb[dbn - 1]).kind != RK_BOXED) emit_boxed(c, dbb[dbn - 1], b);
+        if (dresr.kind == RK_BOXED && repr_of(c, dbb[dbn - 1]).kind != RK_BOXED) emit_boxed(c, dbb[dbn - 1], b);
         else emit_expr(c, dbb[dbn - 1], b);
         buf_puts(b, "; ");
       }
@@ -709,6 +758,30 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     if (sp_streq(name, "glob") && argc == 1) {
       buf_puts(b, "sp_dir_glob("); emit_path_expr(c, argv[0], b); buf_puts(b, ")"); return 1;
     }
+    /* Blockless foreach and each_child retain their arguments for a lazy
+       generator run; each_child's leaves out "." and "..". */
+    int children = sp_streq(name, "each_child");
+    if (is_dir_blockless_iter(name) && nt_ref(nt, id, "block") < 0) {
+      /* a splat's length is only known when it runs: refused, not guessed */
+      if (nt_argv_has_splat(nt, argv, argc)) {
+        unsupported_feature(c, id, children ? "Dir.each_child with a splatted argument and no block"
+                                             : "Dir.foreach with a splatted argument and no block");
+        buf_puts(b, "NULL");
+        return 1;
+      }
+      int ev = -1;
+      if (argc == 2 && nt_kind(nt, argv[1]) == NK_KeywordHashNode) {
+        int en = 0; (void)nt_arr(nt, argv[1], "elements", &en);
+        if (en == 1) ev = kwh_lookup(nt, argv[1], "encoding");
+      }
+      if (argc == 1 || (argc == 2 && ev >= 0)) {
+        int tp = ++g_tmp;
+        buf_printf(b, "({ sp_RbVal _t%d = ", tp); emit_boxed(c, argv[0], b);
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_dir_foreach_enum(_t%d, ", tp, tp);
+        if (ev >= 0) emit_boxed(c, ev, b); else buf_puts(b, "sp_box_nil()");
+        buf_printf(b, ", sp_poly_arg_path, %d); })", children); return 1;
+      }
+    }
     if ((is_directory_entries(name)) && argc == 1) {
       buf_printf(b, "sp_dir_%s(", name); emit_path_expr(c, argv[0], b); buf_puts(b, ")"); return 1;
     }
@@ -764,8 +837,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     /* Time.at(x, *rest) and any other spread: every argument into one list,
        which the runtime reads as Time.at's arguments, as for a lone splat */
     if (sp_streq(name, "at") && argc >= 2) {
-      int any_splat = 0;
-      for (int k = 0; k < argc; k++) if (nt_kind(nt, argv[k]) == NK_SplatNode) any_splat = 1;
+      int any_splat = nt_argv_has_splat(nt, argv, argc);
       if (any_splat) {
         buf_puts(b, "({ ");
         int tf = emit_bm_flat_args(c, argv, argc, b);
@@ -782,7 +854,8 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       return 1;
     }
     if (sp_streq(name, "at") && argc == 1) {
-      TyKind at = comp_ntype(c, argv[0]);
+      Repr ar = repr_of(c, argv[0]);
+      TyKind at = ar.as_ty;
       if (at == TY_TIME) { emit_expr(c, argv[0], b); return 1; }  /* value copy */
       if (at == TY_RATIONAL) {
         int tr = ++g_tmp;
@@ -804,7 +877,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
          numeric) reaches sp_time_at_int's sp_int slot: coerce it. A boxed
          float is understood by sp_poly_to_f, so route poly through the float
          ctor (which also accepts an integral value). */
-      if (at == TY_POLY) {
+      if (ar.kind == RK_BOXED) {
         buf_puts(b, "sp_time_at_float(sp_poly_to_f("); emit_expr(c, argv[0], b);
         buf_puts(b, "))");
         return 1;
@@ -833,11 +906,12 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
        then re-read it in the zone the keyword names -- a name, an Integer
        offset or an offset string, whatever their types (#3696, #3698). */
     if (sp_streq(name, "at") && argc >= 2 &&
-        nt_type(nt, argv[argc - 1]) && sp_streq(nt_type(nt, argv[argc - 1]), "KeywordHashNode") &&
+        nt_argv_kwh(nt, argv, argc) >= 0 &&
         struct_kwarg_value(c, argv[argc - 1], "in") >= 0) {
       int inv = struct_kwarg_value(c, argv[argc - 1], "in");
       int ts = ++g_tmp;
-      TyKind st = comp_ntype(c, argv[0]);
+      Repr sr = repr_of(c, argv[0]);
+      TyKind st = sr.as_ty;
       buf_printf(b, "({ sp_Time _t%d = ", ts);
       if (st == TY_TIME) emit_expr(c, argv[0], b);
       else if (st == TY_FLOAT) { buf_puts(b, "sp_time_at_float("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
@@ -846,7 +920,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         buf_printf(b, "({ sp_Rational _t%d = ", trq); emit_expr(c, argv[0], b);
         buf_printf(b, "; sp_time_at_div(_t%d.num, _t%d.den); })", trq, trq);
       }
-      else if (st == TY_POLY || st == TY_UNKNOWN) {
+      else if (sr.kind == RK_BOXED || st == TY_UNKNOWN) {
         buf_puts(b, "sp_time_at_float(sp_poly_to_f("); emit_boxed(c, argv[0], b); buf_puts(b, "))");
       }
       else { buf_puts(b, "sp_time_at_int("); emit_int_expr(c, argv[0], b); buf_puts(b, ")"); }
@@ -898,11 +972,12 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     if (sp_streq(name, "at") && argc == 2 &&
         !(nt_type(nt, argv[1]) && (sp_streq(nt_type(nt, argv[1]), "KeywordHashNode") ||
                                    sp_streq(nt_type(nt, argv[1]), "HashNode")))) {
-      TyKind st = repr_of(c, argv[0]).as_ty;
+      Repr st_repr = repr_of(c, argv[0]);
+      TyKind st = st_repr.as_ty;
       int ts = ++g_tmp;
       buf_printf(b, "({ sp_Time _t%d = ", ts);
       if (st == TY_FLOAT) { buf_puts(b, "sp_time_at_float("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
-      else if (st == TY_POLY || st == TY_UNKNOWN) { buf_puts(b, "sp_time_at_float(sp_poly_to_f("); emit_boxed(c, argv[0], b); buf_puts(b, "))"); }
+      else if (st_repr.kind == RK_BOXED || st == TY_UNKNOWN) { buf_puts(b, "sp_time_at_float(sp_poly_to_f("); emit_boxed(c, argv[0], b); buf_puts(b, "))"); }
       else { buf_puts(b, "sp_time_at_int("); emit_int_expr(c, argv[0], b); buf_puts(b, ")"); }
       buf_printf(b, "; _t%d = sp_time_add_nsec(_t%d, (int64_t)(", ts, ts);
       TyKind ut = repr_of(c, argv[1]).as_ty;
@@ -925,6 +1000,94 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
 }
 
 /* the module functions of GC, Fiber, Process, Marshal and Math, Integer.sqrt, to_json and Dir.exist? */
+/* Marshal.dump / load / restore through the module as a value (`m =
+   Marshal; m.dump(x)`): a class value that is Marshal at run time takes the
+   module's own, and any other has no such method. Only where no class of
+   the program defines the name and the call answers a box. */
+int emit_marshal_value_call(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  const char *name = nt_str(nt, id, "name");
+  int recv = nt_ref(nt, id, "receiver");
+  int args = nt_ref(nt, id, "arguments"), argc = 0;
+  const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
+  if (!name || recv < 0 || argc != 1 || nt_ref(nt, id, "block") >= 0) return 0;
+  int dump = sp_streq(name, "dump");
+  if (!dump && !sp_streq(name, "load") && !sp_streq(name, "restore")) return 0;
+  NodeKind rk = nt_kind(nt, recv);
+  if (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) return 0;
+  TyKind rt = comp_ntype(c, recv);
+  if ((rt != TY_POLY && rt != TY_CLASS) || nt_kind(nt, argv[0]) == NK_SplatNode) return 0;
+  if (repr_of(c, id).kind != RK_BOXED || recv_user_defines(c, name)) return 0;
+  int tr = ++g_tmp, ta = ++g_tmp;
+  buf_printf(b, "({ sp_RbVal _t%d = ", tr);
+  emit_boxed(c, recv, b);
+  buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_RbVal _t%d = ", tr, ta);
+  emit_boxed(c, argv[0], b);
+  buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); "
+                "sp_Class _c%d = _t%d.tag == SP_TAG_CLASS ? sp_unbox_class(_t%d) : (sp_Class){0, NULL}; "
+                "if (!(_t%d.tag == SP_TAG_CLASS && _c%d.cls_id < 0 && _c%d.name && !strcmp(_c%d.name, \"Marshal\"))) "
+                "sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)); ",
+             ta, tr, tr, tr, tr, tr, tr, tr, name, tr);
+  if (dump) buf_printf(b, "sp_box_str(sp_marshal_dump(_t%d)); })", ta);
+  else buf_printf(b, "const char *_s%d = sp_poly_arg_str_chk(_t%d); "
+                     "sp_marshal_load(_s%d, (sp_int)sp_str_byte_len(_s%d)); })", ta, ta, ta, ta);
+  return 1;
+}
+
+/* IO.select(read, write, error, timeout), and Kernel#select, which is the
+   same call. Arrays of boxed values and literal nils go straight to
+   sp_io_select; any other array argument (an untyped empty [] is an Integer
+   array) goes through its box, each argument rooted while the rest are
+   evaluated and converted (an Array, else CRuby's "wrong argument type";
+   select takes no #to_ary).
+   A nil array watches nothing; a literal nil timeout waits. */
+static int io_select_arg_direct(Compiler *c, int node) {
+  return nt_kind(c->nt, node) == NK_NilNode || repr_of(c, node).as_ty == TY_POLY_ARRAY;
+}
+int emit_io_select(Compiler *c, int argc, const int *argv, Buf *b) {
+  const NodeTable *nt = c->nt;
+  int direct = 1;
+  for (int k = 0; k < 3 && k < argc; k++)
+    if (!io_select_arg_direct(c, argv[k])) direct = 0;
+  if (argc >= 4 && nt_kind(nt, argv[3]) != NK_NilNode && comp_ntype(c, argv[3]) == TY_NIL) direct = 0;
+  if (direct) {
+    buf_puts(b, "sp_io_select(");
+    for (int k = 0; k < 3; k++) {
+      if (k) buf_puts(b, ", ");
+      if (k >= argc || nt_kind(nt, argv[k]) == NK_NilNode) buf_puts(b, "NULL");
+      else emit_expr(c, argv[k], b);
+    }
+    buf_puts(b, ", ");
+    if (argc >= 4 && nt_kind(nt, argv[3]) != NK_NilNode) emit_float_expr(c, argv[3], b);
+    else buf_puts(b, "-1.0");
+    buf_puts(b, ")");
+    return 1;
+  }
+  int vals[3], arrays[3];
+  buf_puts(b, "({ ");
+  for (int k = 0; k < 3; k++) {
+    vals[k] = ++g_tmp;
+    buf_printf(b, "sp_RbVal _t%d = ", vals[k]);
+    if (k < argc) emit_boxed(c, argv[k], b); else buf_puts(b, "sp_box_nil()");
+    buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); ", vals[k]);
+  }
+  int timeout = ++g_tmp;
+  buf_printf(b, "double _t%d = ", timeout);
+  if (argc >= 4 && comp_ntype(c, argv[3]) != TY_NIL) emit_float_expr(c, argv[3], b);
+  else if (argc >= 4) { buf_puts(b, "((void)("); emit_expr(c, argv[3], b); buf_puts(b, "), -1.0)"); }
+  else buf_puts(b, "-1.0");
+  buf_puts(b, "; ");
+  for (int k = 0; k < 3; k++) {
+    arrays[k] = ++g_tmp;
+    buf_printf(b, "sp_PolyArray *_t%d = _t%d.tag == SP_TAG_NIL ? NULL : "
+                  "_t%d.tag == SP_TAG_OBJ && sp_poly_is_array_kind(_t%d.cls_id) ? sp_poly_to_poly_array(_t%d) : "
+                  "(sp_bm_arg_mismatch(_t%d, \"Array\"), (sp_PolyArray *)NULL); SP_GC_ROOT(_t%d); ",
+               arrays[k], vals[k], vals[k], vals[k], vals[k], vals[k], arrays[k]);
+  }
+  buf_printf(b, "sp_io_select(_t%d, _t%d, _t%d, _t%d); })", arrays[0], arrays[1], arrays[2], timeout);
+  return 1;
+}
+
 int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
   /* StringIO is a native-bound package class; .open is Ruby in the package. */
 
@@ -1066,10 +1229,8 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
        NotImplementedError, the count is checked, and the flags are checked
        noclose first */
     if (sp_streq(name, "daemon")) {
-      for (int k = 0; k < argc; k++)
-        if (nt_kind(nt, argv[k]) == NK_SplatNode || nt_kind(nt, argv[k]) == NK_KeywordHashNode ||
-            nt_kind(nt, argv[k]) == NK_BlockArgumentNode)
-          unsupported(c, id, "Process.daemon with a splat, keyword or block argument");
+      if (nt_argv_has(nt, argv, argc, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_BLOCK))
+        unsupported(c, id, "Process.daemon with a splat, keyword or block argument");
       int t = ++g_tmp;
       buf_puts(b, "({ ");
       for (int k = 0; k < 2 || k < argc; k++) {
@@ -1096,7 +1257,11 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       return 1;
     }
     if (repr_of(c, argv[0]).kind == RK_BOXED) {
-      buf_puts(b, "sp_int_sqrt_arg("); emit_boxed(c, argv[0], b); buf_puts(b, ")");
+      buf_puts(b, "sp_poly_isqrt("); emit_boxed(c, argv[0], b); buf_puts(b, ")");
+      return 1;
+    }
+    if (repr_of(c, argv[0]).as_ty == TY_FLOAT && !nt_argv_has_splat(nt, argv, argc)) {
+      buf_puts(b, "sp_float_isqrt("); emit_scalar_operand(c, argv[0], "0.0", b); buf_puts(b, ")");
       return 1;
     }
     buf_puts(b, "sp_int_sqrt("); emit_int_expr(c, argv[0], b); buf_puts(b, ")");
@@ -1202,7 +1367,7 @@ else {
     /* expm1/log1p keep their precision near zero, where exp(x)-1 and log(1+x)
        cancel away most of the significant digits */
     else if (sp_streq(name, "expm1")) cfn = "expm1";
-    else if (sp_streq(name, "log1p")) cfn = "log1p";
+    else if (sp_streq(name, "log1p")) cfn = "sp_math_log1p";
     else if (sp_streq(name, "erf"))   cfn = "erf";
     else if (sp_streq(name, "erfc"))  cfn = "erfc";
     else if (sp_streq(name, "gamma")) cfn = "sp_math_gamma";
@@ -1348,6 +1513,20 @@ static void emit_getaddrinfo_hint(Compiler *c, int arg, int is_family, Buf *b) {
   buf_printf(b, ", %d)", is_family);
 }
 
+/* A domain or socket type argument of Socket.new, Socket.pair or
+   UDPSocket.new: an Integer as it is, and a value that may be a String or a
+   Symbol naming the constant through sp_sock_family_arg, as CRuby reads it */
+void emit_sock_family_arg(Compiler *c, int arg, int is_family, Buf *b) {
+  TyKind t = comp_ntype(c, arg);
+  if (t != TY_STRING && t != TY_SYMBOL && t != TY_POLY) {
+    emit_int_expr(c, arg, b);
+    return;
+  }
+  buf_puts(b, "sp_sock_family_arg(");
+  emit_boxed(c, arg, b);
+  buf_printf(b, ", %d)", is_family);
+}
+
 int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
   /* Thread class methods: Thread.current / Thread.pass (recv is the Thread
      constant). Handled before the Class.new dispatch since they are not `new`. */
@@ -1403,9 +1582,7 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
     if (tcn && is_exc_name(tcn)) {
       if (sp_streq(name, "exception")) {
         if (emit_syserr_family_new(c, id, tcn, argc, argv, b)) return 1;
-        buf_printf(b, "sp_exc_new(\"%s\", ", tcn);
-        emit_exc_msg_arg(c, argc >= 1 ? argv[0] : -1, b);
-        buf_puts(b, ")");
+        emit_exc_new_msg(c, tcn, argc >= 1 ? argv[0] : -1, b);
         return 1;
       }
       if (sp_streq(name, "to_tty?") && argc == 0) {
@@ -1428,6 +1605,18 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
       if (is_unix && argc == 1) {
         buf_puts(b, "sp_addrinfo_new("); emit_str_expr(c, argv[0], b);
         buf_puts(b, ", 0, sp_sock_const(\"SOCK_STREAM\"), 1)");
+        return 1;
+      }
+    }
+    /* IPSocket.getaddress(host), and on the IPSocket classes below it: the
+       first address the name resolves to */
+    if (tcn && sp_feature_required("socket") && sp_streq(name, "getaddress") && argc == 1 &&
+        (sp_streq(tcn, "IPSocket") || sp_streq(tcn, "TCPSocket") || sp_streq(tcn, "UDPSocket"))) {
+      int skc = comp_class_index(c, tcn);
+      if (skc < 0 || comp_cmethod_in_chain(c, skc, name, NULL) < 0) {
+        buf_puts(b, "sp_sock_getaddress(");
+        emit_str_expr(c, argv[0], b);
+        buf_puts(b, ")");
         return 1;
       }
     }
@@ -1469,13 +1658,31 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
       if (sp_streq(name, "gethostname") && argc == 0) {
         buf_puts(b, "sp_sock_gethostname()"); return 1;
       }
+      /* Socket.unix(path) / Socket.tcp(host, port): the connection
+         UNIXSocket.new / TCPSocket.new make, as a Socket (#9934). The block
+         form, a local address and the timeout options are not served. */
+      if (sp_streq(name, "unix") || sp_streq(name, "tcp")) {
+        int tcp = sp_streq(name, "tcp");
+        if (argc != (tcp ? 2 : 1) || nt_ref(nt, id, "block") >= 0) {
+          unsupported_feature(c, id, tcp ? "Socket.tcp with a block, a local address or options; "
+                                            "use TCPSocket.new(host, port)"
+                                          : "Socket.unix with a block; use UNIXSocket.new(path)");
+          buf_puts(b, "NULL");
+          return 1;
+        }
+        buf_puts(b, tcp ? "sp_sock_tcp_socket(" : "sp_sock_unix_socket(");
+        emit_str_expr(c, argv[0], b);
+        if (tcp) { buf_puts(b, ", "); emit_int_expr(c, argv[1], b); }
+        buf_puts(b, ")");
+        return 1;
+      }
       /* Socket.pair / .socketpair -> [end0, end1]; the runtime creates both on
          the first call and hands back the second on the next. */
       if ((is_socket_pair_alias(name)) && argc >= 2) {
         int tp0 = ++g_tmp, tp1 = ++g_tmp, tpa = ++g_tmp;
         buf_printf(b, "({ sp_File *_t%d = sp_sock_pair_end(", tp0);
-        emit_int_expr(c, argv[0], b); buf_puts(b, ", ");
-        emit_int_expr(c, argv[1], b); buf_puts(b, ", ");
+        emit_sock_family_arg(c, argv[0], 1, b); buf_puts(b, ", ");
+        emit_sock_family_arg(c, argv[1], 0, b); buf_puts(b, ", ");
         if (argc >= 3) emit_int_expr(c, argv[2], b); else buf_puts(b, "0");
         buf_printf(b, ", 0); SP_GC_ROOT(_t%d); sp_File *_t%d = sp_sock_pair_end(0, 0, 0, 1);"
                       " SP_GC_ROOT(_t%d); sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
@@ -1557,8 +1764,7 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
          descriptor form -- it is how CRuby spells "wrap this fd", and the way
          to reach a File::Stat from one. */
       if ((sp_streq(name, "for_fd") || sp_streq(name, "new")) && argc >= 1) {
-        const char *lty = nt_type(nt, argv[argc - 1]);
-        int kwh = (lty && sp_streq(lty, "KeywordHashNode")) ? argv[argc - 1] : -1;
+        int kwh = nt_argv_kwh(nt, argv, argc);
         int ac = kwh >= 0 ? kwh_lookup(nt, kwh, "autoclose") : -1;
         buf_puts(b, "sp_io_for_fd(");
         emit_int_expr(c, argv[0], b);
@@ -1582,21 +1788,7 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
         return 1;
       }
       /* IO.select(read, write, error, timeout): a nil array watches nothing */
-      if (sp_streq(name, "select") && argc >= 1 && argc <= 4) {
-        buf_puts(b, "sp_io_select(");
-        for (int k = 0; k < 3; k++) {
-          if (k) buf_puts(b, ", ");
-          if (k >= argc || (nt_type(nt, argv[k]) && sp_streq(nt_type(nt, argv[k]), "NilNode")))
-            buf_puts(b, "NULL");
-          else emit_expr(c, argv[k], b);
-        }
-        buf_puts(b, ", ");
-        if (argc >= 4 && !(nt_type(nt, argv[3]) && sp_streq(nt_type(nt, argv[3]), "NilNode")))
-          emit_float_expr(c, argv[3], b);
-        else buf_puts(b, "-1.0");
-        buf_puts(b, ")");
-        return 1;
-      }
+      if (sp_streq(name, "select") && argc >= 1 && argc <= 4) return emit_io_select(c, argc, argv, b);
       if (sp_streq(name, "copy_stream") && argc == 2) {
         /* IO.copy_stream(src, dst): read the whole source, write it to the dest,
            returning the byte count. sp_io_copy_stream takes two path strings, so
@@ -1739,8 +1931,7 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
         return 1;
       }
       int n_args = extra - (last_is_opts ? 1 : 0);
-      int has_splat = 0;
-      for (int k = 0; k <= n_args; k++) has_splat |= nt_kind(nt, argv[k]) == NK_SplatNode;
+      int has_splat = nt_argv_has_splat(nt, argv, n_args + 1);
       if (has_splat) {
         /* `spawn(*args)`: the command and its arguments are spread at run
            time, then split, as the literal list is (#7192) */
@@ -2083,8 +2274,9 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
                              repr_of(c, argv[0]).kind == RK_BOXED)) {
         Buf rv; memset(&rv, 0, sizeof rv);
         buf_puts(&rv, "sp_rand_poly(sp_random_default_get(), "); emit_boxed(c, argv[0], &rv); buf_puts(&rv, ", 0)");
-        TyKind rk = repr_of(c, id).as_ty;
-        if (rk == TY_POLY || rk == TY_UNKNOWN) buf_puts(b, rv.p);
+        Repr rkr = repr_of(c, id);
+        TyKind rk = rkr.as_ty;
+        if (rkr.kind == RK_BOXED || rk == TY_UNKNOWN) buf_puts(b, rv.p);
         else emit_unbox_text(c, rk, rv.p, b);
         free(rv.p);
       }
@@ -2168,8 +2360,8 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         /* Random#rand(1.0..2.0) -> a Float in [first, last), exact endpoints. */
         int tr = ++g_tmp;
         buf_printf(b, "({ sp_FloatRange _t%d = ", tr); emit_expr(c, argv[0], b);
-        buf_puts(b, "; sp_Random_rand_float_range("); emit_expr(c, recv, b);
-        buf_printf(b, ", _t%d.first, _t%d.last); })", tr, tr);
+        buf_puts(b, "; sp_random_rand_frange("); emit_expr(c, recv, b);
+        buf_printf(b, ", _t%d); })", tr);
       }
       else if (argc >= 1 && repr_of(c, argv[0]).range == TY_INT) {
         /* a Float-endpoint range yields a Float (#2521); an int range an Int. */
@@ -2187,9 +2379,9 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         if (is_float) {
           int tr = ++g_tmp;
           buf_printf(b, "({ sp_Range _t%d = ", tr); emit_expr(c, argv[0], b);
-          buf_puts(b, "; sp_Random_rand_float_range(");
+          buf_puts(b, "; sp_random_rand_fend(");
           emit_expr(c, recv, b);
-          buf_printf(b, ", (sp_float)_t%d.first, sp_range_end_num(_t%d)); })", tr, tr);
+          buf_printf(b, ", _t%d); })", tr);
         }
         else {
           buf_puts(b, "sp_Random_rand_range("); emit_expr(c, recv, b); buf_puts(b, ", ");

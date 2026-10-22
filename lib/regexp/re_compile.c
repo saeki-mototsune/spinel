@@ -17,13 +17,25 @@
 #include "re_prop.h"
 #endif
 
-/* Class IDs are stored in re_inst.a (uint8_t), so at most 256 distinct
-   character classes can be encoded.  Without this cap, class_capa
-   (uint16_t) overflows on doubling past 32768 (8 -> 16 -> ... -> 32768
-   -> 0), mrb_realloc with size 0 returns NULL, and the next memset
-   crashes; even before that, the (uint8_t)id cast at emit sites would
-   silently alias different classes. */
-#define RE_MAX_CLASSES 256
+/* A class instruction (RE_CLASS, RE_NCLASS) names its class by id in
+   re_inst.offset, and the pattern counts its classes in a uint16_t
+   (num_classes), so a pattern holds at most 65535 distinct character
+   classes; the table grows to what the pattern needs. */
+#define RE_MAX_CLASSES 65535
+/* the literal record (literal_cp) a compile keeps in its own frame before
+   it moves to the GC arena */
+#define RE_LITERAL_CP_INLINE 256
+/* the chains literal_class() finds a codepoint's class through, by its low
+   bits */
+#define RE_LITERAL_BUCKETS 256
+
+/* A class's entry in the literal record: the codepoint whose /i literal it
+   stands for (0 for a class made by anything else), and the class before it
+   in that codepoint's bucket chain (its id + 1, 0 for none). */
+typedef struct re_literal {
+  uint32_t cp;
+  uint16_t next;
+} re_literal;
 
 /* What opened a nesting level of the parse; see re_level. */
 enum {
@@ -137,7 +149,7 @@ typedef struct {
   const char *p;       /* current position */
   uint32_t code_len;
   uint32_t code_capa;
-  uint16_t class_capa;
+  uint32_t class_capa;
   uint16_t num_captures;
   uint32_t flags;
   uint32_t orig_flags;  /* flags as passed to mrb_re_compile(), for error
@@ -169,9 +181,16 @@ typedef struct {
                                before the atom, and a `\u{...}` list moves it
                                forward so the quantifier repeats the last
                                codepoint alone */
-  uint32_t literal_cp[RE_MAX_CLASSES];  /* by class id: the codepoint whose
-                               /i literal the class stands for, 0 for a class
-                               made by anything else; see literal_class() */
+  re_literal *literal_cp;   /* by class id: the codepoint whose /i literal
+                               the class stands for, 0 for a class made by
+                               anything else; see literal_class(). In
+                               literal_cp_inline, then a String the GC arena
+                               keeps for the compile once it outgrows that */
+  uint32_t literal_capa;
+  mrb_value literal_store;  /* nil while the record is inline */
+  re_literal literal_cp_inline[RE_LITERAL_CP_INLINE];
+  uint16_t literal_head[RE_LITERAL_BUCKETS];  /* by cp % RE_LITERAL_BUCKETS: the
+                               newest literal class of the bucket, id + 1 */
   uint32_t depth;           /* nesting levels open at the parse point: the
                                levels on the stack below and the character
                                classes open inside one another; bounded by
@@ -254,20 +273,20 @@ compile_error(re_compiler *c, const char *msg)
 }
 
 /* Maximum number of instructions in a compiled pattern. Every jump target
-   lives in re_inst.offset (uint16_t) and a target may be one past the last
-   instruction, so the whole program has to be addressable by that field.
-   Without the cap the targets wrap on the way in and the engine jumps to an
-   unrelated instruction: no exception, no memory error, just a pattern that
-   stops matching text it describes. The check sits in emit(), the one place
+   lives in re_inst.offset (32 bits) and a target may be one past the last
+   instruction, so the whole program has to be addressable by that field;
+   the cap sits far below that, at 16M instructions (128 MB of code), where
+   a pattern is a runaway rather than a table of a few thousand words
+   (more than 65535). The check sits in emit(), the one place
    code_len grows, so it covers every producer including insert_inst(). */
-#define RE_MAX_CODE_LEN 0xffff
+#define RE_MAX_CODE_LEN 0x00ffffff
 
 /* The slot a \K's RE_SAVE carries until the groups are counted and its own
    pair is known; no group's slot is this high (RE_MAX_CAPTURES). */
 #define RE_KEEP_PENDING 0xffff
 
 static uint32_t
-emit(re_compiler *c, uint8_t op, uint8_t a, uint16_t offset)
+emit(re_compiler *c, uint8_t op, uint8_t a, uint32_t offset)
 {
   if (c->code_len >= RE_MAX_CODE_LEN) compile_error(c, "regexp too large");
   if (c->code_len >= c->code_capa) {
@@ -282,7 +301,7 @@ emit(re_compiler *c, uint8_t op, uint8_t a, uint16_t offset)
 }
 
 static void
-patch(re_compiler *c, uint32_t pos, uint16_t offset)
+patch(re_compiler *c, uint32_t pos, uint32_t offset)
 {
   c->pat->code[pos].offset = offset;
 }
@@ -356,14 +375,14 @@ insert_insts(re_compiler *c, uint32_t pos, uint32_t count)
     if (i >= pos && i < pos + count) continue;
     if (op_holds_code_index(c->pat->code[i].op) &&
         (c->pat->code[i].offset > pos || (c->pat->code[i].offset == pos && i >= pos + count))) {
-      c->pat->code[i].offset = (uint16_t)(c->pat->code[i].offset + count);
+      c->pat->code[i].offset = (uint32_t)(c->pat->code[i].offset + count);
     }
   }
 }
 
 /* Insert one instruction at position `pos`; see insert_insts(). */
 static void
-insert_inst(re_compiler *c, uint32_t pos, uint8_t op, uint8_t a, uint16_t offset)
+insert_inst(re_compiler *c, uint32_t pos, uint8_t op, uint8_t a, uint32_t offset)
 {
   insert_insts(c, pos, 1);
   c->pat->code[pos].op = op;
@@ -423,6 +442,22 @@ add_class(re_compiler *c)
      out of, so the slot is cleared before it is counted rather than after. */
   uint16_t id = c->pat->num_classes;
   memset(&c->pat->classes[id], 0, sizeof(re_charclass));
+  if (id >= c->literal_capa) {
+    /* outgrown: the record moves to a String the GC arena holds for the
+       compile, as the levels do (open_level()), and doubles from there */
+    uint32_t capa = c->literal_capa * 2;
+    size_t bytes = sizeof(re_literal) * capa;
+    if (mrb_nil_p(c->literal_store)) {
+      c->literal_store = mrb_str_new(c->mrb, NULL, bytes);
+      memcpy(RSTRING_PTR(c->literal_store), c->literal_cp, sizeof(re_literal) * c->literal_capa);
+    }
+    else {
+      mrb_str_resize(c->mrb, c->literal_store, (mrb_int)bytes);
+    }
+    c->literal_cp = (re_literal*)RSTRING_PTR(c->literal_store);
+    c->literal_capa = capa;
+  }
+  c->literal_cp[id].cp = 0;
   c->pat->num_classes = id + 1;
   return id;
 }
@@ -439,7 +474,10 @@ drop_class(re_compiler *c, uint16_t id)
   mrb_assert(id + 1 == c->pat->num_classes);
   mrb_free(c->mrb, c->pat->classes[id].ranges);
   memset(&c->pat->classes[id], 0, sizeof(re_charclass));
-  c->literal_cp[id] = 0;
+  /* the newest class is its bucket's head */
+  if (c->literal_cp[id].cp)
+    c->literal_head[c->literal_cp[id].cp % RE_LITERAL_BUCKETS] = c->literal_cp[id].next;
+  c->literal_cp[id].cp = 0;
   c->pat->num_classes = id;
 }
 
@@ -455,7 +493,9 @@ drop_class(re_compiler *c, uint16_t id)
    classes it needed were as many as its distinct letters.
 
    Every class is recorded by id, which keeps the record the size of the id
-   space and lets it be searched to `num_classes` alone. It sits in the
+   space, and the literal ones are chained by the codepoint's low bits, so a
+   lookup reads the classes of its bucket alone rather than every class of
+   the pattern. It sits in the
    compiler's own frame rather than behind `pat`, since nothing outlives the
    compile that would want it. Zero marks a class that stands for no literal:
    it cannot be mistaken for one, since U+0000 has no case and neither caller
@@ -465,14 +505,17 @@ drop_class(re_compiler *c, uint16_t id)
 static uint16_t
 literal_class(re_compiler *c, uint32_t cp, mrb_bool *found)
 {
-  for (uint16_t id = 0; id < c->pat->num_classes; id++) {
-    if (c->literal_cp[id] == cp) {
+  uint16_t *head = &c->literal_head[cp % RE_LITERAL_BUCKETS];
+  for (uint16_t e = *head; e; e = c->literal_cp[e - 1].next) {
+    if (c->literal_cp[e - 1].cp == cp) {
       *found = TRUE;
-      return id;
+      return (uint16_t)(e - 1);
     }
   }
   uint16_t id = add_class(c);
-  c->literal_cp[id] = cp;
+  c->literal_cp[id].cp = cp;
+  c->literal_cp[id].next = *head;
+  *head = (uint16_t)(id + 1);
   *found = FALSE;
   return id;
 }
@@ -1490,7 +1533,7 @@ class_add_posix(re_compiler *c, re_charclass *cc, re_charclass *ascii_set,
 /* Room for the longest name looked up, once normalized. */
 #define RE_PROP_NAME_MAX 24
 
-enum { RE_PROP_NONE, RE_PROP_POSIX, RE_PROP_GC, RE_PROP_EMOJI };
+enum { RE_PROP_NONE, RE_PROP_POSIX, RE_PROP_GC, RE_PROP_EMOJI, RE_PROP_RANGE };
 
 /* The POSIX names, as [:name:] spells them and as a property name normalizes
    to: \p{Alpha} is [[:alpha:]] and \p{XDigit} [[:xdigit:]]. */
@@ -1566,6 +1609,16 @@ prop_gc_mask(const char *code, size_t n)
   return m;
 }
 
+/* The binary properties that are one run of codepoints, by their normalized
+   names: \p{RI} (Regional_Indicator), the flags' letters. */
+static const struct {
+  const char *name;
+  uint32_t lo, hi;
+} prop_range_names[] = {
+  {"ri", 0x1F1E6, 0x1F1FF},
+  {"regionalindicator", 0x1F1E6, 0x1F1FF},
+};
+
 /* TRUE where `raw`, normalized, is `norm`. */
 static mrb_bool
 prop_name_is(const char *norm, const char *raw)
@@ -1585,7 +1638,7 @@ prop_name_is(const char *norm, const char *raw)
    For a category the members are `*want` as a mask of the categories it
    holds, a letter standing for every category it begins and a long name for
    the ones prop_gc_long_names lists; for an emoji property they are its
-   bit. */
+   bit, and for a property of one run its row in prop_range_names. */
 static int
 prop_lookup(const char *name, size_t len, char *norm, uint32_t *want)
 {
@@ -1622,6 +1675,12 @@ prop_lookup(const char *name, size_t len, char *norm, uint32_t *want)
     if (prop_name_is(norm, re_prop_emoji_names[i])) {
       *want = (uint32_t)1 << i;
       return RE_PROP_EMOJI;
+    }
+  }
+  for (size_t i = 0; i < sizeof(prop_range_names) / sizeof(prop_range_names[0]); i++) {
+    if (strcmp(norm, prop_range_names[i].name) == 0) {
+      *want = (uint32_t)i;
+      return RE_PROP_RANGE;
     }
   }
 #else
@@ -1721,6 +1780,9 @@ class_add_property(re_compiler *c, uint16_t id, re_charclass *ascii_set,
     if (kind == RE_PROP_GC) {
       class_add_runs(c, set, re_prop_gc_runs, RE_PROP_GC_RUN_COUNT,
                      RE_PROP_GC_BITS, want, FALSE);
+    }
+    else if (kind == RE_PROP_RANGE) {
+      class_add_range(c, set, prop_range_names[want].lo, prop_range_names[want].hi);
     }
     else {
       class_add_runs(c, set, re_prop_emoji_runs, RE_PROP_EMOJI_RUN_COUNT,
@@ -2051,9 +2113,9 @@ open_class_operand(re_compiler *c, re_class_level *lv)
    Two things bound the depth and the shallower answers: the class table,
    every open level holding an entry in it until it closes, and
    MRB_REGEXP_PARSE_DEPTH_LIMIT, which a nest counts against beside the
-   levels the pattern has open. At the default limit the table is the one a
-   pattern meets, at RE_MAX_CLASSES; a build that sets the limit at or below
-   that meets the limit here first.
+   levels the pattern has open. At the default limit, below RE_MAX_CLASSES,
+   the limit is the one a pattern meets; a build that sets it above the
+   table meets the table here first.
 
    `cross` receives the ASCII members the class holds in its own right, which
    is what the caller needs to tell them from the ones an ASCII-only set is
@@ -2267,7 +2329,7 @@ finish_charclass(re_compiler *c, uint16_t id, uint8_t *cross, mrb_bool negated)
 #endif
 
   cc->negated = negated;
-  emit(c, negated ? RE_NCLASS : RE_CLASS, (uint8_t)id, 0);
+  emit(c, negated ? RE_NCLASS : RE_CLASS, 0, id);
 }
 
 /* A property outside a class, at c->p on its 'p' or 'P': the class holding it
@@ -2855,7 +2917,7 @@ emit_char(re_compiler *c, uint8_t ch)
       class_set_bit(&c->pat->classes[id], (uint8_t)(ch ^ 0x20));  /* the other case */
       class_add_fold_counterparts(c, id, ch);
     }
-    emit(c, RE_CLASS, (uint8_t)id, 0);
+    emit(c, RE_CLASS, 0, id);
     return;
   }
   emit(c, RE_CHAR, ch, 0);
@@ -2986,7 +3048,7 @@ emit_cp_folded(re_compiler *c, uint32_t cp)
       class_add_member(c, &c->pat->classes[id], alt[i], FALSE);
     }
   }
-  emit(c, RE_CLASS, (uint8_t)id, 0);
+  emit(c, RE_CLASS, 0, id);
   return TRUE;
 }
 
@@ -3076,16 +3138,28 @@ typedef struct {
   uint8_t kind;
 } re_pending_call;
 
+/* The number the next atomic group or lookaround takes; see num_cuts. The
+   numbers are carried in 16 bits, which a program of more than 65535
+   instructions could outrun, so one past them is refused. */
+static uint16_t
+next_cut(re_compiler *c)
+{
+  if (c->num_cuts >= 0xffff) compile_error(c, "too many atomic groups and lookarounds");
+  return (uint16_t)++c->num_cuts;
+}
+
 /* Park one reference. The records live in a String rather than a buffer this
    frame owns, because the parse raises through longjmp and a raise must not
    strand them: the GC arena holds the String for the length of the compile
-   and no longer, which is exactly the records' life. The count is bounded by
-   the instructions emitted, so it fits the uint16_t field that carries it. */
+   and no longer, which is exactly the records' life. The count is carried
+   in 16 bits, and a program of more than 65535 instructions could outrun
+   them, so one past them is refused. */
 static uint16_t
 add_pending_call(re_compiler *c, uint8_t kind, const char *at, uint32_t len,
                  uint32_t resolved)
 {
   re_pending_call rec;
+  if (c->num_pending >= 0xffff) compile_error(c, "too many subexpression calls");
   if (mrb_nil_p(c->pending_calls)) {
     c->pending_calls = mrb_str_new(c->mrb, NULL, 0);
   }
@@ -3334,7 +3408,7 @@ open_group(re_compiler *c, uint32_t begin, uint32_t outer_atom_start)
       uint32_t la_pos = emit(c, negative ? RE_NEG_LOOKAHEAD : RE_LOOKAHEAD, 0, 0);
       re_level *lv = open_level(c, RE_LEVEL_LOOKAHEAD, begin, outer_atom_start);
       lv->state = negative;
-      lv->num = (uint16_t)++c->num_cuts;
+      lv->num = next_cut(c);
       lv->head = la_pos;
       return;
     }
@@ -3346,7 +3420,7 @@ open_group(re_compiler *c, uint32_t begin, uint32_t outer_atom_start)
       c->alt_count = 0;  /* the record is this body's own; see there */
       re_level *lv = open_level(c, RE_LEVEL_LOOKBEHIND, begin, outer_atom_start);
       lv->state = negative;
-      lv->num = (uint16_t)++c->num_cuts;
+      lv->num = next_cut(c);
       lv->head = lb_pos;
       lv->aux = lv->alt_start;  /* where the body's code begins */
       return;
@@ -3362,10 +3436,9 @@ open_group(re_compiler *c, uint32_t begin, uint32_t outer_atom_start)
          already emitted, and with depths that wrapper and a group inside
          it, compiled with the same groups open around them, shared a
          depth, so a cut of the wrapper was read as the inner group's.
-         Every numbered group emits two instructions, so the number fits
-         the field. */
+         next_cut() bounds the number to the 16 bits that carry it. */
       next_char(c); next_char(c);  /* skip ?> */
-      uint16_t cut = (uint16_t)++c->num_cuts;
+      uint16_t cut = next_cut(c);
       emit(c, RE_ATOMIC, 0, cut);
       re_level *lv = open_level(c, RE_LEVEL_ATOMIC, begin, outer_atom_start);
       lv->num = cut;
@@ -3656,7 +3729,7 @@ emit_multi_backref(re_compiler *c, uint32_t set, uint8_t fold)
 {
   uint32_t taken[RE_MAX_CAPTURES];  /* the arms' jumps to the join point */
   uint32_t num_taken = 0;
-  uint16_t cut = (uint16_t)++c->num_cuts;
+  uint16_t cut = next_cut(c);
 
   emit(c, RE_ATOMIC, 0, cut);
   for (int g = RE_MAX_CAPTURES - 1; g > 0; g--) {
@@ -3671,10 +3744,10 @@ emit_multi_backref(re_compiler *c, uint32_t set, uint8_t fold)
     uint32_t fork = emit(c, RE_SPLIT, 0, 0);
     emit(c, RE_BACKREF, (uint8_t)g, fold);
     taken[num_taken++] = emit(c, RE_JMP, 0, 0);
-    patch(c, fork, (uint16_t)c->code_len);
+    patch(c, fork, (uint32_t)c->code_len);
   }
   for (uint32_t i = 0; i < num_taken; i++) {
-    patch(c, taken[i], (uint16_t)c->code_len);
+    patch(c, taken[i], (uint32_t)c->code_len);
   }
   emit(c, RE_ATOMIC_END, 0, cut);
   c->needs_backtrack = TRUE;  /* the Pike VM cannot cut a thread */
@@ -3685,6 +3758,8 @@ emit_multi_backref(re_compiler *c, uint32_t set, uint8_t fold)
    either a quantifier metacharacter or the end of the sequence, neither of
    them consumed. A '(' is not read here: it opens a level, which is
    compile_levels()'s to push, through open_group(). */
+static void compile_levels(re_compiler *c);
+
 static mrb_bool
 compile_atom(re_compiler *c)
 {
@@ -3756,7 +3831,7 @@ compile_atom(re_compiler *c)
          uppercase forms (\D, \W, \S include utf8_any), so always emit
          RE_CLASS. Emitting RE_NCLASS here would negate a second time and
          make \D/\W/\S behave like \d/\w/\s (issue: negated shorthands). */
-      emit(c, RE_CLASS, (uint8_t)id, 0);
+      emit(c, RE_CLASS, 0, id);
     }
     else if (ch == 'h' || ch == 'H') {
       /* \h / \H both carry their full positive set (hex digits /
@@ -3765,7 +3840,7 @@ compile_atom(re_compiler *c)
       next_char(c);
       uint16_t id = add_class(c);
       class_add_shorthand(&c->pat->classes[id], ch);
-      emit(c, RE_CLASS, (uint8_t)id, 0);
+      emit(c, RE_CLASS, 0, id);
     }
     else if (ch == 'A') {
       next_char(c);
@@ -3967,13 +4042,31 @@ compile_atom(re_compiler *c)
       emit(c, RE_SAVE, 0, RE_KEEP_PENDING);
       c->has_keep = TRUE;
     }
-    else if (ch == 'R' || ch == 'X') {
-      /* Each of these means something in CRuby that this engine does not do:
-         `\R` is any linebreak and `\X` is a whole grapheme cluster. Left to
-         the fall-through each was simply its own letter, so /\R/ matched an
-         R rather than a newline. Inside a character class CRuby reads them
-         as the letter too, which is what the class parser already does, so
-         only the escape outside one is refused here. */
+    else if (ch == 'R') {
+      /* `\R`, any linebreak: CRuby's (?>\r\n|[\n\v\f\r\u{85}\u{2028}\u{2029}]),
+         and for a byte-indexed pattern (?>\r\n|[\n\v\f\r]). It is read from
+         that spelling in its place, the parse cursor moved onto it and back,
+         so the quantifiers after it bind the group. Inside a character class
+         CRuby reads it as the letter, which the class parser does. CRuby
+         refuses it in a look-behind, whose width an atomic group leaves
+         open. */
+      static const char lb_utf8[] = "(?>\\r\\n|[\\n\\v\\f\\r\\u0085\\u2028\\u2029])";
+      static const char lb_bytes[] = "(?>\\r\\n|[\\n\\v\\f\\r])";
+      for (uint32_t i = 0; i < c->level_count; i++)
+        if (c->levels[i].kind == RE_LEVEL_LOOKBEHIND) compile_error(c, "invalid pattern in look-behind");
+      next_char(c);
+      const char *sub = c->binary ? lb_bytes : lb_utf8;
+      const char *sv_p = c->p, *sv_end = c->src_end;
+      c->p = sub;
+      c->src_end = sub + strlen(sub);
+      compile_levels(c);
+      c->p = sv_p;
+      c->src_end = sv_end;
+    }
+    else if (ch == 'X') {
+      /* `\X` is a whole grapheme cluster in CRuby, which this engine does
+         not do. Left to the fall-through it was simply its own letter, so
+         only the escape outside a character class is refused here. */
       compile_error_str(c, mrb_format(c->mrb, "\\\\%c is not supported", (char)ch));
     }
     else if ((ch == 'p' || ch == 'P') && c->p + 1 < c->src_end && c->p[1] == '{') {
@@ -4065,7 +4158,7 @@ emit_atom_copy(re_compiler *c, uint32_t start, uint32_t size)
   for (uint32_t j = 0; j < size; j++) {
     re_inst in = c->pat->code[start + j];
     if (op_holds_code_index(in.op) && in.offset >= start && in.offset <= atom_end) {
-      in.offset = (uint16_t)((int32_t)in.offset + delta);
+      in.offset = (uint32_t)((int64_t)in.offset + delta);
     }
     emit(c, in.op, in.a, in.offset);
   }
@@ -4180,7 +4273,7 @@ compile_quantifiers(re_compiler *c, uint32_t begin, uint32_t start)
       /* Possessive: what stands emitted becomes an atomic group of its own,
          numbered after every group inside it, since those are emitted. */
       next_char(c);
-      uint16_t cut = (uint16_t)++c->num_cuts;
+      uint16_t cut = next_cut(c);
       insert_inst(c, begin, RE_ATOMIC, 0, cut);
       emit(c, RE_ATOMIC_END, 0, cut);
       c->needs_backtrack = TRUE;  /* the Pike VM cannot cut a thread */
@@ -4218,7 +4311,7 @@ compile_quantifiers(re_compiler *c, uint32_t begin, uint32_t start)
            SPLIT offset = end (after JMP), patched after JMP is emitted */
         insert_inst(c, start, nongreedy ? RE_SPLITNG : RE_SPLIT, 0, 0);
         emit(c, RE_JMP, 0, start);
-        c->pat->code[start].offset = (uint16_t)c->code_len;  /* patch: skip to end */
+        c->pat->code[start].offset = (uint32_t)c->code_len;  /* patch: skip to end */
       }
       else if (ch == '+') {
         /* e+ -> body; SPLIT/SPLITNG(start)
@@ -4229,7 +4322,7 @@ compile_quantifiers(re_compiler *c, uint32_t begin, uint32_t start)
       else { /* ? */
         /* e? -> SPLIT(body, end); body; end: */
         insert_inst(c, start, nongreedy ? RE_SPLITNG : RE_SPLIT, 0, 0);
-        c->pat->code[start].offset = (uint16_t)c->code_len;  /* patch: skip to end */
+        c->pat->code[start].offset = (uint32_t)c->code_len;  /* patch: skip to end */
       }
       greedy_rep = !nongreedy;
       start = begin;
@@ -4282,7 +4375,7 @@ compile_quantifiers(re_compiler *c, uint32_t begin, uint32_t start)
       }
       if (has_group) {
         insert_inst(c, start, RE_JMP, 0, 0);
-        patch(c, start, (uint16_t)c->code_len);
+        patch(c, start, (uint32_t)c->code_len);
       }
       else {
         c->code_len = start;
@@ -4319,7 +4412,7 @@ compile_quantifiers(re_compiler *c, uint32_t begin, uint32_t start)
       if (wrap_optional) {
         /* Make the whole {1,m}/{1,} body skippable so it matches zero times. */
         insert_inst(c, start, nongreedy ? RE_SPLITNG : RE_SPLIT, 0, 0);
-        c->pat->code[start].offset = (uint16_t)c->code_len;
+        c->pat->code[start].offset = (uint32_t)c->code_len;
       }
     }
     greedy_rep = FALSE;
@@ -4373,11 +4466,11 @@ close_alternation(re_compiler *c, re_level *lv)
     re_inst *in = &c->pat->code[pc];
     if (in->op != RE_JMP || in->a != RE_JMP_BRANCH) continue;
     in->a = 0;
-    in->offset = (uint16_t)end;
+    in->offset = (uint32_t)end;
     k++;  /* branch k begins right after the exit of branch k - 1 */
     c->pat->code[first - k].op = RE_SPLIT;
     c->pat->code[first - k].a = 0;
-    c->pat->code[first - k].offset = (uint16_t)(pc + 1);
+    c->pat->code[first - k].offset = (uint32_t)(pc + 1);
   }
   mrb_assert(k == split_count);
 
@@ -4422,7 +4515,7 @@ close_level(re_compiler *c)
        groups use, so that a cut aimed at this lookaround is told from one
        aimed at a group around or inside it; see bt_match(). */
     emit(c, RE_LOOK_END, lv->state ? RE_LOOK_NEGATED : 0, lv->num);
-    c->pat->code[lv->head].offset = (uint16_t)c->code_len;  /* patch: skip past sub-pattern */
+    c->pat->code[lv->head].offset = (uint32_t)c->code_len;  /* patch: skip past sub-pattern */
     close_paren(c);
     c->needs_backtrack = TRUE;  /* needs backtracking engine */
     break;
@@ -4466,7 +4559,7 @@ close_level(re_compiler *c)
     else {
       add_lookbehind_widths(c, lv->head, sub_start, body_end);
     }
-    c->pat->code[lv->head].offset = (uint16_t)c->code_len;
+    c->pat->code[lv->head].offset = (uint32_t)c->code_len;
     close_paren(c);
     c->needs_backtrack = TRUE;  /* needs backtracking engine */
     break;
@@ -4481,7 +4574,7 @@ close_level(re_compiler *c)
   case RE_LEVEL_ABSENT:
     emit(c, RE_ABSENT_END, 0, 0);
     close_paren(c);
-    c->pat->code[lv->head].offset = (uint16_t)c->code_len;
+    c->pat->code[lv->head].offset = (uint32_t)c->code_len;
     c->needs_backtrack = TRUE;  /* the Pike VM has no scan of its own */
     break;
 
@@ -4497,7 +4590,7 @@ close_level(re_compiler *c)
   case RE_LEVEL_COND:
     /* With no `no`, the head's offset is the text after the group; with
        one, the jump that ends `yes` goes there. */
-    c->pat->code[lv->state ? lv->aux : lv->head].offset = (uint16_t)c->code_len;
+    c->pat->code[lv->state ? lv->aux : lv->head].offset = (uint32_t)c->code_len;
     close_paren(c);
     c->needs_backtrack = TRUE;  /* the Pike VM's threads carry no test of their captures */
     break;
@@ -4540,7 +4633,7 @@ compile_levels(re_compiler *c)
            at `no` where the group has not matched. */
         if (lv->state) compile_error(c, "invalid conditional pattern");
         lv->aux = emit(c, RE_JMP, 0, 0);
-        c->pat->code[lv->head].offset = (uint16_t)c->code_len;
+        c->pat->code[lv->head].offset = (uint32_t)c->code_len;
         lv->state = TRUE;
         continue;
       }
@@ -5029,7 +5122,7 @@ first_set_walk(const re_inst *code, uint32_t code_len,
         bm[code[pc].a >> 3] |= (uint8_t)(1 << (code[pc].a & 7));
         goto next;
       case RE_CLASS:
-        if (!class_first_bytes(&classes[code[pc].a], bm)) return FALSE;
+        if (!class_first_bytes(&classes[code[pc].offset], bm)) return FALSE;
         goto next;
       case RE_NCLASS: {
         /* negated class: complement of bitmap. Too many bits; not useful. */
@@ -5305,6 +5398,284 @@ compute_first_set(mrb_state *mrb, const re_inst *code, uint32_t code_len,
     }
   }
   return set_bits < 192;  /* useful only if fewer than 75% of bytes match */
+}
+
+/* The most bytes one step of the class can take: one where every member is
+   ASCII, and otherwise the widest character UTF-8 spells. A byte member
+   (RE_CLASS_BYTE) is one byte, but a range list or a bracket says nothing
+   cheap about which of the two it holds, so either is read as the wide one. */
+static uint32_t
+class_max_width(const re_charclass *cc)
+{
+#ifdef RE_UNICODE_CTYPE
+  if (RE_CLASS_HAS_CTYPE(cc)) return 4;
+#endif
+  return (cc->num_ranges == 0 && !cc->utf8_any) ? 1 : 4;
+}
+
+/*
+ * The end assertion every path from pc 0 to RE_MATCH passes, the weakest
+ * across them, and the most bytes a path consumes before passing it; see
+ * mrb_regexp_pattern::end_anchor. RE_END_NONE where any path reaches the
+ * match without one, or where what a path consumes first has no bound.
+ *
+ * A path is followed only up to its first end assertion: whatever it
+ * consumes after one, the assertion has fixed where it stood. So the walk
+ * covers a prefix of the program in which every edge it takes has to run
+ * forward, and a backward edge -- a repetition, which is what leaves the
+ * count unbounded -- ends the analysis. Taken in program order, every pc is
+ * then reached from below only, and the most a path consumes to reach it is
+ * known by the time the scan comes to it.
+ *
+ * A lookaround is zero-width, so the path goes on past it as if the
+ * sub-pattern were not there: what the sub-pattern reads is no part of the
+ * span between the attempt's start and the assertion. A lookbehind reads the
+ * text before the position it stands at, and that text stays in the subject
+ * whatever position the attempt begins at; the engines read it there, not
+ * from where the search was asked to start. What the walk cannot measure --
+ * a backreference, a call, an absent repeater -- ends it.
+ */
+static uint8_t
+compute_end_anchor(mrb_state *mrb, const re_inst *code, uint32_t code_len,
+                   const re_charclass *classes, uint32_t *reach_out)
+{
+  int32_t inline_dist[RE_WALK_INLINE];
+  int32_t *dist = inline_dist;
+  if (code_len > RE_WALK_INLINE) {
+    dist = (int32_t*)mrb_malloc_simple(mrb, sizeof(int32_t) * code_len);
+    if (!dist) return RE_END_NONE;
+  }
+  for (uint32_t i = 0; i < code_len; i++) dist[i] = -1;
+  if (code_len > 0) dist[0] = 0;
+
+  uint8_t kind = RE_END_NONE;
+  uint32_t reach = 0;
+  mrb_bool ok = TRUE;
+  for (uint32_t pc = 0; ok && pc < code_len; pc++) {
+    int32_t d = dist[pc];
+    if (d < 0) continue;
+    re_inst in = code[pc];
+    uint32_t succ[2];
+    int nsucc = 0;
+    uint32_t width = 0;
+    uint8_t here = RE_END_NONE;
+    switch (in.op) {
+    case RE_EOT:   here = RE_END_EOT; break;
+    case RE_EOTNL: here = RE_END_EOTNL; break;
+    case RE_EOL:   here = RE_END_EOL; break;
+    case RE_SAVE:
+    case RE_BOL: case RE_BOT: case RE_GPOS:
+    case RE_WBOUND: case RE_NWBOUND:
+    case RE_ATOMIC: case RE_ATOMIC_END:
+      succ[nsucc++] = pc + 1;
+      break;
+    case RE_CHAR: case RE_BYTE:
+      width = 1;
+      succ[nsucc++] = pc + 1;
+      break;
+    case RE_ANY: case RE_ANY_NL: case RE_NCLASS:
+      width = 4;
+      succ[nsucc++] = pc + 1;
+      break;
+    case RE_CLASS:
+      width = class_max_width(&classes[in.offset]);
+      succ[nsucc++] = pc + 1;
+      break;
+    case RE_JMP:
+    case RE_LOOKAHEAD: case RE_NEG_LOOKAHEAD:
+    case RE_LOOKBEHIND: case RE_NEG_LOOKBEHIND:
+      succ[nsucc++] = in.offset;
+      break;
+    case RE_SPLIT: case RE_SPLITNG: case RE_COND:
+      succ[nsucc++] = pc + 1;
+      succ[nsucc++] = in.offset;
+      break;
+    default:
+      /* RE_MATCH reached with no end assertion on the way, or something the
+         walk cannot measure. */
+      ok = FALSE;
+      continue;
+    }
+    if (here != RE_END_NONE) {
+      if (here > kind) kind = here;
+      if ((uint32_t)d > reach) reach = (uint32_t)d;
+      continue;
+    }
+    for (int i = 0; i < nsucc; i++) {
+      if (succ[i] <= pc || succ[i] >= code_len) { ok = FALSE; break; }
+      int32_t nd = d + (int32_t)width;
+      if (nd > dist[succ[i]]) dist[succ[i]] = nd;
+    }
+  }
+  if (dist != inline_dist) mrb_free(mrb, dist);
+  if (!ok) return RE_END_NONE;
+  *reach_out = reach;
+  return kind;
+}
+
+/* Whether some path from pc 0 reaches RE_MATCH without passing a pc that
+   `seen` already marks; the walk marks what it passes. Every edge an
+   instruction has is followed, which can only add paths: a path the search
+   could never take makes the answer TRUE where it might have been FALSE,
+   and FALSE is the answer anything is built on. A lookaround's sub-pattern
+   is stepped over, since no pc inside one is ever marked beforehand. */
+static mrb_bool
+match_reachable(const re_inst *code, uint32_t code_len, uint8_t *seen,
+                uint32_t *stack)
+{
+  uint32_t top = 0;
+  uint32_t pc = 0;
+  for (;;) {
+    while (pc < code_len && !seen[pc]) {
+      seen[pc] = 1;
+      re_inst in = code[pc];
+      if (in.op == RE_MATCH) return TRUE;
+      switch (in.op) {
+      case RE_JMP:
+      case RE_LOOKAHEAD: case RE_NEG_LOOKAHEAD:
+      case RE_LOOKBEHIND: case RE_NEG_LOOKBEHIND:
+        pc = in.offset;
+        break;
+      case RE_SPLIT: case RE_SPLITNG: case RE_COND:
+        stack[top++] = in.offset;
+        pc++;
+        break;
+      default:
+        pc++;
+        break;
+      }
+    }
+    if (top == 0) return FALSE;
+    pc = stack[--top];
+  }
+}
+
+/* Whether `needle` stands anywhere in `hay`. */
+static mrb_bool
+bytes_contain(const uint8_t *hay, uint32_t hay_len,
+              const uint8_t *needle, uint32_t needle_len)
+{
+  for (uint32_t i = 0; i + needle_len <= hay_len; i++) {
+    if (memcmp(hay + i, needle, needle_len) == 0) return TRUE;
+  }
+  return FALSE;
+}
+
+/* How many runs of literal bytes compute_required() tries as the answer. */
+#define RE_REQUIRED_TRIES 16
+
+/*
+ * A run of literal bytes every match holds, for mrb_regexp_pattern::required.
+ *
+ * A run is a stretch of RE_CHAR at consecutive pcs. Each of those has the
+ * next pc as its only way on, so a path that passes the run's first pc and
+ * goes on to match has matched the whole run, at a position at or after
+ * where its attempt began. A run inside a lookaround is left out: a
+ * lookbehind reads text before the attempt's start, and a negative
+ * lookaround matches where its sub-pattern does not.
+ *
+ * The runs are tried longest first. A run is the answer when every path to
+ * RE_MATCH passes the first pc of a run that holds its bytes: marking those
+ * pcs and walking from pc 0 is that question, a path entering a run partway
+ * through being one the marks do not stop. This is how `#<Class:` is found
+ * in `x(.*)#<Class:|#<Class:y`, which no one fork or run decides: it stands
+ * in both branches, at a different distance from the start in each.
+ *
+ * A run the literal prefix already holds is nothing to add: the prefix
+ * search answers the same question at every attempt, and does it first.
+ */
+static void
+compute_required(mrb_state *mrb, mrb_regexp_pattern *pat, uint32_t code_len)
+{
+  const re_inst *code = pat->code;
+  uint32_t n = code_len + 1;
+
+  /* A call jumps out to a trampoline and back, and an absent repeater's body
+     is a test the scan runs rather than text a match passes through; neither
+     is a shape this walk reads. */
+  for (uint32_t pc = 0; pc < code_len; pc++) {
+    uint8_t op = code[pc].op;
+    if (op == RE_CALL || op == RE_RETURN || op == RE_ABSENT_START ||
+        op == RE_ABSENT || op == RE_ABSENT_END) {
+      return;
+    }
+  }
+
+  /* One block: the walk's stack, the length of the run starting at each pc
+     (0 where none does), the walk's marks, and each pc's literal byte. */
+  uint32_t *stack = (uint32_t*)mrb_malloc_simple(
+      mrb, (size_t)n * (2 * sizeof(uint32_t) + 2));
+  if (!stack) return;
+  uint32_t *run = stack + n;
+  uint8_t *seen = (uint8_t*)(run + n);
+  uint8_t *bytes = seen + n;
+  memset(run, 0, sizeof(uint32_t) * n);
+  memset(bytes, 0, n);
+  for (uint32_t pc = 0; pc < code_len; pc++) {
+    uint8_t op = code[pc].op;
+    if (op == RE_MATCH) break;
+    if (op == RE_LOOKAHEAD || op == RE_NEG_LOOKAHEAD ||
+        op == RE_LOOKBEHIND || op == RE_NEG_LOOKBEHIND) {
+      pc = code[pc].offset - 1;  /* past the sub-pattern */
+      continue;
+    }
+    if (op != RE_CHAR) continue;
+    uint32_t start = pc;
+    bytes[pc] = code[pc].a;
+    while (pc + 1 < code_len && code[pc + 1].op == RE_CHAR) {
+      pc++;
+      bytes[pc] = code[pc].a;
+    }
+    run[start] = pc - start + 1;
+  }
+
+  /* The longest runs, as (start, length), longest first; at most
+     RE_REQUIRED_TRIES of them, each costing a walk. A run longer than the
+     field holds is tried by its first 255 bytes, which every match holding
+     the run holds too. */
+  uint32_t try_at[RE_REQUIRED_TRIES];
+  uint32_t try_len[RE_REQUIRED_TRIES];
+  int ntries = 0;
+  for (uint32_t pc = 0; pc < code_len; pc++) {
+    uint32_t len = run[pc];
+    if (len == 0) continue;
+    if (len > 255) len = 255;
+    int at;
+    if (ntries < RE_REQUIRED_TRIES) at = ntries++;
+    else if (try_len[ntries - 1] >= len) continue;
+    else at = ntries - 1;
+    while (at > 0 && try_len[at - 1] < len) {
+      try_at[at] = try_at[at - 1];
+      try_len[at] = try_len[at - 1];
+      at--;
+    }
+    try_at[at] = pc;
+    try_len[at] = len;
+  }
+
+  for (int t = 0; t < ntries; t++) {
+    const uint8_t *lit = bytes + try_at[t];
+    uint32_t len = try_len[t];
+    if (pat->prefix_len > 0 &&
+        bytes_contain(pat->prefix, pat->prefix_len, lit, len)) {
+      continue;
+    }
+    /* Mark the first pc of every run holding the bytes, then ask whether a
+       path to the match goes around all of them. */
+    memset(seen, 0, n);
+    for (uint32_t pc = 0; pc < code_len; pc++) {
+      if (run[pc] && bytes_contain(bytes + pc, run[pc], lit, len)) seen[pc] = 1;
+    }
+    if (match_reachable(code, code_len, seen, stack)) continue;
+    uint8_t *req = (uint8_t*)mrb_malloc_simple(mrb, len);
+    if (req) {
+      memcpy(req, lit, len);
+      pat->required = req;
+      pat->required_len = (uint8_t)len;
+    }
+    break;
+  }
+  mrb_free(mrb, stack);
 }
 
 /* ---- subexpression calls -------------------------------------------------
@@ -5633,10 +6004,10 @@ resolve_calls(re_compiler *c)
     {
       uint32_t tramp = c->code_len;
       emit(c, RE_CALL, (uint8_t)k, 0);  /* the entry index lands below */
-      emit(c, RE_JMP, 0, (uint16_t)(close + 1));
+      emit(c, RE_JMP, 0, (uint32_t)(close + 1));
       c->pat->code[pc].op = RE_JMP;
       c->pat->code[pc].a = 0;
-      c->pat->code[pc].offset = (uint16_t)tramp;
+      c->pat->code[pc].offset = (uint32_t)tramp;
       c->pat->code[close].op = RE_RETURN;
       c->pat->code[close].a = (uint8_t)k;
       c->pat->code[close].offset = 0;
@@ -5648,7 +6019,7 @@ resolve_calls(re_compiler *c)
   for (uint32_t pc = 0; pc < c->code_len; pc++) {
     if (c->pat->code[pc].op != RE_CALL) continue;
     mrb_assert(entry[c->pat->code[pc].a] != 0);
-    c->pat->code[pc].offset = (uint16_t)entry[c->pat->code[pc].a];
+    c->pat->code[pc].offset = (uint32_t)entry[c->pat->code[pc].a];
   }
 
   never_ending_check(c, called, entry);
@@ -5675,6 +6046,9 @@ mrb_re_compile(mrb_state *mrb, mrb_regexp_pattern *pat,
   c.class_level_store = mrb_nil_value();
   c.class_levels = c.class_levels_inline;
   c.class_level_capa = RE_CLASS_LEVELS_INLINE;
+  c.literal_store = mrb_nil_value();
+  c.literal_cp = c.literal_cp_inline;
+  c.literal_capa = RE_LITERAL_CP_INLINE;
 
   /* Both things the pre-pass removes, a (?#...) group and a `#` comment,
      are spelled with a '#', so a pattern without one is parsed as written.
@@ -5855,16 +6229,32 @@ mrb_re_compile(mrb_state *mrb, mrb_regexp_pattern *pat,
     }
   }
 
+  /* Where every match has to end, and what every match has to hold: two
+     more ways for a search to leave positions untried, answered once here.
+     Under \A there is one position to try and no scan to shorten, and a
+     literal pattern's search is the prefix search alone. */
+  pat->end_anchor = compute_end_anchor(mrb, pat->code, code_len, pat->classes,
+                                       &pat->end_reach);
+  if (!pat->is_literal && pat->anchor != RE_ANCHOR_BOT) {
+    compute_required(mrb, pat, code_len);
+  }
+
   pat->loop_depth = mark_empty_loops(mrb, pat->code, code_len);
 
-  /* Pre-allocate VM state cache for pike_vm */
-  {
-    int list_capa = RE_LIST_CAPA(code_len, pat->loop_depth);
-    pat->cached_visited = (uint32_t*)mrb_calloc(mrb, code_len + 1, sizeof(uint32_t));
-    pat->cached_threads[0] = mrb_malloc(mrb, sizeof(re_thread_cache) * list_capa);
-    pat->cached_threads[1] = mrb_malloc(mrb, sizeof(re_thread_cache) * list_capa);
-    pat->cached_list_capa = list_capa;
-    pat->cache_in_use = FALSE;
+  /* spinel: pike_vm's cached state is taken by the first search that uses
+     it (cache_alloc() in re_exec.c), not here */
+
+  /* spinel: the program and the class table grew by doubling, so as much as
+     half of each is room no instruction fills; give it back now that both
+     are complete. A shrink the allocator refuses keeps the larger block. */
+  if (code_len) {
+    re_inst *code = (re_inst*)mrb_realloc_simple(mrb, pat->code, sizeof(re_inst) * code_len);
+    if (code) pat->code = code;
+  }
+  if (pat->num_classes) {
+    re_charclass *classes = (re_charclass*)mrb_realloc_simple(mrb, pat->classes,
+                                                              sizeof(re_charclass) * pat->num_classes);
+    if (classes) pat->classes = classes;
   }
 
   /* Nothing above allocates any more, so the pattern is complete: publish
@@ -5886,6 +6276,7 @@ mrb_re_free(mrb_state *mrb, mrb_regexp_pattern *pat)
     mrb_free(mrb, pat->named_captures);
     mrb_free(mrb, pat->named_arena);
     mrb_free(mrb, pat->prefix);
+    mrb_free(mrb, pat->required);
     mrb_free(mrb, pat->cached_visited);
     mrb_free(mrb, pat->cached_threads[0]);
     mrb_free(mrb, pat->cached_threads[1]);

@@ -30,6 +30,9 @@
 #include <fnmatch.h>
 #include <sys/stat.h>
 #include <sys/types.h>
+#if defined(__linux__)
+#include <sys/sysmacros.h> /* major/minor for File::Stat's device components */
+#endif
 #include <sys/resource.h>   /* getpriority for Process.getpriority */
 #include <fcntl.h>      /* AT_FDCWD for statx */
 #include <errno.h>
@@ -410,26 +413,53 @@ static void sp_str_to_c_zero_den(const char *dp, double d) {
     sp_raise_cls("ZeroDivisionError", "divided by 0");
   }
 }
+/* One number of a Complex string, by Ruby's syntax: digits, a fraction
+   (".5" too) and an exponent. strtod also reads "nan", "inf", "infinity",
+   hex ("0x10") and a trailing "." ("1."), none of which Ruby's Complex()
+   takes: the number ends where Ruby's would. */
+static double sp_c_num(const char *p, char **end) {
+  const char *q = p;
+  if (*q == '+' || *q == '-') q++;
+  const char *d = q;
+  while (*q >= '0' && *q <= '9') q++;
+  if (*q == '.' && q[1] >= '0' && q[1] <= '9') { q++; while (*q >= '0' && *q <= '9') q++; }
+  else if (q == d) { *end = (char *)p; return 0.0; }
+  if (*q == 'e' || *q == 'E') {
+    const char *e = q + 1;
+    if (*e == '+' || *e == '-') e++;
+    if (*e >= '0' && *e <= '9') { while (*e >= '0' && *e <= '9') e++; q = e; }
+  }
+  size_t n = (size_t)(q - p);
+  char sb[64], *buf = n < sizeof sb ? sb : (char *)malloc(n + 1);
+  if (!buf) sp_raise_cls("NoMemoryError", "failed to allocate memory");
+  memcpy(buf, p, n); buf[n] = '\0';
+  double v = strtod(buf, NULL);
+  if (buf != sb) free(buf);
+  *end = (char *)q;
+  return v;
+}
 static sp_Complex sp_str_to_c_impl(const char *s, int strict) {
   double re = 0, im = 0;
   int parsed = 0;
   const char *fin = s;   /* first byte NOT consumed by the parse */
   if (s) {
     const char *p = s;
-    while (*p == ' ' || *p == '\t') p++;
+    /* leading whitespace of any kind, as strtod skipped it; none between
+       the parts ("1 2i" is invalid) */
+    while (*p == ' ' || (*p >= '\t' && *p <= '\r')) p++;
     char *end = NULL;
-    double a = strtod(p, &end);
+    double a = sp_c_num(p, &end);
     if (end != p) {
       parsed = 1;
       /* rational-syntax component "n/d" */
-      if (*end == '/') { const char *dp = end + 1; char *de = NULL; double d = strtod(dp, &de); if (de != dp) { sp_str_to_c_zero_den(dp, d); a /= d; end = de; } }
+      if (*end == '/') { const char *dp = end + 1; char *de = NULL; double d = sp_c_num(dp, &de); if (de != dp) { sp_str_to_c_zero_den(dp, d); a /= d; end = de; } }
       if (*end == 'i') { im = a; fin = end + 1; }
       else {
         re = a;
         const char *q = end;
-        double b2 = strtod(q, &end);
+        double b2 = sp_c_num(q, &end);
         if (end != q) {
-          if (*end == '/') { const char *dp = end + 1; char *de = NULL; double d = strtod(dp, &de); if (de != dp) { sp_str_to_c_zero_den(dp, d); b2 /= d; end = de; } }
+          if (*end == '/') { const char *dp = end + 1; char *de = NULL; double d = sp_c_num(dp, &de); if (de != dp) { sp_str_to_c_zero_den(dp, d); b2 /= d; end = de; } }
           if (*end == 'i') { im = b2; fin = end + 1; }
           else fin = q;   /* an imaginary number without the 'i' suffix ("1+2") is invalid */
         }
@@ -1327,8 +1357,9 @@ sp_IntArray *sp_file_binread_bytes(const char *path) {SP_GC_ROOT_STR(path);
    sum untruncated, like CRuby). The typed emitter inlines this same loop; the
    boxed receiver reaches it through sp_poly_sum. */
 sp_int sp_str_sum_bits(const char *s, sp_int bits) {
+  if (!s) sp_nil_recv("sum");
   sp_int acc = 0;
-  size_t bl = s ? sp_str_byte_len(s) : 0;   /* every byte, a NUL included (#4527) */
+  size_t bl = sp_str_byte_len(s);   /* every byte, a NUL included (#4527) */
   for (size_t i = 0; i < bl; i++) acc += (unsigned char)s[i];
   return (bits <= 0 || bits >= (sp_int)(sizeof(sp_int) * 8)) ? acc : (acc & ((((sp_int)1) << bits) - 1));
 }
@@ -2156,7 +2187,16 @@ sp_StrArray *sp_bt_format(void **buf, int n) {
   sp_StrArray *a = sp_StrArray_new();
   SP_GC_ROOT(a);
   if (!sp_bt_enabled || n <= 0) return a;
-  char **syms = backtrace_symbols(buf, n);
+  /* Each frame is named at its return address less one, the call itself, as
+     sp_bt_lines asks its line: a method whose last statement raises calls a
+     function that does not return, and gcc ends the method on that call, so
+     its return address is the first byte past the method and named no
+     method (the raising method's frame was dropped). */
+  void **at = (void **)malloc(sizeof *at * (size_t)n);
+  if (!at) return a;
+  for (int i = 0; i < n; i++) at[i] = i > 0 ? (void *)((char *)buf[i] - 1) : buf[i];
+  char **syms = backtrace_symbols(at, n);
+  free(at);
   if (!syms) return a;
   const char *src = (sp_bt_srcfile && sp_bt_srcfile[0]) ? sp_bt_srcfile : "(spinel)";
   int *lines = (int *)calloc((size_t)n, sizeof *lines);
@@ -2528,6 +2568,16 @@ sp_bool sp_file_pipe(const char *path) {
   struct stat st;
   return stat(path ? path : "", &st) == 0 && S_ISFIFO(st.st_mode);
 }
+/* An IO operand is tested by its descriptor even if its path has gone. */
+static int sp_stat_handle_p(sp_File *f);
+sp_bool sp_file_pipe_io(sp_File *io) {SP_GC_ROOT(io);
+  if (!io) sp_raise_cls("TypeError", "no implicit conversion of nil into String");
+  if (sp_stat_handle_p(io))
+    sp_raise_cls("TypeError", "no implicit conversion of File::Stat into String");
+  SP_IO_OPEN(io);
+  struct stat st;
+  return fstat(fileno(io->fp), &st) == 0 && S_ISFIFO(st.st_mode);
+}
 sp_bool sp_file_identical(const char *a, const char *b) {
   struct stat sa, sb;
   if (stat(a ? a : "", &sa) != 0 || stat(b ? b : "", &sb) != 0) return 0;
@@ -2890,7 +2940,8 @@ sp_File *sp_io_stat_handle(sp_File *f) {SP_GC_ROOT(f);
 }
 /* One stat(2) field by index, so File::Stat's numeric accessors need one
    runtime entry rather than a dozen. 0=uid 1=gid 2=nlink 3=dev 4=ino
-   5=blksize 6=blocks 7=rdev. nil when the stat itself fails. */
+   5=blksize 6=blocks 7=rdev 8=dev_major 9=dev_minor. nil when the stat
+   itself fails, or for 8 and 9 where the platform has no major/minor. */
 static sp_int sp_stat_field_n(sp_File *f, sp_int which, int *ok);
 sp_oint sp_stat_field(sp_File *f, sp_int which) {SP_GC_ROOT(f); int ok = 1; sp_int n = sp_stat_field_n(f, which, &ok); return ok ? sp_oint_of(n) : sp_oint_nil(); }
 static sp_int sp_stat_field_n(sp_File *f, sp_int which, int *ok) {SP_GC_ROOT(f);
@@ -2910,6 +2961,18 @@ static sp_int sp_stat_field_n(sp_File *f, sp_int which, int *ok) {SP_GC_ROOT(f);
     case 4: return (sp_int)st.st_ino;
     case 5: return (sp_int)st.st_blksize;
     case 6: return (sp_int)st.st_blocks;
+    case 8:
+#if defined(major)
+      return (sp_int)(unsigned int)major(st.st_dev);
+#else
+      *ok = 0; return 0;
+#endif
+    case 9:
+#if defined(minor)
+      return (sp_int)(unsigned int)minor(st.st_dev);
+#else
+      *ok = 0; return 0;
+#endif
     default: return (sp_int)st.st_rdev;
   }
 }
@@ -2968,9 +3031,29 @@ sp_int sp_stat_type_pred(sp_File *f, sp_int kind) {SP_GC_ROOT(f);
     default: return S_ISSOCK(st.st_mode) ? 1 : 0;
   }
 }
+/* Real/effective primary groups and supplementary groups, as CRuby tests them. */
+static sp_bool sp_stat_group_member(gid_t gid) {
+  if (gid == getgid() || gid == getegid()) return 1;
+  int n = getgroups(0, NULL);
+  if (n <= 0) return 0;
+  gid_t *groups = (gid_t *)malloc((size_t)n * sizeof(gid_t));
+  if (!groups) return 0;
+  n = getgroups(n, groups);
+  sp_bool found = 0;
+  for (int i = 0; i < n; i++) if (groups[i] == gid) { found = 1; break; }
+  free(groups);
+  return found;
+}
+static sp_bool sp_stat_executable_real(const struct stat *st) {
+  uid_t uid = getuid();
+  if (uid == 0) return (st->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
+  if (uid == st->st_uid) return (st->st_mode & S_IXUSR) != 0;
+  if (sp_stat_group_member(st->st_gid)) return (st->st_mode & S_IXGRP) != 0;
+  return (st->st_mode & S_IXOTH) != 0;
+}
 /* The mode-derived predicates of File::Stat that no path helper covers. Kinds:
    0=pipe? 1=zero? 2=readable? 3=writable? 4=executable? 5=blockdev?
-   6=chardev? 7=size? (non-zero size, else nil). */
+   6=chardev? 8=executable_real? (7, size?, is sp_stat_size_q). */
 sp_int sp_stat_pred(sp_File *f, sp_int kind) {SP_GC_ROOT(f);
   struct stat st;
   int r;
@@ -2988,6 +3071,7 @@ sp_int sp_stat_pred(sp_File *f, sp_int kind) {SP_GC_ROOT(f);
     case 4: return (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) ? 1 : 0;
     case 5: return S_ISBLK(st.st_mode) ? 1 : 0;
     case 6: return S_ISCHR(st.st_mode) ? 1 : 0;
+    case 8: return sp_stat_executable_real(&st);
     default: return 0;
   }
 }
@@ -3318,6 +3402,12 @@ sp_Enumerator *sp_Enumerator_dup(sp_Enumerator *e) {SP_GC_ROOT(e);
   *d = *e;
   return d;
 }
+/* Public dup clears frozen state; clone and internal walkers keep raw copies. */
+sp_Enumerator *sp_Enumerator_dup_unfrozen(sp_Enumerator *e) {SP_GC_ROOT(e);
+  sp_Enumerator *d = sp_Enumerator_dup(e);
+  if (d) d->frozen = FALSE;
+  return d;
+}
 void sp_PolyArray_pack_scan(void *p) {
   sp_PolyArray *a = (sp_PolyArray *)p;
   for (sp_int i = 0; i < a->len; i++) sp_mark_rbval(a->data[i]);
@@ -3594,6 +3684,67 @@ sp_Enumerator *sp_Enumerator_new_gen(void (*gen)(sp_Fiber *), void *cap, sp_RbVa
   sp_Enumerator *e = (sp_Enumerator *)sp_gc_alloc(sizeof(sp_Enumerator), NULL, sp_Enumerator_scan);
   e->items = NULL; e->cursor = 0; e->gen = gen; e->gen_cap = cap; e->fib = NULL; e->peeked = FALSE; e->size = size; e->feed = sp_box_nil(); e->has_feed = FALSE; e->gen_result = sp_box_nil(); e->source = sp_box_nil(); e->meth = SPL("each");
   return e;
+}
+/* Blockless Dir.foreach and Dir.each_child: each run reads its own entries,
+   so #to_a and #rewind do not borrow another run's cursor. Path coercion,
+   opening and reading are deferred until the first pull. each_child's run
+   leaves out "." and "..". */
+typedef struct {
+  sp_RbVal path, encoding;
+  const char *(*get_path)(sp_RbVal);
+  int children;
+} sp_DirForeachCap;
+static void sp_dir_foreach_scan(void *p) {
+  sp_DirForeachCap *cap = (sp_DirForeachCap *)p;
+  sp_mark_rbval(cap->path); sp_mark_rbval(cap->encoding);
+}
+static void sp_dir_foreach_gen(sp_Fiber *f) {
+  sp_DirForeachCap *cap = (sp_DirForeachCap *)f->user_data;
+  SP_GC_ROOT(cap);
+  const char *path = cap->get_path(cap->path);
+  SP_GC_ROOT_STR(path);
+  if (!path) sp_raise_cls("TypeError", "no implicit conversion of nil into String");
+  int binary = 0;
+  if (cap->encoding.tag != SP_TAG_NIL) {
+    sp_RbVal enc = sp_encoding_find(cap->encoding);
+    binary = enc.tag == SP_TAG_ENCODING && enc.v.s && strcmp(enc.v.s, "ASCII-8BIT") == 0;
+  }
+  /* The entries are read and the directory closed on the first pull, so a
+     run the consumer stops early (first, take, a break) holds no descriptor. */
+  sp_Dir *dir = sp_Dir_new(path);
+  SP_GC_ROOT(dir);
+  sp_PolyArray *names = sp_PolyArray_new();
+  SP_GC_ROOT(names);
+  const char *name = NULL;
+  SP_GC_ROOT_STR(name);
+  while ((name = sp_Dir_read(dir)) != NULL) {
+    if (cap->children && (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)) continue;
+    if (binary) sp_str_as_binary(name);
+    sp_PolyArray_push(names, sp_box_str(name));
+  }
+  sp_Dir_close(dir);
+  for (sp_int i = 0; i < names->len; i++) sp_Fiber_yield(names->data[i]);
+  f->yielded_value = sp_box_nil();
+}
+const char *sp_poly_inspect(sp_RbVal v);   /* lib/sp_poly_cold.c */
+const char *sp_poly_to_s(sp_RbVal v);      /* lib/sp_poly_cold.c */
+sp_Enumerator *sp_dir_foreach_enum(sp_RbVal path, sp_RbVal encoding,
+                                  const char *(*get_path)(sp_RbVal), int children) {
+  SP_GC_ROOT_RBVAL(path); SP_GC_ROOT_RBVAL(encoding);
+  sp_DirForeachCap *cap = (sp_DirForeachCap *)sp_gc_alloc(sizeof *cap, NULL, sp_dir_foreach_scan);
+  SP_GC_ROOT(cap);
+  cap->path = path; cap->encoding = encoding; cap->get_path = get_path; cap->children = children;
+  sp_Enumerator *e = sp_Enumerator_new_gen(sp_dir_foreach_gen, cap, sp_box_nil()); SP_GC_ROOT(e);
+  /* inspects as CRuby's: Dir:foreach("path") or Dir:foreach("path", encoding: NAME),
+     Dir:each_child(...) likewise */
+  const char *lbl = sp_str_concat(children ? SPL("each_child(") : SPL("foreach("), sp_poly_inspect(path)); SP_GC_ROOT_STR(lbl);
+  /* the prefix goes into the rooted slot before to_s may allocate */
+  if (encoding.tag != SP_TAG_NIL) {
+    lbl = sp_str_concat(lbl, SPL(", encoding: "));
+    lbl = sp_str_concat(lbl, sp_poly_to_s(encoding));
+  }
+  lbl = sp_str_concat(lbl, SPL(")"));
+  return sp_enum_with_src(e, sp_box_class_name(SPL("Dir")), lbl);
 }
 /* Blockless Kernel#loop: an infinite Enumerator that yields nil forever (#3236).
    The generator is internal; only sp_loop_enum is exposed (spinel_rt.h). */
@@ -5606,6 +5757,18 @@ sp_RbVal sp_box_brat(sp_Bigint *num, sp_Bigint *den) {
   p->num = num; p->den = den;
   return sp_box_obj(p, SP_BUILTIN_BIG_RATIONAL);
 }
+/* ...and, for --int-overflow=promote, a value whose reduced terms fit sp_int
+   as the small Rational, which compares equal to the same value made small
+   (`(a * b) / (a * b)` is (1/1) the way Rational(1, 1) is): a Rational goes
+   on as a big one only while it has to */
+sp_RbVal sp_box_brat_norm(sp_Bigint *num, sp_Bigint *den) {
+  sp_RbVal v = sp_box_brat(num, den);
+  sp_BigRational *p = (sp_BigRational *)v.v.p;
+  if (sp_bigint_bit_length(p->num) <= (intptr_t)(sizeof(sp_int) * 8 - 1) &&
+      sp_bigint_bit_length(p->den) <= (intptr_t)(sizeof(sp_int) * 8 - 1))
+    return sp_box_rational(sp_rational_new((sp_int)sp_bigint_to_int(p->num), (sp_int)sp_bigint_to_int(p->den)));
+  return v;
+}
 /* Rational#to_i / #floor / #ceil / #round on a Bignum-numerator Rational.
    Every one of these used to go through sp_brat_to_f and a cast to sp_int:
    past the machine word the cast saturates, and a negative value lands on
@@ -6257,7 +6420,7 @@ const char *sp_str_encode_into(const char *s, const char *t) {
   if (n != sp_str_byte_len(t) || memcmp(s, t, n))
     sp_raise_cls("NotImplementedError",
                  "String#encode! that replaces characters is not supported on this String "
-                 "(--share-strings supports it on a variable); write `s = s.encode(...)`");
+                 "(one held in a variable supports it); write `s = s.encode(...)`");
   if (sp_str_is_binary(t)) sp_str_as_binary(s); else sp_str_as_text(s);
   return s;
 }

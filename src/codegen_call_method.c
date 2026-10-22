@@ -779,10 +779,12 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
   /* <method>.call(args) / [] -> invoke the bound function. A top-level
      method ref calls its function directly; an object-bound Method casts
      fn through the (void *self, sp_int...) ABI, evaluating recv once. */
-  if (recv >= 0 && comp_ntype(c, recv) == TY_METHOD &&
-      is_method_invoke(name)) {
-    int mn = method_recv_node(c, recv);
-    int target = mn >= 0 ? method_obj_target_mi(c, mn) : -1;
+  CallPlan plan = {0};
+  if (is_method_invoke(name)) plan = cplan_method_call(c, id);
+  if (plan.method_call) {
+    int mn = plan.method_node;
+    int target = plan.mi;
+    if (g_plan_check && target >= 0 && is_call_alias(name)) ucall_observe(c, id, target, c->scopes[target].class_id, 0);
     int target_recvless = (mn >= 0 && nt_ref(nt, mn, "receiver") < 0);
     /* A bare `method(:sym)` in an instance method names no receiver but binds
        the enclosing self: it is receiverless in syntax only, so it must take
@@ -840,11 +842,13 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
     if (tm && bam_binop_wrapper(tm)) {
       LocalVar *rlv = scope_local(tm, "__bam_r");
       bop_ops = bop_min = bop_max = tm->nparams - shift;
-      if (sp_streq(bam_builtin_sym(c, target, ""), "[]") && rlv && (ty_is_array(rlv->type) || rlv->type == TY_STRING)) {
+      /* (a String's handle too: a shared String the Method binds) */
+      if (sp_streq(bam_builtin_sym(c, target, ""), "[]") && rlv &&
+          (ty_is_array(rlv->type) || rlv->type == TY_STRING || rlv->type == TY_STRBUF)) {
         bop_min = 1; bop_max = 2;
       }
     }
-    int bop_flat = tm && bam_binop_wrapper(tm) && call_has_splat_arg(nt, argv, argc);
+    int bop_flat = tm && bam_binop_wrapper(tm) && nt_argv_has_splat(nt, argv, argc);
     if (tm && bam_binop_wrapper(tm) && argc > bop_ops && !bop_flat) {
       char exp[16];
       arity_expected(exp, sizeof exp, bop_min, bop_max);
@@ -1108,7 +1112,8 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
         buf_printf(b, "sp_int _t%d = (sp_int)(uintptr_t)(_t%d)", atmp[k], bxtmp[k]);
       }
       else {
-        TyKind pk = repr_of(c, argv[k]).as_ty;
+        Repr pkr = repr_of(c, argv[k]);
+        TyKind pk = pkr.as_ty;
         if (bm_want_boxed && k < 16 && oint_kind(pk) && node_has_oint_form(c, argv[k])) {
           bxtmp[k] = ++g_tmp; bxo[k] = 1; any_bxo = 1;
           buf_printf(b, "sp_RbVal _t%d = %s(", bxtmp[k], pk == TY_FLOAT ? "sp_box_ofloat" : "sp_box_oint");
@@ -1120,7 +1125,7 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
           emit_ctype(c, pk, b); buf_printf(b, " _t%d = ", bxtmp[k]); emit_expr(c, argv[k], b); buf_puts(b, "; ");
           emit_named_root(c, pk, "_t", bxtmp[k], b); buf_puts(b, " ");
           buf_printf(b, "sp_int _t%d = ", atmp[k]);
-          if (pk == TY_POLY) buf_printf(b, "sp_poly_to_i(_t%d)", bxtmp[k]);
+          if (pkr.kind == RK_BOXED) buf_printf(b, "sp_poly_to_i(_t%d)", bxtmp[k]);
           else buf_printf(b, "(sp_int)(_t%d)", bxtmp[k]);
         }
         else {
@@ -1309,7 +1314,8 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
   if (recv >= 0 && comp_ntype(c, recv) == TY_PROC &&
       (is_call_alias(name) ||
        (sp_streq(name, "===") && argc == 1))) {
-    TyKind rty = repr_of(c, id).as_ty;       /* the call's result = proc's body return */
+    Repr rtyr = repr_of(c, id);
+    TyKind rty = rtyr.as_ty;       /* the call's result = proc's body return */
     /* `pr&.call(...)`: a nil proc answers nil and the call does not run. The
        receiver goes into a temp the call below reads (through the argument
        override), so it is evaluated once. Without this the nil receiver
@@ -1328,7 +1334,7 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
       if (oint_kind(rty)) emit_oint_expr(c, id, rty, &cb); else emit_expr(c, id, &cb);
       g_sn_proc_node = sv;
       view_unbind(g_n_argov - 1);
-      const char *nilv = rty == TY_POLY || rty == TY_UNKNOWN ? "sp_box_nil()"
+      const char *nilv = rtyr.kind == RK_BOXED || rty == TY_UNKNOWN ? "sp_box_nil()"
                        : oint_kind(rty) ? oint_nil(rty) : default_value_from_compiler(c, rty);
       buf_printf(b, "(_t%d ? %s : %s)", tq, cb.p ? cb.p : nilv, nilv);
       free(cb.p);
@@ -1415,7 +1421,8 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
           rk == NK_ConstantReadNode || rk == NK_SelfNode)
         emit_expr(c, recv, b);
       else {
-        TyKind rct = repr_of(c, recv).as_ty;
+        Repr rctr = repr_of(c, recv);
+        TyKind rct = rctr.as_ty;
         Buf rb = expr_buf(c, recv);
         int tr = ++g_tmp;
         emit_indent(g_pre, g_indent);
@@ -1424,7 +1431,7 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
         buf_printf(g_pre, " _t%d = %s;\n", tr, rb.p ? rb.p : "");
         free(rb.p);
         emit_indent(g_pre, g_indent);
-        if (rct == TY_POLY) buf_printf(g_pre, "SP_GC_ROOT_RBVAL(_t%d);\n", tr);
+        if (rctr.kind == RK_BOXED) buf_printf(g_pre, "SP_GC_ROOT_RBVAL(_t%d);\n", tr);
         else buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", tr);
         buf_printf(b, "_t%d", tr);
       }
@@ -1540,6 +1547,7 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
   if (recv >= 0 && comp_ntype(c, recv) == TY_METHOD &&
       is_call_alias(name) &&
       method_expr_is_unbound(c, recv)) {
+    if (g_plan_check) ucall_refused(id);
     buf_puts(b, "({ (void)("); emit_expr(c, recv, b);
     buf_printf(b, "); sp_raise_cls(\"NoMethodError\", (&(\"\\xff\" \"undefined method '%s' for an instance of UnboundMethod\")[1])); %s; })",
                name, default_value_from_compiler(c, repr_of(c, id).as_ty));
@@ -1551,8 +1559,8 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
      them (emit_bind_call). */
   if (recv >= 0 && comp_ntype(c, recv) == TY_METHOD && argc >= 1 &&
       sp_streq(name, "bind_call")) {
-    int mn2 = method_recv_node(c, recv);
-    int t2 = mn2 >= 0 ? method_obj_target_mi(c, mn2) : -1;
+    CallPlan plan = cplan_method_call(c, id);
+    int t2 = plan.mi;
     if (t2 >= 0 && c->scopes[t2].class_id >= 0 && !c->scopes[t2].is_cmethod &&
         ty_is_object(comp_ntype(c, argv[0]))) {
       emit_bind_call(c, id, t2, argv, argc, b);
@@ -1915,6 +1923,30 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
 }
 
 /* a Method or a Proc read out of a container widened to poly: name / owner / receiver, arity, and call / () / yield answered from the boxed value */
+/* `slot.call(args) { ... }` (or `&b`) on a boxed callable: a bound Method
+   enters its thunk with the block, and a Proc takes it on the block channel,
+   both through sp_poly_callable_call_blk. The arguments were hoisted into
+   the temps aptmp and published (pubs). The direct casts a Method takes
+   without a block cannot hand one over. */
+static void emit_poly_callable_blk_call(Compiler *c, int t, int argc, const int *argv, const int *aptmp,
+                                        const char *pubs, int kwpos, int tblk, Buf *b) {
+  if (pubs) { buf_puts(b, "("); buf_puts(b, pubs); }
+  buf_printf(b, "sp_poly_callable_call_blk(_t%d, %d, (sp_int[%d]){", t, argc, argc > 16 ? argc : 16);
+  for (int k = 0; k < argc; k++) {
+    Repr ar = repr_of(c, argv[k]);
+    TyKind at = ar.as_ty;
+    if (k) buf_puts(b, ", ");
+    if (!aptmp) emit_expr(c, argv[k], b);
+    else if (ar.kind == RK_BOXED) buf_printf(b, "sp_poly_slot_arg(_t%d)", aptmp[k]);
+    else if (proc_slot_is_ptr(at) || at == TY_PROC) buf_printf(b, "(sp_int)(uintptr_t)_t%d", aptmp[k]);
+    else if (at == TY_FLOAT || proc_slot_via_poly(c, at)) buf_puts(b, "0");
+    else buf_printf(b, "_t%d", aptmp[k]);
+  }
+  if (argc == 0) buf_puts(b, "0");
+  buf_printf(b, "}, %d, _t%d)", kwpos, tblk);
+  if (pubs) buf_puts(b, ")");
+}
+
 int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
   /* A Method read out of a container widened to poly: answer from the
      sp_BoundMethod itself, which carries everything the compile-time arms
@@ -2079,7 +2111,8 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         g_needs_proc_poly_argslot = 1;
         if (argc > SP_PROC_ARG_SLOTS) buf_printf(&pubs, "sp_proc_wide_open(%d), ", argc);
         for (int k = 0; k < argc; k++) {
-          TyKind at = repr_of(c, argv[k]).as_ty;
+          Repr ar = repr_of(c, argv[k]);
+          TyKind at = ar.as_ty;
           int storable = ty_is_object(at) || c_type_name(at) != NULL;
           aptmp[k] = ++g_tmp;
           /* the arg may spill setup into g_pre; emit into a private buffer
@@ -2097,7 +2130,7 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
             emit_indent(g_pre, g_indent);
             if (storable) emit_ctype(c, at, g_pre); else buf_puts(g_pre, "sp_int");
             buf_printf(g_pre, " _t%d = %s;\n", aptmp[k], valb.p ? valb.p : "0");
-            if (at == TY_POLY) { emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT_RBVAL(_t%d);\n", aptmp[k]); }
+            if (ar.kind == RK_BOXED) { emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT_RBVAL(_t%d);\n", aptmp[k]); }
             else if (proc_slot_is_ptr(at) || at == TY_PROC) { emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", aptmp[k]); }
           }
           int hold = proc_arg_box_hold(c, at, g_pre, g_indent);
@@ -2157,6 +2190,14 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
          is created with a NULL self. Branch at run time so a top-level Method
          read out of a container is not invoked with a spurious leading self
          arg -- which would shift every real argument by one (#3231). */
+      int tblk = nt_ref(nt, id, "block") >= 0 ? poly_call_blk_proc(c, id, -1) : -1;
+      if (tblk >= 0) {
+        emit_poly_callable_blk_call(c, t, argc, argv, aptmp, pubs.p, argc == 0 ? 0 :
+                                    nt_kind(nt, argv[argc - 1]) == NK_KeywordHashNode ? 2 : 1, tblk, b);
+        buf_puts(b, yield_else);
+        free(pubs.p); free(aptmp);
+        return 1;
+      }
       if (pubs.p) { buf_puts(b, "("); buf_puts(b, pubs.p); }
       /* A Method whose target cannot read the argument class, or whose
          stamped per-position class differs, cannot be invoked through the
@@ -2244,7 +2285,7 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         EMIT_POLY_CALL_SLOT(k);
       }
       if (argc == 0) buf_puts(b, "0");  /* C99: no empty initializer list */
-      buf_printf(b, "}, %d))", argc == 0 ? 0 : nt_kind(nt, argv[argc - 1]) == NK_KeywordHashNode ? 2 : 1);
+      buf_printf(b, "}, %d))", argc == 0 ? 0 : nt_argv_kwh(nt, argv, argc) >= 0 ? 2 : 1);
       if (pubs.p) buf_puts(b, ")");
       buf_puts(b, yield_else);
       free(pubs.p);
@@ -2279,9 +2320,8 @@ int emit_call_proc_literal_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
          Ruby returns that proc as-is (preserving its lambda? flag), so emit the
          forwarded expression directly rather than wrapping it in a fresh
          non-lambda proc. */
-      int _blk = nt_ref(nt, id, "block");
-      const char *_bty = nt_type(nt, _blk);
-      if (_bty && sp_streq(_bty, "BlockArgumentNode")) {
+      int _blk = nt_call_block_arg(nt, id);
+      if (_blk >= 0) {
         int _fwd = nt_ref(nt, _blk, "expression");
         /* forwarding the enclosing (inlined) method's block param
            (`Proc.new(&b)` inside `def make(&b)`): the real block is the
