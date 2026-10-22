@@ -16992,6 +16992,57 @@ int an_scopes_named_next(Compiler *c, const char *nm, int s) {
   return -1;
 }
 
+/* The scopes sharing scope s's def_node (its copies: a transplanted module
+   method's body, once per includer), ascending: the first, and the next
+   after s (-1 at the end). Frozen, from a table built once per scope-index
+   epoch, as the by-name lists are; else the scan. The share facts asked
+   every scope for a copied self call's twins, at every such call, every
+   build. */
+static int *an_sdn_next, *an_sdn_first_of, an_sdn_stamp_n = -1;
+static unsigned an_sdn_stamp_gen;
+static void an_sdn_build(Compiler *c) {
+  int n = c->nscopes > 0 ? c->nscopes : 1;
+  free(an_sdn_next); free(an_sdn_first_of);
+  an_sdn_next = malloc(sizeof(int) * (size_t)n);
+  an_sdn_first_of = malloc(sizeof(int) * (size_t)n);
+  unsigned cap = 16;
+  while (cap < 2u * (unsigned)n) cap *= 2;
+  int *tab = malloc(sizeof(int) * (size_t)cap);   /* the last scope seen of each def_node */
+  if (!an_sdn_next || !an_sdn_first_of || !tab) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (unsigned i = 0; i < cap; i++) tab[i] = -1;
+  for (int i = 0; i < c->nscopes; i++) {
+    an_sdn_next[i] = -1; an_sdn_first_of[i] = i;
+    int d = c->scopes[i].def_node;
+    if (d < 0) continue;
+    unsigned h = ((unsigned)d * 2654435761u) & (cap - 1);
+    while (tab[h] >= 0 && c->scopes[tab[h]].def_node != d) h = (h + 1) & (cap - 1);
+    if (tab[h] >= 0) { an_sdn_next[tab[h]] = i; an_sdn_first_of[i] = an_sdn_first_of[tab[h]]; }
+    tab[h] = i;
+  }
+  free(tab);
+  an_sdn_stamp_n = c->nscopes; an_sdn_stamp_gen = comp_scope_index_gen();
+}
+int an_scopes_same_def_first(Compiler *c, int s) {
+  if (s < 0 || s >= c->nscopes || c->scopes[s].def_node < 0) return -1;
+  if (comp_scope_index_is_frozen()) {
+    if (an_sdn_stamp_n != c->nscopes || an_sdn_stamp_gen != comp_scope_index_gen()) an_sdn_build(c);
+    return an_sdn_first_of[s];
+  }
+  for (int i = 0; i < c->nscopes; i++)
+    if (c->scopes[i].def_node == c->scopes[s].def_node) return i;
+  return -1;
+}
+int an_scopes_same_def_next(Compiler *c, int s) {
+  if (s < 0 || s >= c->nscopes || c->scopes[s].def_node < 0) return -1;
+  if (comp_scope_index_is_frozen()) {
+    if (an_sdn_stamp_n != c->nscopes || an_sdn_stamp_gen != comp_scope_index_gen()) an_sdn_build(c);
+    return an_sdn_next[s];
+  }
+  for (int i = s + 1; i < c->nscopes; i++)
+    if (c->scopes[i].def_node == c->scopes[s].def_node) return i;
+  return -1;
+}
+
 /* Unique method scope index by name across the program, or -1 (absent or
    defined more than once). Scope 0 is the top level (name NULL). */
 static int an_unique_scope_by_name(Compiler *c, const char *nm) {
@@ -19862,6 +19913,8 @@ static int strbuf_demand_param_container_stores_walk(Compiler *c, const char *pn
    each parameter it followed, and a large program's walk spent its time in
    that scan. Collected up front: the walk can rebuild the by-name lists. */
 static int an_alias_name(Compiler *c, const char *nm);
+static int an_alias_by_old_first(Compiler *c, const char *nm);
+static int *ao_next; static const char **ao_new;
 static int sb_int_cmp(const void *a, const void *b) {
   int x = *(const int *)a, y = *(const int *)b;
   return (x > y) - (x < y);
@@ -19882,18 +19935,18 @@ int *an_scope_call_candidates(Compiler *c, Scope *m, int *n) {
      name, from its new name to its old (comp_resolve_alias_ex), so only a
      name whose chain of old names reaches the method's can call it. Every
      alias name of the program was a candidate before, and each method asked
-     every call on all of them through its receiver's classes. */
-  for (int grew = 1; grew; ) {
-    grew = 0;
-    for (int k = 0; k < c->nclasses; k++)
-      for (int a = 0; a < c->classes[k].naliases; a++) {
-        const char *an = c->classes[k].alias_new[a], *ao = c->classes[k].alias_old[a];
-        if (!an || !ao || anh_has(&seen, an) || !anh_has(&seen, ao)) continue;
-        anh_add(&seen, an);
-        all = realloc(all, sizeof *all * (size_t)(nnames + 1)); all[nnames++] = an;
-        grew = 1;
-      }
-  }
+     every call on all of them through its receiver's classes. The names
+     found are walked in turn (`all` grows under the walk), each through the
+     aliases of that old name: reading every class's aliases per step, for
+     every method the pass walked back from, was 4% of a Rails program's
+     share pass. */
+  for (int i = 0; i < nnames; i++)
+    for (int e = an_alias_by_old_first(c, all[i]); e >= 0; e = ao_next[e]) {
+      const char *an = ao_new[e];
+      if (anh_has(&seen, an)) continue;
+      anh_add(&seen, an);
+      all = realloc(all, sizeof *all * (size_t)(nnames + 1)); all[nnames++] = an;
+    }
   for (int i = 0; i < nnames; i++)
     for (int u = an_calls_named_first(c, all[i]); u >= 0; u = an_calls_named_next(u)) {
       if (cnt == cap) {
@@ -20162,11 +20215,72 @@ static int call_passes_local(const NodeTable *nt, int u, const char *vn) {
   }
   return 0;
 }
+/* The calls of a scope that hand local (vn, vs) as an argument, by (scope,
+   name), kept while the node table and the scopes hold still, as
+   an_local_array_changed's answers are: the test reads only the calls'
+   arguments. The refusal walk is asked per container local, every round,
+   and each ask read every call of the scope: on a Rails program late in
+   its fixpoint that reading was 6% of a sampled window. The ids live in
+   one pool the entries index by offset. */
+typedef struct { int sidx; const char *name; int off, n; } RcmEntry;
+static RcmEntry *rcm_tab; static int rcm_cap, rcm_n;
+static int *rcm_ids; static int rcm_ids_n, rcm_ids_cap;
+static const NodeTable *rcm_nt; static unsigned rcm_ver, rcm_gen; static int rcm_count, rcm_nscopes = -1;
+static RcmEntry *rcm_slot(int sidx, const char *name) {
+  unsigned h = (sp_strhash(name) ^ ((unsigned)sidx * 2654435761u)) & (unsigned)(rcm_cap - 1);
+  while (rcm_tab[h].name && !(rcm_tab[h].sidx == sidx && sp_streq(rcm_tab[h].name, name))) h = (h + 1) & (unsigned)(rcm_cap - 1);
+  return &rcm_tab[h];
+}
+static RcmEntry *rcm_find(Compiler *c, int sidx, const char *name) {
+  const NodeTable *nt = c->nt;
+  if (rcm_nt != nt || rcm_ver != nt->version || rcm_count != nt->count || rcm_gen != comp_scope_index_gen() || rcm_nscopes != c->nscopes) {
+    free(rcm_tab); rcm_cap = 1024; rcm_n = 0; rcm_ids_n = 0;
+    rcm_tab = calloc((size_t)rcm_cap, sizeof *rcm_tab);
+    if (!rcm_tab) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    rcm_nt = nt; rcm_ver = nt->version; rcm_count = nt->count; rcm_gen = comp_scope_index_gen(); rcm_nscopes = c->nscopes;
+  }
+  if (rcm_n * 2 >= rcm_cap) {
+    RcmEntry *old = rcm_tab; int ocap = rcm_cap;
+    rcm_cap *= 2;
+    rcm_tab = calloc((size_t)rcm_cap, sizeof *rcm_tab);
+    if (!rcm_tab) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < ocap; i++) if (old[i].name) *rcm_slot(old[i].sidx, old[i].name) = old[i];
+    free(old);
+  }
+  return rcm_slot(sidx, name);
+}
+/* Those calls, copied out for the caller: the walk under each one may ask
+   for another local's, which can move the pool. */
+static int *rcm_calls(Compiler *c, const char *vn, Scope *vs, int *n) {
+  const NodeTable *nt = c->nt;
+  int sidx = (int)(vs - c->scopes);
+  RcmEntry *e = rcm_find(c, sidx, vn);
+  if (!e->name) {
+    int off = rcm_ids_n;
+    for (int u = comp_scall_first(c, sidx); u >= 0; u = comp_scall_next(c, u)) {
+      if (nt_kind(nt, u) != NK_CallNode || !call_passes_local(nt, u, vn)) continue;
+      if (rcm_ids_n == rcm_ids_cap) {
+        rcm_ids_cap = rcm_ids_cap ? rcm_ids_cap * 2 : 1024;
+        rcm_ids = realloc(rcm_ids, sizeof(int) * (size_t)rcm_ids_cap);
+        if (!rcm_ids) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      }
+      rcm_ids[rcm_ids_n++] = u;
+    }
+    e->sidx = sidx; e->name = vn; e->off = off; e->n = rcm_ids_n - off; rcm_n++;
+  }
+  *n = e->n;
+  if (e->n == 0) return NULL;
+  int *out = malloc(sizeof(int) * (size_t)e->n);
+  if (!out) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  memcpy(out, rcm_ids + e->off, sizeof(int) * (size_t)e->n);
+  return out;
+}
 static void refuse_callee_container_stores(Compiler *c, const char *vn, Scope *vs) {
   const NodeTable *nt = c->nt;
   StoreVals st = {0};
-  for (int u = comp_scall_first(c, (int)(vs - c->scopes)); u >= 0; u = comp_scall_next(c, u)) {
-    if (nt_kind(nt, u) != NK_CallNode || !call_passes_local(nt, u, vn)) continue;
+  int nu = 0; int *us = rcm_calls(c, vn, vs, &nu);
+  for (int k = 0; k < nu; k++) {
+    int u = us[k];
     int mi = comp_scope_of(c, u) == vs ? an_call_target_mi(c, u) : -1;
     Scope *m = mi > 0 ? &c->scopes[mi] : NULL;
     for (int j = 0; m && j < m->nparams; j++) {
@@ -20193,6 +20307,7 @@ static void refuse_callee_container_stores(Compiler *c, const char *vn, Scope *v
     }
   }
   free(st.v);
+  free(us);
 }
 /* The stores into container local (vn, vs): its own, and for a parameter
    or a block parameter, those of what the caller or the iterator binds it
@@ -26714,6 +26829,41 @@ static int an_alias_first(Compiler *c, const char *nm) {
 /* Is `nm` a name some class aliases a method under? */
 static int an_alias_name(Compiler *c, const char *nm) { return an_alias_first(c, nm) >= 0; }
 
+/* The aliases of a method named `nm` (their old name), in class order: the
+   first entry, or -1, then ao_next[e]; ao_new[e] is the entry's new name.
+   The by-old-name twin of the list above, with its stamps, for the walk
+   that follows a method's name to the names that call it. */
+static int an_alias_by_old_first(Compiler *c, const char *nm) {
+  static ANameHash names;
+  static int *first, *last, stamp_nc = -1;
+  static unsigned stamp_gen;
+  if (stamp_nc != c->nclasses || stamp_gen != comp_table_gen) {
+    anh_free(&names); memset(&names, 0, sizeof names);
+    free(first); free(last); free(ao_next); free(ao_new);
+    first = last = ao_next = NULL; ao_new = NULL;
+    int ne = 0, cap = 0;
+    for (int k = 0; k < c->nclasses; k++)
+      for (int a = 0; a < c->classes[k].naliases; a++) {
+        const char *an = c->classes[k].alias_new[a], *ao = c->classes[k].alias_old[a];
+        if (!an || !ao) continue;
+        int h = anh_find(&names, ao);
+        if (ne == cap) {
+          cap = cap ? cap * 2 : 64;
+          first = realloc(first, sizeof(int) * (size_t)cap); last = realloc(last, sizeof(int) * (size_t)cap);
+          ao_next = realloc(ao_next, sizeof(int) * (size_t)cap); ao_new = realloc(ao_new, sizeof *ao_new * (size_t)cap);
+          if (!first || !last || !ao_next || !ao_new) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+        }
+        ao_next[ne] = -1; ao_new[ne] = an;
+        if (h >= 0) { ao_next[last[h]] = ne; last[h] = ne; }
+        else { h = names.n; anh_add(&names, ao); first[h] = last[h] = ne; }
+        ne++;
+      }
+    stamp_nc = c->nclasses; stamp_gen = comp_table_gen;
+  }
+  int h = nm && names.n > 0 ? anh_find(&names, nm) : -1;
+  return h >= 0 ? first[h] : -1;
+}
+
 /* The scopes a call on name `un`, defined by more than one method or reached
    under an alias, can reach.
    Resolved the way the binders resolve it: a class method on a constant
@@ -26747,10 +26897,13 @@ static int an_recv_builtin_without(Compiler *c, int u, const char *un) {
   return 1;
 }
 
-static void an_call_targets_nonunique(Compiler *c, int u, const char *un, ACallTargets *t) {
+static void an_call_targets_nonunique(Compiler *c, int u, const char *un, ACallTargets *t, int ae) {
   const NodeTable *nt = c->nt;
   int first = an_any_scope_by_name(c, un);
-  int aliased = an_alias_name(c, un);
+  /* `ae`: the first class aliasing a method under the name (an_alias_first),
+     resolved by the caller, which has asked it already: a hash of the name
+     each, and a candidate walk asks this for every call of a name */
+  int aliased = ae >= 0;
   if (first < 0 && !aliased) return;
   int rc = nt_ref(nt, u, "receiver");
   NodeKind rk = rc >= 0 ? nt_kind(nt, rc) : NK_SelfNode;
@@ -26796,7 +26949,7 @@ static void an_call_targets_nonunique(Compiler *c, int u, const char *un, ACallT
   else
     for (int k = first; k >= 0 && t->want < 0; k = an_same_name_next(c, k)) act_add(t, k);
   /* and every method a class aliases under the name */
-  for (int e = aliased ? an_alias_first(c, un) : -1; e >= 0; e = al_next[e]) {
+  for (int e = ae; e >= 0; e = al_next[e]) {
     act_add(t, comp_method_in_chain(c, al_cls[e], un, NULL));
     act_add(t, comp_cmethod_in_chain(c, al_cls[e], un, NULL));
   }
@@ -26833,9 +26986,11 @@ static void an_call_targets_of(Compiler *c, int u, ACallTargets *t) {
      (#5957) reaching `Rooms.show_into` beside a `Users.show_into` -- never
      pulled the caller's local into the handle, and the call handed it a
      fresh copy that took every append (#6065). */
-  if ((byname < 0 || an_alias_name(c, un)) && !sp_streq(un, "new"))
-    an_call_targets_nonunique(c, u, un, t);
-  if (!sp_streq(un, "new")) return;
+  if (!sp_streq(un, "new")) {
+    int ae = an_alias_first(c, un);
+    if (byname < 0 || ae >= 0) an_call_targets_nonunique(c, u, un, t, ae);
+    return;
+  }
   int rc = nt_ref(nt, u, "receiver");
   if (rc < 0 || nt_kind(nt, rc) != NK_ConstantReadNode) return;
   const char *cn = nt_str(nt, rc, "name");
@@ -27479,7 +27634,7 @@ static int an_call_targets_scope(Compiler *c, int u, int mi2, Scope *m2) {
   if (!un) return 0;
   int is_new = sp_streq(un, "new"), named = sp_streq(un, m2->name);
   /* only an alias reaches a scope under another name */
-  int aliased = !is_new && an_alias_name(c, un);
+  int ae = is_new ? -1 : an_alias_first(c, un), aliased = ae >= 0;
   int byname = named ? an_unique_scope_by_name(c, un) : -1;
   if (named && byname == mi2 &&
       cplan_user_fresh(c, u)->mi == mi2 &&
@@ -27488,7 +27643,7 @@ static int an_call_targets_scope(Compiler *c, int u, int mi2, Scope *m2) {
      itself resolves to, as an_call_targets_of lists them */
   if (!is_new && ((named && byname < 0) || aliased)) {
     ACallTargets tg = { NULL, 0, 0, mi2, 0 };
-    an_call_targets_nonunique(c, u, un, &tg);
+    an_call_targets_nonunique(c, u, un, &tg, ae);
     if (tg.hit) return 1;
   }
   if (!sp_streq(un, "new") || !sp_streq(m2->name, "initialize")) return 0;
@@ -34934,7 +35089,7 @@ static int dispatch_answers_nil(Compiler *c, int cid, const char *name, int cmet
 static LocalVar *nullable_elem_local(Compiler *c, int at, const char *nm) {
   Scope *sc = nm ? comp_scope_of(c, at) : NULL;
   LocalVar *lv = sc ? scope_local(sc, nm) : NULL;
-  if (!lv || lv->nullable_int_elem) return NULL;
+  if (!lv || (lv->nullable_int_elem & NIE_MARKED)) return NULL;
   return (lv->type == TY_INT_ARRAY || lv->type == TY_FLOAT_ARRAY) ? lv : NULL;
 }
 
@@ -35271,6 +35426,168 @@ int mutated_array(Compiler *c, int recv) {
   return recv;
 }
 
+/* The values a `yield` answers: the tails of the blocks its method is
+   called with (a `next v` too), every one of them -- a full buffer may have
+   left some out, so it grows until they fit. A malloc'd array (the caller
+   frees it), its length into *np. */
+static int *yield_value_tails(Compiler *c, int y, int *np) {
+  Scope *ys = comp_scope_of(c, y);
+  int ymi = ys ? (int)(ys - c->scopes) : -1;
+  int *out = NULL, n = 0;
+  if (ymi >= 0) {
+    int sv_ybn = yield_block_tails_next; yield_block_tails_next = 1;
+    for (int max = 64;; max *= 2) {
+      int *grown = realloc(out, (size_t)max * sizeof *out);
+      if (!grown) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      out = grown;
+      n = yield_block_tails(c, ymi, out, max);
+      if (n < max) break;
+    }
+    yield_block_tails_next = sv_ybn;
+  }
+  *np = n;
+  return out;
+}
+
+/* The nil mark is the array's, not a name's: an int/float array expression
+   `v` denotes the array of a local, an ivar, or the ivar an object call hands
+   out (`k.arr`), and a user method's answer or a `yield`'s value is the array
+   its tail reads (`b = same(a)` reaches what `same` returns: its parameter,
+   and through it a). fn sees each such slot's NIE_ bits (`bits`, with `node`
+   the slot's read) and each expression on the way (`bits` NULL, `node` the
+   expression); `tail` is set past a method's or block's tail. The OR of what
+   fn answers. */
+typedef int (*ElemSlotFn)(Compiler *c, int *bits, int node, int tail, void *ud);
+static int elem_slots_d(Compiler *c, int v, int tail, int depth, ElemSlotFn fn, void *ud) {
+  const NodeTable *nt = c->nt;
+  int r = fn(c, NULL, v, tail, ud);
+  int recv = v >= 0 && depth < 8 ? mutated_array(c, v) : -1;
+  if (recv < 0) return r;
+  if (nt_kind(nt, recv) == NK_YieldNode) {
+    int n, *tails = yield_value_tails(c, recv, &n);
+    for (int k = 0; k < n; k++) r |= elem_slots_d(c, tails[k], 1, depth + 1, fn, ud);
+    free(tails);
+    return r;
+  }
+  if (nt_kind(nt, recv) == NK_LocalVariableReadNode) {
+    const char *nm = nt_str(nt, recv, "name");
+    Scope *sc = nm ? comp_scope_of(c, recv) : NULL;
+    LocalVar *lv = sc ? scope_local(sc, nm) : NULL;
+    if (lv && (lv->type == TY_INT_ARRAY || lv->type == TY_FLOAT_ARRAY))
+      r |= fn(c, &lv->nullable_int_elem, recv, tail, ud);
+    return r;
+  }
+  ClassInfo *ci = NULL; int mi = -1, iv = -1;
+  if (nt_kind(nt, recv) == NK_InstanceVariableReadNode) iv = nullable_elem_ivar(c, recv, &ci);
+  else if (nt_kind(nt, recv) == NK_CallNode) iv = object_call_ivar(c, recv, &ci, &mi);
+  if (iv < 0 && nt_kind(nt, recv) == NK_CallNode) {
+    int tg[CPT_MAX], ntg = cplan_targets(c, recv, tg, CPT_MAX);
+    for (int k = 0; k < ntg; k++) r |= elem_slots_d(c, scope_body_last(c, tg[k]), 1, depth + 1, fn, ud);
+    return r;
+  }
+  /* (an ivar's bits are a byte: fn sees them as an int, written back) */
+  if (iv >= 0 && (ci->ivar_types[iv] == TY_INT_ARRAY || ci->ivar_types[iv] == TY_FLOAT_ARRAY)) {
+    int bits = ci->ivar_nullable_int_elem[iv];
+    r |= fn(c, &bits, recv, tail, ud);
+    ci->ivar_nullable_int_elem[iv] = (unsigned char)bits;
+  }
+  return r;
+}
+
+/* Mark the array `v` denotes, through every slot of it: a store marks its
+   own name (NIE_MARKED, which types its reads) and sets NIE_STORED |
+   NIE_REACH, which the slots past a tail get without the typing mark. The
+   other names of the array -- the local a mutation's receiver was assigned
+   from, the argument a parameter was bound to -- are marked through this
+   too (mark_nullable_params_of_call, the alias arms of the fixpoint), or the
+   proved loop read through the unmarked name took the nil for an Integer.
+   1 when a bit was added. */
+static int mark_slot_fn(Compiler *c, int *bits, int node, int tail, void *ud) {
+  (void)c; (void)node;
+  int add = *(const int *)ud & (tail ? ~NIE_MARKED : ~0);
+  if (!bits || (*bits & add) == add) return 0;
+  *bits |= add;
+  return 1;
+}
+static int mark_elem_slot(Compiler *c, int v, int bits) { return elem_slots_d(c, v, 0, 0, mark_slot_fn, &bits); }
+
+/* Can a nil be in the array `v` denotes at run time, through any name of it
+   (NIE_REACH, or the typing mark itself)? */
+static int reach_slot_fn(Compiler *c, int *bits, int node, int tail, void *ud) {
+  (void)tail; (void)ud;
+  return bits ? (*bits & (NIE_MARKED | NIE_REACH)) != 0 : nullable_int_elem_expr(c, node, 0);
+}
+int elem_nil_reach_expr(Compiler *c, int v) { return elem_slots_d(c, v, 0, 0, reach_slot_fn, NULL); }
+
+/* A typed Array whose value lands in a boxed slot -- an element of a mixed
+   literal, a mixed local, ivar or parameter, a push onto a mixed Array -- is
+   the same array behind the box, so a nil a mutation through a boxed
+   receiver stores (`[a, "x"].each { |x| x << h[k] }`) can be in it: each
+   such array, wherever its value comes from (value positions), is marked
+   as one a nil reaches. Only a program with such a mutation marks any
+   (boxed_nil_store), and the mark asks only the proved loop read. */
+typedef struct { Compiler *c; int changed; } BoxMark;
+static int box_mark_leaf(const VpLeaf *leaf, void *ud) {
+  BoxMark *m = (BoxMark *)ud;
+  if (leaf->kind != VPK_EXPR) return 0;
+  TyKind t = infer_type(m->c, leaf->node);
+  if (t == TY_INT_ARRAY || t == TY_FLOAT_ARRAY) m->changed |= mark_elem_slot(m->c, leaf->node, NIE_STORED | NIE_REACH);
+  return 0;
+}
+static int mark_boxed_value(Compiler *c, int v) {
+  BoxMark m = { c, 0 };
+  if (v >= 0) for_each_value_position(c->nt, v, VPS_ALL, box_mark_leaf, &m);
+  return m.changed;
+}
+/* Does the program mutate a boxed receiver in a way that can store a nil
+   element (a typed Array behind the box takes it)? Asked once a round of
+   mark_nullable_int_locals, into nie_boxed_store. */
+static int nie_boxed_store;
+static int boxed_nil_store(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  NT_FOREACH_KIND(nt, NK_CallNode, id) {
+    int r = nt_ref(nt, id, "receiver");
+    if (r >= 0 && infer_type(c, r) == TY_POLY && nullable_elem_mutation(c, id, 0)) return 1;
+  }
+  return 0;
+}
+static int is_poly_container(TyKind t) {
+  return t == TY_POLY_ARRAY || t == TY_SYM_POLY_HASH || t == TY_STR_POLY_HASH || t == TY_POLY_POLY_HASH;
+}
+/* The boxing places a typed Array's value can reach, for mark_boxed_value. */
+static int mark_boxed_arrays(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  if (!nie_boxed_store) return 0;
+  int changed = 0;
+  NT_FOREACH_KIND(nt, NK_ArrayNode, id) {
+    if (infer_type(c, id) != TY_POLY_ARRAY) continue;
+    int en = 0; const int *els = nt_arr(nt, id, "elements", &en);
+    for (int k = 0; els && k < en; k++) changed |= mark_boxed_value(c, els[k]);
+  }
+  NT_FOREACH_KIND(nt, NK_HashNode, id) {
+    if (!is_poly_container(infer_type(c, id))) continue;
+    int en = 0; const int *els = nt_arr(nt, id, "elements", &en);
+    for (int k = 0; els && k < en; k++) changed |= mark_boxed_value(c, nt_ref(nt, els[k], "value"));
+  }
+  NT_FOREACH_KIND(nt, NK_LocalVariableWriteNode, id) {
+    Scope *ws = comp_scope_of(c, id);
+    LocalVar *wl = ws && nt_str(nt, id, "name") ? scope_local(ws, nt_str(nt, id, "name")) : NULL;
+    if (wl && wl->type == TY_POLY) changed |= mark_boxed_value(c, nt_ref(nt, id, "value"));
+  }
+  NT_FOREACH_KIND(nt, NK_InstanceVariableWriteNode, id)
+    if (infer_type(c, id) == TY_POLY) changed |= mark_boxed_value(c, nt_ref(nt, id, "value"));
+  NT_FOREACH_KIND(nt, NK_CallNode, id) {
+    const char *nm = nt_str(nt, id, "name");
+    int r = nt_ref(nt, id, "receiver");
+    if (!nm || r < 0 || !is_poly_container(infer_type(c, r)) || !(self_mutator_call(nm) || sp_streq(nm, "[]=") || sp_streq(nm, "store")))
+      continue;
+    int ca = nt_ref(nt, id, "arguments"), an = 0;
+    const int *av = ca >= 0 ? nt_arr(nt, ca, "arguments", &an) : NULL;
+    for (int k = 0; av && k < an; k++) changed |= mark_boxed_value(c, av[k]);
+  }
+  return changed;
+}
+
 /* One level further in: can an element of a container HELD BY `v` be nil?
    `v` is the outer container -- an array of arrays, a hash whose
    values are arrays, or a slot holding one -- so `v[k][j]` reaches the scalar. */
@@ -35323,12 +35640,12 @@ static int nullable_int_elem_expr(Compiler *c, int v, int depth) {
     Scope *s = comp_scope_of(c, v);
     const char *n = nt_str(nt, v, "name");
     LocalVar *lv = n && s ? scope_local(s, n) : NULL;
-    return lv && lv->nullable_int_elem;
+    return lv && (lv->nullable_int_elem & NIE_MARKED);
   }
   if (nt_kind(nt, v) == NK_InstanceVariableReadNode) {
     ClassInfo *ci = NULL;
     int iv = nullable_elem_ivar(c, v, &ci);
-    return iv >= 0 && ci->ivar_nullable_int_elem[iv];
+    return iv >= 0 && (ci->ivar_nullable_int_elem[iv] & NIE_MARKED);
   }
   /* A conditional's value is one of its arms, as nullable_int_value walks
      them: the array is marked if any arm's array is. An absent arm is a nil,
@@ -35403,7 +35720,7 @@ static int nullable_int_elem_expr(Compiler *c, int v, int depth) {
       ClassInfo *ci = NULL; int mi = -1;
       int iv = object_call_ivar(c, v, &ci, &mi);
       if (mi > 0) return nullable_int_elem_expr(c, scope_body_last(c, mi), depth + 1);
-      return iv >= 0 && ci->ivar_nullable_int_elem[iv];
+      return iv >= 0 && (ci->ivar_nullable_int_elem[iv] & NIE_MARKED);
     }
     return 0;
   }
@@ -37417,7 +37734,6 @@ void nn_inference_round(Compiler *c) {
   nn_epoch++;
 }
 
-extern int yield_block_tails_next;   /* analyze_util.c */
 /* a String operand that is never nil: a literal */
 static int nn_str_literal(const NodeTable *nt, int n) {
   NodeKind k = n >= 0 ? nt_kind(nt, n) : NK_NONE;
@@ -38508,9 +38824,21 @@ static int mark_nullable_params_of_call(Compiler *c, int id, int mi) {
        makes the two differ: --int-overflow=promote boxes `[f(1), f(-1)]`
        once f answers poly, after the copy min_by runs in took its
        parameter's type from it, and the nil element read as an Integer. */
-    if ((p->type == TY_INT_ARRAY || p->type == TY_FLOAT_ARRAY) && !p->nullable_int_elem &&
+    if ((p->type == TY_INT_ARRAY || p->type == TY_FLOAT_ARRAY) && !(p->nullable_int_elem & NIE_MARKED) &&
         (nullable_int_elem_expr(c, a, 0) || infer_type(c, a) == TY_POLY_ARRAY || infer_type(c, a) == TY_POLY))
-      { p->nullable_int_elem = 1; changed = 1; }
+      { p->nullable_int_elem |= NIE_MARKED; changed = 1; }
+    /* a nil some other name put into the argument's array is in the
+       parameter's: the proved loop read asks (NIE_REACH) */
+    if ((p->type == TY_INT_ARRAY || p->type == TY_FLOAT_ARRAY) && !(p->nullable_int_elem & NIE_REACH) &&
+        elem_nil_reach_expr(c, a))
+      { p->nullable_int_elem |= NIE_REACH; changed = 1; }
+    /* ... and the other way: the parameter IS the caller's array, so a nil
+       the method stores into it (`def add(x, k) = x << h[k]`) is in the
+       argument's array too */
+    if ((p->type == TY_INT_ARRAY || p->type == TY_FLOAT_ARRAY) && (p->nullable_int_elem & NIE_STORED))
+      changed |= mark_elem_slot(c, a, NIE_STORED | NIE_REACH);
+    /* a mixed parameter boxes the argument's array (mark_boxed_arrays) */
+    if (p->type == TY_POLY && nie_boxed_store) changed |= mark_boxed_value(c, a);
     if ((p->type != TY_INT && p->type != TY_FLOAT) || p->nullable_int) continue;
     /* a strict parameter's nil raises at the call: its slot stays plain */
     if (param_strict(c, mi, k, NULL, NULL)) continue;
@@ -39748,6 +40076,7 @@ static void mark_nullable_int_locals(Compiler *c) {
   for (long round = 0; round < rounds_max; round++) {
     int changed = 0;
     nn_compute(c, (int)round);
+    nie_boxed_store = boxed_nil_store(c);
     /* A method whose own return expression can be nil hands it to every
        caller. Without this, only an --rbs-seeded signature made a method
        nilable, so `def pass(x) = x.p_` silently laundered the nil into a
@@ -39864,10 +40193,17 @@ static void mark_nullable_int_locals(Compiler *c) {
       int v = nt_ref(nt, id, "value");
       if (v < 0) continue;
       LocalVar *lv = nullable_elem_local(c, id, nt_str(nt, id, "name"));
-      if (!lv) continue;
       /* the value is the array itself, however it was built: a literal, an
          alias of another marked local, a chain, a method that returns one */
-      if (nullable_int_elem_expr(c, v, 0)) { lv->nullable_int_elem = 1; changed = 1; }
+      if (lv && nullable_int_elem_expr(c, v, 0)) { lv->nullable_int_elem |= NIE_MARKED; changed = 1; }
+      /* ... and a marked local marks the array it was assigned from
+         (`b = a; b << nil` puts the nil in a) */
+      Scope *ws = comp_scope_of(c, id);
+      LocalVar *wl = ws && nt_str(nt, id, "name") ? scope_local(ws, nt_str(nt, id, "name")) : NULL;
+      if (wl && (wl->type == TY_INT_ARRAY || wl->type == TY_FLOAT_ARRAY)) {
+        if (wl->nullable_int_elem & NIE_STORED) changed |= mark_elem_slot(c, v, NIE_STORED | NIE_REACH);
+        if (!(wl->nullable_int_elem & NIE_REACH) && elem_nil_reach_expr(c, v)) { wl->nullable_int_elem |= NIE_REACH; changed = 1; }
+      }
     }
     /* the same slot written through an ivar */
     NT_FOREACH_KIND(nt, NK_InstanceVariableWriteNode, id) {
@@ -39875,29 +40211,21 @@ static void mark_nullable_int_locals(Compiler *c) {
       if (v < 0) continue;
       ClassInfo *ci = NULL;
       int iv = nullable_elem_ivar(c, id, &ci);
-      if (iv < 0 || ci->ivar_nullable_int_elem[iv]) continue;
+      if (iv < 0) continue;
       if (ci->ivar_types[iv] != TY_INT_ARRAY && ci->ivar_types[iv] != TY_FLOAT_ARRAY) continue;
-      if (nullable_int_elem_expr(c, v, 0)) { ci->ivar_nullable_int_elem[iv] = 1; changed = 1; }
+      /* (a marked ivar marks the array it was assigned from, as a local does) */
+      if (ci->ivar_nullable_int_elem[iv] & NIE_STORED) changed |= mark_elem_slot(c, v, NIE_STORED | NIE_REACH);
+      if (!(ci->ivar_nullable_int_elem[iv] & NIE_REACH) && elem_nil_reach_expr(c, v)) { ci->ivar_nullable_int_elem[iv] |= NIE_REACH; changed = 1; }
+      if (!(ci->ivar_nullable_int_elem[iv] & NIE_MARKED) && nullable_int_elem_expr(c, v, 0)) { ci->ivar_nullable_int_elem[iv] |= NIE_MARKED; changed = 1; }
     }
     /* A mutation that stores such a value -- or copies in an array that can
        hold one -- marks the array it mutates, whether it names a local, an
        ivar or the ivar an object call hands out (`k.arr << v`, `k.arr[i] = v`). */
     NT_FOREACH_KIND(nt, NK_CallNode, id) {
-      int recv = mutated_array(c, nt_ref(nt, id, "receiver"));
-      if (recv < 0 || !nullable_elem_mutation(c, id, 0)) continue;
-      if (nt_kind(nt, recv) == NK_LocalVariableReadNode) {
-        LocalVar *lv = nullable_elem_local(c, recv, nt_str(nt, recv, "name"));
-        if (lv) { lv->nullable_int_elem = 1; changed = 1; }
-        continue;
-      }
-      ClassInfo *ci = NULL; int mi = -1, iv = -1;
-      if (nt_kind(nt, recv) == NK_InstanceVariableReadNode) iv = nullable_elem_ivar(c, recv, &ci);
-      else if (nt_kind(nt, recv) == NK_CallNode) iv = object_call_ivar(c, recv, &ci, &mi);
-      if (iv >= 0 && !ci->ivar_nullable_int_elem[iv] &&
-          (ci->ivar_types[iv] == TY_INT_ARRAY || ci->ivar_types[iv] == TY_FLOAT_ARRAY)) {
-        ci->ivar_nullable_int_elem[iv] = 1; changed = 1;
-      }
+      int recv = nt_ref(nt, id, "receiver");
+      if (recv >= 0 && nullable_elem_mutation(c, id, 0)) changed |= mark_elem_slot(c, recv, NIE_MARKED | NIE_STORED | NIE_REACH);
     }
+    changed |= mark_boxed_arrays(c);
     /* `ks.each { |k| h[k] = ... }`: the block parameter IS the element
        (elem_block_params). A poly parameter is marked too: the typed
        emitters (map, select, reject, inject, ...) shadow it with the

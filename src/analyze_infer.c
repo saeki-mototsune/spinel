@@ -3242,9 +3242,15 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
          is an Array, as the no-argument call is, unless a class method of the
          name exists (a boxed Class may be the receiver) */
       if (sp_streq(name, "parameters") && proc_parameters_lambda_mode(nt, argc, argv) != -2) {
-        int pcm = 0;
-        for (int k = 0; k < c->nclasses && !pcm; k++)
-          if (comp_cmethod_in_chain(c, k, name, NULL) >= 0) pcm = 1;
+        /* (the classes whose chain answers the name, or every class while
+           the chain memo cannot be trusted) */
+        int pcm;
+        comp_name_responders(c, name, 1, &pcm);
+        if (pcm < 0) {
+          pcm = 0;
+          for (int k = 0; k < c->nclasses && !pcm; k++)
+            if (comp_cmethod_in_chain(c, k, name, NULL) >= 0) pcm = 1;
+        }
         if (!pcm) { *out = an_poly_concrete(c, name, TY_POLY_ARRAY); return 1; }
       }
       /* poly.arity on a Method read out of a container: the stamped arity, an
@@ -11624,6 +11630,17 @@ int an_rat_value(Compiler *c, int n) {
   return any;
 }
 
+/* What infer_type's memo is keyed by, and whether it is in use: a memo
+   beside it holding an answer derived from inferred types (a block call's
+   callee, yvt_callee_index) keeps its entries exactly as long as the memo
+   keeps the types they were derived from. */
+unsigned long infer_memo_edits(const Compiler *c) {
+  return comp_ty_edits + c->nt->edits + c->nt->version;
+}
+int infer_memo_usable(void) {
+  return !face_active() && !an_builtin_only && an_ie_class_id < 0 && g_infer_blv_pin == 0;
+}
+
 TyKind infer_type(Compiler *c, int id) {
   if (id < 0 || id >= c->nt->count) return TY_UNKNOWN;
   if (g_io_skip_reopen && id != g_io_skip_node) {
@@ -11648,7 +11665,7 @@ TyKind infer_type(Compiler *c, int id) {
   /* the node table's version too: an edit that bumps only it (a rename
      added without its `edits`, #9179's temporary one) still ends what the
      memo holds */
-  unsigned long edits = comp_ty_edits + c->nt->edits + c->nt->version;
+  unsigned long edits = infer_memo_edits(c);
   if (edits != g_imemo_edits) {
     g_imemo_edits = edits;
     /* the last generation stands for its own successor until the wrap */
@@ -11660,8 +11677,7 @@ TyKind infer_type(Compiler *c, int id) {
     g_imemo_gen = 1;
     g_imemo_clean = 1;
   }
-  int memo_ok = !face_active() && !an_builtin_only && an_ie_class_id < 0 &&
-                g_infer_blv_pin == 0;
+  int memo_ok = infer_memo_usable();
   int kept = 0;
   TyKind kept_t = TY_UNKNOWN;
   if (memo_ok && id < g_imemo_cap) {

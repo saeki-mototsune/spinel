@@ -303,6 +303,8 @@ TyKind scan_throw_type(Compiler *c, const char *tag);
 TyKind yield_value_type(Compiler *c, int mi);
 /* Tail expressions of the blocks reaching `mi`'s yield (see analyze_util.c). */
 int yield_block_tails(Compiler *c, int mi, int *out, int max);
+/* Set: yield_block_tails answers a literal block's `next v` too. */
+extern int yield_block_tails_next;
 /* The block value reaching `mi` from a child's `super` (see analyze_util.c). */
 TyKind yield_value_type_via_super(Compiler *c, int mi);
 /* Whether a block-passing call hands on its enclosing method's own block
@@ -451,6 +453,8 @@ void seed_unsupplied_nil_defaults(Compiler *c);
 int infer_container_flow(Compiler *c);
 void an_cls_facts(Compiler *c);   /* analyze_cls.c (#8530) */
 int an_builtin_only_p(void);
+unsigned long infer_memo_edits(const Compiler *c); /* what infer_type's memo is keyed by */
+int infer_memo_usable(void);                       /* ... and whether it is in use */
 TyKind an_builtin_answer(Compiler *c, int id);
 /* the kind of a value of class self_cls: a reopened builtin's own (Time -> TY_TIME),
    else the object */
@@ -771,6 +775,9 @@ void anh_free(ANameHash *st);
    asks these instead. */
 int an_scopes_named_first(Compiler *c, const char *nm);
 int an_scopes_named_next(Compiler *c, const char *nm, int s);
+/* The scopes sharing scope s's def_node (its copies), the same way. */
+int an_scopes_same_def_first(Compiler *c, int s);
+int an_scopes_same_def_next(Compiler *c, int s);
 int a_nested_block(const char *ty);
 int a_is_local_node(const char *ty);
 int a_is_write_node(const char *ty);
