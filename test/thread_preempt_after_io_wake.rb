@@ -48,7 +48,12 @@ a = starves?
 # the spinner, so it runs only once the spinner is preempted.
 idle_r, idle_w = IO.pipe
 reader = Thread.new { idle_r.wait_readable(30.0) }
-sleep 0.3
+# Past the warm window (two timeslices, RUBY_THREAD_TIMESLICE ms, 10 by
+# default) and one 50 ms wait, with a wide margin: nothing shows the
+# monitor's wait to a program, so the sleep outlasts it.
+slice = (ENV["RUBY_THREAD_TIMESLICE"] || "10").to_i
+slice = 10 if slice <= 0
+sleep [0.3, slice * 2 / 1000.0 + 0.25].max
 done = false
 spinner = Thread.new do
   t0 = Process.clock_gettime(Process::CLOCK_MONOTONIC)

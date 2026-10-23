@@ -3821,13 +3821,20 @@ static void *sp_sysmon_main(void *arg) {
          At SPINEL_WORKERS=1 main's own code is timed beside the runnable
          threads (above), and a thread main makes runnable signals no one: so
          while main runs, the monitor looks a quantum later at most, as its
-         idle wait does. */
+         idle wait does. So too while main is runnable beside queued threads
+         -- this turn's timers may have readied it with them, and it leaves
+         its pump for its own code without signalling anyone. */
       if (!busy && dt > SP_PREEMPT_QUANTUM) {
         double last_run = 0.0;
         for (int i = 0; i < sp_active_workers; i++)
           if (g_wslot[i].active && wslot_since(i) > last_run) last_run = wslot_since(i);
-        if ((last_run != 0.0 && now - last_run < SP_SYSMON_WARM) ||
-            (g_worker_cap == 0 && SP_TH_STATE(&g_main_thread) == SP_TH_RUNNING))
+        int main_timed = 0;
+        if (g_worker_cap == 0) {
+          int st = SP_TH_STATE(&g_main_thread);
+          if (st == SP_TH_RUNNING) main_timed = 1;
+          else if (st == SP_TH_RUNNABLE) { int rq0, ru0; counts_approx(&rq0, &ru0); main_timed = rq0 > 0; }
+        }
+        if ((last_run != 0.0 && now - last_run < SP_SYSMON_WARM) || main_timed)
           dt = SP_PREEMPT_QUANTUM;
       }
       /* A floor keeps a deadline already due from becoming a zero wait; it is
