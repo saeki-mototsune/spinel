@@ -11959,6 +11959,37 @@ static int emit_native_binding_call(Compiler *c, int id, int cid, const char *na
   return 0;
 }
 
+/* A receiver an enclosing emission bound to a rooted temp
+   (emit_operands_in_order, emit_args_before_binding) reads as that temp:
+   it ran already, and reading it again runs nothing. Held in a second temp
+   in g_pre, the hold names the first one ahead of the statement that
+   declares it, and emit_operands_in_order took the call back for it; the
+   receiver and its blocks were then emitted again with the whole call, once
+   per enclosing call: 2^depth copies of a builder chain
+   `E.new.child(E.new.on_click { })...`. */
+static int recv_bound_to_temp(int recv) {
+  for (int i = g_n_argov - 1; i >= 0; i--) {
+    if (g_argov_node[i] != recv) continue;
+    const char *t = g_argov_text[i];
+    if (t[0] != '_' || t[1] != 't' || !t[2]) return 0;
+    for (t += 2; *t; t++) if (*t < '0' || *t > '9') return 0;
+    return 1;
+  }
+  return 0;
+}
+
+/* ...but what the call put in g_pre since `pre_at` -- an argument, a
+   splat's spread -- runs ahead of the statement that declares that temp,
+   where Ruby runs the receiver first. The temp is named there, and
+   emit_operands_in_order takes the call back, as it did when the receiver
+   was held in a second temp (emit_dispatch names an argument the same
+   way). */
+static void recv_temp_named_if_preceded(int recv, const char *text, size_t pre_at) {
+  if (!text || g_pre->len <= pre_at || !recv_bound_to_temp(recv)) return;
+  emit_indent(g_pre, g_indent);
+  buf_printf(g_pre, "(void)%s;\n", text);
+}
+
 int emit_object_call(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   const char *name = view_call_name(c, id);
@@ -12699,7 +12730,8 @@ int emit_object_call(Compiler *c, int id, Buf *b) {
            name down to another local's name with no diagnostic. */
         Buf selfv; memset(&selfv, 0, sizeof selfv);
         const char *rty = nt_type(nt, recv);
-        if (rty && (sp_streq(rty, "LocalVariableReadNode") || sp_streq(rty, "InstanceVariableReadNode") || sp_streq(rty, "SelfNode")))
+        if (rty && (sp_streq(rty, "LocalVariableReadNode") || sp_streq(rty, "InstanceVariableReadNode") || sp_streq(rty, "SelfNode") ||
+                    recv_bound_to_temp(recv)))
           selfv = expr_buf(c, recv);
         else {
           int t = ++g_tmp;
@@ -12711,9 +12743,11 @@ int emit_object_call(Compiler *c, int id, Buf *b) {
           buf_puts(g_pre, "\n"); buf_printf(&selfv, "_t%d", t);
         }
         TyKind svt = TY_UNKNOWN;
+        size_t pre_at = g_pre->len;
         int sv = setter_value_open(c, id, b, &svt);
         emit_dispatch(c, cid, name, selfv.p ? selfv.p : "", nt_ref(nt, id, "arguments"), nt_ref(nt, id, "block"), b);
         setter_value_close(c, id, svt, b, sv);
+        recv_temp_named_if_preceded(recv, selfv.p, pre_at);
         free(selfv.p);
         return 1;
       }
@@ -12722,7 +12756,8 @@ int emit_object_call(Compiler *c, int id, Buf *b) {
          multiple times) */
       Buf selfptr; memset(&selfptr, 0, sizeof selfptr);   /* heap text, as above */
       const char *rty = nt_type(nt, recv);
-      if (rty && (sp_streq(rty, "LocalVariableReadNode") || sp_streq(rty, "InstanceVariableReadNode") || sp_streq(rty, "SelfNode")))
+      if (rty && (sp_streq(rty, "LocalVariableReadNode") || sp_streq(rty, "InstanceVariableReadNode") || sp_streq(rty, "SelfNode") ||
+                  recv_bound_to_temp(recv)))
         selfptr = expr_buf(c, recv);
       else {
         int t = ++g_tmp;
@@ -12740,9 +12775,11 @@ int emit_object_call(Compiler *c, int id, Buf *b) {
         buf_printf(&selfptr, "_t%d", t);
       }
       TyKind svt = TY_UNKNOWN;
+      size_t pre_at = g_pre->len;
       int sv = setter_value_open(c, id, b, &svt);
       emit_dispatch(c, cid, name, selfptr.p ? selfptr.p : "", nt_ref(nt, id, "arguments"), nt_ref(nt, id, "block"), b);
       setter_value_close(c, id, svt, b, sv);
+      recv_temp_named_if_preceded(recv, selfptr.p, pre_at);
       free(selfptr.p);
       return 1;
     }
@@ -13105,35 +13142,27 @@ int emit_value_recv_call(Compiler *c, int id, Buf *b) {
     Buf rs = expr_buf(c, recv);
     const char *r = rs.p ? rs.p : "";
     int done = 1;
-    /* CRuby's #utc/#gmtime/#localtime mutate the receiver (and return it);
-       the get* flavors copy. sp_Time is a value struct, so when the receiver
-       is an LVALUE (a local, an ivar slot) the mutation is a write-back
-       assignment -- `v.utc` then really updates v (#2637). A temporary
-       receiver has nothing to observe afterwards, so the copy serves it. */
-    int r_lval = nt_type(nt, recv) && (sp_streq(nt_type(nt, recv), "LocalVariableReadNode") ||
-                                       sp_streq(nt_type(nt, recv), "InstanceVariableReadNode"));
-    if ((sp_streq(name, "utc") || sp_streq(name, "gmtime")) && r_lval)
-      buf_printf(b, "(%s = sp_time_utc(%s))", r, r);
-    else if (sp_streq(name, "localtime") && argc == 0 && r_lval)
-      buf_printf(b, "(%s = sp_time_localtime(%s))", r, r);
-    else if (sp_streq(name, "utc") || sp_streq(name, "gmtime") || sp_streq(name, "getutc")) buf_printf(b, "sp_time_utc(%s)", r);
+    /* CRuby's #utc/#gmtime/#localtime change the receiver and answer it; the
+       get* flavors answer a new Time. A Time is a reference, so the _bang
+       forms write through it and every holder sees the change. */
+    if (sp_streq(name, "utc") || sp_streq(name, "gmtime")) buf_printf(b, "sp_time_utc_bang(%s)", r);
+    else if (sp_streq(name, "getutc")) buf_printf(b, "sp_time_utc(%s)", r);
     /* getlocal(zone)/localtime(zone): a fixed UTC offset, given as seconds or
        a zone string, reinterprets the instant in that zone (#3093) */
     else if ((is_local_time(name)) && argc == 1) {
-      int mutate = sp_streq(name, "localtime") && r_lval;
-      if (mutate) buf_printf(b, "(%s = ", r);
+      const char *bang = sp_streq(name, "localtime") ? "_bang" : "";
       /* a String zone ("+01:00", "UTC", "A"), or a user object naming one
          through #to_str, reads as `in:` does; an Integer is a second count;
          any other value is resolved at run time (sp_time_in_zone_v) */
       TyKind ot = comp_ntype(c, argv[0]);
       if (ot == TY_STRING || obj_conv_method(c, ot, "to_str", TY_STRING, NULL) >= 0) {
-        buf_printf(b, "sp_time_in_zone_s(%s, ", r); emit_str_expr(c, argv[0], b);
+        buf_printf(b, "sp_time_in_zone_s%s(%s, ", bang, r); emit_str_expr(c, argv[0], b);
       }
-      else if (ot == TY_INT) { buf_printf(b, "sp_time_getlocal_off(%s, ", r); emit_int_expr(c, argv[0], b); }
-      else { buf_printf(b, "sp_time_in_zone_v(%s, ", r); emit_boxed(c, argv[0], b); buf_puts(b, ", 1"); }
+      else if (ot == TY_INT) { buf_printf(b, "sp_time_getlocal_off%s(%s, ", bang, r); emit_int_expr(c, argv[0], b); }
+      else { buf_printf(b, "sp_time_in_zone_v%s(%s, ", bang, r); emit_boxed(c, argv[0], b); buf_puts(b, ", 1"); }
       buf_puts(b, ")");
-      if (mutate) buf_puts(b, ")");
     }
+    else if (sp_streq(name, "localtime")) buf_printf(b, "sp_time_localtime_bang(%s)", r);
     else if (is_local_time(name)) buf_printf(b, "sp_time_localtime(%s)", r);
     /* the plain readers: builtin-op rows (builtin_ops.c) */
     else if (emit_builtin_op_text(c, id, recv, rt, name, r, b)) ;
@@ -13147,22 +13176,22 @@ int emit_value_recv_call(Compiler *c, int id, Buf *b) {
     else if (sp_streq(name, "eql?") && argc == 1) {
       if (comp_ntype(c, argv[0]) == TY_TIME) {
         int tt = ++g_tmp, tu = ++g_tmp;
-        buf_printf(b, "({ sp_Time _t%d = %s; sp_Time _t%d = ", tt, r, tu); emit_expr(c, argv[0], b);
+        buf_printf(b, "({ SP_TIME_TMP(_t%d) = %s; SP_TIME_TMP(_t%d) = ", tt, r, tu); emit_expr(c, argv[0], b);
         buf_printf(b, "; sp_time_cmp(_t%d, _t%d) == 0; })", tt, tu);
       }
       /* a poly operand may hold a Time: unwrap and compare by instant */
       else if (repr_of(c, argv[0]).kind == RK_BOXED) {
         int tt = ++g_tmp, tq = ++g_tmp;
-        buf_printf(b, "({ sp_Time _t%d = %s; sp_RbVal _t%d = ", tt, r, tq); emit_expr(c, argv[0], b);
+        buf_printf(b, "({ SP_TIME_TMP(_t%d) = %s; sp_RbVal _t%d = ", tt, r, tq); emit_expr(c, argv[0], b);
         buf_printf(b, "; (sp_bool)(_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME && "
-                      "sp_time_cmp(_t%d, *(sp_Time *)_t%d.v.p) == 0); })", tq, tq, tt, tq);
+                      "sp_time_cmp(_t%d, (sp_Time *)_t%d.v.p) == 0); })", tq, tq, tt, tq);
       }
       else { buf_puts(b, "((void)("); emit_expr(c, argv[0], b); buf_puts(b, "), 0)"); }
     }
     else if (sp_streq(name, "to_a") && argc == 0) {
       /* [sec, min, hour, mday, mon, year, wday, yday, isdst, zone] */
       int tt = ++g_tmp, ta = ++g_tmp;
-      buf_printf(b, "({ sp_Time _t%d = %s; sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);", tt, r, ta, ta);
+      buf_printf(b, "({ SP_TIME_TMP(_t%d) = %s; sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);", tt, r, ta, ta);
       buf_printf(b, " sp_PolyArray_push(_t%d, sp_box_int(sp_time_sec(_t%d)));", ta, tt);
       buf_printf(b, " sp_PolyArray_push(_t%d, sp_box_int(sp_time_min(_t%d)));", ta, tt);
       buf_printf(b, " sp_PolyArray_push(_t%d, sp_box_int(sp_time_hour(_t%d)));", ta, tt);
@@ -13185,14 +13214,14 @@ int emit_value_recv_call(Compiler *c, int id, Buf *b) {
         {"mday", "sp_box_int(sp_time_mday(_t%d))"}, {"hour", "sp_box_int(sp_time_hour(_t%d))"},
         {"min", "sp_box_int(sp_time_min(_t%d))"}, {"sec", "sp_box_int(sp_time_sec(_t%d))"},
         {"wday", "sp_box_int(sp_time_wday(_t%d))"}, {"yday", "sp_box_int(sp_time_yday(_t%d))"},
-        {"subsec", "(_t%d.tv_nsec == 0 ? sp_box_int(0) : sp_box_rational(sp_rational_new((sp_int)_t%d.tv_nsec, 1000000000)))"},
+        {"subsec", "(_t%d->tv_nsec == 0 ? sp_box_int(0) : sp_box_rational(sp_rational_new((sp_int)_t%d->tv_nsec, 1000000000)))"},
         {"dst", "sp_box_bool(sp_time_isdst(_t%d) != 0)"},
         {"zone", "sp_box_str(sp_time_zone(_t%d))"}, {NULL, NULL} };
       /* which keys: a literal array selects them; nil (or non-literal) is all */
       int arr = argv[0];
       int is_arr = nt_type(nt, arr) && sp_streq(nt_type(nt, arr), "ArrayNode");
       int tt = ++g_tmp, th = ++g_tmp;
-      buf_printf(b, "({ sp_Time _t%d = %s; sp_SymPolyHash *_t%d = sp_SymPolyHash_new(); SP_GC_ROOT(_t%d);", tt, r, th, th);
+      buf_printf(b, "({ SP_TIME_TMP(_t%d) = %s; sp_SymPolyHash *_t%d = sp_SymPolyHash_new(); SP_GC_ROOT(_t%d);", tt, r, th, th);
       /* runtime sp_sym_intern for the key: these symbols are synthesized during
          body emission, after the static sp_sym_names table is written, so a
          compile-time id would have no name at run time (rendered as "") (#2866). */
@@ -13226,7 +13255,7 @@ int emit_value_recv_call(Compiler *c, int id, Buf *b) {
     else if ((sp_streq(name, "between?") || sp_streq(name, "clamp")) && argc == 2 &&
              (comp_ntype(c, argv[0]) != TY_TIME || comp_ntype(c, argv[1]) != TY_TIME)) {
       int tt = ++g_tmp;
-      buf_printf(b, "({ sp_Time _t%d = %s; (void)(", tt, r);
+      buf_printf(b, "({ SP_TIME_TMP(_t%d) = %s; (void)(", tt, r);
       emit_boxed(c, argv[0], b); buf_puts(b, "); (void)(");
       emit_boxed(c, argv[1], b);
       buf_puts(b, "); sp_raise_cls(\"ArgumentError\", sp_sprintf(\"comparison of Time with %s failed\", sp_poly_inspect(");
@@ -13236,14 +13265,14 @@ int emit_value_recv_call(Compiler *c, int id, Buf *b) {
     }
     else if (sp_streq(name, "between?") && argc == 2) {
       int tt = ++g_tmp, ta = ++g_tmp, tb2 = ++g_tmp;
-      buf_printf(b, "({ sp_Time _t%d = %s; sp_Time _t%d = ", tt, r, ta); emit_expr(c, argv[0], b);
-      buf_printf(b, "; sp_Time _t%d = ", tb2); emit_expr(c, argv[1], b);
+      buf_printf(b, "({ SP_TIME_TMP(_t%d) = %s; SP_TIME_TMP(_t%d) = ", tt, r, ta); emit_expr(c, argv[0], b);
+      buf_printf(b, "; SP_TIME_TMP(_t%d) = ", tb2); emit_expr(c, argv[1], b);
       buf_printf(b, "; sp_time_cmp(_t%d, _t%d) >= 0 && sp_time_cmp(_t%d, _t%d) <= 0; })", tt, ta, tt, tb2);
     }
     else if (sp_streq(name, "clamp") && argc == 2) {
       int tt = ++g_tmp, ta = ++g_tmp, tb2 = ++g_tmp;
-      buf_printf(b, "({ sp_Time _t%d = %s; sp_Time _t%d = ", tt, r, ta); emit_expr(c, argv[0], b);
-      buf_printf(b, "; sp_Time _t%d = ", tb2); emit_expr(c, argv[1], b);
+      buf_printf(b, "({ SP_TIME_TMP(_t%d) = %s; SP_TIME_TMP(_t%d) = ", tt, r, ta); emit_expr(c, argv[0], b);
+      buf_printf(b, "; SP_TIME_TMP(_t%d) = ", tb2); emit_expr(c, argv[1], b);
       buf_printf(b, "; sp_time_cmp(_t%d, _t%d) < 0 ? _t%d : (sp_time_cmp(_t%d, _t%d) > 0 ? _t%d : _t%d); })",
                  tt, ta, ta, tt, tb2, tb2, tt);
     }
@@ -13251,7 +13280,7 @@ int emit_value_recv_call(Compiler *c, int id, Buf *b) {
               sp_streq(name, ">=") || sp_streq(name, "==") || sp_streq(name, "!=")) && argc == 1 &&
              comp_ntype(c, argv[0]) == TY_TIME) {
       int tt = ++g_tmp, tu = ++g_tmp;
-      buf_puts(b, "({ sp_Time _t"); buf_printf(b, "%d = %s; sp_Time _t%d = ", tt, r, tu);
+      buf_puts(b, "({ SP_TIME_TMP(_t"); buf_printf(b, "%d) = %s; SP_TIME_TMP(_t%d) = ", tt, r, tu);
       emit_expr(c, argv[0], b);
       buf_printf(b, "; sp_time_cmp(_t%d, _t%d) %s 0; })", tt, tu, name);
     }
@@ -13260,7 +13289,7 @@ int emit_value_recv_call(Compiler *c, int id, Buf *b) {
     else if (is_cmp_op(name) && argc == 1 &&
              (repr_of(c, argv[0]).kind == RK_BOXED || repr_of(c, argv[0]).untyped)) {
       int tt = ++g_tmp, tu = ++g_tmp;
-      buf_printf(b, "({ sp_Time _t%d = %s; sp_RbVal _t%d = ", tt, r, tu); emit_boxed(c, argv[0], b);
+      buf_printf(b, "({ SP_TIME_TMP(_t%d) = %s; sp_RbVal _t%d = ", tt, r, tu); emit_boxed(c, argv[0], b);
       buf_printf(b, "; sp_poly_time_cmp_arg(_t%d, _t%d) %s 0; })", tt, tu, name);
     }
     /* a relational comparison against a non-Time operand: CRuby's Comparable
@@ -13271,7 +13300,7 @@ int emit_value_recv_call(Compiler *c, int id, Buf *b) {
     }
     else if (sp_streq(name, "<=>") && argc == 1 && comp_ntype(c, argv[0]) == TY_TIME) {
       int tt = ++g_tmp, tu = ++g_tmp;
-      buf_puts(b, "({ sp_Time _t"); buf_printf(b, "%d = %s; sp_Time _t%d = ", tt, r, tu);
+      buf_puts(b, "({ SP_TIME_TMP(_t"); buf_printf(b, "%d) = %s; SP_TIME_TMP(_t%d) = ", tt, r, tu);
       emit_expr(c, argv[0], b);
       buf_printf(b, "; (sp_int)sp_time_cmp(_t%d, _t%d); })", tt, tu);
     }
@@ -13281,9 +13310,9 @@ int emit_value_recv_call(Compiler *c, int id, Buf *b) {
       TyKind a0t = a0tr.as_ty;
       if (a0tr.kind == RK_BOXED || a0t == TY_UNKNOWN) {
         int tt = ++g_tmp, tu = ++g_tmp;
-        buf_printf(b, "({ sp_Time _t%d = %s; sp_RbVal _t%d = ", tt, r, tu); emit_boxed(c, argv[0], b);
+        buf_printf(b, "({ SP_TIME_TMP(_t%d) = %s; sp_RbVal _t%d = ", tt, r, tu); emit_boxed(c, argv[0], b);
         buf_printf(b, "; (_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME) ? "
-                      "sp_box_int(sp_time_cmp(_t%d, *(sp_Time *)_t%d.v.p)) : sp_box_nil(); })",
+                      "sp_box_int(sp_time_cmp(_t%d, (sp_Time *)_t%d.v.p)) : sp_box_nil(); })",
                    tu, tu, tt, tu);
       }
       else { buf_puts(b, "((void)("); emit_expr(c, argv[0], b); buf_puts(b, "), sp_box_nil())"); }
@@ -19097,17 +19126,24 @@ static void emit_native_object_protocol_text(Compiler *c, const char *name, TyKi
   int t = ++g_tmp;
   /* receiver, then operand, into temps; then the test (negated for !=) */
   buf_printf(b, "({ %s _t%d = %s; ", cty, t, r);
-  if (kind == 1) buf_printf(b, "SP_GC_ROOT(_t%d); ", t);
+  /* (a Time is a reference too: the operand may allocate) */
+  if (kind == 1 || rt == TY_TIME) buf_printf(b, "SP_GC_ROOT(_t%d); ", t);
   Buf test; memset(&test, 0, sizeof test);
   if (at == rt) {
     buf_printf(b, "%s _u%d = %s; ", cty, t, a);
     if (kind == 2 && rt == TY_TMS)
       buf_printf(&test, "(_t%d.utime == _u%d.utime && _t%d.stime == _u%d.stime && "
                         "_t%d.cutime == _u%d.cutime && _t%d.cstime == _u%d.cstime)", t, t, t, t, t, t, t, t);
+    else if (rt == TY_TIME && is_equal) buf_printf(&test, "(_t%d == _u%d)", t, t);
     else if (kind == 2 && rt == TY_TIME) buf_printf(&test, "(sp_time_cmp(_t%d, _u%d) == 0)", t, t);
     else if (kind == 2) buf_printf(&test, "sp_srange_eq(_t%d, _u%d)", t, t);
     else if (fn) buf_printf(&test, "%s(_t%d, _u%d)", fn, t, t);
     else buf_printf(&test, "(_t%d == _u%d)", t, t);
+  }
+  else if (at == TY_POLY && rt == TY_TIME && is_equal) {
+    buf_printf(b, "sp_RbVal _u%d = %s; ", t, a);
+    buf_printf(&test, "(_u%d.tag == SP_TAG_OBJ && _u%d.cls_id == SP_BUILTIN_TIME && _u%d.v.p == (void *)_t%d)",
+               t, t, t, t);
   }
   else if (at == TY_POLY && kind == 2) {
     Buf rb; memset(&rb, 0, sizeof rb);

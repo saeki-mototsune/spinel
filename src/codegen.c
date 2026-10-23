@@ -817,6 +817,16 @@ void emit_rbs_checked_text(Compiler *c, TyKind slot, const char *slotname,
     case TY_STRING: tag = "SP_TAG_STR"; want = "String";  break;
     case TY_SYMBOL: tag = "SP_TAG_SYM"; want = "Symbol";  break;
     case TY_BOOL:   tag = "SP_TAG_BOOL"; want = "a boolean"; break;
+    /* a builtin class's value an RBS type names (builtin_value_kind): boxed
+       as an object of that builtin, or a Class as its own tag */
+    case TY_RANGE:     tag = "SP_TAG_OBJ"; want = "a Range"; break;
+    case TY_TIME:      tag = "SP_TAG_OBJ"; want = "a Time"; break;
+    case TY_THREAD:    tag = "SP_TAG_OBJ"; want = "a Thread"; break;
+    case TY_FIBER:     tag = "SP_TAG_OBJ"; want = "a Fiber"; break;
+    case TY_RANDOM:    tag = "SP_TAG_OBJ"; want = "a Random"; break;
+    case TY_IO:        tag = "SP_TAG_OBJ"; want = "an IO"; break;
+    case TY_EXCEPTION: tag = "SP_TAG_OBJ"; want = "an exception"; break;
+    case TY_CLASS:     tag = "SP_TAG_CLASS"; want = "a Class"; break;
     default:
       if (ty_is_object(slot) && !comp_ty_value_obj(c, slot)) {
         tag = "SP_TAG_OBJ";
@@ -3347,7 +3357,7 @@ void declare_local_named(Compiler *c, Buf *b, LocalVar *lv, const char *name, in
     case TY_RANGE:  buf_puts(&cty, "sp_Range"); init = "{0}"; break;
     case TY_FLOAT_RANGE: buf_puts(&cty, "sp_FloatRange"); init = "{0}"; break;
     case TY_STR_RANGE: buf_puts(&cty, "sp_StrRange"); init = "{0}"; break;
-    case TY_TIME:   buf_puts(&cty, "sp_Time"); init = "{0}"; break;
+    case TY_TIME:   buf_puts(&cty, "sp_Time *"); init = "NULL"; ptr = 1; break;
     case TY_COMPLEX:  buf_puts(&cty, "sp_Complex"); init = "{0}"; break;
     case TY_RATIONAL: buf_puts(&cty, "sp_Rational"); init = "{0}"; break;
     case TY_TMS:    buf_puts(&cty, "sp_Tms"); init = "{0}"; break;
@@ -5410,7 +5420,7 @@ void emit_method_signature(Compiler *c, Scope *s, Buf *b) {
     else if (sp_streq(cn, "Array") || sp_streq(cn, "Hash")) { buf_puts(b, "sp_RbVal self"); }
     else if (sp_streq(cn, "Object") || sp_streq(cn, "Numeric")) { buf_puts(b, "sp_RbVal self"); }
     else if (sp_streq(cn, "Range"))   { buf_puts(b, "sp_Range self"); }
-    else if (sp_streq(cn, "Time"))    { buf_puts(b, "sp_Time self"); }
+    else if (sp_streq(cn, "Time"))    { buf_puts(b, "sp_Time *self"); }
     else if (sp_streq(cn, "Thread"))  { buf_puts(b, "sp_thread *self"); }
     else if (sp_streq(cn, "Fiber"))   { buf_puts(b, "sp_Fiber *self"); }
     /* the runtime's generator: a reopening's self is its handle (the class's
@@ -7976,7 +7986,7 @@ int proc_slot_is_ptr(TyKind t) {
     case TY_QUEUE: case TY_MUTEX: case TY_CONDVAR: case TY_RANDOM:
     case TY_DIR: case TY_ADDRINFO: case TY_SOCKOPT: case TY_OPENSTRUCT:
     case TY_METHOD: case TY_IO: case TY_ARGF: case TY_ENUMERATOR:
-    case TY_REGEX:
+    case TY_REGEX: case TY_TIME:   /* a Time is a heap reference */
       return 1;
     default: break;
   }
@@ -8031,7 +8041,6 @@ const char *cell_value_struct(TyKind t) {
     case TY_RANGE:       return "sp_Range";
     case TY_FLOAT_RANGE: return "sp_FloatRange";
     case TY_STR_RANGE:   return "sp_StrRange";
-    case TY_TIME:        return "sp_Time";
     case TY_TMS:         return "sp_Tms";
     case TY_RATIONAL:    return "sp_Rational";
     case TY_COMPLEX:     return "sp_Complex";
@@ -8055,7 +8064,6 @@ const char *cell_value_struct_empty(TyKind t) {
     case TY_RANGE:       return "((sp_Range){0})";
     case TY_FLOAT_RANGE: return "((sp_FloatRange){0})";
     case TY_STR_RANGE:   return "((sp_StrRange){0})";
-    case TY_TIME:        return "((sp_Time){0})";
     case TY_TMS:         return "((sp_Tms){0})";
     case TY_RATIONAL:    return "((sp_Rational){0})";
     case TY_COMPLEX:     return "((sp_Complex){0})";
@@ -15537,7 +15545,7 @@ static void emit_obj_cmp_dispatch(Compiler *c, Buf *b) {
        other builtins are not boxed as one object id this switch reaches */
     const char *bcase = NULL, *bself = NULL;
     if (is_builtin_reopen(c->classes[k].name)) {
-      if (sp_streq(c->classes[k].name, "Time")) { bcase = "SP_BUILTIN_TIME"; bself = "*(sp_Time *)a.v.p"; }
+      if (sp_streq(c->classes[k].name, "Time")) { bcase = "SP_BUILTIN_TIME"; bself = "(sp_Time *)a.v.p"; }
       else if (sp_streq(c->classes[k].name, "Range")) { bcase = "SP_BUILTIN_RANGE"; bself = "*(sp_Range *)a.v.p"; }
       else continue;
     }
@@ -15606,7 +15614,7 @@ static void emit_obj_cmp_dispatch(Compiler *c, Buf *b) {
     }
     else if (pt == TY_TIME) {
       builtin_guard = "SP_BUILTIN_TIME";
-      snprintf(argbuf, sizeof argbuf, "*(sp_Time *)b.v.p");
+      snprintf(argbuf, sizeof argbuf, "(sp_Time *)b.v.p");
     }
     else {
       continue;
@@ -15870,7 +15878,7 @@ static void emit_user_op_dispatch(Compiler *c, Buf *b, const char *fname, const 
        boxed as one object id are reached by this switch. */
     const char *bcase = NULL, *bself = NULL;
     if (is_builtin_reopen(c->classes[k].name)) {
-      if (sp_streq(c->classes[k].name, "Time")) { bcase = "SP_BUILTIN_TIME"; bself = "*(sp_Time *)a.v.p"; }
+      if (sp_streq(c->classes[k].name, "Time")) { bcase = "SP_BUILTIN_TIME"; bself = "(sp_Time *)a.v.p"; }
       else if (sp_streq(c->classes[k].name, "Range")) { bcase = "SP_BUILTIN_RANGE"; bself = "*(sp_Range *)a.v.p"; }
       else continue;
     }
@@ -20919,7 +20927,8 @@ char *codegen_program(const NodeTable *nt) {
          int → an sp_oint holding nil (SP_OINT_NIL), string → NULL,
          poly → {SP_TAG_NIL,0,{0}}. range/time zero-init with {0}. */
       int oint = civ_is_oint(c, i, j);
-      const char *init = (t == TY_RANGE || t == TY_TIME) ? "{0}"
+      const char *init = (t == TY_RANGE) ? "{0}"
+                       : (t == TY_TIME) ? "NULL"
                        : (t == TY_POLY) ? "{SP_TAG_NIL, 0, {0}}"
                        : (t == TY_INT)  ? "SP_OINT_NIL"
                        : (t == TY_FLOAT) ? "SP_OFLOAT_NIL"

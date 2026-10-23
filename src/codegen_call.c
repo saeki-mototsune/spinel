@@ -6260,7 +6260,7 @@ static int emit_poly_builtin_method(Compiler *c, int id, Buf *b) {
     int tv = ++g_tmp;
     buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b);
     buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME"
-                  " ? sp_time_%s(*(sp_Time *)_t%d.v.p)"
+                  " ? sp_time_%s((sp_Time *)_t%d.v.p)"
                   " : (sp_int)(sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), 0); })",
                tv, tv, tf, tv, name, tv);
     return 1;
@@ -6293,24 +6293,25 @@ static int emit_poly_builtin_method(Compiler *c, int id, Buf *b) {
       buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b);
       buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME ? ", tv, tv);
       if (mutates)
-        buf_printf(b, "(*(sp_Time *)_t%d.v.p = %s(*(sp_Time *)_t%d.v.p), _t%d)",
-                   tv, tconv, tv, tv);
+        buf_printf(b, "(%s_bang((sp_Time *)_t%d.v.p), _t%d)", tconv, tv, tv);
       else
-        buf_printf(b, "sp_box_time(%s(*(sp_Time *)_t%d.v.p))", tconv, tv);
+        buf_printf(b, "sp_box_time(%s((sp_Time *)_t%d.v.p))", tconv, tv);
       buf_printf(b, " : (sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), sp_box_nil()); })",
                  name, tv);
       return 1;
     }
     /* localtime(zone) / getlocal(zone): the zone a value names, as `in:`
-       reads it (sp_time_in_zone_v); nil is local time. */
+       reads it (sp_time_in_zone_v); nil is local time. localtime re-reads
+       the receiver itself, getlocal answers a new Time. */
     if (argc == 1 && (is_local_time(name))) {
       int tv = ++g_tmp, ov = ++g_tmp;
+      const char *bang = sp_streq(name, "localtime") ? "_bang" : "";
       buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b);
       buf_printf(b, "; sp_RbVal _t%d = ", ov); emit_boxed(c, argv[0], b);
       buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME"
-                    " ? sp_box_time(sp_time_in_zone_v(*(sp_Time *)_t%d.v.p, _t%d, 1))"
+                    " ? sp_box_time(sp_time_in_zone_v%s((sp_Time *)_t%d.v.p, _t%d, 1))"
                     " : (sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), sp_box_nil()); })",
-                 tv, tv, tv, ov, name, tv);
+                 tv, tv, bang, tv, ov, name, tv);
       return 1;
     }
   }
@@ -6322,7 +6323,7 @@ static int emit_poly_builtin_method(Compiler *c, int id, Buf *b) {
     buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_expr(c, recv, b);
     buf_printf(b, "; sp_int _t%d = ", dv); emit_int_expr(c, argv[0], b);
     buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME"
-                  " ? sp_time_iso8601_frac(*(sp_Time *)_t%d.v.p, _t%d)"
+                  " ? sp_time_iso8601_frac((sp_Time *)_t%d.v.p, _t%d)"
                   " : (const char *)(sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), NULL); })",
                tv, tv, tv, dv, name, tv);
     return 1;
@@ -6342,19 +6343,19 @@ static int emit_poly_builtin_method(Compiler *c, int id, Buf *b) {
       ti = "((sp_int)((sp_Time *)_tR.v.p)->tv_nsec)";
     else if (sp_streq(name, "utc_offset") || sp_streq(name, "gmt_offset") ||
              sp_streq(name, "gmtoff"))
-      ti = "sp_time_utc_offset(*(sp_Time *)_tR.v.p)";
+      ti = "sp_time_utc_offset((sp_Time *)_tR.v.p)";
     else if (sp_streq(name, "utc?") || sp_streq(name, "gmt?"))
       tb = "(((sp_Time *)_tR.v.p)->is_utc == 1)";
     else if (sp_streq(name, "dst?") || sp_streq(name, "isdst"))
-      tb = "(sp_time_isdst(*(sp_Time *)_tR.v.p) != 0)";
-    else if (sp_streq(name, "sunday?"))    tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 0)";
-    else if (sp_streq(name, "monday?"))    tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 1)";
-    else if (sp_streq(name, "tuesday?"))   tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 2)";
-    else if (sp_streq(name, "wednesday?")) tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 3)";
-    else if (sp_streq(name, "thursday?"))  tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 4)";
-    else if (sp_streq(name, "friday?"))    tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 5)";
-    else if (sp_streq(name, "saturday?"))  tb = "(sp_time_wday(*(sp_Time *)_tR.v.p) == 6)";
-    else if (sp_streq(name, "zone"))       ts = "sp_time_zone(*(sp_Time *)_tR.v.p)";
+      tb = "(sp_time_isdst((sp_Time *)_tR.v.p) != 0)";
+    else if (sp_streq(name, "sunday?"))    tb = "(sp_time_wday((sp_Time *)_tR.v.p) == 0)";
+    else if (sp_streq(name, "monday?"))    tb = "(sp_time_wday((sp_Time *)_tR.v.p) == 1)";
+    else if (sp_streq(name, "tuesday?"))   tb = "(sp_time_wday((sp_Time *)_tR.v.p) == 2)";
+    else if (sp_streq(name, "wednesday?")) tb = "(sp_time_wday((sp_Time *)_tR.v.p) == 3)";
+    else if (sp_streq(name, "thursday?"))  tb = "(sp_time_wday((sp_Time *)_tR.v.p) == 4)";
+    else if (sp_streq(name, "friday?"))    tb = "(sp_time_wday((sp_Time *)_tR.v.p) == 5)";
+    else if (sp_streq(name, "saturday?"))  tb = "(sp_time_wday((sp_Time *)_tR.v.p) == 6)";
+    else if (sp_streq(name, "zone"))       ts = "sp_time_zone((sp_Time *)_tR.v.p)";
     /* the fixed C-style stamp, as the typed arm renders it; only where the
        call is typed a String (or in the dispatch's default arm), and not
        where a reopened Object or Kernel has an asctime, which answers for
@@ -6365,14 +6366,14 @@ static int emit_poly_builtin_method(Compiler *c, int id, Buf *b) {
                comp_method_in_chain(c, comp_class_index(c, "Object"), name, NULL) >= 0) &&
              !(comp_class_index(c, "Kernel") >= 0 &&
                comp_method_in_chain(c, comp_class_index(c, "Kernel"), name, NULL) >= 0))
-      ts = "sp_time_strftime(*(sp_Time *)_tR.v.p, \"%a %b %e %H:%M:%S %Y\")";
+      ts = "sp_time_strftime((sp_Time *)_tR.v.p, \"%a %b %e %H:%M:%S %Y\")";
     else if ((is_iso8601_alias(name)) &&
              sp_feature_enabled("time"))
-      ts = "sp_time_iso8601(*(sp_Time *)_tR.v.p)";
+      ts = "sp_time_iso8601((sp_Time *)_tR.v.p)";
     else if (sp_streq(name, "httpdate") && sp_feature_enabled("time"))
-      ts = "sp_time_httpdate(*(sp_Time *)_tR.v.p)";
+      ts = "sp_time_httpdate((sp_Time *)_tR.v.p)";
     else if ((sp_streq(name, "rfc2822") || sp_streq(name, "rfc822")) && sp_feature_enabled("time"))
-      ts = "sp_time_rfc2822(*(sp_Time *)_tR.v.p)";
+      ts = "sp_time_rfc2822((sp_Time *)_tR.v.p)";
     if (ti || tb || ts) {
       const char *expr = ti ? ti : tb ? tb : ts;
       const char *cty  = ti ? "sp_int" : tb ? "sp_bool" : "const char *";
@@ -10599,10 +10600,10 @@ static void emit_time_civil_zoned(Compiler *c, int *argv, int npos, int zone, Bu
     buf_printf(b, "; _t%d.tag == SP_TAG_NIL ? (_t%d = 1, (int64_t)0) : sp_time_zone_val_off(_t%d, &_t%d); })",
                tb2, tl, tb2, tu);
   }
-  buf_printf(b, "; sp_Time _t%d = _t%d ? sp_time_new(_t%d[0], _t%d[1], _t%d[2], _t%d[3], _t%d[4], _t%d[5])"
+  buf_printf(b, "; SP_TIME_TMP(_t%d) = _t%d ? sp_time_new(_t%d[0], _t%d[1], _t%d[2], _t%d[3], _t%d[4], _t%d[5])"
                 " : sp_time_new_off(_t%d[0], _t%d[1], _t%d[2], _t%d[3], _t%d[4], _t%d[5], _t%d ? 0 : _t%d);",
              tt, tl, tf, tf, tf, tf, tf, tf, tf, tf, tf, tf, tf, tf, tu, tz);
-  buf_printf(b, " if (_t%d) { _t%d.is_utc = 1; _t%d.utc_off = 0; } _t%d; })", tu, tt, tt, tt);
+  buf_printf(b, " if (_t%d) { _t%d->is_utc = 1; _t%d->utc_off = 0; } _t%d; })", tu, tt, tt, tt);
 }
 
 /* The tail of Time.at(..., in: zone) and Time.now(in: zone): re-read the
@@ -10659,7 +10660,7 @@ int emit_time_civil_ctor(Compiler *c, int id, int is_utc, int is_new, Buf *b) {
          else is read as the whole-second field it was */
       else if (sectr.kind == RK_BOXED) { buf_puts(b, "sp_poly_time_sec_f("); emit_boxed(c, argv[5], b); buf_puts(b, ")"); }
       else emit_expr(c, argv[5], b);
-      buf_printf(b, "; sp_Time _t%da = sp_time_new%s(", ts, is_utc ? "_utc" : "");
+      buf_printf(b, "; SP_TIME_TMP(_t%da) = sp_time_new%s(", ts, is_utc ? "_utc" : "");
       for (int i = 0; i < 5; i++) {
         if (i) buf_puts(b, ", ");
         Repr fitr = repr_of(c, argv[i]);
@@ -10669,7 +10670,7 @@ int emit_time_civil_ctor(Compiler *c, int id, int is_utc, int is_new, Buf *b) {
         else if (fit == TY_NIL) buf_puts(b, (i == 1 || i == 2) ? "1" : "0");  /* a nil field is its default */
         else emit_int_expr(c, argv[i], b);
       }
-      buf_printf(b, ", (int64_t)_t%d); _t%da.tv_nsec = (int32_t)((_t%d - (double)(int64_t)_t%d) * 1e9 + 0.5); _t%da; })",
+      buf_printf(b, ", (int64_t)_t%d); _t%da->tv_nsec = (int32_t)((_t%d - (double)(int64_t)_t%d) * 1e9 + 0.5); _t%da; })",
                  ts, ts, ts, ts, ts);
       return 1;
     }
@@ -14889,10 +14890,12 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       { *out = 1; return 1; }
     }
     if (cn && sp_streq(cn, "Array") && argc == 2) {
-      /* Array.new(n, v) -> n copies of v */
+      /* Array.new(n, v) -> n copies of v; a narrowed pointer array (an
+         object array, a table of rows) holds v's unboxed pointer n times */
       Repr ar = repr_of(c, id);
       TyKind at = ar.as_ty;
-      const char *k = (ar.elem == TY_POLY) ? "Poly" : array_kind(at);
+      const char *k = (ar.elem == TY_POLY) ? "Poly"
+                    : ty_is_ptr_array(at) && at != TY_STRH_ARRAY ? "Ptr" : array_kind(at);
       if (k) {
         int tn = ++g_tmp, tv = ++g_tmp, tr = ++g_tmp, ti = ++g_tmp;
         /* The size goes into an `sp_int` temp; coerce a poly size expression
@@ -14907,8 +14910,6 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         else vb = expr_buf(c, argv[1]);
         emit_indent(g_pre, g_indent);
         buf_printf(g_pre, "sp_int _t%d = ", tn); buf_puts(g_pre, nb.p ? nb.p : ""); buf_puts(g_pre, ";\n");
-        emit_indent(g_pre, g_indent);
-        buf_printf(g_pre, "if (_t%d < 0) sp_raise_cls(\"ArgumentError\", \"negative array size\");\n", tn);
         emit_indent(g_pre, g_indent);
         if (ar.elem == TY_POLY) {
           buf_printf(g_pre, "sp_RbVal _t%d = ", tv);
@@ -14940,6 +14941,10 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         buf_puts(g_pre, ";\n");
         emit_indent(g_pre, g_indent);
         if (array_fill_held_only_here(c, argv[1], fh, k)) { emit_gc_root_tmp(c, fh || ar.elem == TY_POLY ? TY_POLY : ar.elem, tv, g_pre); buf_puts(g_pre, "\n"); emit_indent(g_pre, g_indent); }
+        /* the size is checked after the fill ran, as CRuby evaluates both
+           arguments before Array.new looks at them (CodeRabbit on #10019) */
+        buf_printf(g_pre, "if (_t%d < 0) sp_raise_cls(\"ArgumentError\", \"negative array size\");\n", tn);
+        emit_indent(g_pre, g_indent);
         if (is_numeric_literal_tag(k) && *nil_store_sfx(c, k, argv[1])) {
           buf_printf(g_pre, "sp_%sArray *_t%d = _t%d.nil ? sp_%sArray_new_nil(_t%d) : sp_%sArray_new_fill(_t%d, _t%d.v);\n",
                      k, tr, tv, k, tn, k, tn, tv);
@@ -16139,17 +16144,17 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
       TyKind a0t = a0tr.as_ty;
       if (a0t == TY_TIME) {
         int tt = ++g_tmp, tu = ++g_tmp;
-        buf_puts(b, "({ sp_Time _t"); buf_printf(b, "%d = ", tt); emit_expr(c, recv, b);
-        buf_printf(b, "; sp_Time _t%d = ", tu); emit_expr(c, argv[0], b);
+        buf_puts(b, "({ SP_TIME_TMP(_t"); buf_printf(b, "%d) = ", tt); emit_expr(c, recv, b);
+        buf_printf(b, "; SP_TIME_TMP(_t%d) = ", tu); emit_expr(c, argv[0], b);
         buf_printf(b, "; sp_time_cmp(_t%d, _t%d) %s 0; })", tt, tu, eq ? "==" : "!=");
         return 1;
       }
       if (a0tr.kind == RK_BOXED || a0t == TY_UNKNOWN) {
         int tt = ++g_tmp, tu = ++g_tmp;
-        buf_printf(b, "({ sp_Time _t%d = ", tt); emit_expr(c, recv, b);
+        buf_printf(b, "({ SP_TIME_TMP(_t%d) = ", tt); emit_expr(c, recv, b);
         buf_printf(b, "; sp_RbVal _t%d = ", tu); emit_boxed(c, argv[0], b);
         buf_printf(b, "; %s(_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_TIME && "
-                      "sp_time_cmp(_t%d, *(sp_Time *)_t%d.v.p) == 0); })",
+                      "sp_time_cmp(_t%d, (sp_Time *)_t%d.v.p) == 0); })",
                    eq ? "" : "!", tu, tu, tt, tu);
         return 1;
       }
@@ -17162,8 +17167,8 @@ static int emit_array_arith_call(Compiler *c, int id, Buf *b) {
       int tt = ++g_tmp, tu = ++g_tmp;
       if (sp_streq(name, "-") && at == TY_TIME) {
         /* Time - Time -> Float */
-        buf_printf(b, "({ sp_Time _t%d = ", tt); emit_expr(c, recv, b);
-        buf_printf(b, "; sp_Time _t%d = ", tu); emit_expr(c, argv[0], b);
+        buf_printf(b, "({ SP_TIME_TMP(_t%d) = ", tt); emit_expr(c, recv, b);
+        buf_printf(b, "; SP_TIME_TMP(_t%d) = ", tu); emit_expr(c, argv[0], b);
         buf_printf(b, "; sp_time_sub_t(_t%d, _t%d); })", tt, tu);
       }
       else if (is_minus_op(name) && ar.kind == RK_BOXED) {
@@ -17171,7 +17176,7 @@ static int emit_array_arith_call(Compiler *c, int id, Buf *b) {
            number of the tower an earlier Time, anything else a TypeError --
            the boxed subtraction's own Time arm, answering boxed. The operand
            may be a fresh box, so it is rooted across the receiver's box. */
-        buf_printf(b, "({ sp_Time _t%d = ", tt); emit_expr(c, recv, b);
+        buf_printf(b, "({ SP_TIME_TMP(_t%d) = ", tt); emit_expr(c, recv, b);
         buf_printf(b, "; sp_RbVal _t%d = ", tu); emit_boxed(c, argv[0], b);
         buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_poly_sub(sp_box_time(_t%d), _t%d); })", tu, tt, tu);
       }
@@ -17180,12 +17185,12 @@ static int emit_array_arith_call(Compiler *c, int id, Buf *b) {
            number of the tower (a Rational's fraction of a second included)
            and raises TypeError for anything else. Read as an Integer, a
            boxed Rational(3, 4) shifted the Time by 0 seconds. */
-        buf_printf(b, "({ sp_Time _t%d = ", tt); emit_expr(c, recv, b);
+        buf_printf(b, "({ SP_TIME_TMP(_t%d) = ", tt); emit_expr(c, recv, b);
         buf_printf(b, "; sp_RbVal _t%d = ", tu); emit_boxed(c, argv[0], b);
         buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_poly_as_time_chk(sp_poly_add(sp_box_time(_t%d), _t%d)); })", tu, tt, tu);
       }
       else if (at == TY_FLOAT) {
-        buf_printf(b, "({ sp_Time _t%d = ", tt); emit_expr(c, recv, b);
+        buf_printf(b, "({ SP_TIME_TMP(_t%d) = ", tt); emit_expr(c, recv, b);
         buf_printf(b, "; double _t%d = ", tu); emit_expr(c, argv[0], b);
         if (sp_streq(name, "+"))
           buf_printf(b, "; sp_time_add_f(_t%d, _t%d); })", tt, tu);
@@ -17196,7 +17201,7 @@ static int emit_array_arith_call(Compiler *c, int id, Buf *b) {
         /* Time +/- Rational: add the fractional seconds through the float path.
            spinel's Time keeps nanosecond precision, so a Rational whose value
            is representable in ns (e.g. 1/2) round-trips exactly (#2678). */
-        buf_printf(b, "({ sp_Time _t%d = ", tt); emit_expr(c, recv, b);
+        buf_printf(b, "({ SP_TIME_TMP(_t%d) = ", tt); emit_expr(c, recv, b);
         buf_printf(b, "; double _t%d = sp_rational_to_f(", tu); emit_expr(c, argv[0], b);
         buf_printf(b, "); sp_time_add_f(_t%d, %s_t%d); })", tt, sp_streq(name, "-") ? "-" : "", tu);
       }
@@ -17204,7 +17209,7 @@ static int emit_array_arith_call(Compiler *c, int id, Buf *b) {
                at == TY_TIME || ty_is_array(at) || ty_is_hash(at)) {
         /* Time shifts by a number of seconds; anything else is CRuby's
            TypeError, not the operand read as an integer (#3695) */
-        buf_printf(b, "({ sp_Time _t%d = ", tt); emit_expr(c, recv, b);
+        buf_printf(b, "({ SP_TIME_TMP(_t%d) = ", tt); emit_expr(c, recv, b);
         buf_puts(b, "; (void)("); emit_expr(c, argv[0], b);
         /* Time + Time is CRuby's TypeError; only Time - Time is a duration.
            Reading the second Time as an integer did not compile (#3865). */
@@ -17213,7 +17218,7 @@ static int emit_array_arith_call(Compiler *c, int id, Buf *b) {
         buf_printf(b, "))); _t%d; })", tt);
       }
       else {
-        buf_printf(b, "({ sp_Time _t%d = ", tt); emit_expr(c, recv, b);
+        buf_printf(b, "({ SP_TIME_TMP(_t%d) = ", tt); emit_expr(c, recv, b);
         buf_printf(b, "; sp_int _t%d = ", tu); emit_int_expr(c, argv[0], b);
         if (sp_streq(name, "+"))
           buf_printf(b, "; sp_time_add_i(_t%d, _t%d); })", tt, tu);
@@ -24145,8 +24150,8 @@ void emit_utime_arg_ns(Compiler *c, int node, const char *sv, const char *nv, Bu
   TyKind t = comp_ntype(c, node);
   if (t == TY_TIME) {
     int tt = ++g_tmp;
-    buf_printf(b, "{ sp_Time _t%d = ", tt); emit_expr(c, node, b);
-    buf_printf(b, "; %s = _t%d.tv_sec; %s = _t%d.tv_nsec; } ", sv, tt, nv, tt);
+    buf_printf(b, "{ SP_TIME_TMP(_t%d) = ", tt); emit_expr(c, node, b);
+    buf_printf(b, "; %s = _t%d->tv_sec; %s = _t%d->tv_nsec; } ", sv, tt, nv, tt);
     return;
   }
   if (t == TY_NIL) {
@@ -24604,6 +24609,18 @@ void emit_ivar_nil_guard(Compiler *c, int id, int recv, Buf *b, int indent) {
   buf_printf(b, ") == NULL) %s;\n", nr);
 }
 
+/* The nil test of call id's receiver, written where the receiver is held in
+   `_t<th>` (a bang's slot hold: emit_bang_self_handle_1), when the call
+   would take one (nil_recv_guard). Answers 1 when it wrote it: the caller
+   then emits the call under g_ivar_nil_guarded_id, whose own guard would
+   go ahead of the hold and read the temp undeclared (#10017). */
+int emit_held_nil_guard(Compiler *c, int id, int th, Buf *b) {
+  int grecv = -1;
+  if (id == g_ivar_nil_guarded_id || !nil_recv_guard(c, id, &grecv)) return 0;
+  char nr[160]; nil_recv_raise_text(c, id, nr, sizeof nr);
+  buf_printf(b, " if (SP_UNLIKELY(!_t%d)) %s;", th, nr);
+  return 1;
+}
 /* Run statement emitter `fn` for call `id` behind the ivar nil guard: the
    guard goes in front only when `fn` handles the call, since a caller that
    falls back to another emission guards it there. */
@@ -27383,7 +27400,9 @@ static void emit_call_unwrapped(Compiler *c, int id, Buf *b) {
   if (nt_int(c->nt, id, "node_line", 0) > 0) g_refuse_outer = id;
   refuse_string_copies(c, id);
   int grecv = -1;
-  int guard = nil_recv_guard(c, id, &grecv);
+  /* (not for a call whose emitter tests its receiver itself: the bang's
+     held route, g_ivar_nil_guarded_id) */
+  int guard = id != g_ivar_nil_guarded_id && nil_recv_guard(c, id, &grecv);
   if (guard && nt_kind(c->nt, nt_paren_single(c->nt, grecv)) == NK_CallNode) {
     /* a call's result is read once, into a rooted temp the call reads */
     int tg = ++g_tmp;
