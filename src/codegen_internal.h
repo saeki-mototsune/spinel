@@ -103,6 +103,11 @@ static inline const char *isa_const_qualname(const NodeTable *nt, int arg, char 
 extern Buf *g_pre;
 extern int  g_indent;
 extern int  g_tmp;
+/* one representation: the String operands now being rendered are held across
+   a block the program runs (emit_call sets it for a call with a block,
+   emit_stmt_inner clears it for the statements inside), so a handle's read
+   face is a copy (SP_STR_BC, sp_strbuf_read_own), not the live bytes */
+extern int  g_one_held;
 
 /* Inlining a yielding method: method-local names are renamed (to avoid
    clashing with the call site's locals), and yield emits the active
@@ -193,6 +198,7 @@ void emit_strbuf_value(Compiler *c, LocalVar *lv, int v, Buf *b);
 /* The handle such a slot takes from value v: its own, or a new one */
 void emit_strbuf_handle_of(Compiler *c, int v, Buf *b);
 const char *strbuf_new_func(Compiler *c, int v);
+void strbuf_new_of_text(Compiler *c, int v, const char *t, Buf *b);
 /* --share-strings: the handle a value route that answers the String it is
    handed (`+s`, `String(s)`, `s.then { |x| x }`) hands on: 1, or 0 with
    nothing emitted */
@@ -462,6 +468,8 @@ enum {
   RW_YIELD,          /* a yield boxed by the block of this call site */
   RW_TRANSPLANT,     /* a module ivar read boxed by the including class's field */
   RW_RAN_FIRST,      /* an argument that already ran: its temp */
+  RW_PAREN_TAIL,     /* parentheses boxed as the handle of the variable
+                        they end in, after their statements */
   RW_HANDLE_ROUTE,   /* a conditional boxed through its shared handle route */
   RW_LITERAL         /* an empty literal or Hash.new boxed by its shape */
 };
@@ -569,6 +577,38 @@ void strh_elem_handle_text(Compiler *c, int v, Buf *b);
 void strh_emit_recv(Compiler *c, int id, int recv, Buf *b);   /* the receiver of an operation on the Array of handles, nil-checked */
 int strh_elem_slot(Compiler *c, int v);
 int strh_handle_call(Compiler *c, int v);
+int one_str_elem_call(Compiler *c, int v, TyKind rt);
+/* one representation: a block parameter bound to a typed String Array's element is the handle (codegen_fold.c) */
+TyKind one_elem_decl_type(const char *k, TyKind et);
+const char *one_elem_get_sfx(const char *k);
+/* a walk's String Array element `_sa->data[_si]` as the bytes the push or the box takes
+   (the element is the handle under the mode; the text is unchanged otherwise) */
+#define ONE_SA_ELEM (g_one_string ? "SP_SEB(_sa->data[_si])" : "_sa->data[_si]")
+/* ...and boxed: the element's own box (a handle box under the mode, which keeps
+   the String's identity where a box of its bytes made a second object) */
+#define ONE_SA_BOX (g_one_string ? "SP_SEBOX(_sa->data[_si])" : "sp_box_str(_sa->data[_si])")
+/* a String value stored into a Hash of String values (`hn` "StrStr" or
+   "IntStr"), of either face, as the bytes the set takes; the text is
+   unchanged otherwise */
+#define ONE_HV_O(hn) (g_one_string && strstr((hn), "Str") && sp_streq((hn) + strlen(hn) - 3, "Str") ? "SP_STR_B(" : "")
+#define ONE_HV_C(hn) (ONE_HV_O(hn)[0] ? ")" : "")   /* "_e" for a typed String Array under the mode (the element itself) */
+/* An element of a typed String Array / a String Hash's value, boxed: under
+   the mode the element's own box (SP_SEBOX of the _e read, a handle box that
+   keeps its identity), else the box of its bytes. Spelled
+   "%ssp_StrArray_get%s(" with these two. */
+#define ONE_SA_BOXO (g_one_string ? "SP_SEBOX(" : "sp_box_str(")
+#define ONE_SA_GE (g_one_string ? "_e" : "")
+#define ONE_HV_BOXO(hn) (ONE_HV_O(hn)[0] ? "SP_SEBOX(" : "sp_box_str(")
+#define ONE_HV_GE(hn) (ONE_HV_O(hn)[0] ? "_e" : "")
+/* ...and a typed Array kind `k`'s element form: "_e" for the String Array under the mode */
+#define ONE_SA_KE(k) (g_one_string && sp_streq((k), "Str") ? "_e" : "")
+extern int g_one_elem_raw;   /* the element read emit_expr renders as the handle itself (strh_elem_handle_text) */
+extern int g_one_arm_bytes_node;   /* the dispatch whose arms answer into a bytes slot (emit_strbuf_pickup) */
+void one_face_mark(int t, int node);   /* temp t holds node's String by face (__auto_type): its bound reads are SP_STR_B */
+int one_face_is(int t, int node);
+int one_tail_fresh(Compiler *c, int n);   /* a String answer that is a new String: its return clears the published channel */
+int one_str_to_open(Buf *b, TyKind st, const char *fmt, ...);   /* SP_STR_TO(dst, around a String slot write under the mode; close with ")" */
+void one_elem_bind_slot(LocalVar *lv, TyKind bt);
 /* An operation on a String Array of handles (codegen_call_array.c) */
 int emit_strh_call(Compiler *c, int id, Buf *b);
 /* When set, the arms of a boxed `new` (emit_call_new_arms) are only the
@@ -1126,6 +1166,7 @@ void store_check_kind(Compiler *c, int node, TyKind from, TyKind slot, const cha
 /* How emit_coerce may convert: see codegen_util.c. */
 enum { CO_HOLD, CO_CONVERT };
 void emit_coerce(Compiler *c, int node, TyKind slot, int how, const char *what, Buf *b);
+void emit_expr_face(Compiler *c, int node, TyKind t, Buf *b);
 void emit_coerce_text(Compiler *c, int node, TyKind from, TyKind slot, int how,
                       const char *text, const char *what, Buf *b);
 
@@ -1173,6 +1214,10 @@ int obj_str_ret_poly(Compiler *c, int cid, int want_inspect);
 const char *exc_builtin_parent(Compiler *c, int ci);
 void emit_method_cname(Compiler *c, Scope *s, Buf *b);
 void emit_stmt(Compiler *c, int id, Buf *b, int indent);
+/* The statements of parentheses v that run before `tail`, the node their
+   value comes from (through nested parentheses: vp_one's answer), into b,
+   in order (codegen_fold.c). */
+void emit_paren_lead(Compiler *c, int v, int tail, Buf *b, int indent);
 void emit_stmts(Compiler *c, int id, Buf *b, int indent);
 void emit_stmts_tail(Compiler *c, int id, Buf *b, int indent);
 void emit_op_assign(Compiler *c, int id, Buf *b, int indent);
@@ -1813,6 +1858,7 @@ int emit_empty_container_for_slot(Compiler *c, int v, TyKind slot, Buf *b);
 /* A frozen literal from its C-escaped bytes: a reference to the one file-scope
    object for that content, whose definition fzl_emit_defs writes. */
 void emit_frozen_literal(Buf *b, const char *esc, size_t esc_len, size_t raw_len);
+int fzl_text_id(const char *t);
 void fzl_emit_defs(const char *t, Buf *out, int handles);
 /* Emit a Ruby string literal. len is the true byte count (may exceed strlen
    when the string contains embedded NUL bytes). */
@@ -2207,6 +2253,7 @@ const char *arysub_array_ctype(Compiler *c, int cid);   /* codegen.c: an Array s
 void emit_arysub_alloc(Compiler *c, ClassInfo *ci, Buf *b);
 void arysub_box_id(Compiler *c, TyKind t, Buf *b);   /* the cls_id an object's box carries */
 int program_has_arysub(Compiler *c);
+int program_has_strsub(Compiler *c);   /* a class of the program that subclasses String */
 void emit_obj_switch_key(Compiler *c, int tv, Buf *b);   /* codegen.c: a class switch's key, Array subclasses included */
 void emit_arysub_machinery(Compiler *c, Buf *b);
 /* a call Array answers on an Array subclass instance (#7449), as an

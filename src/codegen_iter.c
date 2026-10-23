@@ -8,6 +8,11 @@
 #include "value_pos.h"
 #include <errno.h>
 
+/* One representation: a block parameter bound to a typed String Array's
+   element (the split, scan and upto forms) holds the handle the Array keeps,
+   so a change through it shows in the Array; its slot is the handle's. */
+static TyKind one_elem_bind_type(TyKind et) { return g_one_string && et == TY_STRING ? TY_STRBUF : et; }
+
 /* Is `s` the C text of an integer literal (`589LL`, `-8LL`, `(-8LL)`)? Its
    value in *v. */
 static int c_int_literal_text(const char *s, long long *v) {
@@ -541,7 +546,8 @@ int ivar_read_is_handle(Compiler *c, int a) {
    the same way: the element is no sp_String * either. */
 void emit_strbuf_param_bind(Compiler *c, const LocalVar *pv, TyKind want, const char *src, Buf *b) {
   int h = repr_of_slot(c, pv).kind == RK_STRBUF;
-  if (h && want == TY_STRING) buf_printf(b, "sp_String_new_shared(%s)", src);
+  /* (one representation: the source may be the element itself, SP_STR_HDL) */
+  if (h && want == TY_STRING) buf_printf(b, g_one_string ? "SP_STR_HDL(%s)" : "sp_String_new_shared(%s)", src);
   else if (h && want == TY_POLY) buf_printf(b, "sp_poly_as_strbuf(%s)", src);
   else buf_puts(b, src);
 }
@@ -2496,7 +2502,8 @@ static void emit_block_binds_gathered(Compiler *c, int blk, int t, TyKind at, in
        from a gathered Array of plain Strings: no value there was pulled
        into the handle (`yield(*[a[0]])`), so the block would append to
        a copy */
-    if (repr_of_slot(c, bl).kind == RK_STRBUF && et == TY_STRING)
+    /* (one-String mode: an element of a String Array is the handle) */
+    if (repr_of_slot(c, bl).kind == RK_STRBUF && et == TY_STRING && !g_one_string)
       unsupported_feature(c, site,
                           "a String is passed through a splat into a yield to a block parameter the block "
                           "appends to, from a value that is not a String variable: the block would append "
@@ -4637,7 +4644,7 @@ int emit_tap_then_expr(Compiler *c, int id, Buf *b) {
     buf_puts(&rb, "sp_box_nil()");
   }
   else if (ro) emit_oint_expr(c, recv, et, &rb);
-  else if (et_nil) emit_boxed(c, recv, &rb); else emit_expr(c, recv, &rb);
+  else if (et_nil) emit_boxed(c, recv, &rb); else emit_expr_face(c, recv, et, &rb);
   emit_indent(g_pre, g_indent);
   if (ro) buf_puts(g_pre, oint_ctype(et)); else emit_ctype(c, et, g_pre);
   buf_printf(g_pre, " _t%d = %s;\n", tr, rb.p ? rb.p : ""); free(rb.p);
@@ -4650,6 +4657,8 @@ int emit_tap_then_expr(Compiler *c, int id, Buf *b) {
      stored as one (a call marked to hand out the handle), answers its
      block's value as one */
   int hres = is_then && repr_share_rule(c) && (repr_of(c, id).demand || repr_of(c, id).as_ty == TY_STRBUF);
+  /* (one representation: a String value of either face is collected as the handle) */
+  if (is_then && g_one_string && repr_of(c, id).as_ty == TY_STRING) hres = 1;
   if (is_then) {
     rett = hres ? TY_STRBUF : repr_of(c, id).as_ty;
     /* A body that always `break`s completes normally nowhere, so it publishes
@@ -4789,6 +4798,9 @@ int emit_tap_then_expr(Compiler *c, int id, Buf *b) {
     buf_printf(b, "(_t%d ? sp_String_cstr(_t%d) : NULL)", tr, tr);
   /* tap's value is the receiver's oint, unwrapped for a plain reader */
   else if (is_tap && ro && !node_is_oint(c, id)) buf_printf(b, "%s(_t%d)", oint_arg(et), tr);
+  /* (one representation: a then the mode collected as the handle answers
+     its bytes face where the node is a String) */
+  else if (!is_tap && g_one_string && repr_of(c, id).as_ty == TY_STRING) buf_printf(b, "SP_STR_B(_t%d)", tres);
   else buf_printf(b, "_t%d", is_tap ? tr : tres);
   return 1;
 }
@@ -4900,12 +4912,12 @@ int emit_takewhile_with_index(Compiler *c, int id, Buf *b) {
   emit_indent(g_pre, g_indent + 1);
   if (is_take) {
     buf_printf(g_pre, "if (!(%s)) break;\n", cb.p ? cb.p : "0");
-    emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "sp_%sArray_push(_t%d, %s);\n", k, tr, es);
+    emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, g_one_string && sp_streq(k, "Str") ? "sp_%sArray_push(_t%d, SP_STR_B(%s));\n" : "sp_%sArray_push(_t%d, %s);\n", k, tr, es);
   }
   else {
     buf_printf(g_pre, "if (_t%d && (%s)) continue;\n", tdrop, cb.p ? cb.p : "0");
     emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "_t%d = 0;\n", tdrop);
-    emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "sp_%sArray_push(_t%d, %s);\n", k, tr, es);
+    emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, g_one_string && sp_streq(k, "Str") ? "sp_%sArray_push(_t%d, SP_STR_B(%s));\n" : "sp_%sArray_push(_t%d, %s);\n", k, tr, es);
   }
   free(cb.p);
   emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
@@ -5808,6 +5820,10 @@ static void emit_row_param_bind(Compiler *c, int block, int pj, const char *k, T
   LocalVar *lv = sc ? scope_local(sc, rpn) : NULL;
   TyKind pt = lv ? lv->type : TY_UNKNOWN;
   Buf val; memset(&val, 0, sizeof val);
+  /* (one representation: a String element into the parameter's face, SP_STR_TO) */
+  if (g_one_string && k && sp_streq(k, "Str") && (pt == TY_STRING || pt == TY_STRBUF))
+    buf_printf(&val, "SP_STR_TO(lv_%s, sp_StrArray_get(_t%d, _t%d + %d))", rpn, ta, ti, pj);
+  else
   row_param_value(c, lv, pt, k, rt, ta, ti, pj, &val);
   const char *value = val.p ? val.p : "0";
   const char *nil = pt == TY_UNKNOWN ? NULL : (oint_kind(pt) && lv && slot_is_oint(lv)) ? oint_nil(pt)
@@ -6083,17 +6099,26 @@ static int iter_tap_slice_string_arms(Compiler *c, int id, Buf *b, int indent, c
     int spIndent = indent + 1;
     if (use_shadow_sp) {
       int sb_bn = 0; const int *sb_bb = body >= 0 ? nt_arr(nt, body, "body", &sb_bn) : NULL;
-      lv_set_type(clv0, et);
-      arm_body_infer(c, ARM_SITE_SPLIT, block, et, sb_bb, sb_bn);
+      /* (one representation: the element is the handle, and so is the
+         parameter that holds it, its body inferred over that slot) */
+      TyKind bt = one_elem_bind_type(et); int ss0 = clv0->str_shared;
+      if (bt == TY_STRBUF) clv0->str_shared = 1;
+      lv_set_type(clv0, bt);
+      arm_body_infer(c, ARM_SITE_SPLIT, block, bt, sb_bb, sb_bn);
       emit_indent(b, spIndent); buf_puts(b, "{\n"); spIndent++;
-      emit_indent(b, spIndent); buf_printf(b, "const char *lv_%s = sp_StrArray_get(_t%d, _t%d);\n", p0, tm, ti);
+      emit_indent(b, spIndent); buf_printf(b, bt == TY_STRBUF ? "sp_String *lv_%s = sp_StrArray_get_e(_t%d, _t%d);\n" : "const char *lv_%s = sp_StrArray_get(_t%d, _t%d);\n", p0, tm, ti);
       emit_loop_body(c, body, b, spIndent);
       spIndent--;
       emit_indent(b, spIndent); buf_puts(b, "}\n");
-      lv_set_type(clv0, csaved0);
+      lv_set_type(clv0, csaved0); clv0->str_shared = ss0;
     }
     else {
-      if (p0) { emit_indent(b, spIndent); buf_printf(b, "lv_%s = sp_StrArray_get(_t%d, _t%d);\n", p0, tm, ti); }
+      if (p0) {
+        emit_indent(b, spIndent);
+        /* (one representation: the element into the variable's face) */
+        if (g_one_string) buf_printf(b, "lv_%s = SP_STR_TO(lv_%s, sp_StrArray_get_e(_t%d, _t%d));\n", p0, p0, tm, ti);
+        else buf_printf(b, "lv_%s = sp_StrArray_get(_t%d, _t%d);\n", p0, tm, ti);
+      }
       emit_loop_body(c, body, b, spIndent);
     }
     emit_indent(b, indent); buf_puts(b, "}\n");
@@ -6144,14 +6169,16 @@ static int iter_tap_slice_string_arms(Compiler *c, int id, Buf *b, int indent, c
     int bodyIndent = indent + 1;
     if (use_shadow_sc) {
       int scb_bn = 0; const int *scb_bb = body >= 0 ? nt_arr(nt, body, "body", &scb_bn) : NULL;
-      lv_set_type(clv0, et);
-      arm_body_infer(c, ARM_SITE_SCAN, block, et, scb_bb, scb_bn);
+      TyKind bt = one_elem_bind_type(et); int ss0 = clv0->str_shared;   /* (one representation: see the split form) */
+      if (bt == TY_STRBUF) clv0->str_shared = 1;
+      lv_set_type(clv0, bt);
+      arm_body_infer(c, ARM_SITE_SCAN, block, bt, scb_bb, scb_bn);
       emit_indent(b, bodyIndent); buf_puts(b, "{\n"); bodyIndent++;
-      emit_indent(b, bodyIndent); buf_printf(b, "const char *lv_%s = sp_StrArray_get(_t%d, _t%d);\n", p0, tm, ti);
+      emit_indent(b, bodyIndent); buf_printf(b, bt == TY_STRBUF ? "sp_String *lv_%s = sp_StrArray_get_e(_t%d, _t%d);\n" : "const char *lv_%s = sp_StrArray_get(_t%d, _t%d);\n", p0, tm, ti);
       emit_loop_body(c, body, b, bodyIndent);
       bodyIndent--;
       emit_indent(b, bodyIndent); buf_puts(b, "}\n");
-      lv_set_type(clv0, csaved0);
+      lv_set_type(clv0, csaved0); clv0->str_shared = ss0;
     }
     else {
       if (p0) {
@@ -6235,16 +6262,19 @@ static int iter_range_upto_arms(Compiler *c, int id, Buf *b, int indent, const N
         buf_printf(b, "for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++) {\n", ti, ti, ta, ti);
         if (use_shadow) {
           int sbn = 0; const int *sbb = body >= 0 ? nt_arr(nt, body, "body", &sbn) : NULL;
-          lv_set_type(slv, TY_STRING);
-          arm_body_infer(c, ARM_SITE_STR_UPTO, block, TY_STRING, sbb, sbn);
+          TyKind bt = one_elem_bind_type(TY_STRING); int ss0 = slv->str_shared;   /* (one representation: see the split form) */
+          if (bt == TY_STRBUF) slv->str_shared = 1;
+          lv_set_type(slv, bt);
+          arm_body_infer(c, ARM_SITE_STR_UPTO, block, bt, sbb, sbn);
           emit_indent(b, indent + 1);
-          buf_printf(b, "const char *lv_%s = sp_StrArray_get(_t%d, _t%d);\n", p0, ta, ti);
+          buf_printf(b, bt == TY_STRBUF ? "sp_String *lv_%s = sp_StrArray_get_e(_t%d, _t%d);\n" : "const char *lv_%s = sp_StrArray_get(_t%d, _t%d);\n", p0, ta, ti);
           emit_loop_body(c, body, b, indent + 1);
-          lv_set_type(slv, saved);
+          lv_set_type(slv, saved); slv->str_shared = ss0;
         }
         else {
           emit_indent(b, indent + 1);
-          buf_printf(b, "lv_%s = sp_StrArray_get(_t%d, _t%d);\n", p0, ta, ti);
+          if (g_one_string) buf_printf(b, "lv_%s = SP_STR_TO(lv_%s, sp_StrArray_get_e(_t%d, _t%d));\n", p0, p0, ta, ti);
+          else buf_printf(b, "lv_%s = sp_StrArray_get(_t%d, _t%d);\n", p0, ta, ti);
           emit_loop_body(c, body, b, indent + 1);
         }
         emit_indent(b, indent); buf_puts(b, "}\n");
@@ -6363,7 +6393,7 @@ static int iter_range_upto_arms(Compiler *c, int id, Buf *b, int indent, const N
     emit_expr(c, argv[0], b); buf_puts(b, ", 0);\n");
     emit_indent(b, indent); buf_printf(b, "SP_GC_ROOT(_t%d);\n", ta);
     emit_indent(b, indent); buf_printf(b, "for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++) {\n", ti, ti, ta, ti);
-    emit_indent(b, indent + 1); buf_printf(b, "lv_%s = _t%d->data[_t%d];\n", p0, ta, ti);
+    emit_indent(b, indent + 1); if (g_one_string) buf_printf(b, "lv_%s = SP_STR_TO(lv_%s, _t%d->data[_t%d]);\n", p0, p0, ta, ti); else buf_printf(b, "lv_%s = _t%d->data[_t%d];\n", p0, ta, ti);
     emit_loop_body(c, body, b, indent + 1);
     emit_indent(b, indent); buf_puts(b, "}\n");
     return 1;
@@ -6693,6 +6723,10 @@ static int iter_enum_poly_walk_arms(Compiler *c, int id, Buf *b, int indent, con
             emit_indent(b, indent + 1);
             int oj = (sp_streq(inner_kk, "Int") || sp_streq(inner_kk, "Float")) && block_param_slot_is_oint(c, block, pj);
             /* an oint slot reads the element with its nil (oget) */
+            /* (one representation: the element into a slot of either face, SP_STR_TO) */
+            if (g_one_string && sp_streq(inner_kk, "Str"))
+              buf_printf(b, "lv_%s = SP_STR_TO(lv_%s, sp_StrArray_get(_t%d, %d));\n", rename_local(pnj), rename_local(pnj), tsub, pj);
+            else
             buf_printf(b, "lv_%s = sp_%sArray_%s(_t%d, %d);\n",
                        rename_local(pnj), inner_kk, oj ? "oget" : "get", tsub, pj);
           }
@@ -6794,6 +6828,9 @@ static int iter_enum_poly_walk_arms(Compiler *c, int id, Buf *b, int indent, con
             if (!pname2) continue;
             emit_indent(b, indent + 1);
             int oj = (sp_streq(inner_k, "Int") || sp_streq(inner_k, "Float")) && block_param_slot_is_oint(c, block, pj);
+            if (g_one_string && sp_streq(inner_k, "Str"))
+              buf_printf(b, "lv_%s = SP_STR_TO(lv_%s, sp_StrArray_get(_t%d, %d));\n", rename_local(pname2), rename_local(pname2), tsub, pj);
+            else
             buf_printf(b, "lv_%s = sp_%sArray_%s(_t%d, %d);\n",
                        rename_local(pname2), inner_k, oj ? "oget" : "get", tsub, pj);
           }
@@ -6841,8 +6878,15 @@ static int iter_enum_poly_walk_arms(Compiler *c, int id, Buf *b, int indent, con
       else {
         int o0 = (sp_streq(k, "Int") || sp_streq(k, "Float")) && block_param_slot_is_oint(c, block, 0);
         /* an oint slot reads the element with its nil (oget) */
+        /* (one representation: the element into a slot of either face, SP_STR_TO) */
+        if (g_one_string && sp_streq(k, "Str")) {
+          buf_printf(b, "lv_%s = SP_STR_TO(lv_%s, sp_StrArray_get(", p0, p0);
+          buf_puts(b, rb.p); buf_printf(b, ", _t%d));\n", t);
+        }
+        else {
         buf_printf(b, "lv_%s = sp_%sArray_%s(", p0, k, o0 ? "oget" : "get");
         buf_puts(b, rb.p); buf_printf(b, ", _t%d);\n", t);
+        }
       }
     }
     /* a `*rest` param (splat-only wraps the element; alongside requireds it
@@ -6973,8 +7017,15 @@ static int iter_ewi_zip_poly_arms(Compiler *c, int id, Buf *b, int indent, const
       else {
         int o0 = (sp_streq(k, "Int") || sp_streq(k, "Float")) && block_param_slot_is_oint(c, block, 0);
         /* an oint slot reads the element with its nil (oget) */
+        /* (one representation: the element into a slot of either face, SP_STR_TO) */
+        if (g_one_string && sp_streq(k, "Str")) {
+          buf_printf(b, "lv_%s = SP_STR_TO(lv_%s, sp_StrArray_get(", p0, p0);
+          buf_puts(b, rb.p); buf_printf(b, ", _t%d));\n", t);
+        }
+        else {
         buf_printf(b, "lv_%s = sp_%sArray_%s(", p0, k, o0 ? "oget" : "get");
         buf_puts(b, rb.p); buf_printf(b, ", _t%d);\n", t);
+        }
       }
     }
     if (p1) {
@@ -7577,7 +7628,8 @@ void emit_srange_walk_open(Compiler *c, int recv, int stride, char *elem, size_t
                 " _t%d += _t%d > 0 ? _t%d : 1, _t%d = _t%d ? _t%d : _t%d) {\n",
              ti, tk, ti, ta, ti, ta, ti, tk, tk, tx, ta, tx, tn);
   emit_indent(b, indent + 1);
-  buf_printf(b, "const char *_t%d = _t%d ? sp_StrArray_get(_t%d, _t%d) : _t%d;\n", tc, ta, ta, ti, tx);
+  /* (one representation: the typed Array's element is a handle, read as its bytes here) */
+  buf_printf(b, "const char *_t%d = _t%d ? %ssp_StrArray_get(_t%d, _t%d)%s : _t%d;\n", tc, ta, g_one_string ? "SP_STR_B(" : "", ta, ti, g_one_string ? ")" : "", tx);
   emit_indent(b, indent + 1);
   buf_printf(b, "if (!_t%d) _t%d = sp_str_succ_n(_t%d, _t%d);\n", ta, tn, tx, tk);
   snprintf(elem, elemcap, "_t%d", tc);
@@ -7596,7 +7648,7 @@ void emit_srange_member_param(Compiler *c, int block, const char *p0_orig, const
   int faced = view_face_top(&fnode, &fkind) && fnode == g_srange_walk_recv && fkind == TY_STR_RANGE;
   if (lv && elem_param_is_handle(lv, TY_STRING)) {
     emit_indent(b, indent);
-    buf_printf(b, "lv_%s = sp_String_new_shared(%s);\n", p0, elem);
+    buf_printf(b, g_one_string ? "lv_%s = SP_STR_HDL(%s);\n" : "lv_%s = sp_String_new_shared(%s);\n", p0, elem);   /* (one representation: the element of either face) */
   }
   else if (faced && lv && lv->type == TY_POLY && g_srange_walk_tr >= 0) {
     char belem[160]; snprintf(belem, sizeof belem, "sp_srange_box_end(_t%d, %s)", g_srange_walk_tr, elem);

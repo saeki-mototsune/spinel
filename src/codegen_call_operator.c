@@ -164,6 +164,8 @@ static int poly_cmp_reopen_test(Compiler *c, const char *v, char *out, size_t ca
     { "Numeric", "%s.tag == SP_TAG_INT || %s.tag == SP_TAG_BIGINT || %s.tag == SP_TAG_FLT" },
     { "String",  "%s.tag == SP_TAG_STR" },
     { "Symbol",  "%s.tag == SP_TAG_SYM" },
+    { "TrueClass",  "(%s.tag == SP_TAG_BOOL && %s.v.i)" },
+    { "FalseClass", "(%s.tag == SP_TAG_BOOL && !%s.v.i)" },
   };
   size_t n = 0; out[0] = '\0';
   for (size_t i = 0; i < sizeof owners / sizeof owners[0]; i++) {
@@ -648,11 +650,16 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       int tr = ++g_tmp, ta = ++g_tmp;
       int boxed = repr_of(c, id).kind == RK_BOXED;
       if (boxed) buf_puts(b, "sp_box_oint("); else oint_open(c, id, TY_INT, b);
-      buf_printf(b, "({ const char *_t%d = ", tr); emit_coerce(c, recv, TY_STRING, CO_HOLD, "a comparison operand", b);
-      buf_puts(b, "; ");
-      if (operand_may_allocate(c, argv[0])) buf_printf(b, "SP_GC_ROOT_STR(_t%d); ", tr);
-      buf_printf(b, "const char *_t%d = ", ta);
+      /* (one representation: an operand of either face is held as it is and compared through its bytes) */
+      buf_printf(b, g_one_string ? "({ __auto_type _t%d = (" : "({ const char *_t%d = ", tr); emit_coerce(c, recv, TY_STRING, CO_HOLD, "a comparison operand", b);
+      buf_puts(b, g_one_string ? "); " : "; ");
+      if (operand_may_allocate(c, argv[0])) buf_printf(b, g_one_string ? "SP_GC_ROOT(_t%d); " : "SP_GC_ROOT_STR(_t%d); ", tr);
+      buf_printf(b, g_one_string ? "__auto_type _t%d = (" : "const char *_t%d = ", ta);
       emit_coerce(c, argv[0], TY_STRING, CO_HOLD, "a comparison operand", b);
+      if (g_one_string)
+        buf_printf(b, "); !_t%d || !_t%d ? ((const void *)_t%d == (const void *)_t%d ? sp_oint_of(0) : sp_oint_nil())"
+                      " : sp_oint_of((sp_int)sp_str_cmp_bytes(SP_STR_B(_t%d), SP_STR_B(_t%d))); })", tr, ta, tr, ta, tr, ta);
+      else
       buf_printf(b, "; !_t%d || !_t%d ? (_t%d == _t%d ? sp_oint_of(0) : sp_oint_nil())"
                     " : sp_oint_of((sp_int)sp_str_cmp_bytes(_t%d, _t%d)); })", tr, ta, tr, ta, tr, ta);
       if (boxed) buf_puts(b, ")"); else oint_close(c, id, b);
@@ -1531,7 +1538,7 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
         int tC2 = ++g_tmp;
         /* marked to hand out the handle (`r = obj.buf.clear`): the
            receiver itself, as for the appends */
-        buf_printf(b, "({ sp_String *_t%d = %s; sp_String_set_bin(_t%d, (&(\"\\xff\")[1]));",
+        buf_printf(b, (g_one_string ? "({ sp_String *_t%d = SP_STR_HDL(%s); sp_String_set_bin(_t%d, (&(\"\\xff\")[1]));" : "({ sp_String *_t%d = %s; sp_String_set_bin(_t%d, (&(\"\\xff\")[1]));"),
                    tC2, srefC.p, tC2);
         free(srefC.p);
         if (repr_of(c, id).handle) buf_printf(b, " _t%d; })", tC2);
@@ -1570,8 +1577,9 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
          later <</concat/upcase! mutates it); -str returns a FROZEN string
          (#2331). The copy is sp_str_dup, not sp_str_dup_external: the latter
          sizes it with strlen, which truncated an embedded NUL (#3473). */
-      if (name[0] == '+') { buf_puts(b, "sp_str_uplus("); emit_expr(c, recv, b); buf_puts(b, ")"); }
-      else { buf_puts(b, "sp_str_uminus_val("); emit_expr(c, recv, b); buf_puts(b, ")"); }  /* frozen recv: identity (#2369) */
+      /* (one representation: the receiver read as its bytes, whatever its face) */
+      if (name[0] == '+') { buf_puts(b, "sp_str_uplus("); emit_expr_face(c, recv, TY_STRING, b); buf_puts(b, ")"); }
+      else { buf_puts(b, "sp_str_uminus_val("); emit_expr_face(c, recv, TY_STRING, b); buf_puts(b, ")"); }  /* frozen recv: identity (#2369) */
     }
     /* nil, true, false, a Symbol, a container, a Range and a Time have no
        sign: NoMethodError, as CRuby raises. The C `+x`/`-x` of such a slot
@@ -1923,8 +1931,12 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
          poly operation, not a binding) */
       if (g_plan_check && c->ucall_inf[id].via != UC_NONE)
         for (int k = 0; k < c->nclasses; k++) {
-          int kmi = comp_method_in_class(c, k, name);
-          if (kmi >= 0) ucall_observe(c, id, kmi, k, 1);
+          /* (resolved as the dispatch resolves it, an alias of the name
+             included: activesupport's `alias_method :+, :plus_with_duration`
+             in Date dispatches to plus_with_duration) */
+          int dc = -1;
+          int kmi = comp_method_in_chain(c, k, name, &dc);
+          if (kmi >= 0 && dc == k) ucall_observe(c, id, kmi, k, 1);
         }
       Buf pcall; memset(&pcall, 0, sizeof pcall);
       if (subtree_may_allocate(nt, argv[0])) {

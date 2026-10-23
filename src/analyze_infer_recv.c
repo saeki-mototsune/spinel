@@ -458,7 +458,7 @@ TyKind infer_map_block_ty(Compiler *c, int id, int block) {
     return c->arr_want[id];
   /* A temporary result has no holder to select boxed element storage.
      Its shared block values need the same layout as a stored result. */
-  if (c->share_strings && share_node_elems_share(c, id)) return TY_POLY_ARRAY;
+  if (c->share_strings && !g_one_string && share_node_elems_share(c, id)) return TY_POLY_ARRAY;   /* (one-String mode: the String Array holds the handle) */
   return ty_array_of(bt);
 }
 
@@ -1098,6 +1098,9 @@ int infer_array_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       if (rty && sp_streq(rty, "ArrayNode")) {
         for (int ai = 0; ai < argc; ai++) {
           TyKind at = infer_type(c, argv[ai]);
+          /* (one-String mode: a String Array holds a handle as it holds
+             the bytes) */
+          if (g_one_string && elem_t == TY_STRING && at == TY_STRBUF) continue;
           if (at != TY_UNKNOWN && at != elem_t) { *out = TY_POLY_ARRAY; return 1; }
         }
       }
@@ -1692,7 +1695,7 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
     if (argc <= 2 && argc >= 1 &&
         (sp_streq(name, "byteindex") || sp_streq(name, "byterindex"))) { *out = TY_INT; return 1; }
     if (argc == 1 && (is_partition_family(name)))
-      { *out = c->share_strings && (infer_type(c, argv[0]) == TY_STRING || infer_type(c, argv[0]) == TY_STRBUF || infer_type(c, argv[0]) == TY_REGEX) && share_node_elems_share(c, id)
+      { *out = c->share_strings && !g_one_string && (infer_type(c, argv[0]) == TY_STRING || infer_type(c, argv[0]) == TY_STRBUF || infer_type(c, argv[0]) == TY_REGEX) && share_node_elems_share(c, id)
                    ? TY_POLY_ARRAY : TY_STR_ARRAY; return 1; }
     if (argc == 2 && sp_streq(name, "tr_s")) { *out = TY_STRING; return 1; }
     if (argc == 1 && sp_streq(name, "crypt")) { *out = TY_STRING; return 1; }

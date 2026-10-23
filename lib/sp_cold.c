@@ -690,7 +690,7 @@ static int sp_glob_has_meta(const char *comp) {
 static void sp_glob_push(sp_StrArray *a, const char *path) {
   char *copy = sp_str_alloc(strlen(path));
   strcpy(copy, path);
-  sp_StrArray_push(a, copy);
+  sp_StrArray_push_e(a, SP_SEF(copy));
 }
 
 static int sp_glob_is_dir(const char *path) {
@@ -894,7 +894,7 @@ static void sp_dir_glob_one(const char *pattern, const char *base, sp_StrArray *
     SP_GC_ROOT(tmp);
     sp_glob_walk(start, absolute ? SP_GLOB_ROOT : "", comps, ncomp, 0, tmp);
     for (sp_int i = 0; i < tmp->len; i++) {
-      const char *e = tmp->data[i];
+      const char *e = SP_SEB(tmp->data[i]);
       /* lstat, for the reason the recursive walk uses it: a symlink to a
          directory is not one of the directories this form answers. */
       struct stat lst;
@@ -993,7 +993,7 @@ sp_StrArray *sp_dir_glob_base(const char *pattern, const char *base) {
   { sp_int w = 0;
     for (sp_int r = 0; r < a->len; r++) {
       if (w > 0 && a->data[r] && a->data[w - 1] &&
-          sp_str_cmp_bytes(a->data[w - 1], a->data[r]) == 0) continue;
+          sp_str_cmp_bytes(SP_SEB(a->data[w - 1]), SP_SEB(a->data[r])) == 0) continue;
       a->data[w++] = a->data[r];
     }
     a->len = w; }
@@ -1048,7 +1048,7 @@ sp_StrArray *sp_file_readlines(const char *path) {SP_GC_ROOT_STR(path);
     char *_r = sp_str_alloc_raw(_l + 1);
     memcpy(_r, _buf, _l); _r[_l] = '\0';
     sp_str_set_len(_r, _l);
-    sp_StrArray_push(a, _r);
+    sp_StrArray_push_e(a, SP_SEF(_r));
   }
   free(_buf);
   fclose(_fp);
@@ -1071,7 +1071,7 @@ sp_StrArray *sp_file_readlines_chomp(const char *path) {SP_GC_ROOT_STR(path);
     char *_r = sp_str_alloc_raw(_l + 1);
     memcpy(_r, _buf, _l); _r[_l] = '\0';
     sp_str_set_len(_r, _l);
-    sp_StrArray_push(a, _r);
+    sp_StrArray_push_e(a, SP_SEF(_r));
   }
   free(_buf);
   fclose(_fp);
@@ -1446,7 +1446,7 @@ SP_NORETURN static void sp_typed_replace_elem_error(sp_RbVal v, const char *kind
 
 /* the contents of a shared String buffer as a String of their own, embedded
    NULs and a binary encoding included */
-static const char *sp_strbuf_copy(sp_String *b) {
+static SP_UNUSED const char *sp_strbuf_copy(sp_String *b) {
   size_t n = (size_t)b->len;
   char *c = sp_str_alloc(n);
   memcpy(c, b->data, n);
@@ -1496,9 +1496,15 @@ static void sp_typed_array_replace_boxed(sp_RbVal recv, sp_RbVal src) {
       sp_StrArray *st = sp_StrArray_new(); SP_GC_ROOT(st);
       for (sp_int i = 0; i < els->len; i++) {
         sp_RbVal e = els->data[i];
+#ifdef SP_ONE_STRING
+        if (e.tag == SP_TAG_STR) sp_StrArray_push_e(st, SP_SEF(e.v.s));
+        else if (e.tag == SP_TAG_OBJ && e.cls_id == SP_BUILTIN_STRBUF)
+          sp_StrArray_push_e(st, (sp_strelem)e.v.p);   /* the handle itself: one String */
+#else
         if (e.tag == SP_TAG_STR) sp_StrArray_push(st, e.v.s);
         else if (e.tag == SP_TAG_OBJ && e.cls_id == SP_BUILTIN_STRBUF)
           sp_StrArray_push(st, sp_strbuf_copy((sp_String *)e.v.p));
+#endif
         else if (e.tag == SP_TAG_NIL) sp_StrArray_push(st, NULL);
         else sp_typed_replace_elem_error(e, "String");
       }
@@ -1559,7 +1565,7 @@ sp_RbVal sp_poly_replace(sp_RbVal recv, sp_RbVal src) {SP_GC_ROOT_RBVAL(recv);SP
     switch (src.cls_id) {
       case SP_BUILTIN_INT_ARRAY: { sp_IntArray *s = (sp_IntArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_IntArray_box_elem(s, i)); break; }
       case SP_BUILTIN_FLT_ARRAY: { sp_FloatArray *s = (sp_FloatArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_FloatArray_box_elem(s, i)); break; }
-      case SP_BUILTIN_STR_ARRAY: { sp_StrArray *s = (sp_StrArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_box_str(s->data[i])); break; }
+      case SP_BUILTIN_STR_ARRAY: { sp_StrArray *s = (sp_StrArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, SP_SEBOX(s->data[i])); break; }
       case SP_BUILTIN_POLY_ARRAY: { sp_PolyArray *s = (sp_PolyArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, s->data[i]); break; }
       case SP_BUILTIN_PTR_ARRAY: { sp_PtrArray *s = (sp_PtrArray *)src.v.p; for (sp_int i = 0; i < s->len; i++) sp_PolyArray_push(d, sp_PtrArray_elem_box(s, s->data[i])); break; }
       default: break;
@@ -1820,7 +1826,7 @@ sp_StrArray *sp_dir_entries_impl(const char *path, int children) {
         (name[1] == 0 || (name[1] == '.' && name[2] == 0))) continue;
     char *copy = sp_str_alloc(strlen(name));
     strcpy(copy, name);
-    sp_StrArray_push(a, copy);
+    sp_StrArray_push_e(a, SP_SEF(copy));
   }
   closedir(d);
   sp_StrArray_sort_bang(a);
@@ -1913,12 +1919,12 @@ else if (kind == SP_BUILTIN_STR_ARRAY) {
       SP_GC_ROOT(col);
       for (sp_int r = 0; r < nrows; r++) {
         sp_RbVal rv = rows->data[r];
-        const char *val = sp_str_empty;
+        sp_strelem val = SP_SEF(sp_str_empty);
         if (rv.tag == SP_TAG_OBJ && rv.cls_id == SP_BUILTIN_STR_ARRAY) {
           sp_StrArray *row = (sp_StrArray *)rv.v.p;
           if (c < row->len && row->data[c]) val = row->data[c];
         }
-        sp_StrArray_push(col, val);
+        sp_StrArray_push_e(col, val);
       }
       cv.tag = SP_TAG_OBJ; cv.cls_id = SP_BUILTIN_STR_ARRAY; cv.v.p = col;
     }
@@ -1941,7 +1947,7 @@ else if (kind == SP_BUILTIN_STR_ARRAY) {
         else if (rv.cls_id == SP_BUILTIN_FLT_ARRAY)
           val = sp_box_ofloat(sp_FloatArray_oget((sp_FloatArray *)rv.v.p, c));
         else if (rv.cls_id == SP_BUILTIN_STR_ARRAY)
-          val = sp_box_str(sp_StrArray_get((sp_StrArray *)rv.v.p, c));
+          val = SP_SEBOX(sp_StrArray_get_e((sp_StrArray *)rv.v.p, c));
         else if (rv.tag == SP_TAG_OBJ && rv.cls_id == SP_BUILTIN_PTR_ARRAY)
           val = sp_PtrArray_get_box((sp_PtrArray *)rv.v.p, c);
         sp_PolyArray_push(col, val);
@@ -2222,8 +2228,8 @@ sp_StrArray *sp_bt_format(void **buf, int n) {
       free(name);
       name = strdup(bn);
     }
-    if (lines && lines[i] > 0) sp_StrArray_push(a, sp_sprintf("%s:%d:in `%s'", file, lines[i], name));
-    else sp_StrArray_push(a, sp_sprintf("%s:in `%s'", file, name));
+    if (lines && lines[i] > 0) sp_StrArray_push_e(a, SP_SEF(sp_sprintf("%s:%d:in `%s'", file, lines[i], name)));
+    else sp_StrArray_push_e(a, SP_SEF(sp_sprintf("%s:in `%s'", file, name)));
     free(name);
   }
   if (lfiles) for (int i = 0; i < n; i++) free(lfiles[i]);
@@ -2248,6 +2254,23 @@ const char *sp_File_gets_sep(sp_File *f, const char *sep, sp_int limit, sp_bool 
 sp_StrArray *sp_File_readlines_sep(sp_File *f, const char *sep, sp_bool chomp);
 sp_StrArray *sp_file_readlines_sep(const char *path, const char *sep, sp_bool chomp);
 const char *sp_File_readline_sep(sp_File *f, const char *sep, sp_int limit, sp_bool chomp);
+/* gets/readline distinguish an explicit zero from an omitted or nil limit. */
+const char *sp_File_gets_limit(sp_File *f, const char *sep, sp_oint limit, sp_bool chomp) {SP_GC_ROOT(f);SP_GC_ROOT_STR(sep);
+  if (!limit.nil && limit.v == 0) {
+    SP_IO_OPEN(f);
+    char *r = sp_str_alloc(0);
+    r[0] = 0;
+    if (f->bin_flag) sp_str_mark_binary(r);
+    return r;
+  }
+  return sp_File_gets_sep(f, sep, limit.nil ? 0 : limit.v, chomp);
+}
+const char *sp_File_readline_limit(sp_File *f, const char *sep, sp_oint limit, sp_bool chomp) {SP_GC_ROOT(f);SP_GC_ROOT_STR(sep);
+  const char *r = sp_File_gets_limit(f, sep, limit, chomp);
+  if (!r) sp_raise_cls("EOFError", "end of file reached");
+  return r;
+}
+
 const char *sp_File_getc(sp_File *f);
 const char *sp_File_readchar(sp_File *f);
 sp_oint sp_File_getbyte(sp_File *f);
@@ -2298,6 +2321,7 @@ sp_bool sp_file_zero(const char *path);
 const char *sp_file_dirname(const char *path);
 const char *sp_dir_pwd(void);
 sp_int sp_dir_mkdir(const char *path);
+sp_int sp_dir_mkdir_mode(const char *path, sp_int mode);
 sp_int sp_dir_rmdir(const char *path);
 sp_int sp_dir_chdir(const char *path);
 const char *sp_dir_home(void);
@@ -2422,7 +2446,7 @@ sp_StrArray *sp_File_readlines_sep(sp_File *f, const char *sep, sp_bool chomp) {
   sp_StrArray *a = sp_StrArray_new();
   SP_GC_ROOT(a);
   const char *l;
-  while ((l = sp_File_gets_sep(f, sep, 0, chomp)) != NULL) sp_StrArray_push(a, l);
+  while ((l = sp_File_gets_sep(f, sep, 0, chomp)) != NULL) sp_StrArray_push_e(a, SP_SEF(l));
   return a;
 }
 sp_StrArray *sp_file_readlines_sep(const char *path, const char *sep, sp_bool chomp) {SP_GC_ROOT_STR(path);SP_GC_ROOT_STR(sep);
@@ -2776,6 +2800,7 @@ static int sp_open_fifo_aware(const char *path, int fl, mode_t perm) {
   }
 }
 sp_File *sp_File_open_flags_perm(const char *path, sp_int fl, sp_oint perm) {SP_GC_ROOT_STR(path);
+  path = sp_str_keep(path);   /* (the File keeps its path: a copy of a live payload, sp_str_keep) */
   int fd = sp_open_fifo_aware(path ? path : "", (int)fl | O_CLOEXEC, (mode_t)(perm.nil ? 0666 : perm.v));
   if (fd < 0) sp_file_open_raise(path);
   int acc = (int)fl & O_ACCMODE;
@@ -2797,6 +2822,7 @@ sp_File *sp_File_open_flags(const char *path, sp_int fl) {
    CRuby's ArgumentError and leaves no descriptor behind. A nil perm is
    CRuby's default, 0666. */
 sp_File *sp_File_open_perm(const char *path, const char *mode, sp_oint perm) {SP_GC_ROOT_STR(path);SP_GC_ROOT_STR(mode);
+  path = sp_str_keep(path);   /* (the File keeps its path: a copy of a live payload, sp_str_keep) */
   const char *m = mode && mode[0] ? mode : "r";
   int fl;
   switch (m[0]) {
@@ -2821,7 +2847,7 @@ sp_File *sp_File_open_perm(const char *path, const char *mode, sp_oint perm) {SP
                  : (acc == O_WRONLY) ? ((fl & O_APPEND) ? "a" : "w")
                  : ((fl & O_APPEND) ? "a+" : (m[0] == 'w') ? "w+" : "r+");
   sp_File *f = sp_io_fdopen(fd, fm);
-  f->path = path;
+  f->path = sp_str_retained(path);
   f->mode = m;
   f->is_file = 1;
   return f;
@@ -2838,7 +2864,7 @@ sp_File *sp_file_stat_handle(const char *path) {SP_GC_ROOT_STR(path);
   sp_File *f = (sp_File *)sp_gc_alloc(sizeof(sp_File), NULL, sp_file_stat_scan);
   SP_GC_ROOT(f);   /* the sprintf below allocates, and nothing else holds the fresh handle */
   f->fp = NULL;
-  f->path = sp_sprintf("%s", path ? path : "");
+  f->path = sp_str_retained(sp_sprintf("%s", path ? path : ""));
   sp_gc_wb((void *)f);   /* the sprintf can promote the rooted handle */
   f->mode = (&("\xff" "stat")[1]);
   f->lineno = 0;
@@ -2853,7 +2879,7 @@ sp_File *sp_file_lstat_handle(const char *path) {SP_GC_ROOT_STR(path);
   sp_File *f = (sp_File *)sp_gc_alloc(sizeof(sp_File), NULL, sp_file_stat_scan);
   SP_GC_ROOT(f);
   f->fp = NULL;
-  f->path = sp_sprintf("%s", path ? path : "");
+  f->path = sp_str_retained(sp_sprintf("%s", path ? path : ""));
   sp_gc_wb((void *)f);   /* the sprintf can promote the rooted handle */
   f->mode = (&("\xff" "lstat")[1]);
   f->lineno = 0;
@@ -2941,8 +2967,10 @@ sp_File *sp_io_stat_handle(sp_File *f) {SP_GC_ROOT(f);
 }
 /* One stat(2) field by index, so File::Stat's numeric accessors need one
    runtime entry rather than a dozen. 0=uid 1=gid 2=nlink 3=dev 4=ino
-   5=blksize 6=blocks 7=rdev 8=dev_major 9=dev_minor. nil when the stat
-   itself fails, or for 8 and 9 where the platform has no major/minor. */
+   5=blksize 6=blocks 7=rdev 8=dev_major 9=dev_minor 10=world_readable?
+   11=world_writable? (the permission bits when others may read or write,
+   else nil). nil when the stat itself fails, or for 8 and 9 where the
+   platform has no major/minor. */
 static sp_int sp_stat_field_n(sp_File *f, sp_int which, int *ok);
 sp_oint sp_stat_field(sp_File *f, sp_int which) {SP_GC_ROOT(f); int ok = 1; sp_int n = sp_stat_field_n(f, which, &ok); return ok ? sp_oint_of(n) : sp_oint_nil(); }
 static sp_int sp_stat_field_n(sp_File *f, sp_int which, int *ok) {SP_GC_ROOT(f);
@@ -2974,6 +3002,12 @@ static sp_int sp_stat_field_n(sp_File *f, sp_int which, int *ok) {SP_GC_ROOT(f);
 #else
       *ok = 0; return 0;
 #endif
+    case 10:
+    case 11: {
+      mode_t bit = which == 10 ? S_IROTH : S_IWOTH;
+      if (!(st.st_mode & bit)) { *ok = 0; return 0; }
+      return (sp_int)(st.st_mode & 0777);
+    }
     default: return (sp_int)st.st_rdev;
   }
 }
@@ -3045,16 +3079,22 @@ static sp_bool sp_stat_group_member(gid_t gid) {
   free(groups);
   return found;
 }
-static sp_bool sp_stat_executable_real(const struct stat *st) {
+/* Whether the real uid may read, write or execute what st describes, given
+   that access's owner, group and other bits, as CRuby's File::Stat tests it:
+   root may read and write anything and execute what any x bit allows; else
+   the owner's bits, a member's group bits, or the other bits decide. */
+static sp_bool sp_stat_real_access(const struct stat *st, mode_t usr, mode_t grp, mode_t oth) {
   uid_t uid = getuid();
-  if (uid == 0) return (st->st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) != 0;
-  if (uid == st->st_uid) return (st->st_mode & S_IXUSR) != 0;
-  if (sp_stat_group_member(st->st_gid)) return (st->st_mode & S_IXGRP) != 0;
-  return (st->st_mode & S_IXOTH) != 0;
+  /* root: any read or write; an execute only where some x bit allows it */
+  if (uid == 0) return usr != S_IXUSR || (st->st_mode & (usr | grp | oth)) != 0;
+  if (uid == st->st_uid) return (st->st_mode & usr) != 0;
+  if (sp_stat_group_member(st->st_gid)) return (st->st_mode & grp) != 0;
+  return (st->st_mode & oth) != 0;
 }
 /* The mode-derived predicates of File::Stat that no path helper covers. Kinds:
    0=pipe? 1=zero? 2=readable? 3=writable? 4=executable? 5=blockdev?
-   6=chardev? 8=executable_real? (7, size?, is sp_stat_size_q). */
+   6=chardev? 8=executable_real? 9=readable_real? 10=writable_real?
+   (7, size?, is sp_stat_size_q). */
 sp_int sp_stat_pred(sp_File *f, sp_int kind) {SP_GC_ROOT(f);
   struct stat st;
   int r;
@@ -3072,7 +3112,9 @@ sp_int sp_stat_pred(sp_File *f, sp_int kind) {SP_GC_ROOT(f);
     case 4: return (st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH)) ? 1 : 0;
     case 5: return S_ISBLK(st.st_mode) ? 1 : 0;
     case 6: return S_ISCHR(st.st_mode) ? 1 : 0;
-    case 8: return sp_stat_executable_real(&st);
+    case 8: return sp_stat_real_access(&st, S_IXUSR, S_IXGRP, S_IXOTH);
+    case 9: return sp_stat_real_access(&st, S_IRUSR, S_IRGRP, S_IROTH);
+    case 10: return sp_stat_real_access(&st, S_IWUSR, S_IWGRP, S_IWOTH);
     default: return 0;
   }
 }
@@ -3168,8 +3210,8 @@ sp_bool sp_file_fnmatch(const char *pat, const char *path, sp_int flags) {
 sp_StrArray *sp_file_split(const char *path) {SP_GC_ROOT_STR(path);
   sp_StrArray *a = sp_StrArray_new();
   SP_GC_ROOT(a);
-  sp_StrArray_push(a, sp_file_dirname(path));
-  sp_StrArray_push(a, sp_file_basename(path));
+  sp_StrArray_push_e(a, SP_SEF(sp_file_dirname(path)));
+  sp_StrArray_push_e(a, SP_SEF(sp_file_basename(path)));
   return a;
 }
 sp_bool sp_file_zero(const char *path) {
@@ -3204,9 +3246,14 @@ const char *sp_dir_pwd(void) {
    CRuby's labels; its block-form chdir says dir_chdir0 where this wrapper
    says chdir_path in both forms. A nil path (a NULL string at run time) is
    CRuby's TypeError, as it is for File.size and the time readers above. */
-sp_int sp_dir_mkdir(const char *path) {SP_GC_ROOT_STR(path);
+sp_int sp_dir_mkdir(const char *path) {
+  return sp_dir_mkdir_mode(path, 0777);
+}
+/* Dir.mkdir(path, mode): the requested permissions, filtered by the
+   process umask as the platform mkdir does. */
+sp_int sp_dir_mkdir_mode(const char *path, sp_int mode) {SP_GC_ROOT_STR(path);
   sp_file_path_check(path);
-  if (mkdir(path, 0777) != 0) sp_file_raise_errno("dir_s_mkdir", path);
+  if (mkdir(path, (mode_t)mode) != 0) sp_file_raise_errno("dir_s_mkdir", path);
   return 0;
 }
 sp_int sp_dir_rmdir(const char *path) {SP_GC_ROOT_STR(path);
@@ -3232,6 +3279,14 @@ const char *sp_dir_home(void) {
 }
 void sp_Dir_fin(void *p) { sp_Dir *d = (sp_Dir *)p; if (d->dp) { closedir(d->dp); d->dp = NULL; } }
 void sp_Dir_scan(void *p) { sp_Dir *d = (sp_Dir *)p; if (d->path) sp_mark_string(d->path); }
+/* Object#dup allocates an uninitialized Dir; it does not copy the stream. */
+sp_Dir *sp_dir_dup_handle(sp_Dir *source) {
+  (void)source;
+  sp_Dir *copy = (sp_Dir *)sp_gc_alloc(sizeof(sp_Dir), sp_Dir_fin, sp_Dir_scan);
+  copy->dp = NULL;
+  copy->path = NULL;
+  return copy;
+}
 sp_Dir *sp_Dir_new(const char *path) {SP_GC_ROOT_STR(path);
   DIR *dp = opendir(path ? path : "");
   if (!dp)
@@ -3241,7 +3296,7 @@ sp_Dir *sp_Dir_new(const char *path) {SP_GC_ROOT_STR(path);
   d->dp = dp;
   d->path = NULL;   /* set below: the sprintf may GC, and the scan reads path */
   SP_GC_ROOT(d);
-  d->path = sp_sprintf("%s", path ? path : "");
+  d->path = sp_str_retained(sp_sprintf("%s", path ? path : ""));
   sp_gc_wb((void *)d);   /* the sprintf can promote the rooted handle */
   return d;
 }
@@ -3267,7 +3322,7 @@ sp_StrArray *sp_Dir_entries_h(sp_Dir *d, sp_int children) {SP_GC_ROOT(d);
   struct dirent *e;
   while ((e = readdir(d->dp)) != NULL) {
     if (children && (strcmp(e->d_name, ".") == 0 || strcmp(e->d_name, "..") == 0)) continue;
-    sp_StrArray_push(a, sp_sprintf("%s", e->d_name));
+    sp_StrArray_push_e(a, SP_SEF(sp_sprintf("%s", e->d_name)));
   }
   rewinddir(d->dp);
   return a;
@@ -3288,6 +3343,13 @@ const char *sp_Dir_read(sp_Dir *d) {
 /* NULL is Ruby nil in the string convention: a Dir from Dir.for_fd has no path,
    and CRuby answers nil for it rather than an empty string (#3365). */
 const char *sp_Dir_path(sp_Dir *d) { return d ? d->path : NULL; }
+/* Ruby Dir#path returns a fresh String; internal value-only readers use the
+   raw getter above. A descriptor-created Dir still has a nil path. */
+const char *sp_Dir_path_copy(sp_Dir *d) {
+  SP_GC_ROOT(d);
+  const char *path = sp_Dir_path(d);
+  return path ? sp_str_dup(path) : NULL;
+}
 /* Object#to_s: #<Dir:0xADDR>; #inspect is the #<Dir:PATH> above. */
 const char *sp_Dir_to_s(sp_Dir *d) {
   return d ? sp_sprintf("#<Dir:0x%016llx>", (unsigned long long)(uintptr_t)d) : SPL("");
@@ -3343,7 +3405,11 @@ sp_StrArray *sp_dir_entries_enc(const char *path, int children, sp_RbVal enc) {S
   }
   sp_StrArray *a = sp_dir_entries_impl(path, children);
   if (binary)
+#ifdef SP_ONE_STRING
+    for (sp_int i = 0; i < a->len; i++) if (a->data[i]) { a->data[i]->binary = 1; sp_fd_publish(a->data[i]); }
+#else
     for (sp_int i = 0; i < a->len; i++) sp_str_as_binary(a->data[i]);
+#endif
   return a;
 }
 
@@ -4195,10 +4261,21 @@ sp_StrStrHash *sp_env_to_h(void) {
     size_t kl = (size_t)(eq - *e);
     char *k = sp_str_alloc_raw(kl + 1);
     memcpy(k, *e, kl); k[kl] = 0;
-    sp_StrStrHash_set(h, k, v);
+    sp_StrStrHash_set_e(h, k, SP_SEF(v));
   }
   return h;
 }
+#ifdef SP_ONE_STRING
+/* ENV itself as a value (a parameter defaulting to ENV, a local holding
+   it): the snapshot a store into which keeps a frozen copy of the String,
+   as ENV does (sp_StrStrHash_set_e reads the snapshot's finalizer), where
+   a String Hash holds the String itself */
+sp_StrStrHash *sp_env_value(void) {
+  sp_StrStrHash *h = sp_env_to_h();
+  sp_StrStrHash_mark_env(h);
+  return h;
+}
+#endif
 sp_StrStrHash *sp_env_clear(void) {
   extern char **environ;
   for (;;) {   /* environ shifts under unsetenv: restart until empty */
@@ -4243,6 +4320,18 @@ static void sp_gc_stat_str_cb(void *hdr, void *arg) {
   struct sp_gc_stat_str_acc *a = (struct sp_gc_stat_str_acc *)arg;
   *a->b += ((sp_str_hdr *)hdr)->size & SP_STR_SIZE_MASK; (*a->c)++;
 }
+#ifdef SP_ONE_STRING
+void sp_slab_each_object(int young, int old, void (*fn)(void *hdr, void *arg), void *arg);
+static void sp_gc_stat_one_str_cb(void *hdr, void *arg) {
+  struct sp_gc_stat_str_acc *a = (struct sp_gc_stat_str_acc *)arg;
+  char *o = (char *)hdr + sizeof(sp_gc_hdr);
+  sp_str_hdr *sh = (sp_str_hdr *)(void *)(o + sizeof(struct sp_String_s));
+  if ((char *)SP_STR_BORN_LINK(sh) != o) return;
+  unsigned char m = ((unsigned char *)(sh + 1))[0];
+  if (m != 0xfe && m != 0xfa && m != 0xf1 && m != 0xfd) return;
+  *a->b += ((sp_gc_hdr *)hdr)->size; (*a->c)++;
+}
+#endif
 sp_StrIntHash*sp_gc_stat(void){
   /* The string heap (sp_str_heap) is malloc'd separately and deliberately
      excluded from sp_gc_bytes (see sp_str_alloc). Surface its footprint so
@@ -4257,7 +4346,13 @@ sp_StrIntHash*sp_gc_stat(void){
      generation (a racy read against the allocating workers, benign for an
      introspection stat), then the lists of the strings too large for it */
   { struct sp_gc_stat_str_acc acc = { &str_bytes, &str_count };
-    sp_slab_each_string(1, 1, sp_gc_stat_str_cb, &acc); }
+    sp_slab_each_string(1, 1, sp_gc_stat_str_cb, &acc);
+#ifdef SP_ONE_STRING
+    /* one representation: a String lives in its handle's GC object, the
+       bytes inside it (sp_str_alloc_born, sp_String_new_inline_len) */
+    sp_slab_each_object(1, 1, sp_gc_stat_one_str_cb, &acc);
+#endif
+  }
 #ifdef SP_THREADS
   /* Per-worker lists (see sp_alloc.h): each has a single pusher, and only the
      head moves, so a snapshot walk reaches fully-linked nodes -- at worst it
@@ -4556,7 +4651,7 @@ sp_RbVal sp_main_self(void) {
 sp_StrArray *sp_get_ARGV(void) {
   if (!sp_argv_array_cache) {
     sp_argv_array_cache = sp_StrArray_new();
-    for (sp_int i = 0; i < sp_argv.len; i++) sp_StrArray_push(sp_argv_array_cache, sp_argv.data[i]);
+    for (sp_int i = 0; i < sp_argv.len; i++) sp_StrArray_push_e(sp_argv_array_cache, SP_SEF(sp_argv.data[i]));
   }
   return sp_argv_array_cache;
 }
@@ -4595,10 +4690,14 @@ int sp_argf_ensure(void) {
     sp_argf_obj.started = 1; sp_argf_obj.cur = stdin; sp_argf_obj.fname = &("\xff" "-")[1];
     return 1;
   }
-  const char *fn = sp_StrArray_shift(av);
+  sp_strelem fne = sp_StrArray_shift_e(av);
+#ifdef SP_ONE_STRING
+  SP_GC_ROOT(fne);   /* off the Array now: its bytes live as long as the handle */
+#endif
+  const char *fn = SP_SEB(fne);
   sp_argf_obj.started = 1;
   if (!fn) sp_raise_cls("TypeError", "no implicit conversion of nil into String");
-  sp_argf_obj.fname = fn;   /* marked with the ARGV globals */
+  sp_argf_obj.fname = sp_str_retained(fn);   /* marked with the ARGV globals */
   if (fn[0] == '-' && fn[1] == 0) { sp_argf_obj.cur = stdin; return 1; }
   FILE *f = fopen(fn, "r");
   if (!f) sp_file_raise_errno("rb_sysopen", fn);
@@ -4632,7 +4731,7 @@ const char *sp_argf_read(void) {
 sp_StrArray *sp_argf_readlines(void) {
   sp_StrArray *a = sp_StrArray_new(); SP_GC_ROOT(a);
   const char *line;
-  while ((line = sp_argf_gets())) sp_StrArray_push(a, line);
+  while ((line = sp_argf_gets())) sp_StrArray_push_e(a, SP_SEF(line));
   return a;
 }
 /* CRuby opens the next file to name it, so ARGV loses it here too */
@@ -4732,14 +4831,23 @@ sp_StrRange sp_srange_live(sp_StrRange r) {
 static sp_StrRange sp_srange_held(sp_StrRange r) {
   sp_String *hf = (sp_String *)r.hf, *hl = (sp_String *)r.hl;
   SP_GC_ROOT(hf); SP_GC_ROOT(hl);
+#ifdef SP_ONE_STRING
+  /* one representation: the endpoint's bytes are the handle's own (a sink
+     finds the handle through them), as CRuby's #min answers the begin
+     object itself */
+  if (hf) r.first = sp_String_cstr(hf);
+  if (hl) r.last = sp_String_cstr(hl);
+#else
   if (hf) r.first = sp_str_from_bytes(sp_String_cstr(hf), (size_t)sp_String_length(hf));
   const char *f = r.first;
   SP_GC_ROOT_STR(f);
   if (hl) r.last = sp_str_from_bytes(sp_String_cstr(hl), (size_t)sp_String_length(hl));
+#endif
   return r;
 }
 sp_StrRange sp_srange_new(const char *f, const char *l, sp_int e) {
-  sp_StrRange r; r.first = f; r.last = l; r.excl = e; r.unfrozen = 0; r.sym = 0; r.hf = NULL; r.hl = NULL; return r;
+  /* (the Range keeps its endpoints and answers them again: sp_str_retained) */
+  sp_StrRange r; r.first = sp_str_retained(f); r.last = sp_str_retained(l); r.excl = e; r.unfrozen = 0; r.sym = 0; r.hf = NULL; r.hl = NULL; return r;
 }
 sp_StrArray *sp_srange_to_a(sp_StrRange r) {
   r = sp_srange_held(r);
@@ -4755,7 +4863,7 @@ sp_StrArray *sp_srange_to_a(sp_StrRange r) {
 typedef struct { sp_StrArray *a; sp_int n; } sp_srange_take_st;
 static int sp_srange_take_push(const char *m, void *arg) {
   sp_srange_take_st *st = (sp_srange_take_st *)arg;
-  sp_StrArray_push(st->a, m);
+  sp_StrArray_push_e(st->a, SP_SEF(m));
   return st->a->len >= st->n;
 }
 sp_StrArray *sp_srange_first_n(sp_RbVal box, sp_int n, int take) {
@@ -4776,7 +4884,7 @@ sp_StrArray *sp_srange_first_n(sp_RbVal box, sp_int n, int take) {
     sp_str_upto_each(cur, last, r.excl, sp_srange_take_push, &st);
     return a;
   }
-  for (; a->len < n; cur = sp_str_succ(cur)) sp_StrArray_push(a, sp_str_from_bytes(cur, sp_str_byte_len(cur)));
+  for (; a->len < n; cur = sp_str_succ(cur)) sp_StrArray_push_e(a, SP_SEF(sp_str_from_bytes(cur, sp_str_byte_len(cur))));
   return a;
 }
 sp_bool sp_srange_eq(sp_StrRange a, sp_StrRange b) {
@@ -5210,7 +5318,7 @@ sp_PolyArray *sp_str_lines_poly(const char *s) {SP_GC_ROOT_STR(s);
   if (ls) {
     sp_int len = sp_StrArray_length(ls);
     for (sp_int i = 0; i < len; i++) {
-      sp_PolyArray_push(a, sp_box_str(sp_StrArray_get(ls, i)));
+      sp_PolyArray_push(a, SP_SEBOX(sp_StrArray_get_e(ls, i)));
     }
   }
   return a;
@@ -5298,13 +5406,13 @@ const char *sp_str_gsub_str_str_hash(const char *str, const char *pat, sp_StrStr
 const char *sp_StrArray_sum_str(sp_StrArray *a, const char *init) {SP_GC_ROOT(a);SP_GC_ROOT_STR(init);
   size_t n = init ? sp_str_byte_len(init) : 0;
   if (a) for (sp_int i = 0; i < a->len; i++) if (a->data[i]) {
-    size_t len = sp_str_byte_len(a->data[i]);
+    size_t len = sp_str_byte_len(SP_SEB(a->data[i]));
     if (len > SIZE_MAX - n) sp_oom_die();
     n += len;
   }
   char *r = sp_str_alloc(n); size_t o = 0;
   if (init) { o = sp_str_byte_len(init); memcpy(r, init, o); }
-  if (a) for (sp_int i = 0; i < a->len; i++) if (a->data[i]) { size_t l = sp_str_byte_len(a->data[i]); memcpy(r + o, a->data[i], l); o += l; }
+  if (a) for (sp_int i = 0; i < a->len; i++) if (a->data[i]) { size_t l = sp_str_byte_len(SP_SEBN(a->data[i])); memcpy(r + o, SP_SEBN(a->data[i]), l); o += l; }
   r[o] = 0; sp_str_set_len(r, o); return r;
 }
 sp_RbVal sp_StrArray_uniq_bangq(sp_StrArray *a) {SP_GC_ROOT(a);
@@ -5318,7 +5426,7 @@ sp_RbVal sp_StrArray_uniq_bangq(sp_StrArray *a) {SP_GC_ROOT(a);
    malloc buffer, return an sp_str_alloc'd copy. (Not sp_String#data, whose owner
    isn't GC-rooted across the return.) sp_float_to_s's result is copied
    immediately, before the next call can reuse its buffer. */
-sp_bool sp_StrArray_eq(sp_StrArray*a,sp_StrArray*b){SP_GC_ROOT(a);SP_GC_ROOT(b);if(!a||!b)return a==b;if(a->len!=b->len)return FALSE;for(sp_int i=0;i<a->len;i++)if(!sp_str_eq(a->data[i],b->data[i]))return FALSE;return TRUE;}
+sp_bool sp_StrArray_eq(sp_StrArray*a,sp_StrArray*b){SP_GC_ROOT(a);SP_GC_ROOT(b);if(!a||!b)return a==b;if(a->len!=b->len)return FALSE;for(sp_int i=0;i<a->len;i++)if(!sp_str_eq(SP_SEB(a->data[i]),SP_SEB(b->data[i])))return FALSE;return TRUE;}
 
 /* ---- Complex ops / class-frozen bitmap -- relocated from spinel_rt.h. ---- */
 
@@ -5495,6 +5603,7 @@ sp_File *sp_io_wait_events(sp_File *f, double timeout, sp_int kind) {SP_GC_ROOT(
    ready_error], or nil when the timeout expires first. A nil array stands for
    "watch nothing", so all three nil is just a sleep. */
 sp_File *(*sp_user_to_io_hook)(sp_RbVal) = NULL;
+const char *sp_poly_class_name(sp_RbVal v);   /* lib/sp_poly_cold.c */
 static sp_File *sp_select_io_of(sp_RbVal v) {
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_IO && v.v.p) return (sp_File *)v.v.p;
   /* A user object that answers #to_io names the handle to wait on -- CRuby
@@ -5503,10 +5612,11 @@ static sp_File *sp_select_io_of(sp_RbVal v) {
     sp_File *f = sp_user_to_io_hook(v);
     if (f) return f;
   }
-  sp_raise_cls("TypeError",
-               sp_sprintf("no implicit conversion of %s into IO",
-                          (v.tag == SP_TAG_OBJ && v.cls_id >= 0 && sp_obj_cls_name_fn)
-                            ? sp_obj_cls_name_fn(v.cls_id) : "nil"));
+  /* CRuby names nil, true and false by themselves, anything else by its class */
+  const char *kind = v.tag == SP_TAG_NIL ? "nil"
+                   : v.tag == SP_TAG_BOOL ? (v.v.b ? "true" : "false")
+                   : sp_poly_class_name(v);
+  sp_raise_cls("TypeError", sp_sprintf("no implicit conversion of %s into IO", kind));
   return NULL;
 }
 /* A read-set IO stdio has already buffered input for is readable whatever
@@ -5849,10 +5959,10 @@ sp_Addrinfo *sp_addrinfo_new(const char *ip, sp_int port, sp_int stype, sp_int i
      takes the barrier after the allocation it stores: one barrier after
      both was cleared by the second's collection, which freed the first */
   const char *s = sp_sprintf("%s", ip ? ip : "");
-  sp_gc_wb((void *)a); a->ip = s;
+  sp_gc_wb((void *)a); a->ip = sp_str_retained(s);
   int v6 = !is_unix && ip && strchr(ip, ':') != NULL;
   s = sp_sprintf("%s", is_unix ? "AF_UNIX" : v6 ? "AF_INET6" : "AF_INET");
-  sp_gc_wb((void *)a); a->afname = s;
+  sp_gc_wb((void *)a); a->afname = sp_str_retained(s);
   a->afamily = is_unix ? AF_UNIX : v6 ? AF_INET6 : AF_INET;
   a->port = port;
   a->socktype = stype;
@@ -5975,7 +6085,7 @@ else {
   char *res = sp_str_alloc(olen);
   memcpy(res, out, olen);
   if (out != out_sb) free(out);
-  return res;
+  return sp_str_bin_like(str, res);   /* in the subject's encoding, as sp_re_gsub's */
 }
 const char *sp_re_gsub_str_str_hash(mrb_regexp_pattern *pat, const char *str, sp_StrStrHash *h) {
   return re_gsub_hash(pat, str, h, NULL);
@@ -6018,7 +6128,7 @@ static const char *re_sub_hash(mrb_regexp_pattern *pat, const char *str, sp_StrS
   out[total] = 0;
   sp_str_set_len(out, total);
   if (kbuf != keybuf) free(kbuf);
-  return out;
+  return sp_str_bin_like(str, out);   /* in the subject's encoding, as sp_re_sub's */
 }
 const char *sp_re_sub_str_str_hash(mrb_regexp_pattern *pat, const char *str, sp_StrStrHash *h) {
   return re_sub_hash(pat, str, h, NULL);
@@ -6213,7 +6323,6 @@ static int sp_enc_kw_replace(sp_RbVal v) {   /* `invalid: :replace` / `undef: :r
   return v.tag == SP_TAG_SYM && sp_sym_name_fn && sp_sym_name_fn((sp_sym)v.v.i) &&
          !strcmp(sp_sym_name_fn((sp_sym)v.v.i), "replace");
 }
-const char *sp_poly_class_name(sp_RbVal v);   /* lib/sp_poly_cold.c */
 /* A String argument as CRuby's StringValue takes it: a String, a shared
    String's bytes, or a user object's #to_str; anything else is the TypeError */
 static const char *sp_enc_str_arg(sp_RbVal v) {

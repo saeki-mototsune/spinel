@@ -1825,6 +1825,10 @@ int range_enum_redispatch(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
   if (!name) return 0;
+  /* a Range reopen's own method of the name is the call's target, as the
+     inference arm for a Range receiver takes it (`class Range; def sum = 0;
+     end`) */
+  if (an_reopen_owner(c, id, "Range") >= 0) return 0;
   int block = nt_ref(nt, id, "block");
   int args = nt_ref(nt, id, "arguments"); int argc = 0;
   if (args >= 0) nt_arr(nt, args, "arguments", &argc);
@@ -1912,6 +1916,9 @@ int hash_enum_redispatch(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
   if (!name) return 0;
+  /* a Hash reopen's own method of the name is the call's target, not the
+     pair array (`class Hash; def uniq = "mine"; end`) */
+  if (an_reopen_owner(c, id, "Hash") >= 0) return 0;
   int block = nt_ref(nt, id, "block");
   /* blockless pair-order Enumerables: min/max compare the [k, v] pairs */
   if (block < 0 && (is_extrema_family(name)))
@@ -3034,6 +3041,19 @@ int an_bi_generic_splat(Compiler *c, int id) {
   return builtin_recv_arity_span(name, &lo, &hi);
 }
 
+/* Does some class's chain answer `name` as a class method? From the chain
+   memo's by-name list (comp_name_responders) while it can be trusted, class
+   by class otherwise. The stat predicates' ask below walked every class for
+   every boxed call that reached it, whatever its name. */
+static int an_any_class_cmethod(Compiler *c, const char *name) {
+  int n;
+  comp_name_responders(c, name, 1, &n);
+  if (n >= 0) return n > 0;
+  for (int k = 0; k < c->nclasses; k++)
+    if (comp_cmethod_in_chain(c, k, name, NULL) >= 0) return 1;
+  return 0;
+}
+
 /* A boxed receiver or a boxed first operand (infer_call_inner's rules, in their order) */
 static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt, TyKind a0, TyKind *out) {
   /* poly receiver / poly operand: result type of operations on sp_RbVal */
@@ -3103,6 +3123,11 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
             c->scopes[mi].nparams >= 1 && c->scopes[mi].rest_idx < 0) { *out = TY_POLY; return 1; }
       }
     }
+    /* a program's nil? or is_a? answering anything but a bool: the boxed
+       call can reach it, so its answer is that value, as for == above */
+    if (rt == TY_POLY && (sp_streq(name, "nil?") || is_kind_query(name)) &&
+        an_user_ret_disagrees(c, name, TY_BOOL))
+      { *out = TY_POLY; return 1; }
     if (sp_streq(name, "<") || sp_streq(name, ">") || sp_streq(name, "<=") ||
         sp_streq(name, ">=") || sp_streq(name, "==") || sp_streq(name, "!=") ||
         sp_streq(name, "nil?") || sp_streq(name, "is_a?") || sp_streq(name, "kind_of?"))
@@ -3899,33 +3924,15 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
       /* a stat's mode and numeric fields, as the TY_IO arms type them, where
          the poly-IO arm emits them: not where a class method may own the
          name or an OpenStruct may carry it */
-      if (argc == 0 && !sp_feature_required("ostruct") &&
-          (sp_streq(name, "mode") || sp_streq(name, "uid") || sp_streq(name, "gid") ||
-           sp_streq(name, "nlink") || sp_streq(name, "dev") || sp_streq(name, "ino") ||
-           sp_streq(name, "blksize") || sp_streq(name, "blocks") || sp_streq(name, "rdev") || sp_streq(name, "dev_major") || sp_streq(name, "dev_minor"))) {
-        int cm = 0;
-        for (int k = 0; k < c->nclasses && !cm; k++)
-          if (comp_cmethod_in_chain(c, k, name, NULL) >= 0) cm = 1;
-        if (!cm) { *out = an_poly_concrete(c, name, TY_INT); return 1; }
-      }
+      if (argc == 0 && !sp_feature_required("ostruct") && boxed_stat_name(name) && !an_any_class_cmethod(c, name))
+        { *out = an_poly_concrete(c, name, TY_INT); return 1; }
       /* boxed: an Enumerator answers itself, a stream its 0 */
       if (sp_streq(name, "rewind")) { *out = TY_POLY; return 1; }
       /* a stat's predicates, as the TY_IO arms type them, where the poly-IO
          arm emits them (not where a class method may own the name): size?
          is the int-or-nil count */
-      int stat_pred_cm = 0;
-      for (int k = 0; k < c->nclasses && !stat_pred_cm; k++)
-        if (comp_cmethod_in_chain(c, k, name, NULL) >= 0) stat_pred_cm = 1;
-      if (argc == 0 && !stat_pred_cm && sp_streq(name, "size?")) { *out = an_poly_concrete(c, name, TY_INT); return 1; }
-      if (argc == 0 && !stat_pred_cm && (sp_streq(name, "pipe?") || sp_streq(name, "readable?") ||
-                        sp_streq(name, "writable?") || sp_streq(name, "executable?") || sp_streq(name, "executable_real?") ||
-                        sp_streq(name, "blockdev?") || sp_streq(name, "chardev?") ||
-                        sp_streq(name, "file?") || sp_streq(name, "directory?") ||
-                        sp_streq(name, "symlink?") || sp_streq(name, "owned?") ||
-                        sp_streq(name, "grpowned?") || sp_streq(name, "setuid?") ||
-                        sp_streq(name, "setgid?") || sp_streq(name, "sticky?") ||
-                        sp_streq(name, "socket?")))
-        { *out = an_poly_concrete(c, name, TY_BOOL); return 1; }
+      if (argc == 0 && (sp_streq(name, "size?") || boxed_stat_pred(name) >= 0) && !an_any_class_cmethod(c, name))
+        { *out = an_poly_concrete(c, name, sp_streq(name, "size?") ? TY_INT : TY_BOOL); return 1; }
       if (sp_streq(name, "puts") || sp_streq(name, "print") || sp_streq(name, "putc"))
         { *out = an_poly_concrete(c, name, TY_NIL); return 1; }
       /* printf answers the boxed nil the TY_IO arm answers */
@@ -4988,7 +4995,7 @@ static int infer_string_recv_call(Compiler *c, int id, const NodeTable *nt, cons
   if (recv >= 0 && rt == TY_STRING) {
     if (c->share_strings && argc == 1 && is_partition_family(name) &&
         (infer_type(c, argv[0]) == TY_STRING || infer_type(c, argv[0]) == TY_STRBUF || infer_type(c, argv[0]) == TY_REGEX) &&
-        share_node_elems_share(c, id)) { *out = TY_POLY_ARRAY; return 1; }
+        !g_one_string && share_node_elems_share(c, id)) { *out = TY_POLY_ARRAY; return 1; }
     /* promote mode: a String#to_i past sp_int is a Bignum (sp_str_to_i_promote).
        It reads the mode, so it sits ahead of the to_i row. */
     if (g_promote_mode && sp_streq(name, "to_i") && argc <= 1) { *out = TY_POLY; return 1; }
@@ -5496,24 +5503,37 @@ static int infer_operator_call(Compiler *c, int id, const NodeTable *nt, const c
    any class, and resolving the name's aliases in every class per call grew
    with the classes times the calls. */
 static ANameHash g_sga_names, g_sga_aliases;
-static const Compiler *g_sga_c;
-static unsigned g_sga_gen;
-static long g_sga_n = -1;
+/* ... and the names already asked, with their answers by entry: the walk
+   past the sets resolved the name's alias in every class and asked each
+   whether it is a builtin's reopening, per call, and on a Rails program
+   (1,299 classes) that was 9% of a window late in the fixpoint. The answer
+   reads the accessor and alias lists, the chain (the aliases hop up it) and
+   the required features (a socket class is a builtin once socket is
+   loaded), so the sets and the answers go with any of them. */
+static ANameHash g_sga_asked;
+static signed char *g_sga_ans; static int g_sga_ans_cap;
+static const Compiler *g_sga_c; static const NodeTable *g_sga_nt;   /* the asked names are its strings */
+static unsigned g_sga_gen, g_sga_shape;
+static long g_sga_n = -1; static int g_sga_socket = -1;
 static void sga_index(Compiler *c) {
   /* the lists only grow: their total length says whether one did */
   long n = c->nclasses;
   for (int k = 0; k < c->nclasses; k++)
     n += c->classes[k].nsg_readers + c->classes[k].nsg_writers + c->classes[k].naliases;
-  if (g_sga_c == c && g_sga_gen == comp_table_gen && g_sga_n == n) return;
+  int sock = sp_feature_required("socket");
+  if (g_sga_c == c && g_sga_nt == c->nt && g_sga_gen == comp_table_gen && g_sga_n == n &&
+      g_sga_shape == comp_class_shape_gen() && g_sga_socket == sock) return;
   anh_free(&g_sga_names); memset(&g_sga_names, 0, sizeof g_sga_names);
   anh_free(&g_sga_aliases); memset(&g_sga_aliases, 0, sizeof g_sga_aliases);
+  anh_free(&g_sga_asked); memset(&g_sga_asked, 0, sizeof g_sga_asked);
   for (int k = 0; k < c->nclasses; k++) {
     ClassInfo *ci = &c->classes[k];
     for (int j = 0; j < ci->nsg_readers; j++) if (!anh_has(&g_sga_names, ci->sg_readers[j])) anh_add(&g_sga_names, ci->sg_readers[j]);
     for (int j = 0; j < ci->nsg_writers; j++) if (!anh_has(&g_sga_names, ci->sg_writers[j])) anh_add(&g_sga_names, ci->sg_writers[j]);
     for (int j = 0; j < ci->naliases; j++) if (!anh_has(&g_sga_aliases, ci->alias_new[j])) anh_add(&g_sga_aliases, ci->alias_new[j]);
   }
-  g_sga_c = c; g_sga_gen = comp_table_gen; g_sga_n = n;
+  g_sga_c = c; g_sga_nt = c->nt; g_sga_gen = comp_table_gen; g_sga_n = n;
+  g_sga_shape = comp_class_shape_gen(); g_sga_socket = sock;
 }
 /* Does some class have a `class << self` accessor `name` (`x`, or `x=` with
    one argument)? */
@@ -5524,13 +5544,23 @@ static int cls_value_sg_accessor_any(Compiler *c, const char *name, int argc) {
   /* no class holds the name, nor an alias that may stand for one */
   sga_index(c);
   if (!anh_has(&g_sga_names, setter ? base : name) && !anh_has(&g_sga_aliases, name)) return 0;
-  for (int k = 0; k < c->nclasses; k++) {
+  int e = anh_find(&g_sga_asked, name);
+  if (e >= 0) return g_sga_ans[e];
+  int ans = 0;
+  for (int k = 0; k < c->nclasses && !ans; k++) {
     if (is_builtin_reopen(c->classes[k].name)) continue;
     const char *rn = comp_resolve_cm_alias_at(c, k, name, NULL);
     if (setter ? comp_sg_writer_reached(c, k, name, base, sizeof base) : comp_is_sg_reader(&c->classes[k], rn ? rn : name))
-      return 1;
+      ans = 1;
   }
-  return 0;
+  anh_add(&g_sga_asked, name); e = anh_find(&g_sga_asked, name);
+  if (e >= g_sga_ans_cap) {
+    g_sga_ans_cap = e + 256;
+    g_sga_ans = realloc(g_sga_ans, (size_t)g_sga_ans_cap);
+    if (!g_sga_ans) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  g_sga_ans[e] = (signed char)ans;
+  return ans;
 }
 
 
@@ -5719,6 +5749,7 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
 
   /* identity methods: return the receiver unchanged (clone also with its
      freeze: keyword argument) */
+  int self_tmi, self_fmi;
   if (recv >= 0 &&
       (argc == 0 ||
        (argc == 1 && sp_streq(name, "clone") && argv && nt_type(nt, argv[0]) &&
@@ -5730,7 +5761,10 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
          body answers -- `def dup = self.class.new(...)` answers boxed (#5461) */
       !(ty_is_object(rt) &&
         comp_resolve_member(c, ty_object_class(rt), name, 0, NULL, NULL) != SP_MEMBER_NONE) &&
-      !(rt == TY_POLY && an_user_defines_method(c, name))) {
+      !(rt == TY_POLY && an_user_defines_method(c, name)) &&
+      /* (nor where TrueClass or FalseClass defines it: the reopen rule below
+         types each value's side, cplan_bool_sides) */
+      !(rt == TY_BOOL && cplan_bool_sides(c, id, &self_tmi, &self_fmi))) {
     /* the receiver kind's row answers (the receiver itself, as the rule says
        where no row does) */
     const BuiltinOp *op = an_bop_find(c, id, bop_family_of(rt), name, argc, nt_ref(nt, id, "block") >= 0);
@@ -6150,7 +6184,7 @@ static int infer_receiverless_call(Compiler *c, int id, const NodeTable *nt, con
       if (at == TY_FLOAT)  { *out = TY_FLOAT_ARRAY; return 1; }  /* Array(float) -> [float] */
       /* The scalar String is one fill element, with Array.new's layout. */
       if (at == TY_STRING && c->share_strings) {
-        *out = share_node_elems_share(c, id) ? TY_POLY_ARRAY : infer_array_new_fill(c, argv[0]);
+        *out = !g_one_string && share_node_elems_share(c, id) ? TY_POLY_ARRAY : infer_array_new_fill(c, argv[0]);
         return 1;
       }
       if (at == TY_STRING) { *out = TY_STR_ARRAY; return 1; }    /* Array(str)   -> [str]   */
@@ -6159,7 +6193,7 @@ static int infer_receiverless_call(Compiler *c, int id, const NodeTable *nt, con
     }
     if (sp_streq(name, "Hash") && argc == 1) { *out = kconv_hash_kind(c, argv[0]); return 1; }
     if ((is_format_alias(name)) && argc >= 1) { *out = TY_STRING; return 1; }
-    if (sp_streq(name, "system") && argc >= 1) { *out = TY_BOOL; return 1; }
+    if (sp_streq(name, "system") && argc >= 1) { *out = TY_POLY; return 1; }  /* true, false, or nil when the command cannot run */
     if (sp_streq(name, "trap") && argc >= 1) { *out = TY_POLY; return 1; }  /* the previous handler: a command string or a Proc */
     /* at_exit answers the Proc it registered, so the handler stays callable (#3727) */
     if (sp_streq(name, "at_exit") && nt_ref(nt, id, "block") >= 0) { *out = TY_PROC; return 1; }
@@ -6373,13 +6407,23 @@ static int infer_user_method_call(Compiler *c, int id, const NodeTable *nt, cons
   /* built-in class reopening: look up user-defined methods on scalar built-in
      types -- not for an alias that captured the builtin (builtin_only) */
   if (recv >= 0 && !bonly && !nt_int(nt, id, "builtin_only", 0)) {
+    /* true and false: each value's own class's method, or the builtin's
+       where its class has none; one answer where they agree, else boxed */
+    int tmi, fmi;
+    if (rt == TY_BOOL && !(an_builtin_only && an_bo_recv == recv) && cplan_bool_sides(c, id, &tmi, &fmi)) {
+      int mi = tmi >= 0 ? tmi : fmi;
+      TyKind t = an_user_call(c, id, mi, UC_REOPEN, c->scopes[mi].class_id);
+      int other = tmi >= 0 ? fmi : tmi;
+      TyKind o = other >= 0 ? method_call_ret(c, other, id) : an_builtin_answer(c, id);
+      *out = o == t || o == TY_UNKNOWN || o == TY_VOID ? t : TY_POLY;
+      return 1;
+    }
     const char *oc_cn = NULL;
     switch (rt) {
     case TY_STRING: oc_cn = "String"; break;
     case TY_INT:    oc_cn = "Integer"; break;
     case TY_FLOAT:  oc_cn = "Float"; break;
     case TY_SYMBOL: oc_cn = "Symbol"; break;
-    case TY_BOOL:   oc_cn = "TrueClass"; break;
     case TY_RANGE:  oc_cn = "Range"; break;
     case TY_TIME:   oc_cn = "Time"; break;
     case TY_THREAD: oc_cn = "Thread"; break;
@@ -8174,8 +8218,7 @@ static int chain_has_aliases(Compiler *c, int ci) {
    a.size`), which leaves the block unused, as codegen calls it
    (reopen_override_block_ok). The reopen's method, or -1. */
 static int ty_array_or_hash(TyKind t) { return ty_is_array(t) || ty_is_obj_array(t) || t == TY_STRH_ARRAY || ty_is_hash(t); }
-static int array_hash_reopen_owner(Compiler *c, int id, TyKind rt, const char *name) {
-  const char *cn = ty_is_hash(rt) ? "Hash" : "Array";
+static int reopen_owner_of(Compiler *c, int id, const char *cn, const char *name) {
   /* A block-carrying call of a builtin's name is the reopen's only when it
      does not yield; asked first whether the program reopens the class at
      all, counted again only as the class table grows (a lookup before the
@@ -8184,7 +8227,8 @@ static int array_hash_reopen_owner(Compiler *c, int id, TyKind rt, const char *n
     static int ahr_n = -1, ahr_any = 0;
     if (ahr_n != c->nclasses) {
       ahr_n = c->nclasses;
-      ahr_any = comp_class_index(c, "Array") >= 0 || comp_class_index(c, "Hash") >= 0;
+      ahr_any = comp_class_index(c, "Array") >= 0 || comp_class_index(c, "Hash") >= 0 ||
+                comp_class_index(c, "Range") >= 0 || comp_class_index(c, "Symbol") >= 0;
     }
     if (!ahr_any) return -1;
   }
@@ -8195,6 +8239,25 @@ static int array_hash_reopen_owner(Compiler *c, int id, TyKind rt, const char *n
   if (ami < 0 || adc != aci || !c->scopes[ami].name || !sp_streq(c->scopes[ami].name, name)) return -1;
   if (nt_ref(c->nt, id, "block") >= 0 && builtin_method_known(cn, name) && c->scopes[ami].yields) return -1;
   return ami;
+}
+static int array_hash_reopen_owner(Compiler *c, int id, TyKind rt, const char *name) {
+  return reopen_owner_of(c, id, ty_is_hash(rt) ? "Hash" : "Array", name);
+}
+/* The method the program's reopen of builtin class cn ("Array", "Hash",
+   "Range" or "Symbol") defines itself under call id's name, which the call
+   reaches over the builtin's (a module the reopen includes does not
+   displace the builtin's method). -1 for none, and for a call marked
+   builtin_only. A rewrite that turns the call into another builtin's asks
+   it first. */
+int an_reopen_owner(Compiler *c, int id, const char *cn) {
+  const char *name = nt_str(c->nt, id, "name");
+  if (!name || nt_int(c->nt, id, "builtin_only", 0)) return -1;
+  int mi = reopen_owner_of(c, id, cn, name);
+  /* (a Symbol or Range one; an Array or Hash one keeps the answer the
+     inference arm above gives it) */
+  if (mi >= 0 && c->scopes[mi].is_include_copy && builtin_method_known(cn, name) &&
+      (sp_streq(cn, "Symbol") || sp_streq(cn, "Range"))) return -1;
+  return mi;
 }
 
 static TyKind infer_call_prelude(Compiler *c, int id) {
@@ -9555,19 +9618,19 @@ static TyKind an_empty_container_tail(Compiler *c, int stmts) {
   int n = 0;
   const int *bb = nt_arr(nt, stmts, "body", &n);
   int tail = (bb && n > 0) ? bb[n - 1] : stmts;
-  tail = an_unparen(nt, tail);   /* `([])` is `[]` */
+  tail = nt_paren_single(nt, tail);   /* `([])` is `[]` */
   if (tail < 0) return TY_UNKNOWN;
-  const char *ty = nt_type(nt, tail);
+  NodeKind tk = nt_kind(nt, tail);
   int len = 0;
-  if (ty && sp_streq(ty, "ArrayNode")) {
+  if (tk == NK_ArrayNode) {
     nt_arr(nt, tail, "elements", &len);
     if (len == 0) return TY_POLY_ARRAY;
   }
-  else if (ty && sp_streq(ty, "HashNode")) {
+  else if (tk == NK_HashNode) {
     nt_arr(nt, tail, "elements", &len);
     if (len == 0) return TY_STR_POLY_HASH;
   }
-  else if (ty && sp_streq(ty, "CallNode")) {
+  else if (tk == NK_CallNode) {
     int k = an_empty_container_new(c, tail);
     if (k) return k == 1 ? TY_POLY_ARRAY : TY_STR_POLY_HASH;
   }
@@ -10408,14 +10471,14 @@ static TyKind infer_array_literal(Compiler *c, int id) {
       if (et == TY_NIL) et = TY_POLY;
       /* --share-strings: an element stored as the shared handle settles the
          literal in its poly form, whose boxes hold the handle (#6765) */
-      if (et == TY_STRBUF && c->share_strings) et = TY_POLY;
+      if (et == TY_STRBUF && c->share_strings && !g_one_string) et = TY_POLY;   /* (one-String mode: the String Array holds the handle) */
       e = ty_unify(e, et);
     }
     /* ...unless its Strings are all held as handles: the literal is a
        String Array of handles (#8328 step 5) when a local holds it, where its
        container class can take that form (share_strh_gate refuses it
        otherwise, for good) */
-    if (strh_all && (strh_has || share_strh_literal_slot(c, id)) && !share_strh_node_no(c, id) && strh_literal_held(c, id))
+    if (strh_all && !g_one_string && (strh_has || share_strh_literal_slot(c, id)) && !share_strh_node_no(c, id) && strh_literal_held(c, id))
       return TY_STRH_ARRAY;
     if (c->arr_want && id < c->node_cap && ty_is_obj_array(c->arr_want[id]) &&
         e == ty_array_elem(c->arr_want[id]))
@@ -11114,11 +11177,13 @@ TyKind infer_uncached(Compiler *c, int id) {
       if (vt_elem == TY_NIL) vt_elem = TY_POLY;   /* a nil value keeps the hash poly-valued (see the array literal) */
       /* --share-strings: a value stored as the shared handle settles the
          hash in its poly form, whose boxes hold the handle (#6765) */
-      if (vt_elem == TY_STRBUF && c->share_strings) vt_elem = TY_POLY;
+      if (vt_elem == TY_STRBUF && c->share_strings && !g_one_string) vt_elem = TY_POLY;   /* (one-String mode: the typed Hash holds the handle) */
       vt = ty_unify(vt, vt_elem);
     }
     /* symbol keys -> SymPolyHash (boxed values), regardless of value type */
     if (kt == TY_SYMBOL) return TY_SYM_POLY_HASH;
+    /* (one-String mode: a handle keys the String-keyed Hash, ty_hash_of) */
+    if (g_one_string && kt == TY_STRBUF) kt = TY_STRING;
     TyKind hv = ty_hash_of(kt, vt);
     /* No scalar (key,val) variant: the value is poly-stored (a nested hash/
        array/object, or a mix). The key type still selects the hash variant --
@@ -11178,7 +11243,7 @@ TyKind infer_uncached(Compiler *c, int id) {
       return ty_object(s->class_id);
     }
     int p = comp_super_parent(c, s->class_id, s->is_cmethod);
-    const char *uname = comp_super_name(c, p, s->name, s->is_cmethod);
+    const char *uname = comp_super_name(c, p, comp_scope_def_name(c, s), s->is_cmethod);
     /* `super` in a respond_to? override no ancestor defines is Object's
        respond_to?: a boolean (see emit_super_respond_to) */
     int rto_super = !s->is_cmethod && uname &&
@@ -11824,7 +11889,7 @@ int super_reaches_exc_text(Compiler *c, int id, int reopen) {
       !class_is_exc_subclass(c, s->class_id))
     return 0;
   int p = comp_super_parent(c, s->class_id, 0);
-  const char *uname = comp_super_name(c, p, s->name, 0);
+  const char *uname = comp_super_name(c, p, comp_scope_def_name(c, s), 0);
   if (!uname || !is_exception_message(uname) || (p >= 0 && comp_method_in_chain(c, p, uname, NULL) >= 0))
     return 0;
   int xr[8], xn = reopen ? exc_reopen_definers(c, uname, xr, 8) : 0;

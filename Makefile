@@ -762,6 +762,45 @@ RE_MT_OBJ = $(patsubst lib/regexp/%.c,build/mt/regexp/%.o,$(RE_SRC))
 $(SP_RT_MT_LIB): $(RE_MT_OBJ) $(addprefix build/mt/,$(addsuffix .o,$(RT_MEMBERS))) $(PLATFORM_MT_OBJ)
 	$(AR_DET) ar rcs $@ $^
 
+# ---- One-representation String runtime variant (-DSP_ONE_STRING) ----
+# Same sources, compiled with -DSP_ONE_STRING: every String slot is the
+# handle (docs/internals/string-one-repr-design.md). Linked when the program
+# was compiled with --string-repr=handle (the SPINEL_ONE_STRING marker, see
+# runtime_archive in src/main.c). Temporary: it goes when the mode is the
+# only one.
+SP_RT_ONE_LIB = lib/libspinel_rt_one.a
+ONE_DEF = -DSP_ONE_STRING
+
+build/one/regexp/%.o: lib/regexp/%.c $(RE_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(COPT) $(SEC_FLAGS) $(ONE_DEF) -Ilib/regexp -Ilib/regexp/shim $< -o $@
+
+build/one/%.o: lib/%.c $(RT_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(ONE_DEF) -Ilib -Ilib/regexp -Ilib/regexp/shim $< -o $@
+
+RE_ONE_OBJ = $(patsubst lib/regexp/%.c,build/one/regexp/%.o,$(RE_SRC))
+
+$(SP_RT_ONE_LIB): $(RE_ONE_OBJ) $(addprefix build/one/,$(addsuffix .o,$(RT_MEMBERS))) $(PLATFORM_OBJ)
+	$(AR_DET) ar rcs $@ $^
+
+# ...and its threaded twin, for a program that uses Thread & co. under the
+# mode (-DSP_ONE_STRING with the mt archive's -DSP_THREADS)
+SP_RT_ONE_MT_LIB = lib/libspinel_rt_one_mt.a
+
+build/one-mt/regexp/%.o: lib/regexp/%.c $(RE_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(COPT) $(SEC_FLAGS) $(ONE_DEF) $(MT_DEF) -Ilib/regexp -Ilib/regexp/shim $< -o $@
+
+build/one-mt/%.o: lib/%.c $(RT_HDRS)
+	@mkdir -p $(@D)
+	$(CC) -c $(COPT) -Wno-all $(SEC_FLAGS) $(ONE_DEF) $(MT_DEF) -Ilib -Ilib/regexp -Ilib/regexp/shim $< -o $@
+
+RE_ONE_MT_OBJ = $(patsubst lib/regexp/%.c,build/one-mt/regexp/%.o,$(RE_SRC))
+
+$(SP_RT_ONE_MT_LIB): $(RE_ONE_MT_OBJ) $(addprefix build/one-mt/,$(addsuffix .o,$(RT_MEMBERS))) $(PLATFORM_MT_OBJ)
+	$(AR_DET) ar rcs $@ $^
+
 # ---- ThreadSanitizer build of the threaded runtime (Phase 1 validation) ----
 # The gate links a threaded test against the mt archive, as the driver does,
 # but uninstrumented, so a race shows only when it corrupts the output. This
@@ -976,7 +1015,7 @@ wasm-test: $(SPINEL) wasm-rt
 	done; \
 	rm -rf $$tmp; [ $$ok -eq 1 ]
 
-regexp: $(SP_RT_LIB) $(SP_RT_MT_LIB)
+regexp: $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SP_RT_ONE_LIB) $(SP_RT_ONE_MT_LIB)
 
 # ---- In-tree developer tools ----
 
@@ -1535,7 +1574,7 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	@tmp=$$(mktemp -d /tmp/spinel-ext.XXXXXX); ok=1; \
 	$(SPINEL) test/ext/kernel.rb -c --no-line-map \
 	  --ext-init Init_ext_kernel \
-	  --ext-entry ExtKernel.triple,ExtKernel.shout,ExtKernel.total,ExtKernel.must_pos,ExtKernel.opt_inc,ExtKernel.find_pos \
+	  --ext-entry ExtKernel.triple,ExtKernel.shout,ExtKernel.total,ExtKernel.must_pos,ExtKernel.opt_inc,ExtKernel.label,ExtKernel.find_pos \
 	  -o "$$tmp/k.c" >/dev/null 2>&1 || { echo "ext-test: FAIL (emission)"; ok=0; }; \
 	printf 'module M\n  def self.eat(a)\n    a.sort!\n  end\nend\nif __FILE__ == $$0\n  M.eat([2, 1])\nend\n' > "$$tmp/mut.rb"; \
 	if $(SPINEL) "$$tmp/mut.rb" -c --no-line-map --ext-init spx_i --ext-entry M.eat -o "$$tmp/m.c" >"$$tmp/m.out" 2>&1; then \
@@ -4460,6 +4499,9 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -A1 -E '_t[0-9]+ = lv_env;' "$$tmp/rfp_w.c" | grep -q 'SP_GC_ROOT(_t' || { echo "infer-test: FAIL (a reassigned parameter's argument temp lost its root)"; ok=0; }; \
 	$(SPINEL) test/infer/hash_one_class_each_value.rb -c --no-line-map -o "$$tmp/hoc.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (hash_one_class_each_value: -c)"; ok=0; }; \
 	grep -q 'sp_Item \* lv_it' "$$tmp/hoc.c" && grep -q 'sp_Item_describe((sp_Item \*)lv_it)' "$$tmp/hoc.c" || { echo "infer-test: FAIL (#4846 a one-class hash's each_value is not typed)"; ok=0; }; \
+	$(SPINEL) test/hash_one_class_value_unbox.rb -c --no-line-map -o "$$tmp/hcu.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (hash_one_class_value_unbox: -c)"; ok=0; }; \
+	awk '/^static inline void \*sp_poly_unbox_cls\(.*\)\{/,/^}/' "$$tmp/hcu.c" > "$$tmp/hcu_u.c"; \
+	grep -q 'sp_poly_unbox_cls(sp_StrPolyHash_get(lv_h, lv_key), 0,' "$$tmp/hcu.c" && grep -q 'v.cls_id==cls))return v.v.p;' "$$tmp/hcu_u.c" && ! grep -q 'sp_class_le' "$$tmp/hcu_u.c" || { echo "infer-test: FAIL (a one-class Hash's object read walks the class chain instead of checking the class id inline)"; ok=0; }; \
 	$(SPINEL) test/boxed_recv_class_set_binding.rb -c --no-line-map -o "$$tmp/bcs.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (boxed_recv_class_set_binding: -c)"; ok=0; }; \
 	grep -q 'sp_int sp_Seq_output(sp_Seq \*self, sp_int lv_col, sp_int lv_shift)' "$$tmp/bcs.c" || { echo "infer-test: FAIL (#8530 a call on a boxed receiver bound the parameters of a class it never holds)"; ok=0; }; \
 	$(SPINEL) test/class_ancestor_tests_dynamic.rb -c --no-line-map -o "$$tmp/cat.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (class_ancestor_tests_dynamic: -c)"; ok=0; }; \
@@ -4554,6 +4596,8 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -qE '_hcd[0-9]+_[0-9]+\[lv_(m|q|r|w|x|y|z)\]' "$$tmp/lbi.c" && { echo "infer-test: FAIL (a read whose index the loop does not keep in range lost its bounds test)"; ok=0; }; \
 	grep -qE 'while \((\(\{ .*; )?\(lv_i < _hcl[0-9]+_[0-9]+\)' "$$tmp/lbi.c" || { echo "infer-test: FAIL (a loop that reads a[i] untested does not test i against the cached length)"; ok=0; }; \
 	grep -qE 'lv_(m|q|r|w|y|z) < _hcl' "$$tmp/lbi.c" && { echo "infer-test: FAIL (a loop whose index is not kept in range tests it against the cached length)"; ok=0; }; \
+	$(SPINEL) test/index_read_under_size_local.rb -c --no-line-map -o "$$tmp/irs.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (index_read_under_size_local: -c)"; ok=0; }; \
+	grep -q 'sp_int lv_kk = 0;' "$$tmp/irs.c" && grep -q 'sp_int lv_sx = 0;' "$$tmp/irs.c" || { echo "infer-test: FAIL (a read under n = a.size, or under a loop that only grows an array, is still nil-capable)"; ok=0; }; \
 	$(SPINEL) test/loop_bounded_index_polls.rb -c --no-line-map -o "$$tmp/lbp.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_bounded_index_polls: -c)"; ok=0; }; \
 	grep -F 'while (({ if (SP_UNLIKELY(SP_SAFEPOINT_POLL())) sp_safepoint(), _SP_HCR' "$$tmp/lbp.c" | grep -qF 'sp_fin_run_pending(), _SP_HCR' && grep -qE '_hcd[0-9]+_[0-9]+\[lv_i\]' "$$tmp/lbp.c" || { echo "infer-test: FAIL (a loop that reads a[i] untested does not poll ahead of its i < a.length test)"; ok=0; }; \
 	awk '/^[a-z].* sp_total\(.*\{$$/,/^}/' "$$tmp/lbp.c" | awk 'f { print; exit } /while \(\(\{/ { f = 1 }' | grep -qE 'SP_SAFEPOINT_POLL|SP_FIN_POLL|sp_fin_run_pending' && { echo "infer-test: FAIL (a loop that reads a[i] untested polls between its test and the read)"; ok=0; }; \

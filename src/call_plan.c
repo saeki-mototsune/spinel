@@ -54,9 +54,25 @@ static const char *cplan_reopen_class(TyKind rt) {
   case TY_FIBER:  return "Fiber";
   case TY_RANDOM: return "Random";
   case TY_CLASS:  return "Class";
-  case TY_BOOL:   return "TrueClass";
   default:        return NULL;
   }
+}
+
+/* The methods a TrueClass and a FalseClass reopen define of a call's name,
+   each -1 where that class has none of its own. A true or false receiver
+   reaches its own class's method; the other value keeps the builtin (or
+   CRuby's NoMethodError). 1 when either class has one. */
+int cplan_bool_sides(Compiler *c, int id, int *tmi, int *fmi) {
+  *tmi = *fmi = -1;
+  const char *name = nt_str(c->nt, id, "name");
+  if (!name || nt_int(c->nt, id, "builtin_only", 0)) return 0;
+  static const char *const CN[2] = { "TrueClass", "FalseClass" };
+  for (int k = 0; k < 2; k++) {
+    int ci = comp_class_index(c, CN[k]);
+    int mi = ci >= 0 ? comp_method_in_chain(c, ci, name, NULL) : -1;
+    if (mi >= 0 && c->scopes[mi].class_id == ci) *(k ? fmi : tmi) = mi;
+  }
+  return *tmi >= 0 || *fmi >= 0;
 }
 
 /* a program's own Object method, for a name Object's builtin surface does
@@ -118,7 +134,7 @@ static void cplan_resolve_super(Compiler *c, int id, CallPlan *p) {
     return;
   }
   int par = comp_super_parent(c, s->class_id, s->is_cmethod);
-  const char *uname = comp_super_name(c, par, s->name, s->is_cmethod);
+  const char *uname = comp_super_name(c, par, comp_scope_def_name(c, s), s->is_cmethod);
   if (!uname) return;
   int mi = cplan_super_chain_mi(c, s, par, uname);
   if (mi >= 0) cplan_set(p, mi, par, UC_SUPER, CP_DIRECT);
@@ -398,6 +414,15 @@ static void cplan_resolve_call(Compiler *c, int id, CallPlan *p) {
     int emi = eci >= 0 ? comp_method_in_chain(c, eci, name, NULL) : -1;
     if (emi >= 0) {
       cplan_set(p, emi, eci, UC_REOPEN, io_reopen_ret_mixed(c, name) ? CP_SWITCH : CP_DIRECT);
+      return;
+    }
+  }
+  /* true and false: each value's own class (cplan_bool_sides) */
+  if (rt == TY_BOOL) {
+    int tmi, fmi;
+    if (cplan_bool_sides(c, id, &tmi, &fmi)) {
+      int mi = tmi >= 0 ? tmi : fmi;
+      cplan_set(p, mi, c->scopes[mi].class_id, UC_REOPEN, CP_SWITCH);
       return;
     }
   }
@@ -2804,7 +2829,9 @@ int cplan_nil(Compiler *c, int id) {
      after it has converted the argument, and the argument's TypeError came
      first where CRuby raises NoMethodError, having run the arguments. (A
      mutator writes back into the slot the head would hold.) */
-  int conv = rt == TY_STRING && !an_str_mutator_name(nm) && cplan_nil_arg_converts(c, id);
+  /* (one-String mode: every String slot is the handle, TY_STRBUF) */
+  int conv = (rt == TY_STRING || (g_one_string && rt == TY_STRBUF)) && !an_str_mutator_name(nm) &&
+             cplan_nil_arg_converts(c, id);
   /* (and see cplan_nil_ivar_tested) */
   NodeKind rk = nt_kind(nt, r);
   int ivar_tested = rk == NK_InstanceVariableReadNode && cplan_nil_ivar_tested(c, r, rt, nm);
@@ -2823,8 +2850,11 @@ int cplan_nil(Compiler *c, int id) {
     Repr sr = repr_of_slot(c, lv);
     if (!lv || !(sr.kind == RK_STRBUF || (sr.kind == RK_PTR && sr.as_ty == rt))) return CN_NONE;
   }
-  /* a shared String's handle a call renders is not bound like a value */
-  else if (rr.kind == RK_STRBUF) return CN_NONE;
+  /* a shared String's handle a call renders is not bound like a value
+     (one-String mode: an ivar's is its slot's, held by the head as a
+     local's is; every ivar String is the handle there, where the
+     default mode tests one the plan leaves untested in its arms) */
+  else if (rr.kind == RK_STRBUF && !(g_one_string && (ivar_tested || conv))) return CN_NONE;
   /* a nil the program writes (an element of an Array it stores one into
      or leaves a gap in, too); not one the fact cannot bound (an element
      read, a global, an ivar, a caller not seen, a builtin's answer), which

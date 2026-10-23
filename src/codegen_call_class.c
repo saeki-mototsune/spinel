@@ -725,9 +725,16 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     else if (cs_aty && sp_streq(cs_aty, "StringNode")) cs_qm = nt_str(nt, argv[0], "content");
     if (cs_qm) {
       LocalVar *cv = comp_const(c, cs_qm);
-      if (cv && cv->type != TY_UNKNOWN && repr_of(c, argv[1]).as_ty == cv->type) {
-        buf_printf(b, "(cst_%s = ", cs_qm);
+      TyKind cs_vt = repr_of(c, argv[1]).as_ty;
+      /* (one-String mode: a String of the other face, through SP_STR_HDL /
+         SP_STR_B) */
+      const char *cs_face = !g_one_string || !cv ? NULL
+                          : cv->type == TY_STRBUF && cs_vt == TY_STRING ? "SP_STR_HDL("
+                          : cv->type == TY_STRING && cs_vt == TY_STRBUF ? "SP_STR_B(" : NULL;
+      if (cv && cv->type != TY_UNKNOWN && (cs_vt == cv->type || cs_face)) {
+        buf_printf(b, "(cst_%s = %s", cs_qm, cs_face ? cs_face : "");
         emit_expr(c, argv[1], b);
+        if (cs_face) buf_puts(b, ")");
         if (const_has_flag(cv)) buf_printf(b, ", cst_%s__set = 1", cs_qm);
         buf_printf(b, ", cst_%s)", cs_qm);
         return 1;
@@ -1724,6 +1731,12 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
             /* literal false/nil: fall through to the plain 1-arg call */
           }
         }
+        /* one String representation: a handle argument's read publishes it
+           to the deep-return channel, which a caller's pickup would take for
+           this new String; the answer clears it, as the method's own body
+           does (sp_strface_unpub) */
+        int nv_unpub = g_one_string && (nv_cstr_ret || nv_bin_ret);
+        if (nv_unpub) buf_puts(b, "sp_strface_unpub(");
         if (nv_cstr_ret) buf_puts(b, "sp_str_dup_external(");
         /* Sequence the call before the sp_ffi_bin_len read: C leaves argument
            evaluation order unspecified, so bind the result to a temp first. */
@@ -1745,6 +1758,7 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
         if (nv_bin_ret)
           buf_printf(b, "; sp_str_as_binary(sp_str_from_bytes(_t%d, (size_t)(sp_ffi_bin_len < 0 ? 0 : sp_ffi_bin_len))); })",
                      nv_bin_tmp);
+        if (nv_unpub) buf_puts(b, ")");
         return 1;
       }
     }
@@ -1914,6 +1928,14 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
                  bytes; nil is FFI's NULL, anything else a TypeError (#5679) */
               buf_puts(&call_buf, "sp_poly_arg_str_or_null("); emit_expr(c, argv[ai], &call_buf); buf_puts(&call_buf, ")");
             }
+            /* (one-String mode: a variable's String is its handle, and C is
+               handed its live buffer only where no Ruby code can run during
+               the call (mark_native_str_operands, strbuf_read_raw); a
+               callback or a trap could grow the String and free the buffer,
+               so elsewhere C reads a copy, as the default mode's read is) */
+            else if (g_one_string && !c->strbuf_read_raw[argv[ai]] && strbuf_slot_has(c, argv[ai])) {
+              buf_puts(&call_buf, "sp_str_dup(SP_STR_B("); emit_expr(c, argv[ai], &call_buf); buf_puts(&call_buf, "))");
+            }
             else {
               /* An UNKNOWN argument lowers to the gate's raise token, an
                  sp_RbVal -- it cannot land raw in a const char* slot
@@ -2060,7 +2082,9 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           buf_printf(b, "sp_box_foreign_ptr((void *)(%s))", call_buf.p);
         }
         else if (is_str_ret) {
-          buf_printf(b, "sp_str_dup_external(%s)", call_buf.p);
+          /* (one representation: the answer clears the channel a handle
+             argument's read published, as a native_func's does) */
+          buf_printf(b, g_one_string ? "sp_strface_unpub(sp_str_dup_external(%s))" : "sp_str_dup_external(%s)", call_buf.p);
         }
         else if (is_binstr_ret) {
           /* Binary-safe: build the String from the exact byte count the callee
@@ -2069,9 +2093,9 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
              leaves argument evaluation order unspecified -- via a temp. Tagged
              BINARY for the reason the `cbinstr` arm above gives. */
           int tp = ++g_tmp;
-          buf_printf(b, "({ const char *_t%d = %s; "
+          buf_printf(b, "({ const char *_t%d = %s; %s"
                         "sp_str_as_binary(sp_str_from_bytes(_t%d, (size_t)(sp_ffi_bin_len < 0 ? 0 : sp_ffi_bin_len))); })",
-                     tp, call_buf.p, tp);
+                     tp, call_buf.p, g_one_string ? "_sp_ret_strbuf = NULL; " : "", tp);
         }
         else {
           /* numeric / bool: cast to sp_int or sp_float */
@@ -5210,50 +5234,6 @@ int emit_call_reopen_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
           buf_puts(b, open ? "); })" : ")");
           return 1;
         }
-      }
-    }
-    /* bool: dispatch based on value to correct TrueClass/FalseClass impl */
-    if (rt == TY_BOOL) {
-      int tc_ci = comp_class_index(c, "TrueClass");
-      int fc_ci = comp_class_index(c, "FalseClass");
-      int tc_mi = tc_ci >= 0 ? comp_method_in_chain(c, tc_ci, name, NULL) : -1;
-      int fc_mi = fc_ci >= 0 ? comp_method_in_chain(c, fc_ci, name, NULL) : -1;
-      if (tc_mi >= 0 && fc_mi >= 0) {
-        /* both defined: ternary dispatch */
-        if (g_plan_check) { ucall_observe(c, id, tc_mi, tc_ci, 1); ucall_observe(c, id, fc_mi, fc_ci, 1); }
-        int bt = ++g_tmp;
-        emit_indent(g_pre, g_indent);
-        buf_printf(g_pre, "int _t%d = ", bt); emit_expr(c, recv, g_pre); buf_puts(g_pre, ";\n");
-        buf_printf(b, "(_t%d ? sp_TrueClass_%s(_t%d", bt, mc(name), bt);
-        emit_args_filled(c, tc_mi, nt_ref(nt, id, "arguments"), ", ", b);
-        buf_printf(b, ") : sp_FalseClass_%s(_t%d", mc(name), bt);
-        emit_args_filled(c, fc_mi, nt_ref(nt, id, "arguments"), ", ", b);
-        buf_puts(b, "))");
-        return 1;
-      }
-      if (tc_mi >= 0) {
-        /* only TrueClass defined */
-        if (g_plan_check) ucall_observe(c, id, tc_mi, tc_ci, 0);
-        buf_printf(b, "sp_TrueClass_%s(", mc(name));
-        emit_expr(c, recv, b);
-        emit_args_filled(c, tc_mi, nt_ref(nt, id, "arguments"), ", ", b);
-        buf_puts(b, ")");
-        return 1;
-      }
-      if (fc_mi >= 0) {
-        /* only FalseClass defined: ternary still needed */
-        if (g_plan_check) ucall_observe(c, id, fc_mi, fc_ci, 0);
-        int bt = ++g_tmp;
-        emit_indent(g_pre, g_indent);
-        buf_printf(g_pre, "int _t%d = ", bt); emit_expr(c, recv, g_pre); buf_puts(g_pre, ";\n");
-        buf_printf(b, "(_t%d ? (", bt);
-        buf_printf(b, "sp_FalseClass_%s(_t%d", mc(name), bt);
-        emit_args_filled(c, fc_mi, nt_ref(nt, id, "arguments"), ", ", b);
-        buf_puts(b, "), 0) : sp_FalseClass_");
-        buf_printf(b, "%s(_t%d", mc(name), bt);
-        emit_args_filled(c, fc_mi, nt_ref(nt, id, "arguments"), ", ", b);
-        buf_puts(b, "))");
-        return 1;
       }
     }
     /* Hash reopening: any hash-typed receiver -> box to sp_RbVal */

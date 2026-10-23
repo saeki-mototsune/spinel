@@ -166,7 +166,9 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
        definition's name (#3729). */
     /* (a method a prepend or an extend moved behind another of its name
        runs under a shadow name, `__prep_0_go`: the name as written) */
-    const char *mn = s ? comp_prep_user_name(s->name) : NULL;
+    /* (and one an alias captured ahead of a redefinition runs under the
+       alias, alias_capture_earlier_def: the name its def has) */
+    const char *mn = s ? comp_prep_user_name(comp_scope_def_name(c, s)) : NULL;
     if (mn && mn[0] && sp_streq(name, "__callee__"))
       buf_printf(b, "(_sp_cal ? sp_sym_intern(_sp_cal) : (sp_sym)%d)", comp_sym_intern(c, mn));
     else if (mn && mn[0]) buf_printf(b, "(sp_sym)%d", comp_sym_intern(c, mn));
@@ -671,7 +673,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       buf_printf(g_pre, "const char *_t%d = %s; SP_GC_ROOT_STR(_t%d);\n", tf, fb.p ? fb.p : "", tf);
       free(fb.p);
       emit_pre_format_args(c, av, ac, ta);
-      buf_printf(b, "sp_str_format_polyarr(_t%d, _t%d)", tf, ta);
+      buf_printf(b, g_one_string ? "sp_str_format_polyarr(SP_STR_B(_t%d), _t%d)" : "sp_str_format_polyarr(_t%d, _t%d)", tf, ta);
       return 1;
     }
     if (sp_streq(name, "rand")) {
@@ -1203,16 +1205,28 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
            the same only-this-invocation matching). Rooted for the body's
            duration -- the body can allocate. */
         emit_indent(g_pre, g_indent);
+        if (g_one_string) {
+          /* (one representation: the tag is a handle, which the block
+             parameter holds and a throw hands on as one, so the catch
+             registers the handle itself, matched by identity as a handle) */
+          buf_printf(g_pre, "sp_String *_ctagh%d = sp_String_new_shared(sp_sprintf(\"#<catch:%%lld>\", (long long)++sp_catch_seq)); SP_GC_ROOT(_ctagh%d);\n", t, t);
+          emit_indent(g_pre, g_indent);
+          buf_printf(g_pre, "const char *_ctag%d = (const char *)(void *)_ctagh%d; (void)_ctag%d;\n", t, t, t);
+        }
+        else {
         buf_printf(g_pre, "const char *_ctag%d = sp_sprintf(\"#<catch:%%lld>\", (long long)++sp_catch_seq);\n", t);
         emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT_STR(_ctag%d);\n", t);
+        }
         emit_indent(g_pre, g_indent); buf_printf(g_pre, "sp_catch_tag[sp_catch_top] = _ctag%d;\n", t);
         /* matched by identity, as the block parameter holding this very tag
            is: a copy of it (`tag.dup`) is another object */
-        tag_kind = 2;
+        tag_kind = g_one_string ? 3 : 2;
         const char *bp0 = block_param_name(c, blk, 0);
         if (bp0) {
           emit_indent(g_pre, g_indent);
-          buf_printf(g_pre, "lv_%s = _ctag%d;\n", rename_local(bp0), t);
+          /* (one representation: in the parameter slot's face) */
+          if (g_one_string) buf_printf(g_pre, "lv_%s = SP_STR_TO(lv_%s, _ctagh%d);\n", rename_local(bp0), rename_local(bp0), t);
+          else buf_printf(g_pre, "lv_%s = _ctag%d;\n", rename_local(bp0), t);
         }
       }
       if (tag_kind >= 0) {
@@ -1316,7 +1330,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     return 1;
   }
 
-  /* system(cmd, ...) expr: run and return bool */
+  /* system(cmd, ...) expr: run, and answer true, false or nil */
   if (recv < 0 && sp_streq(name, "system") && argc >= 1 && !bare_call_class_owned(c, id)) {
     if (emit_system_splat(c, id, argv, argc, b)) return 1;
     system_refuse_unsupported(c, id, argv, argc);
@@ -1330,7 +1344,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     }
     buf_printf(b, "const char *_sys_%d[] = { ", ts);
     for (int k = 0; k < argc; k++) { if (k > 0) buf_puts(b, ", "); buf_printf(b, "_sys_%d_%d", ts, k); }
-    buf_printf(b, ", NULL }; (sp_bool)sp_system_args(%d, _sys_%d); })", argc, ts);
+    buf_printf(b, ", NULL }; sp_system_answer(sp_system_args(%d, _sys_%d)); })", argc, ts);
     return 1;
   }
   /* trap(...) / Signal.trap(...): install the handler (a string command or a
@@ -1695,8 +1709,8 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
           if (fhandle) buf_printf(b, "; SP_GC_ROOT(_t%d)", td);
         }
         /* the name is checked after the default evaluates, as CRuby does */
-        buf_printf(b, "; const char *_t%d = getenv(%s_t%d%s); ", tk, env_str_checked(c, argv[0]) ? "sp_env_chk(" : "",
-                   tky, env_str_checked(c, argv[0]) ? ", 0)" : "");
+        buf_printf(b, "; const char *_t%d = getenv(%s%s_t%d%s%s); ", tk, env_str_checked(c, argv[0]) ? "sp_env_chk(" : "",
+                   g_one_string ? "SP_STR_B(" : "", tky, g_one_string ? ")" : "", env_str_checked(c, argv[0]) ? ", 0)" : "");
         emit_ctype(c, fpoly ? TY_POLY : TY_STRING, b);
         buf_printf(b, " _t%d = _t%d ? ", tv, tk);
         if (fhandle) buf_printf(b, "(_sp_ret_strbuf = NULL, sp_env_str(_t%d)) : ", tk);

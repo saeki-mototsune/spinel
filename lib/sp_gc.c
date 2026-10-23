@@ -475,6 +475,12 @@ size_t sp_gc_mk_promo_bytes = 0;
    0xfa -> 0xf8, reset by the list sweep that frees or promotes it). */
 void sp_gc_mark_str(const char *s) {
   sp_str_hdr *h = ((sp_str_hdr *)(s - 1)) - 1;
+#ifdef SP_ONE_STRING
+  /* a String born inside its handle (sp_str_alloc_born) lives as the
+     handle's GC object */
+  { void *o = SP_STR_BORN_LINK(h);
+    if (o && (char *)o + sizeof(struct sp_String_s) == (char *)h) { sp_gc_mark(o); return; } }
+#endif
   if (sp_slab_owns(h)) {
     int wy;
     /* SPINEL_GC_VERIFY: a string slot the sweep has freed is nobody's to
@@ -495,6 +501,14 @@ void sp_gc_mark_str(const char *s) {
 #endif
 }
 void sp_gc_mark(void*obj){if(!obj)return;unsigned char pm=((unsigned char*)obj)[-1];if((pm|0x04)==0xfe){sp_gc_mark_str((const char*)obj);return;}
+#ifdef SP_ONE_STRING
+  /* one representation (string-one-repr-design.md): the bytes of a handle's
+     payload (marker 0xfd) are held as a String's read face, in a root, a
+     Hash key or a box, so they keep the handle alive: the payload's owner
+     link (sp_fd_own) names it. (The root fiber's guard byte is 0xff under
+     this build, sp_fiber.c, so nothing else is marked 0xfd.) */
+  if(pm==0xfd){sp_str_hdr*fh=(sp_str_hdr*)((char*)obj-sizeof(sp_str_hdr)-1);if(fh->next)sp_gc_mark((void*)fh->next);return;}
+#endif
   if(pm==0xfc||pm==0xff||pm==0xfd||pm==0xf1||pm==0xfb||pm==0xf8)return;sp_gc_hdr*h=(sp_gc_hdr*)((char*)obj-sizeof(sp_gc_hdr));if(sp_gc_verify&&!sp_gc_obj_registered(h))sp_gc_verify_fail(obj,h);if(sp_gc_verify_probe_on){if(!h->old&&h->marked==sp_gc_verify_probe)sp_gc_verify_probe_hit=1;return;}if(sp_gc_young_probe_on){if(!h->old)sp_gc_young_probe_hit=1;return;}if(sp_gc_root_phase&&!h->old)h->aged=1;
   int was_young=0;
 #ifdef SP_THREADS

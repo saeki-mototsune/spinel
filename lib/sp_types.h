@@ -174,7 +174,12 @@ typedef struct{sp_float first;sp_float last;sp_int excl;unsigned char omitted;un
    Symbols' names; Symbol#succ is String#succ on the name, so the walk and
    the comparisons are the String Range's, and the readers that answer an
    end or a member make the Symbol of it (sp_srange_box_end). */
+#ifdef SP_ONE_STRING
+/* (one representation: the endpoints' handles typed, which the face macros read as the handle) */
+typedef struct{const char *first;const char *last;unsigned char excl;unsigned char unfrozen;unsigned char sym;struct sp_String_s *hf;struct sp_String_s *hl;}sp_StrRange;
+#else
 typedef struct{const char *first;const char *last;unsigned char excl;unsigned char unfrozen;unsigned char sym;void *hf;void *hl;}sp_StrRange;
+#endif
 /* A class value. `name`, when non-NULL, is a rodata class name carried by a
    class whose cls_id table entry may not exist (an exception's class -- the
    Errno:: family and many builtin error classes have no assigned cls_id). It
@@ -253,6 +258,11 @@ typedef struct sp_gc_hdr { struct sp_gc_hdr *next; void (*finalize)(void *); voi
    `hash` caches sp_str_hash for heap/heap-frozen keys; 0 == not yet
    computed, invalidated to 0 on any in-place mutation (setbyte/set_len). */
 typedef struct sp_str_hdr { struct sp_str_hdr *next; uint32_t size; uint32_t len; uint64_t hash; } sp_str_hdr;
+/* One String representation, U2 (sp_str_alloc_born): a heap String's link
+   to the handle it was born in, bit 1 set when the runtime keeps the String
+   (sp_str_retained) */
+#define SP_STR_BORN_KEPT ((uintptr_t)2)
+#define SP_STR_BORN_LINK(h) ((void *)((uintptr_t)(h)->next & ~SP_STR_BORN_KEPT))
 
 /* ---- Typed arrays ---- */
 #define SP_STRARR_INLINE 4
@@ -291,7 +301,65 @@ typedef struct{void**data;sp_int len;sp_int cap;void(*scan_elem)(void*);sp_int f
 #define SP_PTR_ELEM_INT_ROWS 2   /* sp_IntArray rows (Array[Array[Integer]]) */
 #define SP_PTR_ELEM_FLT_ROWS 3   /* sp_FloatArray rows (Array[Array[Float]]) */
 #define SP_PTR_ELEM_STRBUF   4   /* sp_String handles: a String Array whose Strings are shared (--share-strings) */
-typedef struct{const char**data;sp_int len;sp_int cap;sp_int frozen;const char*inline_data[SP_STRARR_INLINE];}sp_StrArray;
+/* the element of a String Array (and a String Hash's value): the handle
+   under SP_ONE_STRING, the bytes otherwise (sp_string.h's SP_SEB / SP_SEF) */
+/* the shared String handle (sp_string.h); sp_fd_publish reads `binary` and
+   `chilled` as one word */
+struct sp_String_s { char *data; int64_t len; int64_t cap; unsigned binary; unsigned chilled; };
+#ifdef SP_ONE_STRING
+typedef struct sp_String_s *sp_strelem;
+#else
+typedef const char *sp_strelem;
+#endif
+typedef struct{sp_strelem*data;sp_int len;sp_int cap;sp_int frozen;sp_strelem inline_data[SP_STRARR_INLINE];}sp_StrArray;
+/* One representation (SP_ONE_STRING, string-one-repr-design.md): an element
+   of a String container -- an Array's, a Hash's value -- is the String handle,
+   so a change through any name shows in the container. Without the mode it
+   is the bytes, as it always was; these spell the difference once. Each
+   expands where it is used, so a user names only what it includes.
+     SP_SEB(e)  the bytes of element e (NULL for nil), what the byte-level
+                builtins read; SP_SEBN(e) the same for an element the caller
+                has tested is not nil;
+     SP_SEF(b)  an element made of fresh bytes b a builtin produced: the
+                handle that adopts them, or b itself;
+     SP_SEM(e)  mark element e for the collector;
+     SP_SER(e)  root element e across an allocation;
+     SP_SEBOX(e) element e boxed (nil for NULL);
+     SP_SEH(e)  element e as the shared handle (NULL for NULL);
+     SP_SEK(k)  the element a Hash key k (frozen bytes) stands for;
+     SP_SEBOXN(e) element e boxed, nil for NULL (sp_box_nullable_str's);
+     SP_SEE     a new empty element (`""`). */
+#ifdef SP_ONE_STRING
+/* sp_String_new_shared and sp_String_key_handle are sp_string.h's: a file
+   that expands SP_SEF or SP_SEK includes it (sp_str.h does under the mode) */
+/* (each evaluates its operand once: `SP_SEBOX(sp_StrArray_pop_e(a))` popped
+   twice and boxed the second, empty, answer) */
+#define SP_SEB(e) ({ struct sp_String_s *_seb_e = (e); _seb_e ? _seb_e->data : (const char *)NULL; })
+#define SP_SEBN(e) ((e)->data)
+#define SP_SEF(b) sp_String_new_shared(b)
+/* the same for a header ahead of sp_string.h (sp_string.c) */
+struct sp_String_s *sp_strelem_of(const char *b);
+#define SP_SEFX(b) sp_strelem_fx(b)   /* sp_array.h: the fast cases inline */
+#define SP_SEM(e) do { if (e) sp_gc_mark((void *)(e)); } while (0)
+#define SP_SER(e) SP_GC_ROOT(e)
+#define SP_SEBOX(e) ({ struct sp_String_s *_sebox_e = (e); _sebox_e ? sp_box_obj((void *)_sebox_e, SP_BUILTIN_STRBUF) : sp_box_nil(); })
+#define SP_SEH(e) (e)
+#define SP_SEK(k) sp_String_key_handle(k)
+#define SP_SEBOXN(e) SP_SEBOX(e)
+#define SP_SEE sp_String_new_shared(sp_str_empty)
+#else
+#define SP_SEB(e) (e)
+#define SP_SEBN(e) (e)
+#define SP_SEF(b) (b)
+#define SP_SEFX(b) (b)
+#define SP_SEM(e) sp_mark_string(e)
+#define SP_SER(e) SP_GC_ROOT_STR(e)
+#define SP_SEBOX(e) sp_box_str(e)
+#define SP_SEH(e) ((e) ? sp_String_new_shared(e) : NULL)
+#define SP_SEK(k) (k)
+#define SP_SEBOXN(e) sp_box_nullable_str(e)
+#define SP_SEE ""
+#endif
 
 /* ---- Non-poly typed hashes ---- */
 /* An Integer-valued hash's miss answers its default: `default_nil` set is a
@@ -301,8 +369,8 @@ typedef struct{const char**data;sp_int len;sp_int cap;sp_int frozen;const char*i
    open-addressing index), NULL until the first nil value is stored; the
    slot's vals word is 0 then (DESIGN.md D3b-ii). */
 typedef struct{const char**keys;sp_int*vals;const char**order;sp_int len;sp_int cap;sp_int mask;sp_int default_v;sp_bool default_nil;uint64_t*vnil;}sp_StrIntHash;
-typedef struct{const char**keys;const char**vals;const char**order;sp_int len;sp_int cap;sp_int mask;const char*default_v;}sp_StrStrHash;
-typedef struct{sp_int*keys;const char**vals;sp_int*order;sp_bool*used;sp_int len;sp_int cap;sp_int mask;const char*default_v;}sp_IntStrHash;
+typedef struct{const char**keys;sp_strelem*vals;const char**order;sp_int len;sp_int cap;sp_int mask;sp_strelem default_v;}sp_StrStrHash;
+typedef struct{sp_int*keys;sp_strelem*vals;sp_int*order;sp_bool*used;sp_int len;sp_int cap;sp_int mask;sp_strelem default_v;}sp_IntStrHash;
 typedef struct{sp_int*keys;sp_int*vals;sp_int*order;sp_bool*used;sp_int len;sp_int cap;sp_int mask;sp_int default_v;sp_bool default_nil;uint64_t*vnil;}sp_IntIntHash;
 
 /* Signal table bound (0..64): shared by the trap state in the generated TU

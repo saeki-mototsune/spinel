@@ -1592,8 +1592,11 @@ static int sh_copied_self_targets(Compiler *c, int call, int *out, int cap);
    Listing every class's method joined the new String `[:a].map(&:inspect)`
    answers with the ivar a class's own inspect publishes, which no Symbol
    reaches (#9258). The fresh walk bounds its targets the same way. */
-int share_target_armed(Compiler *c, int call, int mi) {
-  const CallPlan *p = cplan_user_fresh(c, call);
+/* ... with the call's fresh plan `p` in hand: the facts' target walk asks
+   this of every target of a call, and resolved the plan again for each
+   (cplan_user_fresh keeps nothing), which on a Rails program was 7% of a
+   sampled window of the share pass. */
+static int share_target_armed_plan(Compiler *c, const CallPlan *p, int call, int mi) {
   if (p->via != UC_POLY || p->send_fallback == mi || mi < 0 || mi >= c->nscopes || c->scopes[mi].is_cmethod) return 1;
   int recv = nt_ref(c->nt, call, "receiver");
   /* (a receiver of no type the walk follows the user methods of: with
@@ -1614,13 +1617,19 @@ int share_target_armed(Compiler *c, int call, int mi) {
               c->scopes[mi].class_id >= 0 ? c->classes[c->scopes[mi].class_id].name : "?", nm, cs->n, cs->bv, np); }
   return 0;
 }
+int share_target_armed(Compiler *c, int call, int mi) {
+  return share_target_armed_plan(c, cplan_user_fresh(c, call), call, mi);
+}
 static int sh_targets_in(ShareFacts *F, Compiler *c, int call, int *out, int cap) {
   (void)F;
   int n = cplan_targets(c, call, out, cap), m = 0;
   if (n == CPT_UNKNOWN) return -1;
   if (n == 0) return sh_copied_self_targets(c, call, out, cap);
+  /* the plan once for the call: cplan_user_fresh answers in a buffer the
+     next resolution overwrites, so it is copied */
+  CallPlan p = *cplan_user_fresh(c, call);
   for (int i = 0; i < n; i++)
-    if (share_target_reachable(c, call, out[i]) && share_target_armed(c, call, out[i])) out[m++] = out[i];
+    if (share_target_reachable(c, call, out[i]) && share_target_armed_plan(c, &p, call, out[i])) out[m++] = out[i];
   return m;
 }
 static int sh_targets(Compiler *c, int call, int *out, int cap) { return sh_targets_in(NULL, c, call, out, cap); }
@@ -1883,7 +1892,7 @@ static int sh_builtin(ShareFacts *F, Compiler *c, int n, int share, int rv, int 
      the same new Strings, in the receiver's class, which an iterator over
      it walks as handles as it walks the receiver's (share_node_fresh_elems).
      Not where a reopening or a module may answer the name instead. */
-  int rcv = an_unparen(nt, nt_ref(nt, n, "receiver"));
+  int rcv = nt_paren_single(nt, nt_ref(nt, n, "receiver"));
   if (container == 1 && blk < 0 && rcv >= 0 && rcv < F->nnodes && F->fresh_cont[rcv] &&
       c->ntype[n] == TY_STR_ARRAY && sh_answers_elems_run(share, argc) &&
       !share_builtin_overridden(c, "Array", nt_str(nt, n, "name")))
@@ -2804,10 +2813,10 @@ static int sh_ostruct_call(ShareFacts *F, Compiler *c, int n, const char *name, 
    links walked from each of them was n^2/2 steps. */
 static int sh_self_chain_base(ShareFacts *F, Compiler *c, int n) {
   const NodeTable *nt = c->nt;
-  int start = an_unparen(nt, n);
+  int start = nt_paren_single(nt, n);
   for (n = start; n >= 0 && nt_kind(nt, n) == NK_CallNode; ) {
     if (n < F->nnodes && F->scb[n] >= 0 && F->scb[n] != n) { n = F->scb[n]; continue; }
-    int r = an_unparen(nt, nt_ref(nt, n, "receiver"));
+    int r = nt_paren_single(nt, nt_ref(nt, n, "receiver"));
     TyKind rt = r >= 0 ? c->ntype[r] : TY_VOID;
     const char *nm = nt_str(nt, n, "name");
     if ((rt != TY_STRING && rt != TY_STRBUF) || !nm ||
@@ -6228,7 +6237,7 @@ static int sh_answers_elems_run(int share, int argc) {
    new? */
 static int sh_fresh_elems(Compiler *c, int r, int depth) {
   const NodeTable *nt = c->nt;
-  r = an_unparen(nt, r);
+  r = nt_paren_single(nt, r);
   if (r < 0 || depth > 8) return 0;
   if (nt_kind(nt, r) == NK_ArrayNode) {
     int en = 0; const int *el = nt_arr(nt, r, "elements", &en);
@@ -6339,8 +6348,9 @@ static int sh_call_fresh(Compiler *c, int n, int depth) {
    String with a part to evaluate is built each time: neither is one. */
 int share_frozen_literal(Compiler *c, int n) {
   const NodeTable *nt = c->nt;
-  n = nt_paren_single(nt, n);
-  if (n < 0) return 0;
+  /* parentheses are the frozen literal their value is (vp_one), as
+     share_value_fresh reads them: `(x; "lit")` is "lit" */
+  if (vp_one(nt, n, VPS_NONE | VP_PARENS_ONLY, &n) != VP1_NODE) return 0;
   NodeKind k = nt_kind(nt, n);
   if (k == NK_StringNode) return nt_int(nt, n, "fzl", 0) != 0;
   if (k == NK_InterpolatedStringNode) return nt_int(nt, n, "fzl", 0) != 0 && interp_is_literal_fold(nt, n);
@@ -6473,10 +6483,10 @@ static int sh_fresh_arm_bad(const VpLeaf *lf, void *ud) {
 }
 /* Is value n a new String or nil: a conditional each of whose arms is one
    (or nil), a rescue modifier whose expression and fallback are, or such a
-   leaf? The arms of the conditional are read through the iterator. `depth`
-   bounds the leaves' own chains of calls, not the shapes. */
+   leaf? The arms of the conditional are read through the iterator, and so
+   are parentheses: `(x; s.dup)` is as new as `s.dup`, and `()` is nil.
+   `depth` bounds the leaves' own chains of calls, not the shapes. */
 int share_value_fresh(Compiler *c, int n, int depth) {
-  n = an_unparen(c->nt, n);
   if (n < 0 || depth > 8) return 0;
   ShFresh f = { c, depth };
   return !for_each_value_position(c->nt, n, VPS_IF | VPS_UNLESS, sh_fresh_arm_bad, &f);
@@ -6730,7 +6740,7 @@ static int sh_carry_kind(const Compiler *c, int n, int by_repr, int lift, int *o
       cplan_user((Compiler *)c, u)->dispatch == CP_NONE) {
     int r = nt_ref(c->nt, u, "receiver");
     if (r >= 0 && (share_value_fresh((Compiler *)c, r, 0) || share_node_carries_handle(c, r))) {
-      *op = an_unparen(c->nt, r);
+      *op = nt_paren_single(c->nt, r);
       return SPK_SELF;
     }
   }
@@ -6811,7 +6821,7 @@ static int sh_carry_kind(const Compiler *c, int n, int by_repr, int lift, int *o
      (emit_strbuf_value) */
   if (by_repr && (r.kind == RK_STRBUF || r.strbuf_src != RS_NONE)) return SPK_SLOT;
   if (sh_bang_self_slot(c, n)) {
-    *op = an_unparen(c->nt, nt_ref(c->nt, n, "receiver"));
+    *op = nt_paren_single(c->nt, nt_ref(c->nt, n, "receiver"));
     return SPK_SELF;
   }
   /* a boxed variable's read lifted into the handle (poly_strbuf_lift) */
@@ -7019,6 +7029,11 @@ int share_node_dead(const Compiler *c, int n) {
 
 int share_route_defer(Compiler *c, const ShareRoute *q, const char *msg) {
   if (!c->share_strings) return 0;
+  /* one representation: every route hands the handle on as it is (see
+     share_routes_check), so none is refused, before or after the seal; a
+     route's run-time mark (a scan's length check) is set as for one the
+     facts vouch for */
+  if (g_one_string) { sh_route_rt_mark(c, q); return 1; }
   if (share_node_dead(c, q->site) || share_node_dead(c, q->to)) return 1;
   if (repr_sealed()) {
     if (!sh_route_ok(c, q)) return 0;
@@ -7044,6 +7059,10 @@ int share_route_defer(Compiler *c, const ShareRoute *q, const char *msg) {
 }
 
 void share_routes_check(Compiler *c) {
+  /* one representation: every slot is the handle and a route hands it on
+     as it is (sp_String_new_shared of a handle is that handle), so no
+     route copies; the deferred routes are not refused */
+  if (g_one_string) return;
   for (int i = 0; i < c->nshare_route; i++) {
     const ShareRoute *r = &c->share_route[i];
     /* (a method the program never names runs nothing) */

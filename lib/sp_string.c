@@ -2,6 +2,7 @@
    prepend / insert / replace / dup are off the hot string-building path, so they
    are compiled once here instead of inline in every generated TU. */
 #include "sp_string.h"
+#include "sp_str.h"   /* sp_str_concat (sp_str_keep_copy) */
 #include <string.h>
 
 /* Only evaluated literal handles join these permanent roots; unused
@@ -58,7 +59,10 @@ int sp_fd_grow_inline(sp_String *s, int64_t need){
   char *raw = (char *)malloc(SP_FD_OVH + new_cap);
   if (!raw) return 0;
   char *data = sp_fd_setup(raw);
-  memcpy(data, s->data, (size_t)s->len + 1);
+  /* the whole old room, as the realloc of an outside payload keeps it: a
+     caller may have set len short of bytes it still reads (set_bin of the
+     String's own bytes empties it, then appends them) */
+  memcpy(data, s->data, (size_t)(s->cap > s->len ? s->cap : s->len) + 1);
   s->cap = new_cap; s->data = data; sp_fd_own(s);
   h->size += s->cap + SP_FD_OVH; sp_gc_bytes_add(s->cap + SP_FD_OVH);
   if (!h->finalize) { h->finalize = sp_String_fin; sp_slab_set_fin(h); }
@@ -126,3 +130,18 @@ const char*sp_sym_to_s_chilled(sp_sym id){
   SP_HEAP_UNLOCK();
   return r;
 }
+
+#ifdef SP_ONE_STRING
+struct sp_String_s *sp_strelem_of(const char *b) { return sp_String_new_shared(b); }
+const char *sp_str_keep_copy(const char *s) { return sp_str_concat(s, sp_str_empty); }
+/* A Hash's copy of a mutable String key: a frozen handle over a copy, whose
+   payload is the key (sp_hash_key_str) */
+const char *sp_hash_key_handle_copy(const char *s) {
+  int64_t len = (int64_t)sp_str_byte_len(s);
+  int bin = sp_str_is_binary(s);
+  sp_String *h = sp_String_new_inline_len(s, len);
+  if (bin) { h->binary = 1; sp_fd_publish(h); }
+  sp_String_freeze(h);
+  return h->data;
+}
+#endif

@@ -758,7 +758,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         Buf vb; memset(&vb, 0, sizeof vb);
         emit_strbuf_handle_of(c, nbb[nbn - 1], &vb);
         emit_indent(g_pre, g_indent);
-        buf_printf(g_pre, "sp_String *_t%d = %s; SP_GC_ROOT(_t%d);\n", tr, vb.p ? vb.p : "NULL", tr);
+        buf_printf(g_pre, (g_one_string ? "sp_String *_t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d);\n" : "sp_String *_t%d = %s; SP_GC_ROOT(_t%d);\n"), tr, vb.p ? vb.p : "NULL", tr);
         free(vb.p);
         ie_body_restore(c, nsnap);
         g_self = sv_self; g_self_deref = sv_deref;
@@ -1015,6 +1015,8 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
             else buf_puts(&eb, "0");
             if (an >= 0 && pscalar && repr_of(c, an).kind == RK_BOXED)
               emit_unbox_text(c, plv->type, eb.p ? eb.p : "", g_pre);
+            /* (one representation: the argument of either face into the parameter's, SP_STR_TO) */
+            else if (pdecl && eb.p && one_str_to_open(g_pre, plv->type, "lv_%s", rename_local(pn))) { buf_puts(g_pre, eb.p); buf_puts(g_pre, ")"); }
             else buf_puts(g_pre, eb.p ? eb.p : "0");
             free(eb.p);
           }
@@ -1128,7 +1130,7 @@ static int emit_freeze_recv_handle(Compiler *c, int recv, Buf *b) {
   int th;
   if (strbuf_slot_text(c, recv, &ref) && !strbuf_pickup_may_nil(c, recv)) {
     th = ++g_tmp;
-    buf_printf(b, "({ sp_String *_t%d = %s; ", th, ref.p);
+    buf_printf(b, (g_one_string ? "({ sp_String *_t%d = SP_STR_HDL(%s); " : "({ sp_String *_t%d = %s; "), th, ref.p);
   }
   else if (strbuf_assign_route(c, recv)) {
     th = ++g_tmp;
@@ -1681,6 +1683,13 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       buf_printf(b, ", %d)", sp_streq(name, "clone") ? 1 : 0);
       return 1;
     }
+    /* Dir#dup allocates a distinct, closed object with no path. */
+    if (argc0 == 0 && sp_streq(name, "dup") && recv_t == TY_DIR) {
+      buf_puts(b, "sp_dir_dup_handle(");
+      emit_expr(c, recv, b);
+      buf_puts(b, ")");
+      return 1;
+    }
     /* Proc#dup/#clone: a distinct shallow copy, not the identity shortcut
        below (d.equal?(pr) must be false) (#3048) */
     if (argc0 == 0 && is_dup_clone && recv_t == TY_PROC) {
@@ -1702,14 +1711,19 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       Buf clref; memset(&clref, 0, sizeof clref);
       if (sp_streq(name, "clone") && strbuf_slot_text(c, recv, &clref)) {
         int th = ++g_tmp, tcl = ++g_tmp;
-        buf_printf(b, "({ sp_String *_t%d = %s; const char *_t%d = _t%d ? sp_str_dup(sp_String_cstr(_t%d)) : NULL;"
-                      " _t%d && sp_String_is_frozen(_t%d) ? sp_str_freeze_val(_t%d) : _t%d; })",
+        buf_printf(b, (g_one_string ? "({ sp_String *_t%d = SP_STR_HDL(%s); const char *_t%d = _t%d ? sp_str_dup(sp_String_cstr(_t%d)) : NULL;"
+                      " _t%d && sp_String_is_frozen(_t%d) ? sp_str_freeze_val(_t%d) : _t%d; })" : "({ sp_String *_t%d = %s; const char *_t%d = _t%d ? sp_str_dup(sp_String_cstr(_t%d)) : NULL;"
+                      " _t%d && sp_String_is_frozen(_t%d) ? sp_str_freeze_val(_t%d) : _t%d; })"),
                    th, clref.p, tcl, th, th, tcl, th, tcl, tcl);
         free(clref.p);
         return 1;
       }
       buf_printf(b, "%s(", sp_streq(name, "clone") ? "sp_str_clone_val" : "sp_str_dup");
-      emit_expr(c, recv, b); buf_puts(b, ")"); return 1;
+      /* (one-String mode: a receiver of either face, `(v || TEXT).dup`) */
+      if (g_one_string) buf_puts(b, "SP_STR_B(");
+      emit_expr(c, recv, b);
+      buf_puts(b, g_one_string ? "))" : ")");
+      return 1;
     }
   }
 
@@ -1822,12 +1836,12 @@ static int emit_safe_nav_self_handle(Compiler *c, int id, int recv, Buf *b) {
   int t = ++g_tmp;
   if (hres) buf_puts(b, hb.p);
   else if (repr_of(c, id).kind == RK_BOXED) {
-    buf_printf(b, "({ sp_String *_t%d = %s; ", t, hb.p);
+    buf_printf(b, (g_one_string ? "({ sp_String *_t%d = SP_STR_HDL(%s); " : "({ sp_String *_t%d = %s; "), t, hb.p);
     str_box_handle_tmp(b, t);
     buf_puts(b, "; })");
   }
   else {
-    buf_printf(b, "({ sp_String *_t%d = %s; _t%d ? ", t, hb.p, t);
+    buf_printf(b, (g_one_string ? "({ sp_String *_t%d = SP_STR_HDL(%s); _t%d ? " : "({ sp_String *_t%d = %s; _t%d ? "), t, hb.p, t);
     str_read_handle_tmp(b, t, 1);
     buf_puts(b, " : (const char *)NULL; })");
   }
@@ -2006,14 +2020,22 @@ static int sn_args_run_late(Compiler *c, int id, int recv) {
        read, which runs none unless it changes a String itself) */
     chg |= operand_may_change_string(c, argv[i]) || (!(nd && i == 0) && subtree_may_run_proc(c, argv[i]));
   }
-  if (!chg) return 0;
   NodeKind k = nt_kind(nt, recv);
-  if (k == NK_LocalVariableReadNode || k == NK_InstanceVariableReadNode || k == NK_ClassVariableReadNode ||
-      k == NK_GlobalVariableReadNode) {
+  int var = k == NK_LocalVariableReadNode || k == NK_InstanceVariableReadNode || k == NK_ClassVariableReadNode ||
+            k == NK_GlobalVariableReadNode;
+  /* (one-String mode: a variable's String is read through its slot, so an
+     argument that assigns the variable is asked about too, changing no
+     String) */
+  if (!chg && !(g_one_string && var && argc > 0)) return 0;
+  if (var) {
     const char *vn = nt_str(nt, recv, "name");
     int plain = 1, wrote = 0;
     for (int i = 0; i < argc && plain; i++) plain = sn_runs_no_code(c, argv[i], k, vn, &wrote);
-    if (plain) return 1;
+    if (plain) return chg || !g_one_string ? 1 : 0;
+    /* (one-String mode: the variable holds the handle, which the guard
+       holds in turn: the call reads its String after the arguments, on the
+       String the variable had, as 2 does for a call's handle) */
+    if (g_one_string) return 2;
     /* (an assignment the arguments make themselves leaves the call on the
        String it had) */
     return nd && !wrote ? 3 : 0;
@@ -2307,10 +2329,12 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
           /* the handle the receiver publishes, run once here and read
              after the arguments */
           Buf hb; memset(&hb, 0, sizeof hb);
-          if (emit_strbuf_route(c, recv, &hb)) {
+          int routed = emit_strbuf_route(c, recv, &hb);
+          if (!routed && g_one_string) { emit_strbuf_handle_of(c, nt_paren_single(c->nt, recv), &hb); routed = 1; }
+          if (routed) {
             tsh = ++g_tmp;
             emit_indent(g_pre, g_indent);
-            buf_printf(g_pre, "sp_String *_t%d = %s; SP_GC_ROOT(_t%d);\n", tsh, hb.p, tsh);
+            buf_printf(g_pre, (g_one_string ? "sp_String *_t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d);\n" : "sp_String *_t%d = %s; SP_GC_ROOT(_t%d);\n"), tsh, hb.p, tsh);
             buf_printf(&rsn, "_t%d ? sp_strbuf_read_pub(_t%d) : (const char *)NULL", tsh, tsh);
           }
           else sn_late = 0;
@@ -2428,7 +2452,10 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
           buf_printf(g_pre, "if (!(%s)) {\n", nilt);
           buf_puts(g_pre, preb2.p);
           emit_indent(g_pre, g_indent);
-          buf_printf(g_pre, "  _snr%d = (%s);\n", rsv, vbs.p ? vbs.p : "");
+          /* (one-String mode: the handle slot takes the call's String in
+             either face) */
+          buf_printf(g_pre, g_one_string && ret2 == TY_STRBUF ? "  _snr%d = SP_STR_HDL(%s);\n" : "  _snr%d = (%s);\n",
+                     rsv, vbs.p ? vbs.p : "");
           emit_indent(g_pre, g_indent);
           buf_puts(g_pre, "}\n");
           buf_printf(b, "_snr%d", rsv);

@@ -27,10 +27,36 @@ static const char *sp_method_desc_cstr(sp_BoundMethod *m);
 sp_RbVal sp_env_shift(void);
 sp_int sp_env_size(void);
 sp_StrStrHash *sp_env_to_h(void);
+#ifdef SP_ONE_STRING
+sp_StrStrHash *sp_env_value(void);
+#endif
 sp_StrStrHash *sp_env_clear(void);
 sp_StrStrHash *sp_env_update_h(sp_StrStrHash *h, int replace);
 sp_StrIntHash*sp_gc_stat(void);
 const char *sp_str_setbyte_cow(const char *s, sp_int i, sp_int v);
+#ifdef SP_ONE_STRING
+/* String#setbyte on a handle (the caller has raised for a frozen one), in
+   place and inline where the handle owns its payload (0xfd) and the index
+   is in it. A byte below 0x80 written into a String a scan proved 7-bit
+   leaves it 7-bit, with the character count it had; any other byte forgets
+   both (sp_str_lcache_drop), as a change through sp_fd_publish does.
+   Anything else -- a range error, a payload the handle does not own --
+   takes sp_str_setbyte_cow's route. Answers the value. */
+static inline sp_int sp_String_setbyte(sp_String *s, sp_int i, sp_int v) {
+  char *d = s->data;
+  sp_int n = s->len, j = i < 0 ? i + n : i;
+  if (SP_LIKELY(((const unsigned char *)d)[-1] == 0xfd && j >= 0 && j < n)) {
+    sp_str_hdr *h = (sp_str_hdr *)sp_fd_base(d);
+    if (!((h->size & SP_STR_SIZE_ASCII7) && (unsigned char)v < 0x80)) sp_str_lcache_drop(d);
+    h->hash = 0;
+    d[j] = (char)(v & 0xff);
+    return v;
+  }
+  const char *q = sp_str_setbyte_cow(d, i, v);
+  if (q != d) sp_String_set_bin(s, q);
+  return v;
+}
+#endif
 #include "sp_random.h"  /* shared Kernel-level PRNG stream (lib/sp_random.c) */
 
 #include <stdio.h>
@@ -439,6 +465,9 @@ const char *sp_sprintf(const char *fmt, ...);
 #include "sp_core.h"
 /* system()/backtick ($?) support now lives in libspinel_rt.a (lib/sp_system.c). */
 #include "sp_system.h"
+/* Kernel#system's answer: true for an exit status of zero, false for
+   another, nil when the command could not run (sp_system_envp's -1) */
+static inline sp_RbVal sp_system_answer(int r) { return r < 0 ? sp_box_nil() : sp_box_bool(r); }
 
 /* Math.* wrappers that raise Math::DomainError on out-of-domain input, per
    CRuby. The runtime exception name is the flattened "Math::DomainError"
@@ -995,7 +1024,7 @@ static inline sp_int sp_int_clamp_range_ck(sp_int v, sp_Range r) {
    name-string predicates in lib/sp_str_cold.c with the hash-key short form. */
 const char *sp_sym_inspect(sp_sym id);
 static const char*sp_gets(void){char buf[4096];if(!SP_SIG_BLOCKING(fgets(buf,sizeof(buf),stdin)))return NULL;size_t l=strlen(buf);char*r=sp_str_alloc_raw(l+1);memcpy(r,buf,l+1);return r;}
-static sp_StrArray*sp_readlines(void){sp_StrArray*a=sp_StrArray_new();SP_GC_ROOT(a);char buf[4096];while(SP_SIG_BLOCKING(fgets(buf,sizeof(buf),stdin))){size_t l=strlen(buf);char*r=sp_str_alloc_raw(l+1);memcpy(r,buf,l+1);sp_StrArray_push(a,r);}return a;}
+static sp_StrArray*sp_readlines(void){sp_StrArray*a=sp_StrArray_new();SP_GC_ROOT(a);char buf[4096];while(SP_SIG_BLOCKING(fgets(buf,sizeof(buf),stdin))){size_t l=strlen(buf);char*r=sp_str_alloc_raw(l+1);memcpy(r,buf,l+1);sp_StrArray_push_e(a,SP_SEF(r));}return a;}
 /* sp_sprintf lives in libspinel_rt.a (lib/sp_cold.c); declared above. */
 /* Use a temp pointer for realloc so the original buffer is not leaked
    on allocation failure. Match the perror+exit pattern used elsewhere
@@ -1303,6 +1332,8 @@ static inline const char *sp_File_gets_into(sp_File *f, char *s, int cap) {
 /* IO#gets with separator / limit / chomp (#2809, #2810, #2820). sep NULL
    reads to EOF; limit <= 0 means unlimited. NULL at EOF. */
 const char *sp_File_gets_sep(sp_File *f, const char *sep, sp_int limit, sp_bool chomp);
+const char *sp_File_gets_limit(sp_File *f, const char *sep, sp_oint limit, sp_bool chomp);
+const char *sp_File_readline_limit(sp_File *f, const char *sep, sp_oint limit, sp_bool chomp);
 /* IO#readlines with separator / chomp (#2820) */
 sp_StrArray *sp_File_readlines_sep(sp_File *f, const char *sep, sp_bool chomp);
 sp_StrArray *sp_file_readlines_sep(const char *path, const char *sep, sp_bool chomp);
@@ -1326,11 +1357,11 @@ const char *sp_File_readpartial_or_nil(sp_File *f, sp_int n);
 /* IO#pread(len, offset): read without moving the file position. Inline
    because it allocates from this TU's string heap (#3038). */
 static inline const char *sp_File_pread(sp_File *f, sp_int len, sp_int off) {
-  SP_IO_OPEN(f);
+  sp_pread_check(f, len, 0);
   if (len < 0) len = 0;
   char *buf = (char *)sp_str_alloc((size_t)len);
-  ssize_t got = pread(fileno(f->fp), buf, (size_t)len, (off_t)off);
-  if (got < 0) sp_raise_cls("IOError", "pread failed");
+  ssize_t got = len ? pread(fileno(f->fp), buf, (size_t)len, (off_t)off) : 0;
+  if (got < 0) sp_pread_raise_errno(f);
   if (got == 0 && len > 0) sp_raise_cls("EOFError", "end of file reached");
   buf[got] = '\0';
   sp_str_set_len(buf, (size_t)got);
@@ -1347,11 +1378,11 @@ static inline const char *sp_File_pread_checked(sp_File *f, sp_int len, sp_int o
 /* IO#pread answering NULL at EOF instead of raising, for the same reason as
    sp_File_readpartial_or_nil. */
 static inline const char *sp_File_pread_or_nil(sp_File *f, sp_int len, sp_int off) {
-  SP_IO_OPEN(f);
+  sp_pread_check(f, len, 1);
   if (len < 0) len = 0;
   char *buf = (char *)sp_str_alloc((size_t)len);
   ssize_t got = pread(fileno(f->fp), buf, (size_t)len, (off_t)off);
-  if (got < 0) sp_raise_cls("IOError", "pread failed");
+  if (got < 0) sp_pread_raise_errno(f);
   if (got == 0 && len > 0) return NULL;
   buf[got] = '\0';
   sp_str_set_len(buf, (size_t)got);
@@ -1432,7 +1463,7 @@ static inline sp_StrArray *sp_File_readlines(sp_File *f) {
   sp_StrArray *a = sp_StrArray_new();
   SP_GC_ROOT(a);
   const char *line;
-  while ((line = sp_File_gets(f)) != NULL) sp_StrArray_push(a, line);
+  while ((line = sp_File_gets(f)) != NULL) sp_StrArray_push_e(a, SP_SEF(line));
   return a;
 }
 /* sp_file_readlines: moved to lib/sp_cold.c */
@@ -2196,8 +2227,9 @@ static sp_bool sp_io_responds(sp_File *f, const char *m, int typed) {
   static const char *const statm[] = { "blksize", "blockdev?", "blocks", "chardev?",
     "dev", "dev_major", "dev_minor", "directory?", "executable?", "executable_real?",
     "file?", "gid", "grpowned?", "ino", "mode",
-    "nlink", "owned?", "pipe?", "rdev", "readable?", "setgid?", "setuid?", "size",
-    "size?", "socket?", "sticky?", "symlink?", "uid", "writable?", "zero?", NULL };
+    "nlink", "owned?", "pipe?", "rdev", "readable?", "readable_real?", "setgid?",
+    "setuid?", "size", "size?", "socket?", "sticky?", "symlink?", "uid",
+    "world_readable?", "world_writable?", "writable?", "writable_real?", "zero?", NULL };
   static const char *const statm_t[] = { "atime", "birthtime", "ctime", "ftype",
     "mtime", NULL };
   static const char *const statm_b[] = { "<", "<=", ">", ">=", "between?", "clamp",
@@ -3097,8 +3129,8 @@ static inline sp_String *sp_StrhArray_unbox(sp_RbVal v) {
    shares (zip): a change through the row reaches the String; nil past the
    end, as a zip row is padded */
 static inline sp_RbVal sp_StrArray_box_handle(sp_StrArray *a, sp_int i) {
-  const char *s = sp_StrArray_get(a, i);
-  return s ? sp_box_nullable_obj(sp_String_new_shared(s), SP_BUILTIN_STRBUF) : sp_box_nil();
+  sp_strelem s = sp_StrArray_get_e(a, i);
+  return s ? sp_box_nullable_obj(SP_SEH(s), SP_BUILTIN_STRBUF) : sp_box_nil();
 }
 /* The read face of a frozen handle: a copy that is frozen too (0xfa, a
    frozen heap String that is collected), so the String read through it,
@@ -3128,6 +3160,32 @@ SP_COLD static const char *sp_strbuf_read_frozen(sp_String *h) {
    face is frozen too (sp_strbuf_read_frozen). */
 /* A handle's read face without the publish: a copy of its bytes, NULL for
    nil, frozen for a frozen handle (sp_strbuf_read_frozen) */
+#ifdef SP_ONE_STRING
+/* One representation (string-one-repr-design.md): no slot holds bytes, so a
+   read face never outlives a change of the handle, and it is the bytes
+   themselves (the payload is laid out as a byte string, marker 0xfd). */
+static inline const char *sp_strbuf_read(sp_String *h) {
+  if (h && SP_UNLIKELY(sp_String_is_frozen(h))) return sp_strbuf_read_frozen(h);
+  return h ? sp_String_cstr(h) : NULL;
+}
+static inline const char *sp_strbuf_read_pub(sp_String *h) {
+  _sp_ret_strbuf = (void *)h;
+  if (h && SP_UNLIKELY(sp_String_is_frozen(h))) return sp_strbuf_read_frozen(h);
+  return h ? sp_String_cstr(h) : NULL;
+}
+/* ...except a read held across a block the program runs (the receiver or
+   an argument of a call with a block, gsub!'s shadow): the block may change
+   the String in place and move its payload, so the C builtin iterates over
+   its own copy, as it did when every read was one */
+static inline const char *sp_strbuf_read_own(sp_String *h) {
+  if (h && SP_UNLIKELY(sp_String_is_frozen(h))) return sp_strbuf_read_frozen(h);
+  return h ? sp_str_concat(sp_String_cstr(h), (&("\xff")[1])) : NULL;
+}
+static inline const char *sp_strbuf_read_pub_own(sp_String *h) {
+  _sp_ret_strbuf = (void *)h;
+  return sp_strbuf_read_own(h);
+}
+#else
 static inline const char *sp_strbuf_read(sp_String *h) {
   if (h && SP_UNLIKELY(sp_String_is_frozen(h))) return sp_strbuf_read_frozen(h);
   return h ? sp_str_concat(sp_String_cstr(h), (&("\xff")[1])) : NULL;
@@ -3137,6 +3195,7 @@ static inline const char *sp_strbuf_read_pub(sp_String *h) {
   if (h && SP_UNLIKELY(sp_String_is_frozen(h))) return sp_strbuf_read_frozen(h);
   return h ? sp_str_concat(sp_String_cstr(h), (&("\xff")[1])) : NULL;
 }
+#endif
 /* --share-strings (#8321): a String Range made from shared handles keeps
    them (hf / hl), and a read of the Range takes each handle's bytes as they
    are now, so a change in place to the endpoint's String shows through it. */
@@ -3254,11 +3313,15 @@ static inline sp_PolyArray *sp_StrArray_to_poly_handles(sp_StrArray *a) {
   SP_GC_ROOT(r);
   if (!a) return r;
   for (sp_int i = 0; i < a->len; i++) {
+#ifdef SP_ONE_STRING
+    sp_PolyArray_push(r, SP_SEBOX(a->data[i]));   /* the element is the handle */
+#else
     const char *s = a->data[i];
     sp_RbVal v = sp_box_str(s);
     if (s && ((const unsigned char *)s)[-1] == 0xfd) v = sp_poly_literal_identity(v);
     else if (s && !sp_str_is_frozen_val(s)) v = sp_box_obj(sp_String_new_shared(s), SP_BUILTIN_STRBUF);
     sp_PolyArray_push(r, v);
+#endif
   }
   return r;
 }
@@ -3280,12 +3343,26 @@ static inline sp_RbVal sp_poly_strbuf_lift(sp_RbVal v) {
    itself: its own box (the shared handle's, where it has one); anything
    else answers its to_s String (sp_poly_to_s), boxed. */
 static inline sp_RbVal sp_poly_to_s_box(sp_RbVal v);
+/* to_s of an instance of a String subclass is a new String of its bytes,
+   not the instance, as CRuby's String#to_s: a later dup or class then
+   answers String. A plain handle is not one (sp_bsub_cls_fn). */
+static inline int sp_poly_is_str_subclass(sp_RbVal v) {
+  return v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF && v.v.p &&
+         sp_bsub_cls_fn && sp_bsub_cls_fn(v) >= 0;
+}
+/* ...and the handle a String box's to_s answers: its own, or that new
+   String's for a subclass instance */
+static inline sp_String *sp_poly_to_s_strbuf(sp_RbVal v) {
+  if (sp_poly_is_str_subclass(v)) return sp_String_new_fresh(sp_String_cstr((sp_String *)v.v.p));
+  return (sp_String *)v.v.p;
+}
 /* --share-strings: to_s of a shared String handle that may be nil (NULL)
    as a box: the handle's own box, or nil's "" */
 static inline sp_RbVal sp_strbuf_to_s_box(sp_String *h) {
   return h ? sp_box_nullable_obj(h, SP_BUILTIN_STRBUF) : sp_box_str(sp_str_frozen_empty);
 }
 static inline sp_RbVal sp_poly_to_s_box(sp_RbVal v) {
+  if (sp_poly_is_str_subclass(v)) return sp_box_str_new(sp_str_dup(sp_String_cstr((sp_String *)v.v.p)));
   if ((v.tag == SP_TAG_STR && v.v.s) || (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF && v.v.p)) return v;
   return sp_box_str_new(sp_poly_to_s(v));
 }
@@ -3294,6 +3371,7 @@ static inline sp_RbVal sp_poly_to_s_box(sp_RbVal v) {
    sp_poly_to_s_box does, anything else its to_s boxed as bytes, with no
    handle made around it */
 static inline sp_RbVal sp_poly_to_s_box_plain(sp_RbVal v) {
+  if (sp_poly_is_str_subclass(v)) return sp_box_str(sp_str_dup(sp_String_cstr((sp_String *)v.v.p)));
   if ((v.tag == SP_TAG_STR && v.v.s) || (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF && v.v.p)) return v;
   return sp_box_str(sp_poly_to_s(v));
 }
@@ -3669,6 +3747,7 @@ static SP_INLINE const char *sp_poly_sep_str(sp_RbVal v) {
    default separator, anything else the separator with no limit */
 static SP_INLINE const char *sp_poly_gets_sep(sp_RbVal v) { return v.tag == SP_TAG_INT ? "\n" : sp_poly_sep_str(v); }
 static SP_INLINE sp_int sp_poly_gets_lim(sp_RbVal v) { return v.tag == SP_TAG_INT ? v.v.i : 0; }
+static SP_INLINE sp_oint sp_poly_gets_olim(sp_RbVal v) { return v.tag == SP_TAG_INT ? sp_oint_of(v.v.i) : sp_oint_nil(); }
 /* The object half of the check below, split out and kept off the inlined path
    for the reason sp_poly_arg_str_obj is: the object case is the rare one.
 
@@ -3946,6 +4025,15 @@ static SP_INLINE const char *sp_slot_str_ck(sp_RbVal v, const char *ivar) {
   sp_slot_store_mismatch(v, ivar, "String");
   return NULL;
 }
+/* ...and into a slot holding a String's handle (the one-String mode's):
+   the handle a box carries, or a new one over the bytes. It may allocate,
+   so it is not among the slot checks that cannot. */
+static SP_INLINE sp_String *sp_slot_strbuf_ck(sp_RbVal v, const char *ivar) {
+  if (v.tag == SP_TAG_STR || sp_poly_is_strbuf(v)) return sp_poly_as_strbuf(v);
+  if (v.tag == SP_TAG_NIL) return NULL;
+  sp_slot_store_mismatch(v, ivar, "String");
+  return NULL;
+}
 static SP_INLINE sp_bool sp_slot_bool_ck(sp_RbVal v, const char *ivar) {
   if (v.tag == SP_TAG_BOOL) return v.v.b;
   sp_slot_store_mismatch(v, ivar, "true or false");
@@ -4089,6 +4177,14 @@ static SP_NOINLINE sp_bool sp_io_line_args(sp_PolyArray *a, const char **sep, sp
     if (*lim < 0) *lim = 0;
   }
   return 0;
+}
+
+/* gets / readline's form of sp_io_line_args: the limit as an sp_oint,
+   nil for none, so an explicit 0 (CRuby's "" without reading) stays apart */
+static SP_UNUSED sp_oint sp_io_gets_args(sp_PolyArray *a, const char **sep) {
+  sp_int lim = 0;
+  if (sp_io_line_args(a, sep, &lim, NULL)) return sp_oint_of(0);
+  return lim > 0 ? sp_oint_of(lim) : sp_oint_nil();
 }
 
 /* A boxed value where a Float is wanted, by Kernel#Float's rules: a real
@@ -7560,6 +7656,18 @@ static const char *sp_poly_elem_s(sp_RbVal v) {
   if (v.tag == SP_TAG_NIL) return NULL;
   sp_raise_typed_elem(v, "String");
 }
+#ifdef SP_ONE_STRING
+/* ...and as the element of a String container under one representation: a
+   handle is stored itself, so a change through any name reaches it; plain
+   bytes get a handle of their own (SP_SEV) */
+static sp_strelem sp_poly_elem_e(sp_RbVal v) {
+  if (sp_poly_is_strbuf(v) && v.v.p) return (sp_strelem)v.v.p;
+  return SP_SEF(sp_poly_elem_s(v));
+}
+#define SP_SEV(v) sp_poly_elem_e(v)
+#else
+#define SP_SEV(v) sp_poly_elem_s(v)
+#endif
 /* The same rules for a key or a value a TYPED hash is asked to store: the
    compiler settled the hash's variant and did not widen it for this store.
    Loud, as sp_poly_typed_hash_store_miss is, not a key or value converted
@@ -7635,8 +7743,8 @@ static sp_StrArray *sp_StrArray_from_elems(sp_RbVal v) {
   SP_GC_ROOT_RBVAL(v);
   sp_PolyArray *p = sp_poly_to_poly_array(v); SP_GC_ROOT(p);
   sp_StrArray *r = sp_StrArray_new(); SP_GC_ROOT(r);
-  if (!p) { sp_StrArray_push(r, sp_poly_elem_s(sp_box_nil())); return r; }
-  for (sp_int i = 0; i < p->len; i++) sp_StrArray_push(r, sp_poly_elem_s(p->data[i]));
+  if (!p) { sp_StrArray_push_e(r, SP_SEV(sp_box_nil())); return r; }
+  for (sp_int i = 0; i < p->len; i++) sp_StrArray_push_e(r, SP_SEV(p->data[i]));
   return r;
 }
 static sp_RbVal sp_poly_shl(sp_RbVal a, sp_RbVal b) {
@@ -7676,11 +7784,15 @@ static sp_RbVal sp_poly_shl(sp_RbVal a, sp_RbVal b) {
       /* a shared-mutable handle pushed into a typed string array stores its
          CONTENTS (the typed storage cannot hold the handle); an empty push
          here silently blanked the element (#3327) */
+#ifdef SP_ONE_STRING
+      sp_strelem _es = SP_SEV(b);
+#else
       const char *_es = b.tag == SP_TAG_STR ? (const char *)b.v.p
                       : (b.tag == SP_TAG_OBJ && b.cls_id == SP_BUILTIN_STRBUF && b.v.p)
                           ? sp_str_dup(sp_String_cstr((sp_String *)b.v.p))   /* a copy: see sp_poly_elem_s */
                           : sp_poly_elem_s(b);   /* nil, or the refusal (#4481) */
-      sp_StrArray_push((sp_StrArray *)a.v.p, _es);
+#endif
+      sp_StrArray_push_e((sp_StrArray *)a.v.p, _es);
       return a;
     }
     if (a.cls_id == SP_BUILTIN_STRBUF && a.v.p) {
@@ -7959,7 +8071,7 @@ SP_NOINLINE SP_COLD static sp_RbVal sp_poly_arr_get_typed(sp_RbVal a, sp_int i) 
     case SP_BUILTIN_INT_ARRAY: { sp_IntArray *ar=(sp_IntArray*)a.v.p; if(!ar) return sp_box_nil(); if(i<0)i+=ar->len; if(i<0||i>=ar->len) return sp_box_nil(); return sp_IntArray_box_elem(ar, i); }
     case SP_BUILTIN_SYM_ARRAY: { sp_IntArray *ar=(sp_IntArray*)a.v.p; if(!ar) return sp_box_nil(); if(i<0)i+=ar->len; if(i<0||i>=ar->len) return sp_box_nil(); return sp_box_sym((sp_sym)ar->data[ar->start+i]); }
     case SP_BUILTIN_FLT_ARRAY: { sp_FloatArray *ar=(sp_FloatArray*)a.v.p; if(!ar) return sp_box_nil(); if(i<0)i+=ar->len; if(i<0||i>=ar->len) return sp_box_nil(); return sp_FloatArray_box_elem(ar, i); }  /* a gap filled by `a[n] = v` past the end is nil (#3836) */
-    case SP_BUILTIN_STR_ARRAY: { sp_StrArray *ar=(sp_StrArray*)a.v.p; if(!ar) return sp_box_nil(); if(i<0)i+=ar->len; if(i<0||i>=ar->len) return sp_box_nil(); return sp_box_str(ar->data[i]); }
+    case SP_BUILTIN_STR_ARRAY: { sp_StrArray *ar=(sp_StrArray*)a.v.p; if(!ar) return sp_box_nil(); if(i<0)i+=ar->len; if(i<0||i>=ar->len) return sp_box_nil(); return SP_SEBOX(ar->data[i]); }
     case SP_BUILTIN_POLY_ARRAY: { sp_PolyArray *ar=(sp_PolyArray*)a.v.p; if(!ar) return sp_box_nil(); if(i<0)i+=ar->len; if(i<0||i>=ar->len) return sp_box_nil(); return ar->data[i]; }
     case SP_BUILTIN_PTR_ARRAY: return sp_PtrArray_get_box((sp_PtrArray *)a.v.p, i);
     default: return sp_box_nil();
@@ -8158,7 +8270,7 @@ static void sp_poly_arr_writeback(sp_RbVal orig, sp_PolyArray *work) {
       for (sp_int i = 0; i < work->len; i++) sp_poly_arr_fit_check(orig.cls_id, work->data[i]);
       sp_gc_wb((void *)a);
       a->len = 0;
-      for (sp_int i = 0; i < work->len; i++) sp_StrArray_push(a, sp_poly_to_s(work->data[i]));
+      for (sp_int i = 0; i < work->len; i++) sp_StrArray_push_e(a, SP_SEF(sp_poly_to_s(work->data[i])));
       return;
     }
     case SP_BUILTIN_PTR_ARRAY: {
@@ -8297,7 +8409,7 @@ static void sp_poly_arr_live_set(sp_RbVal a, sp_int i, sp_RbVal v) {
       sp_FloatArray_oset((sp_FloatArray *)a.v.p, i, sp_unbox_ofloat(v));
       return;
     case SP_BUILTIN_STR_ARRAY:
-      sp_StrArray_set((sp_StrArray *)a.v.p, i, sp_poly_to_s(v));
+      sp_StrArray_set_e((sp_StrArray *)a.v.p, i, SP_SEF(sp_poly_to_s(v)));
       return;
     case SP_BUILTIN_PTR_ARRAY: {
       sp_PtrArray *p = (sp_PtrArray *)a.v.p;
@@ -8520,9 +8632,9 @@ static int sp_poly_splice_unboxed(sp_RbVal recv, sp_int start, sp_int len, sp_Po
     for (sp_int i = 0; i < n; i++) r[i] = src->data[i].v.f;
     sp_FloatArray_splice((sp_FloatArray *)recv.v.p, start, len, r, n);
   } else {
-    const char **r = (const char **)row;
+    sp_strelem *r = (sp_strelem *)row;
     SP_GC_ROOT(src);
-    for (sp_int i = 0; i < n; i++) r[i] = src->data[i].v.s;
+    for (sp_int i = 0; i < n; i++) r[i] = SP_SEF(src->data[i].v.s);
     sp_StrArray_splice((sp_StrArray *)recv.v.p, start, len, r, n);
   }
   sp_pl_free(row);
@@ -8598,7 +8710,7 @@ static sp_RbVal sp_poly_splice(sp_RbVal recv, sp_int start, sp_int len, sp_RbVal
         sp_StrArray *sa = (sp_StrArray *)src.v.p;
         sp_StrArray_splice(a, start, len, sa->data, sa->len); return recv;
       }
-      if (nofill && src.tag == SP_TAG_STR) { const char *v = src.v.s; sp_StrArray_splice(a, start, len, &v, 1); return recv; }
+      if (nofill && src.tag == SP_TAG_STR) { sp_strelem v = SP_SEF(src.v.s); sp_StrArray_splice(a, start, len, &v, 1); return recv; }
       break;
     }
     case SP_BUILTIN_PTR_ARRAY: {
@@ -9097,7 +9209,7 @@ SP_NORETURN SP_COLD static SP_NOINLINE void sp_poly_recur_raise(int kind, const 
 static void sp_PolyArray_flatten_into(sp_PolyArray *dst, sp_RbVal v) {
   if (v.tag != SP_TAG_OBJ) { sp_PolyArray_push(dst, v); return; }
   if (v.cls_id == SP_BUILTIN_INT_ARRAY) { sp_IntArray *ia = (sp_IntArray *)v.v.p; for (sp_int i = 0; i < ia->len; i++) sp_PolyArray_push(dst, sp_IntArray_box_elem(ia, i)); return; }
-  if (v.cls_id == SP_BUILTIN_STR_ARRAY) { sp_StrArray *sa = (sp_StrArray *)v.v.p; for (sp_int i = 0; i < sa->len; i++) sp_PolyArray_push(dst, sp_box_str(sa->data[i])); return; }
+  if (v.cls_id == SP_BUILTIN_STR_ARRAY) { sp_StrArray *sa = (sp_StrArray *)v.v.p; for (sp_int i = 0; i < sa->len; i++) sp_PolyArray_push(dst, SP_SEBOX(sa->data[i])); return; }
   if (v.cls_id == SP_BUILTIN_SYM_ARRAY) { sp_IntArray *ya = (sp_IntArray *)v.v.p; for (sp_int i = 0; i < ya->len; i++) sp_PolyArray_push(dst, sp_box_sym((sp_sym)ya->data[ya->start + i])); return; }
   if (v.cls_id == SP_BUILTIN_FLT_ARRAY) { sp_FloatArray *fa = (sp_FloatArray *)v.v.p; for (sp_int i = 0; i < fa->len; i++) sp_PolyArray_push(dst, sp_FloatArray_box_elem(fa, i)); return; }
   if (v.cls_id == SP_BUILTIN_PTR_ARRAY) { sp_PolyArray_flatten_into(dst, sp_box_poly_array(sp_PtrArray_to_poly((sp_PtrArray *)v.v.p))); return; }   /* rows or objects (#4486) */
@@ -9359,7 +9471,7 @@ static void sp_PolyArray_flatten_into_n(sp_PolyArray *dst, sp_RbVal v, sp_int de
     if (a.tag == SP_TAG_OBJ && a.v.p && sp_poly_is_array_kind(a.cls_id)) { SP_GC_ROOT_RBVAL(a); v = a; }
   }
   if (v.cls_id == SP_BUILTIN_INT_ARRAY) { sp_IntArray *ia = (sp_IntArray *)v.v.p; for (sp_int i = 0; i < ia->len; i++) sp_PolyArray_push(dst, sp_IntArray_box_elem(ia, i)); return; }
-  if (v.cls_id == SP_BUILTIN_STR_ARRAY) { sp_StrArray *sa = (sp_StrArray *)v.v.p; for (sp_int i = 0; i < sa->len; i++) sp_PolyArray_push(dst, sp_box_str(sa->data[i])); return; }
+  if (v.cls_id == SP_BUILTIN_STR_ARRAY) { sp_StrArray *sa = (sp_StrArray *)v.v.p; for (sp_int i = 0; i < sa->len; i++) sp_PolyArray_push(dst, SP_SEBOX(sa->data[i])); return; }
   if (v.cls_id == SP_BUILTIN_SYM_ARRAY) { sp_IntArray *ya = (sp_IntArray *)v.v.p; for (sp_int i = 0; i < ya->len; i++) sp_PolyArray_push(dst, sp_box_sym((sp_sym)ya->data[ya->start + i])); return; }
   if (v.cls_id == SP_BUILTIN_FLT_ARRAY) { sp_FloatArray *fa = (sp_FloatArray *)v.v.p; for (sp_int i = 0; i < fa->len; i++) sp_PolyArray_push(dst, sp_FloatArray_box_elem(fa, i)); return; }
   if (v.cls_id == SP_BUILTIN_PTR_ARRAY) { sp_PolyArray_flatten_into_n(dst, sp_box_poly_array(sp_PtrArray_to_poly((sp_PtrArray *)v.v.p)), depth); return; }
@@ -9483,7 +9595,7 @@ static sp_PolyArray *sp_PolyArray_sum_concat_checked(sp_PolyArray *a, sp_RbVal i
    a String, replace by another kind -- quietly mutated a frozen array. The
    flag is set AFTER the pushes, which would otherwise raise on it. */
 static sp_PolyArray *sp_PolyArray_from_int_array(sp_IntArray *a) { SP_GC_ROOT(a); sp_PolyArray *p = sp_PolyArray_new(); if (!a) return p; for (sp_int i = 0; i < a->len; i++) sp_PolyArray_push(p, sp_IntArray_box_elem(a, i)); p->frozen = a->frozen; return p; }
-static sp_PolyArray *sp_PolyArray_from_str_array(sp_StrArray *a) { SP_GC_ROOT(a); sp_PolyArray *p = sp_PolyArray_new(); if (!a) return p; for (sp_int i = 0; i < a->len; i++) sp_PolyArray_push(p, sp_box_str(a->data[i])); p->frozen = a->frozen; return p; }
+static sp_PolyArray *sp_PolyArray_from_str_array(sp_StrArray *a) { SP_GC_ROOT(a); sp_PolyArray *p = sp_PolyArray_new(); if (!a) return p; for (sp_int i = 0; i < a->len; i++) sp_PolyArray_push(p, SP_SEBOX(a->data[i])); p->frozen = a->frozen; return p; }
 /* String#scan with a pattern that arrives boxed (read out of a table, a
    block parameter over mixed values): a Regexp's payload is the compiled
    pattern; a String is scanned for its bytes, setting $~ as a String pattern
@@ -9570,7 +9682,7 @@ static sp_PolyArray *sp_PolyArray_from_float_array(sp_FloatArray *a) { SP_GC_ROO
    return annotation (e.g. RBS `-> Array[String]`) when the body produced a poly
    array -- the element boxes carry the runtime values, so this is a per-element
    unbox, not a reinterpret. */
-static sp_StrArray *sp_StrArray_from_poly_array(sp_PolyArray *a) { sp_StrArray *r = sp_StrArray_new(); if (!a) return r; SP_GC_ROOT(a); SP_GC_ROOT(r); for (sp_int i = 0; i < a->len; i++) sp_StrArray_push(r, sp_poly_to_s(a->data[i])); return r; }
+static sp_StrArray *sp_StrArray_from_poly_array(sp_PolyArray *a) { sp_StrArray *r = sp_StrArray_new(); if (!a) return r; SP_GC_ROOT(a); SP_GC_ROOT(r); for (sp_int i = 0; i < a->len; i++) sp_StrArray_push_e(r, SP_SEF(sp_poly_to_s(a->data[i]))); return r; }
 /* sp_unbox_oint, not the plain conversion: a typed array carries its nil
    beside the element, and sp_poly_to_i answers 0 for nil (sp_poly_to_f, 0.0).
    A method returning [a] where a is a nullable local reaches here under
@@ -10168,7 +10280,7 @@ static sp_PolyArray *sp_typed_to_poly(void *tp, int kind) {
   if (!tp) return tb;
   if (kind == SP_BUILTIN_STR_ARRAY) {
     sp_StrArray *a = (sp_StrArray *)tp;
-    for (sp_int i = 0; i < a->len; i++) sp_PolyArray_push(tb, sp_box_str(sp_StrArray_get(a, i)));
+    for (sp_int i = 0; i < a->len; i++) sp_PolyArray_push(tb, SP_SEBOX(sp_StrArray_get_e(a, i)));
   }
   else if (kind == SP_BUILTIN_FLT_ARRAY) {
     sp_FloatArray *a = (sp_FloatArray *)tp;
@@ -10236,7 +10348,7 @@ static sp_RbVal sp_StrPolyHash_get(sp_StrPolyHash*h,const char*k){if(!h)return s
 static void sp_StrPolyHash_set(sp_StrPolyHash*h,const char*k,sp_RbVal v){sp_gc_wb((void*)h); if(!k){sp_raise_cls("TypeError","no implicit conversion of nil into String");return;} if(h->len*2>=h->cap)sp_StrPolyHash_grow(h);sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_eq(h->keys[idx],k)){h->vals[idx]=v;return;}idx=(idx+1)&h->mask;}{SP_GC_ROOT(h);SP_GC_ROOT_STR(k);SP_GC_ROOT_RBVAL(v);k=sp_hash_key_str(k);}sp_gc_wb((void*)h);h->keys[idx]=k;h->vals[idx]=v;h->order[h->len]=k;h->len++;}
 static sp_bool sp_StrPolyHash_has_key(sp_StrPolyHash*h,const char*k){if (SP_UNLIKELY(!h)) sp_nil_recv("key?");sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_eq(h->keys[idx],k))return TRUE;idx=(idx+1)&h->mask;}return FALSE;}
 static sp_int sp_StrPolyHash_length(sp_StrPolyHash*h){return h->len;}
-static sp_StrArray*sp_StrPolyHash_keys(sp_StrPolyHash*h){SP_GC_ROOT(h);sp_StrArray*a=sp_StrArray_new();SP_GC_ROOT(a);if (SP_UNLIKELY(!h)) sp_nil_recv("keys");for(sp_int i=0;i<h->len;i++)sp_StrArray_push(a,h->order[i]);return a;}
+static sp_StrArray*sp_StrPolyHash_keys(sp_StrPolyHash*h){SP_GC_ROOT(h);sp_StrArray*a=sp_StrArray_new();SP_GC_ROOT(a);if (SP_UNLIKELY(!h)) sp_nil_recv("keys");for(sp_int i=0;i<h->len;i++)sp_StrArray_push_e(a,SP_SEK(h->order[i]));return a;}
 static sp_PolyArray*sp_StrPolyHash_values(sp_StrPolyHash*h){SP_GC_ROOT(h);sp_PolyArray*a=sp_PolyArray_new();SP_GC_ROOT(a);for(sp_int i=0;i<h->len;i++)sp_PolyArray_push(a,sp_StrPolyHash_get(h,h->order[i]));return a;}
 static sp_bool sp_StrPolyHash_has_value(sp_StrPolyHash*h,sp_RbVal v){if (SP_UNLIKELY(!h)) sp_nil_recv("value?");for(sp_int i=0;i<h->len;i++)if(sp_poly_rb_equal(sp_StrPolyHash_get(h,h->order[i]),v))return TRUE;return FALSE;}
 static void sp_StrPolyHash_delete(sp_StrPolyHash*h,const char*k){ sp_gc_wb((void*)h);sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_eq(h->keys[idx],k)){h->keys[idx]=NULL;h->vals[idx]=sp_box_nil();h->len--;sp_int j=(idx+1)&h->mask;while(h->keys[j]){sp_int nj=(sp_int)(sp_str_hash(h->keys[j])&h->mask);if((j>idx&&(nj<=idx||nj>j))||(j<idx&&nj<=idx&&nj>j)){h->keys[idx]=h->keys[j];h->vals[idx]=h->vals[j];h->keys[j]=NULL;h->vals[j]=sp_box_nil();idx=j;}j=(j+1)&h->mask;}{sp_int oi=0;while(oi<=h->len){if(strcmp(h->order[oi],k)==0){while(oi<h->len){h->order[oi]=h->order[oi+1];oi++;}break;}oi++;}}return;}idx=(idx+1)&h->mask;}}
@@ -10267,14 +10379,14 @@ sp_StrStrHash *sp_StrPolyHash_to_s_values(sp_StrPolyHash *h);
 static sp_StrStrHash *sp_StrIntHash_to_s_values(sp_StrIntHash *h) {
   SP_GC_ROOT(h);
   sp_StrStrHash *r = sp_StrStrHash_new(); SP_GC_ROOT(r);
-  if (h && !h->default_nil) r->default_v = sp_int_to_s(h->default_v);
+  if (h && !h->default_nil) r->default_v = SP_SEF(sp_int_to_s(h->default_v));
   if (h) for (sp_int i = 0; i < h->len; i++) {
     const char *k = h->order[i];
-    { sp_oint v = sp_StrIntHash_vget(h, k); sp_StrStrHash_set(r, k, v.nil ? "" : sp_int_to_s(v.v)); }   /* nil.to_s is "" */
+    { sp_oint v = sp_StrIntHash_vget(h, k); sp_StrStrHash_set_e(r, k, v.nil ? SP_SEE : SP_SEF(sp_int_to_s(v.v))); }   /* nil.to_s is "" */
   }
   return r;
 }
-static sp_StrPolyHash*sp_StrPolyHash_from_str_str_hash(sp_StrStrHash*h){SP_GC_ROOT(h);sp_StrPolyHash*r=sp_StrPolyHash_new();if(!h)return r;if(h->default_v)r->default_v=sp_box_str(h->default_v);for(sp_int i=0;i<h->len;i++){const char*k=h->order[i];sp_StrPolyHash_set(r,k,sp_box_str(sp_StrStrHash_get(h,k)));}if(sp_gc_is_frozen(h))sp_gc_freeze(r);return r;}
+static sp_StrPolyHash*sp_StrPolyHash_from_str_str_hash(sp_StrStrHash*h){SP_GC_ROOT(h);sp_StrPolyHash*r=sp_StrPolyHash_new();if(!h)return r;if(h->default_v)r->default_v=SP_SEBOX(h->default_v);for(sp_int i=0;i<h->len;i++){const char*k=h->order[i];sp_StrPolyHash_set(r,k,SP_SEBOX(sp_StrStrHash_get_e(h,k)));}if(sp_gc_is_frozen(h))sp_gc_freeze(r);return r;}
 /* MatchData#named_captures: {String name => group substring | nil}. A
    non-participating named group maps to nil, so the value side is poly. Lives
    here (not sp_re.c) because the typed-hash machinery is TU-coupled. */
@@ -11105,8 +11217,8 @@ static sp_RbVal sp_poly_hash_foreign_miss(sp_RbVal recv, sp_RbVal key) {
                          ? sp_sym_name_fn((sp_sym)key.v.i) : "";
       return h->dproc(h, nm ? nm : "", h->dproc_self);
     }
-    case SP_BUILTIN_STR_STR_HASH: return sp_box_nullable_str(((sp_StrStrHash *)recv.v.p)->default_v);
-    case SP_BUILTIN_INT_STR_HASH: return sp_box_nullable_str(((sp_IntStrHash *)recv.v.p)->default_v);
+    case SP_BUILTIN_STR_STR_HASH: return SP_SEBOXN(((sp_StrStrHash *)recv.v.p)->default_v);
+    case SP_BUILTIN_INT_STR_HASH: return SP_SEBOXN(((sp_IntStrHash *)recv.v.p)->default_v);
     case SP_BUILTIN_STR_INT_HASH: { sp_StrIntHash *h = (sp_StrIntHash *)recv.v.p; return h->default_nil ? sp_box_nil() : sp_box_int(h->default_v); }
     case SP_BUILTIN_INT_INT_HASH: { sp_IntIntHash *h = (sp_IntIntHash *)recv.v.p; return h->default_nil ? sp_box_nil() : sp_box_int(h->default_v); }
     default: return sp_box_nil();
@@ -11193,8 +11305,8 @@ static SP_UNUSED sp_RbVal sp_marv_hash_default(sp_RbVal h, int *has_proc) {
   if (h.tag != SP_TAG_OBJ || !h.v.p) return sp_box_nil();
   switch (h.cls_id) {
     case SP_BUILTIN_STR_INT_HASH: { sp_StrIntHash *sh = (sp_StrIntHash *)h.v.p; return sh->default_nil ? sp_box_nil() : sp_box_int(sh->default_v); }
-    case SP_BUILTIN_STR_STR_HASH: return sp_box_nullable_str(((sp_StrStrHash *)h.v.p)->default_v);
-    case SP_BUILTIN_INT_STR_HASH: return sp_box_nullable_str(((sp_IntStrHash *)h.v.p)->default_v);
+    case SP_BUILTIN_STR_STR_HASH: return SP_SEBOXN(((sp_StrStrHash *)h.v.p)->default_v);
+    case SP_BUILTIN_INT_STR_HASH: return SP_SEBOXN(((sp_IntStrHash *)h.v.p)->default_v);
     case SP_BUILTIN_INT_INT_HASH: { sp_IntIntHash *ih = (sp_IntIntHash *)h.v.p; return ih->default_nil ? sp_box_nil() : sp_box_int(ih->default_v); }
     case SP_BUILTIN_STR_POLY_HASH:
       *has_proc = ((sp_StrPolyHash *)h.v.p)->dproc != NULL; return ((sp_StrPolyHash *)h.v.p)->default_v;
@@ -11353,7 +11465,7 @@ static sp_RbVal sp_poly_pop(sp_RbVal v) {
       case SP_BUILTIN_STR_ARRAY: {
         sp_StrArray *a = (sp_StrArray *)v.v.p;
         if (a->len <= 0) return sp_box_nil();
-        return sp_box_str(sp_StrArray_pop(a));
+        return SP_SEBOX(sp_StrArray_pop_e(a));
       }
       case SP_BUILTIN_POLY_ARRAY: return sp_PolyArray_pop((sp_PolyArray *)v.v.p);
       case SP_BUILTIN_PTR_ARRAY: {
@@ -11480,7 +11592,7 @@ static sp_RbVal sp_poly_insert(sp_RbVal v, sp_int i, sp_RbVal x) {
         sp_FloatArray_insert_nilable((sp_FloatArray *)v.v.p, i, sp_poly_elem_f(x));
         return v;
       case SP_BUILTIN_STR_ARRAY:
-        sp_StrArray_insert((sp_StrArray *)v.v.p, i, sp_poly_elem_s(x));
+        sp_StrArray_insert_e((sp_StrArray *)v.v.p, i, SP_SEV(x));
         return v;
       case SP_BUILTIN_POLY_ARRAY:
         sp_PolyArray_insert((sp_PolyArray *)v.v.p, i, x);
@@ -11540,8 +11652,8 @@ static sp_RbVal sp_poly_delete_at(sp_RbVal v, sp_int i) {
         return sp_box_ofloat(sp_FloatArray_delete_at_o(a, i));
       }
       case SP_BUILTIN_STR_ARRAY: {
-        const char *r = sp_StrArray_delete_at((sp_StrArray *)v.v.p, i);
-        return r ? sp_box_str(r) : sp_box_nil();
+        sp_strelem r = sp_StrArray_delete_at_e((sp_StrArray *)v.v.p, i);
+        return r ? SP_SEBOX(r) : sp_box_nil();
       }
       case SP_BUILTIN_POLY_ARRAY: {
         sp_PolyArray *a = (sp_PolyArray *)v.v.p;
@@ -11589,7 +11701,7 @@ static sp_RbVal sp_poly_shift(sp_RbVal v) {
       case SP_BUILTIN_STR_ARRAY: {
         sp_StrArray *a = (sp_StrArray *)v.v.p;
         if (a->len <= 0) return sp_box_nil();
-        return sp_box_str(sp_StrArray_shift(a));
+        return SP_SEBOX(sp_StrArray_shift_e(a));
       }
       case SP_BUILTIN_POLY_ARRAY: return sp_PolyArray_shift((sp_PolyArray *)v.v.p);
       case SP_BUILTIN_PTR_ARRAY: return sp_poly_delete_at(v, 0);
@@ -11623,7 +11735,7 @@ static sp_RbVal sp_poly_get_str(sp_RbVal v, const char *key) {
   switch (v.cls_id) {
     case SP_BUILTIN_CURRY: return sp_curry_call_poly((sp_Curry *)v.v.p, 1, (sp_RbVal[]){sp_box_str(key)});
     case SP_BUILTIN_STR_POLY_HASH: return sp_StrPolyHash_get((sp_StrPolyHash*)v.v.p, key);
-    case SP_BUILTIN_STR_STR_HASH: { const char *s = sp_StrStrHash_get((sp_StrStrHash*)v.v.p, key); return s ? sp_box_str(s) : sp_box_nil(); }
+    case SP_BUILTIN_STR_STR_HASH: { sp_strelem s = sp_StrStrHash_get_e((sp_StrStrHash*)v.v.p, key); return s ? SP_SEBOX(s) : sp_box_nil(); }
     case SP_BUILTIN_STR_INT_HASH: return sp_box_oint(sp_StrIntHash_oget((sp_StrIntHash*)v.v.p, key));
     case SP_BUILTIN_POLY_POLY_HASH: return sp_PolyPolyHash_get((sp_PolyPolyHash*)v.v.p, sp_box_str(key));
     /* OpenStruct#["name"] is the member of that name, as with a Symbol */
@@ -11800,8 +11912,8 @@ static sp_RbVal sp_poly_each_elem(sp_RbVal a, sp_int i) {
       if (!h || i < 0 || i >= h->len) return sp_box_nil();
       sp_PolyArray *pair = sp_PolyArray_new(); SP_GC_ROOT(pair);
       sp_PolyArray_push(pair, sp_box_str(h->order[i]));
-      const char *sv = sp_StrStrHash_get(h, h->order[i]);
-      sp_PolyArray_push(pair, sv ? sp_box_str(sv) : sp_box_nil());
+      sp_strelem sv = sp_StrStrHash_get_e(h, h->order[i]);
+      sp_PolyArray_push(pair, sv ? SP_SEBOX(sv) : sp_box_nil());
       return sp_box_poly_array(pair); }
     case SP_BUILTIN_STR_POLY_HASH: {
       sp_StrPolyHash *h = (sp_StrPolyHash*)a.v.p;
@@ -11822,8 +11934,8 @@ static sp_RbVal sp_poly_each_elem(sp_RbVal a, sp_int i) {
       if (!h || i < 0 || i >= h->len) return sp_box_nil();
       sp_PolyArray *pair = sp_PolyArray_new(); SP_GC_ROOT(pair);
       sp_PolyArray_push(pair, sp_box_int(h->order[i]));
-      const char *iv = sp_IntStrHash_get(h, h->order[i]);
-      sp_PolyArray_push(pair, iv ? sp_box_str(iv) : sp_box_nil());
+      sp_strelem iv = sp_IntStrHash_get_e(h, h->order[i]);
+      sp_PolyArray_push(pair, iv ? SP_SEBOX(iv) : sp_box_nil());
       return sp_box_poly_array(pair); }
     case SP_BUILTIN_INT_INT_HASH: {
       sp_IntIntHash *h = (sp_IntIntHash*)a.v.p;
@@ -12004,7 +12116,7 @@ static sp_StrStrHash *sp_StrStrHash_from_poly_hash(sp_PolyPolyHash *src) {
   for (sp_int i = 0; src && i < src->len; i++) {
     sp_RbVal k = src->keys[src->order[i]], v = sp_PolyPolyHash_get(src, k);
     if (k.tag != SP_TAG_STR || v.tag != SP_TAG_STR) { sp_raise_cls("TypeError", "wrong Hash entry type for the parameter"); return h; }
-    sp_StrStrHash_set(h, k.v.s, v.v.s);
+    sp_StrStrHash_set_e(h, k.v.s, SP_SEF(v.v.s));
   }
   return h;
 }
@@ -12193,8 +12305,12 @@ static sp_StrArray *sp_poly_as_str_array(sp_RbVal v) {
     /* a String changed in place is boxed as its handle: the typed Array
        holds its bytes, read out of the handle (a copy, as any String a
        typed Array is given), not the handle's pointer read as bytes */
+#ifdef SP_ONE_STRING
+    sp_StrArray_push_e(a, SP_SEV(e));
+#else
     sp_StrArray_push(a, e.tag == SP_TAG_NIL ? (const char *)0
                         : sp_poly_is_strbuf(e) ? sp_strbuf_read((sp_String *)e.v.p) : e.v.s);
+#endif
   }
   return a;
 }
@@ -12351,7 +12467,7 @@ static SP_NOINLINE sp_RbVal sp_poly_arr_get_hash_cold(sp_RbVal a, sp_int i) {
      keys are Integers answered nil through a boxed #[] because only the
      int->int one had an arm (#3822). */
   if (a.tag == SP_TAG_OBJ && a.cls_id == SP_BUILTIN_INT_STR_HASH) {
-    return sp_box_nullable_str(sp_IntStrHash_get((sp_IntStrHash *)a.v.p, i));
+    return SP_SEBOXN(sp_IntStrHash_get_e((sp_IntStrHash *)a.v.p, i));
   }
   /* a curried Proc read out of a container: [] applies the argument,
      realizing once the accumulator reaches its count */
@@ -12601,7 +12717,7 @@ static sp_RbVal sp_poly_index_poly(sp_RbVal recv, sp_RbVal idx) {
       return sp_box_oint(sp_IntIntHash_oget((sp_IntIntHash *)recv.v.p, i));
     }
     if (recv.cls_id == SP_BUILTIN_INT_STR_HASH)
-      return sp_box_nullable_str(sp_IntStrHash_get((sp_IntStrHash *)recv.v.p, i));
+      return SP_SEBOXN(sp_IntStrHash_get_e((sp_IntStrHash *)recv.v.p, i));
     return sp_poly_hash_foreign_miss(recv, idx);
   }
   /* Integer#[]: one bit of the receiver, a Bignum's included (#4665) */
@@ -12693,9 +12809,11 @@ static sp_RbVal sp_poly_delete_key(sp_RbVal recv, sp_RbVal key) {
         return r.nil ? sp_box_nil() : key;
       }
       case SP_BUILTIN_STR_ARRAY: {
+        /* (a shared String's handle box is that String) */
+        key = sp_poly_strbuf_deref(key);
         if (key.tag != SP_TAG_STR) return sp_box_nil();
-        const char *r = sp_StrArray_delete((sp_StrArray *)recv.v.p, key.v.s);
-        return r ? sp_box_str(r) : sp_box_nil();
+        sp_strelem r = sp_StrArray_delete_e((sp_StrArray *)recv.v.p, SP_SEF(key.v.s));
+        return r ? SP_SEBOX(r) : sp_box_nil();
       }
       case SP_BUILTIN_FLT_ARRAY: {
         if (key.tag == SP_TAG_NIL) {
@@ -13602,8 +13720,8 @@ static sp_RbVal sp_poly_arr_set_hash(sp_RbVal v, sp_int idx, sp_RbVal val) {
                                                  sp_poly_elem_i(val)); break;
     case SP_BUILTIN_FLT_ARRAY:  sp_FloatArray_oset((sp_FloatArray*)v.v.p, idx,
                                                    sp_poly_elem_f(val)); break;
-    case SP_BUILTIN_STR_ARRAY:  sp_StrArray_set((sp_StrArray*)v.v.p, idx,
-                                                 sp_poly_elem_s(val)); break;
+    case SP_BUILTIN_STR_ARRAY:  sp_StrArray_set_e((sp_StrArray*)v.v.p, idx,
+                                                 SP_SEV(val)); break;
     case SP_BUILTIN_POLY_ARRAY: {
       sp_PolyArray *_pa = (sp_PolyArray*)v.v.p;
       if (_pa && !_pa->frozen) {
@@ -13699,8 +13817,8 @@ static sp_RbVal sp_poly_arr_set(sp_RbVal v, sp_int idx, sp_RbVal val) {
                                                  sp_poly_elem_i(val)); break;
     case SP_BUILTIN_FLT_ARRAY:  sp_FloatArray_oset((sp_FloatArray*)v.v.p, idx,
                                                    sp_poly_elem_f(val)); break;
-    case SP_BUILTIN_STR_ARRAY:  sp_StrArray_set((sp_StrArray*)v.v.p, idx,
-                                                 sp_poly_elem_s(val)); break;
+    case SP_BUILTIN_STR_ARRAY:  sp_StrArray_set_e((sp_StrArray*)v.v.p, idx,
+                                                 SP_SEV(val)); break;
     case SP_BUILTIN_POLY_ARRAY: sp_PolyArray_set((sp_PolyArray*)v.v.p, idx, val); break;
     case SP_BUILTIN_PTR_ARRAY: { sp_PtrArray *_pa = (sp_PtrArray*)v.v.p; sp_PtrArray_set_grow(_pa, idx, sp_PtrArray_elem_unbox(_pa, val)); break; }
     /* an Integer key into a boxed hash: stored, or refused by its variant */
@@ -13929,7 +14047,7 @@ static sp_RbVal sp_poly_set_poly(sp_RbVal v, sp_RbVal key, sp_RbVal val) {
        with the entry missing. Say so instead. */
     case SP_BUILTIN_STR_STR_HASH:
       if (key.tag == SP_TAG_STR && val.tag == SP_TAG_STR)
-        sp_StrStrHash_set((sp_StrStrHash*)v.v.p, key.v.s, val.v.s);
+        sp_StrStrHash_set_e((sp_StrStrHash*)v.v.p, key.v.s, SP_SEF(val.v.s));
       else sp_poly_typed_hash_store_miss(key, val, "String", "String");
       break;
     case SP_BUILTIN_STR_INT_HASH:
@@ -13948,7 +14066,7 @@ static sp_RbVal sp_poly_set_poly(sp_RbVal v, sp_RbVal key, sp_RbVal val) {
       break;
     case SP_BUILTIN_INT_STR_HASH:
       if (key.tag == SP_TAG_INT && val.tag == SP_TAG_STR)
-        sp_IntStrHash_set((sp_IntStrHash*)v.v.p, key.v.i, val.v.s);
+        sp_IntStrHash_set_e((sp_IntStrHash*)v.v.p, key.v.i, SP_SEF(val.v.s));
       else sp_poly_typed_hash_store_miss(key, val, "Integer", "String");
       break;
     case SP_BUILTIN_SYM_POLY_HASH:
@@ -13966,8 +14084,8 @@ static sp_RbVal sp_poly_set_poly(sp_RbVal v, sp_RbVal key, sp_RbVal val) {
        Str/Float array (a nested write reached through a poly index) silently
        dropped the assignment. */
     case SP_BUILTIN_STR_ARRAY:
-      if (key.tag == SP_TAG_INT) sp_StrArray_set((sp_StrArray*)v.v.p, key.v.i,
-                                                  sp_poly_elem_s(val));
+      if (key.tag == SP_TAG_INT) sp_StrArray_set_e((sp_StrArray*)v.v.p, key.v.i,
+                                                  SP_SEV(val));
       break;
     case SP_BUILTIN_FLT_ARRAY:
       if (key.tag == SP_TAG_INT) sp_FloatArray_oset((sp_FloatArray*)v.v.p, key.v.i,
@@ -15098,7 +15216,7 @@ static sp_RbVal sp_poly_min(sp_RbVal v) {
     case SP_BUILTIN_INT_ARRAY:  return sp_box_oint(sp_IntArray_min_o(sp_IntArray_nil_cmp_ck((sp_IntArray *)v.v.p)));
     case SP_BUILTIN_FLT_ARRAY:  return sp_box_ofloat(sp_FloatArray_min_o(sp_FloatArray_nil_cmp_ck((sp_FloatArray *)v.v.p)));
     /* a String array reached here through the default and answered nil (#3464) */
-    case SP_BUILTIN_STR_ARRAY:  { const char *m = sp_StrArray_min((sp_StrArray *)v.v.p); return m ? sp_box_str(m) : sp_box_nil(); }
+    case SP_BUILTIN_STR_ARRAY:  { sp_strelem m = sp_StrArray_min_e((sp_StrArray *)v.v.p); return m ? SP_SEBOX(m) : sp_box_nil(); }
     case SP_BUILTIN_SYM_ARRAY: case SP_BUILTIN_PTR_ARRAY: return sp_PolyArray_min(sp_poly_to_poly_array(v));
     case SP_BUILTIN_POLY_ARRAY: return sp_PolyArray_min((sp_PolyArray *)v.v.p);
     /* Time#min is the MINUTE, not an enumerable minimum. A boxed Time has no
@@ -15127,7 +15245,7 @@ static sp_RbVal sp_poly_max(sp_RbVal v) {
   switch (v.cls_id) {
     case SP_BUILTIN_INT_ARRAY:  return sp_box_oint(sp_IntArray_max_o(sp_IntArray_nil_cmp_ck((sp_IntArray *)v.v.p)));
     case SP_BUILTIN_FLT_ARRAY:  return sp_box_ofloat(sp_FloatArray_max_o(sp_FloatArray_nil_cmp_ck((sp_FloatArray *)v.v.p)));
-    case SP_BUILTIN_STR_ARRAY:  { const char *m = sp_StrArray_max((sp_StrArray *)v.v.p); return m ? sp_box_str(m) : sp_box_nil(); }
+    case SP_BUILTIN_STR_ARRAY:  { sp_strelem m = sp_StrArray_max_e((sp_StrArray *)v.v.p); return m ? SP_SEBOX(m) : sp_box_nil(); }
     case SP_BUILTIN_SYM_ARRAY: case SP_BUILTIN_PTR_ARRAY: return sp_PolyArray_max(sp_poly_to_poly_array(v));
     case SP_BUILTIN_POLY_ARRAY: return sp_PolyArray_max((sp_PolyArray *)v.v.p);
     case SP_BUILTIN_RANGE: return sp_range_max_box(*(sp_Range *)v.v.p);
@@ -15465,11 +15583,15 @@ static SP_INLINE int sp_poly_ary_append(sp_RbVal v, sp_RbVal x) {
   }
   if (v.cls_id == SP_BUILTIN_STR_ARRAY) {
     /* a shared String handle stores a copy of its contents, as in sp_poly_shl */
+#ifdef SP_ONE_STRING
+    sp_strelem _es = SP_SEV(x);
+#else
     const char *_es = x.tag == SP_TAG_STR ? (const char *)x.v.p
                     : (x.tag == SP_TAG_OBJ && x.cls_id == SP_BUILTIN_STRBUF && x.v.p)
                         ? sp_str_dup(sp_String_cstr((sp_String *)x.v.p))
                         : sp_poly_elem_s(x);
-    sp_StrArray_push((sp_StrArray *)v.v.p, _es);
+#endif
+    sp_StrArray_push_e((sp_StrArray *)v.v.p, _es);
     return 1;
   }
   return 0;
@@ -15675,15 +15797,15 @@ const char*sp_PolyPolyHash_inspect(sp_PolyPolyHash*h);
    representable. str_str_hash_invert lives above (line ~1132)
    and stays as a same-type round-trip. */
 static sp_PolyPolyHash*sp_StrIntHash_invert_poly(sp_StrIntHash*h){SP_GC_ROOT(h);sp_PolyPolyHash*r=sp_PolyPolyHash_new();if (SP_UNLIKELY(!h)) sp_nil_recv("invert");for(sp_int i=0;i<h->len;i++)sp_PolyPolyHash_set(r,sp_box_oint(sp_StrIntHash_vget(h,h->order[i])),sp_box_str(h->order[i]));return r;}
-static sp_PolyPolyHash*sp_IntStrHash_invert(sp_IntStrHash*h){SP_GC_ROOT(h);sp_PolyPolyHash*r=sp_PolyPolyHash_new();if (SP_UNLIKELY(!h)) sp_nil_recv("invert");for(sp_int i=0;i<h->len;i++)sp_PolyPolyHash_set(r,sp_box_str(sp_IntStrHash_get(h,h->order[i])),sp_box_int(h->order[i]));return r;}
+static sp_PolyPolyHash*sp_IntStrHash_invert(sp_IntStrHash*h){SP_GC_ROOT(h);sp_PolyPolyHash*r=sp_PolyPolyHash_new();if (SP_UNLIKELY(!h)) sp_nil_recv("invert");for(sp_int i=0;i<h->len;i++)sp_PolyPolyHash_set(r,SP_SEBOX(sp_IntStrHash_get_e(h,h->order[i])),sp_box_int(h->order[i]));return r;}
 static sp_bool sp_PolyPolyHash_eq(sp_PolyPolyHash*a,sp_PolyPolyHash*b){if(!a||!b)return a==b;if(a->len!=b->len)return FALSE;for(sp_int i=0;i<a->len;i++){sp_RbVal k=a->keys[a->order[i]];if(!sp_PolyPolyHash_has_key(b,k))return FALSE;if(!sp_poly_rb_equal(sp_PolyPolyHash_get(a,k),sp_PolyPolyHash_get(b,k)))return FALSE;}return TRUE;}
 /* --- cross-variant hash equality ------------------------------------------
    Boxed key/value of the i-th insertion-ordered pair, per variant. */
 static void sp_poly_hash_pair_i(sp_RbVal h, sp_int i, sp_RbVal *k, sp_RbVal *v) {
   switch (h.cls_id) {
     case SP_BUILTIN_STR_INT_HASH: { sp_StrIntHash *x=(sp_StrIntHash*)h.v.p; *k=sp_box_str(x->order[i]); *v=sp_box_oint(sp_StrIntHash_vget(x,x->order[i])); return; }
-    case SP_BUILTIN_STR_STR_HASH: { sp_StrStrHash *x=(sp_StrStrHash*)h.v.p; *k=sp_box_str(x->order[i]); *v=sp_box_str(sp_StrStrHash_get(x,x->order[i])); return; }
-    case SP_BUILTIN_INT_STR_HASH: { sp_IntStrHash *x=(sp_IntStrHash*)h.v.p; *k=sp_box_int(x->order[i]); *v=sp_box_str(sp_IntStrHash_get(x,x->order[i])); return; }
+    case SP_BUILTIN_STR_STR_HASH: { sp_StrStrHash *x=(sp_StrStrHash*)h.v.p; *k=sp_box_str(x->order[i]); *v=SP_SEBOX(sp_StrStrHash_get_e(x,x->order[i])); return; }
+    case SP_BUILTIN_INT_STR_HASH: { sp_IntStrHash *x=(sp_IntStrHash*)h.v.p; *k=sp_box_int(x->order[i]); *v=SP_SEBOX(sp_IntStrHash_get_e(x,x->order[i])); return; }
     case SP_BUILTIN_INT_INT_HASH: { sp_IntIntHash *x=(sp_IntIntHash*)h.v.p; *k=sp_box_int(x->order[i]); *v=sp_box_oint(sp_IntIntHash_vget(x,x->order[i])); return; }
     case SP_BUILTIN_STR_POLY_HASH: { sp_StrPolyHash *x=(sp_StrPolyHash*)h.v.p; *k=sp_box_str(x->order[i]); *v=sp_StrPolyHash_get(x,x->order[i]); return; }
     case SP_BUILTIN_SYM_POLY_HASH: { sp_SymPolyHash *x=(sp_SymPolyHash*)h.v.p; *k=sp_box_sym(x->order[i]); *v=sp_SymPolyHash_get(x,x->order[i]); return; }
@@ -15722,8 +15844,8 @@ static sp_RbVal sp_poly_hash_probe(sp_RbVal h, sp_RbVal k, sp_bool *found) {
   *found = FALSE;
   switch (h.cls_id) {
     case SP_BUILTIN_STR_INT_HASH: { sp_StrIntHash *x=(sp_StrIntHash*)h.v.p; if (k.tag!=SP_TAG_STR||!k.v.s) return sp_box_nil(); if (!sp_StrIntHash_has_key(x,k.v.s)) return sp_box_nil(); *found=TRUE; return sp_box_oint(sp_StrIntHash_vget(x,k.v.s)); }
-    case SP_BUILTIN_STR_STR_HASH: { sp_StrStrHash *x=(sp_StrStrHash*)h.v.p; if (k.tag!=SP_TAG_STR||!k.v.s) return sp_box_nil(); if (!sp_StrStrHash_has_key(x,k.v.s)) return sp_box_nil(); *found=TRUE; return sp_box_str(sp_StrStrHash_get(x,k.v.s)); }
-    case SP_BUILTIN_INT_STR_HASH: { sp_IntStrHash *x=(sp_IntStrHash*)h.v.p; if (k.tag!=SP_TAG_INT) return sp_box_nil(); if (!sp_IntStrHash_has_key(x,k.v.i)) return sp_box_nil(); *found=TRUE; return sp_box_str(sp_IntStrHash_get(x,k.v.i)); }
+    case SP_BUILTIN_STR_STR_HASH: { sp_StrStrHash *x=(sp_StrStrHash*)h.v.p; if (k.tag!=SP_TAG_STR||!k.v.s) return sp_box_nil(); if (!sp_StrStrHash_has_key(x,k.v.s)) return sp_box_nil(); *found=TRUE; return SP_SEBOX(sp_StrStrHash_get_e(x,k.v.s)); }
+    case SP_BUILTIN_INT_STR_HASH: { sp_IntStrHash *x=(sp_IntStrHash*)h.v.p; if (k.tag!=SP_TAG_INT) return sp_box_nil(); if (!sp_IntStrHash_has_key(x,k.v.i)) return sp_box_nil(); *found=TRUE; return SP_SEBOX(sp_IntStrHash_get_e(x,k.v.i)); }
     case SP_BUILTIN_INT_INT_HASH: { sp_IntIntHash *x=(sp_IntIntHash*)h.v.p; if (k.tag!=SP_TAG_INT) return sp_box_nil(); if (!sp_IntIntHash_has_key(x,k.v.i)) return sp_box_nil(); *found=TRUE; return sp_box_oint(sp_IntIntHash_vget(x,k.v.i)); }
     case SP_BUILTIN_STR_POLY_HASH: { sp_StrPolyHash *x=(sp_StrPolyHash*)h.v.p; if (k.tag!=SP_TAG_STR||!k.v.s) return sp_box_nil(); if (!sp_StrPolyHash_has_key(x,k.v.s)) return sp_box_nil(); *found=TRUE; return sp_StrPolyHash_get(x,k.v.s); }
     case SP_BUILTIN_SYM_POLY_HASH: { sp_SymPolyHash *x=(sp_SymPolyHash*)h.v.p; if (k.tag!=SP_TAG_SYM) return sp_box_nil(); if (!sp_SymPolyHash_has_key(x,(sp_sym)k.v.i)) return sp_box_nil(); *found=TRUE; return sp_SymPolyHash_get(x,(sp_sym)k.v.i); }
@@ -15759,8 +15881,8 @@ static void sp_poly_hash_pair(sp_RbVal v, sp_int i, sp_RbVal *k, sp_RbVal *out) 
   if (v.tag != SP_TAG_OBJ) return;
   switch (v.cls_id) {
     case SP_BUILTIN_STR_INT_HASH: { sp_StrIntHash *h=(sp_StrIntHash*)v.v.p; const char *key=h->order[i]; *k=sp_box_str(key); *out=sp_box_oint(sp_StrIntHash_vget(h,key)); break; }
-    case SP_BUILTIN_STR_STR_HASH: { sp_StrStrHash *h=(sp_StrStrHash*)v.v.p; const char *key=h->order[i]; *k=sp_box_str(key); *out=sp_box_str(sp_StrStrHash_get(h,key)); break; }
-    case SP_BUILTIN_INT_STR_HASH: { sp_IntStrHash *h=(sp_IntStrHash*)v.v.p; sp_int key=h->order[i]; *k=sp_box_int(key); *out=sp_box_str(sp_IntStrHash_get(h,key)); break; }
+    case SP_BUILTIN_STR_STR_HASH: { sp_StrStrHash *h=(sp_StrStrHash*)v.v.p; const char *key=h->order[i]; *k=sp_box_str(key); *out=SP_SEBOX(sp_StrStrHash_get_e(h,key)); break; }
+    case SP_BUILTIN_INT_STR_HASH: { sp_IntStrHash *h=(sp_IntStrHash*)v.v.p; sp_int key=h->order[i]; *k=sp_box_int(key); *out=SP_SEBOX(sp_IntStrHash_get_e(h,key)); break; }
     case SP_BUILTIN_INT_INT_HASH: { sp_IntIntHash *h=(sp_IntIntHash*)v.v.p; sp_int key=h->order[i]; *k=sp_box_int(key); *out=sp_box_oint(sp_IntIntHash_vget(h,key)); break; }
     case SP_BUILTIN_STR_POLY_HASH: { sp_StrPolyHash *h=(sp_StrPolyHash*)v.v.p; const char *key=h->order[i]; *k=sp_box_str(key); *out=sp_StrPolyHash_get(h,key); break; }
     case SP_BUILTIN_SYM_POLY_HASH: { sp_SymPolyHash *h=(sp_SymPolyHash*)v.v.p; sp_sym key=h->order[i]; *k=sp_box_sym(key); *out=sp_SymPolyHash_get(h,key); break; }
@@ -16079,7 +16201,7 @@ static sp_StrArray *sp_caller(sp_int start, sp_bool have_len, sp_int len) {
   SP_GC_ROOT(r);
   sp_int from = start < 0 ? 0 : start;
   sp_int to = have_len ? from + (len < 0 ? 0 : len) : full->len;
-  for (sp_int i = from; i < to && i < full->len; i++) sp_StrArray_push(r, full->data[i]);
+  for (sp_int i = from; i < to && i < full->len; i++) sp_StrArray_push_e(r, full->data[i]);
   return r;
 }
 
@@ -16893,7 +17015,7 @@ static const char *sp_syserr_super(sp_Exception *self, sp_int argc, const sp_RbV
   SP_GC_ROOT(self);
   const char *m = sp_syserr_msg_a(self->cls_name, argc, av);
   sp_gc_wb((void *)self);
-  self->msg = m;
+  self->msg = sp_str_retained(m);
   self->xkey = sp_box_nil();
   sp_exc_syserr_init(self);
   return m;
@@ -17890,7 +18012,11 @@ const char *sp_file_basename2(const char *path, const char *suffix);
    String nothing else holds. */
 static void sp_file_join_flat(sp_RbVal v, sp_StrArray *parts, int depth) {
   v = sp_rbval_str(v);
+#ifdef SP_ONE_STRING
+  if (v.tag == SP_TAG_STR) { sp_StrArray_push_e(parts, SP_SEF(v.v.s ? v.v.s : sp_str_empty)); return; }
+#else
   if (v.tag == SP_TAG_STR) { sp_StrArray_push(parts, v.v.s ? v.v.s : ""); return; }
+#endif
   if (v.tag == SP_TAG_OBJ && sp_poly_is_array_kind(v.cls_id)) {
     /* an Array nested past any sane depth is one that contains itself */
     if (depth >= 64) sp_raise_cls("ArgumentError", "recursive array");
@@ -17901,13 +18027,23 @@ static void sp_file_join_flat(sp_RbVal v, sp_StrArray *parts, int depth) {
   /* everything else takes the path slot's protocol: nil / bool / a
      wrongly-classed scalar is CRuby's TypeError, a user object converts
      through #to_path or #to_str, or raises */
-  sp_StrArray_push(parts, sp_poly_arg_path(v));
+  sp_StrArray_push_e(parts, SP_SEF(sp_poly_arg_path(v)));
 }
 static const char *sp_file_join_vals(sp_RbVal *vals, int n) {
   sp_StrArray *parts = sp_StrArray_new();
   SP_GC_ROOT(parts);
   for (int i = 0; i < n; i++) sp_file_join_flat(vals[i], parts, 0);
+#ifdef SP_ONE_STRING
+  /* the join reads bytes: a row of them, while `parts` still holds the handles */
+  const char **bs = (const char **)sp_pl_alloc(sizeof(const char *) * (size_t)(parts->len + 1));
+  if (!bs) sp_oom_die();
+  for (sp_int i = 0; i < parts->len; i++) bs[i] = SP_SEB(parts->data[i]);
+  const char *joined = sp_file_join(bs, (int)parts->len);
+  sp_pl_free(bs);
+  return joined;
+#else
   return sp_file_join(parts->data, (int)parts->len);
+#endif
 }
 /* Issue #892: File.dirname / File.extname / Dir.pwd. */
 const char *sp_file_dirname(const char *path);
@@ -17918,6 +18054,7 @@ const char *sp_dir_pwd(void);
    Windows _-prefixed variants take a single path argument); each returns
    0 on success, matching CRuby's `Dir.mkdir` etc. */
 sp_int sp_dir_mkdir(const char *path);
+sp_int sp_dir_mkdir_mode(const char *path, sp_int mode);
 sp_int sp_dir_rmdir(const char *path);
 sp_int sp_dir_chdir(const char *path);
 sp_int sp_dir_chdir0(const char *path);  /* the block form's label */
@@ -17959,11 +18096,13 @@ sp_StrArray *sp_dir_entries_enc(const char *path, int children, sp_RbVal enc);
 void sp_Dir_fin(void *p);
 void sp_Dir_scan(void *p);
 sp_Dir *sp_Dir_new(const char *path);
+sp_Dir *sp_dir_dup_handle(sp_Dir *source);
 sp_Dir *sp_Dir_for_fd(sp_int fd);
 sp_StrArray *sp_Dir_entries_h(sp_Dir *d, sp_int children);
 sp_int sp_Dir_fchdir(sp_int fd);
 const char *sp_Dir_read(sp_Dir *d);
 const char *sp_Dir_path(sp_Dir *d);
+const char *sp_Dir_path_copy(sp_Dir *d);
 sp_RbVal sp_Dir_close(sp_Dir *d);
 sp_Dir *sp_Dir_rewind(sp_Dir *d);
 sp_int sp_Dir_tell(sp_Dir *d);
@@ -17994,7 +18133,7 @@ static sp_StrArray *sp_dir_glob_multi(sp_RbVal pats) {
     sp_StrArray *one = sp_dir_glob(pat);
     SP_GC_ROOT(one);
     for (sp_int j = 0; one && j < one->len; j++)
-      sp_StrArray_push(out, sp_StrArray_get(one, j));
+      sp_StrArray_push_e(out, sp_StrArray_get_e(one, j));
   }
   return out;
 }
@@ -21559,12 +21698,14 @@ static sp_int sp_proc_compose_fn(void *cap, sp_int argc, sp_int *args) {
      a plain proc adjusts, as everywhere else. */
   if (c->inner && c->inner->lambda_p && c->inner->arity >= 0)
     sp_arity_check(argc, c->inner->arity, c->inner->arity, NULL);
+  /* a call of more than 16 arguments hands on the caller's own slots, one
+     for each (16 copied dropped the 17th on) */
   sp_int inner_args[16] = {0};
-  sp_int inner_argc = argc > 16 ? 16 : argc;
-  for (sp_int _i = 0; _i < inner_argc; _i++) inner_args[_i] = args ? args[_i] : 0;
+  sp_int *inner = argc > 16 && args ? args : inner_args;
+  for (sp_int _i = 0; inner == inner_args && _i < argc && _i < 16; _i++) inner_args[_i] = args ? args[_i] : 0;
   /* the caller already published the boxed argument(s) to the side-channel, so
      the inner proc reads them back regardless of its parameters' static types */
-  sp_proc_call(c->inner, inner_argc, inner_args);
+  sp_proc_call(c->inner, inner == inner_args && argc > 16 ? 16 : argc, inner);
   /* the inner proc publishes its (boxed) result through the return slot;
      thread it to the outer proc on BOTH channels -- a poly parameter reads
      the side-channel, a concrete one reads the sp_int slot. */
@@ -21616,30 +21757,45 @@ static void *sp_proc_compose_v(void *outer, void *inner) {
    by calling the target with the collected (sp_int) arguments. Spinel
    defers the call to the point of use (sp_curry_to_int), so a partial
    curry behaves as a deferred call rather than auto-invoking at arity. */
-/* The int slots feed a target with scalar-int params, which reads them
-   directly rather than from the boxed side-channel. */
-static void sp_curry_int_slots(sp_Curry *c, sp_int *slots) {
-  for (sp_int i = 0; i < c->nargs && i < 16; i++) slots[i] = sp_poly_slot_i(c->args[i]);
+/* Realize a full accumulator: call the target with every collected
+   argument. The int slots feed a target with scalar-int params, which reads
+   them directly; the boxed values go on the side channel, and past its
+   slots into the call's wide store, for a poly-param target to read back
+   with each arg's real type. A curry of more than 16 arguments takes its
+   slots off the heap for the call's length. */
+static SP_NOINLINE void sp_curry_call_target(sp_Curry *c) {
+  SP_GC_ROOT(c);  /* c->args is read during the call; the target can allocate */
+  sp_int n = c->nargs;
+  sp_int slots_s[16], *slots = slots_s, *heap = NULL;
+  SP_GC_ROOT(heap);
+  if (n > 16) {
+    if ((size_t)n > SIZE_MAX / sizeof(sp_int)) {
+      fprintf(stderr, "spinel: out of memory\n");
+      abort();
+    }
+    slots = heap = (sp_int *)sp_gc_alloc(sizeof(sp_int) * (size_t)n, NULL, NULL);
+  }
+  sp_proc_wide_open(n);
+  for (sp_int i = 0; i < n; i++) {
+    /* (as sp_proc_call_spread_wide projects them: a String or object is
+       its pointer, anything else sp_poly_slot_arg) */
+    sp_RbVal e = c->args[i];
+    slots[i] = (e.tag == SP_TAG_OBJ || e.tag == SP_TAG_STR) ? (sp_int)(uintptr_t)e.v.p : sp_poly_slot_arg(e);
+    sp_proc_arg_set(i, e);
+  }
+  /* the target publishes its (boxed) result through the return slot */
+  sp_proc_call(c->target, n, slots);
 }
 static sp_int sp_curry_to_int(sp_Curry *c) {
   if (!c || !c->target) return 0;
-  SP_GC_ROOT(c);  /* c->args is read during the call; the target can allocate */
-  sp_int slots[16];
-  sp_curry_int_slots(c, slots);
-  sp_curry_publish_args(c);
-  /* the target publishes its (boxed) result through the return slot */
-  sp_proc_call(c->target, c->nargs, slots);
+  sp_curry_call_target(c);
   return sp_poly_to_i(_sp_proc_poly_ret);
 }
 /* Realization for a target whose return is not statically int: the boxed
    result flows through unchanged. */
 static sp_RbVal sp_curry_realize_poly(sp_Curry *c) {
   if (!c || !c->target) return sp_box_nil();
-  SP_GC_ROOT(c);
-  sp_int slots[16];
-  sp_curry_int_slots(c, slots);
-  sp_curry_publish_args(c);
-  sp_proc_call(c->target, c->nargs, slots);
+  sp_curry_call_target(c);
   return _sp_proc_poly_ret;
 }
 
@@ -21676,14 +21832,25 @@ static sp_Curry *sp_curry_new_v(sp_Proc *p, sp_RbVal n, sp_int max) {
     return sp_curry_new(p);
   return sp_curry_new_n(p, sp_poly_arg_int_chk(n), max);
 }
+/* the accumulator carries its own completion count -- curry(n)'s n, else
+   the target's required count, stamped at creation */
+static sp_RbVal sp_curry_settle(sp_Curry *c) {
+  if (c->nargs >= c->arity) return sp_curry_realize_poly(c);
+  return sp_box_obj((void *)c, SP_BUILTIN_CURRY);
+}
 static sp_RbVal sp_curry_call_poly(sp_Curry *c, sp_int argc, const sp_RbVal *args) {
   if (!c) return sp_box_nil();
   SP_GC_ROOT(c);
   for (sp_int i = 0; i < argc; i++) c = sp_curry_apply(c, args[i]);
-  /* the accumulator carries its own completion count -- curry(n)'s n, else
-     the target's required count, stamped at creation */
-  if (c->nargs >= c->arity) return sp_curry_realize_poly(c);
-  return sp_box_obj((void *)c, SP_BUILTIN_CURRY);
+  return sp_curry_settle(c);
+}
+/* The same over the call that entered: its n boxed arguments on the side
+   channel, and past its slots in the call's wide store. */
+static sp_RbVal sp_curry_call_channel(sp_Curry *c, sp_int n) {
+  if (!c) return sp_box_nil();
+  SP_GC_ROOT(c);
+  for (sp_int i = 0; i < n; i++) c = sp_curry_apply(c, sp_proc_arg(i));
+  return sp_curry_settle(c);
 }
 
 /* Proc#>> / #<< over a curried Proc: composition threads sp_Proc values, and a
@@ -21696,7 +21863,7 @@ static sp_int sp_curry_proc_fn(void *cap, sp_int argc, sp_int *args) {
   /* apply-and-decide, like every other application path: a call that does
      not reach the accumulator's count answers the next curry, not the
      target called short */
-  _sp_proc_poly_ret = sp_curry_call_poly(cy, argc < 16 ? argc : 16, _sp_proc_poly_args);
+  _sp_proc_poly_ret = sp_curry_call_channel(cy, argc);
   return sp_poly_to_i(_sp_proc_poly_ret);
 }
 /* sp_Proc_scan calls cap_scan WITHOUT marking the capture first, so this hook
@@ -21715,7 +21882,7 @@ static sp_Proc *sp_curry_to_proc(sp_Curry *cy) {
    parameters (_sp_proc_kwpos); 0 when the caller does not say */
 static sp_RbVal sp_poly_callable_call_kw(sp_RbVal v, sp_int n, const sp_int *args, int kwpos) {
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_CURRY)
-    return sp_curry_call_poly((sp_Curry *)v.v.p, n < 16 ? n : 16, _sp_proc_poly_args);
+    return sp_curry_call_channel((sp_Curry *)v.v.p, n);
   /* A bound Method that fell through a call arm's own gate still has the
      generic trampoline, whose poly-ABI and legacy gates read the published
      boxed side-channel -- a typed-array adapter or an int-parameter target
@@ -21848,10 +22015,11 @@ static sp_RbVal sp_bm_call_spread(sp_BoundMethod *m, sp_Proc *blk, sp_RbVal arr,
    helper clamps first. */
 static sp_RbVal sp_poly_callable_spread(sp_RbVal v, sp_RbVal arr, int kwpos) {
   if (v.tag == SP_TAG_OBJ && v.v.p && v.cls_id == SP_BUILTIN_CURRY) {
+    sp_Curry *c = (sp_Curry *)v.v.p;
+    SP_GC_ROOT(c); SP_GC_ROOT_RBVAL(arr);
     sp_int n = sp_poly_length(arr);
-    sp_RbVal args[16];
-    for (sp_int i = 0; i < n && i < 16; i++) args[i] = sp_poly_arr_get(arr, i);
-    return sp_curry_call_poly((sp_Curry *)v.v.p, n < 16 ? n : 16, args);
+    for (sp_int i = 0; i < n; i++) c = sp_curry_apply(c, sp_poly_arr_get(arr, i));
+    return sp_curry_settle(c);
   }
   if (v.tag == SP_TAG_OBJ && v.v.p && v.cls_id == SP_BUILTIN_METHOD)
     return sp_bm_call_spread((sp_BoundMethod *)v.v.p, NULL, arr, kwpos);
@@ -22159,6 +22327,88 @@ static const char *sp_sym_to_s(sp_sym id) { (void)id; return sp_str_empty; }
 static const char *sp_class_to_s(sp_Class c) { return c.name ? c.name : sp_str_empty; }
 static sp_sym sp_sym_intern(const char *s) { (void)s; return (sp_sym)0; }
 static sp_sym sp_sym_intern_n(const char *s, size_t n) { (void)s; (void)n; return (sp_sym)0; }
+#endif
+
+#ifdef SP_ONE_STRING
+/* One representation (string-one-repr-design.md): under the mode a String
+   slot is the handle and a builtin's answer is bytes, and an emitter does
+   not always know which face an expression has (an element read answers
+   the handle, a fresh String bytes). The C compiler does: these resolve the
+   face on the expression's type, so the generated C names one conversion
+   and gets the right one. A handle asked for as a handle is itself, which
+   keeps its identity; bytes asked for as a handle get a new one (a frozen
+   literal its own site's). The runtime's own files do not see these (they
+   spell the element macros of sp_types.h); the generated TU does. */
+static inline sp_String *sp_strface_h_self(sp_String *h) { return h; }
+static inline const char *sp_strface_b_self(const char *s) { return s; }
+static inline const char *sp_strface_b_of(sp_String *h) { return h ? h->data : NULL; }
+static inline const char *sp_strface_b_copy(sp_String *h) { return sp_strbuf_read_own(h); }
+/* ...and bytes held that are a live payload's (a view a bound read answered,
+   marker 0xfd, of a handle that is not frozen) are copied too: the handle
+   can change under the hold (`s.concat(s, s)` reads s after the first
+   append grew it) */
+static inline const char *sp_strface_bc_bytes(const char *s) {
+  if (s && ((const unsigned char *)s)[-1] == 0xfd && !sp_str_is_frozen_val(s)) return sp_str_concat(s, (&("\xff")[1]));
+  return s;
+}
+static inline sp_RbVal sp_strface_box_h(sp_String *h) { return h ? sp_box_obj(h, SP_BUILTIN_STRBUF) : sp_box_nil(); }
+/* A String the program keeps in a box is a handle box (a box is a String
+   slot): the handle of a payload view, a new handle over other mutable
+   bytes; a frozen String stays its bytes, which nothing changes */
+static inline sp_RbVal sp_strface_box_new(const char *s) {
+  if (!s) return sp_box_nil();
+  if (((const unsigned char *)s)[-1] == 0xfd || !sp_str_is_frozen_val(s)) return sp_box_obj(sp_String_new_fresh(s), SP_BUILTIN_STRBUF);
+  return sp_box_str(s);
+}
+/* (each spells its operand once, in a statement expression: the operand may
+   be a statement expression of its own with labels in it, and it is as long
+   as an emitter made it) */
+/* (a bare 0 an emitter writes for nil is an int to _Generic: the zf arm) */
+static inline const char *sp_strface_zero_b(int z) { (void)z; return NULL; }
+static inline sp_String *sp_strface_zero_h(int z) { (void)z; return NULL; }
+static inline sp_RbVal sp_strface_zero_box(int z) { (void)z; return sp_box_nil(); }
+/* (and a String some emitters answer boxed, a String-typed read whose nil
+   or raise arm is a box: the box's String, the handle it holds, or nil) */
+static inline const char *sp_strface_b_box(sp_RbVal v) {
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF) return v.v.p ? ((sp_String *)v.v.p)->data : NULL;
+  return v.tag == SP_TAG_STR ? v.v.s : NULL;
+}
+static inline sp_String *sp_strface_h_box(sp_RbVal v) { return sp_poly_nil_p(v) ? NULL : sp_poly_as_strbuf(v); }
+static inline sp_RbVal sp_strface_box_self(sp_RbVal v) { return v; }
+/* (an untyped pointer is bytes: a conditional with a bare NULL arm, `c ?
+   s : NULL` or a raise arm's `(raise, NULL)`, is a void *; the emitters
+   that hand the published handle on cast it, (sp_String *)_sp_ret_strbuf) */
+#define SP_ONE_FACE(x, hf, bf, zf, rf) ({ __auto_type _sp_fv = (x); \
+  _Generic(_sp_fv, sp_String *: hf, sp_RbVal: rf, int: zf, long: zf, long long: zf, default: bf)(_sp_fv); })
+#define SP_STR_B(x) SP_ONE_FACE(x, sp_strface_b_of, sp_strface_b_self, sp_strface_zero_b, sp_strface_b_box)
+/* the same for an operand held across a block the program runs (sp_strbuf_read_own) */
+#define SP_STR_BC(x) SP_ONE_FACE(x, sp_strface_b_copy, sp_strface_bc_bytes, sp_strface_zero_b, sp_strface_b_box)
+/* The handle and the box of a String of either face, where an emitter
+   does not know which face its operand has: names of their own, beside the
+   runtime's functions, each of which takes the one face its signature says
+   (a String argument is its bytes; the runtime finds a payload view's
+   handle itself, sp_String_new_shared, sp_box_str) */
+#define SP_STR_HDL(x) SP_ONE_FACE(x, sp_strface_h_self, sp_String_new_shared, sp_strface_zero_h, sp_strface_h_box)
+#define SP_STR_BOX(x) SP_ONE_FACE(x, sp_strface_box_h, sp_strface_box_new, sp_strface_zero_box, sp_strface_box_self)
+/* ...and a String of either face as the face slot `dst` has, where the
+   emitter of `dst = v` knows neither (a block parameter a typed walk binds) */
+#define SP_STR_TO(dst, v) _Generic((dst), sp_String *: SP_STR_HDL(v), default: SP_STR_B(v))
+/* A String method's answer that is a new String: the channel a read of a
+   handle inside it published is cleared after the answer is made, so a
+   caller's pickup does not take that handle for it (one_tail_fresh) */
+static inline const char *sp_strface_unpub(const char *s) { _sp_ret_strbuf = NULL; return s; }
+/* A mutator whose receiver is no variable (`String(a[0]) << "!"`): when
+   the receiver's bytes are a live payload's view the String is the
+   payload's owner, which takes the new bytes, and the answer is its view
+   (the receiver, as CRuby's mutator answers); other bytes were a String no
+   one holds, and the new bytes are the answer (emit_str_mut_writeback) */
+static inline const char *sp_strface_write_through(const char *recv, const char *nb) {
+  if (recv && nb && ((const unsigned char *)recv)[-1] == 0xfd) {
+    sp_String *o = (sp_String *)(void *)((sp_str_hdr *)sp_fd_base(recv))->next;
+    if (o) { SP_GC_ROOT_STR(nb); sp_String_set_bin_enc(o, nb); return o->data; }
+  }
+  return nb;
+}
 #endif
 
 #endif /* SP_RUNTIME_H */

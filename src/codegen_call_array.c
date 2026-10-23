@@ -2351,7 +2351,7 @@ int emit_call_store_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         }
         else if (coerce_unknown_val) emit_unresolved_coerced(c, argv[1], hvt, b);
         else if (decl_type == TY_POLY) emit_boxed(c, argv[1], b);
-        else emit_expr(c, argv[1], b);
+        else emit_expr_face(c, argv[1], decl_type, b);
         /* a key that is a shared String slot's read is a fresh copy, read
            in the set after the value: the value is held across it */
         if (tk < 0 && strbuf_read_copies(c, argv[0]) && operand_may_allocate(c, argv[1])) {
@@ -2605,7 +2605,7 @@ static void emit_slice_bang_range_held(Compiler *c, int id, int recv, TyKind rt,
   TyKind et = ty_array_elem(rt);
   const char *e = ab.p ? ab.p : "";
   if (rt == TY_POLY_ARRAY) buf_puts(b, e);
-  else if (et == TY_STRING) buf_printf(b, "sp_box_nullable_str(%s)", e);
+  else if (et == TY_STRING) buf_printf(b, (g_one_string ? "SP_STR_BOX(%s)" : "sp_box_nullable_str(%s)"), e);
   else buf_printf(b, "%s(%s)", oint_box(et), e);
   free(ab.p);
   buf_puts(b, "; })");

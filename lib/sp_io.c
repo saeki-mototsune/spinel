@@ -2011,6 +2011,23 @@ SP_NORETURN void sp_file_raise_errno(const char *op, const char *path) {SP_GC_RO
                sp_sprintf("%s @ %s - %s", strerror(e), op, path ? path : ""));
 }
 
+void sp_pread_check(sp_File *f, sp_int len, sp_bool outbuf) {
+  if (len == 0 && f && !outbuf) return;
+  SP_IO_OPEN(f);
+  const char *m = f->mode;
+  if (m && (m[0] == 'w' || m[0] == 'a')) {
+    for (const char *q = m + 1; *q && *q != ':'; q++)
+      if (*q == '+') return;
+    sp_raise_cls("IOError", "not opened for reading");
+  }
+}
+
+SP_NORETURN void sp_pread_raise_errno(sp_File *f) {
+  int e = errno;
+  if (f->path) sp_file_raise_errno("rb_io_pread", f->path);
+  sp_raise_cls(sp_errno_class_name(e), strerror(e));
+}
+
 sp_bool sp_file_owned(const char *path) {
   struct stat st;
   return path && stat(path, &st) == 0 && st.st_uid == geteuid();
@@ -2321,6 +2338,7 @@ void sp_File_close_half(sp_File *f, sp_bool reading) {SP_GC_ROOT(f);
 }
 /* IO#reopen(path, mode): rebind the handle to another file. */
 sp_File *sp_File_reopen(sp_File *f, const char *path, const char *mode) {SP_GC_ROOT(f);SP_GC_ROOT_STR(path);SP_GC_ROOT_STR(mode); sp_gc_wb((void*)f);
+  path = sp_str_keep(path);   /* (the File keeps its path, sp_str_keep) */
   if (!f) return f;
   /* with no mode the handle keeps its own, as CRuby's does: a "w" handle
      reopens for writing (and truncates), an "rb" one stays binary. fopen
@@ -2357,7 +2375,7 @@ sp_File *sp_File_reopen(sp_File *f, const char *path, const char *mode) {SP_GC_R
   SP_ATOMIC_STORE(&f->fp, nf, __ATOMIC_RELAXED);
   SP_ATOMIC_STORE(&f->closed, 0, __ATOMIC_RELAXED);
   if (reserved) SP_ATOMIC_STORE(&f->uses, 0, __ATOMIC_RELEASE);
-  f->path = path;
+  f->path = sp_str_retained(path);
   /* a mode given replaces the handle's, as CRuby's does: an earlier
      #binmode or #set_encoding no longer decides what a read answers */
   if (mode && mode[0]) { f->bin_flag = 0; f->ext_enc = 0; }

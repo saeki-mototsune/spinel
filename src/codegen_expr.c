@@ -369,7 +369,7 @@ static void interp_plan(Compiler *c, int id, InterpPlan *pl) {
         Buf hb; memset(&hb, 0, sizeof hb);
         emit_strbuf_handle_of(c, expr, &hb);
         int hv = ++g_tmp, tv3 = ++g_tmp;
-        buf_printf(&decls, "sp_String *_t%d = %s; SP_GC_ROOT(_t%d); ", hv, hb.p ? hb.p : "NULL", hv);
+        buf_printf(&decls, (g_one_string ? "sp_String *_t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d); " : "sp_String *_t%d = %s; SP_GC_ROOT(_t%d); "), hv, hb.p ? hb.p : "NULL", hv);
         buf_printf(&late, "const char *_t%d = sp_str_or_empty(sp_strbuf_read(_t%d)); SP_GC_ROOT(_t%d); "
                    "size_t _l%d = sp_str_byte_len(_t%d); ", tv3, hv, tv3, tv3, tv3);
         free(hb.p);
@@ -430,7 +430,15 @@ static void interp_plan(Compiler *c, int id, InterpPlan *pl) {
         /* a nullable string (NULL) interpolates as the empty string (a part
            read after the last part keeps its nil, to read nothing then) */
         if (late_call) EMIT_IV();
+        /* (one-String mode: a value of either face, `"#{file || "-"}"`
+           with file a String-or-nil handle) */
+        else if (g_one_string) { buf_puts(&conv, "sp_str_or_empty(SP_STR_B("); EMIT_IV(); buf_puts(&conv, "))"); }
         else { buf_puts(&conv, "sp_str_or_empty("); EMIT_IV(); buf_puts(&conv, ")"); }
+      }
+      else if (g_one_string && t == TY_STRBUF) {
+        /* (one representation: a part whose value is a handle, a write's in
+           value position; read through its face) */
+        buf_puts(&conv, "sp_str_or_empty(SP_STR_B("); EMIT_IV(); buf_puts(&conv, "))");
       }
       else if (t == TY_FLOAT) {
         /* and a nullable Float holding nil writes nothing too */
@@ -649,6 +657,25 @@ static void interp_plan(Compiler *c, int id, InterpPlan *pl) {
       else if (wkind == WK_NIL) {
         buf_printf(&decls, "(void)(%s); ", conv.p ? conv.p : "0");
         tv2 = -1;
+      }
+      else if (g_one_string && t == TY_STRING && !vexpr[0] && repr_of(c, expr).strbuf_src == RS_HANDLE &&
+               (nt_kind(nt, expr) == NK_LocalVariableReadNode || nt_kind(nt, expr) == NK_InstanceVariableReadNode) &&
+               /* (not a define_method loop variable the literal stands in for) */
+               !(g_dm_subst_name && nt_kind(nt, expr) == NK_LocalVariableReadNode && sp_streq(nt_str(nt, expr, "name"), g_dm_subst_name))) {
+        /* one representation: the part is held as its handle where it is
+           evaluated and read when the parts are joined, as CRuby collects
+           the parts' objects first (a later part that rebinds the variable
+           leaves this part's String; one that changes it in place shows) */
+        int th = ++g_tmp;
+        Buf hb; memset(&hb, 0, sizeof hb);
+        /* (a local through emit_local_ref: a captured or renamed one is not
+           its bare lv_ name) */
+        if (nt_kind(nt, expr) == NK_LocalVariableReadNode) emit_local_ref(c, expr, nt_str(nt, expr, "name"), &hb);
+        else emit_strbuf_handle_of(c, expr, &hb);
+        buf_printf(&decls, (g_one_string ? "sp_String *_t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d); " : "sp_String *_t%d = %s; SP_GC_ROOT(_t%d); "), th, hb.p ? hb.p : "NULL", th);
+        buf_printf(&late, "const char *_t%d = sp_str_or_empty(SP_STR_B(_t%d)); SP_GC_ROOT(_t%d); size_t _l%d = sp_str_byte_len(_t%d); ",
+                   tv2, th, tv2, tv2, tv2);
+        free(hb.p);
       }
       else {
         int defer = 0;
@@ -1072,6 +1099,10 @@ static void emit_ternary_arm_o(Compiler *c, int nd, TyKind res, int res_o, Buf *
       const char *nv = nil_value(res);
       if (!nv) nv = default_value_from_compiler(c, res);
       if (!nv) nv = "0";
+      /* (one representation: a String arm's nil is typed bytes; an untyped
+         NULL made the conditional a void *, which the face macros read as
+         the handle) */
+      if (g_one_string && res == TY_STRING) nv = "((const char *)0)";
       /* a bare `nil` arm emits nothing at all; only a call needs sequencing */
       if (ab.p && ab.p[0]) buf_printf(b, "(%s, %s)", ab.p, nv);
       else buf_puts(b, nv);
@@ -1770,6 +1801,9 @@ int emit_call_or_write_via_methods(Compiler *c, int id, int is_or, Buf *b) {
     if (ro && !wo && want == TY_POLY && rdt != TY_POLY) buf_printf(b, "%s(_t%d)", oint_box(rdt), tv);
     else if (rdt == want) buf_puts(b, sv);
     else if (want == TY_POLY) emit_boxed_text(c, rdt, sv, b);
+    /* (one-String mode: the other face of the same String) */
+    else if (g_one_string && rdt == TY_STRBUF && want == TY_STRING) buf_printf(b, "SP_STR_B(%s)", sv);
+    else if (g_one_string && rdt == TY_STRING && want == TY_STRBUF) buf_printf(b, "SP_STR_HDL(%s)", sv);
     /* nil-preserving: the reader can answer nil, and this arm is exactly the
        one taken when it did (`&&=` on a nil attribute). Plain unboxing lands
        on the payload under the tag -- 0 for an int slot, where nil is
@@ -2024,6 +2058,26 @@ void emit_expr(Compiler *c, int id, Buf *b) {
     g_rat_box_node = save;
     return;
   }
+  /* One representation: an expression's default face is bytes, and an
+     element read of a typed String container answers the handle
+     (one_str_elem_call), so it is read through SP_STR_B here. An emitter
+     that wants the handle itself asks through strh_elem_handle_text, which
+     names the node in g_one_elem_raw. A sink handed the bytes of a live
+     payload finds its handle again through the payload's owner link
+     (sp_strface_owner), so neither face loses the String's identity. */
+  /* (a node an emitter has bound to a temp reads as that temp, in the face
+     its binder chose) */
+  int one_bound = 0;
+  if (g_one_string) for (int i = g_n_argov - 1; i >= 0 && !one_bound; i--) if (g_argov_node[i] == id) one_bound = 1;
+  if (g_one_string && !one_bound && id != g_one_elem_raw && one_str_elem_call(c, id, TY_UNKNOWN)) {
+    int save = g_one_elem_raw;
+    g_one_elem_raw = id;
+    buf_puts(b, "SP_STR_B(");
+    emit_expr(c, id, b);
+    buf_puts(b, ")");
+    g_one_elem_raw = save;
+    return;
+  }
   if (g_repr_check) repr_check_ask(c, id);
   int sk_open = g_share_check ? share_check_mark(c, id, 'x', b) : 0;
   int frame = g_repr_check ? repr_channel_begin(c, id) : -1;
@@ -2163,6 +2217,8 @@ static void emit_if_arm_value(Compiler *c, int last, TyKind res, int res_o, int 
   if (res_o && oint_kind(res)) buf_puts(g_pre, le.p ? le.p : oint_nil(res));
   else if (boxed) buf_puts(g_pre, le.p ? le.p : "sp_box_nil()");
   else if (emit_arm_text_as_bigint(res, lt, le.p ? le.p : default_value_from_compiler(c, lt), g_pre)) { }
+  /* (one representation: the arm of either face into the temp's, SP_STR_TO) */
+  else if (le.p && one_str_to_open(g_pre, res, "_t%d", tr)) { buf_puts(g_pre, le.p); buf_puts(g_pre, ")"); }
   else buf_puts(g_pre, le.p ? le.p : default_value_from_compiler(c, res));
   buf_puts(g_pre, ";\n");
   free(le.p);
@@ -2853,7 +2909,7 @@ static void emit_strbuf_slot_read(Compiler *c, int id, Repr rp, const char *sref
     if (g_repr_check) repr_channel_note(c, id, RCH_BYTES);
   }
   else {
-    buf_printf(b, "sp_strbuf_read_pub(%s)", sref);
+    str_read_handle(b, sref, 1);   /* (one representation: a copy when held, g_one_held) */
     if (g_repr_check) repr_channel_note(c, id, RCH_PUBLISH);
   }
 }
@@ -3144,7 +3200,12 @@ static int emit_ivar_cvar_gvar_expr(Compiler *c, int id, Buf *b, const NodeTable
     TyKind ct = idx >= 0 ? c->classes[cid].cvar_types[idx] : TY_INT;
     Buf ref; memset(&ref, 0, sizeof ref);
     holder_slot_buf(c, &h, &ref);
-    if (ct == TY_STRING && op && sp_streq(op, "+")) {
+    /* (one representation: a handle slot takes the new String in its face) */
+    if (g_one_string && ct == TY_STRBUF && op && sp_streq(op, "+")) {
+      buf_printf(b, "(%s = SP_STR_TO(%s, sp_str_plus(SP_STR_B(%s), ", ref.p, ref.p, ref.p);
+      emit_str_expr(c, v, b); buf_puts(b, ")))");
+    }
+    else if (ct == TY_STRING && op && sp_streq(op, "+")) {
       buf_printf(b, "(%s = sp_str_plus(%s, ", ref.p, ref.p);
       emit_str_expr(c, v, b); buf_puts(b, "))");
     }
@@ -3719,7 +3780,7 @@ static int defined_super_reaches(Compiler *c, int sup) {
   if (mod && !s->is_cmethod) return -1;   /* its includer's chain decides */
   if (comp_super_shadow(c, s)) return 1;
   int p = comp_super_parent(c, s->class_id, s->is_cmethod);
-  const char *u = comp_super_name(c, p, s->name, s->is_cmethod);
+  const char *u = comp_super_name(c, p, comp_scope_def_name(c, s), s->is_cmethod);
   if (!u) return -1;
   if (s->is_cmethod) {
     if (p >= 0 && comp_cmethod_in_chain(c, p, u, NULL) >= 0) return 1;
@@ -4026,7 +4087,10 @@ static void emit_str_lit_late(Compiler *c, const int *els, int n, int t) {
     Buf el; memset(&el, 0, sizeof el);
     tmp[j] = ++g_tmp;
     hnd[j] = (char)lit_elem_carries_handle(c, els[j]);
-    if (hnd[j]) emit_strbuf_handle_of(c, els[j], &el);
+    /* (one representation: the element's text may be bytes whatever
+       carries the handle, so the handle is taken through its face) */
+    if (hnd[j] && g_one_string) emit_expr_face(c, els[j], TY_STRBUF, &el);
+    else if (hnd[j]) emit_strbuf_handle_of(c, els[j], &el);
     else emit_coerce(c, els[j], TY_STRING, CO_HOLD, "an Array literal's element", &el);
     emit_indent(g_pre, g_indent);
     buf_printf(g_pre, "%s _t%d = %s; SP_GC_ROOT%s(_t%d);\n", hnd[j] ? "sp_String *" : "const char *", tmp[j],
@@ -4087,13 +4151,13 @@ static int emit_array_hash_literal_expr(Compiler *c, int id, Buf *b, const NodeT
             if (rlo >= 0 && comp_ntype(c, rlo) == TY_STRING) {
               Buf lo_b; memset(&lo_b, 0, sizeof lo_b); emit_expr(c, rlo, &lo_b);
               Buf hi_b; memset(&hi_b, 0, sizeof hi_b); emit_expr(c, rhi, &hi_b);
-              buf_printf(g_pre, "{ sp_StrArray *_sa = sp_StrArray_from_string_range(%s, %s, %d); if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_PolyArray_push(_t%d, sp_box_str(_sa->data[_si])); }\n",
-                         lo_b.p ? lo_b.p : "NULL", hi_b.p ? hi_b.p : "NULL", rexcl, t);
+              buf_printf(g_pre, "{ sp_StrArray *_sa = sp_StrArray_from_string_range(%s, %s, %d); if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_PolyArray_push(_t%d, %s); }\n",
+                         lo_b.p ? lo_b.p : "NULL", hi_b.p ? hi_b.p : "NULL", rexcl, t, ONE_SA_BOX);
               free(lo_b.p); free(hi_b.p);
             }
             else if (ir.range == TY_STRING)
               /* a String Range held in a variable: its bounds are in the value */
-              buf_printf(g_pre, "{ sp_StrArray *_sa = sp_srange_to_a(%s); if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_PolyArray_push(_t%d, sp_box_str(_sa->data[_si])); }\n", ep, t);
+              buf_printf(g_pre, "{ sp_StrArray *_sa = sp_srange_to_a(%s); if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_PolyArray_push(_t%d, %s); }\n", ep, t, ONE_SA_BOX);
             else {
               buf_printf(g_pre, "{ sp_Range _sr = %s; sp_int _e = _sr.last+(_sr.excl?0:1); for (sp_int _si = _sr.first; _si < _e; _si++) sp_PolyArray_push(_t%d, sp_box_int(_si)); }\n", ep, t);
             }
@@ -4104,7 +4168,7 @@ static int emit_array_hash_literal_expr(Compiler *c, int id, Buf *b, const NodeT
                        ep, t);
           }
           else if (ir.elem == TY_STRING)
-            buf_printf(g_pre, "{ sp_StrArray *_sa = %s; if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_PolyArray_push(_t%d, sp_box_str(_sa->data[_si])); }\n", ep, t);
+            buf_printf(g_pre, "{ sp_StrArray *_sa = %s; if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_PolyArray_push(_t%d, %s); }\n", ep, t, ONE_SA_BOX);
           else if (ir.elem == TY_FLOAT) {
             buf_printf(g_pre, "{ sp_FloatArray *_sa = %s; if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_PolyArray_push(_t%d, sp_box_ofloat(sp_FloatArray_oget(_sa, _si))); }\n",
                        ep, t);
@@ -4184,8 +4248,8 @@ else {
             int rhi2 = nt_ref(nt, rn2, "right");
             Buf lo2; memset(&lo2, 0, sizeof lo2); emit_expr(c, rlo2, &lo2);
             Buf hi2; memset(&hi2, 0, sizeof hi2); emit_expr(c, rhi2, &hi2);
-            buf_printf(g_pre, "{ sp_StrArray *_sa = sp_StrArray_from_string_range(%s, %s, %d); if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_%sArray_push(_t%d, _sa->data[_si]); }\n",
-                       lo2.p ? lo2.p : "NULL", hi2.p ? hi2.p : "NULL", rexcl2, k, t);
+            buf_printf(g_pre, "{ sp_StrArray *_sa = sp_StrArray_from_string_range(%s, %s, %d); if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_%sArray_push(_t%d, %s); }\n",
+                       lo2.p ? lo2.p : "NULL", hi2.p ? hi2.p : "NULL", rexcl2, k, t, ONE_SA_ELEM);
             free(lo2.p); free(hi2.p);
           }
           else {
@@ -4196,7 +4260,7 @@ else {
           /* not the slot itself: a nil lives in the bitmap, and the slot alone reads 0 */
           buf_printf(g_pre, "{ sp_IntArray *_sa = %s; if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_%sArray_push_o(_t%d, sp_IntArray_oget(_sa, _si)); }\n", ep, k, t);
         else if (ir.elem == TY_STRING && sp_streq(k, "Str"))
-          buf_printf(g_pre, "{ sp_StrArray *_sa = %s; if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_%sArray_push(_t%d, _sa->data[_si]); }\n", ep, k, t);
+          buf_printf(g_pre, "{ sp_StrArray *_sa = %s; if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_%sArray_push(_t%d, %s); }\n", ep, k, t, ONE_SA_ELEM);
         else if (ir.elem == TY_FLOAT && sp_streq(k, "Float"))
           buf_printf(g_pre, "{ sp_FloatArray *_sa = %s; if (_sa) for (sp_int _si = 0; _si < _sa->len; _si++) sp_FloatArray_push_o(_t%d, sp_FloatArray_oget(_sa, _si)); }\n", ep, t);
         else if (it == TY_NIL)
@@ -4505,12 +4569,14 @@ static int emit_if_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, const 
       buf_puts(b, pa.p ? pa.p : "");
       /* a diverging (raise/fail) arm is emitted as a statement; the result
          temp keeps its default (never read, since the arm never returns) */
+      /* (one representation: a String arm of either face lands in the bytes result as its view) */
+      const char *fo = g_one_string && res == TY_STRING && !res_o ? "SP_STR_B(" : "", *fc = fo[0] ? ")" : "";
       if (then_raise) buf_printf(b, " %s;\n", ta.p ? ta.p : "0");
-      else buf_printf(b, " _t%d = %s;\n", tr, ta.p ? ta.p : "0");
+      else buf_printf(b, " _t%d = %s%s%s;\n", tr, fo, ta.p ? ta.p : "0", fc);
       buf_puts(b, "}\nelse {\n");
       buf_puts(b, pe.p ? pe.p : "");
       if (else_raise) buf_printf(b, " %s;\n", te.p ? te.p : "0");
-      else buf_printf(b, " _t%d = %s;\n", tr, te.p ? te.p : "0");
+      else buf_printf(b, " _t%d = %s%s%s;\n", tr, fo, te.p ? te.p : "0", fc);
       buf_printf(b, "} _t%d; })", tr);
     }
     free(ta.p); free(te.p); free(pa.p); free(pe.p);
@@ -4595,6 +4661,7 @@ static int emit_if_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, const 
         else if (subt == TY_NIL && res != TY_POLY && nil_value(res))
           buf_puts(g_pre, nil_value(res));
         else if (emit_arm_text_as_bigint(res, subt, sub_e.p ? sub_e.p : default_value_from_compiler(c, subt), g_pre)) { }
+        else if (sub_e.p && one_str_to_open(g_pre, res, "_t%d", tr)) { buf_puts(g_pre, sub_e.p); buf_puts(g_pre, ")"); }
         else buf_puts(g_pre, sub_e.p ? sub_e.p : default_value_from_compiler(c, res));
         buf_puts(g_pre, ";\n");
         free(sub_e.p);
@@ -4722,6 +4789,11 @@ static int emit_and_or_begin_expr(Compiler *c, int id, Buf *b, const NodeTable *
     if (lt_hbox) lt = TY_POLY;
     int t = ++g_tmp;
     int lt_falsy_const = (lt == TY_NIL || lt == TY_VOID);  /* a nil/void left has no C-typed value */
+    /* one representation: a String left that is a handle (a slot's read, an
+       element) is held as the handle, so the chain's value keeps its identity
+       (`v = h[k] || "d"` answers the Hash's own String); the right arm is
+       made a handle too (a literal's is its site's) */
+    int lhandle = g_one_string && lt == TY_STRING && repr_of(c, left).strbuf_src == RS_HANDLE;
     /* An unresolved left emits a poly fallback. One that diverges -- a bare
        name nothing defines raises NameError -- makes the whole chain diverge:
        keep the raise and answer the result's own placeholder, so the slot
@@ -4744,6 +4816,7 @@ static int emit_and_or_begin_expr(Compiler *c, int id, Buf *b, const NodeTable *
     int ro = cond_res_oint(c, id, res);
     buf_puts(b, "({ ");
     if (lo) buf_puts(b, oint_ctype(lt));
+    else if (lhandle) buf_puts(b, "sp_String *");
     else emit_ctype(c, (lt == TY_UNKNOWN || lt_falsy_const) ? res : lt, b);
     buf_printf(b, " _t%d = ", t);
     if (lt_falsy_const) {
@@ -4767,6 +4840,9 @@ static int emit_and_or_begin_expr(Compiler *c, int id, Buf *b, const NodeTable *
     else if (lt == TY_UNKNOWN) emit_unresolved_coerced_text(c, left, res, ltxt, b);
     else if (lo) emit_oint_expr(c, left, lt, b);
     else if (lt_hbox) emit_boxed(c, left, b);
+    else if (lhandle) emit_strbuf_handle_of(c, left, b);
+    /* (one representation: a String left of either face held as its bytes) */
+    else if (g_one_string && lt == TY_STRING) { buf_puts(b, "SP_STR_B("); emit_unresolved_coerced(c, left, lt, b); buf_puts(b, ")"); }
     else emit_unresolved_coerced(c, left, lt, b);
     free(lunk.p);
     buf_puts(b, "; ");
@@ -4844,6 +4920,17 @@ static int emit_and_or_begin_expr(Compiler *c, int id, Buf *b, const NodeTable *
     EMIT_ARM(0, &larm);
     { Buf *sv_pre2 = g_pre; g_pre = &rpre; EMIT_ARM(1, &rarm); g_pre = sv_pre2; }
     #undef EMIT_ARM
+    if (lhandle && res == TY_STRING && rarm.p) {
+      Buf hr; memset(&hr, 0, sizeof hr);
+      buf_printf(&hr, (g_one_string ? "SP_STR_HDL(%s)" : "sp_String_new_fresh(%s)"), rarm.p);
+      free(rarm.p); rarm = hr;
+    }
+    /* (one representation: a right arm of either face beside a bytes left) */
+    else if (g_one_string && !lhandle && !lo && lt == TY_STRING && res == TY_STRING && rarm.p) {
+      Buf hr; memset(&hr, 0, sizeof hr);
+      buf_printf(&hr, "SP_STR_B(%s)", rarm.p);
+      free(rarm.p); rarm = hr;
+    }
     int rhoists = rpre.p && rpre.p[0];
     if (!rhoists) {
       buf_printf(b, "%s ? %s : %s; })", tcond.p ? tcond.p : "1",
@@ -5654,9 +5741,14 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
     for (int ti = 0; ti < tcount; ti++) {
       const char *tnm = nt_str(nt, tv[ti], "name");
       if (!tnm) continue;
-      buf_printf(b, "lv_%s = sp_re_named_capture(sp_re_pat_%d, ", rename_local(tnm), reidx);
+      /* (one representation: the capture, new bytes, into the variable's face) */
+      Scope *nsc = comp_scope_of(c, tv[ti]);
+      LocalVar *nlv = nsc ? scope_local(nsc, rename_local(tnm)) : NULL;
+      int one_to = g_one_string && nlv && (nlv->type == TY_STRING || nlv->type == TY_STRBUF);
+      if (one_to) buf_printf(b, "lv_%s = SP_STR_TO(lv_%s, sp_re_named_capture(sp_re_pat_%d, ", rename_local(tnm), rename_local(tnm), reidx);
+      else buf_printf(b, "lv_%s = sp_re_named_capture(sp_re_pat_%d, ", rename_local(tnm), reidx);
       emit_str_literal(b, tnm);
-      buf_puts(b, "); ");
+      buf_puts(b, one_to ? ")); " : "); ");
     }
     buf_printf(b, "_t%d; })", t);
     return;
@@ -5782,7 +5874,7 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
     else if (irr.elem == TY_STRING) {
       buf_printf(b, "({ sp_StrArray *_t%d = ", ta2); emit_expr(c, ir, b);
       buf_printf(b, "; sp_int _t%d = ", tb2); emit_int_expr(c, iav[0], b);
-      buf_printf(b, "; const char *_t%d = sp_StrArray_get(_t%d, _t%d);", tc2, ta2, tb2);
+      buf_printf(b, g_one_string ? "; const char *_t%d = SP_STR_B(sp_StrArray_get(_t%d, _t%d));" : "; const char *_t%d = sp_StrArray_get(_t%d, _t%d);", tc2, ta2, tb2);
       buf_printf(b, " if (%s_t%d) { ", is_or2 ? "!" : "", tc2);
       emit_guarded_slot_assign(c, iv, tc2, b);
       buf_printf(b, "; sp_StrArray_set(_t%d, _t%d, _t%d); } _t%d; })", ta2, tb2, tc2, tc2);
@@ -5821,7 +5913,7 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
         buf_printf(b, "sp_RbVal _t%d = sp_%sHash_get(_t%d, _t%d);", tc2, hn, ta2, tb2);
         buf_printf(b, " if (%ssp_poly_truthy(_t%d)) { ", is_or2 ? "!" : "", tc2);
         emit_guarded_poly_slot_assign(c, iv, tc2, b);
-        buf_printf(b, "; sp_%sHash_set(_t%d, _t%d, _t%d); } _t%d; })", hn, ta2, tb2, tc2, tc2);
+        buf_printf(b, "; sp_%sHash_set(_t%d, _t%d, %s_t%d%s); } _t%d; })", hn, ta2, tb2, ONE_HV_O(hn), tc2, ONE_HV_C(hn), tc2);
       }
       else if (oint_kind(vt)) {
         /* an Integer or Float slot is read with its nil (a miss, a nil
@@ -5845,8 +5937,20 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
         buf_puts(b, " if (");
         emit_slot_nil_test(c, vt, tc2, is_or2, b);
         buf_puts(b, ") { ");
-        emit_guarded_slot_assign(c, iv, tc2, b);
-        buf_printf(b, "; sp_%sHash_set(_t%d, %s, _t%d); } _t%d; })", hn, ta2, sk, tc2, tc2);
+        /* (one-String mode: the String stored is the answer's own -- a new
+           one gets its handle first, and the view of it is both what the
+           Hash takes, its owner, and what the expression answers; the value
+           is taken in either face) */
+        if (ONE_HV_O(hn)[0]) {
+          Buf rvb; memset(&rvb, 0, sizeof rvb);
+          Buf *svp = g_pre; g_pre = b;
+          emit_expr(c, iv, &rvb);
+          g_pre = svp;
+          buf_printf(b, "_t%d = SP_STR_B(SP_STR_HDL(%s))", tc2, rvb.p ? rvb.p : "NULL");
+          free(rvb.p);
+        }
+        else emit_guarded_slot_assign(c, iv, tc2, b);
+        buf_printf(b, "; sp_%sHash_set(_t%d, %s, %s_t%d%s); } _t%d; })", hn, ta2, sk, ONE_HV_O(hn), tc2, ONE_HV_C(hn), tc2);
       }
     }
     else if (irt == TY_POLY) {
@@ -6174,14 +6278,14 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
         emit_str_form_handle(c, v, &hw);
         int th = ++g_tmp;
         emit_indent(g_pre, g_indent);
-        buf_printf(g_pre, "sp_String *_t%d = %s; SP_GC_ROOT(_t%d);\n", th, hw.p ? hw.p : "NULL", th);
+        buf_printf(g_pre, (g_one_string ? "sp_String *_t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d);\n" : "sp_String *_t%d = %s; SP_GC_ROOT(_t%d);\n"), th, hw.p ? hw.p : "NULL", th);
         free(hw.p);
         ran_first_bind_read(v, th);
         held++;
         continue;
       }
       Buf vb; memset(&vb, 0, sizeof vb);
-      emit_expr(c, v, &vb);
+      emit_expr_face(c, v, vt, &vb);   /* (one representation: in the temp's face) */
       emit_indent(g_pre, g_indent);
       if (vt == TY_NIL || vt == TY_VOID) {
         buf_printf(g_pre, "(void)(%s);\n", vb.p ? vb.p : "0");
