@@ -24,18 +24,26 @@ ARG BASE_IMAGE=ubuntu:24.04
 # ---- build ------------------------------------------------------------------
 FROM ${BASE_IMAGE} AS build
 ARG DEBIAN_FRONTEND=noninteractive
+# ruby runs tools/gen_respond_to_tables.rb, which writes the gitignored
+# lib/spinel_rt_responds_generated.h that `make all` needs; ruby-dev builds
+# the prism gem it requires (24.04's Ruby 3.2 does not bundle one). Only this
+# stage has them: the runtime image still has no Ruby.
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates curl gcc libc6-dev make \
       libcrypt-dev libssl-dev zlib1g-dev \
+      ruby ruby-dev \
  && rm -rf /var/lib/apt/lists/*
 
 WORKDIR /src
 
 # The vendored parsers (prism, rbs) on a layer of their own: `make deps` reads
 # nothing but the Makefile, so the download is redone only when it changes.
+# The prism gem is the Makefile's PRISM_VERSION too.
 COPY Makefile common.mk ./
-RUN make deps
+RUN make deps \
+ && gem install --no-document prism \
+      -v "$(sed -n 's/^PRISM_VERSION ?= *//p' Makefile)"
 
 COPY . .
 
