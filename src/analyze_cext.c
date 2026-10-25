@@ -171,6 +171,34 @@ void desugar_cext_decls(Compiler *c) {
         }
         if (!found) unsupported_feature(c, site, "C extension allocator needs a manifest class");
         buf_puts(&b, "nil");
+      } else if (sp_streq(name, "__cext_undef_allocator")) {
+        /* No allocator: instances come only from TypedData_Make_Struct /
+         * TypedData_Wrap_Struct in C, and Ruby's new and allocate raise as
+         * CRuby's do for a class whose allocator is undefined. */
+        need(c, site, ac, 1); const char *cn = text(c, site, av[0]);
+        int found = 0;
+        for (int q = 0; q < c->n_cext_classes; q++) if (sp_streq(c->cext_classes[q].path, cn) && !c->cext_classes[q].module) {
+          c->cext_classes[q].allocator = -2; c->cext_classes[q].extension = ext; found = 1;
+        }
+        if (!found) unsupported_feature(c, site, "C extension allocator needs a manifest class");
+        owner_open(c, site, &b, cn);
+        buf_printf(&b, "def self.allocate\nraise TypeError, \"allocator undefined for %s\"\nend\n"
+                       "def self.new(*)\nraise TypeError, \"allocator undefined for %s\"\nend\n"
+                       "def dup\nraise TypeError, \"allocator undefined for %s\"\nend\n"
+                       "def clone(freeze: nil)\nraise TypeError, \"allocator undefined for %s\"\nend\nend\n", cn, cn, cn, cn);
+      } else if (sp_streq(name, "__cext_undef_method")) {
+        /* Only initialize / initialize_copy of a class without an allocator:
+         * new, allocate, dup and clone raise before either could run, so
+         * their absence is not observable. Any other undef is refused, as
+         * Module#undef_method is. */
+        need(c, site, ac, 2);
+        const char *cn = text(c, site, av[0]), *mn = text(c, site, av[1]);
+        int undefined_allocator = 0;
+        for (int q = 0; q < c->n_cext_classes; q++)
+          if (sp_streq(c->cext_classes[q].path, cn) && c->cext_classes[q].allocator == -2) undefined_allocator = 1;
+        if (!undefined_allocator || (!sp_streq(mn, "initialize") && !sp_streq(mn, "initialize_copy")))
+          unsupported_feature(c, site, "rb_undef_method is supported only for initialize and initialize_copy of a class whose allocator is undefined");
+        buf_puts(&b, "nil");
       } else if (sp_streq(name, "__cext_alias")) {
         need(c, site, ac, 3); owner_open(c, site, &b, text(c, site, av[0]));
         buf_puts(&b, "alias_method "); symbol(&b, text(c, site, av[1])); buf_puts(&b, ", "); symbol(&b, text(c, site, av[2])); buf_puts(&b, "\nend\n");
@@ -190,15 +218,22 @@ void desugar_cext_decls(Compiler *c) {
         need(c, site, ac, 3);
         int kind = (int)integer(c, site, av[0]), argc = (int)integer(c, site, av[2]);
         const char *key = text(c, site, av[1]);
-        if (kind < 0 || kind > 4 || argc < 0)
+        if (kind < 0 || kind > 5 || argc < 0)
           unsupported_feature(c, site, "invalid C extension dispatch stub");
         int idx = c->n_cext_stubs++;
         c->cext_stubs = realloc(c->cext_stubs, sizeof(CextStub) * (size_t)c->n_cext_stubs);
         c->cext_stubs[idx] = (CextStub){strdup(key), kind, argc, site};
         buf_printf(&b, "def __cext_dispatch_%d(r", idx);
+        if (kind == 5) buf_puts(&b, ", name");
         for (int j = 0; j < argc; j++) buf_printf(&b, ", a%d", j);
         buf_puts(&b, ", &block)\n__cext_box(block)\n__cext_box(");
-        if (kind == 0) {
+        if (kind == 5) {
+          /* An ID the extension computed from a Symbol: sent as Ruby sends a
+           * computed name, over the methods the program defines. */
+          buf_puts(&b, "r.__send__(name");
+          for (int j = 0; j < argc; j++) buf_printf(&b, ", a%d", j);
+          buf_puts(&b, ", &block)");
+        } else if (kind == 0) {
           buf_puts(&b, "r.__cext_target(");
           for (int j = 0; j < argc; j++) buf_printf(&b, "%sa%d", j ? ", " : "", j);
           buf_puts(&b, argc ? ", &block)" : "&block)");
@@ -383,11 +418,13 @@ void register_cext_layouts(Compiler *c) {
       if (ruby_name && sp_streq(ruby_name, cc->path)) { cid = k; break; }
     }
     if (cid < 0) unsupported_feature(c, c->nt->root_id, "C extension class was not registered");
-    if (cc->allocator >= 0) {
+    /* -2: the allocator is undefined, so instances come only from
+     * TypedData_Make_Struct / TypedData_Wrap_Struct; the layout is the same */
+    if (cc->allocator >= 0 || cc->allocator == -2) {
       c->classes[cid].cext_layout = 1;
       c->classes[cid].instantiated = 1;
       c->classes[cid].cext_extension = cc->extension + 1;
-      c->classes[cid].cext_allocator = cc->allocator;
+      c->classes[cid].cext_allocator = cc->allocator >= 0 ? cc->allocator : -1;
     }
   }
 }
@@ -448,14 +485,21 @@ static void emit_missing_cext_send(Compiler *c, Buf *b) {
 void emit_cext_dispatch(Compiler *c, Buf *b) {
   if (!c->n_cext_extensions) return;
   buf_puts(b, "static sp_RbVal _sp_cext_dispatch(int kind, const char *key, sp_RbVal r, int argc, const sp_RbVal *argv, sp_Proc *block) {\n");
+  /* Literal names first; a computed name the literal table does not hold
+   * then goes to the send of its arity. */
+  for (int computed = 0; computed < 2; computed++)
   for (int mi = 1; mi < c->nscopes; mi++) {
     Scope *sc = &c->scopes[mi];
     int idx = sc->def_node >= 0 ? nt_int(c->nt, sc->def_node, "cext_stub", 0) - 1 : -1;
     if (idx < 0) continue;
     CextStub *stub = &c->cext_stubs[idx];
-    buf_printf(b, "if (kind == %d && argc == %d && !strcmp(key, ", stub->kind, stub->argc);
-    emit_str_literal(b, stub->key); buf_puts(b, ")) return ");
-    emit_method_cname(c, sc, b); buf_puts(b, "(r");
+    if ((stub->kind == 5) != computed) continue;
+    if (computed) buf_printf(b, "if (kind == 0 && argc == %d) return ", stub->argc);
+    else {
+      buf_printf(b, "if (kind == %d && argc == %d && !strcmp(key, ", stub->kind, stub->argc);
+      emit_str_literal(b, stub->key); buf_puts(b, ")) return ");
+    }
+    emit_method_cname(c, sc, b); buf_puts(b, computed ? "(r, sp_box_sym(sp_sym_intern(key))" : "(r");
     for (int j = 0; j < stub->argc; j++) buf_printf(b, ", argv[%d]", j);
     buf_puts(b, ", block);\n");
   }

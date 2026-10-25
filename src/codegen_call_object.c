@@ -329,16 +329,15 @@ int emit_call_identity_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
     /* a class value: the identity its box carries (its id, or the name a
        name-backed class boxes by), so a boxed copy of it answers the same */
     else if (rt == TY_CLASS) {
-      buf_puts(b, repr_share_rule(c) ? "((sp_int)(uintptr_t)sp_poly_identity_ptr(sp_box_class("
-                                     : "((sp_int)(uintptr_t)(sp_box_class(");
+      buf_puts(b, "((sp_int)(uintptr_t)sp_poly_identity_ptr(sp_box_class(");
       emit_expr(c, recv, b);
-      buf_puts(b, repr_share_rule(c) ? ")))" : ")).v.p)");
+      buf_puts(b, ")))");
     }
     /* a boxed value: its identity is the boxed payload (heap pointer / int) */
     else if (rt == TY_POLY) {
-      buf_puts(b, repr_share_rule(c) ? "((sp_int)(uintptr_t)sp_poly_identity_ptr(" : "((sp_int)(uintptr_t)(");
+      buf_puts(b, "((sp_int)(uintptr_t)sp_poly_identity_ptr(");
       emit_expr(c, recv, b);
-      buf_puts(b, repr_share_rule(c) ? "))" : ").v.p)");
+      buf_puts(b, "))");
     }
     /* a String: a mutable one held as its shared sp_String has that
        handle's identity, the one a box of it carries (its text is a fresh
@@ -686,7 +685,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       /* --share-strings: the call read as the handle (strbuf_route_ie)
          answers the tail's handle */
       TyKind ntt = nbn > 0 ? repr_of(c, nbb[nbn - 1]).as_ty : TY_NIL;
-      int nhandle = repr_share_rule(c) && comp_ntype(c, id) == TY_STRBUF && (ntt == TY_STRING || ntt == TY_STRBUF);
+      int nhandle = comp_ntype(c, id) == TY_STRBUF && (ntt == TY_STRING || ntt == TY_STRBUF);
       if (nexec) {
         /* into a side buffer: a value's own prelude drains into g_pre first */
         Buf bb; memset(&bb, 0, sizeof bb);
@@ -758,7 +757,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         Buf vb; memset(&vb, 0, sizeof vb);
         emit_strbuf_handle_of(c, nbb[nbn - 1], &vb);
         emit_indent(g_pre, g_indent);
-        buf_printf(g_pre, (g_one_string ? "sp_String *_t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d);\n" : "sp_String *_t%d = %s; SP_GC_ROOT(_t%d);\n"), tr, vb.p ? vb.p : "NULL", tr);
+        buf_printf(g_pre, "sp_String *_t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d);\n", tr, vb.p ? vb.p : "NULL", tr);
         free(vb.p);
         ie_body_restore(c, nsnap);
         g_self = sv_self; g_self_deref = sv_deref;
@@ -841,6 +840,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     if (nt_call_has_block_arg(nt, id)) {
       if (emit_ie_proc(c, id, recv, ie_self_cls, blk, ie_direct ? 0 : ie_tramp, b)) return 1;
       if (ie_direct && recv >= 0 && nt_int(nt, id, "ie_usite", 0) && emit_ie_untraced(c, id, recv, blk, b)) return 1;
+      if (ie_direct && recv >= 0 && emit_ie_non_proc_block(c, id, recv, blk, b)) return 1;
       int is_exec = sp_streq(name, "instance_exec");
       if (g_block_id < 0 && ie_direct && recv < 0 && (is_exec || argc == 0) &&
           resolve_forwarded_block(c, blk) < 0 && !g_yield_proc_ref && !g_current_scope_is_lowered) {
@@ -867,7 +867,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         body_ty = (body_ty == TY_NIL || body_ty == TY_UNKNOWN) ? bn_ty : ty_unify(body_ty, bn_ty);
       /* --share-strings: the call read as the handle (strbuf_route_ie)
          answers the tail's handle */
-      int ohandle = repr_share_rule(c) && comp_ntype(c, id) == TY_STRBUF &&
+      int ohandle = comp_ntype(c, id) == TY_STRBUF &&
                     (body_ty == TY_STRING || body_ty == TY_STRBUF);
       if (ohandle) body_ty = TY_STRBUF;
       int scalar_res = is_scalar_ret(body_ty) && body_ty != TY_VOID && body_ty != TY_NIL && body_ty != TY_UNKNOWN;
@@ -1040,6 +1040,10 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       }
       view_unbind(ie_sv_argov);   /* the binds were the arguments' last readers */
       if (ie_bn > 0) {
+        /* (one representation: the body's own reads are not operands held
+           across the block, g_one_held; `o.instance_eval { @s }` answers the
+           String @s holds) */
+        int sv_oh = g_one_held; g_one_held = 0;
         /* In statement position the value is discarded, so emit the whole body
            as statements -- the last node may not be expressible (e.g. puts). */
         int last_as_stmt = g_ie_discard_value && !scalar_res;
@@ -1094,6 +1098,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         g_ie_res_poly = sv_iep; g_ie_next_oint = sv_ieo;
         g_brk_ser_var = sv_bser;
         g_ie_discard_value = saved_discard;
+        g_one_held = sv_oh;
       }
       /* the aliases end with the body, which the result temps outlive */
       block_aliases_release(&ie_al);
@@ -1130,7 +1135,7 @@ static int emit_freeze_recv_handle(Compiler *c, int recv, Buf *b) {
   int th;
   if (strbuf_slot_text(c, recv, &ref) && !strbuf_pickup_may_nil(c, recv)) {
     th = ++g_tmp;
-    buf_printf(b, (g_one_string ? "({ sp_String *_t%d = SP_STR_HDL(%s); " : "({ sp_String *_t%d = %s; "), th, ref.p);
+    buf_printf(b, "({ sp_String *_t%d = SP_STR_HDL(%s); ", th, ref.p);
   }
   else if (strbuf_assign_route(c, recv)) {
     th = ++g_tmp;
@@ -1147,6 +1152,15 @@ static int emit_freeze_recv_handle(Compiler *c, int recv, Buf *b) {
     th = ++g_tmp;
     buf_printf(b, "({ sp_String *_t%d = ", th);
     emit_strbuf_handle_of(c, recv, b);
+    buf_puts(b, "; ");
+  }
+  /* (or a boxed receiver's call whose arms each answer a String's handle,
+     read as the box's handle, as a mutator's receiver is:
+     emit_recv_route_handle) */
+  else if (c->share_plan && share_plan_producer(c, recv, NULL) == SPK_POLY_ARMS) {
+    th = ++g_tmp;
+    buf_printf(b, "({ sp_String *_t%d = ", th);
+    emit_str_form_handle(c, recv, b);
     buf_puts(b, "; ");
   }
   else { free(ref.p); return 0; }
@@ -1294,7 +1308,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
      caller bound as one, emit_bang_self_handle) freezes that handle, which
      every name of the String holds, and answers its frozen face. The
      identity shortcut below would drop the freeze. */
-  if (repr_share_rule(c) && recv >= 0 && argc == 0 && is_freeze_name(name) &&
+  if (recv >= 0 && argc == 0 && is_freeze_name(name) &&
       repr_of(c, recv).as_ty == TY_STRBUF) {
     int th = ++g_tmp;
     buf_printf(b, "({ sp_String *_t%d = ", th);
@@ -1375,7 +1389,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       emit_expr(c, recv, b); buf_puts(b, " = sp_str_freeze_val("); emit_expr(c, recv, b); buf_puts(b, "); ");
       emit_expr(c, recv, b); buf_puts(b, "; })");
     }
-    else if (repr_share_rule(c) && emit_freeze_recv_handle(c, recv, b)) {}
+    else if (emit_freeze_recv_handle(c, recv, b)) {}
     else if (!emit_freeze_self_answer(c, id, recv, b)) {
       buf_puts(b, "sp_str_freeze_val("); emit_expr(c, recv, b); buf_puts(b, ")");
     }
@@ -1705,7 +1719,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       return 1;
     }
     if (argc0 == 0 && !freeze_stateful && !ty_is_hash(recv_t) &&
-        !(is_dup_clone && (recv_t == TY_STRING || ty_is_array(recv_t) || recv_t == TY_STRH_ARRAY || recv_native))) {
+        !(is_dup_clone && (recv_t == TY_STRING || ty_is_array(recv_t) || recv_native))) {
       emit_expr(c, recv, b); return 1;
     }
     if (argc0 == 0 && recv_t == TY_STRING && is_dup_clone) {
@@ -1717,18 +1731,17 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       Buf clref; memset(&clref, 0, sizeof clref);
       if (sp_streq(name, "clone") && strbuf_slot_text(c, recv, &clref)) {
         int th = ++g_tmp, tcl = ++g_tmp;
-        buf_printf(b, (g_one_string ? "({ sp_String *_t%d = SP_STR_HDL(%s); const char *_t%d = _t%d ? sp_str_dup(sp_String_cstr(_t%d)) : NULL;"
-                      " _t%d && sp_String_is_frozen(_t%d) ? sp_str_freeze_val(_t%d) : _t%d; })" : "({ sp_String *_t%d = %s; const char *_t%d = _t%d ? sp_str_dup(sp_String_cstr(_t%d)) : NULL;"
-                      " _t%d && sp_String_is_frozen(_t%d) ? sp_str_freeze_val(_t%d) : _t%d; })"),
+        buf_printf(b, "({ sp_String *_t%d = SP_STR_HDL(%s); const char *_t%d = _t%d ? sp_str_dup(sp_String_cstr(_t%d)) : NULL;"
+                      " _t%d && sp_String_is_frozen(_t%d) ? sp_str_freeze_val(_t%d) : _t%d; })",
                    th, clref.p, tcl, th, th, tcl, th, tcl, tcl);
         free(clref.p);
         return 1;
       }
       buf_printf(b, "%s(", sp_streq(name, "clone") ? "sp_str_clone_val" : "sp_str_dup");
       /* (one-String mode: a receiver of either face, `(v || TEXT).dup`) */
-      if (g_one_string) buf_puts(b, "SP_STR_B(");
+      buf_puts(b, "SP_STR_B(");
       emit_expr(c, recv, b);
-      buf_puts(b, g_one_string ? "))" : ")");
+      buf_puts(b, "))");
       return 1;
     }
   }
@@ -1805,7 +1818,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
    holds that handle, not a copy of its bytes, so the freeze reaches every
    name of the String, and the call answers it (or its frozen face), or nil. */
 static int emit_safe_nav_freeze_handle(Compiler *c, int id, const char *name, int recv, Buf *b) {
-  if (!repr_share_rule(c) || g_sn_skip == id || !is_freeze_name(name) || call_plain_argc(c, id) != 0 ||
+  if (g_sn_skip == id || !is_freeze_name(name) || call_plain_argc(c, id) != 0 ||
       nt_ref(c->nt, id, "block") >= 0 || cplan_user(c, id)->dispatch != CP_NONE) return 0;
   /* a receiver a caller already holds as the handle (emit_bang_self_handle
      binds it) is taken as it is */
@@ -1832,7 +1845,7 @@ static int emit_safe_nav_freeze_handle(Compiler *c, int id, const char *name, in
    or nil. A guard holding x's bytes made every later link take the handle
    by running x again. */
 static int emit_safe_nav_self_handle(Compiler *c, int id, int recv, Buf *b) {
-  if (!repr_share_rule(c) || g_sn_skip == id || !strbuf_self_route(c, recv) || !strbuf_bang_self_local(c, id))
+  if (g_sn_skip == id || !strbuf_self_route(c, recv) || !strbuf_bang_self_local(c, id))
     return 0;
   TyKind rt = repr_of(c, id).as_ty;
   int hres = repr_of(c, id).demand || rt == TY_STRBUF;
@@ -1842,12 +1855,12 @@ static int emit_safe_nav_self_handle(Compiler *c, int id, int recv, Buf *b) {
   int t = ++g_tmp;
   if (hres) buf_puts(b, hb.p);
   else if (repr_of(c, id).kind == RK_BOXED) {
-    buf_printf(b, (g_one_string ? "({ sp_String *_t%d = SP_STR_HDL(%s); " : "({ sp_String *_t%d = %s; "), t, hb.p);
+    buf_printf(b, "({ sp_String *_t%d = SP_STR_HDL(%s); ", t, hb.p);
     str_box_handle_tmp(b, t);
     buf_puts(b, "; })");
   }
   else {
-    buf_printf(b, (g_one_string ? "({ sp_String *_t%d = SP_STR_HDL(%s); _t%d ? " : "({ sp_String *_t%d = %s; _t%d ? "), t, hb.p, t);
+    buf_printf(b, "({ sp_String *_t%d = SP_STR_HDL(%s); _t%d ? ", t, hb.p, t);
     str_read_handle_tmp(b, t, 1);
     buf_puts(b, " : (const char *)NULL; })");
   }
@@ -1861,7 +1874,7 @@ static int emit_safe_nav_self_handle(Compiler *c, int id, int recv, Buf *b) {
    copy to cut. */
 static int emit_safe_nav_route_hold(Compiler *c, int id, int recv, const char *name, Buf *b) {
   TyKind ret = repr_of(c, id).as_ty;
-  if (!repr_share_rule(c) || g_sn_skip == id || !name || !is_string_position_mutator(name) ||
+  if (g_sn_skip == id || !name || !is_string_position_mutator(name) ||
       (ret != TY_STRING && !oint_kind(ret)) || repr_of(c, id).kind == RK_BOXED || repr_of(c, recv).as_ty != TY_STRING ||
       !strbuf_self_route(c, recv) || g_n_argov >= MAX_ARG_OVERRIDE)
     return 0;
@@ -2032,21 +2045,19 @@ static int sn_args_run_late(Compiler *c, int id, int recv) {
   /* (one-String mode: a variable's String is read through its slot, so an
      argument that assigns the variable is asked about too, changing no
      String) */
-  if (!chg && !(g_one_string && var && argc > 0)) return 0;
+  if (!chg && !(var && argc > 0)) return 0;
   if (var) {
     const char *vn = nt_str(nt, recv, "name");
     int plain = 1, wrote = 0;
     for (int i = 0; i < argc && plain; i++) plain = sn_runs_no_code(c, argv[i], k, vn, &wrote);
-    if (plain) return chg || !g_one_string ? 1 : 0;
+    if (plain) return chg ? 1 : 0;
     /* (one-String mode: the variable holds the handle, which the guard
        holds in turn: the call reads its String after the arguments, on the
        String the variable had, as 2 does for a call's handle) */
-    if (g_one_string) return 2;
-    /* (an assignment the arguments make themselves leaves the call on the
-       String it had) */
-    return nd && !wrote ? 3 : 0;
+    return 2;
   }
-  return repr_share_rule(c) && call_publishes_shared_handle(c, recv) ? 2 : 0;
+  /* (one-String mode: every String is its handle, which the guard holds) */
+  return 2;
 }
 /* safe navigation (&.): a nil receiver answers nil, any other the call, guarded by a nil test */
 int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv) {
@@ -2057,7 +2068,7 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
          assignment's handle (emit_strbuf_assign_safe_nav) runs once, as
          that handle or NULL; its value is the handle, or that handle's
          String (none for a statement before the last of its sequence) */
-      TyKind art = repr_share_rule(c) ? repr_of(c, id).as_ty : TY_UNKNOWN;
+      TyKind art = repr_of(c, id).as_ty;
       if (art == TY_STRING || art == TY_STRBUF) {
         Buf hb; memset(&hb, 0, sizeof hb);
         if (emit_strbuf_assign_safe_nav(c, id, &hb)) {
@@ -2080,7 +2091,7 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
       TyKind rrt = rrr.as_ty;
       if (rrt == TY_NIL) {
         /* nil&.foo always returns nil */
-        TyKind ret = repr_share_rule(c) && repr_of(c, id).demand ? TY_STRBUF : repr_of(c, id).as_ty;
+        TyKind ret = repr_of(c, id).demand ? TY_STRBUF : repr_of(c, id).as_ty;
         const char *dv = default_value_from_compiler(c, ret);
         buf_puts(b, dv ? dv : "0");
         return 1;
@@ -2166,7 +2177,7 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
            result, emit the natural form and default the nil arm to match. */
         int tsn = ++g_tmp;
         /* (an attribute assignment marked to hand out its handle answers it) */
-        TyKind ret2 = repr_share_rule(c) && (repr_of(c, id).demand || (repr_of(c, id).handle && repr_write_share(c, id)))
+        TyKind ret2 = (repr_of(c, id).demand || (repr_of(c, id).handle && repr_write_share(c, id)))
                       ? TY_STRBUF : repr_of(c, id).as_ty;
         Buf rsn = expr_buf(c, recv);
         emit_indent(g_pre, g_indent);
@@ -2302,7 +2313,7 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
       if ((sn_obj || rrt == TY_STRING || sn_scalar || sn_cont) && g_sn_skip != id) {
         int tsn2 = ++g_tmp;
         /* (an attribute assignment marked to hand out its handle answers it) */
-        TyKind ret2 = repr_share_rule(c) && (repr_of(c, id).demand || (repr_of(c, id).handle && repr_write_share(c, id)))
+        TyKind ret2 = (repr_of(c, id).demand || (repr_of(c, id).handle && repr_write_share(c, id)))
                       ? TY_STRBUF : repr_of(c, id).as_ty;
         /* The temp lives in g_pre (statement scope), not an inline ({ }):
            the re-entered dispatch hoists its (substituted) receiver into
@@ -2321,9 +2332,9 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
            or no String (`px.pick(s)&.<<(x)`, strbuf_poly_user_boxes): the
            guard holds the handle its box carries, or NULL for the arm
            that answers nil, where the bytes it read were a copy */
-        int sn_self = repr_share_rule(c) && rrt == TY_STRING && !sn_obj && !sn_scalar && !sn_cont &&
+        int sn_self = rrt == TY_STRING && !sn_obj && !sn_scalar && !sn_cont &&
                       strbuf_self_route(c, recv);
-        int sn_poly = !sn_self && repr_share_rule(c) && c->share_plan && rrt == TY_STRING && !sn_obj && !sn_scalar &&
+        int sn_poly = !sn_self && c->share_plan && rrt == TY_STRING && !sn_obj && !sn_scalar &&
                       !sn_cont && share_plan_producer(c, recv, NULL) == SPK_POLY_ARMS;
         int sn_hold = sn_self || sn_poly;
         /* arguments that run code, which a String receiver's change in
@@ -2336,11 +2347,11 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
              after the arguments */
           Buf hb; memset(&hb, 0, sizeof hb);
           int routed = emit_strbuf_route(c, recv, &hb);
-          if (!routed && g_one_string) { emit_strbuf_handle_of(c, nt_paren_single(c->nt, recv), &hb); routed = 1; }
+          if (!routed) { emit_strbuf_handle_of(c, nt_paren_single(c->nt, recv), &hb); routed = 1; }
           if (routed) {
             tsh = ++g_tmp;
             emit_indent(g_pre, g_indent);
-            buf_printf(g_pre, (g_one_string ? "sp_String *_t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d);\n" : "sp_String *_t%d = %s; SP_GC_ROOT(_t%d);\n"), tsh, hb.p, tsh);
+            buf_printf(g_pre, "sp_String *_t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d);\n", tsh, hb.p, tsh);
             buf_printf(&rsn, "_t%d ? sp_strbuf_read_pub(_t%d) : (const char *)NULL", tsh, tsh);
           }
           else sn_late = 0;
@@ -2460,7 +2471,7 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
           emit_indent(g_pre, g_indent);
           /* (one-String mode: the handle slot takes the call's String in
              either face) */
-          buf_printf(g_pre, g_one_string && ret2 == TY_STRBUF ? "  _snr%d = SP_STR_HDL(%s);\n" : "  _snr%d = (%s);\n",
+          buf_printf(g_pre, ret2 == TY_STRBUF ? "  _snr%d = SP_STR_HDL(%s);\n" : "  _snr%d = (%s);\n",
                      rsv, vbs.p ? vbs.p : "");
           emit_indent(g_pre, g_indent);
           buf_puts(g_pre, "}\n");
@@ -3418,7 +3429,7 @@ static int emit_data_ivar_set(Compiler *c, int id, int recv, int value, int cid,
    expected printed garbage. Under --share-strings only: the default build
    keeps what it emitted. */
 static int ivar_set_slot_read(Compiler *c, int id, TyKind mt) {
-  if (mt != TY_STRBUF || !repr_share_rule(c)) return 0;
+  if (mt != TY_STRBUF) return 0;
   Repr rp = repr_of(c, id);
   return rp.as_ty == TY_STRING && rp.kind != RK_BOXED && !rp.handle && !comp_value_dropped(c, id);
 }
@@ -3474,7 +3485,7 @@ static void emit_reflect_ivar_set(Compiler *c, int id, int recv, int value, int 
   if (nb && rp.kind == RK_BOXED) buf_printf(b, "%s(%s)", oint_box(mt), val);
   else if (nb) { oint_open(c, id, mt, b); buf_puts(b, val); oint_close(c, id, b); }
   else if (ivar_set_slot_read(c, id, mt)) emit_strbuf_node_read(c, id, val, b);
-  else if (mt == TY_STRBUF && rp.as_ty == TY_STRING && rp.kind != RK_BOXED && repr_share_rule(c)) buf_puts(b, val);
+  else if (mt == TY_STRBUF && rp.as_ty == TY_STRING && rp.kind != RK_BOXED) buf_puts(b, val);
   else emit_coerce_text(c, id, mt, rp.as_ty, CO_HOLD, val, "an instance variable write result", b);
   buf_puts(b, "; })");
 }
@@ -3663,7 +3674,7 @@ int emit_object_ivar_call(Compiler *c, int id, const char *name, int recv, TyKin
         else buf_puts(b, ")");
         free(lhs.p);
       }
-      else if ((mt == TY_STRBUF || (repr_share_rule(c) && mt == TY_STRING)) &&
+      else if ((mt == TY_STRBUF || (mt == TY_STRING)) &&
                (repr_of(c, id).demand || repr_of(c, id).handle)) {
         /* the caller asked for the HANDLE (a demand, or the read marked as
            the handle itself), not a reading of it. The out-of-line reader

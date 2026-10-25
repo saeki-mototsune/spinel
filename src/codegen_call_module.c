@@ -11,6 +11,75 @@
 #include "repr.h"
 #include "codegen_call_arms.h"
 
+/* Process.spawn's in/out/err slots, pushed onto _t<topts> in order. The
+   runtime finds each slot's value under its own key or a group key such as
+   [:out, :err]; a later slot of a group reuses the descriptor its first slot
+   resolved, so a grouped filename is opened once and the slots share one
+   file offset. */
+static void emit_spawn_fd_options(Compiler *c, Buf *b, int tkv, int tfd, int tth, int topts, int town) {
+  for (int i = 0; i < 3; i++) {
+    /* a filename boxed as the String's handle reads as the String (the arms
+       below test the String tag) */
+    char vref[48];
+    snprintf(vref, sizeof vref, "sp_poly_strbuf_deref(_t%d)", tkv);
+    buf_printf(b,
+      "{ sp_RbVal _t%d; sp_bool _t%d; int _prior; "
+      "_t%d = sp_process_redirect_value(_t%d, %d, &_t%d, &_prior); "
+      "if (_t%d) { if (_prior >= 0) sp_PolyArray_push(_t%d, _t%d->data[_prior]);\nelse { "
+      "  sp_RbVal _v = %s; "
+      "  if (_v.tag == SP_TAG_NIL) { "
+      "    sp_PolyArray_push(_t%d, sp_box_int(-1)); "
+      "  }\nelse if (_v.tag == SP_TAG_BOOL && !_v.v.i) { "
+      "    sp_PolyArray_push(_t%d, sp_box_int(-1)); "
+      "  }\nelse if (_v.tag == SP_TAG_INT) { "
+      "    sp_PolyArray_push(_t%d, _v); "
+      "  }\nelse if (_v.tag == SP_TAG_OBJ && _v.cls_id == SP_BUILTIN_IO && _v.v.p) { "
+      "    sp_PolyArray_push(_t%d, sp_box_int(sp_File_fileno((sp_File*)_v.v.p))); "
+      "  }\nelse if (_v.tag == SP_TAG_STR) { "
+      "    sp_PolyArray_push(_t%d, sp_box_int(sp_process_open_redirect(_v.v.s, %d, _t%d))); "
+      "  }\nelse if (_v.tag == SP_TAG_OBJ && _v.cls_id == SP_BUILTIN_POLY_ARRAY) { "
+      "    sp_PolyArray *_a = (sp_PolyArray*)_v.v.p; "
+      "    if (_a->len >= 2 && _a->data[0].tag == SP_TAG_SYM "
+      "        && _a->data[0].v.i == sp_sym_intern(\"child\")) { "
+      "      sp_RbVal _fdv = _a->data[1]; "
+      "      if (_fdv.tag == SP_TAG_SYM) { "
+      "        if (_fdv.v.i == sp_sym_intern(\"out\")) { "
+      "          sp_PolyArray_push(_t%d, sp_box_int(1)); "
+      "        }\nelse if (_fdv.v.i == sp_sym_intern(\"err\")) { "
+      "          sp_PolyArray_push(_t%d, sp_box_int(2)); "
+      "        }\nelse { "
+      "          sp_process_spawn_fail(_t%d, \"ArgumentError\", \"bad redirect value\"); "
+      "        } "
+      "      }\nelse if (_fdv.tag == SP_TAG_INT) { "
+      "        sp_PolyArray_push(_t%d, sp_box_int((int)_fdv.v.i)); "
+      "      }\nelse { "
+      "        sp_process_spawn_fail(_t%d, \"ArgumentError\", \"bad redirect value\"); "
+      "      } "
+      "    }\nelse { "
+      "      sp_process_spawn_fail(_t%d, \"ArgumentError\", \"bad child-array shape\"); "
+      "    } "
+      "  }\nelse { "
+      "    sp_process_spawn_fail(_t%d, \"ArgumentError\", \"bad redirect type\"); "
+      "  } "
+      "}}\nelse { sp_PolyArray_push(_t%d, sp_box_int(-1)); } }",
+      tkv, tfd, tkv, tth, i, tfd,
+      tfd, topts, topts, vref,
+      topts,
+      topts,
+      topts,
+      topts,
+      topts, i, town,
+      topts,
+      topts,
+      town,
+      topts,
+      town,
+      town,
+      town,
+      topts);
+  }
+}
+
 /* File.join's scalar and flattened routes keep their operands alive
    across every later argument, including argument setup emitted in g_pre. */
 static void emit_file_join_args(Compiler *c, const int *argv, int argc, int boxed, Buf *b) {
@@ -36,6 +105,41 @@ static void emit_file_join_args(Compiler *c, const int *argv, int argc, int boxe
   buf_printf(b, "}, %d); })", argc);
 }
 
+/* Dir.glob(pattern, base:, sort:, flags:): one pattern with sort: or flags:;
+   a lone base: keeps its own route. The pattern and the keyword values are
+   evaluated once, in source order, and handed boxed to
+   sp_dir_glob_keywords, which reads them. */
+static int emit_dir_glob_options(Compiler *c, const int *argv, Buf *b) {
+  const NodeTable *nt = c->nt;
+  int en = 0; const int *els = nt_arr(nt, argv[1], "elements", &en);
+  if (en < 1 || en > 3 || ty_is_array(comp_ntype(c, argv[0])) || nt_kind(nt, argv[0]) == NK_ArrayNode) return 0;
+  int nodes[4], n = 1, bi = -1, si = -1, fi = -1;
+  nodes[0] = argv[0];
+  for (int k = 0; k < en; k++) {
+    if (nt_kind(nt, els[k]) != NK_AssocNode) return 0;
+    int key = nt_ref(nt, els[k], "key"), val = nt_ref(nt, els[k], "value");
+    const char *kn = key >= 0 && nt_kind(nt, key) == NK_SymbolNode ? nt_str(nt, key, "value") : NULL;
+    if (!kn || val < 0) return 0;
+    if (sp_streq(kn, "base")) bi = n;
+    else if (sp_streq(kn, "sort")) si = n;
+    else if (sp_streq(kn, "flags")) fi = n;
+    else return 0;
+    nodes[n++] = val;
+  }
+  if (si < 0 && fi < 0) return 0;
+  buf_puts(b, "({ ");
+  int first = emit_rooted_arg_list(c, nodes, n, "sp_RbVal", "SP_GC_ROOT_RBVAL", emit_boxed, NULL, b);
+  buf_printf(b, "sp_dir_glob_keywords(_t%d", first);
+  int slot[3] = { bi, fi, si };
+  for (int k = 0; k < 3; k++) {
+    if (slot[k] >= 0) buf_printf(b, ", _t%d", first + slot[k]);
+    else buf_puts(b, ", sp_box_nil()");
+    if (k > 0) buf_printf(b, ", %d", slot[k] >= 0);
+  }
+  buf_puts(b, "); })");
+  return 1;
+}
+
 /* realdirpath takes (path, base), while join consumes (base, path).
    Hold the values in Ruby's order before reversing the slots. */
 static void emit_file_realdirpath2(Compiler *c, const int *argv, Buf *b) {
@@ -43,6 +147,18 @@ static void emit_file_realdirpath2(Compiler *c, const int *argv, Buf *b) {
   int first = emit_rooted_arg_list(c, argv, 2, "const char *", "SP_GC_ROOT_STR", emit_path_expr, NULL, b);
   buf_printf(b, "sp_file_realdirpath(sp_file_join((const char *[]){_t%d, _t%d}, 2)); })",
              first + 1, first);
+}
+
+/* DOTMATCH applies to each pattern when the argument is an Array. */
+static void emit_dir_glob_dot(Compiler *c, int pattern, Buf *b) {
+  if (nt_kind(c->nt, pattern) == NK_ArrayNode || ty_is_array(comp_ntype(c, pattern))) {
+    buf_puts(b, "sp_dir_glob_multi_dot("); emit_boxed(c, pattern, b);
+  }
+  else if (repr_of(c, pattern).kind == RK_BOXED) {
+    buf_puts(b, "sp_dir_glob_dot_boxed("); emit_boxed(c, pattern, b);
+  }
+  else { buf_puts(b, "sp_dir_glob_dot("); emit_path_expr(c, pattern, b); }
+  buf_puts(b, ")");
 }
 
 /* the class methods of File / FileTest, Dir and Time */
@@ -711,7 +827,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     if (sp_streq(name, "glob") && argc == 2 && nt_type(nt, argv[1]) &&
         sp_streq(nt_type(nt, argv[1]), "ConstantPathNode") &&
         nt_str(nt, argv[1], "name") && sp_streq(nt_str(nt, argv[1], "name"), "FNM_DOTMATCH")) {
-      buf_puts(b, "sp_dir_glob_dot("); emit_path_expr(c, argv[0], b); buf_puts(b, ")"); return 1;
+      emit_dir_glob_dot(c, argv[0], b); return 1;
     }
     /* Dir.glob(pattern, base: dir): a lone base: keyword; nil is the current directory */
     if (sp_streq(name, "glob") && argc == 2 && nt_kind(nt, argv[1]) == NK_KeywordHashNode &&
@@ -724,6 +840,9 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         buf_puts(b, ")"); return 1;
       }
     }
+    /* Dir.glob(pattern, base:, sort:, flags: File::FNM_DOTMATCH) */
+    if (sp_streq(name, "glob") && argc == 2 && nt_kind(nt, argv[1]) == NK_KeywordHashNode &&
+        emit_dir_glob_options(c, argv, b)) return 1;
     /* Dir[*pats] / Dir.glob(*pats), and Dir[a, b]: every pattern a splat
        holds or an argument names, gathered into one list for the union */
     if (sp_streq(name, "glob") && argc >= 1 &&
@@ -2027,79 +2146,17 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
         int tfd = ++g_tmp;
         buf_printf(b, " sp_RbVal _t%d = ", tth);
         emit_boxed(c, argv[argc - 1], b);
-        buf_puts(b, ";");
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d);", tth);
         /* For the three fd slots (in/out/err): look up the value and
-           resolve it. The C block is emitted three times with the
-           key name changed -- a top-level static helper would be
-           cleaner but cannot be declared inside a statement
-           expression. A filename is opened by the runtime, read-only
+           resolve it (emit_spawn_fd_options). The C block is emitted
+           three times with the slot changed -- a top-level static
+           helper would be cleaner but cannot be declared inside a
+           statement expression. A filename is opened by the runtime, read-only
            for :in and write-truncate for :out and :err, and the fds
            it opened are recorded in _town so the runtime can close
            the parent's copies once the child has its own; a caller's
            IO is never closed. */
-        const char *fd_keys[] = { "in", "out", "err" };
-        for (int i = 0; i < 3; i++) {
-          /* --share-strings: a filename boxed as the String's handle reads
-             as the String (the arms below test the String tag) */
-          char vref[48];
-          snprintf(vref, sizeof vref, repr_share_rule(c) ? "sp_poly_strbuf_deref(_t%d)" : "_t%d", tkv);
-          buf_printf(b,
-            "{ sp_RbVal _t%d; sp_bool _t%d; "
-            "_t%d = sp_poly_hash_get_pair_val(_t%d, "
-            "sp_box_sym(sp_sym_intern(\"%s\")), &_t%d); "
-            "if (_t%d) { "
-            "  sp_RbVal _v = %s; "
-            "  if (_v.tag == SP_TAG_NIL) { "
-            "    sp_PolyArray_push(_t%d, sp_box_int(-1)); "
-            "  }\nelse if (_v.tag == SP_TAG_BOOL && !_v.v.i) { "
-            "    sp_PolyArray_push(_t%d, sp_box_int(-1)); "
-            "  }\nelse if (_v.tag == SP_TAG_INT) { "
-            "    sp_PolyArray_push(_t%d, _v); "
-            "  }\nelse if (_v.tag == SP_TAG_OBJ && _v.cls_id == SP_BUILTIN_IO && _v.v.p) { "
-            "    sp_PolyArray_push(_t%d, sp_box_int(sp_File_fileno((sp_File*)_v.v.p))); "
-            "  }\nelse if (_v.tag == SP_TAG_STR) { "
-            "    sp_PolyArray_push(_t%d, sp_box_int(sp_process_open_redirect(_v.v.s, %d, _t%d))); "
-            "  }\nelse if (_v.tag == SP_TAG_OBJ && _v.cls_id == SP_BUILTIN_POLY_ARRAY) { "
-            "    sp_PolyArray *_a = (sp_PolyArray*)_v.v.p; "
-            "    if (_a->len >= 2 && _a->data[0].tag == SP_TAG_SYM "
-            "        && _a->data[0].v.i == sp_sym_intern(\"child\")) { "
-            "      sp_RbVal _fdv = _a->data[1]; "
-            "      if (_fdv.tag == SP_TAG_SYM) { "
-            "        if (_fdv.v.i == sp_sym_intern(\"out\")) { "
-            "          sp_PolyArray_push(_t%d, sp_box_int(1)); "
-            "        }\nelse if (_fdv.v.i == sp_sym_intern(\"err\")) { "
-            "          sp_PolyArray_push(_t%d, sp_box_int(2)); "
-            "        }\nelse { "
-            "          sp_process_spawn_fail(_t%d, \"ArgumentError\", \"bad redirect value\"); "
-            "        } "
-            "      }\nelse if (_fdv.tag == SP_TAG_INT) { "
-            "        sp_PolyArray_push(_t%d, sp_box_int((int)_fdv.v.i)); "
-            "      }\nelse { "
-            "        sp_process_spawn_fail(_t%d, \"ArgumentError\", \"bad redirect value\"); "
-            "      } "
-            "    }\nelse { "
-            "      sp_process_spawn_fail(_t%d, \"ArgumentError\", \"bad child-array shape\"); "
-            "    } "
-            "  }\nelse { "
-            "    sp_process_spawn_fail(_t%d, \"ArgumentError\", \"bad redirect type\"); "
-            "  } "
-            "}\nelse { sp_PolyArray_push(_t%d, sp_box_int(-1)); } }",
-            tkv, tfd, tkv, tth, fd_keys[i], tfd,
-            tfd, vref,
-            topts,
-            topts,
-            topts,
-            topts,
-            topts, i, town,
-            topts,
-            topts,
-            town,
-            topts,
-            town,
-            town,
-            town,
-            topts);
-        }
+        emit_spawn_fd_options(c, b, tkv, tfd, tth, topts, town);
         /* pgroup: look up, accept true / 0 / Integer, or 0. */
         buf_printf(b,
           " { sp_RbVal _t%d; sp_bool _t%d; "
@@ -2136,7 +2193,7 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
           "_t%d = sp_poly_hash_get_pair_val(_t%d, "
           "sp_box_sym(sp_sym_intern(\"chdir\")), &_t%d); ",
           tkv, tfd, tkv, tth, tfd);
-        if (repr_share_rule(c)) buf_printf(b, "_t%d = sp_poly_strbuf_deref(_t%d); ", tkv, tkv);
+        buf_printf(b, "_t%d = sp_poly_strbuf_deref(_t%d); ", tkv, tkv);
         buf_printf(b,
           "if (_t%d && _t%d.tag == SP_TAG_STR) "
           "{ sp_PolyArray_push(_t%d, _t%d); } "
@@ -2240,6 +2297,8 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
   /* Enumerator instance methods: #next / #peek (raise StopIteration past the
      end), #rewind (reset, returns self), #size. */
   if (recv >= 0 && comp_ntype(c, recv) == TY_ENUMERATOR) {
+    /* a method the program defines on Enumerator answers first */
+    if (emit_call_reopen_arms(c, id, b, nt, name, recv, TY_ENUMERATOR)) return 1;
     /* the readers that render the receiver and the arguments: builtin-op rows */
     if (emit_builtin_op(c, id, recv, TY_ENUMERATOR, name, b)) return 1;
     /* find_index(v) walks it only as far as the hit, so an endless one

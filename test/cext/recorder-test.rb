@@ -20,7 +20,8 @@ ids, arities, bridge = CextRecord.scan(<<~C)
 C
 check(ids == %w[@other Error split strip], "bridge literal IDs")
 check(arities == [1, 2], "vector/block-call arities")
-check(bridge == {"ivars" => %w[@flags @other @paths], "evals" => ["ENV['FLAG']"], "constant_reads" => true}, "bridge scan operations")
+check(bridge == {"ivars" => %w[@flags @other @paths], "evals" => ["ENV['FLAG']"], "constant_reads" => true, "computed_ids" => false}, "bridge scan operations")
+check(CextRecord.scan("rb_funcall(obj, sp_cext_scanned_sym2id(name), 0);")[2]["computed_ids"], "SYM2ID marks computed IDs")
 {
   'rb_intern2(name, 2)' => "rb_intern",
   'rb_intern2("abc", size)' => "length",
@@ -32,8 +33,7 @@ check(bridge == {"ivars" => %w[@flags @other @paths], "evals" => ["ENV['FLAG']"]
   'rb_eval_string(code)' => "literal",
   'rb_to_id(value)' => "runtime-computed",
   'rb_check_id(&value)' => "runtime-computed",
-  'rb_sym2id(value)' => "runtime-computed",
-  'SYM2ID(value)' => "runtime-computed"
+  'rb_sym2id(value)' => "runtime-computed"
 }.each do |source, diagnostic|
   begin
     CextRecord.scan(source)
@@ -72,6 +72,9 @@ Dir.mktmpdir("cext-recorder-test-") do |dir|
   refusals = {
     "object class during Init" => ['rb_obj_class(rb_cObject);', "rb_obj_class"],
     "class name during Init" => ['rb_class2name(rb_cObject);', "rb_class2name"],
+    "number conversion during Init" => ['NUM2LONG(INT2FIX(1));', "NUM2LONG"],
+    "value type during Init" => ['TYPE(rb_cObject);', "rb_type"],
+    "hash read during Init" => ['rb_hash_aref(rb_cObject, Qnil);', "rb_hash_aref"],
     "Ruby execution" => ['rb_funcall(rb_cObject, rb_intern("name"), 0);', "rb_funcall"],
     "invalid constant lookup" => ['rb_const_get(rb_cObject, rb_intern("lower"));', "ASCII constant names"],
     "eval" => ['rb_eval_string("ENV[\\\"HOME\\\"]");', "rb_eval_string"],
@@ -80,9 +83,10 @@ Dir.mktmpdir("cext-recorder-test-") do |dir|
     "clock" => ['time(0);', "time"],
     "file" => ['fopen("forbidden", "r");', "fopen"],
     "dynamic ID" => ['const char *name = "strip"; rb_intern(name);', "rb_intern"],
-    "computed symbol ID" => ['SYM2ID(rb_str_intern(rb_str_new_cstr("name")));', "runtime-computed"],
+    "computed string ID" => ['extern ID rb_check_id(VALUE *); rb_check_id(0);', "runtime-computed"],
     "dynamic eval" => ['const char *code = "1"; rb_eval_string(code);', "literal"],
     "dynamic ivar" => ['const char *name = "@x"; rb_iv_get(rb_cObject, name);', "literal"],
+    "catch during Init" => ['rb_catch("tag", 0, Qnil);', "rb_catch"],
     "vector call during Init" => ['rb_funcallv(rb_cObject, rb_intern("name"), 0, 0);', "rb_funcallv"],
     "API address" => ['ID (*intern)(const char *) = rb_intern; intern("strip");', "rb_intern"],
     "dynamic arity" => ['int argc = 0; rb_funcall(rb_cObject, rb_intern("name"), argc);', "rb_funcall"],

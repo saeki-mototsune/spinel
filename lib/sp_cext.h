@@ -8,6 +8,9 @@ sp_RbVal sp_cext_object_class(sp_RbVal);
 sp_RbVal sp_cext_hash_new(void);
 sp_RbVal sp_cext_plain_object_new(void);
 void sp_cext_hash_set(sp_RbVal, sp_RbVal, sp_RbVal);
+sp_int sp_cext_object_to_int(sp_RbVal);
+int sp_cext_type(sp_RbVal, int (*)(int));
+sp_RbVal sp_cext_hash_get(sp_RbVal, sp_RbVal);
 
 /* Internal bridge. The compiler/recorder will use this only for opted-in
  * extensions; an ordinary generated translation unit never includes it. */
@@ -41,6 +44,10 @@ extern void *(*sp_cext_class_alloc_fn)(int);
 extern sp_RbVal (*sp_cext_class_lookup_fn)(const char *);
 extern void *(*sp_cext_object_alloc_fn)(int);
 extern int (*sp_cext_data_class_fn)(int);
+/* catch and throw over the generated unit's catch stack (rb_catch, rb_throw,
+ * rb_iter_break) */
+extern sp_RbVal (*sp_cext_catch_fn)(sp_RbVal, sp_RbVal (*)(void *), void *);
+extern void (*sp_cext_throw_fn)(sp_RbVal, sp_RbVal);
 
 VALUE sp_cext_value(sp_RbVal value);
 sp_RbVal sp_cext_rbval(VALUE value);

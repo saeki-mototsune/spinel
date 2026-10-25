@@ -73,7 +73,9 @@ void strbuf_arg_index_free(Compiler *c);
    exactly what promote mode is asking us to avoid. Off (0) for raise/wrap, so
    the default gates and optcarrot (which pins wrap) see no behavior change. */
 extern int g_promote_mode;
-extern int g_one_string;   /* --string-repr=handle: every String slot is the handle (string-one-repr-design.md) */
+/* --int-overflow=wrap: an Integer stays a machine integer, wrapping; no
+   local is widened to Bignum by the loop-growth detectors */
+extern int g_wrap_mode;
 void an_rat_boxed_mark(int id);
 int an_rat_boxed(int id);
 int an_rat_value(Compiler *c, int n);
@@ -147,7 +149,6 @@ int nil_fact_why(const Compiler *c, int node);
    are pointers that the program stores nil into or leaves a gap in
    (NFW_ELEM_NIL's Arrays)? */
 int nil_elem_fact_node(const Compiler *c, int node);
-const char *nil_fact_why_name(int why);
 /* Does the fact track a value of type t: an object, or a builtin held as a
    pointer that is NULL for nil (a String, an Array, a Hash, an IO)? */
 int nil_fact_tracked(TyKind t);
@@ -155,6 +156,8 @@ int nil_fact_tracked(TyKind t);
 /* One post-convergence bind pass fills UNKNOWN params from empty
    array-literal args (fst([]) with def fst(a) = a.first). */
 extern int g_final_bind_pass;
+/* The pass that decides container seeds a box reached mid-fixpoint (param_seed_holds, ret_seed_holds, class_ivar_pin_holds). */
+extern int g_seed_box_settled;
 
 /* Unified value type of a slot's `recv[k] = v` writes; nwrites (optional)
    reports how many contributed, so a caller can tell "no evidence" from
@@ -169,12 +172,27 @@ void analyze_program(Compiler *c);
    (0 or 1) defs of that name: read ahead of the desugars, by absence. */
 int an_prog_never_gives(const char *nm, int defs);
 int an_prog_names_method(const char *nm);
+/* Kernel itself as call id's constant receiver (analyze_util.c) */
+int an_kernel_const_recv(Compiler *c, int id, int recv, int fresh);
+/* The argument shape of a `super` in a ` override (analyze_util.c) */
+int an_super_backtick_shape(Compiler *c, int id, const Scope *s, int *arg);
 int an_prog_meta_by_value(void);
 /* 1 or -1 when `id` is that Integer literal, parenthesized or not; 0 otherwise */
 int an_unit_int_literal(const NodeTable *nt, int id);
 /* a push onto a typed Array a builtin call just built, given an element of
    another kind: it answers the general Array (analyze_infer.c) */
 int an_push_widens_fresh(Compiler *c, int id);
+/* ...and onto one a boxed receiver's builtin built (`x.to_s.scan(re) << 99`
+   with x.to_s boxed): the kinds the push stores (AN_LIFT_*), for which the
+   receiver's builtin arms box their typed Array as the general one
+   (analyze_infer.c) */
+enum { AN_LIFT_INT = 1, AN_LIFT_FLOAT = 2, AN_LIFT_STRING = 4, AN_LIFT_SYMBOL = 8, AN_LIFT_OTHER = 16 };
+int an_push_lifts_boxed(Compiler *c, int id);
+/* a builtin of this name answers a new Array where it answers one (analyze_pass.c) */
+int fresh_array_builtin_name(const char *nm);
+/* the value of node n is dropped where it is: a statement's, a loop
+   body's, an ensure clause's (an_value_dropped, analyze_infer.c) */
+int an_node_dropped(Compiler *c, int n);
 /* True if a regex source contains a capturing group: an unescaped '(' that
    isn't the start of a non-capturing/extension group '(?...'. scan returns
    nested arrays for capturing patterns, which the str_array path can't model. */
@@ -476,7 +494,9 @@ TyKind ewo_memo_elem_type(Compiler *c, int callid);
 int curry_apply_info(Compiler *c, int node, int *out_complete, TyKind *out_ret);
 int curry_count_max(Compiler *c, int recv);
 int an_program_builds_methods(Compiler *c);   /* the program builds Method objects at all */
+int an_program_makes_dir(Compiler *c);   /* the program names Dir anywhere */
 int an_program_makes_bsearch_enum(Compiler *c);   /* Array#bsearch without a block, anywhere */
+int an_program_makes_io(Compiler *c);   /* a boxed value may be an IO (a syntactic test) */
 int an_zero_arg_builtin_shadowed(Compiler *c, const char *name, int argc);
 int an_user_recv_defines_method(Compiler *c, const char *name);
 /* obj.methods / public_methods / singleton_methods on an instance of `cid`
@@ -489,6 +509,7 @@ int an_object_methods_all_arg(Compiler *c, int cid, int argc, const int *argv);
 const char *an_value_methods_class(Compiler *c, int recv, TyKind rt, const char *name, int argc,
                                    const int *argv);
 int an_class_singleton_methods_listable(Compiler *c, int cid);
+int an_singleton_methods_foldable(Compiler *c, const char *cn);
 int ewo_memo_passed_to_callable_at(Compiler *c, int callid, int pidx);
 
 /* Class index when a receiverless instance_eval/exec resolves to self, else -1. */
@@ -637,9 +658,9 @@ int std_stream_assigned(Compiler *c, const char *nm);   /* ... or is assigned at
 int std_stream_value_classes(Compiler *c, char *set);   /* classes the streams' stores hold; 0: unbounded */
 int std_stream_foreign_writer(Compiler *c, const char *nm);   /* an object output cannot write to */
 int std_stream_bare_call_own(Compiler *c, int id, const char *nm);   /* bare nm reaches the program's own */
-/* --share-strings (#8328 step 5): the operation (StrhOp, builtin_names.h)
-   call node `call` is on a String Array of handles, given the receiver's
-   type rt: STRH_NONE unless rt is TY_STRH_ARRAY, the call's index
+/* The operation (StrhOp, builtin_names.h) call node `call` is on a String
+   Array, whose elements are handles, given the receiver's type rt:
+   STRH_NONE unless rt is TY_STR_ARRAY, the call's index
    arguments are Integers, no argument is a splat, a keyword Hash or a block
    argument, and no method of the program's own stands in for Array's. */
 int strh_call_op(Compiler *c, int call, TyKind rt);

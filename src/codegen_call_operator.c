@@ -651,17 +651,13 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       int boxed = repr_of(c, id).kind == RK_BOXED;
       if (boxed) buf_puts(b, "sp_box_oint("); else oint_open(c, id, TY_INT, b);
       /* (one representation: an operand of either face is held as it is and compared through its bytes) */
-      buf_printf(b, g_one_string ? "({ __auto_type _t%d = (" : "({ const char *_t%d = ", tr); emit_coerce(c, recv, TY_STRING, CO_HOLD, "a comparison operand", b);
-      buf_puts(b, g_one_string ? "); " : "; ");
-      if (operand_may_allocate(c, argv[0])) buf_printf(b, g_one_string ? "SP_GC_ROOT(_t%d); " : "SP_GC_ROOT_STR(_t%d); ", tr);
-      buf_printf(b, g_one_string ? "__auto_type _t%d = (" : "const char *_t%d = ", ta);
+      buf_printf(b, "({ __auto_type _t%d = (", tr); emit_coerce(c, recv, TY_STRING, CO_HOLD, "a comparison operand", b);
+      buf_puts(b, "); ");
+      if (operand_may_allocate(c, argv[0])) buf_printf(b, "SP_GC_ROOT(_t%d); ", tr);
+      buf_printf(b, "__auto_type _t%d = (", ta);
       emit_coerce(c, argv[0], TY_STRING, CO_HOLD, "a comparison operand", b);
-      if (g_one_string)
-        buf_printf(b, "); !_t%d || !_t%d ? ((const void *)_t%d == (const void *)_t%d ? sp_oint_of(0) : sp_oint_nil())"
-                      " : sp_oint_of((sp_int)sp_str_cmp_bytes(SP_STR_B(_t%d), SP_STR_B(_t%d))); })", tr, ta, tr, ta, tr, ta);
-      else
-      buf_printf(b, "; !_t%d || !_t%d ? (_t%d == _t%d ? sp_oint_of(0) : sp_oint_nil())"
-                    " : sp_oint_of((sp_int)sp_str_cmp_bytes(_t%d, _t%d)); })", tr, ta, tr, ta, tr, ta);
+      buf_printf(b, "); !_t%d || !_t%d ? ((const void *)_t%d == (const void *)_t%d ? sp_oint_of(0) : sp_oint_nil())"
+                    " : sp_oint_of((sp_int)sp_str_cmp_bytes(SP_STR_B(_t%d), SP_STR_B(_t%d))); })", tr, ta, tr, ta, tr, ta);
       if (boxed) buf_puts(b, ")"); else oint_close(c, id, b);
       return 1;
     }
@@ -1538,11 +1534,11 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
         int tC2 = ++g_tmp;
         /* marked to hand out the handle (`r = obj.buf.clear`): the
            receiver itself, as for the appends */
-        buf_printf(b, (g_one_string ? "({ sp_String *_t%d = SP_STR_HDL(%s); sp_String_set_bin(_t%d, (&(\"\\xff\")[1]));" : "({ sp_String *_t%d = %s; sp_String_set_bin(_t%d, (&(\"\\xff\")[1]));"),
+        buf_printf(b, "({ sp_String *_t%d = SP_STR_HDL(%s); sp_String_set_bin(_t%d, (&(\"\\xff\")[1]));",
                    tC2, srefC.p, tC2);
         free(srefC.p);
         if (repr_of(c, id).handle) buf_printf(b, " _t%d; })", tC2);
-        else buf_printf(b, " sp_String_cstr(_t%d); })", tC2);
+        else buf_printf(b, " sp_strbuf_read_pub(_t%d); })", tC2);
         return 1;
       } }
     const char *rty = nt_type(nt, recv);
@@ -1648,9 +1644,9 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
                       : hrr.key == TY_STRING ? "const char *" : "sp_RbVal";
     const char *kbox = hrr.key == TY_SYMBOL ? "sp_box_sym(_key)"
                      : hrr.key == TY_STRING ? "sp_box_str(_key)" : "_key";
-    int dn2 = ++g_proc_counter;
+    const char *dn2 = uid_new();
     buf_printf(&g_procs,
-      "static sp_RbVal _sp_hash_dproc_%d(sp_%sHash *_self_h, %s _key, void *_dproc_self) {\n"
+      "static sp_RbVal _sp_hash_dproc_%s(sp_%sHash *_self_h, %s _key, void *_dproc_self) {\n"
       "  return sp_penum_call2((sp_Proc *)_dproc_self,"
       " sp_box_nullable_obj((void *)_self_h, %s), %s);\n}\n",
       dn2, hn2, keyct, hash_box_cls(hrt), kbox);
@@ -1665,7 +1661,7 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
     Repr vt2r = repr_of(c, id);
     TyKind vt2 = vt2r.as_ty;
     int ans = (vt2 == TY_PROC || vt2r.kind == RK_BOXED || vt2 == TY_UNKNOWN) ? tp2 : th2;
-    buf_printf(b, " _t%d->dproc = _sp_hash_dproc_%d; _t%d->dproc_self = (void *)_t%d;"
+    buf_printf(b, " _t%d->dproc = _sp_hash_dproc_%s; _t%d->dproc_self = (void *)_t%d;"
                   " sp_gc_wb((void *)_t%d); _t%d; })",
                th2, dn2, th2, tp2, th2, ans);
     return 1;
@@ -1678,7 +1674,7 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
   /* (--share-strings: so does a call answering its receiver over a
      handle, `id(s).concat(x)[0] = v`, held as that handle first, run once:
      the store takes it from the temp, ran_first_handle) */
-  int aset_route = recv >= 0 && repr_share_rule(c) && repr_of(c, recv).as_ty == TY_STRING &&
+  int aset_route = recv >= 0 && repr_of(c, recv).as_ty == TY_STRING &&
                    strbuf_self_route(c, recv) && g_n_argov + 2 < MAX_ARG_OVERRIDE;
   /* (one a `&.` guard holds already is taken from there: ran_first_handle) */
   int aset_held = aset_route && ran_first_handle(recv) >= 0;

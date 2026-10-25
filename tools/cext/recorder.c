@@ -208,6 +208,11 @@ void rb_define_attr(VALUE o, const char *n, int r, int w) {
 }
 void rb_include_module(VALUE o, VALUE m) { event("include",o); field("module",owner(m,"rb_include_module")->name); end(); }
 void rb_extend_object(VALUE o, VALUE m) { event("extend",o); field("module",owner(m,"rb_extend_object")->name); end(); }
+void rb_undef_method(VALUE o, const char *n) { event("undef_method",o); field("name",n); end(); }
+void rb_undef_alloc_func(VALUE o) {
+    if (owner(o,"rb_undef_alloc_func")->module == 1) refuse("rb_undef_alloc_func","expected a class");
+    event("undef_allocator",o); end();
+}
 ID rb_intern(const char *s) {
     for (size_t i=0;i<symbol_count;i++) if (!strcmp(s,symbols[i])) return i+1;
     char **next = realloc(symbols,(symbol_count+1)*sizeof(*next));
@@ -257,6 +262,16 @@ VALUE rb_const_get(VALUE value,ID id) {
     event("reference",value);field("path",full);end();
     return (VALUE)reference;
 }
+VALUE rb_const_get_at(VALUE value,ID id) { return rb_const_get(value,id); }
+/* From the extension's own definitions and the builtins it knows, never from
+ * the program's Ruby: the run-time bridge answers from the same facts, so
+ * both runs of Init take the same path and define the same things. */
+int rb_const_defined(VALUE value,ID id) {
+    const char *name=rb_id2name(id);constant_name(name);
+    if(binding(value,name))return 1;
+    Binding *b=binding(rb_cObject,name);
+    return b && owner(b->value,"rb_const_defined")->builtin;
+}
 VALUE rb_eval_string(const char *s) { (void)s;DENIED("rb_eval_string"); }
 void rb_raise(VALUE v,const char *s,...) { (void)v;(void)s;DENIED("rb_raise"); }
 void rb_exc_raise(VALUE v) { (void)v;DENIED("rb_exc_raise"); }
@@ -305,9 +320,11 @@ int rb_enc_str_coderange(VALUE v) { (void)v;DENIED("rb_enc_str_coderange"); }
 VALUE rb_hash_new_capa(long n) { (void)n;DENIED("rb_hash_new_capa"); }
 VALUE rb_hash_aset(VALUE h,VALUE k,VALUE v) { (void)h;(void)k;(void)v;DENIED("rb_hash_aset"); }
 int rb_num2int(VALUE v) { (void)v;DENIED("NUM2INT"); }
+long rb_num2long(VALUE v) { (void)v;DENIED("NUM2LONG"); }
 VALUE rb_obj_class(VALUE v) { (void)v;DENIED("rb_obj_class"); }
 const char *rb_class2name(VALUE v) { (void)v;DENIED("rb_class2name"); }
 void rb_check_type(VALUE v,int t) { (void)v;(void)t;DENIED("Check_Type"); }
+int rb_type(VALUE v) { (void)v;DENIED("rb_type"); }
 VALUE rb_ll2inum(long long n) { (void)n;DENIED("LL2NUM"); }
 VALUE rb_float_new(double n) { (void)n;DENIED("DBL2NUM"); }
 VALUE rb_ary_new_capa(long n) { (void)n;DENIED("rb_ary_new_capa"); }
@@ -316,6 +333,8 @@ VALUE rb_ary_pop(VALUE v) { (void)v;DENIED("rb_ary_pop"); }
 void rb_ary_store(VALUE v,long i,VALUE item) { (void)v;(void)i;(void)item;DENIED("rb_ary_store"); }
 VALUE rb_ary_entry(VALUE v,long i) { (void)v;(void)i;DENIED("rb_ary_entry"); }
 long sp_cext_array_len(VALUE v) { (void)v;DENIED("RARRAY_LEN"); }
+VALUE rb_ary_subseq(VALUE v,long b,long n) { (void)v;(void)b;(void)n;DENIED("rb_ary_subseq"); }
+VALUE rb_hash_aref(VALUE h,VALUE k) { (void)h;(void)k;DENIED("rb_hash_aref"); }
 
 int rb_block_given_p(void) { DENIED("rb_block_given_p"); }
 VALUE rb_block_proc(void) { DENIED("rb_block_proc"); }
@@ -338,6 +357,10 @@ VALUE rb_ivar_get(VALUE v, ID id) { (void)v;(void)id;DENIED("rb_ivar_get"); }
 VALUE rb_ivar_set(VALUE v, ID id, VALUE a) { (void)v;(void)id;(void)a;DENIED("rb_ivar_set"); }
 
 VALUE rb_block_call(VALUE v, ID id, int n, const VALUE *a, rb_block_call_func_t f, VALUE d) { (void)v;(void)id;(void)n;(void)a;(void)f;(void)d;DENIED("rb_block_call"); }
+VALUE rb_catch(const char *t,rb_block_call_func_t f,VALUE d) { (void)t;(void)f;(void)d;DENIED("rb_catch"); }
+void rb_throw(const char *t,VALUE v) { (void)t;(void)v;DENIED("rb_throw"); }
+void rb_iter_break(void) { DENIED("rb_iter_break"); }
+void rb_iter_break_value(VALUE v) { (void)v;DENIED("rb_iter_break_value"); }
 
 ID sp_cext_scanned_sym2id(VALUE v) { return (ID)(v >> RUBY_SPECIAL_SHIFT); }
 VALUE rb_str_intern(VALUE v) { (void)v;DENIED("rb_str_intern"); }

@@ -23,6 +23,7 @@
 #include <unistd.h>
 #include "sp_alloc.h"   /* sp_str_alloc / sp_str_set_len / sp_raise_cls */
 #include "sp_array.h"   /* sp_StrArray for Dir.glob */
+#include "sp_hash.h"    /* sp_StrIntHash for Dir.glob(sort: false) */
 #include <dirent.h>
 #if defined(_WIN32)
 #include <spawn.h>
@@ -1000,6 +1001,42 @@ sp_StrArray *sp_dir_glob_base(const char *pattern, const char *base) {
   return a;
 }
 
+const char *sp_poly_inspect(sp_RbVal v);   /* lib/sp_poly_cold.c */
+/* Dir.glob's keyword options reuse the walk; sort: false keeps the walk's
+   order, which the filesystem gives. */
+sp_StrArray *sp_dir_glob_options(const char *pattern, const char *base, sp_bool dotmatch, sp_RbVal sort) {
+  SP_GC_ROOT_STR(pattern); SP_GC_ROOT_STR(base); SP_GC_ROOT_RBVAL(sort);
+  if (sort.tag != SP_TAG_BOOL)
+    sp_raise_cls("ArgumentError", sp_sprintf("expected true or false as sort: %s", sp_poly_inspect(sort)));
+  int old_dotmatch = sp_glob_dotmatch;
+  sp_glob_dotmatch = dotmatch;
+  sp_StrArray *a;
+  if (sort.v.i) a = sp_dir_glob_base(pattern, base);
+  else {
+    a = sp_StrArray_new();
+    SP_GC_ROOT(a);
+    if (pattern) {
+      sp_glob_start();
+      sp_dir_glob_braces(pattern, base, a);
+      sp_glob_finish();
+    }
+    /* drop a repeated path as sp_dir_glob_base does, without sorting */
+    sp_StrIntHash *seen = sp_StrIntHash_new();
+    SP_GC_ROOT(seen);
+    sp_int w = 0;
+    for (sp_int i = 0; i < a->len; i++) {
+      sp_strelem e = a->data[i];
+      const char *k = SP_SEB(e);
+      if (k && sp_StrIntHash_has_key(seen, k)) continue;
+      if (k) sp_StrIntHash_set(seen, k, 1);
+      a->data[w++] = e;
+    }
+    a->len = w;
+  }
+  sp_glob_dotmatch = old_dotmatch;
+  return a;
+}
+
 sp_StrArray *sp_dir_glob(const char *pattern) { return sp_dir_glob_base(pattern, NULL); }
 
 /* ---- File.read/size/mtime/join/readlines + Math.lgamma (cold) ---- */
@@ -1699,35 +1736,37 @@ sp_int sp_file_write(const char *path, const char *data) {SP_GC_ROOT_STR(path);S
    next allocation waited on the command too (#4528). The child is forked
    here with its stdout on a pipe; the read parks on that pipe like any read
    from a pipe does, and the wait is the scheduler's polling one, as
-   Kernel#system's is. */
+   Kernel#system's is.
+   A command line with no shell character runs as its words, with no shell
+   (sp_cmdline_shell_p, CRuby's rule): a program that cannot be run raises
+   its Errno, as `missing` does under CRuby, where the shell only printed
+   "not found" and the answer was "". */
+extern const char *sp_errno_class_name(int e);   /* lib/sp_exc.c: the Errno:: class for a C errno */
 const char *sp_backtick(const char *cmd) {SP_GC_ROOT_STR(cmd);
+  int via_shell = sp_cmdline_shell_p(cmd);
+  char **words = NULL;
+  if (!via_shell) {
+    int wn = 0;
+    if (!(words = sp_cmdline_words(cmd, &wn))) sp_raise_cls("NoMemoryError", "out of memory");
+  }
+  /* the program a failed exec names: the first word, "" for a line of none */
+  const char *prog = words ? (words[0] ? words[0] : "") : "/bin/sh";
   int fds[2];
-  if (sp_io_make_pipe(fds) != 0) { sp_last_status = -1; return sp_str_empty; }
+  if (sp_io_make_pipe(fds) != 0) { free(words); sp_last_status = -1; return sp_str_empty; }
   fflush(NULL);
-#if defined(_WIN32)
-  /* posix_spawn where there is no fork (see sp_process.c) */
-  pid_t pid = 0;
-  {
-    posix_spawn_file_actions_t fa;
-    posix_spawn_file_actions_init(&fa);
-    posix_spawn_file_actions_addclose(&fa, fds[0]);
-    if (fds[1] != 1) { posix_spawn_file_actions_adddup2(&fa, fds[1], 1); posix_spawn_file_actions_addclose(&fa, fds[1]); }
-    char *av[] = { (char *)"sh", (char *)"-c", (char *)cmd, NULL };
-    int rc = posix_spawn(&pid, "/bin/sh", &fa, NULL, av, environ);
-    posix_spawn_file_actions_destroy(&fa);
-    if (rc != 0) { close(fds[0]); close(fds[1]); sp_last_status = 127 << 8; return sp_str_empty; }
+  int exec_errno = 0;
+  int pid = sp_system_start(words ? NULL : cmd, prog, words, NULL, fds[1], fds[0], &exec_errno);
+  if (pid <= 0) {
+    close(fds[0]); close(fds[1]);
+    if (pid == 0 && words) {
+      const char *msg = sp_sprintf("%s - %s", strerror(exec_errno), prog);
+      free(words);
+      sp_raise_cls(sp_errno_class_name(exec_errno), msg);
+    }
+    free(words);
+    return sp_str_empty;
   }
-#else
-  pid_t pid = fork();
-  if (pid < 0) { close(fds[0]); close(fds[1]); sp_last_status = -1; return sp_str_empty; }
-  if (pid == 0) {
-    close(fds[0]);
-    if (fds[1] != 1) { dup2(fds[1], 1); close(fds[1]); }
-    else fcntl(1, F_SETFD, 0);
-    execl("/bin/sh", "sh", "-c", cmd, (char *)NULL);
-    _exit(127);
-  }
-#endif
+  free(words);
   close(fds[1]);
   size_t cap = 4096, len = 0;
   char *buf = (char *)malloc(cap);
@@ -2368,6 +2407,7 @@ static int sp_File_tail_incomplete(const unsigned char *s, size_t len) {
 
 const char *sp_File_gets_sep(sp_File *f, const char *sep, sp_int limit, sp_bool chomp) {SP_GC_ROOT(f);SP_GC_ROOT_STR(sep);
   SP_IO_OPEN(f);
+  sp_io_check_readable(f);
   sp_io_wait_readable(f);
   SP_IO_OPEN(f);   /* the park can return after another thread closed the handle */
   /* an empty separator is paragraph mode, a nil one (NULL) reads to the end;
@@ -3519,7 +3559,9 @@ sp_Enumerator *sp_enum_as_gen(sp_Enumerator *e) {
 }
 /* Recognize the annotated materialized walks in the existing return
    dispatch; an inspect label must not turn a supported walk into an error. */
+static void sp_io_codepoint_gen(sp_Fiber *f);
 static int sp_enum_returns_source(sp_Enumerator *e) {
+  if (e->gen == sp_io_codepoint_gen) return 1;
   const char *m = e->meth;
   return m && (strcmp(m, "each") == 0 || strcmp(m, "each_with_index") == 0 ||
                strncmp(m, "cycle(", 6) == 0 || strncmp(m, "combination(", 12) == 0 ||
@@ -3531,7 +3573,10 @@ static int sp_enum_returns_source(sp_Enumerator *e) {
                strncmp(m, "downto(", 7) == 0 ||
                /* a Hash's own walks, labeled only where the Hash is the source */
                strcmp(m, "each_pair") == 0 || strcmp(m, "each_key") == 0 ||
-               strcmp(m, "each_value") == 0);
+               strcmp(m, "each_value") == 0 ||
+               /* a String's piece walks answer the String */
+               strcmp(m, "each_char") == 0 || strcmp(m, "each_line") == 0 ||
+               strcmp(m, "each_byte") == 0 || strcmp(m, "each_codepoint") == 0);
 }
 sp_RbVal sp_enum_with_index_value(sp_Enumerator *e) {SP_GC_ROOT(e);
   if (sp_enum_returns_source(e))
@@ -3825,6 +3870,50 @@ sp_Enumerator *sp_loop_enum(void) {
   return e;
 }
 
+/* IO codepoints are read when the Enumerator is walked, retaining its source. */
+typedef struct { sp_File *io; } sp_IOCodepointCap;
+static void sp_io_codepoint_scan(void *p) {
+  sp_gc_mark(((sp_IOCodepointCap *)p)->io);
+}
+static void sp_io_codepoint_gen(sp_Fiber *f) {
+  sp_IOCodepointCap *cap = (sp_IOCodepointCap *)f->user_data; SP_GC_ROOT(cap);
+  const char *text = NULL; SP_GC_ROOT_STR(text);
+  while ((text = sp_File_getc(cap->io)) != NULL)
+    sp_Fiber_yield(sp_box_int(sp_str_ord(text)));
+  sp_gc_wb((void *)f);
+  f->yielded_value = sp_box_obj(cap->io, SP_BUILTIN_IO);
+}
+sp_Enumerator *sp_io_codepoint_enumerator(sp_File *io) {SP_GC_ROOT(io);
+  sp_IOCodepointCap *cap = (sp_IOCodepointCap *)sp_gc_alloc(sizeof *cap, NULL, sp_io_codepoint_scan);
+  SP_GC_ROOT(cap); cap->io = io;
+  sp_Enumerator *e = sp_Enumerator_new_gen(sp_io_codepoint_gen, cap, sp_box_nil());
+  return sp_enum_with_src(e, sp_box_obj(io, SP_BUILTIN_IO), SPL("each_codepoint"));
+}
+static void sp_io_codepoint_rewind(sp_Enumerator *e) {SP_GC_ROOT(e);
+  sp_File *io = ((sp_IOCodepointCap *)e->gen_cap)->io;
+  SP_IO_OPEN(io);
+  if (fseeko(io->fp, 0, SEEK_SET) != 0) sp_raise_cls(sp_errno_class_name(errno), strerror(errno));
+  clearerr(io->fp); io->lineno = 0;
+}
+
+/* A boxed Dir's block walk rewinds the handle, as CRuby's Dir#each does, and
+   reads one entry at a time, so a break leaves the rest unread. */
+static void sp_dir_each_gen(sp_Fiber *f) {
+  sp_Dir *dir = (sp_Dir *)f->user_data; SP_GC_ROOT(dir);
+  const char *entry = NULL; SP_GC_ROOT_STR(entry);
+  sp_Dir_rewind(dir);
+  while ((entry = sp_Dir_read(dir)) != NULL)
+    sp_Fiber_yield(sp_box_str(entry));
+  sp_gc_wb((void *)f);
+  f->yielded_value = sp_box_obj(dir, SP_BUILTIN_DIR);
+}
+sp_RbVal sp_dir_each_enumerator(sp_Dir *dir) {SP_GC_ROOT(dir);
+  sp_Enumerator *e = sp_Enumerator_new_gen(sp_dir_each_gen, dir, sp_box_nil());
+  SP_GC_ROOT(e);
+  e = sp_enum_with_src(e, sp_box_obj(dir, SP_BUILTIN_DIR), SPL("each"));
+  return sp_box_obj(e, SP_BUILTIN_ENUMERATOR);
+}
+
 /* IO.copy_stream(src_path, dst_path): stream one file to another, byte count. */
 sp_int sp_io_copy_stream(const char *src, const char *dst) {SP_GC_ROOT_STR(src);SP_GC_ROOT_STR(dst);
   FILE *in = fopen(src ? src : "", "rb");
@@ -3940,6 +4029,7 @@ sp_PolyArray *sp_Enumerator_next_values(sp_Enumerator *e) {SP_GC_ROOT(e); return
 sp_PolyArray *sp_Enumerator_peek_values(sp_Enumerator *e) {SP_GC_ROOT(e); return sp_enum_values_wrap(sp_Enumerator_peek(e)); }
 sp_Enumerator *sp_Enumerator_rewind(sp_Enumerator *e) { sp_gc_wb((void*)e);
   if (!e) return NULL;
+  if (e->gen == sp_io_codepoint_gen) sp_io_codepoint_rewind(e);
   if (e->gen) { e->fib = NULL; e->peeked = FALSE; e->gen_result = sp_box_nil(); }
   else { e->cursor = 0; if (SP_UNLIKELY(e->live)) sp_enum_live_rewind(e); }
   if (e->is_bsearch) { e->bsearch_lo = 0; e->bsearch_hi = e->items ? e->items->len - 1 : -1; e->bsearch_mid = -1; e->bsearch_waiting = FALSE; e->bsearch_result = sp_box_nil(); e->peeked = FALSE; }

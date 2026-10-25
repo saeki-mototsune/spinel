@@ -113,6 +113,9 @@ sp_File *sp_File_open_perm(const char *path, const char *mode, sp_oint perm);   
    CRuby sockets' sync = true. `kind` labels the handle ("tcp", "tcpserver",
    ...) for #class rendering. (#2922) */
 sp_File *sp_io_fdopen_sock(int fd, const char *kind);
+/* Access-mode checks retain closed-stream error precedence. */
+void sp_io_check_readable(sp_File *f);
+void sp_io_check_writable(sp_File *f);
 void sp_io_wait_readable(sp_File *f);
 void sp_io_wait_fd_readable(int fd);
 /* Park until the handle can take bytes (a socket, or an IO.pipe write end). */
@@ -324,6 +327,9 @@ SP_NORETURN SP_COLD void sp_dir_raise_closed(void);
    struct because the poly to_s and spaceship in spinel_rt.h call them. */
 const char *sp_Dir_to_s(sp_Dir *d);
 sp_RbVal sp_Dir_cmp(sp_Dir *d, sp_RbVal other);
+/* and the boxed count/include? there read the handle through these */
+const char *sp_Dir_read(sp_Dir *d);
+sp_Dir *sp_Dir_rewind(sp_Dir *d);
 
 /* ---- sp_io_pipe/sysopen relocated from spinel_rt.h (0 optcarrot uses). ---- */
 sp_PolyArray *sp_io_pipe(void);

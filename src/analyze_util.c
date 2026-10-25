@@ -1,6 +1,7 @@
 #include "analyze_internal.h"
 #include "builtin_names.h"
 #include "share.h"
+#include "call_plan.h"
 #include <errno.h>
 #include <limits.h>
 
@@ -845,8 +846,11 @@ int str_in(const char *s, const char *const *set) {
    whether to keep its result. In a `rescue` that meant the array was built
    and thrown away (`x = ([] rescue 0)` assigned nil), and in a begin/rescue
    the value unified to the handler's Integer and the array pointer went into
-   an sp_int slot (#3495, #3496). */
-int node_is_empty_container(const NodeTable *nt, int node) {
+   an sp_int slot (#3495, #3496). An `Array.new` or `Hash.new` the program
+   answers with its own class method is that method's value, not an empty
+   container. */
+int node_is_empty_container(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
   node = nt_paren_single(nt, node);   /* `([])` is as empty as `[]` */
   if (node < 0) return 0;
   NodeKind k = nt_kind(nt, node);
@@ -864,7 +868,7 @@ int node_is_empty_container(const NodeTable *nt, int node) {
   if (!rn || (!sp_streq(rn, "Array") && !sp_streq(rn, "Hash"))) return 0;
   int ca = nt_ref(nt, node, "arguments");
   int argc = 0; if (ca >= 0) nt_arr(nt, ca, "arguments", &argc);
-  return argc == 0;
+  return argc == 0 && !cplan_const_user(c, node, rn, 1);
 }
 
 int is_arith_op(const char *op) {
@@ -1462,6 +1466,9 @@ int recv_hash_new_default_arg(Compiler *c, int recv) {
 TyKind hash_default_value_ty(Compiler *c, int dn) {
   if (dn < 0) return TY_UNKNOWN;
   TyKind t = infer_type(c, dn);
+  /* (one-String mode: a default held as its handle is a String to the
+     Hash's value kind, which holds the handle) */
+  if (t == TY_STRBUF) return TY_STRING;
   if (t != TY_UNKNOWN) return t;
   NodeKind k = nt_kind(c->nt, dn);
   if (k == NK_ArrayNode || k == NK_HashNode || k == NK_KeywordHashNode) return TY_POLY;
@@ -4203,8 +4210,10 @@ static int param_handed_computed_name(Compiler *c, int arg, const char *vn, int 
   }
   if (key >= 0 && c->send_param_memo && c->send_param_memo[key]) return c->send_param_memo[key] == 2;
   int res = 0;
-  NT_FOREACH_KIND(nt, NK_CallNode, id) {
-    if (res) continue;
+  /* the calls of the method's name, off the calls-by-name index: every
+     call of the program was read for each parameter asked about */
+  for (int id = an_calls_named_first(c, sc->name); id >= 0 && !res; id = an_calls_named_next(id)) {
+    if (nt_kind(nt, id) != NK_CallNode) continue;
     const char *cn = nt_str(nt, id, "name");
     if (!cn || !sp_streq(cn, sc->name)) continue;
     int a = nt_ref(nt, id, "arguments");
@@ -4328,7 +4337,7 @@ int io_reopen_ret_mixed(Compiler *c, const char *name) {
 }
 /* The builtin superclass of an IO-family class, as lib/sp_io.c walks a
    handle's kind (sp_io_super_of); NULL above IO. */
-static const char *io_super_name(const char *k) {
+const char *io_super_name(const char *k) {
   static const char *const pairs[][2] = {
     {"TCPServer", "TCPSocket"}, {"TCPSocket", "IPSocket"}, {"UDPSocket", "IPSocket"},
     {"IPSocket", "BasicSocket"}, {"UNIXServer", "UNIXSocket"}, {"UNIXSocket", "BasicSocket"},
@@ -4399,7 +4408,7 @@ const char *time_strict_parser_call(Compiler *c, int id) {
 /* The program's parent map (an_parent_map), kept on the Compiler as the
    emitter's is (codegen_parents, the same fields) and rebuilt whenever the
    node table changed, for an analysis that asks where a node sits on every
-   round (share_strh_gate). */
+   round. */
 const int *comp_parent_map(Compiler *c) {
   const NodeTable *nt = c->nt;
   if (!c->cg_parent || c->cg_parent_n != nt->count || c->cg_parent_ver != nt->version) {
@@ -4421,49 +4430,6 @@ int comp_value_dropped(Compiler *c, int n) {
   return n >= 0 && n < c->nt->count && vp_climb(c->nt, comp_parent_map(c), n, VPS_NONE, &up) == VPU_DROPPED;
 }
 
-/* Is the value of method m only ever taken where a call node reads it, and
-   its type free to be the form? A method the runtime or a protocol calls
-   (deconstruct, to_s, an extension entry, a proc form) has it taken where no
-   node does; one an --rbs seed gave its return (`-> Array[String]`) has the
-   seed's C type, which no handle Array converts into. */
-int strh_method_open(const Scope *m) {
-  return m->name && !method_name_implicitly_invoked(m->name) && !(m->class_id >= 0 && (sp_streq(m->name, "deconstruct") || sp_streq(m->name, "deconstruct_keys"))) && !m->is_ext_entry &&
-         !m->is_proc_form && !m->is_lowered_yield && !m->ret_rbs_seeded;
-}
-/* Is node n, a read of an Array of handles, the value its method answers: the
-   body's last statement (an `if`'s arm, a begin's body and parentheses
-   included) or the one argument of a `return`? The caller's name for it is
-   the method's value (a SHK_RET holder of its class). Climbs from the node
-   (vp_climb), so its cost is the nesting depth. */
-int strh_value_returned(Compiler *c, const int *par, int n) {
-  const NodeTable *nt = c->nt;
-  if (n < 0 || n >= nt->count) return 0;
-  VpUp up;
-  VpUpKind ended = vp_climb(nt, par, n, STRH_CLIMB | VP_FOLLOW_RETURN, &up);
-  if (ended == VPU_JUMP)
-    return comp_scope_of(c, up.parent)->def_node >= 0 && strh_method_open(comp_scope_of(c, up.parent));
-  return vp_up_def(nt, &up) >= 0 && strh_method_open(comp_scope_of(c, n));
-}
-/* Is Array literal n where a variable can hold it: a local's, an instance
-   variable's, a global's, a class variable's or a constant's write, an
-   argument of a call or a yield, a method's value? The String handle Array
-   form is given to a literal only there, and share_strh_gate asks the
-   places that name a holder of its class (strh_literal_valid). */
-int strh_literal_held(Compiler *c, int n) {
-  if (comp_lwrite_of_value(c, n) >= 0) return 1;
-  const int *par = comp_parent_map(c);
-  int p = n >= 0 && n < c->nt->count ? par[n] : -1;
-  if (p < 0) return 0;
-  NodeKind pk = nt_kind(c->nt, p);
-  if ((pk == NK_InstanceVariableWriteNode || pk == NK_GlobalVariableWriteNode || pk == NK_ClassVariableWriteNode ||
-       pk == NK_ConstantWriteNode) && nt_paren_single(c->nt, nt_ref(c->nt, p, "value")) == n)
-    return 1;
-  /* an argument of a call or a yield, the value of a method */
-  if (is_arguments_node_type(nt_type(c->nt, p)) && par[p] >= 0 &&
-      (nt_kind(c->nt, par[p]) == NK_CallNode || nt_kind(c->nt, par[p]) == NK_YieldNode))
-    return 1;
-  return strh_value_returned(c, par, n);
-}
 
 /* Is argument n's type want, or (unknown_ok, for the gate's early rounds)
    not settled yet? */
@@ -4502,7 +4468,7 @@ static int strh_plain_block_params(Compiler *c, int blk) {
 }
 int strh_call_op_in(Compiler *c, int call, TyKind rt, int unknown_ok) {
   const NodeTable *nt = c->nt;
-  if (rt != TY_STRH_ARRAY || call < 0 || nt_kind(nt, call) != NK_CallNode) return STRH_NONE;
+  if (rt != TY_STR_ARRAY || call < 0 || nt_kind(nt, call) != NK_CallNode) return STRH_NONE;
   const char *nm = nt_str(nt, call, "name");
   int ca = nt_ref(nt, call, "arguments"), argc = 0, blk = nt_ref(nt, call, "block");
   const int *av = ca >= 0 ? nt_arr(nt, ca, "arguments", &argc) : NULL;
@@ -4521,7 +4487,7 @@ int strh_call_op_in(Compiler *c, int call, TyKind rt, int unknown_ok) {
       if (vt != TY_STRING && vt != TY_STRBUF && vt != TY_UNKNOWN && vt != TY_POLY) return STRH_NONE;
     }
   /* (the other operand of == is another Array of handles) */
-  if (op == STRH_EQ && !strh_arg_ty_ok(c, av[0], TY_STRH_ARRAY, TY_STRH_ARRAY, unknown_ok)) return STRH_NONE;
+  if (op == STRH_EQ && !strh_arg_ty_ok(c, av[0], TY_STR_ARRAY, TY_STR_ARRAY, unknown_ok)) return STRH_NONE;
   /* (a separator or a needle that is a String) */
   if ((op == STRH_JOIN || op == STRH_INCLUDE) && argc == 1 &&
       !strh_arg_ty_ok(c, av[0], TY_STRING, TY_STRBUF, unknown_ok)) return STRH_NONE;
@@ -4536,4 +4502,43 @@ int strh_var_read(const NodeTable *nt, int n) {
   NodeKind k = n >= 0 ? nt_kind(nt, n) : NK_NONE;
   return k == NK_LocalVariableReadNode || k == NK_InstanceVariableReadNode || k == NK_GlobalVariableReadNode ||
          k == NK_ConstantReadNode || k == NK_ClassVariableReadNode;
+}
+
+/* Is `recv` the builtin Kernel module as call `id`'s receiver (a constant
+   read of Kernel the program gives no class method of the call's name)? */
+int an_kernel_const_recv(Compiler *c, int id, int recv, int fresh) {
+  const NodeTable *nt = c->nt;
+  if (recv < 0 || nt_kind(nt, recv) != NK_ConstantReadNode) return 0;
+  const char *rn = nt_str(nt, recv, "name");
+  return rn && sp_streq(rn, "Kernel") && !cplan_const_user(c, id, rn, fresh);
+}
+
+/* The String a `super` in a ` override (call `id` in scope `s`) hands
+   Kernel#`: 1 for super(x) with one plain argument (*arg is x), 2 for a
+   zero-argument super in a def of one required parameter and nothing
+   else, 0 for any other shape, -1 where no Kernel#` is above self. */
+int an_super_backtick_shape(Compiler *c, int id, const Scope *s, int *arg) {
+  const NodeTable *nt = c->nt;
+  *arg = -1;
+  /* a BasicObject instance has no Kernel above it: NoMethodError */
+  if (!s->is_cmethod && s->class_id >= 0 && class_is_blank_slate(c, s->class_id)) return -1;
+  if (nt_kind(nt, id) == NK_SuperNode) {
+    int a = nt_ref(nt, id, "arguments"), an = 0;
+    const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
+    if (an != 1 || nt_ref(nt, id, "block") >= 0) return 0;
+    NodeKind ak = nt_kind(nt, av[0]);
+    if (ak == NK_SplatNode || ak == NK_KeywordHashNode || ak == NK_BlockArgumentNode) return 0;
+    *arg = av[0];
+    return 1;
+  }
+  if (nt_kind(nt, id) != NK_ForwardingSuperNode) return 0;
+  if (s->nparams != 1 || s->rest_idx >= 0 || s->kwrest_idx >= 0 || s->pdefault[0] >= 0) return 0;
+  int pn = s->def_node >= 0 && nt_kind(nt, s->def_node) == NK_DefNode ? nt_ref(nt, s->def_node, "parameters") : -1;
+  if (pn >= 0) {
+    int rn = 0, kn = 0;
+    nt_arr(nt, pn, "requireds", &rn);
+    nt_arr(nt, pn, "keywords", &kn);
+    if (rn != 1 || kn != 0 || nt_ref(nt, pn, "rest") >= 0 || nt_ref(nt, pn, "keyword_rest") >= 0) return 0;
+  }
+  return 2;
 }

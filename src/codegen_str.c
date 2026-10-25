@@ -98,7 +98,7 @@ static int str_uplus_literal(Compiler *c, int v) {
    slot. */
 static int str_handle_ran_first(Compiler *c, int v, StrForm *sf) {
   int ran = arg_ran_first(v, 0), late = ran && str_var_read(c, v);
-  if (ran_first_handle(v) < 0 || (!late && !(repr_share_rule(c) && ran))) return 0;
+  if (ran_first_handle(v) < 0 || (!late && !(ran))) return 0;
   buf_printf(&sf->expr, "_t%d", ran_first_handle(v));
   return 1;
 }
@@ -110,7 +110,7 @@ static int str_handle_route(Compiler *c, int v, StrForm *sf) {
 static int str_handle_slot(Compiler *c, int v, StrForm *sf) {
   /* (one-String mode: a variable read that ran first holds the handle, or
      a view of it, in its temp: the String the variable had) */
-  if (g_one_string && arg_ran_first(v, 0) && str_var_read(c, v))
+  if (arg_ran_first(v, 0) && str_var_read(c, v))
     for (int i = g_n_argov - 1; i >= 0; i--)
       if (g_argov_node[i] == v) { buf_printf(&sf->expr, "SP_STR_HDL(%s)", g_argov_text[i]); return 1; }
   if ((arg_ran_first(v, 0) && str_var_read(c, v)) || !strbuf_slot_text(c, v, &sf->expr)) return 0;
@@ -326,7 +326,6 @@ static int str_render_ident(Compiler *c, int v, int form, StrForm *sf) {
      handle, as a slot's is) */
   else if (strh_handle_call(c, v)) {
     sf->cty = TY_STRBUF;
-    if (g_share_check) share_check_mark(c, v, 'H', b);
     strh_elem_handle_text(c, v, b);
     return SPF_HANDLE;
   }
@@ -339,10 +338,6 @@ static int str_render_ident(Compiler *c, int v, int form, StrForm *sf) {
     buf_puts(b, "sp_box_str(");
     emit_expr(c, v, b);
     buf_puts(b, ")");
-    if (g_share_check) {
-      share_check_declare_reads(b, at, v);
-      share_check_declare_reads(b, at, bx);
-    }
     return SPF_HANDLE;
   }
   else {
@@ -350,7 +345,6 @@ static int str_render_ident(Compiler *c, int v, int form, StrForm *sf) {
     /* (--share-check sees the handle these name: emit_expr's own mark is
        not on their path) */
     if (strbuf_slot_has(c, v)) {
-      if (g_share_check) share_check_mark(c, v, 'H', b);
       strbuf_slot_text(c, v, b);
       return SPF_HANDLE;
     }
@@ -359,7 +353,6 @@ static int str_render_ident(Compiler *c, int v, int form, StrForm *sf) {
        read) */
     size_t at = b->len;
     if (bang_self_handle_has(c, v) && emit_bang_self_handle(c, v, b)) {
-      if (g_share_check) share_check_declare_reads(b, at, v);
       return SPF_HANDLE;
     }
     if (str_route_names_handle(c, v)) {
@@ -369,7 +362,6 @@ static int str_render_ident(Compiler *c, int v, int form, StrForm *sf) {
       if (named) buf_puts(b, hb.p ? hb.p : "NULL");
       free(hb.p);
       if (named) {
-        if (g_share_check) share_check_declare_reads(b, at, v);
         return SPF_HANDLE;
       }
     }
@@ -398,12 +390,11 @@ static int str_render_ident(Compiler *c, int v, int form, StrForm *sf) {
 /* (one representation: the text may be of either face, a handle or a view
    of one; sp_box_nullable_str / sp_box_str box the handle either way) */
 void str_box_open(Buf *b, int nullable) {
-  if (g_one_string) { buf_puts(b, "SP_STR_BOX("); return; }
-  buf_puts(b, nullable ? "sp_box_nullable_obj(" : "sp_box_obj(");
+  (void)nullable;
+  buf_puts(b, "SP_STR_BOX(");
 }
 void str_box_close(Buf *b) {
-  if (g_one_string) { buf_puts(b, ")"); return; }
-  buf_puts(b, ", SP_BUILTIN_STRBUF)");
+  buf_puts(b, ")");
 }
 void str_box_handle(Buf *b, const char *h) {
   str_box_open(b, 1);
@@ -424,7 +415,7 @@ void str_box_handle_tmp(Buf *b, int tmp) {
    written, str_read_handle_tmp a temp. */
 /* (one representation: a read held across a block is a copy, g_one_held) */
 static const char *str_read_face(int pub) {
-  if (g_one_string && g_one_held) return pub ? "sp_strbuf_read_pub_own" : "sp_strbuf_read_own";
+  if (g_one_held) return pub ? "sp_strbuf_read_pub_own" : "sp_strbuf_read_own";
   return pub ? "sp_strbuf_read_pub" : "sp_strbuf_read";
 }
 void str_read_handle(Buf *b, const char *h, int pub) {
@@ -450,7 +441,7 @@ void str_read_handle_close(Buf *b) {
    converts has no handle. */
 void str_new_handle_open(Buf *b) {
   /* (one representation: the operand may be of either face, SP_STR_HDL) */
-  buf_puts(b, g_one_string ? "SP_STR_HDL(" : "sp_String_new_shared(");
+  buf_puts(b, "SP_STR_HDL(");
 }
 void str_new_handle_close(Buf *b) {
   buf_puts(b, ")");
@@ -470,8 +461,7 @@ void str_new_handle_open_of(Compiler *c, int v, Buf *b) {
 void str_box_bytes(Buf *b, const char *e) {
   /* (one representation: the text may be the handle whatever the plan
      read it as, so it is boxed through its face) */
-  if (g_one_string) { buf_printf(b, "SP_STR_BOX(%s)", e); return; }
-  buf_printf(b, "%s(%s)", ty_box_fn(TY_STRING), e);
+  buf_printf(b, "SP_STR_BOX(%s)", e);
 }
 
 /* The box of a String Range's endpoint held in temp `t` (an sp_StrRange):
@@ -508,8 +498,7 @@ void emit_str_box_leaf(Compiler *c, int v, int wrap, Buf *b) {
   }
   /* (one representation: the leaf's text may be the handle, boxed through
      its face) */
-  else if (g_one_string) buf_puts(&sf.expr, "SP_STR_BOX(");
-  else buf_printf(&sf.expr, "%s(", ty_box_fn(TY_STRING));
+  else buf_puts(&sf.expr, "SP_STR_BOX(");
   emit_expr(c, v, &sf.expr);
   buf_puts(&sf.expr, ")");
   str_form_settle(c, &sf, b);
@@ -567,10 +556,6 @@ static int str_box_kernel_string(Compiler *c, int v, Buf *b) {
     buf_printf(b, "(_t%d.tag == SP_TAG_STR && _t%d.v.s) || sp_poly_is_strbuf(_t%d) ? _t%d : sp_box_str(({ "
                   "const char *_s%d = sp_poly_check_str(_t%d); _s%d ? _s%d : sp_poly_to_s(_t%d); })); })",
                t, t, t, t, t, t, t, t, t);
-  if (g_share_check) {
-    share_check_declare_reads(b, at, v);
-    share_check_declare_reads(b, at, x);
-  }
   return 1;
 }
 
@@ -757,7 +742,7 @@ static void str_identity_operand_form(Compiler *c, int v, StrForm *sf) {
 static void str_identity_box_text(const StrForm *sf, const char *e, Buf *b) {
   if (sf->cty == TY_POLY) buf_puts(b, e);
   else if (sf->cty == TY_STRBUF) str_box_handle(b, e);
-  else buf_printf(b, (g_one_string ? "SP_STR_BOX(%s)" : "sp_box_str(%s)"), e);
+  else buf_printf(b, "SP_STR_BOX(%s)", e);
 }
 
 /* Node v, a String, as the box a dispatch answers it in (an arm of a

@@ -96,13 +96,6 @@ int local_sole_range_node(Compiler *c, int recv);
 int const_array_elems_all_int_array(Compiler *c, const char *cname);
 int *an_parent_map(const NodeTable *nt);
 const int *comp_parent_map(Compiler *c);
-/* --share-strings: is node n an Array literal refused the String handle
-   Array form for good (share_strh_gate)? */
-int share_strh_node_no(const Compiler *c, int n);
-/* ...and is it written into a variable already holding the form? */
-int share_strh_literal_slot(Compiler *c, int n);
-int strh_method_open(const Scope *m);   /* analyze_util.c */
-int strh_value_returned(Compiler *c, const int *par, int n);
 /* The definite-assignment walk (analyze.c), shared with the nil facts
    (analyze_nil.c): the program's parent map, each statement's place in its
    list (filled one list at a time, -1 for a node not in its parent's list),
@@ -116,11 +109,6 @@ void du_memo_free(void);
    block it ends at) climbs: where a value is passed on to the statement or
    the block that holds it. */
 enum { AN_DROP_CLIMB = VPS_ALL };
-/* The edges the String handle Array walkers climb (strh_value_returned,
-   strh_value_ignored): `if`, `unless`, `case`, `case`/`in` and a begin, its
-   body beside an else too (the answer errs on the side of an Array that
-   escapes). */
-enum { STRH_CLIMB = VPS_IF | VPS_UNLESS | VPS_CASE | VPS_CASE_IN | VPS_BEGIN | VP_BEGIN_BOTH };
 int an_value_dropped(const NodeTable *nt, const int *parent, int node);
 int cow_user_block_value(Compiler *c, const int *parent, int id);
 /* The methods the default build may lend a String parameter's slot by
@@ -130,7 +118,6 @@ int cow_user_block_value(Compiler *c, const int *parent, int id);
    parameters alias the caller's String, and are not passed by value.
    analyze.c */
 void an_byref_eligible_scopes(Compiler *c, char *elig);
-int an_byref_param_by_value(Compiler *c, const char *elig, int mi, int pi);
 /* A runtime protocol name: the emitted program can call the method with
    no CallNode of its own (`puts obj` calls to_s). analyze.c */
 int method_name_implicitly_invoked(const char *nm);
@@ -235,7 +222,7 @@ int an_local_writes_named_next(int id);
    leads to it. Each still has to be resolved; the list only narrows. */
 int *an_scope_call_candidates(Compiler *c, Scope *m, int *n);
 int is_arith_op(const char *op);
-int node_is_empty_container(const NodeTable *nt, int node);
+int node_is_empty_container(Compiler *c, int node);
 int bind_coerce_operator_params(Compiler *c);
 int is_cmp_op(const char *op);
 int is_numeric_coerce_op(const char *op);
@@ -377,7 +364,7 @@ void collect_def_params(Compiler *c, int def_id, Scope *s);
 char *dm_lit_str(Compiler *c, int lit);
 char *dm_eval_name(Compiler *c, int node, const char *bv, int lit);
 TyKind dm_lit_type(Compiler *c, int lit);
-int collect_dm_each_unroll(Compiler *c, int id, int class_id);
+int collect_dm_each_unroll(Compiler *c, int id, int class_id, int scope_idx);
 const char *builtin_class_of_type(TyKind t);
 /* Whether method `m` can take call `call_id`'s arguments (analyze_pass.c) */
 int method_takes_call_args(Compiler *c, Scope *m, int call_id);
@@ -427,6 +414,7 @@ void process_include_body(Compiler *c, int ci, int body_node);
 void desugar_module_prepends(Compiler *c);
 void register_includes(Compiler *c);
 int desugar_included_self_class(Compiler *c, int body, const char *cn);
+int desugar_included_bare_builtin(Compiler *c, int body, const char *cn);
 void register_include_attrs(Compiler *c);
 void rewrite_attr_supers(Compiler *c);
 void rewrite_self_attr_empty_writes(Compiler *c);
@@ -486,6 +474,7 @@ int arg_slot_for_param(Compiler *c, Scope *m, int idx, int argc); /* codegen_fol
 int arg_layout_plain_arg(Compiler *c, Scope *m, int pos_argc, int i); /* codegen_fold.c */
 int arg_layout_param_node(Compiler *c, Scope *m, int call, int i, int *spread); /* codegen_fold.c */
 void arg_layout_param_map(Compiler *c, Scope *m, const int *argv, int argc, int *out); /* codegen_fold.c */
+void arg_layout_call_param_map(Compiler *c, Scope *m, int call, int n, int *out, int *spread); /* codegen_fold.c */
 int arg_layout_param_source(Compiler *c, Scope *m, int call, int i, int *spread);
 int zsuper_param_source(Compiler *c, Scope *s, Scope *pm, int j);         /* codegen_fold.c */
 int ty_runs_no_code(TyKind t);  /* codegen_call.c: a builtin reading such a value runs no program code */
@@ -540,6 +529,10 @@ void ty_recv_call_extra_args(const Compiler *c, const int *av, int argc,
 TyKind infer_sum_block_ty(Compiler *c, int block);
 TyKind infer_map_block_ty(Compiler *c, int id, int block);
 void step_kw_positional(Compiler *c, NodeTable *nt, int id, int args, int to_v, int by_v, int by_first);
+int step_kw_unknown(Compiler *c, NodeTable *nt, int id, int args);
+void kw_error_message(char *out, size_t n, const char *kind, int count, const char *names);
+void kw_names_add(char *list, size_t n, int *count, const char *inspected);
+void kw_key_inspect(const char *kn, int is_sym, char *out, size_t n);
 /* A range endpoint that is the infinite Float constant (analyze_infer.c). */
 int infer_end_is_float_inf(Compiler *c, int right);
 int propagate_prep_params(Compiler *c);
@@ -663,6 +656,8 @@ int desugar_safe_nav_attr_write(Compiler *c);
 int desugar_body_self_call(Compiler *c);
 int desugar_body_module_eval(Compiler *c);
 int desugar_extend_self(Compiler *c);
+int desugar_instance_eval_defs(Compiler *c);
+int enumerator_own_with_object(Compiler *c, int id);
 int block_body_breaks(const NodeTable *nt, int node);   /* a break that leaves this block */
 int desugar_kernel_reopen(Compiler *c);
 int desugar_singleton_class_mixin(Compiler *c);
@@ -793,7 +788,6 @@ int an_scopes_named_next(Compiler *c, const char *nm, int s);
 /* The scopes sharing scope s's def_node (its copies), the same way. */
 int an_scopes_same_def_first(Compiler *c, int s);
 int an_scopes_same_def_next(Compiler *c, int s);
-int a_nested_block(const char *ty);
 int a_is_local_node(const char *ty);
 int a_is_write_node(const char *ty);
 void a_mark_subtree(Compiler *c, int id, char *inproc);

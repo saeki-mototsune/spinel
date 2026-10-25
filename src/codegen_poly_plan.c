@@ -132,7 +132,7 @@ void pa_end(Compiler *c, int frame, const PolyPlan *p) {
   /* PC_BOX of a String writes sp_box_str. A method promising a shared
      return must retain its published handle across this boxing boundary.
      PC_BOX_HANDLE records that emitted alternative to the plain box. */
-  if (c->share_strings) for (int a = 0; a < f->n; a++) {
+  for (int a = 0; a < f->n; a++) {
     const PolyArm *o = &f->arm[a];
     if (o->mi <= 0 || o->mi >= c->nscopes || o->vty != TY_STRING) continue;
     int mi = o->kind == PA_PROC_FORM ? scope_proc_form_of(c, o->mi) : o->mi;
@@ -204,7 +204,7 @@ void pa_report(void) {
    A fresh result a builtin only reads, or the caller drops, keeps no alias. */
 void emit_poly_user_box(Compiler *c, int id, Scope *m, const char *call, Buf *b) {
   if (m->ret != TY_STRING ||
-      (!m->ret_handle && !(m->ret_fresh && share_node_shares(c, id) && !share_node_transient(c, id)))) {
+      (!m->ret_handle && !(m->ret_fresh && !an_node_dropped(c, id)))) {
     emit_boxed_ret_call(c, m, call, b);   /* an oint return boxes with its nil */
     return;
   }
@@ -287,7 +287,7 @@ static void emit_poly_user_arm0(Compiler *c, int id, const char *name, TyKind re
          where the rule shares the call's String, publishes that String's
          handle, read through its handle form (repr_native_arm_handle), as
          a method arm's tail read does: the call's pickup takes it */
-      if (repr_native_arm_handle(c, id, k) && share_node_shares(c, id)) {
+      if (repr_native_arm_handle(c, id, k)) {
         Buf hc, rb;
         memset(&hc, 0, sizeof hc);
         memset(&rb, 0, sizeof rb);
@@ -300,7 +300,7 @@ static void emit_poly_user_arm0(Compiler *c, int id, const char *name, TyKind re
       else
         snprintf(cbuf, sizeof cbuf, "%s((%s *)_t%d.v.p%s)", nmet->csym, c->classes[nmet->class_id].c_struct, tv, rest0);
       if (sp_streq(nmet->ret, "string?"))
-        snprintf(nbuf, sizeof nbuf, (g_one_string ? "SP_STR_BOX(%s)" : "sp_box_nullable_str(%s)"), cbuf);
+        snprintf(nbuf, sizeof nbuf, "SP_STR_BOX(%s)", cbuf);
       else
         snprintf(nbuf, sizeof nbuf, "%s", cbuf);
       TyKind mret = native_spec_to_ty(nmet->ret);
@@ -496,10 +496,9 @@ static void emit_poly_user_arm0(Compiler *c, int id, const char *name, TyKind re
          handle: the handle the method publishes, else one around the String
          (NULL for nil) */
       else if (ret == TY_STRBUF && cret9 == TY_STRING) {
-        if (repr_share_rule(c) && c->scopes[pf9 ? pfi9 : mi].ret_handle) {
+        if (c->scopes[pf9 ? pfi9 : mi].ret_handle) {
           int pv = ++g_tmp;
-          buf_printf(b, g_one_string ? "({ _sp_ret_strbuf = NULL; __auto_type _v%d = (%s); !_v%d ? NULL : _sp_ret_strbuf ? "
-                        "(sp_String *)_sp_ret_strbuf : " : "({ _sp_ret_strbuf = NULL; const char *_v%d = %s; !_v%d ? NULL : _sp_ret_strbuf ? "
+          buf_printf(b, "({ _sp_ret_strbuf = NULL; __auto_type _v%d = (%s); !_v%d ? NULL : _sp_ret_strbuf ? "
                         "(sp_String *)_sp_ret_strbuf : ", pv, call, pv);
           str_new_handle_open(b);
           buf_printf(b, "_v%d", pv);
@@ -514,6 +513,13 @@ static void emit_poly_user_arm0(Compiler *c, int id, const char *name, TyKind re
       }
       else if (ret == TY_POLY && cret9 != TY_POLY) {
         emit_poly_user_box(c, id, &c->scopes[pf9 ? pfi9 : mi], call, b); pconv = PC_BOX;
+      }
+      /* a method answering a String's handle (`h["k"] = "v"`'s value)
+         into a plain String slot: read through the handle, as a reader's
+         handle field is below; assigned bare, the C did not build */
+      else if (cret9 == TY_STRBUF && ret == TY_STRING) {
+        str_read_handle(b, call, 1);
+        pconv = PC_COPY;
       }
       /* The slot is scalar (e.g. a length dispatch fixed to sp_int) but
          this class's method widened its return to poly: coerce down. */
@@ -579,7 +585,7 @@ static void emit_poly_user_arm0(Compiler *c, int id, const char *name, TyKind re
        call under the pickup's own view, which has dropped the box mark, and
        answered no, so the pickup wrapped the bytes in a new handle and the
        field's String lost its identity: `{ host: req.host }` held a copy) */
-    str_read_handle(b, fld, repr_share_rule(c));
+    str_read_handle(b, fld, 1);
     pconv = PC_COPY;
   }
   /* a plain String field (a Struct member) where the call answers a handle
@@ -710,6 +716,50 @@ void emit_poly_user_arms0(Compiler *c, int id, const char *name, int argc, TyKin
   if (at) arm_texts_flush(at, n, b);
   free(at);
   free(arms);
+}
+
+/* The block-taking Enumerable methods a class with an #each that mixes in
+   Enumerable answers through Enumerable, for which the builtin walk of its
+   elements (sp_poly_enum_proc over the elements its #to_a or #each gives)
+   is the answer; NULL for another name: a Hash-only walk, a mutator, or a
+   walk that answers the receiver (each_with_index, reverse_each), which
+   the elements' Array would stand in for. */
+static const char *poly_enum_includer_op(const char *name) {
+  static const char *const names[] = {
+    "map", "collect", "select", "filter", "find_all", "reject", "find", "detect",
+    "find_index", "sort_by", "count", "sum", "any?", "all?", "none?", "uniq", "to_h", NULL };
+  for (int i = 0; names[i]; i++) if (sp_streq(name, names[i])) return poly_enum_op_for(name);
+  return NULL;
+}
+
+/* A zero-argument poly dispatch with a block that exists because a user
+   class defines the name: the instances of a class that answers it through
+   Enumerable (Set, a class of the program's with an #each that includes
+   it) had no arm and fell to the NoMethodError. They walk the elements
+   their #each yields (the synthesized __enum_to_a, not a #to_a the class
+   may define otherwise) with the shared proc, as a builtin container does
+   in the pre-arm. P's arms are the classes that answer it themselves. */
+void emit_poly_enum_includer_arms0(Compiler *c, int id, const char *name, TyKind ret, int tv, int tr,
+                                   int blk_tmp0, const PolyPlan *p, Buf *b) {
+  const char *op = blk_tmp0 >= 0 && nt_ref(c->nt, id, "block") >= 0 ? poly_enum_includer_op(name) : NULL;
+  if (!op) return;
+  char v[32];
+  snprintf(v, sizeof v, "_t%d", tv);
+  for (int k = 0; k < c->nclasses; k++) {
+    ClassInfo *ci = &c->classes[k];
+    if (!ci->instantiated || ci->is_native_class || comp_class_is_module(c, ci)) continue;
+    int armed = 0;
+    for (int i = 0; p && i < p->n && !armed; i++) armed = p->arm[i].key == k;
+    char elems[320];
+    if (armed || !comp_enum_reaches(c, k) || !comp_enum_answers_first(c, k, name) ||
+        !obj_each_elems_text(c, k, v, elems, sizeof elems)) continue;
+    char pcall[512];
+    snprintf(pcall, sizeof pcall, "sp_poly_enum_proc(%s, %s, _t%d)", elems, op, blk_tmp0);
+    buf_printf(b, " case %d: _t%d = ", k, tr);
+    if (ret == TY_POLY) buf_puts(b, pcall);
+    else emit_unbox_text(c, ret, pcall, b);
+    buf_puts(b, "; break;");
+  }
 }
 
 /* Reuse the typed Struct writer with the receiver and arguments already
@@ -1303,7 +1353,8 @@ static int poly_user_arm_n_decide(Compiler *c, const char *name, const PolyUserA
   a->kind = pfi >= 0 ? PA_PROC_FORM : PA_USER; a->mi = mi; a->def = (short)defcls; a->vty = (unsigned char)mret;
   a->conv = U->is_setter_val || mret == TY_VOID || mret == TY_NIL || method_is_void(ks) ? PC_VOID
           : ret == TY_POLY && mret != TY_POLY ? PC_BOX
-          : ret != TY_POLY && mret == TY_POLY ? PC_UNBOX : PC_SAME;
+          : ret != TY_POLY && mret == TY_POLY ? PC_UNBOX
+          : mret == TY_STRBUF && ret == TY_STRING ? PC_COPY : PC_SAME;
   return 1;
 }
 
@@ -1372,7 +1423,7 @@ int emit_poly_user_arm_n(Compiler *c, int id, int k, const char *call, TyKind mr
     if (ret == TY_POLY && mret != TY_POLY) { emit_poly_user_box(c, id, ms, call, b); conv = PC_BOX; }
     else if (c->n_cext_extensions && ret == TY_STRBUF && mret == TY_STRING) {
       int temp = ++g_tmp;
-      buf_printf(b, g_one_string ? "({ _sp_ret_strbuf = NULL; __auto_type _v%d = (%s); !_v%d ? NULL : " : "({ _sp_ret_strbuf = NULL; const char *_v%d = %s; !_v%d ? NULL : ", temp, call, temp);
+      buf_printf(b, "({ _sp_ret_strbuf = NULL; __auto_type _v%d = (%s); !_v%d ? NULL : ", temp, call, temp);
       if (ms && ms->ret_handle) buf_puts(b, "_sp_ret_strbuf ? (sp_String *)_sp_ret_strbuf : ");
       str_new_handle_open(b);
       buf_printf(b, "_v%d", temp);
@@ -1382,6 +1433,11 @@ int emit_poly_user_arm_n(Compiler *c, int id, int k, const char *call, TyKind mr
     else if (ret != TY_POLY && mret == TY_POLY) {
       plan_put_boxed(c, so, is_scalar_ret(ret) ? ret : TY_INT, call, b);
       conv = PC_UNBOX;
+    }
+    /* a String's handle into a plain String slot (as the zero-argument arm) */
+    else if (mret == TY_STRBUF && ret == TY_STRING) {
+      str_read_handle(b, call, 1);
+      conv = PC_COPY;
     }
     /* so: the result slot is an sp_oint / sp_ofloat (plan_slot_oint) */
     else if (ms && ms->ret == mret && method_ret_is_oint(ms)) {
@@ -1870,6 +1926,14 @@ void emit_poly_prearms0(Compiler *c, int id, const char *name, const PolySpecial
     if (ret == TY_POLY) buf_printf(b, " _t%d = sp_box_int(_rw);", tr);
     else if (ret == TY_INT) buf_printf(b, " _t%d = _rw;", tr);
     buf_puts(b, " (void)_rw; }\nelse ");
+    /* a Dir also rewinds and answers its own handle, where the program can
+       make one */
+    if (an_program_makes_dir(c)) {
+      buf_printf(b, "if (_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_DIR)"
+                    " { sp_Dir_rewind((sp_Dir *)_t%d.v.p);", tv, tv, tv);
+      if (ret == TY_POLY) buf_printf(b, " _t%d = _t%d;", tr, tv);
+      buf_puts(b, " }\nelse ");
+    }
     /* an Enumerator rewinds, and answers itself where the result is boxed */
     buf_printf(b, "if (_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_ENUMERATOR)"
                   " { sp_Enumerator_rewind((sp_Enumerator *)_t%d.v.p);", tv, tv, tv);
@@ -1899,15 +1963,23 @@ void emit_poly_prearms0(Compiler *c, int id, const char *name, const PolySpecial
        getc a nil-able String (NULL boxes to nil), getbyte an Integer or
        nil (an oint), readline/readchar/readbyte raise EOFError */
     const BuiltinZeroOp *io_op = bop_zero_find(TY_IO, name);
-    /* a stat handle's times (File::Stat#mtime / atime), a Time each */
-    int stat_k = sp_streq(name, "mtime") ? 0 : sp_streq(name, "atime") ? 1 : -1;
-    if (stat_k >= 0 && (ret == TY_POLY || ret == TY_TIME)) {
-      char sx[96];
-      snprintf(sx, sizeof sx, "sp_stat_handle_time((sp_File *)_t%d.v.p, %d)", tv, stat_k);
-      buf_printf(b, "if (_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_IO) { _t%d = ", tv, tv, tr);
-      if (ret == TY_POLY) emit_boxed_text(c, TY_TIME, sx, b);
-      else buf_puts(b, sx);
-      buf_puts(b, "; }\nelse ");
+    /* a stat handle's readers (boxed_stat_reader: mtime, atime, ftype),
+       rendered through their TY_IO rows, which also hold that a File handle
+       has no ftype (sp_stat_extended_recv): the row gives the answer's kind.
+       It is one arm of the dispatch, which records nothing for it, as the
+       hand-written arm before it did not (emit_builtin_op_arm_text) */
+    const BuiltinOp *sop = boxed_stat_reader(name) ? bop_find(TY_IO, name, 0, 0) : NULL;
+    if (sop && (ret == TY_POLY || ret == sop->result)) {
+      Buf sb = {0};
+      char sr[48];
+      snprintf(sr, sizeof sr, "((sp_File *)_t%d.v.p)", tv);
+      if (emit_builtin_op_arm_text(c, id, nt_ref(nt, id, "receiver"), TY_IO, name, sr, &sb)) {
+        buf_printf(b, "if (_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_IO) { _t%d = ", tv, tv, tr);
+        if (ret == TY_POLY) emit_boxed_text(c, sop->result, sb.p, b);
+        else buf_puts(b, sb.p);
+        buf_puts(b, "; }\nelse ");
+      }
+      free(sb.p);
     }
     /* a bare puts writes the newline and answers nil (#6158) */
     if (sp_streq(name, "puts")) {
@@ -2266,7 +2338,7 @@ void emit_poly_cases0(Compiler *c, int id, int recv, const char *name, const Pol
     view_unbind(g_n_argov - 1);
     /* an emission that fell through to the raise token adds nothing: leave
        those tags on the switch's own default so the message is the same */
-    int kept9 = ib9.p && strncmp(share_check_unmarked(ib9.p), "sp_raise_nomethod(", 18) != 0;
+    int kept9 = ib9.p && strncmp(ib9.p, "sp_raise_nomethod(", 18) != 0;
     if (g_plan_check) pa_observe(PA_TRIAL, PA_KEY_TRIAL + PT_CONTAINER, -1, TY_UNKNOWN, kept9);
     if (kept9) {
       buf_puts(b, " case SP_BUILTIN_INT_ARRAY: case SP_BUILTIN_SYM_ARRAY:"
@@ -2338,14 +2410,14 @@ int emit_poly_defaults0(Compiler *c, int id, int recv, const char *name, const P
     }
     /* A boxed to_s answers a String receiver itself: with sharing, the
        box it holds is the answer, not a copy of its bytes. */
-    else if (ret == TY_POLY && repr_share_rule(c) && is_to_s_name(name))
+    else if (ret == TY_POLY && is_to_s_name(name))
       buf_printf(b, program_has_strsub(c) ? "(_t%d.tag == SP_TAG_STR || sp_poly_is_strbuf(_t%d)) ? sp_poly_to_s_box(_t%d) : sp_box_str(%s(_t%d))"
                                           : "(_t%d.tag == SP_TAG_STR || sp_poly_is_strbuf(_t%d)) ? _t%d : sp_box_str(%s(_t%d))",
                  tv, tv, tv, pfn, tv);
     else if (ret == TY_POLY) buf_printf(b, "sp_box_str(%s(_t%d))", pfn, tv);
     /* (one-String mode: the bytes of a String subclass instance lead back
        to its handle, so its to_s, a new String, is a copy of them, #9968) */
-    else if (g_one_string && program_has_strsub(c) && is_to_s_name(name))
+    else if (program_has_strsub(c) && is_to_s_name(name))
       buf_printf(b, "(sp_poly_is_str_subclass(_t%d) ? sp_str_dup(%s(_t%d)) : %s(_t%d))", tv, pfn, tv, pfn, tv);
     else buf_printf(b, "%s(_t%d)", pfn, tv);
     buf_puts(b, "; break;");
@@ -2641,7 +2713,7 @@ int emit_poly_defaults0(Compiler *c, int id, int recv, const char *name, const P
     char rv[80];
     snprintf(rv, sizeof rv, "sp_File_read((sp_File *)_t%d.v.p)", tv);
     buf_printf(b, " case SP_BUILTIN_IO: _t%d = ", tr);
-    if (ret == TY_POLY) buf_printf(b, (g_one_string ? "SP_STR_BOX(%s)" : "sp_box_nullable_str(%s)"), rv);
+    if (ret == TY_POLY) buf_printf(b, "SP_STR_BOX(%s)", rv);
     else buf_puts(b, rv);
     buf_puts(b, "; break;");
   }
@@ -2905,7 +2977,7 @@ void poly_specials_n(Compiler *c, int id, const char *name, int argc, const int 
      is what CRuby answers for a non-String separator anyway. */
   if (is_pjoin && argc == 1) {
     TyKind jat = comp_ntype(c, argv[0]);
-    if (repr_share_rule(c) && jat == TY_STRBUF) jat = TY_STRING;
+    if (jat == TY_STRBUF) jat = TY_STRING;
     if (!(jat == TY_STRING || jat == TY_POLY || jat == TY_NIL || jat == TY_UNKNOWN))
       is_pjoin = 0;
   }
@@ -2924,7 +2996,7 @@ void poly_specials_n(Compiler *c, int id, const char *name, int argc, const int 
      non-String format anyway. */
   if (is_ppack) {
     TyKind pat = comp_ntype(c, argv[0]);
-    if (repr_share_rule(c) && pat == TY_STRBUF) pat = TY_STRING;
+    if (pat == TY_STRBUF) pat = TY_STRING;
     if (!(pat == TY_STRING || pat == TY_POLY || pat == TY_UNKNOWN)) is_ppack = 0;
   }
   /* Both arms answer a String, so they can only be emitted where the result
@@ -3126,7 +3198,7 @@ void emit_poly_prearms_n(Compiler *c, const char *name, const PolySpecialsN *ps,
   char strarg[64];
   snprintf(strarg, sizeof strarg, argc > 0 && atmp_ty[0] == TY_STRBUF
            ? "sp_strbuf_read_pub(_t%d)"
-           : g_one_string && argc > 0 && atmp_ty[0] == TY_STRING ? "SP_STR_B(_t%d)" : "_t%d",   /* (one representation: a handle held) */
+           : argc > 0 && atmp_ty[0] == TY_STRING ? "SP_STR_B(_t%d)" : "_t%d",   /* (one representation: a handle held) */
            argc > 0 ? atmp[0] : 0);
   int is_cover = ps->cover, is_ctryconv = ps->ctryconv, is_gcdlcm = ps->gcdlcm, is_ppack = ps->ppack;
   int is_include = ps->include, is_strdel = ps->strdel, is_strpart = ps->strpart;
@@ -3380,7 +3452,7 @@ void emit_poly_prearms_n(Compiler *c, const char *name, const PolySpecialsN *ps,
                  unread);
     }
     buf_printf(b, "if (_t%d.tag == SP_TAG_STR) { _t%d = ", tv, tr);
-    if (ret == TY_POLY) buf_printf(b, (g_one_string ? "SP_STR_BOX(%s)" : "sp_box_str(%s)"), eb.p); else buf_puts(b, eb.p);
+    if (ret == TY_POLY) buf_printf(b, "SP_STR_BOX(%s)", eb.p); else buf_puts(b, eb.p);
     buf_puts(b, "; }\nelse ");
     free(eb.p);
   }
@@ -3571,7 +3643,7 @@ void emit_poly_cases_n(Compiler *c, int id, const char *name, const PolySpecials
   char strarg[64];
   snprintf(strarg, sizeof strarg, argc > 0 && atmp_ty[0] == TY_STRBUF
            ? "sp_strbuf_read_pub(_t%d)"
-           : g_one_string && argc > 0 && atmp_ty[0] == TY_STRING ? "SP_STR_B(_t%d)" : "_t%d",   /* (one representation: a handle held) */
+           : argc > 0 && atmp_ty[0] == TY_STRING ? "SP_STR_B(_t%d)" : "_t%d",   /* (one representation: a handle held) */
            argc > 0 ? atmp[0] : 0);
   int is_index = ps->index, is_unshift = ps->unshift, is_push = ps->push, is_ppack = ps->ppack;
   int is_pjoin = ps->pjoin, is_include = ps->include, is_arr_index = ps->arr_index;
@@ -3871,6 +3943,13 @@ void emit_poly_cases_n(Compiler *c, int id, const char *name, const PolySpecials
       }
       if (ret == TY_POLY) buf_puts(b, ")");
       buf_puts(b, "; break;");
+      if (sp_streq(name, "seek") && argc == 1 && an_program_makes_dir(c)) {
+        buf_puts(b, " case SP_BUILTIN_DIR: ");
+        if (ret == TY_POLY) buf_printf(b, "_t%d = sp_box_obj(", tr);
+        buf_printf(b, "sp_Dir_seek((sp_Dir *)_t%d.v.p, %s)", tv, iv[0]);
+        if (ret == TY_POLY) buf_puts(b, ", SP_BUILTIN_DIR)");
+        buf_puts(b, "; break;");
+      }
     }
   }
   if (is_unshift) {

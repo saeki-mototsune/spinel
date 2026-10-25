@@ -508,8 +508,11 @@ void sp_gc_mark(void*obj){if(!obj)return;unsigned char pm=((unsigned char*)obj)[
      link (sp_fd_own) names it. (The root fiber's guard byte is 0xff under
      this build, sp_fiber.c, so nothing else is marked 0xfd.) */
   if(pm==0xfd){sp_str_hdr*fh=(sp_str_hdr*)((char*)obj-sizeof(sp_str_hdr)-1);if(fh->next)sp_gc_mark((void*)fh->next);return;}
+  /* a view of a payload a growth moved (0xf9, sp_fd_retire): its owner
+     still, and the payload is stamped with the cycle that reached it */
+  if(pm==0xf9){sp_str_hdr*fh=(sp_str_hdr*)((char*)obj-sizeof(sp_str_hdr)-1);fh->hash=(uint64_t)sp_gc_mark_gen;if(fh->next)sp_gc_mark((void*)fh->next);return;}
 #endif
-  if(pm==0xfc||pm==0xff||pm==0xfd||pm==0xf1||pm==0xfb||pm==0xf8)return;sp_gc_hdr*h=(sp_gc_hdr*)((char*)obj-sizeof(sp_gc_hdr));if(sp_gc_verify&&!sp_gc_obj_registered(h))sp_gc_verify_fail(obj,h);if(sp_gc_verify_probe_on){if(!h->old&&h->marked==sp_gc_verify_probe)sp_gc_verify_probe_hit=1;return;}if(sp_gc_young_probe_on){if(!h->old)sp_gc_young_probe_hit=1;return;}if(sp_gc_root_phase&&!h->old)h->aged=1;
+  if(pm==0xfc||pm==0xff||pm==0xfd||pm==0xf9||pm==0xf1||pm==0xfb||pm==0xf8)return;sp_gc_hdr*h=(sp_gc_hdr*)((char*)obj-sizeof(sp_gc_hdr));if(sp_gc_verify&&!sp_gc_obj_registered(h))sp_gc_verify_fail(obj,h);if(sp_gc_verify_probe_on){if(!h->old&&h->marked==sp_gc_verify_probe)sp_gc_verify_probe_hit=1;return;}if(sp_gc_young_probe_on){if(!h->old)sp_gc_young_probe_hit=1;return;}if(sp_gc_root_phase&&!h->old)h->aged=1;
   int was_young=0;
 #ifdef SP_THREADS
   if(sp_gc_par_mark){
@@ -667,7 +670,7 @@ int sp_gc_pin_overflow = 0;
 void sp_gc_pin_remembered_slow(void *obj) {
   if (!obj) return;
   { unsigned char pm = ((unsigned char *)obj)[-1];
-    if (pm == 0xfd || pm == 0xff || pm == 0xf1 || pm == 0xf0 ||
+    if (pm == 0xfd || pm == 0xf9 || pm == 0xff || pm == 0xf1 || pm == 0xf0 ||
         pm == 0xfe || pm == 0xfc || pm == 0xfb || pm == 0xfa || pm == 0xf8) return; }
   sp_gc_hdr *h = (sp_gc_hdr *)obj - 1;
   if (h->pinned) return;
@@ -700,7 +703,7 @@ void sp_gc_wb_slow(void *obj) {
      (ASAN: global-buffer-overflow, and a wandering segfault without it), and a
      literal or a frozen string is not a GC allocation either. */
   { unsigned char pm = ((unsigned char *)obj)[-1];
-    if (pm == 0xfd || pm == 0xff || pm == 0xf1 || pm == 0xf0 ||
+    if (pm == 0xfd || pm == 0xf9 || pm == 0xff || pm == 0xf1 || pm == 0xf0 ||
         pm == 0xfe || pm == 0xfc || pm == 0xfb || pm == 0xfa || pm == 0xf8) return; }
   sp_gc_hdr *h = (sp_gc_hdr *)obj - 1;
   if (!h->old || h->dirty) return;
@@ -1365,7 +1368,7 @@ void sp_ivtbl_put(const void *obj, void *tbl) {
 static int sp_ivt_key_live(const void *obj, int full) {
   if ((uintptr_t)obj & 7) return 1;   /* a class's key (sp_bivar_key): no object behind it */
   unsigned char pm = ((const unsigned char *)obj)[-1];
-  if (pm == 0xfc || pm == 0xff || pm == 0xfd || pm == 0xf1 || pm == 0xfb || pm == 0xf8) return 1;
+  if (pm == 0xfc || pm == 0xff || pm == 0xfd || pm == 0xf9 || pm == 0xf1 || pm == 0xfb || pm == 0xf8) return 1;
   const sp_gc_hdr *h = (const sp_gc_hdr *)obj - 1;
   return full ? h->marked == sp_gc_mark_gen : (h->old || h->marked == sp_gc_mark_gen);
 }
@@ -1393,6 +1396,58 @@ static void sp_ivt_after_mark(int full) {
   if (keep != sp_ivt_n) { sp_ivt_n = keep; sp_ivt_reindex(sp_ivt_icap); }
 }
 static void sp_ivt_drain(void) { sp_gc_mark_drain_all(); sp_gc_mkl_fold(); }
+
+/* The outside payloads a String's growth moved (sp_fd_grow, lib/sp_string.h).
+   A view of the old bytes may still be held -- a temp a frame roots, a Hash
+   key, a box -- and the mark reads the payload's owner link through it, so
+   freeing it at the move sent a later mark into freed (or unmapped) memory.
+   Each is kept, marked 0xf9, until a full cycle's mark reaches no view of it:
+   the mark stamps the payload with its cycle (sp_gc_mark), and the full
+   cycle frees every one it did not stamp. A minor cycle frees none, as its
+   mark does not walk the old objects a view may sit in. */
+/* One list per OS worker, which only that worker appends to, so a growth
+   takes no lock (a shared one under contention cost bm_threaded_render a
+   fifth more instructions); the collector reads them all with the world
+   stopped. */
+typedef struct { char **v; int n, cap; char _pad[64 - sizeof(char **) - 2 * sizeof(int)]; } sp_fd_retired_t;
+#ifdef SP_THREADS
+static sp_fd_retired_t sp_fd_retired[SP_MAX_WORKERS];
+#define SP_FD_RETIRED_MINE (&sp_fd_retired[sp_worker_id])
+#define SP_FD_RETIRED_LISTS SP_MAX_WORKERS
+#else
+static sp_fd_retired_t sp_fd_retired[1];
+#define SP_FD_RETIRED_MINE (&sp_fd_retired[0])
+#define SP_FD_RETIRED_LISTS 1
+#endif
+static int sp_fd_nretired;   /* any list non-empty since the last full sweep */
+void sp_fd_retire(char *base) {
+  sp_str_hdr *fh = (sp_str_hdr *)base;
+  fh->hash = 0;
+  base[sizeof(sp_str_hdr)] = (char)0xf9;
+  sp_fd_retired_t *r = SP_FD_RETIRED_MINE;
+  if (r->n == r->cap) {
+    int nc = r->cap ? r->cap * 2 : 64;
+    char **nv = (char **)realloc(r->v, sizeof(char *) * (size_t)nc);
+    if (!nv) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    r->v = nv; r->cap = nc;
+  }
+  r->v[r->n++] = base;
+  if (!sp_fd_nretired) sp_fd_nretired = 1;
+}
+static void sp_fd_retired_sweep(void) {
+  for (int w = 0; w < SP_FD_RETIRED_LISTS; w++) {
+    sp_fd_retired_t *r = &sp_fd_retired[w];
+    int keep = 0;
+    for (int i = 0; i < r->n; i++) {
+      sp_str_hdr *fh = (sp_str_hdr *)r->v[i];
+      if (fh->hash == (uint64_t)sp_gc_mark_gen) r->v[keep++] = r->v[i];
+      else free(r->v[i]);
+    }
+    r->n = keep;
+  }
+  sp_fd_nretired = 0;
+  for (int w = 0; w < SP_FD_RETIRED_LISTS && !sp_fd_nretired; w++) sp_fd_nretired = sp_fd_retired[w].n > 0;
+}
 
 void sp_gc_collect(void){
   /* The previous cycle's sweep may still be running beside the mutators:
@@ -1538,6 +1593,8 @@ void sp_gc_collect(void){
        While it is set every mark is whole-heap, so nothing is missed; once
        compaction has made room the set is authoritative again. */
     if (sp_gc_pin_overflow && keep < SP_GC_PINNED_MAX) sp_gc_pin_overflow = 0; }
+  /* the moved payloads no view reached, now the marks are final */
+  if (full && sp_fd_nretired) sp_fd_retired_sweep();
   if (sp_fin_n) sp_fin_after_mark(full);
   if (sp_ivt_n) sp_ivt_after_mark(full);
 #ifdef SP_CEXT

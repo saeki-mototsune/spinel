@@ -52,6 +52,7 @@ static const char *cplan_reopen_class(TyKind rt) {
   case TY_TIME:   return "Time";
   case TY_THREAD: return "Thread";
   case TY_FIBER:  return "Fiber";
+  case TY_ENUMERATOR: return "Enumerator";
   case TY_RANDOM: return "Random";
   case TY_CLASS:  return "Class";
   default:        return NULL;
@@ -187,7 +188,7 @@ static int cplan_called_before_def(Compiler *c, int id, int mi) {
 int cplan_reopen_runs_builtin(Compiler *c, int id, int mi) {
   const NodeTable *nt = c->nt;
   int blk = nt_ref(nt, id, "block");
-  return c->share_strings && mi >= 0 && blk >= 0 && nt_kind(nt, blk) == NK_BlockNode && c->scopes[mi].yields &&
+  return mi >= 0 && blk >= 0 && nt_kind(nt, blk) == NK_BlockNode && c->scopes[mi].yields &&
          c->scopes[mi].class_id == comp_class_index(c, "String") && cplan_called_before_def(c, id, mi);
 }
 /* The existing boxed dispatch candidates also serve literal-name send arms. */
@@ -408,6 +409,10 @@ static void cplan_resolve_call(Compiler *c, int id, CallPlan *p) {
   }
   if (rt == TY_EXCEPTION) { cplan_exc_reopen(c, name, p); return; }
   if (nt_int(nt, id, "builtin_only", 0)) return;
+  /* a call written under a builtin alias (detect, collect_concat) that the
+     desugar renamed to the builtin's own name reaches a reopen's method of
+     the name it was written with, not of the new name */
+  const char *rname = nt_str(nt, id, "orig_name") ? nt_str(nt, id, "orig_name") : name;
   /* an IO handle's reopen: the File, IO or socket class that defines it */
   if (rt == TY_IO) {
     int eci = io_reopen_class(c, name);
@@ -429,7 +434,7 @@ static void cplan_resolve_call(Compiler *c, int id, CallPlan *p) {
   const char *rc = cplan_reopen_class(rt);
   if (rc) {
     int ci = comp_class_index(c, rc);
-    int mi = ci >= 0 ? comp_method_in_chain(c, ci, name, NULL) : -1;
+    int mi = ci >= 0 ? comp_method_in_chain(c, ci, rname, NULL) : -1;
     /* (--share-strings: a String reopening's yielding method of a name,
        which a call with a literal block reaches, is the builtin's still for
        a call the program runs ahead of the method's definition, at its top
@@ -451,8 +456,8 @@ static void cplan_resolve_call(Compiler *c, int id, CallPlan *p) {
   /* an Array or Hash reopen's own method of the name */
   if ((ty_is_array(rt) || ty_is_obj_array(rt) || ty_is_hash(rt)) && nt_ref(nt, id, "block") < 0) {
     int aci = comp_class_index(c, ty_is_hash(rt) ? "Hash" : "Array");
-    int adc = -1, ami = aci >= 0 ? comp_method_in_chain(c, aci, name, &adc) : -1;
-    if (ami >= 0 && adc == aci && c->scopes[ami].name && sp_streq(c->scopes[ami].name, name)) {
+    int adc = -1, ami = aci >= 0 ? comp_method_in_chain(c, aci, rname, &adc) : -1;
+    if (ami >= 0 && adc == aci && c->scopes[ami].name && sp_streq(c->scopes[ami].name, rname)) {
       cplan_set(p, ami, aci, UC_REOPEN, CP_DIRECT);
       return;
     }
@@ -843,7 +848,7 @@ static void ct_index_build(Compiler *c) {
    that implicit edge just as it binds an explicit call. */
 static int ct_exception_text(Compiler *c, int id, int *out) {
   const char *name = nt_str(c->nt, id, "name");
-  if (!c->share_strings || !name || nt_int(c->nt, id, "builtin_only", 0) ||
+  if (!name || nt_int(c->nt, id, "builtin_only", 0) ||
       !is_exception_message(name) || call_plain_argc(c, id) != 0 ||
       nt_ref(c->nt, id, "block") >= 0) return -2;
   int recv = nt_ref(c->nt, id, "receiver");
@@ -956,7 +961,7 @@ static int ct_resolve(Compiler *c, int id, int *out) {
      asks each class the receiver can hold for its own method, and adding
      every class's here widened the facts of the bundled library's calls,
      a Set's #inspect over its elements, for nothing) */
-  if (c->share_strings && cn && !is_text_conversion(cn)) {
+  if (cn && !is_text_conversion(cn)) {
     int np = 0;
     const PolyCand *pc = comp_poly_candidates(c, cn, &np);
     for (int i = 0; i < np; i++) {
@@ -1092,6 +1097,21 @@ static int cplan_argc(const NodeTable *nt, int id) {
   int n = 0;
   if (a >= 0) nt_arr(nt, a, "arguments", &n);
   return n;
+}
+
+/* Every argument of call `id` is a constant naming one of the program's
+   modules: a boxed receiver's `prepend` is then Module#prepend, not String's. */
+static int cplan_module_args(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  int a = nt_ref(nt, id, "arguments"), n = 0;
+  const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &n) : NULL;
+  if (n < 1 || !av) return 0;
+  for (int i = 0; i < n; i++) {
+    NodeKind k = nt_kind(nt, av[i]);
+    int ci = k == NK_ConstantReadNode || k == NK_ConstantPathNode ? comp_class_index(c, nt_str(nt, av[i], "name")) : -1;
+    if (ci < 0 || !comp_class_is_module(c, &c->classes[ci])) return 0;
+  }
+  return 1;
 }
 
 /* A call to something spinel deliberately does not support (docs/limitations.md),
@@ -1300,6 +1320,9 @@ static const char *feature_limit(Compiler *c, int id, int *stop, int *lx, char *
   if (nt_int(nt, id, "define_method_name", 0) && cplan_reachable(c, id))
     return "Module#define_method with a non-literal name is not supported; "
            "use a literal Symbol or String (see docs/limitations.md)";
+  if (is_raise_alias(name) && nt_int(nt, id, "struct_cond_dm", 0) && cplan_reachable(c, id))
+    return "a define_method under a condition only the run time decides, in a Struct.new or "
+           "Data.define block, is not supported: write the class with `class`; see docs/limitations.md";
   if (cplan_computed_ivar_get(c, id, name))
     return sp_streq(name, "instance_variable_set")
       ? "Object#instance_variable_set with a non-literal name on a receiver that may be an instance "
@@ -1450,8 +1473,10 @@ static const char *feature_limit(Compiler *c, int id, int *stop, int *lx, char *
      Object counts though a program that never reopens it has no class entry
      for it: `Object.include M` (or through `O = Object`) otherwise compiled
      to a NoMethodError at run time. */
-  if (!why && rcn && (comp_class_index(c, rcn) >= 0 || sp_streq(rcn, "Object")) &&
-      (sp_streq(name, "include") || sp_streq(name, "prepend") ||
+  int mixin = sp_streq(name, "include") || sp_streq(name, "prepend");
+  if (!why && rcn && (comp_class_index(c, rcn) >= 0 || sp_streq(rcn, "Object") ||
+                      (mixin && is_builtin_reopen_name(rcn))) &&
+      (mixin ||
        sp_streq(name, "attr_accessor") || sp_streq(name, "attr_reader") ||
        sp_streq(name, "attr_writer") || sp_streq(name, "define_method"))) {
     /* only the receiver's own class method of the name answers instead:
@@ -1465,6 +1490,22 @@ static const char *feature_limit(Compiler *c, int id, int *stop, int *lx, char *
              "restructured through an explicit receiver. Move the `%s` inside `class %s ... "
              "end` (see docs/limitations.md)", rcn, name, name, rcn);
     why = buf;
+  }
+  /* the same through a Class held in a variable (`[A, B].each { |k| k.include(M) }`)
+     or a singleton class the desugaring left: a NoMethodError at run time */
+  if (!why && mixin) {
+    int rk = recv >= 0 ? nt_kind(nt, recv) : -1;
+    if (rk == NK_CallNode && nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "singleton_class"))
+      why = "singleton_class.include(...) / singleton_class.prepend(...) is supported only as a statement "
+            "of a class or module body, or at the top level on a class or module the program declares: "
+            "move it into `class X ... end` (see docs/limitations.md)";
+    else if (!rcn && recv >= 0 && (comp_ntype(c, recv) == TY_CLASS ||
+                                   (comp_ntype(c, recv) == TY_POLY && cplan_module_args(c, id))))
+      why = "include / prepend on a Class held in a variable is not supported by AOT compilation: the ancestor "
+            "chain is baked at compile time, so the class must be named by a constant. Write "
+            "`K.include(M)` (or `include M` inside `class K ... end`) for each class "
+            "(see docs/limitations.md)";
+    if (why) *lx = LX_NAME;
   }
 
   if (!why) { *stop = 0; return NULL; }
@@ -1894,6 +1935,8 @@ static void cpoly_user_arms0(Compiler *c, int id, const char *name, TyKind ret, 
         TyKind slotty = is_scalar_ret(ret) ? ret : TY_INT;
         conv = cpoly_conv(ret, cret);
         if (conv == PC_SAME && cret == TY_BIGINT && (slotty == TY_INT || slotty == TY_FLOAT)) conv = PC_NUM;
+        /* a String's handle into a plain String slot is read, as a reader's is */
+        else if (conv == PC_SAME && cret == TY_STRBUF && ret == TY_STRING) conv = PC_COPY;
       }
       cpoly_add(p, &cap, pfi >= 0 ? PA_PROC_FORM : PA_USER, k, mi, cret, conv);
       p->arm[p->n - 1].def = (short)defcls;
@@ -1944,7 +1987,7 @@ int cplan_arm_args_fit(Compiler *c, Scope *ks, const ArgLayout *L, int pos_argc,
     if (pt0 == TY_STRBUF && pv0->str_shared && (at0 == TY_STRING || at0 == TY_STRBUF)) continue;
     /* --share-strings: a handle into a String parameter passes its bytes
        (emit_poly_temp_as reads the held handle) */
-    if (pt0 == TY_STRING && at0 == TY_STRBUF && repr_share_rule(c)) continue;
+    if (pt0 == TY_STRING && at0 == TY_STRBUF) continue;
     int pc = pt0 != TY_POLY && pt0 != TY_UNKNOWN && pt0 != TY_NIL && pt0 != TY_VOID;
     int ac = at0 != TY_POLY && at0 != TY_UNKNOWN && at0 != TY_NIL && at0 != TY_VOID;
     if (pc && ac && pt0 != at0 &&
@@ -2099,7 +2142,7 @@ static void cpoly_prearms_n(Compiler *c, int id, const char *name, int argc, con
 TyKind cplan_poly_arg_storage(Compiler *c, int id) {
   Repr r = repr_of(c, id);
   if (r.strbuf_src == RS_SLOT_POLY) return TY_POLY;
-  if (repr_share_rule(c) && r.as_ty == TY_STRING && r.strbuf_src == RS_HANDLE) return TY_STRBUF;
+  if (r.as_ty == TY_STRING && r.strbuf_src == RS_HANDLE) return TY_STRBUF;
   return r.as_ty;
 }
 
@@ -2207,6 +2250,7 @@ static void cpoly_user_arms_n(Compiler *c, int id, const char *name, int argc, c
     if (!fits) continue;
     TyKind mret = ks->ret;
     int conv = is_setter_val || mret == TY_VOID || mret == TY_NIL || method_is_void(ks) ? PC_VOID
+             : mret == TY_STRBUF && ret == TY_STRING ? PC_COPY
              : cpoly_conv(ret, mret);
     cpoly_add(p, &cap, pfi >= 0 ? PA_PROC_FORM : PA_USER, k, mi, mret, conv);
     p->arm[p->n - 1].def = (short)defcls;
@@ -2445,7 +2489,9 @@ static void cpoly_resolve(Compiler *c, int id, PolyPlan *p, int full) {
   if (argc == 0) {
     PolySpecials0 ps;
     cpoly_flags0(c, id, name, p, &ps);
-    cpoly_user_arms0(c, id, name, p->ret, p);
+    /* (one-String mode: a String answer the arms hand on as its bytes, as
+       the emitter's slot takes it: a handle ivar's reader reads it out) */
+    cpoly_user_arms0(c, id, name, p->ret == TY_STRBUF ? TY_STRING : p->ret, p);
     if (!full) return;
     int cap = p->n;
     cpoly_prearms0(c, id, name, &ps, p->ret, p, &cap);
@@ -2489,6 +2535,16 @@ static const PolyPlan *cplan_poly_level(Compiler *c, int id, int full) {
 #ifndef NDEBUG
   int tmp0 = g_tmp;
 #endif
+  /* Resolve into a plan of this call's own, then store it. Resolving can
+     ask for another call's arms (an argument's representation reads its
+     reader arms: repr_boxed_reader_handle), which comes back here and
+     refills `fresh` or moves the memo under the arms this call is still
+     adding. */
+  PolyPlan r = {0};
+  cpoly_resolve(c, id, &r, full);
+#ifndef NDEBUG
+  assert(g_tmp == tmp0);   /* resolving emits nothing */
+#endif
   PolyPlan *p = &fresh;
   if (plain) {
     if (id >= g_pp_cap) {
@@ -2504,10 +2560,8 @@ static const PolyPlan *cplan_poly_level(Compiler *c, int id, int full) {
     free(g_pp_name[id]);
     g_pp_name[id] = nm ? strdup(nm) : NULL;
   }
-  cpoly_resolve(c, id, p, full);
-#ifndef NDEBUG
-  assert(g_tmp == tmp0);   /* resolving emits nothing */
-#endif
+  free(p->arm);
+  *p = r;
   return p;
 }
 
@@ -2564,8 +2618,9 @@ int cplan_visibility_class(Compiler *c, int id, int ci) {
     if (ty_is_object(rt)) ci = ty_object_class(rt);
   }
   const ClsSet *s = cls_fact_node(c, recv);
-  if (s && !s->bv && s->n == 1 && cls_fact_bounded(c, s->cls[0]))
-    return layout_only && s->cls[0] != ci ? -1 : s->cls[0];
+  int one = s && !s->bv && s->n == 1 ? cls_set_next(s, -1) : -1;
+  if (one >= 0 && cls_fact_bounded(c, one))
+    return layout_only && one != ci ? -1 : one;
   int n = 0;
   if (ci >= 0 && cls_fact_bounded(c, ci)) comp_descendants(c, ci, &n);
   return ci >= 0 && cls_fact_bounded(c, ci) && n == 0 ? ci : -1;
@@ -2729,11 +2784,10 @@ void cplan_poly_free(PolyPlan *p) {
 
 /* the receivers whose nil target the plan decides: a typed pointer whose
    NULL is nil, a builtin's or a user object's (repr_of says which object
-   is held as a pointer; a by-value one has no nil), an Array of shared
-   Strings' handles (TY_STRH_ARRAY) included, whose arguments then run
-   ahead of the nil test (emit_nil_target_head) */
+   is held as a pointer; a by-value one has no nil), whose arguments then
+   run ahead of the nil test (emit_nil_target_head) */
 static int cplan_nil_family(TyKind t) {
-  return t == TY_STRING || ty_is_array(t) || t == TY_STRH_ARRAY || ty_is_obj_array(t) || ty_is_hash(t) ||
+  return t == TY_STRING || ty_is_array(t) || ty_is_obj_array(t) || ty_is_hash(t) ||
          t == TY_IO || ty_is_object(t);
 }
 
@@ -2798,7 +2852,7 @@ static int cplan_nil_arg_converts(Compiler *c, int id) {
    modify frozen String: nil"), where CRuby raises NoMethodError; it is
    tested as a local's is. */
 static int cplan_nil_ivar_tested(Compiler *c, int r, TyKind rt, const char *nm) {
-  return (ty_is_array(rt) || ty_is_obj_array(rt) || rt == TY_STRH_ARRAY || (rt == TY_STRING && an_str_mutator_name(nm))) &&
+  return (ty_is_array(rt) || ty_is_obj_array(rt) || (rt == TY_STRING && an_str_mutator_name(nm))) &&
          nil_fact_why(c, r) == NFW_IVAR;
 }
 
@@ -2817,7 +2871,7 @@ int cplan_nil(Compiler *c, int id) {
      including a subclass whose #message invokes #to_s implicitly. */
   int exc_text = is_exception_message(nm) &&
     (rt == TY_EXCEPTION || (ty_is_object(rt) && class_is_exc_subclass(c, ty_object_class(rt))));
-  if (!(cplan_nil_family(rt) || exc_text || (rt == TY_STRBUF && c->share_strings)) || comp_ntype(c, r) != rt) return CN_NONE;
+  if (!(cplan_nil_family(rt) || exc_text || (rt == TY_STRBUF)) || comp_ntype(c, r) != rt) return CN_NONE;
   Repr rr = repr_of(c, r);
   if ((rr.kind != RK_PTR && rr.kind != RK_STRBUF) || !rr.may_nil || rr.nil_tested) return CN_NONE;
   /* an ivar keeps the release build's policy (ivar_nil_recv_guard, #5960):
@@ -2830,7 +2884,7 @@ int cplan_nil(Compiler *c, int id) {
      first where CRuby raises NoMethodError, having run the arguments. (A
      mutator writes back into the slot the head would hold.) */
   /* (one-String mode: every String slot is the handle, TY_STRBUF) */
-  int conv = (rt == TY_STRING || (g_one_string && rt == TY_STRBUF)) && !an_str_mutator_name(nm) &&
+  int conv = (rt == TY_STRING || (rt == TY_STRBUF)) && !an_str_mutator_name(nm) &&
              cplan_nil_arg_converts(c, id);
   /* (and see cplan_nil_ivar_tested) */
   NodeKind rk = nt_kind(nt, r);
@@ -2854,7 +2908,7 @@ int cplan_nil(Compiler *c, int id) {
      (one-String mode: an ivar's is its slot's, held by the head as a
      local's is; every ivar String is the handle there, where the
      default mode tests one the plan leaves untested in its arms) */
-  else if (rr.kind == RK_STRBUF && !(g_one_string && (ivar_tested || conv))) return CN_NONE;
+  else if (rr.kind == RK_STRBUF && !((ivar_tested || conv))) return CN_NONE;
   /* a nil the program writes (an element of an Array it stores one into
      or leaves a gap in, too); not one the fact cannot bound (an element
      read, a global, an ivar, a caller not seen, a builtin's answer), which

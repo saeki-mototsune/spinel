@@ -62,13 +62,6 @@ int is_kind_query(const char *n) {
   return sp_streq(n, "is_a?") || sp_streq(n, "kind_of?") || sp_streq(n, "instance_of?");
 }
 
-/* A call that answers about the receiver itself without reading any of
-   its instance variables: its class, its identity, nil?, frozen?. */
-int is_member_blind_query(const char *n) {
-  return is_kind_query(n) || sp_streq(n, "class") || sp_streq(n, "object_id") ||
-         sp_streq(n, "__id__") || sp_streq(n, "nil?") || sp_streq(n, "frozen?") ||
-         sp_streq(n, "equal?") || sp_streq(n, "respond_to?");
-}
 
 int is_round_family(const char *n) {
   return sp_streq(n, "round") || sp_streq(n, "ceil") || sp_streq(n, "floor") || sp_streq(n, "truncate");
@@ -168,18 +161,8 @@ int is_select_bang(const char *n) {
          sp_streq(n, "reject!") || sp_streq(n, "delete_if");
 }
 
-int is_retaining_filter(const char *n) {
-  return is_select_bang(n) || sp_streq(n, "select") || sp_streq(n, "filter") ||
-         sp_streq(n, "find_all") || sp_streq(n, "reject");
-}
 
-int is_reorder_iter(const char *n) {
-  return sp_streq(n, "sort") || sp_streq(n, "sort_by");
-}
 
-int is_enum_partition_def(const char *n) {
-  return strncmp(n, "__enum_partition__", 18) == 0;
-}
 
 int is_stop_walk(const char *n) {
   return is_find_or_take_while(n) || sp_streq(n, "find_index") || sp_streq(n, "each_with_index");
@@ -349,7 +332,6 @@ int is_str_each_iter(const char *n) {
 }
 
 int is_freeze_name(const char *n) { return sp_streq(n, "freeze"); }
-int is_enum_step_name(const char *n) { return sp_streq(n, "next") || sp_streq(n, "peek") || sp_streq(n, "size"); }
 
 int is_str_string_yield(const char *n) {
   return sp_streq(n, "each_char") || sp_streq(n, "each_line") || sp_streq(n, "upto") ||
@@ -938,15 +920,6 @@ int is_select_reject_bang(const char *n) {
 int is_raise_alias(const char *n) {
   return sp_streq(n, "raise") || sp_streq(n, "fail");
 }
-/* the Exception methods that answer the message (the share walk's sh_exc) */
-int is_exc_message_name(const char *n) {
-  return sp_streq(n, "message") || sp_streq(n, "full_message") || sp_streq(n, "detailed_message");
-}
-/* Exception.exception(m) and e.exception(m): an exception that keeps m as its
-   message, as new does */
-int is_exception_factory(const char *n) {
-  return sp_streq(n, "exception");
-}
 /* +s alone: a route that answers its String operand unless frozen
    (--share-strings, emit_strbuf_route) */
 int is_unary_plus(const char *n) {
@@ -1103,13 +1076,7 @@ int is_standard_output_global(const char *n) {
   return sp_streq(n, "$stdout") || sp_streq(n, "$stderr");
 }
 
-int is_file_class_name(const char *n) {
-  return n && sp_streq(n, "File");
-}
 
-int is_filetest_module_name(const char *n) {
-  return n && sp_streq(n, "FileTest");
-}
 
 int is_io_class_name(const char *n) {
   return sp_streq(n, "IO") || sp_streq(n, "File");
@@ -1508,7 +1475,6 @@ int is_arguments_node_type(const char *t) { return t && sp_streq(t, "ArgumentsNo
 
 int is_when_node_type(const char *t) { return t && sp_streq(t, "WhenNode"); }
 
-int is_ensure_node_type(const char *t) { return t && sp_streq(t, "EnsureNode"); }
 
 /* The encoding `Encoding::<nm>` names, or NULL. CRuby defines a constant
    for every encoding name and alias with `-` and `.` as `_`, as written and
@@ -1556,27 +1522,10 @@ int strh_op(const char *n, int argc, int block) {
   return STRH_NONE;
 }
 
-int is_kernel_print_name(const char *n) {
-  return n && (sp_streq(n, "p") || sp_streq(n, "puts") || sp_streq(n, "print"));
-}
 
-int is_identity_compare_name(const char *n) {
-  return n && (sp_streq(n, "equal?") || sp_streq(n, "==") || sp_streq(n, "!="));
-}
 
-int is_nil_shared_name(const char *n) {
-  return n && (sp_streq(n, "nil?") || is_identity_compare_name(n));
-}
 
-int builtin_iter_owner(const char *n) {
-  if (!n) return BITER_NONE;
-  if (sp_streq(n, "each") || sp_streq(n, "reverse_each") || sp_streq(n, "each_with_index")) return BITER_ARRAY;
-  if (sp_streq(n, "times") || is_upto_name(n) || sp_streq(n, "downto")) return BITER_INTEGER;
-  if (sp_streq(n, "each_char")) return BITER_STRING;
-  return BITER_NONE;
-}
 
-int is_frozen_query(const char *n) { return n && sp_streq(n, "frozen?"); }
 
 int is_pop_name(const char *n) { return n && sp_streq(n, "pop"); }
 
@@ -1642,4 +1591,11 @@ int stat_field_slot(const char *name) {
 /* mode or one of those fields */
 int boxed_stat_name(const char *name) {
   return sp_streq(name, "mode") || stat_field_slot(name) >= 0;
+}
+/* File::Stat's readers that a boxed receiver always dispatches on, where a
+   class of the program's own keeps its arm: mtime, atime and ftype (their
+   TY_IO rows say what each answers). ctime is left out: on a boxed
+   receiver it may be Time#ctime's String as well. */
+int boxed_stat_reader(const char *name) {
+  return sp_streq(name, "mtime") || sp_streq(name, "atime") || sp_streq(name, "ftype");
 }

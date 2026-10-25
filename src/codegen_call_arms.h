@@ -88,6 +88,7 @@ void emit_ie_param_default(Compiler *c, TyKind t, Buf *b);
 int emit_ie_poly(Compiler *c, int id, Buf *b);
 int emit_ie_proc(Compiler *c, int id, int recv, int self_cls, int blk, int tramp, Buf *b);
 int emit_ie_untraced(Compiler *c, int id, int recv, int blk, Buf *b);
+int emit_ie_non_proc_block(Compiler *c, int id, int recv, int blk, Buf *b);
 extern int g_ie_poly_node;
 int ie_body_has_break_next(Compiler *c, int node);
 int ie_body_ivar_write(const NodeTable *nt, int node);
@@ -105,7 +106,6 @@ int emit_int_operand_fail(Compiler *c, int id, int recv, int arg, int is_shift, 
 int exc_subclass_defines_cmp(Compiler *c);
 int obj_cmp_by_identity(TyKind t);
 int object_defines_cmp(Compiler *c);
-void scalar_nil_test(TyKind t, const char *v, char *out, size_t n);
 int any_class_defines(Compiler *c, const char *qm);
 int any_class_responds(Compiler *c, const char *qm);
 int class_implicit_responds(Compiler *c, int cid, const char *qm);
@@ -171,6 +171,13 @@ int ctor_block_splices(Compiler *c, int id);
 void emit_builtin_new_arms(Compiler *c, int argc, const int *atmp, int rt2, int kt, int boxed, Buf *b);
 int emit_class_new_call(Compiler *c, int id, Buf *b);
 void emit_class_value_new_kw(Compiler *c, int id, int recv, int boxed, Buf *b);
+/* The head of a Class-value `new` switch on `_t<kt>` (an sp_Class, or a
+   boxed value when `boxed`), its result `_t<rt2>` seeded nil. A box's
+   cls_id selects a constructor only when it holds a Class: an Integer's, a
+   Symbol's or nil's can equal a user class's index, and a user
+   object's is its class's, so anything else
+   switches on -1, no arm's label, and takes the default's NoMethodError. */
+void emit_class_value_new_switch(int rt2, int kt, int boxed, Buf *b);
 void emit_ctor_arm_case(Compiler *c, int ci, int rt2, int self_t, const char *pre, const char *args, int given, Buf *b);
 void struct_nil_fill_stmts(Compiler *c, int ci, int given, const char *obj, Buf *out);
 void emit_ctor_arm_param(Compiler *c, Scope *is, int j, const ArgLayout *L, const int *atmp, Buf *pdpre, Buf *out);
@@ -193,6 +200,7 @@ extern int g_cls_value_recv;
 int hoist_dispatch_args(Compiler *c, int argsN, int **sv, int **vw);
 int obj_member_shadows(Compiler *c, TyKind rt, const char *nm);
 void refl_class_singleton_methods(Compiler *c, int ci, int all, ReflNames *r);
+void refl_builtin_singleton_methods(const char *cls, int all, ReflNames *r);
 void refl_class_instance_methods(Compiler *c, int ci, int pub, int prot, ReflNames *r);
 void refl_module_instance_methods(Compiler *c, int m, int prot, ReflNames *r);
 void refl_module_own_methods(Compiler *c, int m, int pub, int prot, int priv, ReflNames *r);

@@ -14,6 +14,7 @@
 #define _DARWIN_C_SOURCE 1
 #endif
 #include <stdint.h>
+#include <inttypes.h>
 #include <stddef.h>
 #include <limits.h>
 #include <stdbool.h>
@@ -31,6 +32,16 @@ typedef uintptr_t VALUE;
 typedef uintptr_t ID;
 typedef intptr_t SIGNED_VALUE;
 typedef pid_t rb_pid_t;
+
+/* config.h's helper for a -D value an extension prints (racc's
+   RACC_INFO_VERSION) */
+#define STRINGIZE(expr) STRINGIZE0(expr)
+#define STRINGIZE0(expr) #expr
+/* "%"PRIsVALUE in an rb_raise format takes a VALUE and prints its to_s, or
+   its inspect with the + flag, as CRuby's does */
+#define PRI_VALUE_PREFIX "l"
+#define RUBY_PRI_VALUE_MARK "\v"
+#define PRIsVALUE PRIiPTR RUBY_PRI_VALUE_MARK
 
 #define Qfalse ((VALUE)0x00)
 #define Qnil   ((VALUE)0x08)
@@ -84,6 +95,10 @@ VALUE rb_ll2inum(long long);
 VALUE rb_float_new(double);
 #define NUM2INT(v) rb_num2int((VALUE)(v))
 #define LL2NUM(v) rb_ll2inum((long long)(v))
+long rb_num2long(VALUE);
+#define NUM2LONG(v) rb_num2long((VALUE)(v))
+#define INT2NUM(v) LL2NUM((int)(v))
+#define LONG2NUM(v) LL2NUM((long)(v))
 #define DBL2NUM(v) rb_float_new((double)(v))
 #define ID2SYM(id) (((VALUE)(id) << RUBY_SPECIAL_SHIFT) | RUBY_SYMBOL_FLAG)
 #ifdef SP_CEXT_RECORDER
@@ -99,7 +114,15 @@ void ruby_xfree(void *);
 #define xfree ruby_xfree
 void *sp_cext_allocv(VALUE *, size_t, size_t);
 #define RB_ALLOCV_N(type,handle,count) ((type *)sp_cext_allocv(&(handle),sizeof(type),(size_t)(count)))
-enum { T_STRING = 5, T_ARRAY = 7 };
+/* CRuby's value_type.h numbers */
+enum { T_NONE = 0x00, T_OBJECT = 0x01, T_CLASS = 0x02, T_MODULE = 0x03, T_FLOAT = 0x04,
+       T_STRING = 0x05, T_REGEXP = 0x06, T_ARRAY = 0x07, T_HASH = 0x08, T_STRUCT = 0x09,
+       T_BIGNUM = 0x0a, T_FILE = 0x0b, T_DATA = 0x0c, T_MATCH = 0x0d, T_COMPLEX = 0x0e,
+       T_RATIONAL = 0x0f, T_NIL = 0x11, T_TRUE = 0x12, T_FALSE = 0x13, T_SYMBOL = 0x14,
+       T_FIXNUM = 0x15, T_UNDEF = 0x16 };
+int rb_type(VALUE);
+#define TYPE(v) rb_type((VALUE)(v))
+#define RB_TYPE_P(v,t) (rb_type((VALUE)(v)) == (t))
 VALUE rb_obj_class(VALUE);
 const char *rb_class2name(VALUE);
 void rb_check_type(VALUE, int);
@@ -162,6 +185,9 @@ VALUE rb_hash_new(void);
 VALUE rb_hash_new_capa(long);
 VALUE rb_hash_aset(VALUE, VALUE, VALUE);
 VALUE rb_ary_new_capa(long);
+#define rb_ary_new2 rb_ary_new_capa
+VALUE rb_ary_subseq(VALUE, long, long);
+VALUE rb_hash_aref(VALUE, VALUE);
 VALUE rb_ary_push(VALUE, VALUE);
 VALUE rb_ary_pop(VALUE);
 void rb_ary_store(VALUE, long, VALUE);

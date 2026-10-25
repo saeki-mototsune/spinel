@@ -125,7 +125,7 @@ static int emit_op_template(Compiler *c, const BopCtx *x, Buf *b) {
     if (p[0] == '$' && p[1] == 'r') {
       /* (one-String mode: a String row's receiver is its bytes face,
          whichever face its text has -- an `a || b` of handles) */
-      int rface = g_one_string && x->rt == TY_STRING;
+      int rface = x->rt == TY_STRING;
       if (!r && x->rtext) {
         if (rface) { Buf fb; memset(&fb, 0, sizeof fb); buf_printf(&fb, "SP_STR_B(%s)", x->rtext); r = fb.p; }
         else r = strdup(x->rtext);
@@ -175,6 +175,11 @@ static int emit_op_template(Compiler *c, const BopCtx *x, Buf *b) {
       emit_recv_rooted(c, x->recv, tn[0], "SP_GC_ROOT", b);
       p++;
     }
+    else if (p[0] == '$' && p[1] == 'C') {
+      const char *sfx = case_map_suffix(c, argc, argv);
+      buf_printf(b, "%s%s", sfx, sp_streq(sfx, "_turkic") ? "_sym" : "");
+      p++;
+    }
     else if (p[0] == '$' && p[1] == 'H') {
       buf_puts(b, ty_hash_cname(x->rt));
       p++;
@@ -218,10 +223,9 @@ static int emit_op_template(Compiler *c, const BopCtx *x, Buf *b) {
     else if (p[0] == '$' && (p[1] == 'B' || p[1] == 'E')) {
       int beg = p[1] == 'B';
       int chk = x->name && is_endpoint_query(x->name);
-      if (repr_share_rule(c) && chk)
+      if (chk)
         buf_printf(b, "sp_srange_%s(sp_srange_need_end(_t%d, %d))", beg ? "first" : "last", x->t0, !beg);
-      else if (repr_share_rule(c)) buf_printf(b, "sp_srange_%s(_t%d)", beg ? "first" : "last", x->t0);
-      else buf_printf(b, "_t%d.%s", x->t0, beg ? "first" : "last");
+      else buf_printf(b, "sp_srange_%s(_t%d)", beg ? "first" : "last", x->t0);
       p++;
     }
     else if (p[0] == '$' && p[1] == 'R') {
@@ -506,7 +510,7 @@ static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *)
 };
 
 static int emit_builtin_op_ex(Compiler *c, int id, int recv, TyKind rt, const char *name,
-                              const char *rtext, int t0, int stage, BopArgKind arg_of, Buf *b) {
+                              const char *rtext, int t0, int stage, BopArgKind arg_of, int observe, Buf *b) {
   if (recv < 0) return 0;
   /* a Hash or Array receiver of any variant reads its family's rows */
   TyKind lk = bop_family_of(rt);
@@ -519,27 +523,35 @@ static int emit_builtin_op_ex(Compiler *c, int id, int recv, TyKind rt, const ch
   if (!op || op->emit == BOPE_NONE || !bop_emitters[op->emit]) return 0;
   BopCtx x = { id, recv, argc, rt, name, op, rtext, t0 };
   if (!bop_emitters[op->emit](c, &x, b)) return 0;
-  if (g_plan_check) plan_check_observe(c, id, rt, op);
+  if (g_plan_check && observe) plan_check_observe(c, id, rt, op);
   return 1;
 }
 
 int emit_builtin_op_text(Compiler *c, int id, int recv, TyKind rt, const char *name,
                          const char *rtext, Buf *b) {
-  return emit_builtin_op_ex(c, id, recv, rt, name, rtext, 0, 0, bop_arg_ntype, b);
+  return emit_builtin_op_ex(c, id, recv, rt, name, rtext, 0, 0, bop_arg_ntype, 1, b);
+}
+
+/* A row rendered as one arm of a boxed dispatch: the node answers what the
+   dispatch answers, so the row is not compared with inference's for the
+   node (--plan-check) */
+int emit_builtin_op_arm_text(Compiler *c, int id, int recv, TyKind rt, const char *name,
+                             const char *rtext, Buf *b) {
+  return emit_builtin_op_ex(c, id, recv, rt, name, rtext, 0, 0, bop_arg_ntype, 0, b);
 }
 
 int emit_builtin_op_tmp(Compiler *c, int id, int recv, TyKind rt, const char *name,
                         int t0, Buf *b) {
-  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, t0, 0, bop_arg_ntype, b);
+  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, t0, 0, bop_arg_ntype, 1, b);
 }
 
 int emit_builtin_op(Compiler *c, int id, int recv, TyKind rt, const char *name, Buf *b) {
-  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, 0, 0, bop_arg_ntype, b);
+  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, 0, 0, bop_arg_ntype, 1, b);
 }
 
 int emit_builtin_op_stage(Compiler *c, int id, int recv, TyKind rt, const char *name,
                           int stage, Buf *b) {
-  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, 0, stage, bop_arg_ntype, b);
+  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, 0, stage, bop_arg_ntype, 1, b);
 }
 
 /* The call emitted through the row of its name that guards no argument kind,
@@ -547,5 +559,5 @@ int emit_builtin_op_stage(Compiler *c, int id, int recv, TyKind rt, const char *
    viewed as an Integer to emit the element branch, and the row of an
    Integer index would state a result the held branch does not take. */
 int emit_builtin_op_unguarded(Compiler *c, int id, int recv, TyKind rt, const char *name, Buf *b) {
-  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, 0, -1, NULL, b);
+  return emit_builtin_op_ex(c, id, recv, rt, name, NULL, 0, -1, NULL, 1, b);
 }

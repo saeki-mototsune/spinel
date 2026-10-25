@@ -16,7 +16,6 @@ int is_call_alias(const char *n);     /* call () []: a Proc/Method's invocation 
 int is_method_invoke(const char *n);  /* call () [] ===: Method invocation */
 int is_bind_call(const char *n);  /* bind_call: an UnboundMethod bound and called in one */
 int is_kind_query(const char *n);     /* is_a? kind_of? instance_of? */
-int is_member_blind_query(const char *n); /* class object_id __id__ nil? frozen? equal? respond_to? is_a? ... */
 int is_round_family(const char *n);   /* round ceil floor truncate */
 int is_push_alias(const char *n);     /* push << append */
 int is_bit_op(const char *n);         /* & | ^ */
@@ -39,9 +38,6 @@ int is_set_op(const char *n);         /* & intersection | union - difference */
 int is_combination_family(const char *n);  /* combination permutation repeated_combination repeated_permutation */
 int is_visibility_name(const char *n);     /* private protected public */
 int is_select_bang(const char *n);    /* select! filter! keep_if reject! delete_if: the in-place filters */
-int is_retaining_filter(const char *n); /* select filter find_all reject, and the in-place filters: the iterators answering some of their elements */
-int is_reorder_iter(const char *n); /* sort sort_by: the iterators answering all of their elements, reordered by a block */
-int is_enum_partition_def(const char *n); /* __enum_partition__N: partition's builtin definition, per call site */
 int is_each_name(const char *n); /* each */
 int is_each_entry(const char *n); /* each_entry */
 int is_find_index(const char *n); /* find_index */
@@ -79,7 +75,6 @@ int is_length_spelling(const char *n); /* size count empty? */
 int is_difference_spelling(const char *n); /* difference */
 int is_str_each_iter(const char *n);  /* each_char each_line each_byte each_codepoint: String's element iterators */
 int is_freeze_name(const char *n);    /* freeze */
-int is_enum_step_name(const char *n); /* next peek size: an Enumerator stepped from outside */
 int is_str_string_yield(const char *n); /* each_char each_line upto chars lines split scrub: String methods whose block takes a String */
 int is_unpack_name(const char *n); /* unpack: a String decoded into values, which a block takes one by one */
 int is_catch_name(const char *n); /* catch: a tagged non-local jump target */
@@ -176,8 +171,6 @@ int is_encoding_mutator(const char *n); /* encode! force_encoding */
 int encoding_mutator_max_argc(const char *n);
 int is_range_end_reader(const char *n); /* end last */
 int is_raise_alias(const char *n); /* fail raise */
-int is_exception_factory(const char *n); /* exception */
-int is_exc_message_name(const char *n); /* message full_message detailed_message */
 int is_unary_plus(const char *n); /* +@ */
 int is_loop_name(const char *n); /* loop */
 int is_first_or_take(const char *n); /* first take */
@@ -273,8 +266,6 @@ int is_string_position_mutator(const char *n); /* []= clear insert setbyte slice
 int is_array_push_family(const char *n); /* << append prepend push unshift */
 
 int is_io_class_name(const char *n); /* File IO */
-int is_file_class_name(const char *n); /* File */
-int is_filetest_module_name(const char *n); /* FileTest */
 int is_immediate_class_name(const char *n); /* FalseClass NilClass TrueClass */
 int is_object_base_name(const char *n); /* BasicObject Object */
 int is_builtin_method_host_name(const char *n); /* Object BasicObject Kernel Comparable Enumerable Module */
@@ -345,7 +336,6 @@ int is_scan_name(const char *n); /* scan: a String's match iterator */
 int is_insert_name(const char *n); /* insert */
 int is_arguments_node_type(const char *t); /* ArgumentsNode */
 int is_when_node_type(const char *t);      /* WhenNode */
-int is_ensure_node_type(const char *t);    /* EnsureNode */
 int is_clear_name(const char *n); /* clear */
 int is_enumerator_with(const char *n); /* with_index with_object: an enumerator link */
 int is_lazy_name(const char *n);       /* lazy */
@@ -378,11 +368,9 @@ int is_untabled_native_class_name(const char *n);
 
 int is_define_method_name(const char *n); /* define_method */
 int is_alias_method_name(const char *n);  /* alias_method */
-/* --share-strings (#8328 step 5): the operations a String Array of handles
-   (TY_STRH_ARRAY) answers itself, by name, argument count and block (0
-   none, 1 a literal block, 2 a block argument). A container class one of
-   whose names takes any other stays in the poly form (share_strh_gate);
-   inference and codegen answer exactly these. */
+/* The operations a String Array (whose elements are handles) answers
+   itself, by name, argument count and block (0 none, 1 a literal block, 2
+   a block argument). */
 typedef enum {
   STRH_NONE,
   STRH_ELEM,     /* [](i), at(i), first, last: the element, a String */
@@ -400,13 +388,8 @@ typedef enum {
   STRH_INSPECT   /* inspect, to_s */
 } StrhOp;
 int strh_op(const char *n, int argc, int block);
-int is_kernel_print_name(const char *n);      /* p puts print */
-int is_identity_compare_name(const char *n);  /* equal? == != */
-int is_nil_shared_name(const char *n);        /* nil? equal? == !=: what nil answers as a String does */
 /* the receiver kind a block-taking iterator name belongs to */
 enum { BITER_NONE, BITER_ARRAY, BITER_INTEGER, BITER_STRING };
-int builtin_iter_owner(const char *n);        /* each reverse_each each_with_index / times upto downto / each_char */
-int is_frozen_query(const char *n);           /* frozen? */
 int is_pop_name(const char *n);               /* pop */
 int is_first_name(const char *n);             /* first */
 
@@ -432,4 +415,5 @@ int ostruct_member_name(const char *n);
 int boxed_stat_pred(const char *n);   /* a mode predicate's sp_stat_pred kind, a type predicate's sp_stat_type_pred kind + 100, else -1 */
 int stat_field_slot(const char *n);   /* a numeric field's sp_stat_field slot, else -1 */
 int boxed_stat_name(const char *n);   /* mode or a numeric field */
+int boxed_stat_reader(const char *n); /* mtime, atime, ftype */
 #endif

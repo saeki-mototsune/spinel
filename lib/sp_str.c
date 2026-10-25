@@ -234,6 +234,7 @@ void sp_raise_frozen_str(const char*s){SP_GC_ROOT_STR(s);const char*ins=sp_str_i
    specs exercise. Full Unicode is out of scope (one internal UTF-8 rep). */
 uint32_t sp_uc_toupper(uint32_t cp){
   if(cp<0x80)return (uint32_t)toupper((int)cp);
+  if(cp==0x131)return 0x49;
   if(cp>=0xE0&&cp<=0xFE&&cp!=0xF7)return cp-0x20; /* Latin-1 lower -> upper */
   if(cp==0xFF)return 0x178;                       /* ÿ -> Ÿ */
   if(cp>=0x100&&cp<=0x137){ if(cp&1)return cp-1; return cp; } /* Latin-Ext-A pairs */
@@ -244,6 +245,7 @@ uint32_t sp_uc_toupper(uint32_t cp){
 }
 uint32_t sp_uc_tolower(uint32_t cp){
   if(cp<0x80)return (uint32_t)tolower((int)cp);
+  if(cp==0x130)return cp;
   if(cp>=0xC0&&cp<=0xDE&&cp!=0xD7)return cp+0x20; /* Latin-1 upper -> lower */
   if(cp==0x178)return 0xFF;                        /* Ÿ -> ÿ */
   if(cp>=0x100&&cp<=0x137){ if((cp&1)==0)return cp+1; return cp; }
@@ -518,7 +520,10 @@ const char*sp_str_repeat(const char*s,sp_int n){SP_GC_ROOT_STR(s);
   size_t total=(size_t)n*l;
   sp_str_check_size(0,total);
   char*r=sp_str_alloc_raw(total+1);
-  for(sp_int i=0;i<n;i++)memcpy(r+(l*i),s,l);
+  /* one copy, then the filled part onto the rest, doubling: log2(n)
+     memcpys rather than n (a one-byte string times 20M was 20M calls) */
+  memcpy(r,s,l);
+  for(size_t done=l;done<total;){size_t c=done<total-done?done:total-done;memcpy(r+done,r,c);done+=c;}
   r[total]=0;
   sp_str_set_len(r,total);
   return sp_str_bin_from(r,s);
@@ -933,12 +938,12 @@ sp_StrArray*sp_str_scan(const char*s,const char*pat){if(!s)sp_nil_recv("scan");
   /* `$~` is the last match, or nil when there was none */
   if(pl==0){
     const char*p=s;
-    for(;;){sp_str_split_push(a,p,0);if(p>=pe)break;p+=sp_utf8_advance(p);}
+    for(;;){sp_str_piece(a,s,p,0);if(p>=pe)break;p+=sp_str_is_binary(s)?1:sp_utf8_advance(p);}
     if(sp_re_track_last)sp_re_set_lit_match(s,(sp_int)(p-s),(sp_int)(p-s));
     return a;
   }
   const char*p=s,*f,*last=NULL;
-  while((f=sp_bytestr(p,(size_t)(pe-p),pat,pl))!=NULL){sp_str_split_push(a,f,pl);last=f;p=f+pl;}
+  while((f=sp_bytestr(p,(size_t)(pe-p),pat,pl))!=NULL){sp_str_piece(a,s,f,pl);last=f;p=f+pl;}
   if(sp_re_track_last){if(last)sp_re_set_lit_match(s,(sp_int)(last-s),(sp_int)(last-s+pl));else sp_re_clear_last_match();}
   return a;
 }

@@ -42,12 +42,6 @@ enum { SP_VIS_PUBLIC = 0, SP_VIS_PRIVATE = 1, SP_VIS_PROTECTED = 2 };
    only inherits it (#4509), so the record is the NODE whose value made the
    slot degrade; the node's own origin (Compiler.norigin) leads on from there
    to the expression the poly was born at. */
-/* The user classes a value can hold (analyze_cls.c, #8530): `all` for every
-   class, else the class indices, sorted, at most CLS_SET_MAX of them. A
-   member at or past nclasses is the Class object of (member - nclasses),
-   which a call dispatches to class methods. `bv`: the value may also be a
-   builtin (a container, a Proc), whose own methods then answer too. */
-#define CLS_SET_MAX 16
 /* The tables infer_type reads are written only through setters that count
    each change in comp_ty_edits, so that its memo can tell whether an
    earlier query's answer still holds (#8852). Their fields are const under
@@ -67,9 +61,36 @@ static inline TyKind ty_ref_set(TyRef r, TyKind t) {
   return t;
 }
 
-/* bv: a builtin value with no class of the program's; os: an OpenStruct,
-   whose members answer any name (size, length, count, empty?) */
-typedef struct { unsigned char all, n, bv, os; int cls[CLS_SET_MAX]; } ClsSet;
+/* The user classes a value can hold (analyze_cls.c, #8530): `all` for every
+   class, else a set of class indices with no bound on how many: a sparse
+   bitset, its nw nonzero words w at word indices wi (ascending), n members.
+   A member at or past nclasses is the Class object of (member - nclasses),
+   which a call dispatches to class methods. `bv`: the value may also be a
+   builtin (a container, a Proc), whose own methods then answer too. Read
+   with cls_set_has and cls_set_next. */
+typedef struct { unsigned char all, bv, os; int n, nw; unsigned long long *w; int *wi; } ClsSet;
+/* the position of the first word at word index q or past it */
+static inline int cls_set_word_from(const ClsSet *s, int q) {
+  int lo = 0, hi = s->nw;
+  while (lo < hi) { int m = (lo + hi) >> 1; if (s->wi[m] < q) lo = m + 1; else hi = m; }
+  return lo;
+}
+static inline int cls_set_has(const ClsSet *s, int k) {
+  if (k < 0) return 0;
+  int p = cls_set_word_from(s, k >> 6);
+  return p < s->nw && s->wi[p] == (k >> 6) && ((s->w[p] >> (k & 63)) & 1);
+}
+/* the member after k (k = -1 for the first), -1 past the last */
+static inline int cls_set_next(const ClsSet *s, int k) {
+  int i = k + 1, q = i >> 6;
+  for (int p = cls_set_word_from(s, q); p < s->nw; p++) {
+    unsigned long long m = s->w[p];
+    if (s->wi[p] == q) m &= ~0ULL << (i & 63);
+    if (m) return s->wi[p] * 64 + __builtin_ctzll(m);
+  }
+  return -1;
+}
+void cls_pool_free(ClsSet *pool, int n);   /* a pool of sets and their words */
 
 typedef struct {
   int node;      /* the argument, written value or returned value whose type degraded the slot; -1 = untraced */
@@ -138,6 +159,10 @@ typedef struct {
                        during the init raise NameError (uninitialized constant) */
   int rbs_seeded;   /* param type pinned from an --rbs advisory seed: the
                        fixpoint must not widen it (see apply_rbs_seeds) */
+  int rbs_box_held; /* (params) a box reached the container seed while the
+                       fixpoint ran and the seed held: it may have been a
+                       transient, so the settled types decide whether the
+                       seed gives way (param_seed_holds, an_settle_seed_boxes) */
   int nullable_int; /* an int local that was assigned a value which can be
                        nil (a search miss, a pop off an empty array): its
                        slot holds its nil beside the value, and boxing it
@@ -239,6 +264,11 @@ typedef struct {
                        method's own positional parameter j (`a[i, n] = src`),
                        boxed when its callers disagree: the binding checks
                        each call's argument j's elements the same way. */
+  unsigned long long store_merge_src; /* (params, hashes) bit j set: a merge!
+                       or update into this parameter merges the method's own
+                       positional parameter j, boxed when its callers
+                       disagree: the binding checks each call's hash for it,
+                       its keys and values, the same way. */
   int store_rest_src; /* (params, containers) one past the first element of the
                        method's rest parameter that a push, unshift or insert
                        through this parameter stores, or 0: the rest
@@ -269,12 +299,6 @@ typedef struct {
                        the rule shares settled in its poly form, and its
                        elements are boxed handles (repr_of_slot's
                        elems_handle) */
-  unsigned char strh_form; /* --share-strings: a String Array the rule
-                       settled as an Array of the Strings' handles
-                       (TY_STRH_ARRAY, share_strh_gate) */
-  unsigned char strh_no; /* ...and one whose container class cannot take that
-                       form yet: it keeps the poly form, for good (the mark
-                       is never cleared, so the fixpoint ends) */
   int str_shared;   /* (TY_STRBUF) a shared-mutable string: it is aliased
                        (`s2 = s1`) AND mutated in place, so the whole alias set
                        holds the one sp_String* handle -- reads hand out the live
@@ -397,6 +421,10 @@ typedef struct {
   int is_prepend_copy;        /* the instance method a `prepend` copied in, in
                                  front of the class's own (its super reaches
                                  that one -- the builtin's, for a builtin) */
+  int mixin_guarded;          /* such a copy of a prepend a later top-level
+                                 reopening makes: it hands the call to the
+                                 class's own method until that statement has
+                                 run (mixin_guard_body) */
   int is_extend_copy;         /* the class method an `extend` copied in: a later
                                  extend of a module defining the same name
                                  replaces it the same way */
@@ -488,6 +516,9 @@ typedef struct {
                           of docs/internals/ext-design.md) */
   int ret_rbs_seeded;  /* ret pinned from an --rbs advisory seed: the fixpoint
                           must not recompute it from the body */
+  int ret_rbs_box_held; /* a box reached that container seed while the
+                          fixpoint ran and the seed held: the settled types
+                          decide (ret_seed_holds, an_settle_seed_boxes) */
   int ret_elems_shared; /* --share-strings: that seed was Array[String], and the
                           Strings the method answers are shared, so the return
                           settled in its poly form, the boxes holding the
@@ -661,6 +692,12 @@ typedef struct {
                                      SCALAR -- so without this flag the next
                                      write pass replaced the narrowed type with
                                      something strictly worse. */
+  unsigned char *ivar_alias_wide;  /* the alias propagation widened the slot
+                                      to the general Array because another
+                                      name of its Array is one
+                                      (propagate_alias_widening): the
+                                      re-narrow keeps it, as its own
+                                      pushes do not show why */
   int nivars, civars;
   unsigned char *ivar_obj_may_nil; /* the nil fact per ivar (analyze_nil.c,
                                      #7444), indexed as ivars was when the
@@ -675,6 +712,9 @@ typedef struct {
   char **rbs_pin_ivars; /* ivar names (incl '@') pinned by an --rbs seed: the
                            fixpoint must not widen their type */
   int n_rbs_pin_ivars, c_rbs_pin_ivars;
+  int ivar_box_held;    /* a box reached one of those container pins while the
+                           fixpoint ran and the pin held: the settled types
+                           decide (class_ivar_pin_holds, an_settle_seed_boxes) */
   char **cvars;        /* class variable names, incl. leading '@@' */
   SP_TY_FIELD TyKind *cvar_types;
   unsigned char *cvar_nullable_int; /* the Integer or Float class variable can
@@ -898,10 +938,7 @@ typedef struct {
 
 /* The bits of ClassInfo.ivar_elems_shared and cvar_elems_shared */
 enum {
-  ELEMS_POLY = 1,     /* the TY_POLY_ARRAY slot holds its Strings as handles */
-  ELEMS_STRH = 2,     /* the slot is a String Array of handles (TY_STRH_ARRAY) */
-  ELEMS_STRH_NO = 4   /* ...and a container class that cannot take that form,
-                         for good (share_strh_gate) */
+  ELEMS_POLY = 1      /* the TY_POLY_ARRAY slot holds its Strings as handles */
 };
 static inline TyKind ivar_set_type(ClassInfo *ci, int k, TyKind t) {
   if (ci->ivar_types[k] != t) { ((TyKind *)ci->ivar_types)[k] = t; comp_ty_edits++; }
@@ -1356,15 +1393,14 @@ typedef struct {
   int *bi_base_cnt;
   char **bi_base_key;
   int bi_base_cap;
-  /* --share-strings (SPINEL_SHARE_STRINGS): a mutable String is the shared
-     handle unless the analysis proves it local (repr_str_shares, #6765),
-     and the share classes that rule reads (share.h), rebuilt as the
-     analysis goes. Off, nothing builds them and the C is unchanged. */
+  /* a parsed program node's base: the nearest def, class or module it is in
+     (itself, for one of those), or -1 at the top level (comp_node_pbases) */
+  int *node_pbase; int node_pbase_n;
+  char **pbase_keys; int *pbase_key_cnt; int pbase_key_slots, pbase_key_n;   /* key -> times seen */
+  /* --share-strings (SPINEL_SHARE_STRINGS): every String slot is the
+     shared handle (#6765); the share classes (share.h) are rebuilt as the
+     analysis goes for the questions still asked of them. */
   int share_borrows;    /* arguments share_mark_borrows lets borrow the bytes */
-  /* the route refusals the flag left to the rule (share_route_defer),
-     checked against the final facts at seal */
-  struct ShareRoute *share_route;
-  int nshare_route, cshare_route;
   /* the program's parent map, for the emitter's questions about where a node
      sits (codegen_util.c's codegen_parents); rebuilt when the node table
      changed, freed with the Compiler */
@@ -1384,7 +1420,6 @@ typedef struct {
      arguments to (a proc form, or a method with a `&blk` it calls), or 0 */
   int proc_arg_src;
   struct ShareFacts *share;
-  struct ShareAgree *share_agree;   /* --share-check's state (share_check.c) */
   /* the String plan's memo (share_plan.c): per node, its need, the role of
      its consumer, and its type when the need was asked, filled at seal under
      --share-strings, and the node table's version then */
@@ -1411,12 +1446,6 @@ typedef struct {
      boxed (share_plan_box_plain) */
   int *share_parent;
   int share_parent_n;
-  /* --share-strings: per node, an Array literal or a call answering a new
-     Array whose container class cannot take the String handle Array form
-     (share_strh_gate): it keeps the poly form, as the holders of its class
-     do. Grown on demand; never cleared */
-  unsigned char *strh_no;
-  int strh_no_cap;
   /* strbuf_bang_self_local's answers within one outermost query
      (codegen_util.c): per node, the query it was answered in and the
      answer. Its recursion over a receiver chain reaches each link by
@@ -1430,7 +1459,6 @@ typedef struct {
   struct SbArgIndex *sb_args; /* settled parameter sources, built once for storage */
   unsigned share_sig;   /* the types the facts were last applied over */
   unsigned share_in_sig;   /* the types the last application started from */
-  int strh_demoted;   /* a slot left the String handle Array form after the proc-return re-derivation (share_strh_gate); an_phase_storage re-derives them again */
   /* the methods compute_byref_out_params let take a lent slot
      (an_byref_eligible_scopes), kept for the share facts built after it
      (nbyref_elig scopes; NULL before it runs) */
@@ -1482,6 +1510,9 @@ typedef struct {
      receivers are typed (-1 once resolved) */
   int *redef_calls;
   int nredef_calls;
+  /* the flags of the later prepends that guard their copies
+     (mixin_guard_body): $__spinel_mixin_ran_1 .. n_mixin_flags */
+  int n_mixin_flags;
   /* the operand-local reads splat_dispatch_on_length marked splat_view,
      which desugar_splat_view_scalars rewrites once typed (-1 once seen) */
   int *splat_views;
@@ -1497,6 +1528,7 @@ int name_list_has(char **list, int n, const char *name);
 /* Resize per-node arrays (ntype/nscope) after the node table grew. */
 void comp_grow_node_arrays(Compiler *c);
 int comp_node_ord(Compiler *c, int id, int *builtin);
+void comp_node_pbases(Compiler *c);   /* the parsed program nodes' bases (comp_new) */
 const char *comp_node_tag(Compiler *c, int id);
 
 /* If `id` is a ternary `cond ? A : B` -- an IfNode whose then- and else-clauses
@@ -1750,6 +1782,7 @@ int lazy_stage_name(const char *nm);
 int poly_builtin_zero_arg_name(const char *m);
 int chain_is_lazy_valued(Compiler *c, int node);      /* CallNode chain evaluating to a Lazy */
 int poly_str_iter_enum(Compiler *c, int id);        /* boxed String iterator answers an Enumerator (analyze_infer_recv.c) */
+int poly_io_codepoint_enum(Compiler *c, int id);   /* boxed each_codepoint takes the IO arm (analyze_infer_recv.c) */
 int lazy_alias_chain(Compiler *c, int var_read);
 int lazy_method_chain(Compiler *c, int call);      /* parameterless method whose body is a lazy chain -> chain node, else -1 */
 int lazy_resolve_chain(Compiler *c, int n);
@@ -1832,6 +1865,7 @@ int        io_reopen_leaves_builtin(Compiler *c, const char *name);
 int        io_reopen_defs(Compiler *c, const char *name, int public_only, int *ks, int max);
 int        io_reopen_ret_mixed(Compiler *c, const char *name);
 int        io_family_descends(Compiler *c, int k, int owner);
+const char *io_super_name(const char *k);
 /* Like comp_method_in_class but walks the superclass chain. On success,
    *def_class (if non-NULL) is set to the class that defines the method. */
 int        comp_method_in_chain(Compiler *c, int class_id, const char *name, int *def_class);
@@ -1849,6 +1883,12 @@ const int *comp_name_responders(Compiler *c, const char *name, int is_cm, int *n
    and the class shape stand still. A retargeted send on a boxed receiver
    asked it class by class at every resolution of its plan. */
 int        comp_name_reader_any(Compiler *c, const char *name);
+/* The classes whose own chain hop defines a reader of `name` (the ones
+   comp_reader_in_chain answers with def_class the class itself), ascending,
+   *n of them; kept as comp_name_reader_any's answers are. The kinds walk
+   asked it class by class for every argument-less call on a receiver that
+   can be anything, at every solve. */
+const int *comp_name_reader_owners(Compiler *c, const char *name, int *n);
 /* does class_id's chain define the method call id names, and does the call reach it? A call
    marked builtin_only (the super of a program's own reflection, rewritten to
    self's builtin) does not. */
@@ -1934,6 +1974,7 @@ int        comp_is_nested_int_array_literal(Compiler *c, int node); /* `[[ints],
    pass did not see, a value it cannot bound). A class the set leaves out
    is one no instance of which reaches the node (analyze_cls.c, #8530). */
 const ClsSet *cls_fact_node(Compiler *c, int node);
+void cls_fact_use_report(Compiler *c);   /* SPINEL_CLS_USE: the consumers' arms (#8837) */
 /* Is class k one the fact bounds: a class the program defines, whose
    instances the pass follows from their construction? A reopened builtin's,
    a native class's and a module's are not. */
@@ -1999,6 +2040,7 @@ int        comp_is_own_reader(ClassInfo *ci, const char *name);
 int        comp_enum_answers_first(Compiler *c, int cid, const char *name);
 int        comp_comparable_answers_first(Compiler *c, int cid, const char *name);
 int        comp_comparable_reaches(Compiler *c, int cid);
+int        comp_enum_reaches(Compiler *c, int cid);   /* Enumerable among its ancestors */
 int        core_method_vis(const char *cls, const char *m, int inherit);   /* codegen_call_class.c */
 int        comp_is_writer(ClassInfo *ci, const char *name);
 int        name_is_plain_setter(const char *name);

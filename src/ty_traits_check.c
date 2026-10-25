@@ -38,7 +38,7 @@ static int trait_has_box_text(TyKind t) {
   case TY_SYMBOL: case TY_RANGE: case TY_FLOAT_RANGE: case TY_STR_RANGE: case TY_TMS:
   case TY_TIME: case TY_COMPLEX: case TY_RATIONAL: case TY_CLASS: case TY_INT_ARRAY:
   case TY_FLOAT_ARRAY: case TY_STR_ARRAY: case TY_POLY_ARRAY: case TY_OPENSTRUCT:
-  case TY_INT_ARRAY_ARRAY: case TY_FLOAT_ARRAY_ARRAY: case TY_STRH_ARRAY:
+  case TY_INT_ARRAY_ARRAY: case TY_FLOAT_ARRAY_ARRAY:
     return 1;
   default:
     return 0;
@@ -55,7 +55,13 @@ static TyTraits trait_from_functions(Compiler *c, TyKind t) {
   r.box = ty_box_fn(t);
   r.box_nil = ty_box_nil_fn(t);
   int sv_tmp = g_tmp;
-  if (trait_has_box_text(t)) {
+  /* (one-String mode boxes a String of either face through SP_STR_BOX,
+     ahead of the table: the rows keep the two representations' boxes) */
+  if ((t == TY_STRING || t == TY_STRBUF)) {
+    r.box_text = ty_traits[t].box_text;
+    r.box_form = ty_traits[t].box_form;
+  }
+  else if (trait_has_box_text(t)) {
     Buf b; memset(&b, 0, sizeof b);
     g_tmp = 0;
     emit_boxed_text(c, t, "$e", &b);

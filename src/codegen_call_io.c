@@ -363,7 +363,7 @@ static void emit_io_read_nonblock_buffer(Compiler *c, int id, int handle, Buf *b
   const NodeTable *nt = c->nt;
   int recv = nt_ref(nt, id, "receiver"), argc = 0;
   const int *argv = call_args(nt, id, &argc);
-  int shared = repr_share_rule(c), held[3], tr = ++g_tmp;
+  int shared = 1, held[3], tr = ++g_tmp;
   int tf = ++g_tmp, tn = ++g_tmp, te = ++g_tmp, ts = ++g_tmp, tb = ++g_tmp, eof = ++g_tmp;
   buf_puts(b, "({ ");
   Buf *saved_pre = g_pre;
@@ -465,8 +465,7 @@ static const char *io_pread_entry(int argc) {
 
 int emit_io_read_nonblock_outbuf(Compiler *c, int id, Buf *b) {
   if (!io_read_nonblock_outbuf(c, id)) return 0;
-  if (repr_share_rule(c)) emit_io_read_nonblock_buffer(c, id, 0, b);
-  else emit_io_read_nonblock_value(c, id, b);
+  emit_io_read_nonblock_buffer(c, id, 0, b);
   return 1;
 }
 
@@ -475,7 +474,7 @@ int emit_io_read_nonblock_outbuf(Compiler *c, int id, Buf *b) {
    that identity. The seal and the emitter ask this same predicate. */
 int strbuf_io_outbuf(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
-  if (!repr_share_rule(c) || id < 0 || nt_kind(nt, id) != NK_CallNode) return -1;
+  if (id < 0 || nt_kind(nt, id) != NK_CallNode) return -1;
   const char *name = nt_str(nt, id, "name");
   int sh = bop_share_named(TY_IO, name);
   if (sh == BSH_FILL1 && is_nonblock_io(name) && io_read_nonblock_outbuf(c, id)) return 1;
@@ -495,7 +494,7 @@ int strbuf_io_outbuf(Compiler *c, int id) {
 /* Hold each operand before dispatch, including a boxed receiver. The
    existing read helper fills the buffer and answers its handle here. */
 int emit_strbuf_io_read(Compiler *c, int id, Buf *b) {
-  if (repr_share_rule(c) && io_read_nonblock_outbuf(c, id)) {
+  if (io_read_nonblock_outbuf(c, id)) {
     emit_io_read_nonblock_buffer(c, id, 1, b);
     return 1;
   }
@@ -856,6 +855,7 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
        (boxed_winsize_set(c, name, argc, argv)) ||
        ((sp_streq(name, "__sp_tty_mode") || sp_streq(name, "__sp_tty_restore")) && argc == 1) ||
        sp_streq(name, "readlines") || sp_streq(name, "rewind") ||
+       poly_io_codepoint_enum(c, id) ||
        sp_streq(name, "readpartial") ||
        /* a socket read back out of a container: its non-blocking connect and
           its options, as the typed socket arms answer them */
@@ -957,6 +957,19 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       char base[256];
       if (setter_base_name(name, base, sizeof base) && comp_writer_in_chain(c, k, base, NULL)) iocand = 1;
     }
+    /* each_codepoint: the runtime answers a box, read back at the call's
+       representation (an Enumerator where it is kept) */
+    if (!iocand && poly_io_codepoint_enum(c, id)) {
+      Repr r = repr_of(c, id);
+      Buf eb; memset(&eb, 0, sizeof eb);
+      buf_puts(&eb, "sp_poly_io_codepoint_enum("); emit_boxed(c, recv, &eb);
+      buf_printf(&eb, ", %d)", poly_str_iter_enum(c, id));
+      if (r.kind == RK_BOXED) buf_puts(b, eb.p);
+      else emit_unbox_text(c, r.as_ty, eb.p, b);
+      free(eb.p);
+      c->args_in_call = recv;
+      return 1;
+    }
     /* printf: the receiver and every argument, the format included, are
        evaluated and rooted before the handle is unboxed, so a receiver that
        is no IO raises NoMethodError after them, as in CRuby. The format
@@ -1011,8 +1024,31 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       buf_printf(b, "(_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_ENUMERATOR) ? ", tv, tv);
       if (boxed) buf_printf(b, "(sp_Enumerator_rewind((sp_Enumerator *)_t%d.v.p), _t%d)", tv, tv);
       else buf_printf(b, "(sp_Enumerator_rewind((sp_Enumerator *)_t%d.v.p), (sp_int)0)", tv);
+      /* a Dir rewinds and answers itself, where the program can make one */
+      if (an_program_makes_dir(c)) {
+        buf_printf(b, " : (_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_DIR) ? ", tv, tv);
+        if (boxed) buf_printf(b, "(sp_Dir_rewind((sp_Dir *)_t%d.v.p), _t%d)", tv, tv);
+        else buf_printf(b, "(sp_Dir_rewind((sp_Dir *)_t%d.v.p), (sp_int)0)", tv);
+      }
       buf_printf(b, " : %ssp_File_rewind(sp_poly_as_io(_t%d, \"rewind\"))%s; })",
                  boxed ? "sp_box_int(" : "", tv, boxed ? ")" : "");
+      return 1;
+    }
+    /* seek(pos) on a boxed value, where the program can make a Dir: a Dir
+       seeks and answers itself, a stream answers IO#seek's 0. Without a
+       Dir the stream arm below takes it. */
+    if (!iocand && sp_streq(name, "seek") && argc == 1 && !nt_argv_has_splat(nt, argv, argc) &&
+        an_program_makes_dir(c)) {
+      int tv = ++g_tmp, tio3 = ++g_tmp, tp = ++g_tmp;
+      int boxed = repr_of(c, id).kind == RK_BOXED;
+      buf_puts(b, "({ "); tv = hold_operand(c, recv, TY_POLY, 1, tv, 1, " ", b);
+      buf_printf(b, "sp_File *_t%d = (_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_DIR)"
+                    " ? NULL : sp_poly_as_io(_t%d, \"seek\"); sp_int _t%d = ", tio3, tv, tv, tv, tp);
+      emit_int_expr_offt(c, argv[0], b);
+      buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_DIR ? ", tv, tv);
+      if (boxed) buf_printf(b, "sp_box_obj(sp_Dir_seek((sp_Dir *)_t%d.v.p, _t%d), SP_BUILTIN_DIR)", tv, tp);
+      else buf_printf(b, "(sp_Dir_seek((sp_Dir *)_t%d.v.p, _t%d), (sp_int)0)", tv, tp);
+      buf_printf(b, " : %ssp_File_seek(_t%d, _t%d, 0)%s; })", boxed ? "sp_box_int(" : "", tio3, tp, boxed ? ")" : "");
       return 1;
     }
     if (!iocand) {
@@ -2071,8 +2107,7 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
         buf_printf(b, " sp_RbVal lv_%s = %s(_t%d); SP_GC_ROOT_RBVAL(lv_%s);", bpn2,
                    (is_byte || is_cp) ? "sp_box_int" : "sp_box_str", lt2, bpn2);
       /* A character is a fresh String, bound just as a fresh line is. */
-      else if (bpn2 && !is_byte && !is_cp && repr_share_rule(c) &&
-               repr_of_slot(c, scope_local(comp_scope_of(c, blk2), bp2)).kind == RK_STRBUF)
+      else if (bpn2 && !is_byte && !is_cp && repr_of_slot(c, scope_local(comp_scope_of(c, blk2), bp2)).kind == RK_STRBUF)
         emit_line_param_decl(c, id, bpn2, lt2, b);
       else if (bpn2) {
         buf_printf(b, " %s lv_%s = _t%d;", (is_byte || is_cp) ? "sp_int" : "const char *", bpn2, lt2);

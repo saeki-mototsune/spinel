@@ -222,22 +222,15 @@ static int sp_json_max_depth(const jbuf *b) {
    otherwise, the exponent unpadded -- "1e+20", "0.00000015", "1e-10".
    Float#to_s writes some of these differently ("1.0e+20", "1.5e-07"). */
 static const char *sp_json_float(double d) {
-  char tmp[40];
-  int p = 1;
-  for (; p <= 17; p++) {
-    snprintf(tmp, sizeof tmp, "%.*e", p - 1, d);
-    if (strtod(tmp, NULL) == d) break;
-  }
-  if (p > 17) p = 17;
-  snprintf(tmp, sizeof tmp, "%.*e", p - 1, d);
-  /* tmp is [-]D[.DDD]e[+-]XX: take the digits and the decimal exponent */
-  int neg = tmp[0] == '-';
-  const char *q = tmp + neg;
-  char digits[24]; int nd = 0;
-  for (; *q && *q != 'e'; q++) if (*q >= '0' && *q <= '9') digits[nd++] = *q;
-  int e10 = atoi(q + 1);
-  while (nd > 1 && digits[nd - 1] == '0') nd--;   /* "1.000e+20" -> "1" */
-  if (d == 0.0) { nd = 1; digits[0] = '0'; e10 = 0; }
+  /* the shortest digits that read back as d (Float#to_s's), and the decimal
+     exponent of the first: one integer computation where probing
+     snprintf("%.*e") with strtod at each precision took up to 17 of each,
+     which was most of a float-heavy JSON.generate */
+  int neg = signbit(d) != 0;
+  char digits[32]; int nd = 1, e10 = 0;
+  digits[0] = '0';
+  if (d != 0.0) e10 = sp_float_shortest(neg ? -d : d, digits, &nd);
+  while (nd > 1 && digits[nd - 1] == '0') nd--;   /* "1000" at 1e20 -> "1" */
   int K = e10 - (nd - 1);              /* value = digits * 10^K */
   int ex = K + nd - 1; if (ex < 0) ex = -ex;
   char out[64]; int o = 0;
@@ -528,6 +521,20 @@ static void jp_utf8(jbuf *b, unsigned cp) {
 static const char *jp_string(jrd *j) {
   if (j->p >= j->end || *j->p != '"') jp_err("expected a string");
   j->p++;
+  /* the common string has no escape: its bytes are the input's, copied once
+     into a string of their length, where a byte-at-a-time buffer grew by
+     realloc and was copied again. An escape or a control character leaves
+     the scan to the loop below, from the string's start. */
+  const char *q = j->p;
+  while (q < j->end && *q != '"' && *q != '\\' && (unsigned char)*q >= 0x20) q++;
+  if (q < j->end && *q == '"') {
+    size_t n = (size_t)(q - j->p);
+    char *r = sp_str_alloc(n);
+    memcpy(r, j->p, n);
+    sp_str_set_len(r, n);
+    j->p = q + 1;
+    return r;
+  }
   jbuf b; memset(&b, 0, sizeof b);
   while (j->p < j->end && *j->p != '"') {
     char c = *j->p++;
@@ -543,10 +550,14 @@ static const char *jp_string(jrd *j) {
       case 'b': jb_c(&b, '\b'); break;  case 'f': jb_c(&b, '\f'); break;
       case 'u': {
         unsigned cp; jp_hex4(j, &b, &cp);
-        if (cp >= 0xD800 && cp <= 0xDBFF && j->end - j->p >= 2 && j->p[0] == '\\' && j->p[1] == 'u') {
+        /* a high surrogate needs a low one after it, as CRuby's parser has
+           it ("\ud800x" and "\ud800A" raise); a lone low surrogate is
+           written as its bytes, as there */
+        if (cp >= 0xD800 && cp <= 0xDBFF) {
+          if (j->end - j->p < 2 || j->p[0] != '\\' || j->p[1] != 'u') { free(b.p); jp_err("incomplete surrogate pair"); }
           j->p += 2; unsigned lo; jp_hex4(j, &b, &lo);
-          if (lo >= 0xDC00 && lo <= 0xDFFF) cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
-          else jp_utf8(&b, cp), cp = lo;   /* lone high surrogate: emit both raw */
+          if (lo < 0xDC00 || lo > 0xDFFF) { free(b.p); jp_err("invalid surrogate pair"); }
+          cp = 0x10000 + ((cp - 0xD800) << 10) + (lo - 0xDC00);
         }
         jp_utf8(&b, cp);
         break;
@@ -589,6 +600,13 @@ static sp_RbVal jp_number(jrd *j) {
   }
   size_t n = (size_t)(j->p - start);
   if (n == 0) jp_err("invalid number");
+  /* an Integer of at most 18 digits cannot pass int64: its value is read
+     straight off the input, with no copy for strtoll */
+  if (!is_float && n - (*start == '-') <= 18) {
+    long long v = 0;
+    for (const char *d = start + (*start == '-'); d < j->p; d++) v = v * 10 + (*d - '0');
+    return sp_box_i64((int64_t)(*start == '-' ? -v : v));
+  }
   /* the digits as a C string: a stack buffer for the usual width, the heap
      for an integer longer than that, which is a Bignum and has no limit */
   char stk[64];

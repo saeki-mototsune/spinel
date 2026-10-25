@@ -9,8 +9,13 @@ CRuby 4.0 ships.
 - License: Ruby's (`COPYING`) or the 2-clause BSD license (`BSDL`), both
   copied from that commit.
 
-`optparse/*.rb` is unchanged. `optparse.rb` is unchanged except for these
-hunks, each in its own commit with the reason:
+`optparse/*.rb` is unchanged except that six of them (`ac.rb`, `date.rb`,
+`shellwords.rb`, `time.rb`, `uri.rb`, `version.rb`) lose their first line,
+`# frozen_string_literal: false`: Spinel freezes every string literal and
+warns that the pragma is ignored, so it warned in every program that
+required one of them, and their literals are frozen either way.
+`optparse.rb` is unchanged except for these hunks, each in its own commit
+with the reason:
 
 | Where | Upstream | Here | Why |
 |---|---|---|---|
@@ -20,6 +25,7 @@ hunks, each in its own commit with the reason:
 | `List#accept`, `make_switch` | `pattern.method(:convert).to_proc` | `->(*a) { pattern.convert(*a) }` | refused on a pattern of several classes |
 | `visit` | `el.__send__(id, *args, &block)` | a `case` calling each method by name | the block did not arrive |
 | pager of `--help` | a branch under `if ... and false` with `Process.exec(..., in: f)` | removed | `exec` with options is refused, even dead |
+| pager of `--help` | `IO.popen(*args, &print)` | `Process.spawn` of the pager reading an `IO.pipe` | `IO.popen` with a write mode is not supported; through the splat it raised ArgumentError on a terminal with `PAGER` set |
 | `--version` | `--version=pkg` loads `optparse/version` | the package name is ignored | that file finds versions by constant names at run time |
 | `version`, `release` | `defined?(@version) && @version` | `@version` | `defined?` answered nil for an ivar set only by `attr_writer` |
 | `release` | `defined?(::Release) && ::Release` | `defined?(::Release) ? ::Release : nil` | refused under `--share-strings` |

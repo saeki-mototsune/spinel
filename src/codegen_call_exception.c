@@ -183,7 +183,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
   if (sp_streq(name, "detailed_message") && emit_exc_detailed_options(c, id, recv, argc, argv, b)) return 1;
   /* A marked message read takes the existing exception handle route,
      including a rescued variable specialized to an exception subclass. */
-  if (repr_share_rule(c) && is_exception_message(name) &&
+  if (is_exception_message(name) &&
       (repr_of(c, id).handle || repr_of(c, id).demand) && strbuf_route_exc_message(c, id))
     return emit_strbuf_route(c, id, b);
   /* A specialized rescue var (`rescue MyError => e`, MyError carrying ivars)
@@ -420,7 +420,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       buf_puts(b, "sp_box_obj(");
       if (hm) buf_puts(b, "sp_exc_attach_msg(");
       buf_printf(b, "sp_exc_exception((sp_Exception *)_t%d.v.p, ", t);
-      if (sm) { buf_puts(b, g_one_string ? "sp_exc_msg_given(SP_STR_B(" : "sp_exc_msg_given("); emit_expr(c, argv[0], b); buf_puts(b, g_one_string ? "))" : ")"); }
+      if (sm) { buf_puts(b, "sp_exc_msg_given(SP_STR_B("); emit_expr(c, argv[0], b); buf_puts(b, "))"); }
       else buf_printf(b, "_t%d.tag == SP_TAG_NIL ? (&(\"\\xff\")[1]) : sp_exc_msg_given(sp_poly_to_s(_t%d))", ta, ta);
       buf_puts(b, ")");
       if (hm) buf_printf(b, ", %s)", mh.p);
@@ -1073,17 +1073,16 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
             /* the exception is built here, holding the handle, as the
                rescue would build it (sp_exc_new_for_catch) */
             buf_printf(b, "sp_raise_exc((sp_Exception *)sp_exc_attach_msg(sp_exc_new_for_catch(\"%s\", "
-                          "sp_exc_msg_given(%s", effn, g_one_string ? "SP_STR_B(" : "");
+                          "sp_exc_msg_given(%s", effn, "SP_STR_B(");
             emit_expr(c, av[1], b);
-            buf_printf(b, "%s)), %s))", g_one_string ? ")" : "", mh.p);
+            buf_printf(b, "%s)), %s))", ")", mh.p);
             exc_msg_release(b, mk);
             free(mh.p);
           }
           else if (comp_ntype(c, av[1]) == TY_STRING) {
-            buf_printf(b, "sp_raise_cls(\"%s\", sp_exc_msg_given(%s", effn, g_one_string ? "SP_STR_B(" : "");
+            buf_printf(b, "sp_raise_cls(\"%s\", sp_exc_msg_given(%s", effn, "SP_STR_B(");
             emit_expr(c, av[1], b);
-            if (g_one_string) buf_puts(b, ")");
-            buf_puts(b, "))");
+            buf_puts(b, ")))");
           }
           else {
             /* nil is not a message, so the class name answers (#3812) */
@@ -1107,7 +1106,7 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
         buf_printf(b, "({ sp_RbVal _t%d = ", rk); emit_boxed(c, av[0], b);
         buf_printf(b, "; sp_RbVal _t%d = ", rm); emit_boxed(c, av[1], b);
         buf_printf(b, "; %s(_t%d, _t%d); })",
-                   repr_share_rule(c) && share_node_shares(c, av[1]) ? "sp_raise_poly_msg_h" : "sp_raise_poly_msg", rk, rm);
+                   "sp_raise_poly_msg_h", rk, rm);
       }
       else if (at == TY_EXCEPTION)
         { buf_puts(b, "sp_raise_exc((sp_Exception *)("); emit_expr(c, av[0], b); buf_puts(b, "))"); }
@@ -1140,13 +1139,13 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
         }
         else if (exc_msg_hold(c, av[0], b, &mh, &mk)) {
           buf_printf(b, "sp_raise_exc((sp_Exception *)sp_exc_attach_msg(sp_exc_new_for_catch(\"RuntimeError\", "
-                      "sp_exc_msg_given(%s", g_one_string ? "SP_STR_B(" : "");
+                      "sp_exc_msg_given(%s", "SP_STR_B(");
           emit_expr(c, av[0], b);
-          buf_printf(b, "%s)), %s))", g_one_string ? ")" : "", mh.p);
+          buf_printf(b, "%s)), %s))", ")", mh.p);
           exc_msg_release(b, mk);
           free(mh.p);
         }
-        else { buf_puts(b, g_one_string ? "sp_raise(sp_exc_msg_given(SP_STR_B(" : "sp_raise(sp_exc_msg_given("); emit_expr(c, av[0], b); buf_puts(b, g_one_string ? ")))" : "))"); }
+        else { buf_puts(b, "sp_raise(sp_exc_msg_given(SP_STR_B("); emit_expr(c, av[0], b); buf_puts(b, ")))"); }
       }
       else if (at == TY_POLY || at == TY_CLASS) {
         /* the runtime value may be a string, an exception object, an exception
@@ -1189,7 +1188,7 @@ int exc_msg_handle(Compiler *c, int arg, Buf *b) {
    with *mh the handle's text, and *mark the bound node's mark when b was
    opened (-1 otherwise); exc_msg_release closes it after the exception. */
 int exc_msg_holds(Compiler *c, int arg) {
-  return arg >= 0 && repr_share_rule(c) && comp_ntype(c, arg) == TY_STRING &&
+  return arg >= 0 && comp_ntype(c, arg) == TY_STRING &&
          share_plan_of(c, arg, SPR_TAKE, NULL).form == SPF_HANDLE;
 }
 int exc_msg_hold(Compiler *c, int arg, Buf *b, Buf *mh, int *mark) {

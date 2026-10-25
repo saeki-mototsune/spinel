@@ -34,7 +34,8 @@ static void emit_bm_legacy_casts_boxed(Compiler *c, int tr, int eargc, const int
         TyKind pk = repr_of(c, argv[k]).as_ty;
         char tn[24]; snprintf(tn, sizeof tn, "_t%d", atmp[k]);
         if (pk == TY_NIL) { buf_puts(b, "0"); continue; }
-        buf_puts(b, proc_slot_is_ptr(pk) ? "(sp_int)(uintptr_t)(" : "(sp_int)(");
+        int hdl = (pk == TY_STRING || pk == TY_STRBUF);   /* (as abi_sig_token says) */
+        buf_puts(b, hdl ? "(sp_int)(uintptr_t)SP_STR_HDL(" : proc_slot_is_ptr(pk) ? "(sp_int)(uintptr_t)(" : "(sp_int)(");
         emit_unbox_text(c, pk, tn, b);
         buf_puts(b, ")");
       }
@@ -385,11 +386,11 @@ int emit_op_method_to_proc(Compiler *c, const BopCtx *x, Buf *b) {
   if (target >= 0) {
     Scope *tm = &c->scopes[target];
     int np = tm->nparams;
-    int tid = ++g_proc_counter;
+    const char *tid = uid_new();
     /* a bound __bam wrapper carries param[0] in the Method's self slot:
        proc arg k maps to param[k + shift] */
     int shift = method_call_param_shift(c, mn, target);
-    char mtpn[40]; snprintf(mtpn, sizeof mtpn, "_mtp_%d", tid);
+    char mtpn[UNIT_TAG_MAX + 16]; snprintf(mtpn, sizeof mtpn, "_mtp_%s", tid);
     emit_method_tramp_fn(c, tm, shift, mtpn, 0, method_node_recv_class(c, recv, tm->class_id), NULL, NULL);
     /* arity: required count (minus the self-carried wrapper param),
        negative when the signature is variadic (the Scope folds
@@ -403,7 +404,7 @@ int emit_op_method_to_proc(Compiler *c, const BopCtx *x, Buf *b) {
       buf_printf(b, "({ void *_t%d = (void *)(", tcap);
       emit_expr(c, recv, b);
       buf_printf(b, "); SP_GC_ROOT(_t%d);", tcap);
-      buf_printf(b, " sp_proc_new_meta((void *)_mtp_%d, _t%d, sp_bm_cap_scan, %d, TRUE, 0, NULL, NULL); })",
+      buf_printf(b, " sp_proc_new_meta((void *)_mtp_%s, _t%d, sp_bm_cap_scan, %d, TRUE, 0, NULL, NULL); })",
                  tid, tcap, m_arity); }
     return 1;
   }
@@ -1109,7 +1110,10 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
         bxtmp[k] = ++g_tmp;
         emit_ctype(c, pk, b); buf_printf(b, " _t%d = ", bxtmp[k]); emit_expr(c, argv[k], b); buf_puts(b, "; ");
         emit_named_root(c, pk, "_t", bxtmp[k], b); buf_puts(b, " ");
-        buf_printf(b, "sp_int _t%d = (sp_int)(uintptr_t)(_t%d)", atmp[k], bxtmp[k]);
+        /* (one-String mode: a String goes to the cast as its handle, which
+           every String parameter is) */
+        int hdl = (pk == TY_STRING || pk == TY_STRBUF);
+        buf_printf(b, "sp_int _t%d = (sp_int)(uintptr_t)(%s_t%d%s)", atmp[k], hdl ? "SP_STR_HDL(" : "", bxtmp[k], hdl ? ")" : "");
       }
       else {
         Repr pkr = repr_of(c, argv[k]);
@@ -1118,14 +1122,14 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
           bxtmp[k] = ++g_tmp; bxo[k] = 1; any_bxo = 1;
           buf_printf(b, "sp_RbVal _t%d = %s(", bxtmp[k], pk == TY_FLOAT ? "sp_box_ofloat" : "sp_box_oint");
           emit_oint_expr(c, argv[k], pk, b); buf_puts(b, "); ");
-          buf_printf(b, "sp_int _t%d = sp_poly_to_i(_t%d)", atmp[k], bxtmp[k]);
+          buf_printf(b, "sp_int _t%d = _t%d.v.i", atmp[k], bxtmp[k]);
         }
         else if (bm_want_boxed && pk != TY_UNKNOWN && pk != TY_VOID && pk != TY_NIL) {
           bxtmp[k] = ++g_tmp;
           emit_ctype(c, pk, b); buf_printf(b, " _t%d = ", bxtmp[k]); emit_expr(c, argv[k], b); buf_puts(b, "; ");
           emit_named_root(c, pk, "_t", bxtmp[k], b); buf_puts(b, " ");
           buf_printf(b, "sp_int _t%d = ", atmp[k]);
-          if (pkr.kind == RK_BOXED) buf_printf(b, "sp_poly_to_i(_t%d)", bxtmp[k]);
+          if (pkr.kind == RK_BOXED) buf_printf(b, "_t%d.v.i", bxtmp[k]);
           else buf_printf(b, "(sp_int)(_t%d)", bxtmp[k]);
         }
         else {
@@ -1666,7 +1670,7 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       buf_printf(b, "void *_t%d = (void *)sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
                     " sp_PolyArray_push((sp_PolyArray *)_t%d, _t%d); ", self_tmp, self_tmp, self_tmp, tbr);
     }
-    else if (self_receiver && repr_share_rule(c) && method_call_param_shift(c, id, mi) &&
+    else if (self_receiver && method_call_param_shift(c, id, mi) &&
              repr_of_slot(c, scope_local(&c->scopes[mi], c->scopes[mi].pnames[0])).kind == RK_STRBUF) {
       /* Capture the representation the wrapper receives, including the
          root kind the Method's collector follows after construction. */
@@ -1796,11 +1800,22 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
           }
           else if (oi == 1) {
             buf_printf(&g_proc_protos, "static sp_int _bam_%sArray_set(void *a, sp_int i, sp_int v);\n", bk);
+            /* (one-String mode: the element comes as its handle, and the
+               value answered is its String, as the stamped kind reads it) */
+            if (ki == 1)
+              buf_printf(&g_procs, "static sp_int _bam_%sArray_set(void *a, sp_int i, sp_int v) {\n"
+                                   "  sp_%sArray_set_e((sp_%sArray *)a, i, (sp_String *)(uintptr_t)v);\n"
+                                   "  return (sp_int)(uintptr_t)SP_STR_B((sp_String *)(uintptr_t)v);\n}\n", bk, bk, bk);
+            else
             buf_printf(&g_procs, "static sp_int _bam_%sArray_set(void *a, sp_int i, sp_int v) {\n"
                                  "  sp_%sArray_set((sp_%sArray *)a, i, %sv);\n  return v;\n}\n", bk, bk, bk, uncast);
           }
           else {
             buf_printf(&g_proc_protos, "static sp_int _bam_%sArray_push(void *a, sp_int v);\n", bk);
+            if (ki == 1)
+              buf_printf(&g_procs, "static sp_int _bam_%sArray_push(void *a, sp_int v) {\n"
+                                   "  sp_%sArray_push_e((sp_%sArray *)a, (sp_String *)(uintptr_t)v);\n  return (sp_int)(uintptr_t)a;\n}\n", bk, bk, bk);
+            else
             buf_printf(&g_procs, "static sp_int _bam_%sArray_push(void *a, sp_int v) {\n"
                                  "  sp_%sArray_push((sp_%sArray *)a, %sv);\n  return (sp_int)(uintptr_t)a;\n}\n", bk, bk, bk, uncast);
           }
@@ -2180,6 +2195,9 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
                  emit_boxed_text(c, _at, _tn, b); } \
         } \
         else if (mabi_poly) emit_boxed(c, argv[k], b); \
+        else if (aptmp && (repr_of(c, argv[k]).as_ty == TY_STRING || \
+                                           repr_of(c, argv[k]).as_ty == TY_STRBUF)) \
+          buf_printf(b, "(sp_int)(uintptr_t)SP_STR_HDL(_t%d)", aptmp[k]); \
         else EMIT_POLY_CALL_SLOT(k); \
       } while (0)
       /* both arms yield a BOXED result now that the call types poly: the

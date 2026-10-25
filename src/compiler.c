@@ -112,7 +112,8 @@ Compiler *comp_new(const NodeTable *nt) {
   /* On only when set to something: empty is off, as SPINEL_DEFER_REFUSALS
      reads it, and so is "0", as SPINEL_GATE_RAISE=0 and SPINEL_INLINE_FORCE=0
      are. An environment that exports the variable as "0" or "" means off. */
-  c->share_strings = sp_share_strings_env();
+  c->share_strings = 1;
+  comp_node_pbases(c);
   comp_node_ord(c, 0, NULL);   /* number the parsed nodes before any rewrite */
   c->node_ord_parsed = nt->count;
   return c;
@@ -126,9 +127,164 @@ Compiler *comp_new(const NodeTable *nt) {
    among the program's nodes. A node the parser stamped as spliced from
    builtins/ (`node_bi`, which a clone carries along) is numbered by its place
    among the nodes of its base, the builtin method it sits in, so an edit to
-   one builtin method renames nothing outside it. A number once given is
-   kept: the table is extended over the nodes appended since, never refilled,
-   so a node a rewrite resets keeps its number and cannot hand it to another. */
+   one builtin method renames nothing outside it. A program node counts the
+   same way within the def, class or module it is in (comp_node_pbases), so
+   an edit to one method renames nothing in another; only a node outside
+   every def and class is numbered among the program's such nodes. A number
+   once given is kept: the table is extended over the nodes appended since,
+   never refilled, so a node a rewrite resets keeps its number and cannot
+   hand it to another. */
+static void bi_base_reserve(Compiler *c, int b) {
+  if (b < c->bi_base_cap) return;
+  int cap = c->bi_base_cap ? c->bi_base_cap : 64;
+  while (cap <= b) cap *= 2;
+  int *gc = realloc(c->bi_base_cnt, sizeof(int) * (size_t)cap);
+  char **gk = realloc(c->bi_base_key, sizeof(char *) * (size_t)cap);
+  if (!gc || !gk) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int j = c->bi_base_cap; j < cap; j++) { gc[j] = 0; gk[j] = NULL; }
+  c->bi_base_cnt = gc; c->bi_base_key = gk; c->bi_base_cap = cap;
+}
+
+/* A C-safe spelling of `nm` of at most `max` characters, into key; returns
+   the length the whole spelling takes, so a larger one says it was cut. */
+static size_t key_spell(char *key, size_t max, size_t o, const char *nm) {
+  size_t whole = o;
+  for (const char *q = nm; *q; q++) {
+    if ((*q >= 'a' && *q <= 'z') || (*q >= 'A' && *q <= 'Z') || (*q >= '0' && *q <= '9') || *q == '_') {
+      if (o == whole && o < max) key[o++] = *q;
+      whole++;
+    } else {
+      if (o == whole && o + 3 <= max) o += (size_t)snprintf(key + o, 4, "x%02x", (unsigned char)*q);
+      whole += 3;
+    }
+  }
+  key[o] = '\0';
+  return whole;
+}
+
+/* How many times `key` has been given to a program base before this one:
+   a reopened class, a method defined twice. */
+static int pbase_key_count(Compiler *c, const char *key) {
+  if (c->pbase_key_slots == 0 || (c->pbase_key_n + 1) * 2 > c->pbase_key_slots) {
+    int ns = c->pbase_key_slots ? c->pbase_key_slots * 2 : 1024;
+    char **nk = calloc((size_t)ns, sizeof(char *));
+    int *nc = calloc((size_t)ns, sizeof(int));
+    if (!nk || !nc) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < c->pbase_key_slots; i++) {
+      if (!c->pbase_keys[i]) continue;
+      unsigned h = 2166136261u;
+      for (const char *q = c->pbase_keys[i]; *q; q++) h = (h ^ (unsigned char)*q) * 16777619u;
+      int j = (int)(h & (unsigned)(ns - 1));
+      while (nk[j]) j = (j + 1) & (ns - 1);
+      nk[j] = c->pbase_keys[i]; nc[j] = c->pbase_key_cnt[i];
+    }
+    free(c->pbase_keys); free(c->pbase_key_cnt);
+    c->pbase_keys = nk; c->pbase_key_cnt = nc; c->pbase_key_slots = ns;
+  }
+  unsigned h = 2166136261u;
+  for (const char *q = key; *q; q++) h = (h ^ (unsigned char)*q) * 16777619u;
+  int j = (int)(h & (unsigned)(c->pbase_key_slots - 1));
+  while (c->pbase_keys[j]) {
+    if (!strcmp(c->pbase_keys[j], key)) return c->pbase_key_cnt[j]++;
+    j = (j + 1) & (c->pbase_key_slots - 1);
+  }
+  c->pbase_keys[j] = strdup(key); c->pbase_key_cnt[j] = 1;
+  c->pbase_key_n++;
+  return 0;
+}
+
+/* The program's bases and their keys: one walk of the parsed tree from the
+   root. A def's key is its class's key and its name (`Model_label`,
+   `Model_s_make` for a class method), a class's its name under its outer
+   one, so two methods of one name in two classes never share a base. A key
+   longer than 24 characters keeps its head and a hash of the whole; a key
+   given twice (a reopened class, a redefinition) gets `_dN`. */
+void comp_node_pbases(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int n = nt->count;
+  c->node_pbase = malloc(sizeof(int) * (size_t)(n > 0 ? n : 1));
+  if (!c->node_pbase) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  /* -2 until walked: a top-level node's -1 then also says it was */
+  for (int i = 0; i < n; i++) c->node_pbase[i] = -2;
+  c->node_pbase_n = n;
+  if (n <= 0) return;
+  int cap = n * 2;
+  int *stack = malloc(sizeof(int) * (size_t)cap);
+  if (!stack) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  int sp = 0;
+  stack[sp++] = 0; stack[sp++] = -1;   /* node, base */
+  while (sp > 0) {
+    int base = stack[--sp], k = stack[--sp];
+    if (k < 0 || k >= n || c->node_pbase[k] != -2) continue;
+    const char *ty = nt_type(nt, k);
+    int is_def = ty && !strcmp(ty, "DefNode");
+    int is_cls = ty && (!strcmp(ty, "ClassNode") || !strcmp(ty, "ModuleNode") || !strcmp(ty, "SingletonClassNode"));
+    if ((is_def || is_cls) && nt_int(nt, k, "node_bi", 0) == 0) {
+      /* the base's key, `_`, then the name after its length in the source
+         (5Cloud_3sum, 2ax3f for a?): a name holds `_` and `x` too, no name
+         starts with a digit, and the length tells an `x3f` spelled for one
+         byte from three, so no two definitions spell one key */
+      char key[128]; size_t o = 0;
+      if (base >= 0 && c->bi_base_key[base]) o = (size_t)snprintf(key, 64, "%s_", c->bi_base_key[base]);
+      if (o > 63) o = 63;
+      const char *nm = NULL;
+      if (is_def) {
+        nm = nt_str(nt, k, "name");
+        if (nt_ref(nt, k, "receiver") >= 0) key[o++] = 's';
+      }
+      else if (ty[0] == 'S') nm = "sclass";
+      else {
+        int cp = nt_ref(nt, k, "constant_path");
+        nm = cp >= 0 ? nt_str(nt, cp, "name") : NULL;
+      }
+      const char *nw = nm && *nm ? nm : ty;
+      char sp[64];
+      /* cut at 60, the spelling can lose all that tells two names apart */
+      int cut = key_spell(sp, 60, 0, nw) > 60;
+      /* an escaped byte in a name that also holds a literal `x` can spell
+         like another name of its length (éxc3xa9 and xc3xa9é both spell
+         xc3xa9xc3xa9): the key then takes a hash of the name itself */
+      int odd = nw[strspn(nw, "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_")] && strchr(nw, 'x');
+      o += (size_t)snprintf(key + o, sizeof key - o, "%zu%s", strlen(nw), sp);
+      if (o > 24 || odd) {
+        unsigned h = 2166136261u;
+        for (const char *q = key; *q; q++) h = (h ^ (unsigned char)*q) * 16777619u;
+        if (cut || odd) for (const char *q = nw; *q; q++) h = (h ^ (unsigned char)*q) * 16777619u;
+        if (o > 15) o = 15;
+        snprintf(key + o, sizeof key - o, "_%08x", h);
+      }
+      int dup = pbase_key_count(c, key);
+      if (dup) {
+        /* the whole key (at most 24 here) and a `_dN` no key has taken */
+        char root[sizeof key];
+        snprintf(root, sizeof root, "%s", key);
+        do snprintf(key, sizeof key, "%s_d%d", root, dup++);
+        while (pbase_key_count(c, key));
+      }
+      bi_base_reserve(c, k);
+      c->bi_base_key[k] = strdup(key);
+      base = k;
+    }
+    c->node_pbase[k] = base;
+    /* a child two nodes share is pushed by each */
+    int nr = nt_num_refs(nt, k), na = nt_num_arrs(nt, k), need = nr;
+    for (int i = 0; i < na; i++) { int cnt = 0; nt_arr_at(nt, k, i, &cnt); need += cnt; }
+    if (sp + need * 2 > cap) {
+      while (sp + need * 2 > cap) cap *= 2;
+      int *ns = realloc(stack, sizeof(int) * (size_t)cap);
+      if (!ns) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      stack = ns;
+    }
+    for (int i = nr - 1; i >= 0; i--) { int r = nt_ref_at(nt, k, i); if (r >= 0 && r < n) { stack[sp++] = r; stack[sp++] = base; } }
+    for (int i = na - 1; i >= 0; i--) {
+      int cnt = 0; const int *ids = nt_arr_at(nt, k, i, &cnt);
+      for (int j = cnt - 1; j >= 0; j--) if (ids[j] >= 0 && ids[j] < n) { stack[sp++] = ids[j]; stack[sp++] = base; }
+    }
+  }
+  free(stack);
+  for (int i = 0; i < n; i++) if (c->node_pbase[i] == -2) c->node_pbase[i] = -1;   /* not reached: no base */
+}
+
 static void comp_node_base_key(Compiler *c, int b) {
   const NodeTable *nt = c->nt;
   const char *nm = nt_str(nt, b, "name");
@@ -158,10 +314,16 @@ static void comp_node_base_key(Compiler *c, int b) {
 static int comp_node_base(Compiler *c, int k) {
   const NodeTable *nt = c->nt;
   int b = (int)nt_int(nt, k, "node_bi", 0) - 1;
+  if (b < 0 && k < c->node_pbase_n) b = c->node_pbase[k];
   if (b < 0 && k >= c->node_ord_parsed && c->nscope && k < c->node_cap) {
     int si = c->nscope[k];
     int dn = si > 0 && si < c->nscopes ? c->scopes[si].def_node : -1;
-    if (dn >= 0 && dn < nt->count) b = (int)nt_int(nt, dn, "node_bi", 0) - 1;
+    if (dn >= 0 && dn < nt->count) {
+      b = (int)nt_int(nt, dn, "node_bi", 0) - 1;
+      /* a program's def: the node counts in it; a block or a lambda, or a
+         def a rewrite made, in the base that one counts in */
+      if (b < 0 && dn != k) b = dn < c->node_pbase_n ? c->node_pbase[dn] : comp_node_base(c, dn);
+    }
   }
   return b >= 0 && b < nt->count ? b : -1;
 }
@@ -170,15 +332,7 @@ static void comp_node_ord_assign(Compiler *c, int k) {
   int b = comp_node_base(c, k);
   c->node_base[k] = b;
   if (b < 0) { c->node_ord[k] = c->node_ord_prog++ << 1; return; }
-  if (b >= c->bi_base_cap) {
-    int cap = c->bi_base_cap ? c->bi_base_cap : 64;
-    while (cap <= b) cap *= 2;
-    int *gc = realloc(c->bi_base_cnt, sizeof(int) * (size_t)cap);
-    char **gk = realloc(c->bi_base_key, sizeof(char *) * (size_t)cap);
-    if (!gc || !gk) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-    for (int j = c->bi_base_cap; j < cap; j++) { gc[j] = 0; gk[j] = NULL; }
-    c->bi_base_cnt = gc; c->bi_base_key = gk; c->bi_base_cap = cap;
-  }
+  bi_base_reserve(c, b);
   if (!c->bi_base_key[b]) comp_node_base_key(c, b);
   c->node_ord[k] = (c->bi_base_cnt[b]++ << 1) | 1;
 }
@@ -208,23 +362,24 @@ int comp_node_ord(Compiler *c, int id, int *builtin) {
   if (id < 0 || id >= c->node_ord_n) { if (builtin) *builtin = 0; return 0; }
   if (c->node_ord[id] < 0) comp_node_ord_assign(c, id);
   int v = c->node_ord[id];
-  if (builtin) *builtin = v & 1;
+  if (builtin) *builtin = (v & 1) && c->node_base[id] >= 0 && nt_int(c->nt, c->node_base[id], "node_bi", 0) > 0;
   return v >> 1;
 }
 
-/* comp_node_ord as the text a name carries: "12" for a program node, and
-   for a builtin's "q", its method's name and its number there ("qmin_by_12"),
-   so the two never name the same thing. The text lives until eight more have
-   been asked for. */
+/* comp_node_ord as the text a name carries: "12" for a program node outside
+   every def and class, "p5Model_5label_3" for one in a method (its base's key
+   and its number there), and for a builtin's "q", its method's name and its
+   number there ("qmin_by_12"), so no two name the same thing. The text lives
+   until eight more have been asked for. */
 const char *comp_node_tag(Compiler *c, int id) {
   static char ring[8][200];
   static int next = 0;
   char *t = ring[next++ & 7];
   int b = 0;
   int ord = comp_node_ord(c, id, &b);
-  int base = b ? c->node_base[id] : -1;
+  int base = id >= 0 && id < c->node_ord_n && (c->node_ord[id] & 1) ? c->node_base[id] : -1;
   if (base >= 0 && base < c->bi_base_cap && c->bi_base_key[base])
-    snprintf(t, sizeof ring[0], "q%s_%d", c->bi_base_key[base], ord);
+    snprintf(t, sizeof ring[0], "%c%s_%d", b ? 'q' : 'p', c->bi_base_key[base], ord);
   else snprintf(t, sizeof ring[0], "%d", ord);
   return t;
 }
@@ -273,12 +428,10 @@ void comp_free(Compiler *c) {
   for (int i = 0; i < c->n_cext_classes; i++) free(c->cext_classes[i].path);
   free(c->cext_classes);
   share_facts_free(c);
-  share_check_free(c);
   share_plan_free(c);
   free(c->bsl_gen);
   free(c->bsl_val);
   if (g_repr_check) repr_channel_free(c);
-  share_routes_free(c);
   free(c->byref_elig);
   c->byref_elig = NULL;
   c->nbyref_elig = 0;
@@ -294,9 +447,6 @@ void comp_free(Compiler *c) {
   free(c->cg_parent);
   c->cg_parent = NULL;
   c->cg_parent_n = 0;
-  free(c->strh_no);
-  c->strh_no = NULL;
-  c->strh_no_cap = 0;
   free(c->lazy_hoist);
   c->lazy_hoist = NULL;
   c->lazy_hoist_n = 0;
@@ -314,9 +464,11 @@ void comp_free(Compiler *c) {
   c->pres_names = NULL; c->pres_flags = NULL; c->npres = c->cpres = 0;
   free(c->nil_fact);
   free(c->nil_elem_fact);
-  free(c->cls_fact); free(c->cls_pool); free(c->cls_kind);
+  free(c->cls_fact); cls_pool_free(c->cls_pool, c->ncls_pool); free(c->cls_kind);
   free(c->send_param_memo);
-  free(c->node_ord); free(c->node_base);
+  free(c->node_ord); free(c->node_base); free(c->node_pbase);
+  for (int k = 0; k < c->pbase_key_slots; k++) free(c->pbase_keys[k]);
+  free(c->pbase_keys); free(c->pbase_key_cnt);
   for (int k = 0; k < c->bi_base_cap; k++) free(c->bi_base_key[k]);
   free(c->bi_base_key); free(c->bi_base_cnt);
   c->blk_body_map = NULL; c->blk_body_map_n = 0;
@@ -788,6 +940,7 @@ int comp_ivar_intern(ClassInfo *ci, const char *name) {
     ci->ivar_nullable_int = realloc(ci->ivar_nullable_int, (size_t)ci->civars);
     ci->ivar_nullable_int_elem = realloc(ci->ivar_nullable_int_elem, (size_t)ci->civars);
     ci->ivar_arr_elem_arr_or_nil = realloc(ci->ivar_arr_elem_arr_or_nil, (size_t)ci->civars);
+    ci->ivar_alias_wide = realloc(ci->ivar_alias_wide, (size_t)ci->civars);
   }
   ci->ivars[ci->nivars] = strdup(name);
   ((TyKind *)ci->ivar_types)[ci->nivars] = TY_UNKNOWN;
@@ -801,6 +954,7 @@ int comp_ivar_intern(ClassInfo *ci, const char *name) {
   ci->ivar_nullable_int[ci->nivars] = 0;
   ci->ivar_nullable_int_elem[ci->nivars] = 0;
   ci->ivar_arr_elem_arr_or_nil[ci->nivars] = 0;
+  ci->ivar_alias_wide[ci->nivars] = 0;
   return ci->nivars++;
 }
 
@@ -825,6 +979,7 @@ int comp_member_intern(ClassInfo *ci, const char *name) {
     IV_SWAP(ivar_nullable_int, unsigned char);
     IV_SWAP(ivar_nullable_int_elem, unsigned char);
     IV_SWAP(ivar_arr_elem_arr_or_nil, unsigned char);
+    IV_SWAP(ivar_alias_wide, unsigned char);
 #undef IV_SWAP
   }
   return ci->nmembers++;
@@ -1258,6 +1413,52 @@ int comp_name_reader_any(Compiler *c, const char *name) {
   if (!rda_name[j]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   rda_ans[j] = (signed char)ans; rda_n++;
   return ans;
+}
+
+/* See compiler.h. Kept as comp_name_reader_any's answers are, under the same
+   stamps, in a table of its own: the names, each one's list and count. */
+static char **rdo_name; static int **rdo_list; static int *rdo_n; static int rdo_cap, rdo_cnt;
+static const Compiler *rdo_c; static unsigned rdo_tgen, rdo_shape; static int rdo_ncls = -1;
+const int *comp_name_reader_owners(Compiler *c, const char *name, int *n) {
+  *n = 0;
+  if (!name) return NULL;
+  if (rdo_c != c || rdo_tgen != comp_table_gen || rdo_shape != cmc_shape || rdo_ncls != c->nclasses) {
+    for (int i = 0; i < rdo_cap; i++) { free(rdo_name[i]); rdo_name[i] = NULL; free(rdo_list[i]); rdo_list[i] = NULL; }
+    rdo_cnt = 0; rdo_c = c; rdo_tgen = comp_table_gen; rdo_shape = cmc_shape; rdo_ncls = c->nclasses;
+  }
+  if (rdo_cnt * 2 >= rdo_cap) {
+    int ocap = rdo_cap; char **on = rdo_name; int **ol = rdo_list; int *oc = rdo_n;
+    rdo_cap = ocap ? ocap * 2 : 256;
+    rdo_name = calloc((size_t)rdo_cap, sizeof(char *));
+    rdo_list = calloc((size_t)rdo_cap, sizeof(int *));
+    rdo_n = calloc((size_t)rdo_cap, sizeof(int));
+    if (!rdo_name || !rdo_list || !rdo_n) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < ocap; i++) {
+      if (!on[i]) continue;
+      unsigned j = sp_strhash(on[i]) & (unsigned)(rdo_cap - 1);
+      while (rdo_name[j]) j = (j + 1) & (unsigned)(rdo_cap - 1);
+      rdo_name[j] = on[i]; rdo_list[j] = ol[i]; rdo_n[j] = oc[i];
+    }
+    free(on); free(ol); free(oc);
+  }
+  unsigned j = sp_strhash(name) & (unsigned)(rdo_cap - 1);
+  while (rdo_name[j]) {
+    if (sp_streq(rdo_name[j], name)) { *n = rdo_n[j]; return rdo_list[j]; }
+    j = (j + 1) & (unsigned)(rdo_cap - 1);
+  }
+  int cnt = 0, *list = NULL;
+  for (int k = 0; k < c->nclasses; k++) {
+    int dc = -1;
+    if (!comp_reader_in_chain(c, k, name, &dc) || dc != k) continue;
+    int *g = realloc(list, sizeof(int) * (size_t)(cnt + 1));
+    if (!g) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    list = g; list[cnt++] = k;
+  }
+  rdo_name[j] = strdup(name);
+  if (!rdo_name[j]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  rdo_list[j] = list; rdo_n[j] = cnt; rdo_cnt++;
+  *n = cnt;
+  return list;
 }
 
 int comp_ary_root(Compiler *c, int cid) {
@@ -2596,6 +2797,9 @@ int comp_enum_answers_first(Compiler *c, int cid, const char *name) {
 }
 int comp_comparable_answers_first(Compiler *c, int cid, const char *name) {
   return mixin_answers_first(c, cid, name, 1);
+}
+int comp_enum_reaches(Compiler *c, int cid) {
+  return cid >= 0 && cid < c->nclasses && mixin_reaches(c, cid, 0, 0);
 }
 int comp_comparable_reaches(Compiler *c, int cid) {
   return cid >= 0 && cid < c->nclasses && mixin_reaches(c, cid, 1, 0);
@@ -3951,6 +4155,7 @@ LocalVar *scope_local_intern(Scope *s, const char *name) {
   lv->store_key_src = 0;
   lv->store_val_src = 0;
   lv->store_elems_src = 0;
+  lv->store_merge_src = 0;
   lv->store_rest_src = 0;
   scope_locals_appended(s);
   return lv;

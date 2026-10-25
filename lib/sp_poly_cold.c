@@ -32,6 +32,56 @@ sp_RbVal sp_cext_plain_object_new(void) {
 sp_RbVal sp_cext_hash_new(void) {
   return sp_box_obj(sp_PolyPolyHash_new(), SP_BUILTIN_POLY_POLY_HASH);
 }
+/* an object of the program as an Integer: its to_int, else CRuby's TypeError */
+sp_int sp_cext_object_to_int(sp_RbVal object) {
+  return sp_poly_arg_int_obj(object);
+}
+/* CRuby's T_* number for a value: an extension data class instance is
+   T_DATA, an instance of a program class that inherits from a builtin answers
+   as that builtin, a Struct's or a Data's T_STRUCT. */
+static int sp_cext_class_type(int cls_id) {
+  if (!sp_class_kind_of_name_fn) return T_OBJECT;
+  if (sp_class_kind_of_name_fn(cls_id, "Array")) return T_ARRAY;
+  if (sp_class_kind_of_name_fn(cls_id, "Hash")) return T_HASH;
+  if (sp_class_kind_of_name_fn(cls_id, "String")) return T_STRING;
+  if (sp_class_kind_of_name_fn(cls_id, "Struct") || sp_class_kind_of_name_fn(cls_id, "Data")) return T_STRUCT;
+  return T_OBJECT;
+}
+int sp_cext_type(sp_RbVal v, int (*data_class)(int)) {
+  switch (v.tag) {
+  case SP_TAG_NIL: return T_NIL;
+  case SP_TAG_BOOL: return v.v.b ? T_TRUE : T_FALSE;
+  case SP_TAG_INT: return v.v.i >= RUBY_FIXNUM_MIN && v.v.i <= RUBY_FIXNUM_MAX ? T_FIXNUM : T_BIGNUM;
+  case SP_TAG_BIGINT: return T_BIGNUM;
+  case SP_TAG_FLT: return T_FLOAT;
+  case SP_TAG_SYM: return T_SYMBOL;
+  case SP_TAG_STR: return T_STRING;
+  case SP_TAG_CLASS:
+    return sp_class_is_module_fn && sp_class_is_module_fn((sp_Class){v.cls_id, NULL}) ? T_MODULE : T_CLASS;
+  case SP_TAG_OBJ:
+    if (v.cls_id == SP_BUILTIN_STRBUF) return T_STRING;
+    if (sp_poly_is_array_kind(v.cls_id)) return T_ARRAY;
+    if (sp_poly_is_hash_kind(v.cls_id)) return T_HASH;
+    if (v.cls_id >= 0) return data_class && data_class(v.cls_id) ? T_DATA : sp_cext_class_type(v.cls_id);
+    switch (v.cls_id) {
+    case SP_BUILTIN_REGEX: return T_REGEXP;
+    case SP_BUILTIN_RANGE: case SP_BUILTIN_FLOAT_RANGE: case SP_BUILTIN_STR_RANGE: return T_STRUCT;
+    case SP_BUILTIN_IO: return T_FILE;
+    case SP_BUILTIN_MATCHDATA: return T_MATCH;
+    case SP_BUILTIN_COMPLEX: return T_COMPLEX;
+    case SP_BUILTIN_RATIONAL: case SP_BUILTIN_BIG_RATIONAL: return T_RATIONAL;
+    case SP_BUILTIN_OBJECT: case SP_BUILTIN_BASIC_OBJECT: case SP_BUILTIN_EXCEPTION: return T_OBJECT;
+    default: return T_DATA;
+    }
+  default: return T_OBJECT;
+  }
+}
+/* hash[key], with the Hash's default or default proc for a missing key */
+sp_RbVal sp_cext_hash_get(sp_RbVal hash, sp_RbVal key) {
+  if(hash.tag != SP_TAG_OBJ || !sp_poly_is_hash_kind(hash.cls_id))
+    sp_raise_cls("TypeError", "expected a Hash");
+  return sp_poly_index_poly(hash, key);
+}
 void sp_cext_hash_set(sp_RbVal hash, sp_RbVal key, sp_RbVal value) {
   if(hash.tag != SP_TAG_OBJ || hash.cls_id != SP_BUILTIN_POLY_POLY_HASH)
     sp_raise_cls("TypeError", "expected a widened Hash");
@@ -695,8 +745,22 @@ sp_RbVal sp_poly_slice_or_call(sp_RbVal v, sp_RbVal a, sp_RbVal b)
   return sp_poly_slice(v, sp_poly_arg_int_chk(a), sp_poly_arg_int_chk(b));
 }
 
+/* Object's copy machinery allocates a receiver before initialize_copy fails.
+   Do not copy a queue's synchronization state or return the original handle. */
+sp_queue *sp_Queue_copy_error(sp_queue *q) {
+  if (!q) return NULL;  /* a nullable typed receiver is nil, whose copy is nil */
+  SP_GC_ROOT(q);
+  sp_queue *copy = sp_Queue_max(q) > 0 ? sp_SizedQueue_new(sp_Queue_max(q)) : sp_Queue_new();
+  SP_GC_ROOT(copy);
+  sp_RbVal original = sp_box_obj(q, SP_BUILTIN_QUEUE);
+  sp_raise_nomethod(sp_nomethod_msg_args("initialize_copy", sp_box_obj(copy, SP_BUILTIN_QUEUE), 1, &original));
+  return NULL;
+}
+
 sp_RbVal sp_poly_dup(sp_RbVal v, int keep_frozen)
 {
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_QUEUE && v.v.p)
+    sp_Queue_copy_error((sp_queue *)v.v.p);
 #ifdef SP_CEXT
   if (v.tag == SP_TAG_OBJ && v.cls_id >= 0 && sp_cext_data_class_fn && sp_cext_data_class_fn(v.cls_id))
     return sp_cext_duplicate(v, keep_frozen);
@@ -1652,4 +1716,47 @@ else {
   }
   buf[out] = 0;
   char *r = sp_str_alloc(out); memcpy(r, buf, out); free(buf); return r;
+}
+
+/* A grouped redirection shares one open file description across its slots. */
+static int sp_process_redirect_slot(sp_RbVal key) {
+  if (key.tag == SP_TAG_INT) return key.v.i >= 0 && key.v.i < 3 ? (int)key.v.i : -1;
+  if (key.tag != SP_TAG_SYM || !sp_sym_name_fn) return -1;
+  const char *name = sp_sym_name_fn((sp_sym)key.v.i);
+  return strcmp(name, "in") == 0 ? 0 : strcmp(name, "out") == 0 ? 1 :
+         strcmp(name, "err") == 0 ? 2 : -1;
+}
+static int sp_process_redirect_group(sp_RbVal key) {
+  if (!sp_rbval_is_array(key)) return 0;
+  int mask = 0;
+  sp_int n = sp_poly_length(key);
+  for (sp_int j = 0; j < n; j++) {
+    int slot = sp_process_redirect_slot(sp_poly_arr_get(key, j));
+    if (slot < 0) return 0;
+    mask |= 1 << slot;
+  }
+  return mask;
+}
+/* Process.spawn's value for one standard descriptor slot (0 in, 1 out,
+   2 err): a :in/:out/:err key, or an Array key such as [:out, :err] that
+   names the slot. For a group, *prior is the group's first slot when that
+   comes before this one, so the caller reuses the descriptor it resolved
+   there instead of opening the same file again. */
+sp_RbVal sp_process_redirect_value(sp_RbVal opts, int slot, sp_bool *found, int *prior) {
+  SP_GC_ROOT_RBVAL(opts);
+  *found = FALSE;
+  *prior = -1;
+  for (sp_int j = 0, n = sp_poly_length(opts); j < n; j++) {
+    sp_RbVal key, value;
+    sp_poly_hash_pair(opts, j, &key, &value);
+    if (key.tag == SP_TAG_SYM && sp_process_redirect_slot(key) == slot) {
+      *found = TRUE; return value;
+    }
+    int mask = sp_process_redirect_group(key);
+    if (mask & (1 << slot)) {
+      for (int k = 0; k < slot; k++) if (mask & (1 << k)) { *prior = k; break; }
+      *found = TRUE; return value;
+    }
+  }
+  return sp_box_nil();
 }

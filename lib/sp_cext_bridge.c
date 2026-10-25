@@ -86,17 +86,34 @@ static VALUE lookup(const char *name) {
     if (!sp_cext_class_lookup_fn) sp_raise_cls("RuntimeError", "C extension class hook is missing");
     return sp_cext_value(sp_cext_class_lookup_fn(name));
 }
-static VALUE define_under(VALUE outer, const char *name) {
+/* Paths the running Init has defined, so rb_const_defined answers as the
+ * recorder did: from the extension's own definitions and the builtins it
+ * knows, never from the program's Ruby state. */
+static char **init_paths;
+static size_t init_path_count;
+static char *qualified(VALUE outer, const char *name) {
     const char *parent = class_name(outer);
-    if (!strcmp(parent, "Object")) return lookup(name);
     size_t len = strlen(parent) + strlen(name) + 3;
     char *full = malloc(len); if (!full) rb_raise(rb_eNoMemError, "class name allocation failed");
-    snprintf(full, len, "%s::%s", parent, name);
-    VALUE v = lookup(full); free(full); return v;
+    if (!strcmp(parent, "Object")) snprintf(full, len, "%s", name);
+    else snprintf(full, len, "%s::%s", parent, name);
+    return full;
 }
-VALUE rb_define_class(const char *name, VALUE superclass) { (void)superclass; return lookup(name); }
+static void init_path(const char *path) {
+    if (!binding) return;
+    char **next = realloc(init_paths, (init_path_count + 1) * sizeof(*next));
+    char *copy = strdup(path);
+    if (!next || !copy) rb_raise(rb_eNoMemError, "C extension Init path allocation failed");
+    init_paths = next; init_paths[init_path_count++] = copy;
+}
+static VALUE define_path(const char *full) { init_path(full); return lookup(full); }
+static VALUE define_under(VALUE outer, const char *name) {
+    char *full = qualified(outer, name);
+    VALUE v = define_path(full); free(full); return v;
+}
+VALUE rb_define_class(const char *name, VALUE superclass) { (void)superclass; return define_path(name); }
 VALUE rb_define_class_under(VALUE outer, const char *name, VALUE superclass) { (void)superclass; return define_under(outer,name); }
-VALUE rb_define_module(const char *name) { return lookup(name); }
+VALUE rb_define_module(const char *name) { return define_path(name); }
 VALUE rb_define_module_under(VALUE outer, const char *name) { return define_under(outer,name); }
 static void bind_function(VALUE (*fn)(ANYARGS)) {
     if (!binding || next_function >= binding->count)
@@ -112,6 +129,20 @@ void rb_define_alias(VALUE o,const char *n,const char *old) { (void)o;(void)n;(v
 void rb_define_attr(VALUE o,const char *n,int r,int w) { (void)o;(void)n;(void)r;(void)w; }
 void rb_include_module(VALUE o,VALUE m) { (void)o;(void)m; }
 void rb_extend_object(VALUE o,VALUE m) { (void)o;(void)m; }
+void rb_undef_method(VALUE o,const char *n) { (void)o;(void)n; }
+void rb_undef_alloc_func(VALUE o) { (void)o; }
+static const char *const recorder_builtins[] = {"BasicObject","Object","Class","Module","String","Array","Hash",
+    "Integer","Float","IO","Exception","StandardError","RuntimeError","TypeError","ArgumentError","RangeError",
+    "NoMemoryError","SystemCallError",NULL};
+int rb_const_defined(VALUE outer,ID id) {
+    const char *name=rb_id2name(id);
+    if(!name)rb_raise(rb_eArgError,"unknown constant ID");
+    if(!binding)rb_raise(rb_eRuntimeError,"rb_const_defined outside Init is unsupported");
+    for(int i=0;recorder_builtins[i];i++)if(!strcmp(recorder_builtins[i],name))return 1;
+    char *full=qualified(outer,name);int found=0;
+    for(size_t i=0;i<init_path_count && !found;i++)found=!strcmp(init_paths[i],full);
+    free(full);return found;
+}
 void rb_define_const(VALUE o,const char *n,VALUE v) {
     (void)o;(void)n;
     if(!binding || next_constant>=binding->constant_count)sp_raise_cls("RuntimeError","C constant definitions outside Init are unsupported");
@@ -137,6 +168,7 @@ static void sp_cext_init_locked(sp_cext_extension *extension) {
     sp_cext_extension *previous=binding;
     size_t previous_function=next_function, previous_constant=next_constant;
     int roots=sp_gc_nroots;
+    volatile size_t previous_paths=init_path_count;
     jmp_buf frame;
     if(setjmp(frame)!=0) {
         int unwind=sp_cext_unwinding();
@@ -147,6 +179,7 @@ static void sp_cext_init_locked(sp_cext_extension *extension) {
         }
         init_roots=previous_roots;free(addresses);binding=previous;
         next_function=previous_function;next_constant=previous_constant;
+        while(init_path_count>previous_paths)free(init_paths[--init_path_count]);
         sp_cext_arena_restore(mark);sp_gc_nroots=roots;
         if(unwind)sp_cext_resume_unwind();
         else sp_fiber_reraise(cls,msg,obj);
@@ -155,6 +188,7 @@ static void sp_cext_init_locked(sp_cext_extension *extension) {
     sp_exc_arm(frame);
     init_roots=&journal;binding=extension;next_function=0;next_constant=0;extension->init();
     sp_exc_disarm();init_roots=previous_roots;free(addresses);binding=previous;
+    while(init_path_count>previous_paths)free(init_paths[--init_path_count]);
     next_function=previous_function;next_constant=previous_constant;
     extension->initialized=1;
     sp_cext_arena_restore(mark);
@@ -195,6 +229,8 @@ void *rb_check_typeddata(VALUE value,const rb_data_type_t *type) {
 void *sp_cext_data_ptr(VALUE value) { return data_object(value)->cext_data; }
 const rb_data_type_t *sp_cext_data_type(VALUE value) { return data_object(value)->cext_type; }
 static void *sp_cext_allocate_locked(sp_cext_extension *ext,int slot,int cls) {
+    /* rb_undef_alloc_func: no slot, as CRuby's allocator-undefined class */
+    if(slot<0)rb_raise(rb_eTypeError,"allocator undefined for %s",sp_obj_cls_name_fn?sp_obj_cls_name_fn(cls):"class");
     sp_cext_init(ext);sp_cext_arena_mark mark=sp_cext_arena_enter();
     sp_RbVal k={SP_TAG_CLASS,cls,{.i=cls}};
     VALUE obj=((VALUE (*)(VALUE))ext->functions[slot])(sp_cext_value(k));
@@ -218,25 +254,57 @@ sp_RbVal sp_cext_duplicate(sp_RbVal value,int keep_frozen) {
     if(keep_frozen && hdr->frozen)((sp_gc_hdr *)ptr-1)->frozen=1;
     return copy;
 }
-int rb_num2int(VALUE value) {
+/* NUM2LONG and NUM2INT answer as CRuby's rb_num2long / rb_num2int, with the
+ * same messages; an object of the program converts through its to_int. */
+long rb_num2long(VALUE value) {
     sp_RbVal number=sp_cext_rbval(value);
-    if(number.tag==SP_TAG_INT) {
-        if(number.v.i<INT_MIN || number.v.i>INT_MAX)rb_raise(rb_eRangeError,"integer out of range of int");
-        return (int)number.v.i;
+    if(number.tag==SP_TAG_INT)return (long)number.v.i;
+    if(number.tag==SP_TAG_FLT) {
+        double d=number.v.f;
+        if(d<-(double)LONG_MIN && d>=(double)LONG_MIN)return (long)d;
+        char text[32];
+        if(isnan(d))snprintf(text,sizeof text,"NaN");
+        else if(isinf(d))snprintf(text,sizeof text,d<0?"-Inf":"Inf");
+        else snprintf(text,sizeof text,"%-.10g",d);
+        rb_raise(rb_eRangeError,"float %s out of range of integer",text);
     }
-    if(number.tag==SP_TAG_FLT || number.tag==SP_TAG_BIGINT) {
-        double converted=number.tag==SP_TAG_FLT ? number.v.f : sp_bigint_to_double(number.v.p);
-        double integer=trunc(converted);
-        if(!isfinite(integer) || integer<INT_MIN || integer>INT_MAX)rb_raise(rb_eRangeError,"number out of range of int");
-        return (int)integer;
+    if(number.tag==SP_TAG_BIGINT)rb_raise(rb_eRangeError,"bignum too big to convert into 'long'");
+    if(number.tag==SP_TAG_OBJ && number.cls_id>=0)return (long)sp_cext_object_to_int(number);
+    if(number.tag==SP_TAG_NIL)rb_raise(rb_eTypeError,"no implicit conversion from nil to integer");
+    if(number.tag==SP_TAG_BOOL)rb_raise(rb_eTypeError,"no implicit conversion of %s into Integer",number.v.b?"true":"false");
+    rb_raise(rb_eTypeError,"no implicit conversion of %s into Integer",rb_class2name(rb_obj_class(value)));
+}
+int rb_num2int(VALUE value) {
+    long number=rb_num2long(value);
+    if(number>INT_MAX)rb_raise(rb_eRangeError,"integer %ld too big to convert to 'int'",number);
+    if(number<INT_MIN)rb_raise(rb_eRangeError,"integer %ld too small to convert to 'int'",number);
+    return (int)number;
+}
+int rb_type(VALUE value) { return sp_cext_type(sp_cext_rbval(value),sp_cext_data_class_fn); }
+/* CRuby's builtin_types names for Check_Type's message */
+static const char *type_name(int type) {
+    switch(type) {
+    case T_NIL: return "nil"; case T_OBJECT: return "Object"; case T_CLASS: return "Class";
+    case T_MODULE: return "Module"; case T_FLOAT: return "Float"; case T_STRING: return "String";
+    case T_REGEXP: return "Regexp"; case T_ARRAY: return "Array"; case T_FIXNUM: return "Integer";
+    case T_HASH: return "Hash"; case T_STRUCT: return "Struct"; case T_BIGNUM: return "Integer";
+    case T_FILE: return "File"; case T_TRUE: return "true"; case T_FALSE: return "false";
+    case T_SYMBOL: return "Symbol"; case T_DATA: return "Data"; case T_MATCH: return "MatchData";
+    case T_RATIONAL: return "Rational"; case T_COMPLEX: return "Complex";
+    default: return "unknown";
     }
-    rb_raise(rb_eTypeError,"expected a numeric value");
 }
 void rb_check_type(VALUE value,int type) {
     sp_RbVal object=sp_cext_rbval(value);
     if(type==T_STRING && (object.tag==SP_TAG_STR || (object.tag==SP_TAG_OBJ && object.cls_id==SP_BUILTIN_STRBUF)))return;
     if(type==T_ARRAY && object.tag==SP_TAG_OBJ && object.cls_id==SP_BUILTIN_POLY_ARRAY)return;
-    rb_raise(rb_eTypeError,"unexpected C extension argument type");
+    int actual=rb_type(value);
+    /* an Array the analysis did not widen, or a String or Array subclass:
+     * C could not use it as one */
+    if(actual==type && (type==T_STRING || type==T_ARRAY))rb_raise(rb_eTypeError,"unexpected C extension argument type");
+    if(actual==type)return;
+    const char *name=value==Qnil ? "nil" : value==Qtrue ? "true" : value==Qfalse ? "false" : rb_class2name(rb_obj_class(value));
+    rb_raise(rb_eTypeError,"wrong argument type %s (expected %s)",name,type_name(type));
 }
 VALUE rb_ll2inum(long long number) { return sp_cext_value(sp_box_int(number)); }
 VALUE rb_float_new(double number) { return sp_cext_value(sp_box_float(number)); }
@@ -360,6 +428,17 @@ void rb_ary_store(VALUE v,long index,VALUE item) {
     if(index==a->len)sp_PolyArray_push(a,value);
     else { sp_gc_wb(a);a->data[index]=value; }
 }
+/* A new Array of the elements from begin, as CRuby's rb_ary_subseq: nil when
+ * begin is past the end or either bound is negative. */
+VALUE rb_ary_subseq(VALUE v,long begin,long length) {
+    sp_PolyArray *a=array(v);
+    if(begin>a->len || begin<0 || length<0)return Qnil;
+    if(length>a->len-begin)length=a->len-begin;
+    sp_PolyArray *slice=sp_PolyArray_new();SP_GC_ROOT(slice);
+    for(long i=0;i<length;i++)sp_PolyArray_push(slice,a->data[begin+i]);
+    return sp_cext_value(sp_box_poly_array(slice));
+}
+VALUE rb_hash_aref(VALUE hash,VALUE key) { return sp_cext_value(sp_cext_hash_get(sp_cext_rbval(hash),sp_cext_rbval(key))); }
 VALUE rb_ary_entry(VALUE v,long i) { sp_PolyArray *a=array(v);if(i<0)i+=a->len;return i<0||i>=a->len?Qnil:sp_cext_value(a->data[i]); }
 long sp_cext_array_len(VALUE v) { return (long)array(v)->len; }
 ID rb_intern(const char *name) {
@@ -470,6 +549,7 @@ VALUE rb_iv_set(VALUE receiver, const char *name, VALUE value) { return dispatch
 VALUE rb_ivar_get(VALUE receiver, ID id) { return rb_iv_get(receiver, rb_id2name(id)); }
 VALUE rb_ivar_set(VALUE receiver, ID id, VALUE value) { return rb_iv_set(receiver, rb_id2name(id), value); }
 VALUE rb_const_get(VALUE receiver, ID id) { (void)class_name(receiver); return dispatch(3, rb_id2name(id), receiver, 0, NULL, NULL); }
+VALUE rb_const_get_at(VALUE receiver, ID id) { return rb_const_get(receiver, id); }
 VALUE rb_eval_string(const char *code) { return dispatch(4, code, Qnil, 0, NULL, NULL); }
 ID rb_intern2(const char *s, long len) {
     if (len < 0) rb_raise(rb_eArgError, "negative symbol length");
@@ -540,6 +620,57 @@ static sp_int callback_trampoline(void *p, sp_int argc, sp_int *raw) {
     sp_exc_disarm(); sp_cext_unlock();
     return result;
 }
+sp_RbVal (*sp_cext_catch_fn)(sp_RbVal, sp_RbVal (*)(void *), void *);
+void (*sp_cext_throw_fn)(sp_RbVal, sp_RbVal);
+/* A C body run under a Ruby catch: its handles are released when it returns
+ * and when a throw or a raise leaves it. */
+typedef struct { rb_block_call_func_t fn; VALUE tag, data; } CatchBody;
+static sp_RbVal catch_body(void *p) {
+    CatchBody *body = p;
+    sp_cext_arena_mark mark = sp_cext_arena_enter();
+    const int roots = sp_gc_nroots;
+    jmp_buf frame;
+    if (setjmp(frame) != 0) {
+        int unwind = sp_cext_unwinding();
+        const char *cls = sp_exc_cur_cls(), *msg = sp_exc_cur_msg();
+        void *obj = sp_exc_cur_obj();
+        sp_exc_disarm(); sp_cext_arena_restore(mark); sp_gc_nroots = roots;
+        if (unwind) sp_cext_resume_unwind();
+        else sp_fiber_reraise(cls, msg, obj);
+        abort();
+    }
+    sp_exc_arm(frame);
+    VALUE result = body->fn(body->tag, body->data, 0, NULL, Qnil);
+    sp_RbVal value = sp_cext_rbval(result);
+    sp_exc_disarm(); sp_cext_arena_restore(mark);
+    return value;
+}
+static sp_RbVal catch_under(sp_RbVal tag, sp_RbVal (*fn)(void *), void *p) {
+    if (!sp_cext_catch_fn || !sp_cext_throw_fn) rb_raise(rb_eRuntimeError, "C extension catch hook is missing");
+    return sp_cext_catch_fn(tag, fn, p);
+}
+VALUE rb_catch(const char *tag, rb_block_call_func_t fn, VALUE data) {
+    VALUE symbol = ID2SYM(rb_intern(tag));
+    CatchBody body = {fn, symbol, data};
+    return sp_cext_value(catch_under(sp_cext_rbval(symbol), catch_body, &body));
+}
+void rb_throw(const char *tag, VALUE value) {
+    if (!sp_cext_throw_fn) rb_raise(rb_eRuntimeError, "C extension catch hook is missing");
+    sp_cext_throw_fn(sp_box_sym((sp_sym)rb_intern(tag)), sp_cext_rbval(value));
+    abort();
+}
+/* rb_block_call runs its call under a catch whose tag is the block call
+ * itself, so rb_iter_break leaves the iteration as a Ruby break does: the
+ * ensures between run, and rb_block_call returns the break value. */
+typedef struct IterCall {
+    VALUE receiver; const char *name; int argc; const VALUE *argv; sp_Proc *block;
+    sp_RbVal tag; struct IterCall *outer;
+} IterCall;
+static SP_TLS IterCall *iteration;
+static sp_RbVal iterate(void *p) {
+    IterCall *call = p;
+    return sp_cext_rbval(dispatch(0, call->name, call->receiver, call->argc, call->argv, call->block));
+}
 VALUE rb_block_call(VALUE receiver, ID id, int argc, const VALUE *argv, rb_block_call_func_t fn, VALUE data) {
     if (!fn) return rb_funcallv(receiver, id, argc, argv);
     CextCallback *cap = sp_gc_alloc(sizeof(*cap), NULL, callback_scan);
@@ -547,12 +678,38 @@ VALUE rb_block_call(VALUE receiver, ID id, int argc, const VALUE *argv, rb_block
     cap->callback = fn; cap->data = sp_cext_rbval(data); cap->outer = current_block;
     sp_Proc *block = sp_proc_new_meta((void *)callback_trampoline, cap, callback_scan, -1, FALSE, 0, NULL, NULL);
     SP_GC_ROOT(block);
-    return dispatch(0, rb_id2name(id), receiver, argc, argv, block);
+    sp_RbVal tag = sp_box_obj(cap, SP_BUILTIN_OBJECT);
+    IterCall call = {receiver, rb_id2name(id), argc, argv, block, tag, iteration};
+    IterCall *volatile outer = iteration;
+    const int roots = sp_gc_nroots;
+    jmp_buf frame;
+    if (setjmp(frame) != 0) {
+        int unwind = sp_cext_unwinding();
+        const char *cls = sp_exc_cur_cls(), *msg = sp_exc_cur_msg();
+        void *obj = sp_exc_cur_obj();
+        sp_exc_disarm(); iteration = outer; sp_gc_nroots = roots;
+        if (unwind) sp_cext_resume_unwind();
+        else sp_fiber_reraise(cls, msg, obj);
+        abort();
+    }
+    sp_exc_arm(frame);
+    iteration = &call;
+    sp_RbVal result = catch_under(tag, iterate, &call);
+    sp_exc_disarm(); iteration = outer;
+    return sp_cext_value(result);
 }
+void rb_iter_break_value(VALUE value) {
+    if (!iteration) sp_raise_cls("LocalJumpError", "break from proc-closure");
+    sp_cext_throw_fn(iteration->tag, sp_cext_rbval(value));
+    abort();
+}
+void rb_iter_break(void) { rb_iter_break_value(Qnil); }
 #endif
 
 #ifdef SP_CEXT
 VALUE rb_str_intern(VALUE v) { return ID2SYM(rb_intern2(RSTRING_PTR(v), RSTRING_LEN(v))); }
+/* SYM2ID in the retained objects, compiled for the recorder's scan */
+ID sp_cext_scanned_sym2id(VALUE v) { return SYM2ID(v); }
 #endif
 
 #ifdef SP_CEXT

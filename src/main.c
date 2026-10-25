@@ -469,8 +469,6 @@ static void usage(void) {
     "  --ext-init NAME    Emit a host-callable library: NAME() replaces main\n"
     "  --ext-entry M.m,.. Export these module methods (with -c; writes a .h contract)\n"
     "  --ext cruby        Also generate the CRuby extension shim (<out>_ext.c)\n"
-    "  --share-strings  Accepted and ignored: a mutable String is always\n"
-    "              shared by reference (#6765)\n"
     "  --no-inline-hot  Do not force small leaf methods inline (default: do).\n"
     "                 Forcing is worth a sixth of optcarrot's frame rate and\n"
     "                 costs up to twice the C compile time\n"
@@ -522,12 +520,6 @@ static const char *runtime_archive(const char *csrc, int threads, int wasi, int 
     fprintf(stderr, "spinel: C extensions currently require the native exception runtime\n");
     return NULL;
   }
-  int one = strstr(csrc, "/* SPINEL_ONE_STRING */") != NULL;
-  if (one && (*cext || wasi)) {
-    fprintf(stderr, "spinel: --string-repr=handle does not link with C extensions or wasm yet\n");
-    return NULL;
-  }
-  if (one) return threads ? "libspinel_rt_one_mt.a" : "libspinel_rt_one.a";
   return *cext ? (threads ? "libspinel_cext_rt_mt.a" : "libspinel_cext_rt.a") : threads ? "libspinel_rt_mt.a" : "libspinel_rt.a";
 }
 
@@ -694,10 +686,9 @@ int main(int argc, char **argv) {
     else if (sp_streq(a, "-I"))            { if (++i < argc) sp_add_feature_root(argv[i]); i++; }
     else if (!strncmp(a, "-I", 2) && a[2]) { sp_add_feature_root(a + 2); i++; }
     else if (sp_streq(a, "-S"))            { stdout_mode = 1; i++; }
-    /* the one-representation String (in progress, string-one-repr-design.md):
-       every String slot is the handle, linked against the archive built for it */
-    else if (sp_streq(a, "--string-repr=handle")) { g_one_string = 1; i++; }
-    else if (sp_streq(a, "--string-repr=bytes"))  { g_one_string = 0; i++; }
+    /* every String slot is the handle, the only representation: the
+       option that chose it is accepted and ignored */
+    else if (sp_streq(a, "--string-repr=handle")) { i++; }
     else if (sp_streq(a, "--print-build")) { print_build = 1; i++; }
     else if (sp_streq(a, "-E"))            { run_mode = 1; i++; }
     else if (sp_streq(a, "--emit-rbs"))    { emit_rbs = 1; i++; }
@@ -705,7 +696,6 @@ int main(int argc, char **argv) {
     else if (sp_streq(a, "--plan-check"))  { g_plan_check = 1; i++; }
     else if (sp_streq(a, "--arm-check"))   { g_arm_check = 1; i++; }
     else if (sp_streq(a, "--repr-check"))  { g_repr_check = 1; i++; }
-    else if (sp_streq(a, "--share-check")) { g_share_check = 1; i++; }
     else if (sp_streq(a, "--dump-repr"))   { g_dump_repr = 1; i++; }
     else if (sp_streq(a, "--check-traits")) { g_check_traits = 1; i++; }
 #ifdef SP_BOP_SHARE_CHECK
@@ -851,6 +841,7 @@ int main(int argc, char **argv) {
   /* Let the analyzer widen accumulating int locals to bigint more freely in
      promote mode (block-iteration loops, not just `while`). See analyze.h. */
   g_promote_mode = sp_streq(int_overflow, "promote");
+  g_wrap_mode = sp_streq(int_overflow, "wrap");
   g_traits_promote = g_promote_mode;
   if (exc_abort && !target_wasi) {
     fprintf(stderr, "spinel: --exceptions=abort is for --target=wasm32-wasi\n");
@@ -1439,6 +1430,9 @@ int main(int argc, char **argv) {
   if (!target_wasi) add_platform_flags(&cmd, &bi, SPINEL_PLATFORM_LIBS, lib_dir);
 #endif
   bi_put(&bi, "define", ov_define);
+  /* (the runtime a pack compiles from source is the one-String mode's, as
+     the program's C defines it for itself) */
+  bi_put(&bi, "define", "-DSP_ONE_STRING");
 #if !defined(__APPLE__)
   if (debug && !target_wasi) s_add(&cmd, "-rdynamic ");  /* ELF: name user frames in backtraces */
 #endif

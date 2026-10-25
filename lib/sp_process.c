@@ -2,8 +2,10 @@
  *
  * Lives in its own TU because the codegen calls sp_process_spawn
  * with pre-resolved positional args (in_fd, out_fd, err_fd, pgroup,
- * rlimit_cpu, rlimit_as, chdir, owned). All opts-hash unpacking happens
- * at compile time in the codegen; the runtime just needs primitive int
+ * rlimit_cpu, rlimit_as, chdir, owned). The codegen turns each option
+ * into one of them; the in/out/err redirects are found in opts at run
+ * time by sp_process_redirect_value (lib/sp_poly_cold.c), grouped keys
+ * ([:out, :err] =>) included; the runtime just needs primitive int
  * / int-fd / int-pgroup / int-rlimit values. The cmd is either a
  * String or an Array (boxed as a PolyArray). args is a PolyArray of
  * extra String args appended after cmd.
@@ -263,12 +265,15 @@ void sp_system_env_check(sp_RbVal env) {
   int owned[3] = { -1, -1, -1 };
   sp_spawn_env_check(env, owned);
 }
-int sp_system_env_args(sp_RbVal env, int argc, const char *const *argv) {
+/* prog, for system([program, argv0], ...), is the program and argv[0] the
+   argv0 it sees; NULL when argv[0] is the program. env is nil for none. */
+int sp_system_prog_env_args(sp_RbVal env, const char *prog, int argc, const char *const *argv) {
+  if (env.tag == SP_TAG_NIL) return sp_system_prog_envp(prog, argc, argv, NULL);
   SP_GC_ROOT_RBVAL(env);
   sp_system_env_check(env);
   char **envp = sp_spawn_envp(env);
   if (!envp) sp_raise_cls("NoMemoryError", "out of memory");
-  int ok = sp_system_envp(argc, argv, envp);
+  int ok = sp_system_prog_envp(prog, argc, argv, envp);
   free(envp);
   return ok;
 }

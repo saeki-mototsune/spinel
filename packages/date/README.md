@@ -31,6 +31,19 @@ type and share what the code holds (to be offered upstream):
   `plus_without_duration`) is then the method a DateTime runs as well, where
   a `DateTime#+` of its own was another method the alias settling refused.
 
+One change fixes that commit's answer, also to be offered upstream: the
+parsers, `strptime` and `strftime` read a non-String argument through a
+private `string_value`, as CRuby's StringValue does (`to_str`, public or
+not, if it has one, else a TypeError naming `nil`, `true`, `false` or the
+class). The fixed-format parsers (`_iso8601`, `_rfc3339`, `_xmlschema`,
+`_rfc2822`, `_httpdate`, `_jisx0301`) still answer `{}` for `nil`.
+
+`date/constants.rb` loses its first line, `# encoding: US-ASCII`: Spinel
+reads every source file as UTF-8 and warns that another encoding's comment
+is ignored, so it warned in every program that required date. The file is
+ASCII, so its bytes read the same; its Strings report UTF-8 where CRuby's
+report US-ASCII, as they did with the comment.
+
 When the pull request is merged upstream, replace these files with the
 released gem's `lib/`, keep the changes upstream has not taken, and update
 the commit above.

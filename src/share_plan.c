@@ -106,10 +106,6 @@ int share_plan_form(int need, int supply) {
   return need == SPN_NEW ? SPF_WRAP : SPF_REFUSE;
 }
 
-const char *share_plan_form_name(int form) {
-  static const char *const names[] = { "bytes", "handle", "wrap", "refuse" };
-  return form >= SPF_BYTES && form <= SPF_REFUSE ? names[form] : "?";
-}
 
 /* The String receiver call v answers (a String method that answers self,
    or self or nil, and no program method of the name), or -1. itself, and
@@ -210,7 +206,7 @@ static int share_plan_producer_core(Compiler *c, int v, int *op, int unlifted) {
      publishes or a new one (or a conversion of it a String answers with
      itself): the dispatch is read as a box, and its handle is bound
      (strbuf_poly_user_base) */
-  if (repr_share_rule(c) && strbuf_poly_user_base(c, v) >= 0) return SPK_POLY_ARMS;
+  if (strbuf_poly_user_base(c, v) >= 0) return SPK_POLY_ARMS;
   if (share_value_fresh(c, v, 0)) return SPK_NONE;
   if (share_plan_exc_super(c, v)) return SPK_EXC_SUPER;
   /* (a call whose answer the C picks up after it, the handle its targets
@@ -237,14 +233,6 @@ static int share_plan_producer_core(Compiler *c, int v, int *op, int unlifted) {
 
 static int share_plan_producer_at(Compiler *c, int v, int *op) { return share_plan_producer_core(c, v, op, 0); }
 
-const char *share_plan_kind_name(int kind) {
-  static const char *const names[] = { "none", "box", "slot", "demanded", "elem", "slot_poly", "frozen", "self",
-                                       "bang_box", "proc_call", "poly_arms", "exc_message", "exc_super", "published",
-                                       "reader", "write", "assign", "operand", "block_value", "yield", "cond",
-                                       "sequence", "lift" };
-  _Static_assert(sizeof names / sizeof names[0] == SPK__COUNT, "a name for each producer kind");
-  return kind >= 0 && kind < SPK__COUNT ? names[kind] : "?";
-}
 
 int share_plan_producer_unlifted(Compiler *c, int v, int *operand) {
   int rv, k = share_plan_producer_core(c, v, &rv, 1);
@@ -568,7 +556,6 @@ int share_plan_targets_cover(Compiler *c, int u) {
    literal's (SP_SHARE_STRING_LITERALS, which the share rule sets), so
    what the call hands on is the object. See share.h. */
 int share_plan_call_answers_literal(Compiler *c, int v) {
-  if (!repr_share_rule(c)) return 0;
   int u = nt_paren_single(c->nt, v);
   if (u < 0 || nt_kind(c->nt, u) != NK_CallNode || nt_ref(c->nt, u, "block") >= 0) return 0;
   int tg[CPT_MAX], n = cplan_targets(c, u, tg, CPT_MAX);
@@ -736,11 +723,10 @@ static int share_plan_supplies(Compiler *c, int v) { return share_plan_supplies_
 enum { SPN_ASK = 3, SPM_NEED = 3, SPM_ROLE_SHIFT = 2 };
 
 static int share_plan_need_of(int need) {
-  return need == SHN_NO ? SPN_BYTES : need == SHN_FRESH ? SPN_NEW : SPN_OBJECT;
+  return need == SHN_NO ? SPN_BYTES : SPN_OBJECT;
 }
 int share_plan_need(Compiler *c, int v) { return share_plan_need_of(share_value_needs_handle(c, v)); }
 
-static int share_plan_box_plain(Compiler *c, int v);
 static int share_plan_box_kept(Compiler *c, int v);
 
 /* What a consumer in `role` needs of value v, whose own need (what its
@@ -750,15 +736,14 @@ static int share_plan_role_need(Compiler *c, int v, int role, int need) {
   if (role == SPR_IDENTITY) return SPN_OBJECT;
   /* A box is copied by value, so a box of a String's bytes is a String of
      its own once a copy is changed in place: a box of a String no other
-     name holds is a new handle, which every copy names, unless a copy is
-     proven unseen (share_plan_box_plain), or the box goes into nothing
-     that keeps it (share_plan_box_kept): a builtin that only reads it is
-     handed the bytes. A frozen literal is its own object already. Any
+     name holds is a new handle, which every copy names, unless the box
+     goes into nothing that keeps it (share_plan_box_kept): a builtin that
+     only reads it is handed the bytes. A frozen literal is its own object already. Any
      other value needs what a taker does. */
   if (role == SPR_BOX) {
     if (share_frozen_literal(c, v)) return SPN_BYTES;
     if (share_value_fresh(c, v, 0))
-      return share_plan_box_plain(c, v) || !share_plan_box_kept(c, v) ? SPN_BYTES : SPN_NEW;
+      return !share_plan_box_kept(c, v) ? SPN_BYTES : SPN_NEW;
   }
   /* the store asks past the literal it splits (never less than the value) */
   if (role == SPR_STORE && need == SPN_BYTES) return share_plan_need_of(share_store_needs_handle(c, v));
@@ -911,19 +896,6 @@ int share_plan_store_renders(Compiler *c, int v) {
   return mw < 0 || mw >= n || nt_ref(nt, mw, "value") != p || share_plan_multi_renders(c, mw, e);
 }
 
-/* Does the receiver path of in-place change `call` render the handle of
-   `base`, the String the change reaches (the base of the chain of
-   self-answering calls its receiver is)? emit_recv_route_handle renders a
-   boxed receiver's call whose arms answer a String (SPK_POLY_ARMS) through
-   the handle face when it is the receiver itself, but not as the base of a
-   chain (`px.pick(s).concat("2").concat("3")`): the outer change reaches the
-   bytes the inner one answered. */
-int share_plan_recv_renders(Compiler *c, int call, int base) {
-  const NodeTable *nt = c->nt;
-  if (call < 0 || base < 0 || nt_kind(nt, call) != NK_CallNode) return 1;
-  int u = nt_paren_single(nt, base);
-  return u == nt_paren_single(nt, nt_ref(nt, call, "receiver")) || share_plan_producer(c, u, NULL) != SPK_POLY_ARMS;
-}
 
 /* The plan of value v for a consumer in `role`, v's own need known. */
 SharePlan share_plan_with_need(Compiler *c, int v, int role, int need) {
@@ -948,19 +920,6 @@ SharePlan share_plan_with_need(Compiler *c, int v, int role, int need) {
   return p;
 }
 
-/* Asked live, as the return walk runs before the memo exists. */
-int share_plan_return_box(Compiler *c, int v) {
-  if (!repr_share_rule(c) || !c->share || v < 0) return 0;
-  switch (nt_kind(c->nt, v)) {
-  case NK_IfNode: case NK_UnlessNode: case NK_CaseNode: case NK_CaseMatchNode: case NK_BeginNode:
-  case NK_ParenthesesNode: case NK_StatementsNode: case NK_OrNode: case NK_AndNode:
-  case NK_RescueModifierNode: case NK_WhileNode: case NK_UntilNode:
-    return 0;
-  default: break;
-  }
-  if (repr_of(c, v).kind != RK_BOXED) return 0;
-  return share_plan_with_need(c, v, SPR_TAKE, share_plan_need(c, v)).form == SPF_HANDLE;
-}
 
 /* Does an arm of conditional (or begin, `||`, `&&`) v, or v itself where it
    is a call, answer by a route boxes cannot render (strbuf_box_unrendered)?
@@ -982,8 +941,8 @@ static int share_plan_arms_unrendered(Compiler *c, int v) {
    a call whose route boxes cannot render (strbuf_box_unrendered, also on an
    arm of a conditional) boxes as it did, from its bytes. */
 int share_plan_box_handle(Compiler *c, int v) {
-  if (repr_share_rule(c) && c->share && v >= 0 && strbuf_self_chain_base(c, v) >= 0) return 1;
-  if (!repr_share_rule(c) || !c->share || v < 0 || share_plan_arms_unrendered(c, v) ||
+  if (c->share && v >= 0 && strbuf_self_chain_base(c, v) >= 0) return 1;
+  if (!c->share || v < 0 || share_plan_arms_unrendered(c, v) ||
       share_plan_with_need(c, v, SPR_BOX, SPN_OBJECT).form != SPF_HANDLE)
     return 0;
   /* ...and a route the emitters take: a value that hands on its handle, or
@@ -995,16 +954,11 @@ int share_plan_box_handle(Compiler *c, int v) {
          (r >= 0 && nt_kind(c->nt, r) != NK_CallNode && strbuf_bang_self_local(c, u) && strbuf_slot_has(c, r));
 }
 
-const char *share_plan_role_name(int role) {
-  static const char *const names[] = { "take", "read", "test", "store", "identity", "box" };
-  return role >= SPR_TAKE && role <= SPR_BOX ? names[role] : "?";
-}
 
 int share_plan_role(Compiler *c, int v) {
   return c->share_plan && v >= 0 && v < c->share_plan_n ? c->share_plan[v] >> SPM_ROLE_SHIFT : SPR_TAKE;
 }
 
-int share_plan_second_role(Compiler *c, int v) { return share_plan_self_recv(c, v) >= 0 ? SPR_TEST : -1; }
 
 /* Give node n's consumer `role`, and through parentheses and a statement
    list's last statement, the node whose value n is. */
@@ -1235,21 +1189,6 @@ static int share_plan_box_kept(Compiler *c, int v) {
   return 1;
 }
 
-/* Is node v, a new String, an element of a container literal a holder
-   keeps whose elements share_node_elems_local proves its own? No other
-   name can tell a copy of its box from the String there, and a handle
-   would cost an allocation and a copy per box. */
-static int share_plan_box_plain(Compiler *c, int v) {
-  const NodeTable *nt = c->nt;
-  int n = c->share_parent_n, p = c->share_parent && v >= 0 && v < n ? c->share_parent[v] : -1;
-  while (p >= 0 && p < n && nt_kind(nt, p) == NK_ParenthesesNode) p = c->share_parent[p];
-  if (p >= 0 && p < n && nt_kind(nt, p) == NK_AssocNode) p = c->share_parent[p];
-  if (p < 0 || p >= n || (nt_kind(nt, p) != NK_ArrayNode && nt_kind(nt, p) != NK_HashNode)) return 0;
-  /* (a temporary literal is not: the walk joins an element read off it,
-     `[s, 1].first`, to no class of the literal's) */
-  return share_node_anchored(c, p) && share_node_elems_local(c, p);
-}
-
 void share_plan_free(Compiler *c) {
   free(c->share_parent);
   c->share_parent = NULL;
@@ -1267,7 +1206,7 @@ void share_plan_free(Compiler *c) {
    and the table version it was asked under, and its consumer's role. */
 void share_plan_build(Compiler *c) {
   share_plan_free(c);
-  if (!repr_share_rule(c) || !c->share) return;
+  if (!c->share) return;
   int n = c->nt->count;
   c->share_plan = malloc((size_t)n + 1);
   c->share_plan_ty = malloc(sizeof *c->share_plan_ty * ((size_t)n + 1));

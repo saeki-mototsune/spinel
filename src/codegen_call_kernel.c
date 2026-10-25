@@ -559,7 +559,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
         emit_boxed(c, av[0], b);
         buf_puts(b, ")");
       }
-      else if (repr_share_rule(c) && at == TY_STRING && repr_of(c, id).as_ty == TY_POLY_ARRAY) {
+      else if (at == TY_STRING && repr_of(c, id).as_ty == TY_POLY_ARRAY) {
         /* The inferred boxed element keeps its shared String handle. */
         int t = ++g_tmp;
         buf_printf(b, "({ sp_String *_t%d = ", t); emit_strbuf_handle_of(c, av[0], b);
@@ -673,7 +673,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       buf_printf(g_pre, "const char *_t%d = %s; SP_GC_ROOT_STR(_t%d);\n", tf, fb.p ? fb.p : "", tf);
       free(fb.p);
       emit_pre_format_args(c, av, ac, ta);
-      buf_printf(b, g_one_string ? "sp_str_format_polyarr(SP_STR_B(_t%d), _t%d)" : "sp_str_format_polyarr(_t%d, _t%d)", tf, ta);
+      buf_printf(b, "sp_str_format_polyarr(SP_STR_B(_t%d), _t%d)", tf, ta);
       return 1;
     }
     if (sp_streq(name, "rand")) {
@@ -1205,28 +1205,21 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
            the same only-this-invocation matching). Rooted for the body's
            duration -- the body can allocate. */
         emit_indent(g_pre, g_indent);
-        if (g_one_string) {
-          /* (one representation: the tag is a handle, which the block
-             parameter holds and a throw hands on as one, so the catch
-             registers the handle itself, matched by identity as a handle) */
-          buf_printf(g_pre, "sp_String *_ctagh%d = sp_String_new_shared(sp_sprintf(\"#<catch:%%lld>\", (long long)++sp_catch_seq)); SP_GC_ROOT(_ctagh%d);\n", t, t);
-          emit_indent(g_pre, g_indent);
-          buf_printf(g_pre, "const char *_ctag%d = (const char *)(void *)_ctagh%d; (void)_ctag%d;\n", t, t, t);
-        }
-        else {
-        buf_printf(g_pre, "const char *_ctag%d = sp_sprintf(\"#<catch:%%lld>\", (long long)++sp_catch_seq);\n", t);
-        emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT_STR(_ctag%d);\n", t);
-        }
+        /* (the tag is a handle, which the block parameter holds and a
+           throw hands on as one, so the catch registers the handle itself,
+           matched by identity as a handle) */
+        buf_printf(g_pre, "sp_String *_ctagh%d = sp_String_new_shared(sp_sprintf(\"#<catch:%%lld>\", (long long)++sp_catch_seq)); SP_GC_ROOT(_ctagh%d);\n", t, t);
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "const char *_ctag%d = (const char *)(void *)_ctagh%d; (void)_ctag%d;\n", t, t, t);
         emit_indent(g_pre, g_indent); buf_printf(g_pre, "sp_catch_tag[sp_catch_top] = _ctag%d;\n", t);
         /* matched by identity, as the block parameter holding this very tag
            is: a copy of it (`tag.dup`) is another object */
-        tag_kind = g_one_string ? 3 : 2;
+        tag_kind = 3;
         const char *bp0 = block_param_name(c, blk, 0);
         if (bp0) {
           emit_indent(g_pre, g_indent);
           /* (one representation: in the parameter slot's face) */
-          if (g_one_string) buf_printf(g_pre, "lv_%s = SP_STR_TO(lv_%s, _ctagh%d);\n", rename_local(bp0), rename_local(bp0), t);
-          else buf_printf(g_pre, "lv_%s = _ctag%d;\n", rename_local(bp0), t);
+          buf_printf(g_pre, "lv_%s = SP_STR_TO(lv_%s, _ctagh%d);\n", rename_local(bp0), rename_local(bp0), t);
         }
       }
       if (tag_kind >= 0) {
@@ -1326,6 +1319,18 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     free(tb.p);
     if (argc >= 2) emit_boxed(c, argv[1], b);
     else buf_puts(b, "sp_box_nil()");
+    buf_puts(b, ")");
+    return 1;
+  }
+
+  /* `("cmd"): Kernel#` itself, which a backtick literal is beside a def of
+     ` (desugar_user_backtick), where self does not reach that def, and
+     Kernel.`("cmd") */
+  if (sp_streq(name, "`") && argc == 1 && nt_ref(nt, id, "block") < 0 && nt_kind(nt, argv[0]) != NK_SplatNode &&
+      (infer_type(c, argv[0]) == TY_STRING || infer_type(c, argv[0]) == TY_STRBUF) &&
+      (recv < 0 ? !bare_call_class_owned(c, id) : an_kernel_const_recv(c, id, recv, 0))) {
+    buf_puts(b, "sp_backtick(");
+    emit_str_expr(c, argv[0], b);
     buf_puts(b, ")");
     return 1;
   }
@@ -1535,7 +1540,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         /* --share-strings: a variable's handle is read as a copy of its
            bytes, which reach unsetenv past sp_env_str's allocation */
         Buf kref; memset(&kref, 0, sizeof kref);
-        int key_handle = repr_share_rule(c) && strbuf_slot_text(c, eav[0], &kref);
+        int key_handle = strbuf_slot_text(c, eav[0], &kref);
         /* a key the operand builds (`ENV.delete(key(1))`) is a new String
            nothing else holds, and it too reaches unsetenv past that
            allocation; a variable's or a literal's is held where it is */
@@ -1549,15 +1554,6 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         if (dpoly) buf_printf(b, "sp_RbVal _t%d = sp_box_str(_t%d); ", result, t2);
         if (dblk >= 0) {
           const char *dp0 = block_param_name(c, dblk, 0);
-          if (repr_share_rule(c) && dp0 && share_node_shares(c, eav[0])) {
-            ShareRoute q = share_route(id, eav[0], 0);
-            /* a key no other name can see a copy of (a new String) takes
-               a new handle of its own */
-            q.to = dblk; q.to_name = dp0;
-            q.carry = key_handle ? eav[0] : strbuf_flow_unseen(c, eav[0]) ? SHARE_CARRY_NONE : SHARE_CARRY_COPY;
-            const char *msg = "ENV.delete is not supported: its block would receive a copy of a shared String key; see docs/limitations.md";
-            if (!share_route_defer(c, &q, msg)) unsupported_feature(c, id, msg);
-          }
           int dbody = nt_ref(nt, dblk, "body");
           int dbn = 0; const int *dbb = dbody >= 0 ? nt_arr(nt, dbody, "body", &dbn) : NULL;
           int dval = dbn > 0 ? dbb[dbn - 1] : -1;
@@ -1567,9 +1563,9 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
                analyzed type (it may not be a declared local here) */
             LocalVar *dlv = scope_local(comp_scope_of(c, id), dp0);
             TyKind dpt = dlv ? dlv->type : TY_STRING;
-            if (repr_share_rule(c) && dpt != TY_STRING && dpt != TY_STRBUF && dpt != TY_POLY)
+            if (dpt != TY_STRING && dpt != TY_STRBUF && dpt != TY_POLY)
               unsupported_feature(c, id, "ENV.delete is not supported: its block parameter cannot carry the String key; see docs/limitations.md");
-            if (repr_share_rule(c) && repr_of_slot(c, dlv).handle) {
+            if (repr_of_slot(c, dlv).handle) {
               if (!key_handle && !key_new && nt_kind(nt, eav[0]) != NK_StringNode) buf_printf(b, "SP_GC_ROOT(_t%d); ", t1);
               buf_printf(b, "sp_String *lv_%s = ", rename_local(dp0));
               if (key_handle) buf_puts(b, kref.p);
@@ -1710,7 +1706,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         }
         /* the name is checked after the default evaluates, as CRuby does */
         buf_printf(b, "; const char *_t%d = getenv(%s%s_t%d%s%s); ", tk, env_str_checked(c, argv[0]) ? "sp_env_chk(" : "",
-                   g_one_string ? "SP_STR_B(" : "", tky, g_one_string ? ")" : "", env_str_checked(c, argv[0]) ? ", 0)" : "");
+                   "SP_STR_B(", tky, ")", env_str_checked(c, argv[0]) ? ", 0)" : "");
         emit_ctype(c, fpoly ? TY_POLY : TY_STRING, b);
         buf_printf(b, " _t%d = _t%d ? ", tv, tk);
         if (fhandle) buf_printf(b, "(_sp_ret_strbuf = NULL, sp_env_str(_t%d)) : ", tk);

@@ -210,19 +210,17 @@ int repr_dyn_cls(const Compiler *c, TyKind t);
 /* the flag readers that decide it (old names: box_nullable_arg, the local
    arm of call_returns_nullable_int) */
 int repr_box_nullable_arg(Compiler *c, int v);
-int repr_local_nullable_int(Compiler *c, int node);
 /* Does a container of type t hold its Strings as `const char *` (a typed
    String Array or a Hash with String values), so none can be the shared
    handle? */
 int repr_typed_str_container(TyKind t);
 /* A retained typed literal whose String elements need shared handles. */
 int repr_str_literal_shares(Compiler *c, int node);
-/* Whether repr_seal has run for the current compile. */
-int repr_sealed(void);
 /* Does the share rule decide which Strings are the shared handle
    (--share-strings, #6765)? Codegen asks this, not the flag: where it is
    0, every emitter takes master's form. */
-int repr_share_rule(const Compiler *c);
+/* The share rule is the only one (one representation): folded away. */
+#define repr_share_rule(c) ((void)(c), 1)
 
 /* R1 (--repr-check): the form a boxer gave a value, recorded at each of
    emit_boxed's and emit_boxed_text's returns, and the form repr_of predicts
@@ -265,7 +263,6 @@ void repr_check_ask(const Compiler *c, int node);
    All callers guard these with g_repr_check; no shadow exists otherwise. */
 enum { RCH_NONE, RCH_PUBLISH, RCH_CLEAR, RCH_NIL, RCH_HANDLE, RCH_BYTES, RCH_BOXED };
 void repr_channel_predict(Compiler *c, int node, int mi, int form);
-void repr_channel_clearing(Compiler *c, int delta);
 int repr_channel_begin(Compiler *c, int node);
 int repr_channel_ensure(Compiler *c, int node);
 void repr_channel_note(Compiler *c, int node, int form);
@@ -322,18 +319,9 @@ int repr_coerce_plan(Compiler *c, int node, TyKind slot, int how, TyKind *from_o
 int repr_coerce_text_form(Compiler *c, int node, TyKind from, TyKind slot, int how);
 const char *repr_coerce_form_name(int form);
 
-/* ---- --share-strings (#6765) ----
-   The one rule: under the flag, a String holder (share.h) is the shared
-   handle unless the analysis proves it local. Proven local: no in-place
-   mutation reaches its class, or the class has this one holder and every
-   mutation goes through it, so the new pointer can be written back into
-   that slot. The analysis applies the answer to the flags repr_of reads
-   (share_default_apply); codegen follows repr_of. */
-int repr_str_shares(const Compiler *c, int holder);
-/* the same rule for the elements of holder h's containers */
-int repr_str_elems_share(const Compiler *c, int holder);
-/* the rule over a class's facts (SHF_*, the count of its holders) */
-int repr_str_class_shares(unsigned flags, int holders);
+/* Does local lv of scope s hold a String the rule shares (a slot whose type
+   can hold one)? */
+int repr_local_shares(const Compiler *c, const Scope *s, const LocalVar *lv);
 /* repr_of(c, node).share alone, without the rest of repr_of: whether a
    read or write node of a global, a constant or a class variable names a
    slot that holds the handle the rule assigned. The analysis's loops and

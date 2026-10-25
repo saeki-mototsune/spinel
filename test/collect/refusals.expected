@@ -60,6 +60,12 @@ spinel: 1 refusal, nothing written
 == test/reject/bind_call_class_value_block_target.rb [promote] rc=1
 spinel: test/reject/bind_call_class_value_block_target.rb:12: unsupported call: node N (CallNode `bind_call`) recv=CallNode/ty0 argc=1 arg0ty1001
 spinel: 1 refusal, nothing written
+== test/reject/builtin_include_in_method.rb [default] rc=1
+spinel: test/reject/builtin_include_in_method.rb:7: String.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class String ... end` (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/builtin_include_in_method.rb [promote] rc=1
+spinel: test/reject/builtin_include_in_method.rb:7: String.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class String ... end` (see docs/limitations.md)
+spinel: 1 refusal, nothing written
 == test/reject/builtin_reopen_bare_instance_method.rb [default] rc=1
 spinel: test/reject/builtin_reopen_bare_instance_method.rb:6: unsupported call: node N (CallNode `instance_method`) recv=-/ty-1 argc=1 arg0ty8
 spinel: 1 refusal, nothing written
@@ -86,6 +92,12 @@ spinel: test/reject/builtin_singleton_alias_call_unordered_same_line.rb:3: Time.
 spinel: test/reject/builtin_singleton_alias_chain.rb:7: Time.at: rebinding a builtin singleton method captured by an alias is not supported; see docs/limitations.md
 == test/reject/builtin_singleton_alias_chain.rb [promote] rc=1
 spinel: test/reject/builtin_singleton_alias_chain.rb:7: Time.at: rebinding a builtin singleton method captured by an alias is not supported; see docs/limitations.md
+== test/reject/builtin_singleton_class_prepend.rb [default] rc=1
+spinel: test/reject/builtin_singleton_class_prepend.rb:6: singleton_class.include(...) / singleton_class.prepend(...) is supported only as a statement of a class or module body, or at the top level on a class or module the program declares: move it into `class X ... end` (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/builtin_singleton_class_prepend.rb [promote] rc=1
+spinel: test/reject/builtin_singleton_class_prepend.rb:6: singleton_class.include(...) / singleton_class.prepend(...) is supported only as a statement of a class or module body, or at the top level on a class or module the program declares: move it into `class X ... end` (see docs/limitations.md)
+spinel: 1 refusal, nothing written
 == test/reject/builtin_singleton_kernel_alias.rb [default] rc=1
 spinel: test/reject/builtin_singleton_kernel_alias.rb:5: Kernel.sleep: alias of a builtin singleton method that is later overridden is not supported; see docs/limitations.md
 == test/reject/builtin_singleton_kernel_alias.rb [promote] rc=1
@@ -410,6 +422,12 @@ spinel: test/reject/class_superclass_method_call.rb:10: unsupported superclass e
 spinel: test/reject/class_then_module.rb:6: Thing is not a module (the first declaration, at line 3, is a class)
 == test/reject/class_then_module.rb [promote] rc=1
 spinel: test/reject/class_then_module.rb:6: Thing is not a module (the first declaration, at line 3, is a class)
+== test/reject/class_value_include.rb [default] rc=1
+spinel: test/reject/class_value_include.rb:9: include / prepend on a Class held in a variable is not supported by AOT compilation: the ancestor chain is baked at compile time, so the class must be named by a constant. Write `K.include(M)` (or `include M` inside `class K ... end`) for each class (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/class_value_include.rb [promote] rc=1
+spinel: test/reject/class_value_include.rb:9: include / prepend on a Class held in a variable is not supported by AOT compilation: the ancestor chain is baked at compile time, so the class must be named by a constant. Write `K.include(M)` (or `include M` inside `class K ... end`) for each class (see docs/limitations.md)
+spinel: 1 refusal, nothing written
 == test/reject/compact_class_internal_name_clash.rb [default] rc=1
 spinel: test/reject/compact_class_internal_name_clash.rb:5: a class or module named Foo under a module path takes the internal name X__Foo, which the program's own class X__Foo already has, and a top-level Foo is defined too; rename one of them
 == test/reject/compact_class_internal_name_clash.rb [promote] rc=1
@@ -497,15 +515,21 @@ spinel: test/reject/const_value_not_a_module.rb:4: B is not a module: it is assi
 == test/reject/const_value_not_a_module.rb [promote] rc=1
 spinel: test/reject/const_value_not_a_module.rb:4: B is not a module: it is assigned a value on line 4, and declared with module on line 6
 == test/reject/constant_write_as_value_string.rb [default] rc=1
-spinel: test/reject/constant_write_as_value_string.rb:4: `S = ...` used as a value is not supported for a constant holding a String (the value would be a copy); assign S on a line of its own and use S
+spinel: test/reject/constant_write_as_value_string.rb:4: `S = ...` used as a value is not supported for a constant holding this kind of value; assign S on a line of its own and use S
 spinel: 1 refusal, nothing written
 == test/reject/constant_write_as_value_string.rb [promote] rc=1
-spinel: test/reject/constant_write_as_value_string.rb:4: `S = ...` used as a value is not supported for a constant holding a String (the value would be a copy); assign S on a line of its own and use S
+spinel: test/reject/constant_write_as_value_string.rb:4: `S = ...` used as a value is not supported for a constant holding this kind of value; assign S on a line of its own and use S
 spinel: 1 refusal, nothing written
 == test/reject/def_delegators_splat.rb [default] rc=1
 spinel: test/reject/def_delegators_splat.rb:10: def_delegators with arguments other than a literal symbol list is not supported (write the names as symbols: `def_delegators :@target, :name, ...`)
 == test/reject/def_delegators_splat.rb [promote] rc=1
 spinel: test/reject/def_delegators_splat.rb:10: def_delegators with arguments other than a literal symbol list is not supported (write the names as symbols: `def_delegators :@target, :name, ...`)
+== test/reject/define_method_each_integer_name.rb [default] rc=1
+spinel: test/reject/define_method_each_integer_name.rb:3: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/define_method_each_integer_name.rb [promote] rc=1
+spinel: test/reject/define_method_each_integer_name.rb:3: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
+spinel: 1 refusal, nothing written
 == test/reject/define_method_handed_block.rb [default] rc=1
 spinel: test/reject/define_method_handed_block.rb:7: Module#define_method with `&` of a block or Proc that is not a literal (`&block`, a parameter, a constant, a call's result) is not supported: the defined method's body is known only at run time. Pass a block literal to define_method instead
 spinel: 1 refusal, nothing written
@@ -612,6 +636,12 @@ spinel: 1 refusal, nothing written
 == test/reject/define_method_proc_ref_in_method.rb [promote] rc=1
 spinel: test/reject/define_method_proc_ref_in_method.rb:8: Module#define_method with `&` of a block or Proc that is not a literal (`&block`, a parameter, a constant, a call's result) is not supported: the defined method's body is known only at run time. Pass a block literal to define_method instead
 spinel: 1 refusal, nothing written
+== test/reject/define_method_struct_block_runtime_cond.rb [default] rc=1
+spinel: test/reject/define_method_struct_block_runtime_cond.rb:4: a define_method under a condition only the run time decides, in a Struct.new or Data.define block, is not supported: write the class with `class`; see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/define_method_struct_block_runtime_cond.rb [promote] rc=1
+spinel: test/reject/define_method_struct_block_runtime_cond.rb:4: a define_method under a condition only the run time decides, in a Struct.new or Data.define block, is not supported: write the class with `class`; see docs/limitations.md
+spinel: 1 refusal, nothing written
 == test/reject/defined_super_builtin_singleton.rb [default] rc=1
 spinel: test/reject/defined_super_builtin_singleton.rb:6: unsupported defined?(super) where the method super reaches is not known at compile time: node N (DefinedNode)
 spinel: 1 refusal, nothing written
@@ -624,6 +654,18 @@ spinel: 1 refusal, nothing written
 == test/reject/dynamic_send_then_refusal.rb [promote] rc=1
 spinel: test/reject/dynamic_send_then_refusal.rb:15: String#unicode_normalize is not supported: Unicode normalization requires shipping the Unicode decomposition/composition tables, which spinel deliberately does not carry -- the same limit as String#grapheme_clusters (see docs/limitations.md)
 spinel: 1 refusal, nothing written
+== test/reject/enumerator_own_with_object.rb [default] rc=1
+spinel: test/reject/enumerator_own_with_object.rb:17: Enumerator#with_object of the program's own (an Enumerator reopening, or a module it prepends or includes) is not supported
+== test/reject/enumerator_own_with_object.rb [promote] rc=1
+spinel: test/reject/enumerator_own_with_object.rb:17: Enumerator#with_object of the program's own (an Enumerator reopening, or a module it prepends or includes) is not supported
+== test/reject/enumerator_own_with_object_reader.rb [default] rc=1
+spinel: test/reject/enumerator_own_with_object_reader.rb:16: Enumerator#with_object of the program's own (an Enumerator reopening, or a module it prepends or includes) is not supported
+== test/reject/enumerator_own_with_object_reader.rb [promote] rc=1
+spinel: test/reject/enumerator_own_with_object_reader.rb:16: Enumerator#with_object of the program's own (an Enumerator reopening, or a module it prepends or includes) is not supported
+== test/reject/enumerator_with_object_builtin_alias.rb [default] rc=1
+spinel: test/reject/enumerator_with_object_builtin_alias.rb:17: Enumerator#with_object of the program's own (an Enumerator reopening, or a module it prepends or includes) is not supported
+== test/reject/enumerator_with_object_builtin_alias.rb [promote] rc=1
+spinel: test/reject/enumerator_with_object_builtin_alias.rb:17: Enumerator#with_object of the program's own (an Enumerator reopening, or a module it prepends or includes) is not supported
 == test/reject/exception_ivar_set_nil_numeric_slot.rb [default] rc=1
 spinel: test/reject/exception_ivar_set_nil_numeric_slot.rb:10: unsupported instance_variable_set of a value that may be nil into an exception's Integer or Float ivar: node N (CallNode `instance_variable_set`) recv=LocalVariableReadNode/ty18 argc=2 arg0ty8
 spinel: 1 refusal, nothing written
@@ -690,6 +732,26 @@ spinel: test/reject/inherited_alias_later_redefined.rb:9: D#o: alias of an inher
 spinel: test/reject/inherited_singleton_alias_later_redefined.rb:10: D.o: alias of an inherited method that P defines again after it is not supported; see docs/limitations.md
 == test/reject/inherited_singleton_alias_later_redefined.rb [promote] rc=1
 spinel: test/reject/inherited_singleton_alias_later_redefined.rb:10: D.o: alias of an inherited method that P defines again after it is not supported; see docs/limitations.md
+== test/reject/instance_eval_def_beside_statements.rb [default] rc=1
+spinel: test/reject/instance_eval_def_beside_statements.rb:6: a method defined in an instance_eval block, other than one of defs only on a class or module the program defines and without arguments, is not supported: name the receiver (`def Klass.m`) instead
+== test/reject/instance_eval_def_beside_statements.rb [promote] rc=1
+spinel: test/reject/instance_eval_def_beside_statements.rb:6: a method defined in an instance_eval block, other than one of defs only on a class or module the program defines and without arguments, is not supported: name the receiver (`def Klass.m`) instead
+== test/reject/instance_eval_def_shadowed_path.rb [default] rc=1
+spinel: test/reject/instance_eval_def_shadowed_path.rb:10: a method defined in an instance_eval block, other than one of defs only on a class or module the program defines and without arguments, is not supported: name the receiver (`def Klass.m`) instead
+== test/reject/instance_eval_def_shadowed_path.rb [promote] rc=1
+spinel: test/reject/instance_eval_def_shadowed_path.rb:10: a method defined in an instance_eval block, other than one of defs only on a class or module the program defines and without arguments, is not supported: name the receiver (`def Klass.m`) instead
+== test/reject/instance_eval_def_unnamed_receiver.rb [default] rc=1
+spinel: test/reject/instance_eval_def_unnamed_receiver.rb:8: a method defined in an instance_eval block, other than one of defs only on a class or module the program defines and without arguments, is not supported: name the receiver (`def Klass.m`) instead
+== test/reject/instance_eval_def_unnamed_receiver.rb [promote] rc=1
+spinel: test/reject/instance_eval_def_unnamed_receiver.rb:8: a method defined in an instance_eval block, other than one of defs only on a class or module the program defines and without arguments, is not supported: name the receiver (`def Klass.m`) instead
+== test/reject/instance_eval_def_value_constant.rb [default] rc=1
+spinel: test/reject/instance_eval_def_value_constant.rb:12: a method defined in an instance_eval block, other than one of defs only on a class or module the program defines and without arguments, is not supported: name the receiver (`def Klass.m`) instead
+== test/reject/instance_eval_def_value_constant.rb [promote] rc=1
+spinel: test/reject/instance_eval_def_value_constant.rb:12: a method defined in an instance_eval block, other than one of defs only on a class or module the program defines and without arguments, is not supported: name the receiver (`def Klass.m`) instead
+== test/reject/instance_exec_def_with_argument.rb [default] rc=1
+spinel: test/reject/instance_exec_def_with_argument.rb:8: a method defined in an instance_eval block, other than one of defs only on a class or module the program defines and without arguments, is not supported: name the receiver (`def Klass.m`) instead
+== test/reject/instance_exec_def_with_argument.rb [promote] rc=1
+spinel: test/reject/instance_exec_def_with_argument.rb:8: a method defined in an instance_eval block, other than one of defs only on a class or module the program defines and without arguments, is not supported: name the receiver (`def Klass.m`) instead
 == test/reject/instance_exec_default_ivar_write.rb [default] rc=1
 spinel: test/reject/instance_exec_default_ivar_write.rb:6: an instance variable written in a block that instance_exec or instance_eval runs on a value with no instance variable layout (nil, a builtin value, Object.new): the value has no slot to hold it at run time
 spinel: 1 refusal, nothing written
@@ -708,6 +770,10 @@ spinel: 1 refusal, nothing written
 == test/reject/instance_exec_untraced_proc_param.rb [promote] rc=1
 spinel: test/reject/instance_exec_untraced_proc_param.rb:8: instance_exec/instance_eval of a proc parameter some call site hands a value spinel cannot trace to a proc literal
 spinel: 1 refusal, nothing written
+== test/reject/io_gets_with_last_line_read.rb [default] rc=1
+spinel: test/reject/io_gets_with_last_line_read.rb:3: IO#gets or IO#readline in a program that reads $_: they do not set $_ here, so $_ would not be the line just read. Keep the line in a variable instead
+== test/reject/io_gets_with_last_line_read.rb [promote] rc=1
+spinel: test/reject/io_gets_with_last_line_read.rb:3: IO#gets or IO#readline in a program that reads $_: they do not set $_ here, so $_ would not be the line just read. Keep the line in a variable instead
 == test/reject/io_popen.rb [default] rc=1
 spinel: test/reject/io_popen.rb:4: IO.popen is not supported (Open3.capture2 / capture3 or Process.spawn cover its uses)
 spinel: 1 refusal, nothing written
@@ -974,6 +1040,14 @@ spinel: test/reject/macro_receiver_write.rb:10: unsupported send with a runtime 
 spinel: test/reject/macro_refused_inner_write.rb:10: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
 == test/reject/macro_refused_inner_write.rb [promote] rc=1
 spinel: test/reject/macro_refused_inner_write.rb:10: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
+== test/reject/macro_residual_call_keeps_macro.rb [default] rc=1
+spinel: test/reject/macro_residual_call_keeps_macro.rb:8: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
+spinel: test/reject/macro_residual_call_keeps_macro.rb:16: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
+spinel: 2 refusals, nothing written
+== test/reject/macro_residual_call_keeps_macro.rb [promote] rc=1
+spinel: test/reject/macro_residual_call_keeps_macro.rb:8: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
+spinel: test/reject/macro_residual_call_keeps_macro.rb:16: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
+spinel: 2 refusals, nothing written
 == test/reject/macro_residual_value.rb [default] rc=1
 spinel: test/reject/macro_residual_value.rb:7: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
 == test/reject/macro_residual_value.rb [promote] rc=1
@@ -1002,6 +1076,12 @@ spinel: test/reject/macro_setter_send.rb:5: unsupported send with a runtime meth
 spinel: test/reject/macro_source_line.rb:4: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
 == test/reject/macro_source_line.rb [promote] rc=1
 spinel: test/reject/macro_source_line.rb:4: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
+== test/reject/macro_super_override_keeps_macro.rb [default] rc=1
+spinel: test/reject/macro_super_override_keeps_macro.rb:7: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/macro_super_override_keeps_macro.rb [promote] rc=1
+spinel: test/reject/macro_super_override_keeps_macro.rb:7: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
+spinel: 1 refusal, nothing written
 == test/reject/macro_template_top_write.rb [default] rc=1
 spinel: test/reject/macro_template_top_write.rb:9: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
 == test/reject/macro_template_top_write.rb [promote] rc=1
@@ -1124,42 +1204,46 @@ spinel: 1 refusal, nothing written
 == test/reject/object_method_ivar_struct_slot.rb [promote] rc=1
 spinel: test/reject/object_method_ivar_struct_slot.rb:3: unsupported instance_variable_set to an ivar absent from the fixed object layout: node N (CallNode `instance_variable_set`) recv=SelfNode/ty50 argc=2 arg0ty8
 spinel: 1 refusal, nothing written
-== test/reject/object_receiver_include.rb [default] rc=1
-spinel: test/reject/object_receiver_include.rb:7: Object.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class Object ... end` (see docs/limitations.md)
-spinel: 1 refusal, nothing written
-== test/reject/object_receiver_include.rb [promote] rc=1
-spinel: test/reject/object_receiver_include.rb:7: Object.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class Object ... end` (see docs/limitations.md)
-spinel: 1 refusal, nothing written
 == test/reject/object_receiver_include_alias.rb [default] rc=1
 spinel: test/reject/object_receiver_include_alias.rb:8: Object.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class Object ... end` (see docs/limitations.md)
 spinel: 1 refusal, nothing written
 == test/reject/object_receiver_include_alias.rb [promote] rc=1
 spinel: test/reject/object_receiver_include_alias.rb:8: Object.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class Object ... end` (see docs/limitations.md)
 spinel: 1 refusal, nothing written
-== test/reject/object_receiver_include_unrelated_def.rb [default] rc=1
-spinel: test/reject/object_receiver_include_unrelated_def.rb:7: Object.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class Object ... end` (see docs/limitations.md)
-spinel: 1 refusal, nothing written
-== test/reject/object_receiver_include_unrelated_def.rb [promote] rc=1
-spinel: test/reject/object_receiver_include_unrelated_def.rb:7: Object.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class Object ... end` (see docs/limitations.md)
-spinel: 1 refusal, nothing written
-== test/reject/prepend_after_call.rb [default] rc=1
-spinel: test/reject/prepend_after_call.rb:12: a later statement mixes module Loud into class Dog (include or prepend), after this call, so the call would reach the module's method before the module is there. Include or prepend the module where the class is defined, ahead of the call.
-== test/reject/prepend_after_call.rb [promote] rc=1
-spinel: test/reject/prepend_after_call.rb:12: a later statement mixes module Loud into class Dog (include or prepend), after this call, so the call would reach the module's method before the module is there. Include or prepend the module where the class is defined, ahead of the call.
-== test/reject/prepend_after_call_in_method.rb [default] rc=1
-spinel: test/reject/prepend_after_call_in_method.rb:11: a later statement mixes module Loud into class Dog (include or prepend), after this call, so the call would reach the module's method before the module is there. Include or prepend the module where the class is defined, ahead of the call.
-== test/reject/prepend_after_call_in_method.rb [promote] rc=1
-spinel: test/reject/prepend_after_call_in_method.rb:11: a later statement mixes module Loud into class Dog (include or prepend), after this call, so the call would reach the module's method before the module is there. Include or prepend the module where the class is defined, ahead of the call.
-== test/reject/prepend_after_self_call.rb [default] rc=1
-spinel: test/reject/prepend_after_self_call.rb:10: a later statement mixes module Loud into class Dog (include or prepend), after this call, so the call would reach the module's method before the module is there. Include or prepend the module where the class is defined, ahead of the call.
-== test/reject/prepend_after_self_call.rb [promote] rc=1
-spinel: test/reject/prepend_after_self_call.rb:10: a later statement mixes module Loud into class Dog (include or prepend), after this call, so the call would reach the module's method before the module is there. Include or prepend the module where the class is defined, ahead of the call.
+== test/reject/range_prepended_alias_chain_endpoint_write.rb [default] rc=1
+spinel: test/reject/range_prepended_alias_chain_endpoint_write.rb:17: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
+== test/reject/range_prepended_alias_chain_endpoint_write.rb [promote] rc=1
+spinel: test/reject/range_prepended_alias_chain_endpoint_write.rb:17: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
+== test/reject/range_prepended_alias_endpoint_write.rb [default] rc=1
+spinel: test/reject/range_prepended_alias_endpoint_write.rb:16: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
+== test/reject/range_prepended_alias_endpoint_write.rb [promote] rc=1
+spinel: test/reject/range_prepended_alias_endpoint_write.rb:16: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
+== test/reject/range_reopen_float_range.rb [default] rc=1
+spinel: test/reject/range_reopen_float_range.rb:8: a method the program defines in Range, called on a Range of Floats: only an Integer Range runs it
+== test/reject/range_reopen_float_range.rb [promote] rc=1
+spinel: test/reject/range_reopen_float_range.rb:8: a method the program defines in Range, called on a Range of Floats: only an Integer Range runs it
+== test/reject/range_reopen_string_range.rb [default] rc=1
+spinel: test/reject/range_reopen_string_range.rb:12: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
+== test/reject/range_reopen_string_range.rb [promote] rc=1
+spinel: test/reject/range_reopen_string_range.rb:12: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
+== test/reject/range_reopened_endpoint_write.rb [default] rc=1
+spinel: test/reject/range_reopened_endpoint_write.rb:11: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
+== test/reject/range_reopened_endpoint_write.rb [promote] rc=1
+spinel: test/reject/range_reopened_endpoint_write.rb:11: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
+== test/reject/range_reopened_member_answer.rb [default] rc=1
+spinel: test/reject/range_reopened_member_answer.rb:9: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
+== test/reject/range_reopened_member_answer.rb [promote] rc=1
+spinel: test/reject/range_reopened_member_answer.rb:9: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
 == test/reject/range_time_bound.rb [default] rc=1
 spinel: test/reject/range_time_bound.rb:4: a Range of Time objects cannot be built: a Range is an unboxed value with sp_int bounds, so it has nowhere to hold them. Comparing against the bounds directly (`t >= lo && t < hi`) needs no Range and does work (see docs/limitations.md)
 spinel: 1 refusal, nothing written
 == test/reject/range_time_bound.rb [promote] rc=1
 spinel: test/reject/range_time_bound.rb:4: a Range of Time objects cannot be built: a Range is an unboxed value with sp_int bounds, so it has nowhere to hold them. Comparing against the bounds directly (`t >= lo && t < hi`) needs no Range and does work (see docs/limitations.md)
 spinel: 1 refusal, nothing written
+== test/reject/rational_include_method.rb [default] rc=1
+spinel: test/reject/rational_include_method.rb:9: unsupported a method of a module included or prepended into Rational or Complex (define it in the class body instead): node N (CallNode `desc`) recv=RationalNode/ty15 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/rational_include_method.rb [promote] rc=0
 == test/reject/rational_pow_bignum.rb [default] rc=1
 spinel: test/reject/rational_pow_bignum.rb:7: the receiver of a Float `**` given a Rational, which no conversion keeps in its sp_float slot
 spinel: 1 refusal, nothing written
@@ -1192,6 +1276,14 @@ spinel: test/reject/reopen_redef_poly_call_between.rb:13: a method redefined by 
 spinel: test/reject/reopen_redef_subclass_override_between.rb:10: a method redefined by a later reopening of its class is called between the two definitions on an object of a subclass that overrides it, so which definition the call reaches depends on where the override is defined. Define the method once, or the override before the call.
 == test/reject/reopen_redef_subclass_override_between.rb [promote] rc=1
 spinel: test/reject/reopen_redef_subclass_override_between.rb:10: a method redefined by a later reopening of its class is called between the two definitions on an object of a subclass that overrides it, so which definition the call reaches depends on where the override is defined. Define the method once, or the override before the call.
+== test/reject/require_relative_adjacent_literals.rb [default] rc=1
+spinel: test/reject/require_relative_adjacent_literals.rb:4: require_relative needs its path as one string literal
+== test/reject/require_relative_adjacent_literals.rb [promote] rc=1
+spinel: test/reject/require_relative_adjacent_literals.rb:4: require_relative needs its path as one string literal
+== test/reject/require_relative_literal_expression.rb [default] rc=1
+spinel: test/reject/require_relative_literal_expression.rb:4: require_relative needs its path as one string literal
+== test/reject/require_relative_literal_expression.rb [promote] rc=1
+spinel: test/reject/require_relative_literal_expression.rb:4: require_relative needs its path as one string literal
 == test/reject/rescue_modifiers_nested_too_deep.rb [default] rc=1
 spinel: test/reject/rescue_modifiers_nested_too_deep.rb:6: this expression nests more levels of conditionals, rescue modifiers or blocks than the compiler's emission stack holds; bind an inner part to a local or a method
 spinel: 1 refusal, nothing written
@@ -1226,6 +1318,10 @@ spinel: 1 refusal, nothing written
 == test/reject/runtime_condition_def_respond_to.rb [promote] rc=1
 spinel: test/reject/runtime_condition_def_respond_to.rb:9: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
+== test/reject/scan_subject_stdin_gets.rb [default] rc=1
+spinel: test/reject/scan_subject_stdin_gets.rb:3: IO#gets or IO#readline in a program that reads $_: they do not set $_ here, so $_ would not be the line just read. Keep the line in a variable instead
+== test/reject/scan_subject_stdin_gets.rb [promote] rc=1
+spinel: test/reject/scan_subject_stdin_gets.rb:3: IO#gets or IO#readline in a program that reads $_: they do not set $_ here, so $_ would not be the line just read. Keep the line in a variable instead
 == test/reject/scrub_bang_block.rb [default] rc=1
 spinel: test/reject/scrub_bang_block.rb:2: String#scrub! with a block is not yet supported: the block would be ignored
 spinel: 1 refusal, nothing written
@@ -1314,10 +1410,26 @@ spinel: test/reject/set_identity_kept_block_value.rb:29: a value whose identity 
 spinel: test/reject/set_identity_lambda_yield_kept.rb:22: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
 == test/reject/set_identity_lambda_yield_kept.rb [promote] rc=1
 spinel: test/reject/set_identity_lambda_yield_kept.rb:22: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+== test/reject/set_identity_list_concat_strings_to_set.rb [default] rc=1
+spinel: test/reject/set_identity_list_concat_strings_to_set.rb:14: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+== test/reject/set_identity_list_concat_strings_to_set.rb [promote] rc=1
+spinel: test/reject/set_identity_list_concat_strings_to_set.rb:14: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+== test/reject/set_identity_list_to_set_own_to_a.rb [default] rc=1
+spinel: test/reject/set_identity_list_to_set_own_to_a.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+== test/reject/set_identity_list_to_set_own_to_a.rb [promote] rc=1
+spinel: test/reject/set_identity_list_to_set_own_to_a.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
 == test/reject/set_identity_member_list_read.rb [default] rc=1
-spinel: test/reject/set_identity_member_list_read.rb:15: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+spinel: test/reject/set_identity_member_list_read.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
 == test/reject/set_identity_member_list_read.rb [promote] rc=1
-spinel: test/reject/set_identity_member_list_read.rb:15: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+spinel: test/reject/set_identity_member_list_read.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+== test/reject/set_identity_own_alias_method.rb [default] rc=1
+spinel: test/reject/set_identity_own_alias_method.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+== test/reject/set_identity_own_alias_method.rb [promote] rc=1
+spinel: test/reject/set_identity_own_alias_method.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+== test/reject/set_identity_own_name_list_to_set.rb [default] rc=1
+spinel: test/reject/set_identity_own_name_list_to_set.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+== test/reject/set_identity_own_name_list_to_set.rb [promote] rc=1
+spinel: test/reject/set_identity_own_name_list_to_set.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
 == test/reject/set_identity_pairs_to_h.rb [default] rc=1
 spinel: test/reject/set_identity_pairs_to_h.rb:10: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
 == test/reject/set_identity_pairs_to_h.rb [promote] rc=1
@@ -1342,6 +1454,10 @@ spinel: test/reject/set_identity_reader_by_send.rb:13: a value whose identity is
 spinel: test/reject/set_identity_reader_method_object.rb:15: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
 == test/reject/set_identity_reader_method_object.rb [promote] rc=1
 spinel: test/reject/set_identity_reader_method_object.rb:15: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+== test/reject/set_identity_reader_name_table_key_sent.rb [default] rc=1
+spinel: test/reject/set_identity_reader_name_table_key_sent.rb:11: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+== test/reject/set_identity_reader_name_table_key_sent.rb [promote] rc=1
+spinel: test/reject/set_identity_reader_name_table_key_sent.rb:11: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
 == test/reject/set_identity_reflective_fresh_members.rb [default] rc=1
 spinel: test/reject/set_identity_reflective_fresh_members.rb:11: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
 == test/reject/set_identity_reflective_fresh_members.rb [promote] rc=1
@@ -1370,6 +1486,10 @@ spinel: test/reject/set_identity_send_name_writer.rb:14: a value whose identity 
 spinel: test/reject/set_identity_singleton_attr_reader.rb:16: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
 == test/reject/set_identity_singleton_attr_reader.rb [promote] rc=1
 spinel: test/reject/set_identity_singleton_attr_reader.rb:16: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+== test/reject/set_identity_string_list_to_set.rb [default] rc=1
+spinel: test/reject/set_identity_string_list_to_set.rb:14: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
+== test/reject/set_identity_string_list_to_set.rb [promote] rc=1
+spinel: test/reject/set_identity_string_list_to_set.rb:14: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
 == test/reject/set_identity_string_member.rb [default] rc=1
 spinel: test/reject/set_identity_string_member.rb:8: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
 == test/reject/set_identity_string_member.rb [promote] rc=1
@@ -1384,28 +1504,6 @@ spinel: 1 refusal, nothing written
 == test/reject/setter_symbol_block_builtin.rb [promote] rc=1
 spinel: test/reject/setter_symbol_block_builtin.rb:6: a setter Symbol (`&:name=`) as the block of a builtin method is not supported
 spinel: 1 refusal, nothing written
-== test/reject/share_builder_local_lambda_return.rb [default] rc=1
-spinel: test/reject/share_builder_local_lambda_return.rb:642: the String the value of `lit` hands on as a variable's write is shared with another name and changed in place, and that route cannot carry the shared handle yet: it would hand on a copy (#9258)
-== test/reject/share_builder_local_lambda_return.rb [promote] rc=1
-spinel: test/reject/share_builder_local_lambda_return.rb:642: the String the value of `lit` hands on as a variable's write is shared with another name and changed in place, and that route cannot carry the shared handle yet: it would hand on a copy (#9258)
-== test/reject/share_call_past_plan_held_answer.rb [default] rc=1
-spinel: test/reject/share_call_past_plan_held_answer.rb:85: the String the value of `lit` hands on as a variable's write is shared with another name and changed in place, and that route cannot carry the shared handle yet: it would hand on a copy (#9258)
-== test/reject/share_call_past_plan_held_answer.rb [promote] rc=1
-spinel: test/reject/share_call_past_plan_held_answer.rb:85: the String the value of `lit` hands on as a variable's write is shared with another name and changed in place, and that route cannot carry the shared handle yet: it would hand on a copy (#9258)
-== test/reject/share_call_past_plan_method_missing.rb [default] rc=1
-spinel: test/reject/share_call_past_plan_method_missing.rb:78: warning: method_missing is defined but spinel does not dispatch undefined-method calls to it; such calls raise NoMethodError (method_missing can still be called explicitly)
-spinel: test/reject/share_call_past_plan_method_missing.rb:85: the String the value of `lit` hands on as a variable's write is shared with another name and changed in place, and that route cannot carry the shared handle yet: it would hand on a copy (#9258)
-== test/reject/share_call_past_plan_method_missing.rb [promote] rc=1
-spinel: test/reject/share_call_past_plan_method_missing.rb:78: warning: method_missing is defined but spinel does not dispatch undefined-method calls to it; such calls raise NoMethodError (method_missing can still be called explicitly)
-spinel: test/reject/share_call_past_plan_method_missing.rb:85: the String the value of `lit` hands on as a variable's write is shared with another name and changed in place, and that route cannot carry the shared handle yet: it would hand on a copy (#9258)
-== test/reject/share_call_past_plan_reader.rb [default] rc=1
-spinel: test/reject/share_call_past_plan_reader.rb:83: the String the value of `lit` hands on as a variable's write is shared with another name and changed in place, and that route cannot carry the shared handle yet: it would hand on a copy (#9258)
-== test/reject/share_call_past_plan_reader.rb [promote] rc=1
-spinel: test/reject/share_call_past_plan_reader.rb:83: the String the value of `lit` hands on as a variable's write is shared with another name and changed in place, and that route cannot carry the shared handle yet: it would hand on a copy (#9258)
-== test/reject/share_call_past_plan_super_reader.rb [default] rc=1
-spinel: test/reject/share_call_past_plan_super_reader.rb:84: the String the value of `lit` hands on as a variable's write is shared with another name and changed in place, and that route cannot carry the shared handle yet: it would hand on a copy (#9258)
-== test/reject/share_call_past_plan_super_reader.rb [promote] rc=1
-spinel: test/reject/share_call_past_plan_super_reader.rb:84: the String the value of `lit` hands on as a variable's write is shared with another name and changed in place, and that route cannot carry the shared handle yet: it would hand on a copy (#9258)
 == test/reject/singleton_class_ancestry.rb [default] rc=1
 spinel: test/reject/singleton_class_ancestry.rb:7: the ancestry and the method table of a singleton class are not modeled: its name, identity, instance_methods(false) and method_defined? are; see docs/limitations.md
 spinel: 1 refusal, nothing written
@@ -1456,8 +1554,12 @@ spinel: test/reject/singleton_untraced_no_self.rb:61: singleton method on a rece
 spinel: test/reject/singleton_untraced_no_self.rb:74: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
 spinel: test/reject/singleton_untraced_no_self.rb:80: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
 spinel: test/reject/singleton_untraced_no_self.rb:89: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
+spinel: test/reject/singleton_untraced_no_self.rb:111: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
+spinel: test/reject/singleton_untraced_no_self.rb:116: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
+spinel: test/reject/singleton_untraced_no_self.rb:121: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
+spinel: test/reject/singleton_untraced_no_self.rb:125: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
 spinel: test/reject/singleton_untraced_no_self.rb:68: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
-spinel: 12 refusals, nothing written
+spinel: 16 refusals, nothing written
 == test/reject/singleton_untraced_no_self.rb [promote] rc=1
 spinel: test/reject/singleton_untraced_no_self.rb:11: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
 spinel: test/reject/singleton_untraced_no_self.rb:21: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
@@ -1470,8 +1572,12 @@ spinel: test/reject/singleton_untraced_no_self.rb:61: singleton method on a rece
 spinel: test/reject/singleton_untraced_no_self.rb:74: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
 spinel: test/reject/singleton_untraced_no_self.rb:80: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
 spinel: test/reject/singleton_untraced_no_self.rb:89: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
+spinel: test/reject/singleton_untraced_no_self.rb:111: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
+spinel: test/reject/singleton_untraced_no_self.rb:116: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
+spinel: test/reject/singleton_untraced_no_self.rb:121: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
+spinel: test/reject/singleton_untraced_no_self.rb:125: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
 spinel: test/reject/singleton_untraced_no_self.rb:68: singleton method on a receiver spinel cannot trace to one `new` of a user class or Object (a String, an Array, a parameter, a value read out of a collection, a class held in a variable): no call on it would reach the method
-spinel: 12 refusals, nothing written
+spinel: 16 refusals, nothing written
 == test/reject/stdout_reassigned_pp.rb [default] rc=1
 spinel: test/reject/stdout_reassigned_pp.rb:6: unsupported pp while the program reassigns $stdout (puts, print, printf and p without a splat or block argument write through it): node N (CallNode `pp`) recv=-/ty-1 argc=1 arg0ty19
 spinel: 1 refusal, nothing written
@@ -1673,13 +1779,13 @@ spinel: 1 refusal, nothing written
 spinel: test/reject/table_loop_table_through_to_h.rb:8: unsupported call: node N (CallNode `const_set`) recv=-/ty-1 argc=2 arg0ty6
 spinel: 1 refusal, nothing written
 == test/reject/time_parse_no_require.rb [default] rc=1
-spinel: test/reject/time_parse_no_require.rb:7: Time.parse is not supported: spinel implements Time's other `require "time"` additions (the instance methods iso8601, httpdate, rfc2822) but not the string-parsing ones. Store times as epoch seconds and read them with Time.at instead (see docs/limitations.md)
+spinel: test/reject/time_parse_no_require.rb:7: Time.parse is not supported without `require "time"`, which defines it in CRuby (see docs/limitations.md)
 == test/reject/time_parse_no_require.rb [promote] rc=1
-spinel: test/reject/time_parse_no_require.rb:7: Time.parse is not supported: spinel implements Time's other `require "time"` additions (the instance methods iso8601, httpdate, rfc2822) but not the string-parsing ones. Store times as epoch seconds and read them with Time.at instead (see docs/limitations.md)
+spinel: test/reject/time_parse_no_require.rb:7: Time.parse is not supported without `require "time"`, which defines it in CRuby (see docs/limitations.md)
 == test/reject/time_strptime_no_require.rb [default] rc=1
-spinel: test/reject/time_strptime_no_require.rb:7: Time.strptime is not supported: spinel implements Time's other `require "time"` additions (the instance methods iso8601, httpdate, rfc2822) but not the string-parsing ones. Store times as epoch seconds and read them with Time.at instead (see docs/limitations.md)
+spinel: test/reject/time_strptime_no_require.rb:7: Time.strptime is not supported without `require "time"`, which defines it in CRuby (see docs/limitations.md)
 == test/reject/time_strptime_no_require.rb [promote] rc=1
-spinel: test/reject/time_strptime_no_require.rb:7: Time.strptime is not supported: spinel implements Time's other `require "time"` additions (the instance methods iso8601, httpdate, rfc2822) but not the string-parsing ones. Store times as epoch seconds and read them with Time.at instead (see docs/limitations.md)
+spinel: test/reject/time_strptime_no_require.rb:7: Time.strptime is not supported without `require "time"`, which defines it in CRuby (see docs/limitations.md)
 == test/reject/toplevel_include_yield_ivar_target.rb [default] rc=1
 spinel: test/reject/toplevel_include_yield_ivar_target.rb:14: unsupported top-level include of a module method that uses instance variables: node N (CallNode `pair`) recv=-/ty-1 argc=0
 spinel: 1 refusal, nothing written
@@ -1697,6 +1803,18 @@ spinel: test/reject/typed_array_kept_by_struct_into_mutated_param.rb:10: an Arra
 spinel: 1 refusal, nothing written
 == test/reject/typed_array_kept_by_struct_into_mutated_param.rb [promote] rc=1
 spinel: test/reject/typed_array_kept_by_struct_into_mutated_param.rb:10: an Array[Integer] is passed to `add`'s parameter `out`, which the method mutates: the parameter is a general Array and the argument would be copied into it, so the mutation would not reach the caller's array. Give the parameter the argument's kind (an rbs seed, or callers that all pass Array[Integer]), or build the argument as a general Array.
+spinel: 1 refusal, nothing written
+== test/reject/unresolved_builtin_method.rb [default] rc=1
+spinel: test/reject/unresolved_builtin_method.rb:7: unsupported Hash#transform_values on a value typed as Hash, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `transform_values`) recv=LocalVariableReadNode/ty28 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/unresolved_builtin_method.rb [promote] rc=1
+spinel: test/reject/unresolved_builtin_method.rb:7: unsupported Hash#transform_values on a value typed as Hash, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `transform_values`) recv=LocalVariableReadNode/ty28 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/unresolved_builtin_method_sym_block.rb [default] rc=1
+spinel: test/reject/unresolved_builtin_method_sym_block.rb:17: unsupported Array#drop_while on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `drop_while`) recv=CallNode/ty22 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/unresolved_builtin_method_sym_block.rb [promote] rc=1
+spinel: test/reject/unresolved_builtin_method_sym_block.rb:17: unsupported Array#drop_while on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `drop_while`) recv=CallNode/ty22 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/unsupported_node_kind.rb [default] rc=1
 spinel: test/reject/unsupported_node_kind.rb:5: unsupported condition (non-bool): FlipFlopNode at test/reject/unsupported_node_kind.rb:5:8

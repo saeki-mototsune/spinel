@@ -728,7 +728,7 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       TyKind cs_vt = repr_of(c, argv[1]).as_ty;
       /* (one-String mode: a String of the other face, through SP_STR_HDL /
          SP_STR_B) */
-      const char *cs_face = !g_one_string || !cv ? NULL
+      const char *cs_face = !cv ? NULL
                           : cv->type == TY_STRBUF && cs_vt == TY_STRING ? "SP_STR_HDL("
                           : cv->type == TY_STRING && cs_vt == TY_STRBUF ? "SP_STR_B(" : NULL;
       if (cv && cv->type != TY_UNKNOWN && (cs_vt == cv->type || cs_face)) {
@@ -1102,10 +1102,17 @@ static int ffi_arg_allocates(Compiler *c, int node) {
 /* Is argument ai of FFI function fi's call a String made where it stands
    (a shared handle's copy, a call's answer)? Nothing holds it but the C
    call's argument list. */
+/* (one-String mode: a variable's String goes to a :str argument as a copy
+   of its bytes where Ruby code can run during the call, as the argument's
+   emission below has it: the copy is made where it stands) */
+static int ffi_str_arg_copied(Compiler *c, int node) {
+  return comp_ntype(c, node) != TY_POLY && !c->strbuf_read_raw[node] && strbuf_slot_has(c, node);
+}
 static int ffi_str_arg_fresh(Compiler *c, int fi, int ai, const int *argv, int fixed_argc, int is_vararg) {
-  return (ai < fixed_argc ? ffi_spec_is_str(c->ffi_funcs[fi].args[ai])
-                          : is_vararg && comp_ntype(c, argv[ai]) == TY_STRING) &&
-         ffi_str_arg_collectable(c, argv[ai]) && ffi_arg_allocates(c, argv[ai]);
+  int str = ai < fixed_argc ? ffi_spec_is_str(c->ffi_funcs[fi].args[ai])
+                            : is_vararg && comp_ntype(c, argv[ai]) == TY_STRING;
+  return str && ffi_str_arg_collectable(c, argv[ai]) &&
+         (ffi_arg_allocates(c, argv[ai]) || (ai < fixed_argc && ffi_str_arg_copied(c, argv[ai])));
 }
 
 /* Does such a String sit beside another argument whose evaluation
@@ -1113,9 +1120,10 @@ static int ffi_str_arg_fresh(Compiler *c, int fi, int ai, const int *argv, int f
 static int ffi_str_arg_beside_alloc(Compiler *c, int fi, int argc, const int *argv, int fixed_argc, int is_vararg) {
   int nfresh = 0, nalloc = 0;
   for (int ai = 0; ai < argc; ai++) {
-    if (!ffi_arg_allocates(c, argv[ai])) continue;
+    int fresh = ffi_str_arg_fresh(c, fi, ai, argv, fixed_argc, is_vararg);
+    if (!fresh && !ffi_arg_allocates(c, argv[ai])) continue;
     nalloc++;
-    nfresh += ffi_str_arg_fresh(c, fi, ai, argv, fixed_argc, is_vararg);
+    nfresh += fresh;
   }
   return nfresh && nalloc >= 2;
 }
@@ -1200,7 +1208,7 @@ int attr_assign_slot(Compiler *c, int id, int *cid, int *iv) {
   /* --share-strings: a boxed receiver is dispatched on its class
      (emit_boxed_writer_arms); where one class has the writer, an attr
      writer or a Struct member, the slot is that class's */
-  if ((rt == TY_POLY || rt == TY_UNKNOWN) && c->share_strings) {
+  if ((rt == TY_POLY || rt == TY_UNKNOWN)) {
     int wmi, wcls;
     if (boxed_writer_defs(c, name, base, &wmi, &wcls) != 1 || wmi >= 0) return 0;
     snprintf(ivn, sizeof ivn, "@%s", base);
@@ -1218,18 +1226,15 @@ int attr_assign_slot(Compiler *c, int id, int *cid, int *iv) {
 }
 
 /* Is call id an attribute assignment of one plain String to an explicit
-   `def x=(v)` (one required parameter, the one method the call reaches),
-   where the --share-strings rule shares its value's String? Its value is
-   the String the writer was handed, as the handle it is a name of, whatever
-   the writer returns (call_is_setter_assign). */
+   `def x=(v)` (one required parameter, the one method the call reaches)?
+   Its value is the String the writer was handed, as the handle it is a
+   name of, whatever the writer returns (call_is_setter_assign). */
 int user_assign_handle(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   int recv = nt_ref(nt, id, "receiver"), argc = 0;
   const int *argv = call_args(nt, id, &argc);
-  /* (the rule's answer is the cheap test, and most assignments fail it: it
-     goes before the representation reads) */
-  if (!c->share_strings || recv < 0 || argc != 1 || nt_ref(nt, id, "block") >= 0 || !call_is_setter_assign(nt, id) ||
-      !share_assign_shares(c, id) || repr_of(c, argv[0]).kind == RK_BOXED ||
+  if (recv < 0 || argc != 1 || argv[0] < 0 || nt_ref(nt, id, "block") >= 0 || !call_is_setter_assign(nt, id) ||
+      repr_of(c, argv[0]).kind == RK_BOXED ||
       (comp_ntype(c, argv[0]) != TY_STRING && comp_ntype(c, argv[0]) != TY_STRBUF))
     return 0;
   /* a boxed receiver is dispatched on its class, and its arms answer the
@@ -1275,7 +1280,7 @@ const NativeMethod *native_assign_keeps(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   int recv = nt_ref(nt, id, "receiver"), argc = 0;
   const int *argv = call_args(nt, id, &argc);
-  if (!repr_share_rule(c) || recv < 0 || argc != 1 || nt_ref(nt, id, "block") >= 0 || !call_is_setter_assign(nt, id) ||
+  if (recv < 0 || argc != 1 || nt_ref(nt, id, "block") >= 0 || !call_is_setter_assign(nt, id) ||
       repr_of(c, argv[0]).kind == RK_BOXED || (comp_ntype(c, argv[0]) != TY_STRING && comp_ntype(c, argv[0]) != TY_STRBUF))
     return NULL;
   TyKind rty = repr_of(c, recv).as_ty, at = comp_ntype(c, argv[0]);
@@ -1285,8 +1290,7 @@ const NativeMethod *native_assign_keeps(Compiler *c, int id) {
   if (nk < 0 || !c->classes[nk].native_share_keeps) return NULL;
   int nm = comp_native_method_find_typed(c, nk, nt_str(nt, id, "name"), 1, 0, &at);
   const NativeMethod *m = nm >= 0 ? &c->native_methods[nm] : NULL;
-  return m && m->kind == 0 && (m->share & NSH_KEEPS) && m->share_csym && !m->rest && m->nargs == 1 &&
-         share_node_elems_share(c, recv) ? m : NULL;
+  return m && m->kind == 0 && (m->share & NSH_KEEPS) && m->share_csym && !m->rest && m->nargs == 1 ? m : NULL;
 }
 
 /* The edges the assignment walkers climb: the conditionals, a begin and its
@@ -1323,106 +1327,8 @@ static int assign_is_returned(Compiler *c, int id, const int *par) {
   return 0;
 }
 
-/* Is call id (through parentheses) the receiver of a String mutator or of
-   freeze, whose emitter takes the receiver as the handle it changes
-   (strbuf_recv_handle, the freeze arm), so the text a copy would give is
-   never read? */
-static int assign_mutated_receiver(Compiler *c, int id, int explicit_writer) {
-  const NodeTable *nt = c->nt;
-  int q = comp_recv_parent(c, id);
-  /* through the links that answer the receiver itself (`itself`, `to_s`) */
-  for (int d = 0; d < 8 && q >= 0 && nt_kind(nt, q) == NK_CallNode && str_self_call(nt, q) &&
-                  is_receiver_conversion(nt_str(nt, q, "name")) && !nt_safe_nav(nt, q); d++)
-    q = comp_recv_parent(c, q);
-  const char *nm = q >= 0 && nt_kind(nt, q) == NK_CallNode ? nt_str(nt, q, "name") : NULL;
-  /* a safe-navigation mutator takes no route over the handle (it must skip a
-     nil): an attr writer's value stays refused there, an explicit writer's
-     keeps its emission without the handle */
-  int argc = 0;
-  if (q >= 0) call_args(nt, q, &argc);
-  /* (a mutator given nothing to append, `concat`, answers its receiver
-     without the route taking a handle) */
-  return nm && (is_string_rebind_mutator(nm) || is_freeze_family(nm)) && !(argc == 0 && is_append_concat(nm)) &&
-         (explicit_writer || !nt_safe_nav(nt, q));
-}
 
-/* Is call id, as a call's receiver, only read: the call changes nothing,
-   does not answer its receiver and keeps none of its value (the share walk
-   peeked it, or it answers a count, a flag or the like: `size`, `bytes`,
-   `start_with?`, `upcase`; not `<<`, `freeze`, `to_s`, `itself`)? */
-static int assign_peeked_reader(Compiler *c, int id) {
-  const NodeTable *nt = c->nt;
-  int q = comp_recv_parent(c, id);
-  if (q < 0 || nt_kind(nt, q) != NK_CallNode) return 0;
-  const char *nm = nt_str(nt, q, "name");
-  int argc = 0;
-  call_args(nt, q, &argc);
-  TyKind qt = comp_ntype(c, q);
-  /* (a blockless iterator's Enumerator keeps its receiver) */
-  if (qt == TY_ENUMERATOR) return 0;
-  /* (an argument that runs code can change the String after the receiver's
-     read was taken: `(o.a = s) + (s << "3")`) */
-  const int *qav = nt_ref(nt, q, "arguments") >= 0 ? call_args(nt, q, &argc) : NULL;
-  for (int i = 0; qav && i < argc; i++)
-    if (subtree_has_side_effect(c, qav[i])) return 0;
-  int keeps_none = share_node_peeked(c, id) || (qt != TY_STRING && qt != TY_STRBUF && qt != TY_POLY && qt != TY_UNKNOWN);
-  return nm && keeps_none && nt_ref(nt, q, "block") < 0 && !is_string_rebind_mutator(nm) && !is_freeze_family(nm) &&
-         !bop_name_mutates(nm, 0) && bop_answers_self(TY_STRING, nm, argc, 0) == 0 &&
-         cplan_user(c, q)->dispatch == CP_NONE;
-}
 
-/* Is the value of call id thrown away: the share walk found it unread, or a
-   builtin that keeps none only prints it (`p x`; never one that changes its
-   receiver, whose mutation the aliases must see), or it is a statement that
-   is not the last of its sequence, or the value of a conditional, begin or
-   parenthesized expression that is itself dropped, or the value of a block
-   whose call just answers the yield (`def y = yield`) and is itself
-   dropped, or the value of a tap's block? What ends the climb (a loop
-   body, a block of an iterator) is an_value_dropped's, unless a user class
-   defines a method of the block call's name, which can answer the block's
-   value. The tail or `return` of a method that answers nothing (a `void` C
-   function, as an --rbs `-> nil` seed makes it) is thrown away too. */
-static int assign_value_dropped(Compiler *c, int id, const int *par) {
-  const NodeTable *nt = c->nt;
-  int n = id;
-  Scope *ms = comp_scope_of(c, id);
-  if (ms && ms->def_node >= 0 && method_is_void(ms) && (assign_is_tail(c, id, par) || assign_is_returned(c, id, par))) return 1;
-  for (int p = par[n]; ; p = par[n]) {
-    /* (a node can be a call's receiver and a statement's value both: the
-       parent map keeps one of them, comp_recv_parent the receiver) */
-    if (share_node_unread(c, n) || (share_node_peeked(c, n) && comp_recv_parent(c, n) < 0) || assign_peeked_reader(c, n)) return 1;
-    /* a String Hash key is copied (frozen) by CRuby: no identity is asked of it */
-    if (p >= 0 && nt_kind(nt, p) == NK_AssocNode && nt_ref(nt, p, "key") == n) return 1;
-    if (p < 0) return 0;
-    NodeKind k = nt_kind(nt, p);
-    if (k == NK_StatementsNode) {
-      int sn = 0;
-      const int *sb = nt_arr(nt, p, "body", &sn);
-      if (sn > 0 && sb[sn - 1] != n) return 1;
-      int gp = par[p];
-      NodeKind gk = gp >= 0 ? nt_kind(nt, gp) : NK_NONE;
-      if (gk == NK_BlockNode && par[gp] >= 0 && nt_kind(nt, par[gp]) == NK_CallNode) {
-        /* the block's value is its call's when the method only yields */
-        const CallPlan *pl = cplan_user(c, par[gp]);
-        int mb = pl->dispatch == CP_DIRECT && pl->mi > 0 ? c->scopes[pl->mi].body : -1;
-        int mn = 0;
-        const int *mbb = mb >= 0 && nt_kind(nt, mb) == NK_StatementsNode ? nt_arr(nt, mb, "body", &mn) : NULL;
-        if (mn == 1 && nt_kind(nt, mbb[0]) == NK_YieldNode) { n = par[gp]; continue; }
-      }
-      if (gp >= 0 && vp_is_value_edge(nt, gp, p, ASSIGN_CLIMB)) {
-        n = p;
-        continue;
-      }
-      /* tap answers its receiver, never its block's value */
-      const char *bn = gk == NK_BlockNode && par[gp] >= 0 && nt_kind(nt, par[gp]) == NK_CallNode
-                       ? nt_str(nt, par[gp], "name") : NULL;
-      if (bn && sp_streq(bn, "tap") && !cow_user_block_value(c, par, n)) return 1;
-      return an_value_dropped(nt, par, n) && !cow_user_block_value(c, par, n);
-    }
-    if (!vp_is_value_edge(nt, p, n, ASSIGN_CLIMB)) return 0;
-    n = p;
-  }
-}
 
 /* An attribute assignment's value that is taken as a String, not as the
    handle (the call is not marked to hand it out), is a copy of the one
@@ -1468,35 +1374,11 @@ int writers_change_param(Compiler *c, int id) {
   if (n < 0) return 1;
   for (int i = 0; i < n; i++) {
     const Scope *m = &c->scopes[mis[i]];
-    if (m->nparams != 1 || !m->pnames[0] || subtree_changes_local(c->nt, m->body, m->pnames[0], repr_share_rule(c))) return 1;
+    if (m->nparams != 1 || !m->pnames[0] || subtree_changes_local(c->nt, m->body, m->pnames[0], 1)) return 1;
   }
   return 0;
 }
 
-static void assign_value_route(Compiler *c, int id, int value, int as_string, int explicit_writer) {
-  static const char msg[] =
-    "an attribute assignment in value position (kept, passed on, or a method's last expression, "
-    "which the method answers) stores into an instance variable that is mutated in place through "
-    "another name, and its value would be a copy (a String is not yet shared by reference through "
-    "an assignment's value). Make the assignment a statement of its own, or read the String back "
-    "through the reader.";
-  /* a dropped value (a statement) is no consumer of a copy */
-  const int *par = codegen_node_parents(c, id);
-  if (c->share_strings && par && (assign_value_dropped(c, id, par) || assign_mutated_receiver(c, id, explicit_writer))) return;
-  /* nor is a String iterator's Enumerator walked where it is made, which
-     reads the String as it is there (one kept holds the handle:
-     str_each_enum_keeps) */
-  if (c->share_strings && str_each_enum_walked_here(c, comp_recv_parent(c, id))) return;
-  ShareRoute q = share_route(id, value, 0);
-  q.to = id;
-  Scope *sc = comp_scope_of(c, id);
-  int mi = sc ? (int)(sc - c->scopes) : -1;
-  int tail = mi > 0 && par && sc->def_node >= 0 && sc->ret_handle &&
-             (assign_is_tail(c, id, par) || assign_is_returned(c, id, par));
-  Repr mk = repr_of(c, id);
-  q.carry = ((mk.handle || mk.demand) && !as_string) || tail ? id : SHARE_CARRY_COPY;
-  if (!share_route_defer(c, &q, msg)) unsupported_feature(c, id, msg);
-}
 
 /* The value of a native binding's attribute assignment (native_assign_keeps)
    that is taken as a String, not as the handle: href is the binding's
@@ -1549,7 +1431,6 @@ static int emit_setter_assign_value(Compiler *c, int id, const int *argv, Buf *b
      the value is taken as the handle it is that handle (hv) */
   Repr hr = repr_of(c, id);
   int shr = user_assign_handle(c, id), hv = shr && (hr.handle || hr.demand);
-  if (shr && !hv) assign_value_route(c, id, argv[0], 0, 1);
   if (simple) {
     buf_puts(b, "({ (void)(");
     emit_setter_call_for_effect(c, id, shr, b);
@@ -1735,7 +1616,7 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
            to the deep-return channel, which a caller's pickup would take for
            this new String; the answer clears it, as the method's own body
            does (sp_strface_unpub) */
-        int nv_unpub = g_one_string && (nv_cstr_ret || nv_bin_ret);
+        int nv_unpub = (nv_cstr_ret || nv_bin_ret);
         if (nv_unpub) buf_puts(b, "sp_strface_unpub(");
         if (nv_cstr_ret) buf_puts(b, "sp_str_dup_external(");
         /* Sequence the call before the sp_ffi_bin_len read: C leaves argument
@@ -1751,6 +1632,11 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           if (sp_streq(spec, "any")) emit_boxed(c, argv[ai], b);
           else if (sp_streq(spec, "string")) emit_str_expr(c, argv[ai], b);
           else if (sp_streq(spec, "int")) emit_int_expr(c, argv[ai], b);
+          /* a :float, :bool or :string? from a value of any representation
+             (a boxed parameter of the def that stands for the function when
+             the module is held as a value), as a native class's binding
+             takes it */
+          else if (emit_native_value_arg(c, spec, argv[ai], b)) ;
           else emit_expr(c, argv[ai], b);
         }
         buf_puts(b, ")");
@@ -1933,7 +1819,7 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
                the call (mark_native_str_operands, strbuf_read_raw); a
                callback or a trap could grow the String and free the buffer,
                so elsewhere C reads a copy, as the default mode's read is) */
-            else if (g_one_string && !c->strbuf_read_raw[argv[ai]] && strbuf_slot_has(c, argv[ai])) {
+            else if (!c->strbuf_read_raw[argv[ai]] && strbuf_slot_has(c, argv[ai])) {
               buf_puts(&call_buf, "sp_str_dup(SP_STR_B("); emit_expr(c, argv[ai], &call_buf); buf_puts(&call_buf, "))");
             }
             else {
@@ -1944,8 +1830,8 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
               Buf fb; memset(&fb, 0, sizeof fb);
               emit_expr(c, argv[ai], &fb);
               const char *ft = fb.p ? fb.p : "";
-              if (strncmp(share_check_unmarked(ft), "sp_raise_nomethod(", 18) == 0 ||
-                  strncmp(share_check_unmarked(ft), "(sp_raise_cls(", 14) == 0)
+              if (strncmp(ft, "sp_raise_nomethod(", 18) == 0 ||
+                  strncmp(ft, "(sp_raise_cls(", 14) == 0)
                 buf_printf(&call_buf, "((void)(%s), (const char *)0)", ft);
               else buf_puts(&call_buf, ft);
               free(fb.p);
@@ -2084,7 +1970,7 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
         else if (is_str_ret) {
           /* (one representation: the answer clears the channel a handle
              argument's read published, as a native_func's does) */
-          buf_printf(b, g_one_string ? "sp_strface_unpub(sp_str_dup_external(%s))" : "sp_str_dup_external(%s)", call_buf.p);
+          buf_printf(b, "sp_strface_unpub(sp_str_dup_external(%s))", call_buf.p);
         }
         else if (is_binstr_ret) {
           /* Binary-safe: build the String from the exact byte count the callee
@@ -2095,7 +1981,7 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           int tp = ++g_tmp;
           buf_printf(b, "({ const char *_t%d = %s; %s"
                         "sp_str_as_binary(sp_str_from_bytes(_t%d, (size_t)(sp_ffi_bin_len < 0 ? 0 : sp_ffi_bin_len))); })",
-                     tp, call_buf.p, g_one_string ? "_sp_ret_strbuf = NULL; " : "", tp);
+                     tp, call_buf.p, "_sp_ret_strbuf = NULL; ", tp);
         }
         else {
           /* numeric / bool: cast to sp_int or sp_float */
@@ -2330,12 +2216,6 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
             /* a tail emitted into a String result slot takes a String, the
                handle mark or not */
             int _ahv = _avt == TY_STRBUF && !(g_result_var && g_result_ty == TY_STRING && !g_result_poly);
-            /* --share-strings: the copy is right where the rule does not
-               share the String; where it does, the value has to be the
-               handle, which the route check asks of every consumer, the
-               mark or not (assign_value_route) */
-            if (_aci->ivar_str_shared[_aiv] && (c->share_strings || _avt != TY_STRBUF))
-              assign_value_route(c, id, argv[0], _avt == TY_STRBUF && !_ahv, 0);
             buf_printf(b, "_t%d->iv_%s = ", _atmp, iv_c(_abase));
             emit_strbuf_ivar_store(c, _aci->ivar_str_shared[_aiv], argv[0], b);
             if (_ahv) buf_printf(b, "; %s_t%d->iv_%s; })", _amsp, _atmp, iv_c(_abase));
@@ -2343,6 +2223,9 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
               char _asr[300]; snprintf(_asr, sizeof _asr, "_t%d->iv_%s", _atmp, iv_c(_abase));
               buf_printf(b, "; %s", _amsp);
               if (_avt == TY_STRBUF) buf_printf(b, "sp_strbuf_read_pub(%s)", _asr);
+              /* (one representation: an assignment whose value is boxed,
+                 a writer a subclass overrides, boxes the handle) */
+              else if (_avt == TY_POLY) buf_printf(b, "SP_STR_BOX(%s)", _asr);
               else emit_strbuf_node_read(c, id, _asr, b);
               buf_puts(b, "; })");
             }
@@ -2566,7 +2449,7 @@ static int boxed_arg_wants_root(Compiler *c, int node) {
   if (t == TY_INT || t == TY_FLOAT || t == TY_BOOL || t == TY_NIL || t == TY_SYMBOL || t == TY_CLASS)
     return 0;
   if (comp_ty_value_obj(c, t) || ty_is_struct_valued(t)) return 1;
-  if (repr_share_rule(c) && (t == TY_STRING || t == TY_STRBUF)) return 1;
+  if ((t == TY_STRING || t == TY_STRBUF)) return 1;
   return !((tr.kind == RK_BOXED || needs_root(t)) && !arg_wants_root(c, t, node));
 }
 
@@ -2677,7 +2560,7 @@ int emit_call_new_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const c
       buf_printf(b, "sp_RbVal _t%d = ", atmp[a]); emit_boxed(c, argv[a], b);
       buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); ", atmp[a]);
     }
-    buf_printf(b, "sp_RbVal _t%d = sp_box_nil(); switch(_t%d.cls_id){", rt2, kt);
+    emit_class_value_new_switch(rt2, kt, 0, b);
     CtorArityArms aerr = {0};
     for (int ci = 0; ci < c->nclasses; ci++) {
       if (is_builtin_reopen(c->classes[ci].name) || c->classes[ci].is_native_class) continue;
@@ -2834,8 +2717,7 @@ int emit_call_new_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const c
     int kt = ++g_tmp, rt2 = ++g_tmp;
     buf_printf(b, "({ sp_Class _t%d = ", kt); emit_expr(c, recv, b); buf_printf(b, "; ");
     int sv_cbt = hoist_ctor_block(c, id, b);
-    buf_printf(b, "sp_RbVal _t%d = sp_box_nil(); ", rt2);
-    buf_printf(b, "switch(_t%d.cls_id){", kt);
+    emit_class_value_new_switch(rt2, kt, 0, b);
     CtorArityArms aerr = {0};
     for (int ci = 0; ci < c->nclasses; ci++) {
       if (is_builtin_reopen(c->classes[ci].name)) continue;
@@ -2988,7 +2870,7 @@ int emit_call_new_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const c
       if (boxed_arg_wants_root(c, argv[a])) buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); ", atmp[a]);
       else buf_puts(b, "; ");
     }
-    buf_printf(b, "sp_RbVal _t%d = sp_box_nil(); switch(_t%d.cls_id){", rt2, kt);
+    emit_class_value_new_switch(rt2, kt, 1, b);
     CtorArityArms aerr = {0};
     for (int ci = 0; ci < c->nclasses; ci++) {
       if (is_builtin_reopen(c->classes[ci].name) || c->classes[ci].is_native_class) continue;
@@ -3600,6 +3482,26 @@ void emit_class_value_constants(Compiler *c, const char *cv, int inherit, Buf *b
   buf_printf(b, " _t%d; })", ta);
 }
 
+/* ClassName.singleton_methods / singleton_methods(false): the class
+   methods the program defines, a compile-time list like the one above. */
+static int emit_class_value_singleton_methods(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
+  (void)id;
+  if (!sp_streq(name, "singleton_methods") || argc > 1) return 0;
+  const char *cn2 = nt_type(nt, recv) && sp_streq(nt_type(nt, recv), "ConstantReadNode")
+                    ? nt_str(nt, recv, "name") : NULL;
+  int ci2 = cn2 ? comp_class_index(c, cn2) : -1;
+  int all = argc == 0 || nt_kind(nt, argv[0]) == NK_TrueNode;
+  if (!cn2 || (argc == 1 && !all && nt_kind(nt, argv[0]) != NK_FalseNode) || !an_singleton_methods_foldable(c, cn2)) return 0;
+  ReflNames r = {0};
+  refl_builtin_singleton_methods(cn2, all, &r);
+  if (ci2 >= 0) refl_class_singleton_methods(c, ci2, all, &r);
+  buf_puts(b, "sp_box_poly_array(");
+  refl_emit_sym_array(c, -1, &r, b);
+  buf_puts(b, ")");
+  refl_free(&r);
+  return 1;
+}
+
 int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
   /* SomeClass.superclass -> the parent class as sp_Class value */
   if (recv >= 0 && argc == 0 && sp_streq(name, "superclass") &&
@@ -3642,8 +3544,8 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         nt_type(nt, recv) && sp_streq(nt_type(nt, recv), "SelfNode") &&
         is_builtin_reopen(c->classes[g_emitting_class_id].name)) {
       const char *ecn = c->classes[g_emitting_class_id].name;
-      /* an IO reopening's self is the sp_File handle, typed so */
-      if (!sp_streq(ecn, "TrueClass") && !sp_streq(ecn, "FalseClass") && !io_family_class(c, g_emitting_class_id))
+      /* an IO reopening's self is the sp_File handle, an Enumerator's the sp_Enumerator */
+      if (!sp_streq(ecn, "TrueClass") && !sp_streq(ecn, "FalseClass") && !io_family_class(c, g_emitting_class_id) && !sp_streq(ecn, "Enumerator"))
         rt = TY_POLY;
     }
     /* MatchData is nullable (nil on no-match): .class checks at run time so a
@@ -4154,24 +4056,7 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         }
       }
     }
-    /* ClassName.singleton_methods / singleton_methods(false): the class
-       methods the program defines, a compile-time list like the one above. */
-    if (sp_streq(name, "singleton_methods") && argc <= 1) {
-      const char *cn2 = nt_type(nt, recv) && sp_streq(nt_type(nt, recv), "ConstantReadNode")
-                        ? nt_str(nt, recv, "name") : NULL;
-      int ci2 = cn2 ? comp_class_index(c, cn2) : -1;
-      int all = argc == 0 || nt_kind(nt, argv[0]) == NK_TrueNode;
-      if (ci2 >= 0 && (argc == 0 || all || nt_kind(nt, argv[0]) == NK_FalseNode) &&
-          an_class_singleton_methods_listable(c, ci2)) {
-        ReflNames r = {0};
-        refl_class_singleton_methods(c, ci2, all, &r);
-        buf_puts(b, "sp_box_poly_array(");
-        refl_emit_sym_array(c, -1, &r, b);
-        buf_puts(b, ")");
-        refl_free(&r);
-        return 1;
-      }
-    }
+    if (emit_class_value_singleton_methods(c, id, b, nt, name, recv, argc, argv)) return 1;
     /* `equal?` joins them: a class is one object per name, so identity and
        equality are the same question here (#4271). */
     if (is_equality_name(name) && argc == 1) {
@@ -4295,7 +4180,10 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
           if (sp_streq(name, "class_variable_get")) { emit_boxed_text(c, ct, ref, b); return 1; }
           if (sp_streq(name, "class_variable_set") && argc == 2) {
             buf_printf(b, "(%s = ", ref);
-            if (ct == TY_POLY) emit_boxed(c, argv[1], b); else emit_expr(c, argv[1], b);
+            if (ct == TY_POLY) emit_boxed(c, argv[1], b);
+            /* (a slot that holds a String's handle takes the String's) */
+            else if (ct == TY_STRBUF) { buf_puts(b, "SP_STR_HDL("); emit_expr(c, argv[1], b); buf_puts(b, ")"); }
+            else emit_expr(c, argv[1], b);
             buf_puts(b, ", ");
             emit_cvar_set_flag(c, ccid, cvn, 1, b);
             emit_boxed_text(c, ct, ref, b); buf_puts(b, ")");
@@ -5212,6 +5100,7 @@ int emit_call_reopen_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     case TY_TIME:   oc_cn = "Time"; break;
     case TY_THREAD: oc_cn = "Thread"; break;
     case TY_FIBER:  oc_cn = "Fiber"; break;
+    case TY_ENUMERATOR: oc_cn = "Enumerator"; break;
     case TY_IO:     oc_cn = "File"; break;
     case TY_CLASS:  oc_cn = "Class"; break;
     default: break;
@@ -5227,7 +5116,10 @@ int emit_call_reopen_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
               emit_reopen_block_call(c, id, recv, oc_mi, NULL, b)) return 1;
           if (g_plan_check) ucall_observe(c, id, oc_mi, oc_ci, 0);
           size_t at = b->len;
-          buf_printf(b, "sp_%s_%s(", mc_reopen_cls(c, oc_ci, name), mc(name));
+          /* the method's own name: an alias's call names the method it
+             resolved to */
+          const char *mn = c->scopes[oc_mi].name;
+          buf_printf(b, "sp_%s_%s(", mc_reopen_cls(c, oc_ci, mn), mc(mn));
           int open = emit_reopen_recv_args(c, id, oc_mi, recv, 0, NULL, at, b);
           /* a method taking `&block` takes the call's block, or NULL (#7200) */
           emit_callee_block_arg(c, id, &c->scopes[oc_mi], b);

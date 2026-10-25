@@ -27,6 +27,8 @@ void rb_define_alias(VALUE, const char *, const char *);
 void rb_define_attr(VALUE, const char *, int, int);
 void rb_include_module(VALUE, VALUE);
 void rb_extend_object(VALUE, VALUE);
+void rb_undef_method(VALUE, const char *);
+void rb_undef_alloc_func(VALUE);
 ID rb_intern(const char *);
 ID rb_intern2(const char *, long);
 #define rb_intern_const rb_intern
@@ -39,14 +41,21 @@ VALUE rb_str_intern(VALUE);
 VALUE rb_funcall(VALUE, ID, int, ...);
 VALUE rb_funcallv(VALUE, ID, int, const VALUE *);
 #define RB_BLOCK_CALL_FUNC_ARGLIST(yielded, data) VALUE yielded, VALUE data, int argc, const VALUE *argv, VALUE blockarg
-typedef VALUE (*rb_block_call_func_t)(VALUE, VALUE, int, const VALUE *, VALUE);
+typedef VALUE rb_block_call_func(RB_BLOCK_CALL_FUNC_ARGLIST(yielded_arg, callback_arg));
+typedef rb_block_call_func *rb_block_call_func_t;
 VALUE rb_block_call(VALUE, ID, int, const VALUE *, rb_block_call_func_t, VALUE);
 VALUE rb_iv_get(VALUE, const char *);
 VALUE rb_iv_set(VALUE, const char *, VALUE);
 VALUE rb_ivar_get(VALUE, ID);
 VALUE rb_ivar_set(VALUE, ID, VALUE);
 VALUE rb_const_get(VALUE, ID);
+VALUE rb_const_get_at(VALUE, ID);
+int rb_const_defined(VALUE, ID);
 VALUE rb_eval_string(const char *);
+VALUE rb_catch(const char *, rb_block_call_func_t, VALUE);
+void rb_throw(const char *, VALUE) SP_CEXT_NORETURN;
+void rb_iter_break(void) SP_CEXT_NORETURN;
+void rb_iter_break_value(VALUE) SP_CEXT_NORETURN;
 
 /* CRuby answers these by calling the Ruby method, so they are rb_funcall with
  * a literal name: the scanner records the name, and an override answers as it

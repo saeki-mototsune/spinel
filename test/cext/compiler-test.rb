@@ -110,4 +110,13 @@ end
 cruby_oracle('display')
 cruby_oracle('dispatch')
 cruby_oracle('object_class')
+cruby_oracle('numbers')
+cruby_oracle('types')
+cruby_oracle('arrays')
+cruby_oracle('catch_throw')
+cruby_oracle('sealed')
+cruby_oracle('const_defined')
+cruby_oracle('symbol_ids')
+cruby_oracle('feed')
+cruby_oracle('formats')
 puts 'C extension compiler bridge: CRuby oracle and GC modes passed'

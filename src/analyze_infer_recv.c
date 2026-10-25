@@ -456,9 +456,6 @@ TyKind infer_map_block_ty(Compiler *c, int id, int block) {
      in only to unbox it again on each read. */
   if (c->arr_want && id < c->node_cap && ty_is_ptr_array(c->arr_want[id]))
     return c->arr_want[id];
-  /* A temporary result has no holder to select boxed element storage.
-     Its shared block values need the same layout as a stored result. */
-  if (c->share_strings && !g_one_string && share_node_elems_share(c, id)) return TY_POLY_ARRAY;   /* (one-String mode: the String Array holds the handle) */
   return ty_array_of(bt);
 }
 
@@ -588,6 +585,11 @@ int infer_hash_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       { *out = TY_POLY_POLY_HASH; return 1; }
     if (sp_streq(name, "merge") && argc == 1) {
       TyKind at = argc >= 1 ? infer_type(c, argv[0]) : TY_UNKNOWN;
+      if (ty_is_object(at)) {
+        int hmi = comp_method_in_chain(c, ty_object_class(at), "to_hash", NULL);
+        if (hmi >= 0 && ty_is_hash((TyKind)c->scopes[hmi].ret) && (TyKind)c->scopes[hmi].ret != rt)
+          { *out = TY_POLY_POLY_HASH; return 1; }
+      }
       /* a conflict block whose value the receiver's variant cannot hold
          builds the general boxed hash, as a boxed receiver's does */
       if (ty_hash_val(rt) != TY_POLY) {
@@ -657,6 +659,7 @@ static int fill_value_fits(Compiler *c, int call, TyKind rt) {
     if (an < 1) return 1;
     fv = infer_type(c, av[0]);
   }
+  if (fv == TY_STRBUF) fv = TY_STRING;   /* (one-String mode: the String Array holds the handle) */
   return fe == TY_POLY || fv == TY_UNKNOWN || fv == TY_POLY || fv == TY_VOID || fv == fe;
 }
 
@@ -702,16 +705,6 @@ int infer_array_call(Compiler *c, int id, TyKind rt, TyKind *out) {
        unknown until the caller supplies a predicate. */
     if (sp_streq(name, "bsearch") && block < 0 && argc == 0) {
       *out = TY_ENUMERATOR;
-      return 1;
-    }
-    /* --share-strings: a retaining iterator over a fresh String Array whose
-       elements the rule shares answers the handles its block saw, the
-       PolyArray a local's Array of them would be (a temporary result has no
-       holder to select boxed element storage). The in-place filters answer
-       self or nil, boxed, and keep their type. */
-    if (c->share_strings && rt == TY_STR_ARRAY && !is_select_reject_bang(name) &&
-        share_iter_answers_handles(c, id)) {
-      *out = TY_POLY_ARRAY;
       return 1;
     }
     /* dig(*keys) walks a runtime key list: the depth, and so the value's
@@ -978,6 +971,9 @@ int infer_array_call(Compiler *c, int id, TyKind rt, TyKind *out) {
               const char *sop = fold_seed_op_sym(c, id, argc, argv);
               TyKind et = ty_array_elem(rt);
               int arith = sop && is_arith_op(sop);
+              /* `&`, `|` and `^` keep a Bignum element's width: an int seed
+                 folded over one does not fit an sp_int either */
+              int boxes = arith || (sop && is_bit_op(sop));
               /* A seed of another class is not an accumulator this element type
                  can hold at all: `[1, 2, 3].reduce(0.5, :+)` accumulates Float
                  and a Bignum seed does not fit an sp_int. Those fold boxed, and
@@ -991,7 +987,7 @@ int infer_array_call(Compiler *c, int id, TyKind rt, TyKind *out) {
                  arithmetic operator: the accumulator promotes to the boxed
                  element and the result is a boxed poly (#3220). A plain poly
                  array's element type is unknown, so gate on the literal. */
-              else if (arith && rt == TY_POLY_ARRAY && recv >= 0 &&
+              else if (boxes && rt == TY_POLY_ARRAY && recv >= 0 &&
                        nt_type(nt, recv) && sp_streq(nt_type(nt, recv), "ArrayNode")) {
                 int ren = 0; const int *rev = nt_arr(nt, recv, "elements", &ren);
                 int boxed_num = 0;
@@ -1007,7 +1003,7 @@ int infer_array_call(Compiler *c, int id, TyKind rt, TyKind *out) {
                  a zip.map): the elements may be Float/Rational/etc., so an int
                  seed cannot unbox the boxed accumulator without reinterpreting
                  the bits. Keep the result boxed (#3238). */
-              else if (arith && et == TY_POLY) it = TY_POLY;
+              else if (boxes && et == TY_POLY) it = TY_POLY;
             }
             /* The same rule for a seed that is not a number at all -- a String,
                nil, true/false, a Rational. `[1, 2].reduce("x", :*)` accumulates
@@ -1100,7 +1096,7 @@ int infer_array_call(Compiler *c, int id, TyKind rt, TyKind *out) {
           TyKind at = infer_type(c, argv[ai]);
           /* (one-String mode: a String Array holds a handle as it holds
              the bytes) */
-          if (g_one_string && elem_t == TY_STRING && at == TY_STRBUF) continue;
+          if (elem_t == TY_STRING && at == TY_STRBUF) continue;
           if (at != TY_UNKNOWN && at != elem_t) { *out = TY_POLY_ARRAY; return 1; }
         }
       }
@@ -1435,7 +1431,7 @@ int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out) {
           comp_resolve_member(c, cid, base, 1, NULL, NULL) == SP_MEMBER_ATTR) {
         TyKind rhsk = infer_type(c, argv[0]);
         /* (a handle local's value is its String face, as an ivar write's is) */
-        if (rhsk == TY_STRBUF && c->share_strings) rhsk = TY_STRING;
+        if (rhsk == TY_STRBUF) rhsk = TY_STRING;
         /* codegen boxes a scalar rhs into a poly ivar slot, so the assignment
            expression's C value is that boxed poly -- report poly to match. */
         char wivn[258]; snprintf(wivn, sizeof wivn, "@%s", base);
@@ -1454,7 +1450,7 @@ int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out) {
                 ? comp_method_in_chain(c, cid, name, NULL) : -1;
       if (smi >= 0) {
         TyKind rhsk = infer_type(c, argv[0]);
-        if (rhsk == TY_STRBUF && c->share_strings) rhsk = TY_STRING;
+        if (rhsk == TY_STRBUF) rhsk = TY_STRING;
         if (rhsk != TY_UNKNOWN) {
           an_user_call_record(c, id, smi, UC_INST, cid);
           *out = rhsk; return 1;
@@ -1695,8 +1691,7 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
     if (argc <= 2 && argc >= 1 &&
         (sp_streq(name, "byteindex") || sp_streq(name, "byterindex"))) { *out = TY_INT; return 1; }
     if (argc == 1 && (is_partition_family(name)))
-      { *out = c->share_strings && !g_one_string && (infer_type(c, argv[0]) == TY_STRING || infer_type(c, argv[0]) == TY_STRBUF || infer_type(c, argv[0]) == TY_REGEX) && share_node_elems_share(c, id)
-                   ? TY_POLY_ARRAY : TY_STR_ARRAY; return 1; }
+      { *out = TY_STR_ARRAY; return 1; }
     if (argc == 2 && sp_streq(name, "tr_s")) { *out = TY_STRING; return 1; }
     if (argc == 1 && sp_streq(name, "crypt")) { *out = TY_STRING; return 1; }
     /* try_convert on a class-tagged boxed value: the value or nil, as the
@@ -1878,6 +1873,8 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
   if (recv >= 0 && rt == TY_POLY && argc == 0 && nt_ref(nt, id, "block") < 0 &&
       is_str_each_iter(name) && !an_user_defines_or_reads(c, name)) {
     if (poly_str_iter_enum(c, id)) { *out = TY_ENUMERATOR; return 1; }
+    /* an IO's codepoints are an Enumerator over the stream, a String's an Array */
+    if (poly_io_codepoint_enum(c, id)) { *out = TY_POLY; return 1; }
     if (is_byte_codepoint_each(name)) { *out = TY_INT_ARRAY; return 1; }
     { *out = TY_STR_ARRAY; return 1; }
   }
@@ -1893,7 +1890,7 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
     const char *ebp = block_param_name(c, eb, 0);
     Scope *ebs = ebp ? comp_scope_of(c, eb) : NULL;
     LocalVar *ebl = (ebs && ebp) ? scope_local(ebs, ebp) : NULL;
-    if (ebl && ebl->type != TY_STRING && !(ebl->type == TY_STRBUF && ebl->str_shared && c->share_strings))
+    if (ebl && ebl->type != TY_STRING && !(ebl->type == TY_STRBUF && ebl->str_shared))
       lv_set_type(ebl, ebl->type == TY_INT || (ebl->type == TY_POLY && block_yields_int_too(nt, eb)) ? TY_POLY : TY_STRING);
     { *out = TY_STRING; return 1; }
   }
@@ -2212,6 +2209,17 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
    what an Array does not answer (`next`, `with_index`). Walked where it is
    made otherwise, it walks the Array chars, lines or bytes answers, the
    same items read at the same point, and keeps their element types. */
+/* Does a blockless, argumentless each_codepoint on a boxed receiver (call
+   id) go to the boxed IO arm (sp_poly_io_codepoint_enum), which answers a
+   stream Enumerator for an IO and the String forms otherwise? Only where
+   the program can hold an IO in a box (an_program_makes_io); inference and
+   both emitter tests read this one answer. */
+int poly_io_codepoint_enum(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  const char *name = nt_str(nt, id, "name");
+  return name && sp_streq(name, "each_codepoint") && nt_ref(nt, id, "arguments") < 0 &&
+         nt_ref(nt, id, "block") < 0 && an_program_makes_io(c);
+}
 int poly_str_iter_enum(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   int q = comp_recv_parent(c, id);

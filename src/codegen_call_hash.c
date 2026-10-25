@@ -136,7 +136,7 @@ int emit_op_hash_to_proc(Compiler *c, const BopCtx *x, Buf *b) {
   TyKind rt = x->rt;
   const char *hn = ty_hash_cname(rt);
   TyKind kt = ty_hash_key(rt), vt = ty_hash_val(rt);
-  int pn = ++g_proc_counter;
+  const char *pn = uid_new();
   /* The key is read from the proc's boxed side-channel, which every caller
      publishes, not from the sp_int slot: the proc can be called with a key
      of any class, and the slot's bits read as a `const char *` for a
@@ -152,8 +152,8 @@ int emit_op_hash_to_proc(Compiler *c, const BopCtx *x, Buf *b) {
                      : (kt == TY_STRING) ? "SP_TAG_STR"
                      : (kt == TY_INT) ? "SP_TAG_INT" : NULL;
   g_needs_proc_poly_argslot = 1;
-  buf_printf(&g_proc_protos, "static sp_int _hashproc_%d(void *cap, sp_int argc, sp_int *args);\n", pn);
-  buf_printf(&g_procs, "static sp_int _hashproc_%d(void *cap, sp_int argc, sp_int *args) {\n", pn);
+  buf_printf(&g_proc_protos, "static sp_int _hashproc_%s(void *cap, sp_int argc, sp_int *args);\n", pn);
+  buf_printf(&g_procs, "static sp_int _hashproc_%s(void *cap, sp_int argc, sp_int *args) {\n", pn);
   /* the hash proc is a lambda: exactly one key, as CRuby's raises --
      the old `argc < 1 -> return 0` left the return slot holding the
      previous call's value */
@@ -180,7 +180,7 @@ int emit_op_hash_to_proc(Compiler *c, const BopCtx *x, Buf *b) {
       emit_boxed_text(c, vt, _ge, &g_procs);
     } }
   buf_puts(&g_procs, ";\n  return 0;\n}\n");
-  buf_printf(b, "sp_proc_new_meta((void *)_hashproc_%d, (void *)(", pn);
+  buf_printf(b, "sp_proc_new_meta((void *)_hashproc_%s, (void *)(", pn);
   emit_expr(c, recv, b);
   /* CRuby's Hash#to_proc is a lambda: lambda? answers true and a
      composed call enforces its 1-arity instead of reading a stale slot */
@@ -321,7 +321,7 @@ int emit_op_hash_default(Compiler *c, const BopCtx *x, Buf *b) {
     buf_printf(b, "; (_t%d && !_t%d->default_nil) ? sp_box_int(_t%d->default_v) : sp_box_nil(); })", t, t, t);
   }
   else if (rt == TY_STR_STR_HASH || rt == TY_INT_STR_HASH) {
-    buf_printf(b, "; (_t%d && _t%d->default_v) ? %s_t%d->default_v) : sp_box_nil(); })", t, t, g_one_string ? "SP_SEBOX(" : "sp_box_str(", t);
+    buf_printf(b, "; (_t%d && _t%d->default_v) ? %s_t%d->default_v) : sp_box_nil(); })", t, t, "SP_SEBOX(", t);
   }
   else {
     buf_printf(b, "; (void)_t%d; sp_box_nil(); })", t);
@@ -607,7 +607,7 @@ int emit_op_hash_set_default(Compiler *c, const BopCtx *x, Buf *b) {
   else if (rt == TY_STR_STR_HASH || rt == TY_INT_STR_HASH) {
     buf_printf(b, is_nil ? " if (_t%d) _t%d->default_v = " : " if (_t%d) { _t%d->default_v = ", t, t);
     /* (one representation: the values' slot holds the element, the handle) */
-    int one_h = g_one_string && !is_nil;
+    int one_h = !is_nil;
     if (one_h) buf_puts(b, "SP_STR_HDL(");
     if (is_nil) buf_puts(b, "NULL");
     else if (held && at == TY_POLY) buf_printf(b, "sp_poly_hval_s(%s)", av);
@@ -720,8 +720,8 @@ int emit_op_hash_delete(Compiler *c, const BopCtx *x, Buf *b) {
   else
     /* (one representation: a String value is the handle, read here as its bytes face) */
     buf_printf(b, "; %s _t%d = sp_%sHash_has_key%s(_t%d, _t%d) ? %ssp_%sHash_get%s(_t%d, _t%d)%s : %s;",
-               c_type_name(vt), tv, hn, ks, th, tk, g_one_string && vt == TY_STRING ? "SP_STR_B(" : "", hn, ks, th, tk,
-               g_one_string && vt == TY_STRING ? ")" : "",
+               c_type_name(vt), tv, hn, ks, th, tk, vt == TY_STRING ? "SP_STR_B(" : "", hn, ks, th, tk,
+               vt == TY_STRING ? ")" : "",
                vt == TY_POLY ? "sp_box_nil()" : vt == TY_STRING ? "NULL" : default_value_from_compiler(c, vt));
   buf_printf(b, " sp_%sHash_delete%s(_t%d, _t%d); ", hn, rt == TY_STR_POLY_HASH ? "_bytes" : ks, th, tk);
   if (vt == TY_INT) { oint_open(c, x->id, TY_INT, b); buf_printf(b, "_t%d", tv); oint_close(c, x->id, b); buf_puts(b, "; })"); }
@@ -983,7 +983,15 @@ int emit_op_hash_assoc(Compiler *c, const BopCtx *x, Buf *b) {
   buf_printf(b, "({ sp_%sHash *_t%d = ", hn, th); emit_expr(c, recv, b); buf_puts(b, ";");
   if (env) buf_printf(b, " SP_GC_ROOT(_t%d);", th);
   /* store argument */
-  if (!is_rassoc) {
+  /* (one-String mode: ENV.assoc's pair holds the argument itself, which
+     the caller can change, so its handle is held and boxed) */
+  int one_k = env && !is_rassoc && comp_ntype(c, argv[0]) == TY_STRING;
+  int tk = one_k ? ++g_tmp : 0;
+  if (one_k) {
+    buf_printf(b, " sp_String *_t%d = SP_STR_HDL(", tk); emit_expr(c, argv[0], b);
+    buf_printf(b, "); SP_GC_ROOT(_t%d); const char *_t%d = sp_env_chk(SP_STR_B(_t%d), 0);", tk, ta, tk);
+  }
+  else if (!is_rassoc) {
     buf_printf(b, " %s _t%d = ", hash_key_ctype(c, argv[0], kt), ta); emit_hash_key_o(c, argv[0], kt, b); buf_puts(b, ";");
   }
   else {
@@ -1017,7 +1025,9 @@ int emit_op_hash_assoc(Compiler *c, const BopCtx *x, Buf *b) {
   }
   /* build pair */
   buf_printf(b, " _t%d = sp_PolyArray_new();", tr);
-  if (env) {
+  if (one_k)
+    buf_printf(b, " SP_GC_ROOT(_t%d); sp_PolyArray_push(_t%d, SP_STR_BOX(_t%d));", tr, tr, tk);
+  else if (env) {
     buf_printf(b, " SP_GC_ROOT(_t%d); sp_PolyArray_push(_t%d, sp_box_str(", tr, tr);
     if (is_rassoc) buf_printf(b, "sp_str_dup_external(_t%d->order[_t%d])", th, ti);
     else buf_printf(b, "_t%d", ta);

@@ -177,7 +177,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
       /* (--share-strings: so is one on a handle, which the guard holds,
          `id(s)&.setbyte(0, 90)`, as emit_call_safe_nav_arms guards it) */
       int sr = nt_ref(nt, node, "receiver");
-      if (repr_share_rule(c) && sr >= 0 && repr_of(c, sr).as_ty == TY_STRBUF && repr_of(c, sr).kind != RK_BOXED) return 1;
+      if (sr >= 0 && repr_of(c, sr).as_ty == TY_STRBUF && repr_of(c, sr).kind != RK_BOXED) return 1;
     }
     const char *nm = view_call_name(c, node);
     if (!nm) return 0;
@@ -561,7 +561,7 @@ static int repr_recv_boxed(const Compiler *c, int recv) {
    tells them apart. */
 static void repr_layout(Repr *r, TyKind t) {
   /* (a String Array of handles holds each String as its handle) */
-  r->elem = t == TY_STRH_ARRAY ? TY_STRBUF : ty_is_array(t) || ty_is_obj_array(t) ? ty_array_elem(t) : TY_UNKNOWN;
+  r->elem = ty_is_array(t) || ty_is_obj_array(t) ? ty_array_elem(t) : TY_UNKNOWN;
   r->key = ty_hash_key(t);
   r->val = ty_hash_val(t);
   r->range = t == TY_RANGE ? TY_INT : t == TY_FLOAT_RANGE ? TY_FLOAT
@@ -683,7 +683,7 @@ TyKind repr_opt_kind(const Compiler *c, int node) {
 
 /* repr.h: the write's slot holds the rule's handle */
 int repr_write_share(const Compiler *c, int node) {
-  if (node < 0 || !c->share_strings) return 0;
+  if (node < 0) return 0;
   Compiler *mc = (Compiler *)c;
   const NodeTable *nt = c->nt;
   NodeKind k = nt_kind(nt, node);
@@ -722,12 +722,12 @@ int repr_write_share(const Compiler *c, int node) {
 const NativeMethod *repr_native_arm_handle(Compiler *c, int v, int k) {
   const NodeTable *nt = c->nt;
   int recv = v >= 0 && nt_kind(nt, v) == NK_CallNode ? nt_ref(nt, v, "receiver") : -1;
-  if (!repr_share_rule(c) || !c->share || recv < 0 || k < 0 || k >= c->nclasses || !c->classes[k].is_native_class ||
+  if (!c->share || recv < 0 || k < 0 || k >= c->nclasses || !c->classes[k].is_native_class ||
       nt_ref(nt, v, "arguments") >= 0 || nt_ref(nt, v, "block") >= 0)
     return NULL;
   int nm = comp_native_method_find(c, k, nt_str(nt, v, "name"), 0, 0);
   const NativeMethod *m = nm >= 0 ? &c->native_methods[nm] : NULL;
-  return m && (m->share & NSH_ANSWERS) && m->share_csym && share_node_elems_share(c, recv) ? m : NULL;
+  return m && (m->share & NSH_ANSWERS) && m->share_csym ? m : NULL;
 }
 /* Is v a boxed receiver's call whose arm, for each class the receiver can
    hold, is such a native binding (`o.string` where o holds a StringIO or a
@@ -769,7 +769,7 @@ static int repr_boxed_native_handle(Compiler *c, int v) {
    binding's handle form answers the handle it kept. The binding, or NULL. */
 const NativeMethod *repr_super_native_keeps(Compiler *c, int n) {
   const NodeTable *nt = c->nt;
-  if (!repr_share_rule(c) || !c->share || n < 0 || nt_kind(nt, n) != NK_SuperNode) return NULL;
+  if (!c->share || n < 0 || nt_kind(nt, n) != NK_SuperNode) return NULL;
   Scope *ms = comp_scope_of(c, n);
   if (!ms || ms->is_cmethod || ms->class_id < 0 || ms->class_id >= c->nclasses || ms->def_node < 0 ||
       !ms->name || is_initialize_family(ms->name) || c->classes[ms->class_id].nsub_root <= 0)
@@ -782,7 +782,7 @@ const NativeMethod *repr_super_native_keeps(Compiler *c, int n) {
   int nm = comp_native_method_find_typed(c, root, ms->name, 1, 0, &at);
   const NativeMethod *m = nm >= 0 ? &c->native_methods[nm] : NULL;
   if (!m || m->kind != 0 || !(m->share & NSH_KEEPS) || !m->share_csym || m->rest || m->nargs != 1) return NULL;
-  return repr_str_elems_share(c, share_self_holder(c, (int)(ms - c->scopes))) ? m : NULL;
+  return m;
 }
 
 /* repr.h: does method mi answer no value -- every path of its body ends in
@@ -832,17 +832,11 @@ int repr_call_returns_handle(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
   v = nt_paren_single(c->nt, v);
   if (repr_super_native_keeps(c, v)) return 1;
-  if (repr_share_rule(c) && v >= 0 && (nt_kind(nt, v) == NK_SuperNode || nt_kind(nt, v) == NK_ForwardingSuperNode)) {
+  if (v >= 0 && (nt_kind(nt, v) == NK_SuperNode || nt_kind(nt, v) == NK_ForwardingSuperNode)) {
     const CallPlan *p = cplan_user(c, v);
     return p->dispatch == CP_DIRECT && repr_self_handle(c, p->mi) && scope_ret_handle(c, p->mi);
   }
   if (v < 0 || nt_kind(nt, v) != NK_CallNode) return 0;
-  /* an attribute assignment answers its right-hand side, not what the
-     writer returns: where the facts keep its value apart from the
-     right-hand side's String (share_assign_unjoined), that value is the
-     right-hand side's own pointer, and a writer that dups publishes its
-     own copy */
-  if (share_assign_unjoined(c, v)) return 0;
   /* a String's value, or one the pickup marks to be stored as the handle */
   TyKind t = c->ntype[v];
   if (t != TY_STRING && !(t == TY_STRBUF && (c->strbuf_box[v] || c->n_cext_extensions))) return 0;
@@ -880,7 +874,7 @@ int repr_call_returns_handle(Compiler *c, int v) {
     /* a boxed argument's classes, or an object's own and its subclasses'
        (the class alone for a `K.new`, which builds exactly K) */
     TyKind at = comp_ntype(c, av[0]);
-    int ocid = repr_share_rule(c) && ty_is_object(at) ? ty_object_class(at) : -1;
+    int ocid = ty_is_object(at) ? ty_object_class(at) : -1;
     if (ocid < 0 && repr_of(c, av[0]).kind != RK_BOXED) return 0;
     int own[CPT_MAX];
     const int *ks = ocid >= 0 ? own : poly_recv_classes(c, v, &n);
@@ -929,7 +923,7 @@ int repr_call_returns_handle(Compiler *c, int v) {
    Names with a builtin face keep their own route. */
 int repr_boxed_reader_handle(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
-  if (!repr_share_rule(c) || v < 0 || nt_kind(nt, v) != NK_CallNode ||
+  if (v < 0 || nt_kind(nt, v) != NK_CallNode ||
       (c->ntype[v] != TY_STRING && !(c->ntype[v] == TY_STRBUF && c->strbuf_box[v])) ||
       nt_ref(nt, v, "block") >= 0 ||
       nt_ref(nt, v, "arguments") >= 0) return 0;
@@ -956,7 +950,7 @@ int repr_boxed_reader_handle(Compiler *c, int v) {
    decides. */
 int repr_boxed_to_s_operand(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
-  if (!repr_share_rule(c) || v < 0 || nt_kind(nt, v) != NK_CallNode) return -1;
+  if (v < 0 || nt_kind(nt, v) != NK_CallNode) return -1;
   const char *nm = nt_str(nt, v, "name");
   int recv = nt_ref(nt, v, "receiver");
   if (!is_to_s_name(nm) || recv < 0 || call_plain_argc(c, v) != 0 ||
@@ -983,13 +977,11 @@ static int scope_self_is_string(const Compiler *c, int scope) {
 }
 
 int repr_self_handle(const Compiler *c, int scope) {
-  if (!c->share_strings || !scope_self_is_string(c, scope)) return 0;
-  int h = share_self_holder(c, scope);
-  return share_self_used(c, h) && repr_str_shares(c, h);
+  return scope_self_is_string(c, scope);
 }
 
 int repr_self_shared(const Compiler *c, int node) {
-  if (!c->share_strings || node < 0 || nt_kind(c->nt, node) != NK_SelfNode) return 0;
+  if (node < 0 || nt_kind(c->nt, node) != NK_SelfNode) return 0;
   Scope *s = comp_scope_of((Compiler *)c, node);
   return s && repr_self_handle(c, (int)(s - c->scopes));
 }
@@ -1007,7 +999,7 @@ static int repr_user_answers_self(Compiler *c, int v) {
     if (body >= 0 && nt_kind(nt, body) == NK_StatementsNode) nt_arr(nt, body, "body", &nb);
     int last = scope_body_last(c, tg[i]);
     if (m->def_node < 0 || m->nparams != 0 || nb != 1 || last < 0 || nt_kind(nt, last) != NK_SelfNode ||
-        !scope_self_is_string(c, tg[i]) || share_self_holder(c, tg[i]) < 0)
+        !scope_self_is_string(c, tg[i]))
       return 0;
   }
   return 1;
@@ -1017,7 +1009,7 @@ static int repr_user_answers_self(Compiler *c, int v) {
    and boxed-form prediction use the same fact. */
 int repr_string_conversion_operand(Compiler *c, int v) {
   v = nt_paren_single(c->nt, v);
-  if (!repr_share_rule(c) || v < 0 || nt_kind(c->nt, v) != NK_CallNode) return -1;
+  if (v < 0 || nt_kind(c->nt, v) != NK_CallNode) return -1;
   int r = nt_ref(c->nt, v, "receiver");
   return r >= 0 && is_receiver_conversion(nt_str(c->nt, v, "name")) &&
          call_plain_argc(c, v) == 0 && (nt_ref(c->nt, v, "block") < 0 || nt_int(c->nt, v, "dyn_arm", 0)) &&
@@ -1030,14 +1022,14 @@ int repr_string_conversion_operand(Compiler *c, int v) {
    must carry its handle too. */
 int repr_env_store_operand(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
-  if (!repr_share_rule(c) || v < 0 || nt_kind(nt, v) != NK_CallNode) return -1;
+  if (v < 0 || nt_kind(nt, v) != NK_CallNode) return -1;
   int r = nt_ref(nt, v, "receiver"), argc = 0;
   const int *argv = call_args(nt, v, &argc);
   return r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode && is_env_const(nt_str(nt, r, "name")) &&
          !comp_const(c, "ENV") && argc == 2 && bop_share_named(BOP_ENV, nt_str(nt, v, "name")) == BSH_LAST &&
          (repr_of(c, argv[1]).kind != RK_BOXED || share_value_unobserved(c, argv[1])) &&
-         (!(share_node_flags(c, argv[0]) & SHF_MUT) || repr_of(c, argv[0]).handle ||
-          share_value_fresh(c, argv[0], 0) || !subtree_has_side_effect(c, argv[1])) ? argv[1] : -1;
+         (repr_of(c, argv[0]).handle || share_value_fresh(c, argv[0], 0) || !subtree_has_side_effect(c, argv[1]))
+         ? argv[1] : -1;
 }
 /* Does string conversion `node` hand on a handle: the operand it ends in,
    through further conversions, is a boxed value or a route that carries
@@ -1064,7 +1056,7 @@ static int repr_strbuf_src(const Compiler *c, int node, TyKind t) {
     if (repr_static_read_kind(k)) return repr_static_share(c, node) ? RS_HANDLE : RS_NONE;
     /* An ivar promoted after the node types settled still reads as
        String here. Its box carries the shared slot's handle too. */
-    if (c->share_strings && k == NK_InstanceVariableReadNode) {
+    if (k == NK_InstanceVariableReadNode) {
       const char *nm = nt_str(nt, node, "name");
       int cid = nm ? strbuf_ivar_owner(mc, node) : -1;
       int iv = cid >= 0 ? comp_ivar_index(&c->classes[cid], nm) : -1;
@@ -1078,7 +1070,7 @@ static int repr_strbuf_src(const Compiler *c, int node, TyKind t) {
     const char *ln = nt_str(nt, node, "name");
     Scope *s = ln ? comp_scope_of(mc, node) : NULL;
     LocalVar *lv = s ? scope_local(s, ln) : NULL;
-    if (c->share_strings && lv && lv->type == TY_POLY && c->nilnarrow[node] == TY_STRBUF) return RS_SLOT_POLY;
+    if (lv && lv->type == TY_POLY && c->nilnarrow[node] == TY_STRBUF) return RS_SLOT_POLY;
     return lv && lv->type == TY_STRBUF && lv->str_shared ? RS_HANDLE : RS_NONE;
   }
   if (t != TY_STRBUF) return RS_NONE;
@@ -1143,7 +1135,7 @@ static int repr_strbuf_src(const Compiler *c, int node, TyKind t) {
     /* A container store can mark the reader itself as the handle too. */
     if (repr_boxed_reader_handle(mc, node)) return RS_DEMANDED;
     /* The implicit-self reader boxes its slot too, not a fresh String. */
-    if (c->share_strings && (c->strbuf_box[node] || c->strbuf_handle_demand[node]) &&
+    if ((c->strbuf_box[node] || c->strbuf_handle_demand[node]) &&
         strbuf_self_reader_slot(mc, node)) return RS_DEMANDED;
     int r = nt_ref(nt, node, "receiver");
     if (r >= 0 && ty_is_object(comp_ntype(c, r)) &&
@@ -1176,7 +1168,7 @@ TyKind repr_stored_type(const Compiler *c, int id, TyKind t) {
   /* (--share-strings: a value the analysis typed as the handle that is
      demanded as one is stored as one, as any other demanded value is:
      `{ |t| u = t }` spliced under a demand, the write of a handle local) */
-  if (t == TY_STRBUF) return c->strbuf_box[id] || (c->share_strings && c->strbuf_handle_demand[id]) ? TY_STRBUF : TY_STRING;
+  if (t == TY_STRBUF) return c->strbuf_box[id] || (c->strbuf_handle_demand[id]) ? TY_STRBUF : TY_STRING;
   /* (a boxed value is held in its box whatever is asked of it: a reader
      whose ivar widened past a String answers the box, which a handle's
      slot did not take, and the C did not build) */
@@ -1218,17 +1210,6 @@ int repr_box_nullable_arg(Compiler *c, int v) {
   return 0;
 }
 
-/* A local that was assigned a nilable Integer result holds its nil as the
-   call's answer did: `i = s.index("z")` then `i == nil` has to answer
-   true. The analysis marks the local (call_returns_nullable_int's local
-   arm). */
-int repr_local_nullable_int(Compiler *c, int node) {
-  const NodeTable *nt = c->nt;
-  const char *ln = nt_str(nt, node, "name");
-  Scope *sc = ln ? comp_scope_of(c, node) : NULL;
-  LocalVar *lv = sc ? scope_local(sc, ln) : NULL;
-  return lv && lv->nullable_int;
-}
 
 /* Can a value held as t be nil? A user object and a builtin pointer the
    analysis follows (nil_fact_tracked: a String, an Array, a Hash, an IO)
@@ -1274,7 +1255,7 @@ Repr repr_of(const Compiler *c, int node) {
   r.opt_producer = (unsigned)opt_producer;
   r.strbuf_src = (unsigned char)repr_strbuf_src(c, node, kt);
   r.share = (unsigned)repr_static_share(c, node);
-  if (r.strbuf_src == RS_SLOT_POLY && !(c->share_strings && r.narrowed == TY_STRBUF)) r.kind = RK_BOXED;
+  if (r.strbuf_src == RS_SLOT_POLY && !(r.narrowed == TY_STRBUF)) r.kind = RK_BOXED;
   else if (r.strbuf_src != RS_NONE) r.kind = RK_STRBUF;
   /* a pointer that can be nil (repr_may_nil); a by-value user object the
      nil fact says may be nil too, whose layout has no nil to hold it in */
@@ -1328,7 +1309,7 @@ ReprForm repr_box_form(const Compiler *c, Repr r) {
   if (r.big) return RF_BIGINT;
   /* an Array of pointers (objects, nested Arrays, a String Array's handles)
      is stamped with what its elements are */
-  if (ty_is_object(r.elem) || ty_is_array(r.elem) || t == TY_STRH_ARRAY) return RF_PTR_ARRAY;
+  if (ty_is_object(r.elem) || ty_is_array(r.elem)) return RF_PTR_ARRAY;
   if (ty_is_object(t)) return r.dyn_cls ? RF_NULLABLE_DYN : RF_NULLABLE;
   return RF_NULLABLE;
 }
@@ -1382,7 +1363,7 @@ int repr_store_fits(Compiler *c, TyKind from, TyKind to) {
      handle: a typed container's element is the handle (sp_strelem), and a
      bytes slot reads it through SP_STR_B, which the C compiler holds the
      emitter to (string-one-repr-design.md). */
-  if (g_one_string && from == TY_STRBUF && to == TY_STRING) return 1;
+  if (from == TY_STRBUF && to == TY_STRING) return 1;
   int fc = repr_store_class(c, from), tc = repr_store_class(c, to);
   if (from == TY_NIL) return 0;   /* see store_nil_fits */
   if (fc == SC_NONE) return 0;
@@ -1414,7 +1395,7 @@ static int repr_empty_lit_as(Compiler *c, int v, TyKind slot) {
     nt_arr(nt, v, "elements", &n);
     return !n && ty_is_hash(slot) && ty_hash_cname(slot);
   }
-  if (sp_streq(vty, "CallNode") && node_is_empty_container(nt, v)) {
+  if (sp_streq(vty, "CallNode") && node_is_empty_container(c, v)) {
     const char *rn = nt_str(nt, nt_ref(nt, v, "receiver"), "name");
     if (rn && sp_streq(rn, "Hash") && ty_is_hash(slot) && ty_hash_cname(slot)) return 1;
     if (rn && sp_streq(rn, "Array"))
@@ -1459,7 +1440,7 @@ int repr_coerce_plan(Compiler *c, int node, TyKind slot, int how, TyKind *from_o
      rule: the handle the value is, or a fresh one around it, as a plain
      `@x = v` stores it. A frozen literal is the handle of its own site
      (SP_SHARE_STRING_LITERALS), so it keeps one identity and stays frozen */
-  if (slot == TY_STRBUF && how == CO_HOLD && from == TY_STRING && repr_share_rule(c)) return CF_STRBUF_HANDLE;
+  if (slot == TY_STRBUF && how == CO_HOLD && from == TY_STRING) return CF_STRBUF_HANDLE;
   if (from == TY_POLY && how == CO_HOLD) {
     if (repr_poly_rhs_ok(slot)) return CF_POLY_RHS;
     if (ty_is_array(slot) || ty_is_ptr_array(slot) || ty_is_hash(slot) || slot == TY_BIGINT ||
@@ -1521,7 +1502,7 @@ static void channel_drop(struct ReprChannelCheck *q, int frame) {
 }
 
 void repr_channel_predict(Compiler *c, int node, int mi, int form) {
-  if (!c->share_strings || node < 0) return;
+  if (node < 0) return;
   struct ReprChannelCheck *q = c->repr_channel_check;
   if (!q) {
     q = calloc(1, sizeof *q);
@@ -1556,9 +1537,6 @@ int repr_channel_begin(Compiler *c, int node) {
   return f;
 }
 
-void repr_channel_clearing(Compiler *c, int delta) {
-  if (c->repr_channel_check) c->repr_channel_check->clearing += delta;
-}
 
 int repr_channel_ensure(Compiler *c, int node) {
   struct ReprChannelCheck *q = c->repr_channel_check;
@@ -1600,19 +1578,12 @@ void repr_channel_end(Compiler *c, int frame) {
   }
   ChannelLeaf *l = &q->leaf[f.node];
   if (q->clearing) f.form = RCH_CLEAR;
-  /* The early pickup walk can precede the owned-return proof. Its local
-     read still publishes, but the settled ownership fact permits clearing.
-     A call returning a fresh bound argument has the same permission once
-     its parameter-return fact has settled. */
-  int fresh = share_return_owned(c, f.node, l->mi) ||
-              share_node_fresh(c, f.node) || share_call_fresh(c, f.node);
-  int want = fresh ? RCH_CLEAR : l->want;
+  int want = l->want;
   l->seen = 1;
   q->checked++;
   /* nil is decided by the returned bytes, before any pickup reads the
      channel. A handle-valued view/boxed return carries the value itself. */
-  if (want != RCH_NIL && f.form != RCH_HANDLE && f.form != RCH_BOXED && f.form != want &&
-      !(fresh && f.form == RCH_PUBLISH)) {
+  if (want != RCH_NIL && f.form != RCH_HANDLE && f.form != RCH_BOXED && f.form != want) {
     int conflict = want == RCH_CLEAR || f.form != RCH_NONE;
     const char *cls = conflict ? "channel-conflict" : "channel-unobserved";
     if (conflict) q->conflicts++;
@@ -1634,7 +1605,6 @@ void repr_channel_boxed(Compiler *c, int node, int frame) {
 }
 
 void repr_channel_pickup(Compiler *c, int node, int nil_guard) {
-  if (!c->share_strings) return;
   int mis[CPT_MAX], n = cplan_targets(c, node, mis, CPT_MAX);
   if (c->repr_channel_check) c->repr_channel_check->pickups++;
   for (int i = 0; i < n; i++) {
@@ -1693,7 +1663,7 @@ Repr repr_of_slot(const Compiler *c, const LocalVar *lv) {
   /* str_shared refines TY_STRBUF; it can outlive that storage type */
   if (lv->type == TY_STRBUF && lv->str_shared) r.handle = 1;
   /* under the rule, that handle is the one it assigned */
-  r.share = r.handle && c->share_strings;
+  r.share = r.handle;
   r.elems_handle = lv->elems_shared && lv->type == TY_POLY_ARRAY;
   r.elem_nil_marked = (unsigned)repr_elem_nil(r.elem, lv->nullable_int_elem & NIE_MARKED, lv->obj_elem_may_nil);
   r.elem_nil_reach = (unsigned)repr_elem_nil(r.elem, lv->nullable_int_elem & (NIE_MARKED | NIE_REACH), 0);
@@ -1703,7 +1673,6 @@ Repr repr_of_slot(const Compiler *c, const LocalVar *lv) {
   return r;
 }
 
-static void repr_share_seal(Compiler *c);
 
 /* Method and constructor signatures pass a kept &block as sp_Proc *.
    Check the slot as well as expression boxing: a read can infer Proc even
@@ -1723,14 +1692,12 @@ static void repr_check_block_params(Compiler *c) {
 
 void repr_seal(Compiler *c) {
   if (g_repr_check) repr_check_block_params(c);
-  if (c->share_strings) repr_share_seal(c);
   repr_sealed_flag = 1;
   /* the String plan (share_plan.c), from the final facts and flags, asked
      as codegen will ask them: sealed */
-  if (c->share_strings) share_plan_build(c);
+  share_plan_build(c);
 }
 
-int repr_sealed(void) { return repr_sealed_flag; }
 
 /* ---- --share-strings (#6765) ---- */
 
@@ -1746,459 +1713,42 @@ int repr_static_share(const Compiler *c, int node) {
   return holder_of_node(c, node, &h) && (h.r.share || (c->n_cext_extensions && h.r.handle));
 }
 
-int repr_str_class_shares(unsigned flags, int holders) {
-  /* one representation (--string-repr=handle): every String holder is the
-     handle; the share facts then decide nothing about layout */
-  if (g_one_string) return 1;
-  if (flags & SHF_IDENTITY) return 1;
-  if (!(flags & SHF_MUT)) return 0;
-  return holders >= 2 || (flags & (SHF_UNKNOWN | SHF_INDIRECT | SHF_MULTI)) != 0;
+
+/* Does local lv of scope s hold a String the rule shares: one whose type
+   can hold a String, but the loop variable a define_method unroll
+   substitutes (collect_dm_each_unroll), which is no slot? */
+int repr_local_shares(const Compiler *c, const Scope *s, const LocalVar *lv) {
+  if (!s || !lv) return 0;
+  if (s->dm_subst_name && lv->name && sp_streq(lv->name, s->dm_subst_name)) return 0;
+  return sh_may_hold(c, lv->type);
 }
 
-int repr_str_shares(const Compiler *c, int holder) {
-  if (!c->share_strings || !c->share || holder < 0) return 0;
-  return repr_str_class_shares(share_class_flags(c, holder), share_class_holders(c, holder));
-}
 
-int repr_str_elems_share(const Compiler *c, int holder) {
-  if (!c->share_strings || !c->share || holder < 0) return 0;
-  int e = share_elem_holder(c, holder);
-  return e >= 0 && repr_str_class_shares(share_elem_flags(c, e), share_elem_holders(c, e));
-}
 
-/* The representation of share holder h's slot, now that the analysis is
-   final: a box (RK_BOXED) holds whatever is stored, the handle included;
-   `share` says the slot is the handle. A byref-out local is not (its slot
-   is the caller's), and a class variable is every class's of the name (the
-   facts key it by name alone): boxed if one is, and the handle only if
-   every String one is. ty is TY_UNKNOWN for a holder with no slot. */
-static Repr repr_of_share_holder(Compiler *c, const ShareHolder *h) {
-  Repr r;
-  memset(&r, 0, sizeof r);
-  r.ty = r.as_ty = TY_UNKNOWN;
-  switch (h->kind) {
-  case SHK_SELF:
-    if (!scope_self_is_string(c, h->scope) || !share_self_used(c, share_self_holder(c, h->scope))) break;
-    r.ty = r.as_ty = TY_STRING;
-    r.share = repr_self_handle(c, h->scope);
-    break;
-  case SHK_LOCAL: {
-    LocalVar *lv = &c->scopes[h->scope].locals[h->local];
-    r = repr_of_slot(c, lv);
-    if (lv->byref_out) r.share = 0;
-    break;
-  }
-  case SHK_IVAR: {
-    int iv = comp_ivar_index(&c->classes[h->cid], h->name);
-    if (iv >= 0) r = repr_of_ivar(c, h->cid, iv);
-    break;
-  }
-  case SHK_GVAR: {
-    LocalVar *gv = comp_gvar(c, h->name[0] == '$' ? h->name + 1 : h->name);
-    if (gv) r = repr_of_slot(c, gv);
-    break;
-  }
-  case SHK_CONST: {
-    LocalVar *cv = h->name ? comp_const(c, h->name) : NULL;
-    if (cv) r = repr_of_slot(c, cv);
-    break;
-  }
-  case SHK_CVAR:
-    for (int k = 0; k < c->nclasses; k++) {
-      int i = h->name ? comp_cvar_index(&c->classes[k], h->name) : -1;
-      if (i < 0) continue;
-      Repr ck = repr_of_cvar(c, k, i);
-      if (ck.ty == TY_POLY) { ck.kind = RK_BOXED; return ck; }
-      if (ck.share) r = ck;
-      else if (ck.ty == TY_STRING || ck.ty == TY_STRBUF) return ck;
-    }
-    break;
-  default:
-    break;
-  }
-  if (r.ty == TY_POLY) r.kind = RK_BOXED;
-  return r;
-}
-
-/* A container holder whose elements share: are they boxed (a box holds the
-   handle), or typed Strings (`const char *` elements)? 1, 0, or -1 for a
-   holder that is no container. A global, a constant and a class variable
-   count too: a String Array constant whose elements a block parameter
-   changes as the handle holds copies of them */
-static int repr_share_elems_carried(Compiler *c, const ShareHolder *h) {
-  TyKind t = TY_UNKNOWN;
-  if (h->kind == SHK_LOCAL) t = c->scopes[h->scope].locals[h->local].type;
-  else if (h->kind == SHK_IVAR) {
-    int iv = comp_ivar_index(&c->classes[h->cid], h->name);
-    if (iv < 0) return -1;
-    t = c->classes[h->cid].ivar_types[iv];
-  }
-  else if (h->kind == SHK_GVAR || h->kind == SHK_CONST) t = repr_of_share_holder(c, h).ty;
-  else if (h->kind == SHK_CVAR) {
-    /* every class's of the name, which the facts key as one: a typed
-       container of any of them holds copies */
-    int any = -1;
-    for (int k = 0; k < c->nclasses; k++) {
-      int i = h->name ? comp_cvar_index(&c->classes[k], h->name) : -1;
-      TyKind ct = i >= 0 ? c->classes[k].cvar_types[i] : TY_UNKNOWN;
-      if (!ty_is_array(ct) && !ty_is_hash(ct)) continue;
-      if (repr_typed_str_container(ct)) return 0;
-      any = 1;
-    }
-    return any;
-  }
-  if (!ty_is_array(t) && !ty_is_hash(t)) return -1;
-  return repr_typed_str_container(t) ? 0 : 1;
-}
 
 /* repr.h: a container type whose C form holds its Strings as `const char *`.
    Under the one-String mode there is none: the typed containers hold the
    handle (sp_strelem, string-one-repr-design.md). */
 int repr_typed_str_container(TyKind t) {
-  if (g_one_string) return 0;
-  return t == TY_STR_ARRAY || t == TY_STR_STR_HASH || t == TY_INT_STR_HASH;
-}
-
-int repr_str_literal_shares(Compiler *c, int node) {
-  if (!c->share_strings || node < 0) return 0;
-  NodeKind k = nt_kind(c->nt, node);
-  return (k == NK_ArrayNode || k == NK_HashNode) &&
-         repr_typed_str_container(c->ntype[node]) && comp_scope_of(c, node)->reachable &&
-         share_node_elems_share(c, node) && share_node_anchored(c, node);
-}
-
-static const char *repr_share_kind_name(int kind) {
-  switch (kind) {
-  case SHK_LOCAL: return "variable";
-  case SHK_IVAR:  return "instance variable";
-  case SHK_GVAR:  return "global variable";
-  case SHK_CVAR:  return "class variable";
-  case SHK_CONST: return "constant";
-  default:        return "value";
-  }
-}
-
-/* What a flow kind (ShareFlowKind) hands its value to, for a message. */
-static const char *repr_flow_kind_name(int kind) {
-  switch (kind) {
-  case SHFL_WRITE:  return "a variable's write";
-  case SHFL_MEMBER: return "an attribute or member store";
-  case SHFL_ARG:    return "a method's argument";
-  case SHFL_ELEM:   return "a container's element";
-  case SHFL_BLOCK:  return "a block's value a container keeps";
-  case SHFL_YIELD:  return "a yield's argument";
-  case SHFL_PARAM:  return "a block's parameter";
-  case SHFL_LEND:   return "a lent argument";
-  case SHFL_MULTI:  return "a multiple write's target";
-  case SHFL_MUTATE: return "an in-place change";
-  default:          return "a value";
-  }
-}
-
-/* The route value node v is, for a message: a call's value by its name, a
-   variable by its name, else the kind of construct. */
-static void repr_flow_route_name(const Compiler *c, int v, char *out, size_t cap) {
-  const NodeTable *nt = c->nt;
-  NodeKind k = nt_kind(nt, v);
-  const char *nm = nt_str(nt, v, "name");
-  if (k == NK_CallNode && nm) { snprintf(out, cap, "the value of `%s`", nm); return; }
-  if (holder_kind_of(k) != HK_NONE && nm) {
-    snprintf(out, cap, "%s `%s`", repr_static_read_kind(k) || k == NK_LocalVariableReadNode ||
-             k == NK_InstanceVariableReadNode ? "the variable" : "the write of", nm);
-    return;
-  }
-  switch (k) {
-  case NK_BeginNode:  snprintf(out, cap, "a begin's value"); return;
-  case NK_IfNode: case NK_UnlessNode: case NK_CaseNode: case NK_AndNode: case NK_OrNode:
-                      snprintf(out, cap, "a conditional's value"); return;
-  case NK_YieldNode:  snprintf(out, cap, "a yield's value"); return;
-  case NK_SuperNode: case NK_ForwardingSuperNode:
-                      snprintf(out, cap, "super's value"); return;
-  case NK_WhileNode: case NK_UntilNode:
-                      snprintf(out, cap, "a loop's value"); return;
-  default:            snprintf(out, cap, "this value"); return;
-  }
-}
-
-/* Does value v raise before it exists: a call whose receiver chain (or a
-   constant path's parents) starts at the read of a constant the program
-   defines nowhere, which codegen emits as the NameError raise (emit of a
-   ConstantReadNode), or at the parenthesized raise analyze_scope.c makes
-   of a nested name it cannot find (`(raise NameError, "uninitialized
-   constant X"; nil)`)? Such a value is handed on nowhere: `@d =
-   BCrypt::Password.create(x).to_s` with no BCrypt raises before the write. */
-static int repr_value_raises_first(Compiler *c, int v) {
-  const NodeTable *nt = c->nt;
-  for (int d = 0; d < 64 && v >= 0; d++) {
-    NodeKind k = nt_kind(nt, v);
-    /* below the value itself every link is untyped, as a chain on a
-       missing name is: ENV, ARGF and the like are untyped reads too, but
-       their methods answer typed values */
-    if (d > 0 && (k == NK_CallNode || k == NK_ConstantPathNode) && c->ntype[v] != TY_UNKNOWN) return 0;
-    if (k == NK_CallNode) { v = nt_ref(nt, v, "receiver"); continue; }
-    if (k == NK_ConstantPathNode) { v = nt_ref(nt, v, "parent"); continue; }
-    if (k == NK_ConstantReadNode) {
-      const char *nm = nt_str(nt, v, "name");
-      return d > 1 && nm && c->ntype[v] == TY_UNKNOWN && !comp_const(c, nm) && comp_class_index(c, nm) < 0 &&
-             builtin_class_id(nm) == 0 && !is_builtin_exception_name(nm) && !is_builtin_class_name(nm) &&
-             !is_builtin_module_name(nm) && !is_env_const(nm);
-    }
-    if (k != NK_ParenthesesNode) return 0;
-    int st = nt_ref(nt, v, "body");
-    if (st < 0 || nt_kind(nt, st) != NK_StatementsNode) return 0;
-    int n = 0; const int *b = nt_arr(nt, st, "body", &n);
-    for (int i = 0; b && i < n; i++) {
-      int s = nt_paren_single(c->nt, b[i]);
-      const char *nm = s >= 0 && nt_kind(nt, s) == NK_CallNode && nt_ref(nt, s, "receiver") < 0
-                       ? nt_str(nt, s, "name") : NULL;
-      if (nm && is_raise_alias(nm) && !bare_call_class_owned(c, s) && cplan_user_fresh(c, s)->mi < 0)
-        return 1;
-    }
-    return 0;
-  }
+  (void)t;
   return 0;
 }
 
-/* A call on a boxed receiver that no class the box can hold answers, and
-   that no builtin value answers by name, raises NoMethodError before it
-   answers: no String flows from it. (`route.int_params` in a program that
-   never makes a Route: the box holds only the classes it does make.) */
-static int repr_call_answers_nothing(Compiler *c, int v) {
-  const NodeTable *nt = c->nt;
-  if (nt_kind(nt, v) != NK_CallNode || nt_ref(nt, v, "block") >= 0) return 0;
-  int recv = nt_ref(nt, v, "receiver");
-  const char *nm = nt_str(nt, v, "name");
-  if (recv < 0 || !nm || !repr_recv_boxed(c, recv)) return 0;
-  int argc = call_plain_argc(c, v);
-  if (argc < 0 || ty_poly_face_owners(nm, argc, 0, 1, 1)) return 0;
-  return cplan_poly_arms(c, v)->n == 0;
+int repr_str_literal_shares(Compiler *c, int node) {
+  if (node < 0) return 0;
+  NodeKind k = nt_kind(c->nt, node);
+  return (k == NK_ArrayNode || k == NK_HashNode) &&
+         repr_typed_str_container(c->ntype[node]) && comp_scope_of(c, node)->reachable;
 }
 
-/* Does flow value node v need the route check: a String (or a box that may
-   hold one) whose class the rule shares? */
-static int repr_flow_checked(Compiler *c, int v) {
-  v = nt_paren_single(c->nt, v);
-  if (v < 0) return 0;
-  if (repr_value_raises_first(c, v) || repr_call_answers_nothing(c, v)) return 0;
-  NodeKind k = nt_kind(c->nt, v);
-  if (k == NK_NilNode || k == NK_StringNode || k == NK_InterpolatedStringNode) return 0;
-  TyKind t = c->ntype[v];
-  if (t != TY_STRING && t != TY_STRBUF && t != TY_POLY) return 0;
-  /* a container literal is no String */
-  if (k == NK_ArrayNode || k == NK_HashNode || k == NK_RangeNode) return 0;
-  /* an explicit writer's assignment whose value nothing sees as its
-     right-hand side's object: the value a holder wraps is its own */
-  if (share_assign_unjoined(c, v)) return 0;
-  return share_node_shares(c, v);
-}
 
-/* The route half of the seal: every flow the walk recorded into a class
-   the rule shares (share_flow_at) has to go along a route codegen hands
-   the shared handle on (strbuf_flow_carries), or the program is refused,
-   naming the route, rather than compiled handing on a copy. A flow kind
-   or a route codegen does not know is refused too. */
-static void repr_flow_refuse(Compiler *c, int u, int kind) {
-  /* one representation: every route hands the handle on as it is */
-  if (g_one_string) return;
-  char rn[160];
-  repr_flow_route_name(c, u, rn, sizeof rn);
-  char msg[512];
-  snprintf(msg, sizeof msg, "the String %s hands on as %s is shared with another "
-           "name and changed in place, and that route cannot carry the shared handle yet: it would hand "
-           "on a copy (#9258)", rn, repr_flow_kind_name(kind));
-  unsupported_feature_collect(c, u, msg);
-}
-/* The values the n flows lend to a parameter that is no byref slot
-   (SHFL_LEND, whose route always carries them), marked by node; NULL
-   when there are none. */
-static unsigned char *repr_flows_lent(Compiler *c, int n) {
-  unsigned char *lent = NULL;
-  for (int j = 0; j < n; j++) {
-    int site, w;
-    if (share_flow_at(c, j, &site, &w) != SHFL_LEND || w < 0 || w >= c->nt->count) continue;
-    const ShareHolder *ph = share_holder(c, site);
-    if (!ph || ph->kind != SHK_LOCAL || c->scopes[ph->scope].locals[ph->local].byref_out) continue;
-    if (!lent && !(lent = calloc((size_t)c->nt->count, 1))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-    lent[w] = 1;
-  }
-  return lent;
-}
-static void repr_share_flows_check(Compiler *c, const char *stats) {
-  int nf = share_flow_count(c);
-  int bad = -1, bad_kind = 0;
-  unsigned char *lent = repr_flows_lent(c, nf);
-  for (int i = 0; i < nf; i++) {
-    int site, v;
-    int kind = share_flow_at(c, i, &site, &v);
-    /* the String a flow stores that must be the handle where it is emitted
-       (share_value_needs_handle), and whether its destination shares */
-    if (stats && stats[0] == '2' && v >= 0 && share_value_needs_handle(c, v)) {
-      const char *fp = nt_file_path(c->nt, (int)nt_int(c->nt, v, "node_file", -1));
-      fprintf(stderr, "share-flow-need: %s:%d node %d into %s dest-shares=%d needs-handle=%d\n", fp ? fp : "?",
-              (int)nt_int(c->nt, v, "node_line", 0), v, repr_flow_kind_name(kind), share_flow_dest_shares(c, i),
-              share_value_needs_handle(c, v));
-    }
-    /* a flow in an unreachable scope is never emitted (bad_lit's rule) */
-    if (v < 0 || !comp_scope_of(c, v)->reachable || !repr_flow_checked(c, v)) continue;
-    /* an argument whose parameter the walk lends it (a slot the callee
-       only reads for the length of the call, SHFL_LEND) and whose class
-       does not share is handed on as that lend is: the lend's own flow is
-       the one checked (`sig(pick(h, k, fb))`, #9258 cluster 14) */
-    if (kind == SHFL_ARG && lent && lent[v] && share_flow_dest_shares(c, i) == 0) continue;
-    int u = nt_paren_single(c->nt, v);
-    int ok = strbuf_flow_carries(c, kind, site, v);
-    if (stats && stats[0] == '2') {
-      char rn[160];
-      repr_flow_route_name(c, u, rn, sizeof rn);
-      const char *fp = nt_file_path(c->nt, (int)nt_int(c->nt, u, "node_file", -1));
-      /* (the plan the route asks for, as strbuf_flow_carries asks it) */
-      SharePlan sp = share_plan_of(c, v, kind == SHFL_WRITE || kind == SHFL_MEMBER || kind == SHFL_MULTI ? SPR_STORE
-                                         : kind == SHFL_ELEM || kind == SHFL_BLOCK ? SPR_BOX : SPR_TAKE, NULL);
-      int rcv = nt_kind(c->nt, u) == NK_CallNode ? nt_ref(c->nt, u, "receiver") : -1;
-      const char *sfp = site >= 0 ? nt_file_path(c->nt, (int)nt_int(c->nt, site, "node_file", -1)) : NULL;
-      fprintf(stderr, "share-flow: %s:%d node %d %s (%s) into %s carried=%d flags=%u plan form=%d kind=%s need=%d recv=%s site=%s:%d (%s)\n",
-              fp ? fp : "?", (int)nt_int(c->nt, u, "node_line", 0), u, rn, ty_name(c->ntype[u]),
-              repr_flow_kind_name(kind), ok, share_node_flags(c, u), sp.form, share_plan_kind_name(sp.kind), sp.need,
-              rcv >= 0 ? ty_name(c->ntype[rcv]) : "-", sfp ? sfp : "?", site >= 0 ? (int)nt_int(c->nt, site, "node_line", 0) : -1,
-              site >= 0 ? ty_name(c->ntype[site]) : "-");
-    }
-    /* the first refused flow, or under SP_COLLECT_ERRORS and --emit-types
-       each one */
-    if (!ok && refusals_go_on()) repr_flow_refuse(c, u, kind);
-    else if (!ok && bad < 0) { bad = u; bad_kind = kind; }
-  }
-  free(lent);
-  if (bad >= 0) repr_flow_refuse(c, bad, bad_kind);
-}
 
-/* The seal's holder refusals: holder h holds a copy of a String the rule
-   shares (with elems, its elements are copies), or literal n does. */
-static void repr_share_holder_refuse(Compiler *c, int h, int elems) {
-  const ShareHolder *sh = share_holder(c, h);
-  char nm[160];
-  if (sh->kind == SHK_LOCAL) snprintf(nm, sizeof nm, "`%s`", c->scopes[sh->scope].locals[sh->local].name);
-  else snprintf(nm, sizeof nm, "`%s`", sh->name ? sh->name : "?");
-  const char *kind = sh->kind == SHK_LOCAL && c->scopes[sh->scope].locals[sh->local].is_block_param
-                     ? "block parameter" : repr_share_kind_name(sh->kind);
-  char msg[512];
-  if (elems)
-    snprintf(msg, sizeof msg, "the Strings %s %s holds are shared with another "
-             "name and changed in place, and a typed String container cannot hold the shared handle "
-             "yet (#9258)", kind, nm);
-  else
-    snprintf(msg, sizeof msg, "the String %s %s holds is shared with another "
-             "name and changed in place, and a %s cannot hold the shared handle yet (#9258)",
-             kind, nm, kind);
-  unsupported_feature_collect(c, sh->node, msg);
-}
-static void repr_share_literal_refuse(Compiler *c, int n) {
-  unsupported_feature_collect(c, n, "the Strings this literal holds are shared with "
-                              "another name and changed in place, and a typed String container cannot hold "
-                              "the shared handle yet (#9258)");
-}
 
-/* The analysis is final: every holder the rule shares has to hold the
-   handle now. One whose kind cannot carry it yet is refused, naming it,
-   rather than compiled holding a copy. SPINEL_SHARE_STATS=1 reports what
-   the rule decided. */
-static void repr_share_seal(Compiler *c) {
-  share_facts_build(c);
-  int nh = share_holder_count(c);
-  int bad = -1, bad_elems = 0;
-  int n_str = 0, n_shared = 0, n_kind[SHK_UNKNOWN + 1] = {0}, n_param = 0, n_elems = 0;
-  int n_route_only = 0, n_unknown = 0;
-  const char *stats = getenv("SPINEL_SHARE_STATS");
-  struct ShareFacts *closed = stats ? share_facts_build_closed(c) : NULL;
-  for (int h = 0; h < nh; h++) {
-    const ShareHolder *sh = share_holder(c, h);
-    int ec = repr_share_elems_carried(c, sh);
-    if (ec >= 0 && repr_str_elems_share(c, h)) {
-      n_elems++;
-      if (!ec && bad < 0) { bad = h; bad_elems = 1; }
-    }
-    /* does the holder hold the shared handle (a box holds what is stored,
-       the handle included)? -1 for one that holds no String */
-    Repr hr = repr_of_share_holder(c, sh);
-    int carried = hr.kind == RK_BOXED || hr.share ? 1 : hr.ty == TY_STRING || hr.ty == TY_STRBUF ? 0 : -1;
-    if (carried < 0) continue;
-    n_str++;
-    int shares = repr_str_shares(c, h);
-    if (!shares) {
-      /* a handle a route rule made that the rule does not ask for */
-      if (carried && sh->kind != SHK_CVAR && sh->kind != SHK_CONST &&
-          !(sh->kind == SHK_LOCAL && c->scopes[sh->scope].locals[sh->local].type == TY_POLY) &&
-          !(sh->kind == SHK_IVAR && c->classes[sh->cid].ivar_types[comp_ivar_index(&c->classes[sh->cid], sh->name)] == TY_POLY) &&
-          !(sh->kind == SHK_GVAR && carried == 1 && comp_gvar(c, sh->name[0] == '$' ? sh->name + 1 : sh->name)->type == TY_POLY))
-        n_route_only++;
-      continue;
-    }
-    n_shared++;
-    n_kind[sh->kind]++;
-    if (sh->kind == SHK_LOCAL && c->scopes[sh->scope].locals[sh->local].is_param) n_param++;
-    if (closed && !share_closed_shares(closed, sh)) n_unknown++;
-    if (!carried && bad < 0) bad = h;
-  }
-  /* a container literal no holder names, whose elements the rule shares
-     only once the facts settle after the fixpoint, kept a typed String
-     form: its elements would be copies. A literal in an unreachable
-     scope is never emitted, so no call can observe its copies. */
-  int bad_lit = -1;
-  for (int n = 0; n < c->nt->count && bad_lit < 0; n++) {
-    NodeKind k = nt_kind(c->nt, n);
-    if (k != NK_ArrayNode && k != NK_HashNode) continue;
-    if (!comp_scope_of(c, n)->reachable) continue;
-    int ne = 0;
-    nt_arr(c->nt, n, "elements", &ne);
-    /* an empty one holds no String yet: what is stored later goes through
-       the holder that keeps it; one nothing can reach again once its
-       expression is done (`p [a, b]`) keeps no name for its copies */
-    if (ne > 0 && repr_str_literal_shares(c, n))
-      bad_lit = n;
-  }
-  if (stats && stats[0] == '3') share_dump_unknown_mutations(c);
-  if (stats && stats[0] == '2')
-    for (int h = 0; h < nh; h++) {
-      const ShareHolder *sh = share_holder(c, h);
-      const char *nm = sh->kind == SHK_LOCAL ? c->scopes[sh->scope].locals[sh->local].name : sh->name;
-      fprintf(stderr, "share-holder: %s %s%s%s flags=%u holders=%d shares=%d elems-share=%d\n",
-              repr_share_kind_name(sh->kind), nm ? nm : "?",
-              sh->kind == SHK_LOCAL ? " in " : "",
-              sh->kind == SHK_LOCAL ? (c->scopes[sh->scope].name ? c->scopes[sh->scope].name : "<top>") : "",
-              share_class_flags(c, h), share_class_holders(c, h), repr_str_shares(c, h),
-              repr_str_elems_share(c, h));
-    }
-  if (stats) {
-    fprintf(stderr, "share-stats: string-holders=%d shared=%d local=%d (param=%d) ivar=%d gvar=%d "
-            "cvar=%d const=%d containers=%d via-unknown=%d route-only=%d refused=%d borrows=%d\n",
-            n_str, n_shared, n_kind[SHK_LOCAL], n_param, n_kind[SHK_IVAR], n_kind[SHK_GVAR],
-            n_kind[SHK_CVAR], n_kind[SHK_CONST], n_elems, n_unknown, n_route_only, bad >= 0,
-            c->share_borrows);
-    share_facts_drop(closed);
-  }
-  /* a route master refuses, left to the rule: refused as master does
-     unless the final facts share its String */
-  share_routes_check(c);
-  if (refusals_go_on()) {
-    /* SP_COLLECT_ERRORS and --emit-types: every refused holder and
-       literal, as the routes above were */
-    for (int h = 0; h < nh; h++) {
-      const ShareHolder *sh = share_holder(c, h);
-      if (repr_share_elems_carried(c, sh) == 0 && repr_str_elems_share(c, h)) repr_share_holder_refuse(c, h, 1);
-      Repr hr = repr_of_share_holder(c, sh);
-      if (hr.kind != RK_BOXED && !hr.share && (hr.ty == TY_STRING || hr.ty == TY_STRBUF) && repr_str_shares(c, h))
-        repr_share_holder_refuse(c, h, 0);
-    }
-    for (int n = bad_lit; n >= 0 && n < c->nt->count; n++) {
-      NodeKind k = nt_kind(c->nt, n);
-      int ne = 0;
-      if (k == NK_ArrayNode || k == NK_HashNode) nt_arr(c->nt, n, "elements", &ne);
-      if (ne > 0 && comp_scope_of(c, n)->reachable && repr_str_literal_shares(c, n)) repr_share_literal_refuse(c, n);
-    }
-  }
-  else if (bad < 0 && bad_lit >= 0) repr_share_literal_refuse(c, bad_lit);
-  else if (bad >= 0) repr_share_holder_refuse(c, bad, bad_elems);
-  repr_share_flows_check(c, stats);
-}
+
+
+
+
+
 
 /* ---- --dump-repr (#7501) ----
    One line per slot with the representation chosen for it, sorted, so the
@@ -2238,7 +1788,7 @@ Repr repr_of_ivar(const Compiler *c, int cid, int iv) {
   }
   if (repr_may_nil(r.ty, nil_fact_ivar(c, cid, ci->ivars[iv]))) r.may_nil = 1;
   if (r.ty == TY_STRBUF && ci->ivar_str_shared[iv]) r.handle = 1;
-  r.share = r.handle && c->share_strings;
+  r.share = r.handle;
   r.elems_handle = (ci->ivar_elems_shared[iv] & ELEMS_POLY) && r.ty == TY_POLY_ARRAY;
   /* the element marking sits on the family's topmost class that has the
      ivar, where every subclass reads it (nullable_elem_ivar_in) */
@@ -2279,7 +1829,7 @@ Repr repr_of_cvar(const Compiler *c, int cid, int idx) {
   if (r.kind == RK_OPT) r.may_nil = r.nil_scalar = 1;
   if (repr_may_nil(r.ty, 1)) r.may_nil = 1;
   if (r.ty == TY_STRBUF && ci->cvar_str_shared[idx]) r.handle = 1;
-  r.share = r.handle && c->share_strings;
+  r.share = r.handle;
   r.elems_handle = (ci->cvar_elems_shared[idx] & ELEMS_POLY) && r.ty == TY_POLY_ARRAY;
   repr_set_class_facts(c, &r, r.ty);
   return r;
@@ -2406,4 +1956,3 @@ char *repr_dump(const Compiler *c) {
   return out;
 }
 
-int repr_share_rule(const Compiler *c) { return c->share_strings; }

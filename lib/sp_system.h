@@ -19,10 +19,17 @@ int sp_system_args(int argc, const char *const *argv);
 /* the same with envp (NULL-terminated "NAME=value" entries) as the child's
    whole environment, or this process's when envp is NULL */
 int sp_system_envp(int argc, const char *const *argv, char **envp);
+/* the same with prog as the program and argv[0] as the argv0 it sees
+   (system([program, argv0], ...)): no shell, no splitting into words */
+int sp_system_prog_envp(const char *prog, int argc, const char *const *argv, char **envp);
 /* CRuby's test of whether the shell runs a one-String command line, and
    the words of a line it does not run (one malloc block, NULL-terminated;
    Process.spawn and system share both) */
 int sp_cmdline_shell_p(const char *line);
+/* start a child for system and backticks: the shell runs line, or prog
+   runs with argv; see sp_system.c for the answer and out_fd/close_fd */
+int sp_system_start(const char *line, const char *prog, char *const *argv, char **envp,
+                    int out_fd, int close_fd, int *exec_errno);
 char **sp_cmdline_words(const char *line, int *argc_out);
 
 #endif
