@@ -1118,12 +1118,12 @@ int emit_op_array_compact_bang(Compiler *c, const BopCtx *x, Buf *b) {
   if (rt == TY_POLY_ARRAY) {
     if (sp_streq(name, "compact!") && argc == 0) {
       /* value form: self when changed, nil when a no-op (CRuby) */
-      buf_puts(b, "sp_PolyArray_compact_bangq("); emit_expr(c, recv, b); buf_puts(b, ")");
+      buf_puts(b, "sp_PolyArray_compact_bangq("); emit_array_frozen_checked(c, recv, rt, b); buf_puts(b, ")");
       return 1;
     }
     if (sp_streq(name, "flatten!") && argc == 0) {
       /* value form: self when changed, nil when a no-op (CRuby) */
-      buf_puts(b, "sp_PolyArray_flatten_bangq("); emit_expr(c, recv, b); buf_puts(b, ")");
+      buf_puts(b, "sp_PolyArray_flatten_bangq("); emit_array_frozen_checked(c, recv, rt, b); buf_puts(b, ")");
       return 1;
     }
     return 0;
@@ -1142,7 +1142,7 @@ int emit_op_array_compact_bang(Compiler *c, const BopCtx *x, Buf *b) {
       (rt == TY_INT_ARRAY || rt == TY_STR_ARRAY || rt == TY_FLOAT_ARRAY)) {
     /* a typed array can hold neither sub-arrays nor nils: both bangs are
        always a no-op, and CRuby's no-op contract is nil */
-    buf_puts(b, "((void)("); emit_expr(c, recv, b); buf_puts(b, "), sp_box_nil())");
+    buf_puts(b, "((void)("); emit_array_frozen_checked(c, recv, rt, b); buf_puts(b, "), sp_box_nil())");
     return 1;
   }
   return 0;
@@ -1191,8 +1191,13 @@ int emit_op_array_flatten(Compiler *c, const BopCtx *x, Buf *b) {
     /* a typed (scalar-element) array has no nesting: flatten(n) copies,
        flatten!(n) is a no-op returning nil */
     if (name[7] == '!') {
-      buf_puts(b, "((void)("); emit_expr(c, recv, b); buf_puts(b, "), (void)(");
-      emit_int_expr(c, argv[0], b); buf_puts(b, "), sp_box_nil())");
+      /* the receiver, then the depth, then the frozen check: the depth's
+         side effects run before the raise, as in CRuby */
+      int t = ++g_tmp;
+      buf_printf(b, "({ sp_%sArray *_t%d = ", k, t); emit_expr(c, recv, b);
+      buf_printf(b, "; SP_GC_ROOT(_t%d); (void)(", t); emit_int_expr(c, argv[0], b);
+      buf_printf(b, "); if (_t%d && _t%d->frozen) sp_raise_frozen_array_at(_t%d, %s); sp_box_nil(); })",
+                 t, t, t, array_frozen_cls(rt));
     }
     else {
       buf_puts(b, "((void)(");
@@ -1782,7 +1787,9 @@ int emit_op_array_concat(Compiler *c, const BopCtx *x, Buf *b) {
      in place, return the receiver. Coerce a typed-array argument to poly. */
   if (rt == TY_POLY_ARRAY && sp_streq(name, "concat")) {
     int t = ++g_tmp;
-    buf_printf(b, "({ sp_PolyArray *_t%d = ", t); emit_expr(c, recv, b); buf_puts(b, ";");
+    /* rooted: an argument that allocates can collect a receiver nothing
+       else holds (a method's value) before the frozen check and the appends */
+    buf_printf(b, "({ sp_PolyArray *_t%d = ", t); emit_expr(c, recv, b); buf_printf(b, "; SP_GC_ROOT(_t%d);", t);
     /* evaluate (and root) every argument left-to-right BEFORE any append, so a
        side-effecting argument or one that reads the receiver sees pre-mutation
        state, per Ruby's arg-before-call evaluation order. */
@@ -1813,6 +1820,8 @@ int emit_op_array_concat(Compiler *c, const BopCtx *x, Buf *b) {
     int lb = g_tmp + 1; g_tmp += argc;
     for (int ai = 0; ai < argc; ai++)
       buf_printf(b, " sp_int _t%d = sp_PolyArray_length(_t%d);", lb + ai, base + ai);
+    /* a frozen receiver raises even when every argument is empty */
+    buf_printf(b, " if (_t%d && _t%d->frozen) sp_raise_frozen_array_at(_t%d, SP_BUILTIN_POLY_ARRAY);", t, t, t);
     for (int ai = 0; ai < argc; ai++) {
       int ti = ++g_tmp;
       buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d; _t%d++) sp_PolyArray_push(_t%d, sp_PolyArray_get(_t%d, _t%d));",
@@ -2143,8 +2152,8 @@ int emit_call_append_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     int needs_lift = 0;
     if (arr.elem != TY_POLY && array_kind(art)) {
       TyKind elem_t = arr.elem;
-      const char *rty = nt_type(nt, recv);
-      if (rty && sp_streq(rty, "ArrayNode")) {
+      NodeKind rk = nt_kind(nt, recv);
+      if (rk == NK_ArrayNode) {
         for (int a = 0; a < argc; a++) {
           Repr ar = repr_of(c, argv[a]);
           TyKind at = ar.as_ty;
@@ -2175,6 +2184,8 @@ int emit_call_append_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
          root theirs */
       buf_printf(b, "sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d); ", t, t);
       for (int j = 0; j < en; j++) {
+        /* a splat element (`[*a]`) spreads its items, as the literal would */
+        if (emit_poly_concat_splat(c, t, els[j], b)) { buf_puts(b, " "); continue; }
         Buf el; memset(&el, 0, sizeof el);
         emit_boxed(c, els[j], &el);
         buf_printf(b, "sp_PolyArray_push(_t%d, %s); ", t, el.p ? el.p : "sp_box_nil()");
@@ -2710,7 +2721,7 @@ int emit_call_array_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
        sp_streq(name, "zip") || sp_streq(name, "flatten") || sp_streq(name, "compact") ||
        sp_streq(name, "uniq") || sp_streq(name, "sort") || sp_streq(name, "reverse") ||
        sp_streq(name, "shuffle")) &&
-      nt_type(nt, recv) && sp_streq(nt_type(nt, recv), "ArrayNode")) {
+      nt_kind(nt, recv) == NK_ArrayNode) {
     int en = 0; nt_arr(nt, recv, "elements", &en);
     if (en == 0) {
       if (sp_streq(name, "each_index")) {
@@ -2932,38 +2943,49 @@ int emit_arysub_call(Compiler *c, int id, Buf *b) {
   if (!arysub_view_open(c, id, &v)) return 0;
   int inner_o = node_is_oint(c, id) && oint_kind(repr_of(c, id).as_ty) && !outer_o;
   const char *cn = recv >= 0 && ty_is_object(rt) ? c->classes[ty_object_class(rt)].c_name : NULL;
-  if (inner_o) buf_printf(b, "%s(", oint_arg(repr_of(c, id).as_ty));
+  /* an unwrap's offer for this call (emit_oint_unwrap_ck, `a[0] + 1`): the
+     Array's read takes it and answers the plain value, with the unwrap's
+     own error for nil, so it is not unwrapped again */
+  Buf *ob = b, side; memset(&side, 0, sizeof side);
+  int offered = inner_o && g_ck_node == id && !g_ck_done;
+  if (offered) ob = &side;
+  else if (inner_o) buf_printf(b, "%s(", oint_arg(repr_of(c, id).as_ty));
   if (v.vi >= 0 && v.nat == TY_POLY) {
     int t = ++g_tmp;
-    buf_printf(b, "({ sp_RbVal _t%d = ", t);
-    emit_call(c, id, b);
-    buf_printf(b, "; _t%d.tag == SP_TAG_NIL ? NULL : (sp_%s *)_t%d.v.p; })", t, cn, t);
+    buf_printf(ob, "({ sp_RbVal _t%d = ", t);
+    emit_call(c, id, ob);
+    buf_printf(ob, "; _t%d.tag == SP_TAG_NIL ? NULL : (sp_%s *)_t%d.v.p; })", t, cn, t);
   }
   else if (v.copy && cn && comp_ary_is_str(c, ty_object_class(rt))) {
     /* to_s / to_str of a String subclass instance: a String of its bytes,
        which the view already copied */
-    emit_call(c, id, b);
+    emit_call(c, id, ob);
   }
   else if (v.copy) {
-    buf_printf(b, "%s_dup(", arysub_array_ctype(c, ty_object_class(rt)));
-    emit_call(c, id, b);
-    buf_puts(b, ")");
+    buf_printf(ob, "%s_dup(", arysub_array_ctype(c, ty_object_class(rt)));
+    emit_call(c, id, ob);
+    buf_puts(ob, ")");
   }
   else if (v.copy_class) {
     const char *at = arysub_array_ctype(c, ty_object_class(rt));
     int t = ++g_tmp, d = ++g_tmp;
-    buf_printf(b, "({ %s *_t%d = ", at, t);
-    emit_call(c, id, b);
-    buf_printf(b, "; SP_GC_ROOT(_t%d); sp_%s *_t%d = (sp_%s *)sp_%s__dup((void *)%s, 0); SP_GC_ROOT(_t%d); "
+    buf_printf(ob, "({ %s *_t%d = ", at, t);
+    emit_call(c, id, ob);
+    buf_printf(ob, "; SP_GC_ROOT(_t%d); sp_%s *_t%d = (sp_%s *)sp_%s__dup((void *)%s, 0); SP_GC_ROOT(_t%d); "
                   "%s_replace(&_t%d->ary, _t%d); _t%d; })",
                t, cn, d, cn, cn, g_argov_text[v.bound], d, at, d, t, d);
   }
   else {
-    if (v.vi >= 0) buf_printf(b, "((sp_%s *)(", cn);
-    emit_call(c, id, b);
-    if (v.vi >= 0) buf_puts(b, "))");
+    if (v.vi >= 0) buf_printf(ob, "((sp_%s *)(", cn);
+    emit_call(c, id, ob);
+    if (v.vi >= 0) buf_puts(ob, "))");
   }
-  if (inner_o) buf_puts(b, ")");
+  if (offered) {
+    if (g_ck_done) buf_puts(b, side.p ? side.p : "0");
+    else buf_printf(b, "%s(%s)", oint_arg(repr_of(c, id).as_ty), side.p ? side.p : "0");
+    free(side.p);
+  }
+  else if (inner_o) buf_puts(b, ")");
   arysub_view_close(c, &v);
   return 1;
 }

@@ -80,6 +80,7 @@ void an_rat_boxed_mark(int id);
 int an_rat_boxed(int id);
 int an_rat_value(Compiler *c, int n);
 extern int g_exc_abort;   /* --exceptions=abort (src/main.c) */
+extern int g_gc_none;     /* --gc=none (src/main.c) */
 /* is a def's value (the Symbol it names) used? par: an_parent_map */
 int an_def_value_used(const NodeTable *nt, const int *par, int v);
 int *an_parent_map(const NodeTable *nt);
@@ -174,6 +175,8 @@ int an_prog_never_gives(const char *nm, int defs);
 int an_prog_names_method(const char *nm);
 /* Kernel itself as call id's constant receiver (analyze_util.c) */
 int an_kernel_const_recv(Compiler *c, int id, int recv, int fresh);
+int an_kernel_backtick_recv(Compiler *c, int id, int recv, int fresh, int in_default);
+int *an_blank_slates_lacking(Compiler *c, const char *name, int *n);
 /* The argument shape of a `super` in a ` override (analyze_util.c) */
 int an_super_backtick_shape(Compiler *c, int id, const Scope *s, int *arg);
 int an_prog_meta_by_value(void);
@@ -355,6 +358,8 @@ int hash_vals_nullable(Compiler *c, int node);
 int nullable_int_value_raw(Compiler *c, int id);
 /* `@x = v` at write node id leaves @x's nil bit clear, as it already was */
 int nn_ivar_write_keeps_clear(Compiler *c, int id);
+/* `a[i]` on a pointer array proven to read within it (no nil past the end) */
+int an_elem_read_in_bounds(Compiler *c, int id);
 /* is position pos of a multiple assignment's value, read from a constant Array of a proven length, within it and no nil (a position from the end is not asked)? */
 int masgn_const_elem_in_range(Compiler *c, int value, long long pos);
 int scalar_nil_only_call(Compiler *c, int id, TyKind rt);
