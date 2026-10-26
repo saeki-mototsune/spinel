@@ -86,3 +86,13 @@ end
 p Doc.new(["one"]).lines.first
 p Blank.new([]).lines.first
 p Wrap.new([]).blank.lines.first
+
+# a class method's `new`, called on a subclass, builds the subclass
+class Maker
+  def self.build(h) = new(h)
+end
+class Made < Maker
+  attr_reader :request, :response
+  def initialize(h); @request = Request.new(h); @response = Response.new; end
+end
+p run(Made.build({}))

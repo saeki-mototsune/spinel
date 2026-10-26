@@ -51256,7 +51256,8 @@ static void an_phase_method_backstops(Compiler *c) {
           int rv = nt_ref(nt, id, "receiver");
           Scope *cs = comp_scope_of(c, id);
           int cid = -1;
-          if (rv < 0 || nt_kind(nt, rv) == NK_SelfNode) cid = cs && cs->is_cmethod ? cs->class_id : -1;
+          int self_new = rv < 0 || nt_kind(nt, rv) == NK_SelfNode;
+          if (self_new) cid = cs && cs->is_cmethod ? cs->class_id : -1;
           else if (nt_kind(nt, rv) == NK_ConstantReadNode || nt_kind(nt, rv) == NK_ConstantPathNode)
             cid = comp_class_index(c, nt_str(nt, rv, "name"));
           else {
@@ -51265,6 +51266,10 @@ static void an_phase_method_backstops(Compiler *c) {
             continue;
           }
           if (cid >= 0 && comp_method_in_chain(c, cid, "initialize", NULL) == s) called = 1;
+          /* `new` in a class method builds whichever subclass it is called on */
+          for (int k = 0; self_new && cid >= 0 && !called && k < c->nclasses; k++)
+            if (k != cid && is_descendant(c, k, cid) &&
+                comp_method_in_chain(c, k, "initialize", NULL) == s) called = 1;
         }
       }
       if (!called) continue;
