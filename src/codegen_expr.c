@@ -348,7 +348,7 @@ static void interp_plan(Compiler *c, int id, InterpPlan *pl) {
                  : g_emitting_class_id >= 0 ? g_emitting_class_id
                  : cs->class_id;
         if (cn && dcid >= 0) {
-          int mi = comp_method_in_chain(c, dcid, cn, NULL);
+          int mi = call_target(c, expr, dcid, cn, 0, NULL);
           if (mi >= 0) t = c->scopes[mi].ret;
         }
       }
@@ -535,9 +535,9 @@ static void interp_plan(Compiler *c, int id, InterpPlan *pl) {
         /* a value-type object (single-ivar) has a by-VALUE to_s signature;
            casting its receiver to a pointer is a C type error (#2357) */
         if (!part_nil && (comp_ty_value_obj(c, t) || (!vexpr[0] && !iv_pre && expr_is_held_ref(c, expr)))) {
-          const char *tsm = obj_str_mname(c, ty_object_class(t), 0);
-          if (comp_ty_value_obj(c, t)) buf_printf(&conv, "sp_%s_%s(", cn, tsm);
-          else buf_printf(&conv, "sp_%s_%s((sp_%s *)", cn, tsm, cn);
+          const char *tsf = obj_str_fn(c, ty_object_class(t), 0);
+          if (comp_ty_value_obj(c, t)) buf_printf(&conv, "%s(", tsf);
+          else buf_printf(&conv, "%s((sp_%s *)", tsf, cn);
           EMIT_IV(); buf_printf(&conv, "%s)", obj_str_blockarg(c, ty_object_class(t), 0));
         }
         else {
@@ -548,7 +548,7 @@ static void interp_plan(Compiler *c, int id, InterpPlan *pl) {
           EMIT_IV();
           buf_printf(&conv, "); SP_GC_ROOT(_t%d); ", to);
           if (part_nil) buf_printf(&conv, "_t%d ? ", to);
-          buf_printf(&conv, "sp_%s_%s(_t%d%s)%s; })", cn, obj_str_mname(c, ty_object_class(t), 0), to,
+          buf_printf(&conv, "%s(_t%d%s)%s; })", obj_str_fn(c, ty_object_class(t), 0), to,
                      obj_str_blockarg(c, ty_object_class(t), 0), part_nil ? " : sp_str_empty" : "");
         }
         if (ret_poly) buf_puts(&conv, ")");
@@ -1315,6 +1315,21 @@ static int const_ref_is_rescued(Compiler *c, int id) {
   return 0;
 }
 
+/* Is this constant reference on the right of a `&&` whose left arm is a
+   statically false defined? guard (comp_defined_guard_false)? That arm never
+   runs, so the reference never raises: `defined?(::X) && ::X` is how a
+   program reads a constant it may not have, as the `? :` form does, which
+   folds its dead arm away before it is emitted. */
+static int const_ref_is_guarded(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  for (int b = 0; b < nt->count; b++) {
+    if (nt_kind(nt, b) != NK_AndNode) continue;
+    if (!comp_defined_guard_false(c, nt_ref(nt, b, "left"))) continue;
+    if (node_in_subtree(nt, nt_ref(nt, b, "right"), id)) return 1;
+  }
+  return 0;
+}
+
 /* The constant path AS WRITTEN, for a message someone has to find in their
    source. The `par_nmc` the arms below key on is deliberately the parent's
    LEAF name (the ffi and platform-constant tables are keyed that way), and
@@ -1751,7 +1766,7 @@ int emit_call_or_write_via_methods(Compiler *c, int id, int is_or, Buf *b) {
   buf_printf(b, " _t%d = ", tv);
   if (rk == SP_MEMBER_METHOD) {
     Buf rb; memset(&rb, 0, sizeof rb);
-    emit_method_cname(c, &c->scopes[rmi], &rb);
+    buf_puts(&rb, mc_method(c, &c->scopes[rmi]));
     buf_printf(&rb, "((sp_%s *)_t%d)", rcn, tr);
     TyKind got = (TyKind)c->scopes[rmi].ret;
     if (got == TY_UNKNOWN || got == TY_VOID) got = rdt;
@@ -1827,7 +1842,7 @@ int emit_call_or_write_via_methods(Compiler *c, int id, int is_or, Buf *b) {
     emit_orw_vis_raise(c, wvis, wn, cid, rt, rv, b);
   }
   else if (wk == SP_MEMBER_METHOD) {
-    emit_method_cname(c, &c->scopes[wmi], b);
+    buf_puts(b, mc_method(c, &c->scopes[wmi]));
     buf_printf(b, "((sp_%s *)_t%d, ", wcn, tr);
     { Scope *ws = &c->scopes[wmi];
       LocalVar *pv = (ws->nparams > 0 && ws->pnames[0]) ? scope_local(ws, ws->pnames[0]) : NULL;
@@ -3439,7 +3454,8 @@ static int emit_constant_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, 
              build succeeds and the first request crashes (#3976). It stays a
              warning, not an error: referencing a missing constant to test the
              NameError is legal Ruby, and ruby/spec does exactly that. */
-          if (!const_ref_is_rescued(c, id)) warn_undefined_constant(c, id, nm);
+          if (!const_ref_is_rescued(c, id) && !const_ref_is_guarded(c, id))
+            warn_undefined_constant(c, id, nm);
           buf_printf(b, "(sp_raise_cls(\"NameError\", \"uninitialized constant %s\"), ((sp_Class){-1}))", nm);
         }
       }
@@ -3747,7 +3763,23 @@ static int emit_constant_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         buf_printf(b, "((sp_Class){(sp_int)-1, SPL(\"%s\")})", fullname);
         return 1;
       }
-      if (!const_ref_is_rescued(c, id)) warn_undefined_constant(c, id, fullname);
+      if (!const_ref_is_rescued(c, id) && !const_ref_is_guarded(c, id))
+        warn_undefined_constant(c, id, fullname);
+      /* CRuby resolves the path left to right and names the first segment
+         it does not find: `Mylib::VERSION` with no Mylib raises
+         "uninitialized constant Mylib" */
+      { int segs[32], ns = 0;
+        for (int s = nt_ref(nt, id, "parent"); s >= 0 && ns < 32 &&
+             (nt_kind(nt, s) == NK_ConstantReadNode || nt_kind(nt, s) == NK_ConstantPathNode);
+             s = nt_kind(nt, s) == NK_ConstantPathNode ? nt_ref(nt, s, "parent") : -1)
+          segs[ns++] = s;
+        for (int i = ns - 1; i >= 0; i--)
+          if (!const_seg_resolves(c, segs[i])) {
+            char miss[512];
+            const_path_written(nt, segs[i], miss, sizeof miss);
+            if (miss[0]) snprintf(fullname, sizeof fullname, "%s", miss);
+            break;
+          } }
       buf_printf(b, "(sp_raise_cls(\"NameError\", \"uninitialized constant %s\"), ((sp_Class){-1}))", fullname);
     }
     return 1;
@@ -3815,6 +3847,15 @@ static int emit_defined_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     else if (vk == NK_InstanceVariableReadNode) {
       /* Return "instance-variable" only when the ivar is known to be assigned. */
       const char *inm = nt_str(nt, v, "name");
+      /* an attr_writer or attr_accessor of self's class or a superclass
+         writes it too (a Struct member is no ivar) */
+      Scope *ws = comp_scope_of(c, v);
+      for (int k = ws && !ws->is_cmethod ? ws->class_id : -1; k >= 0 && inm && !res; k = c->classes[k].parent) {
+        ClassInfo *wi = &c->classes[k];
+        int mi = comp_ivar_index(wi, inm);
+        if (comp_is_writer(wi, inm + 1) && !((wi->is_struct || wi->is_data) && mi >= 0 && mi < wi->nmembers))
+          res = "instance-variable";
+      }
       for (int kk = 0; kk < nt->count && !res; kk++) {
         NodeKind kt_k = nt_kind(nt, kk);
         if (kt_k == NK_InstanceVariableWriteNode &&
@@ -3959,11 +4000,11 @@ static int emit_defined_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     }
     else if (vk == NK_CallNode && nt_ref(nt, v, "receiver") < 0) {
       const char *cn = nt_str(nt, v, "name");
-      if (cn && comp_method_index(c, cn) >= 0) res = "method";
+      if (cn && call_target(c, v, -1, cn, CT_TOP, NULL) >= 0) res = "method";
       /* an implicit-self call inside a class resolves through the
          enclosing class's method chain (readers included) */
       else if (cn && comp_scope_of(c, id) && comp_scope_of(c, id)->class_id >= 0 &&
-               (comp_method_in_chain(c, comp_scope_of(c, id)->class_id, cn, NULL) >= 0 ||
+               (call_target(c, v, comp_scope_of(c, id)->class_id, cn, 0, NULL) >= 0 ||
                 comp_reader_in_chain(c, comp_scope_of(c, id)->class_id, cn, NULL)))
         res = "method";
       else if (cn && defined_bare_builtin(c, id, cn)) res = "method";
@@ -5238,6 +5279,31 @@ static int emit_range_boxed_ends(Compiler *c, int id, int left, int right, int e
   buf_printf(b, ", %d); })", excl);
   return 1;
 }
+
+/* A literal end reads the same whenever it runs: the other end's order
+   against it does not show. */
+static int range_end_literal(const NodeTable *nt, int n) {
+  switch (nt_kind(nt, n)) {
+    case NK_IntegerNode: case NK_FloatNode: case NK_NilNode: case NK_TrueNode:
+    case NK_FalseNode: case NK_SymbolNode: case NK_StringNode:
+      return 1;
+    default:
+      return 0;
+  }
+}
+
+/* fn(lo, hi, excl), the Range's builder over its two ends' C. in_order: the
+   ends go to temps first, the begin before the end, as Ruby runs them. */
+static void emit_range_build(Buf *b, const char *fn, Buf *lo, Buf *hi, int excl, int in_order) {
+  if (in_order) {
+    int tl = ++g_tmp, th = ++g_tmp;
+    buf_printf(b, "({ __typeof__(%s) _t%d = %s; __typeof__(%s) _t%d = %s; %s(_t%d, _t%d, %d); })",
+               lo->p, tl, lo->p, hi->p, th, hi->p, fn, tl, th, excl);
+  }
+  else buf_printf(b, "%s(%s, %s, %d)", fn, lo->p, hi->p, excl);
+  free(lo->p); free(hi->p);
+}
+
 /* A Range literal in value position (a..b, a...b, endless and beginless) */
 static int emit_range_literal(Compiler *c, int id, Buf *b, const NodeTable *nt) {
   int left = nt_ref(nt, id, "left");
@@ -5471,18 +5537,27 @@ static int emit_range_literal(Compiler *c, int id, Buf *b, const NodeTable *nt) 
      each bound as an sp_oint. A bound known present is the plain one. */
   int lo_o = left_unbounded || (left >= 0 && (repr_of(c, left).kind == RK_BOXED || (comp_ntype(c, left) == TY_INT && node_has_oint_form(c, left))));
   int hi_o = right_unbounded || (right >= 0 && !fend && !pend && comp_ntype(c, right) == TY_INT && node_has_oint_form(c, right));
+  /* Ruby runs the begin before the end; C does not order a call's
+     arguments (gcc ran `at(3)` before `at(1)` in `x&.slice(at(1)..at(3))`
+     on a boxed x). Where an end can do something, the two go to temps in
+     their order first. */
+  int in_order = !left_unbounded && !right_unbounded &&
+                 ((subtree_has_side_effect(c, left) && !range_end_literal(nt, right)) ||
+                  (subtree_has_side_effect(c, right) && !range_end_literal(nt, left)));
+  Buf lo, hi;
+  memset(&lo, 0, sizeof lo); memset(&hi, 0, sizeof hi);
+  const char *fn;
   if (!fend && !pend && (lo_o || hi_o)) {
-    buf_puts(b, "sp_range_new_o(");
-    if (left_unbounded) buf_puts(b, "sp_oint_nil()");
-    else if (repr_of(c, left).kind == RK_BOXED) { buf_puts(b, "sp_range_lo_bound("); emit_expr(c, left, b); buf_puts(b, ")"); }
-    else emit_oint_expr(c, left, TY_INT, b);
-    buf_puts(b, ", ");
-    if (right_unbounded) buf_puts(b, "sp_oint_nil()");
-    else emit_oint_expr(c, right, TY_INT, b);
-    buf_printf(b, ", %d)", excl);
+    fn = "sp_range_new_o";
+    if (left_unbounded) buf_puts(&lo, "sp_oint_nil()");
+    else if (repr_of(c, left).kind == RK_BOXED) { buf_puts(&lo, "sp_range_lo_bound("); emit_expr(c, left, &lo); buf_puts(&lo, ")"); }
+    else emit_oint_expr(c, left, TY_INT, &lo);
+    if (right_unbounded) buf_puts(&hi, "sp_oint_nil()");
+    else emit_oint_expr(c, right, TY_INT, &hi);
+    emit_range_build(b, fn, &lo, &hi, excl, in_order);
     return 1;
   }
-  buf_puts(b, fend ? "sp_range_new_fend(" : pend ? "sp_range_new_pend(" : "sp_range_new(");
+  fn = fend ? "sp_range_new_fend" : pend ? "sp_range_new_pend" : "sp_range_new";
   /* a nil that arrives at run time -- boxed, or an Integer slot's nil --
      is the absent bound too; read as a number, `lo..x` with x nil was the
      empty `lo..0` */
@@ -5491,22 +5566,21 @@ static int emit_range_literal(Compiler *c, int id, Buf *b, const NodeTable *nt) 
      answer for `..2` where CRuby has `..2.5`. Say so at run time. */
   if (!left_unbounded && !right_unbounded && repr_of(c, left).kind == RK_BOXED &&
       comp_ntype(c, right) == TY_FLOAT) {
-    buf_puts(b, "sp_range_lo_float_end("); emit_expr(c, left, b); buf_puts(b, ")");
+    buf_puts(&lo, "sp_range_lo_float_end("); emit_expr(c, left, &lo); buf_puts(&lo, ")");
   }
   /* a boxed begin holding a Float cannot be an Integer range's: it says so
      (sp_range_lo_bound), where the conversion truncated it */
   else if (!left_unbounded && repr_of(c, left).kind == RK_BOXED) {
-    buf_puts(b, "sp_range_lo_bound("); emit_expr(c, left, b); buf_puts(b, ")");
+    buf_puts(&lo, "sp_range_lo_bound("); emit_expr(c, left, &lo); buf_puts(&lo, ")");
   }
   /* (a Float or boxed end: the begin as an sp_oint, nil for an open one) */
-  else if (left_unbounded) buf_puts(b, pend ? "sp_oint_nil()" : "SP_RANGE_NO_BEGIN");
-  else if (pend) emit_oint_expr(c, left, TY_INT, b);
-  else emit_int_expr(c, left, b);
-  buf_puts(b, ", ");
-  if (fend) emit_float_expr(c, right, b);
-  else if (pend) emit_expr(c, right, b);
-  else emit_int_expr(c, right, b);
-  buf_printf(b, ", %d)", excl);
+  else if (left_unbounded) buf_puts(&lo, pend ? "sp_oint_nil()" : "SP_RANGE_NO_BEGIN");
+  else if (pend) emit_oint_expr(c, left, TY_INT, &lo);
+  else emit_int_expr(c, left, &lo);
+  if (fend) emit_float_expr(c, right, &hi);
+  else if (pend) emit_expr(c, right, &hi);
+  else emit_int_expr(c, right, &hi);
+  emit_range_build(b, fn, &lo, &hi, excl, in_order);
   return 1;
   return 0;
 }
@@ -5728,6 +5802,7 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
     return;
   }
   if (ty_k == NK_TrueNode)  { buf_puts(b, "1"); return; }
+  if (ty_k == NK_LoadNode)  { emit_load_call(c, id, b); return; }   /* (only one naming no file stands as a value) */
   if (ty_k == NK_FalseNode) { buf_puts(b, "0"); return; }
   if (ty_k == NK_NilNode)   { buf_puts(b, "0"); return; }  /* default in numeric/bool context */
   if (ty_k == NK_SymbolNode) {

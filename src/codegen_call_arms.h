@@ -125,7 +125,6 @@ int emit_respond_to_by_cls(Compiler *c, int recv, const char *qm, int argc, cons
 extern int g_rto_exc;
 int emit_respond_to_exc_cls(Compiler *c, int recv, const char *qm, int argc, const int *argv, Buf *b);
 int method_hidden_from_reflection(Compiler *c, int cid, const char *m);
-int name_is_synth_method(Compiler *c, const char *m);
 int refl_member_of_struct_superclass(Compiler *c, int ci, const char *m);
 int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const char *qm, int argc, const int *argv);
 int respond_to_user_defined(Compiler *c, int id, int recv);
@@ -149,10 +148,10 @@ void emit_ffi_callback_arg(Compiler *c, int cbidx, int argnode, Buf *out);
 void emit_ffi_num_arg(Compiler *c, int arg, TyKind at, const char *spec, int dbl, Buf *b);
 int emit_or_take_back(Compiler *c, int id, Buf *b, int (*fn)(Compiler *, int, Buf *));
 int emit_sg_accessor(Compiler *c, int id, int ci, const char *cn, const char *name, int argc, const int *argv, Buf *b);
-/* Does a value of class k answer `name` by a `class << self` accessor ahead
-   of any class method of the name? And the arms of those classes in the
-   class-tag ternary over the boxed value in _t<tv>. */
-int cls_sg_accessor_first(Compiler *c, int k, const char *name, int argc);
+/* Does a value of class k answer call `call`'s `name` by a `class << self`
+   accessor ahead of any class method of the name? And the arms of those
+   classes in the class-tag ternary over the boxed value in _t<tv>. */
+int cls_sg_accessor_first(Compiler *c, int call, int k, const char *name, int argc);
 void emit_boxed_cls_sg_first_arms(Compiler *c, int id, const char *name, int argc, const int *argv, int tv, Buf *b);
 int cls_value_sg_accessor_named(Compiler *c, const char *name, int argc);
 int emit_cls_value_sg_accessor_of(Compiler *c, int id, int recv, const char *ktext, const char *name, int argc,
@@ -179,7 +178,7 @@ void emit_class_value_new_kw(Compiler *c, int id, int recv, int boxed, Buf *b);
    Symbol's or nil's can equal a user class's index, and a user
    object's is its class's, so anything else
    switches on -1, no arm's label, and takes the default's NoMethodError. */
-void emit_class_value_new_switch(int rt2, int kt, int boxed, Buf *b);
+void emit_class_value_new_switch(Compiler *c, int rt2, int kt, int boxed, Buf *b);
 void emit_ctor_arm_case(Compiler *c, int ci, int rt2, int self_t, const char *pre, const char *args, int given, Buf *b);
 void struct_nil_fill_stmts(Compiler *c, int ci, int given, const char *obj, Buf *out);
 void emit_ctor_arm_param(Compiler *c, Scope *is, int j, const ArgLayout *L, const int *atmp, Buf *pdpre, Buf *out);

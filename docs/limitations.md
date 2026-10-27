@@ -169,10 +169,10 @@ here on an OS update; a context given a `cert_store` validates against that
 store instead. The package exists only where libssl's headers were
 present at build time.
 
-The require-gated stdlib Spinel *does* provide (`StringIO`, `IO#winsize`,
+The require-only stdlib Spinel *does* provide (`StringIO`, `IO#winsize`,
 `Time#iso8601`, ...) requires its `require`, matching CRuby; an unsatisfiable
-`require` is a compile error. This is opt-in today via `--require-gate` (or
-`SPINEL_REQUIRE_GATE=1`); `spin build` always compiles with it on.
+`require` is a compile error. This is opt-in today via `--strict-require` (or
+`SPINEL_STRICT_REQUIRE=1`); `spin build` always compiles with it on.
 See [require.md](require.md) for which stdlib needs which `require`.
 | Mixed / non-UTF-8 encodings | UTF-8 / ASCII-8BIT only. `IO#set_encoding` picks between the two (US-ASCII counts as UTF-8) for what a read with no length and `getc` answer; a third encoding, an internal encoding that would convert reads, or `BOM\|` raises `NotImplementedError` at run time, and options (`invalid: :replace`, ...) are refused. `String#encode` / `encode!` convert between UTF-8, ASCII-8BIT and US-ASCII with `invalid:`, `undef:` and `replace:` as CRuby's; with another encoding they answer ASCII text unchanged where both encodings hold it as ASCII (and an empty String as empty) and raise `NotImplementedError` otherwise, as they do for non-ASCII text from US-ASCII to itself without `invalid: :replace`, and a call that names `xml:`, `fallback:` or a newline option, or computes an option's key, is refused (a `**` hash holding one of those options raises `NotImplementedError`). `encode!` that replaces characters works on a variable or a String shared by reference, where it reaches every name for the String, and raises `NotImplementedError` elsewhere; `s = s.encode(...)` works everywhere | one internal representation; transcoding tables are out of scope |
 | Embedded `NUL` in general binary strings | `char *` boundary assumption | most string ops are NUL-terminated at the C boundary |
@@ -692,6 +692,11 @@ still works.
   wait (a `sleep`, a `Queue#pop`, a `join`, a `Mutex#lock`, an IO wait) or
   `Thread.pass`, not in the middle of a computation as CRuby can;
   `Thread#kill` of the main thread is a no-op, where CRuby ends the process.
+- **An `--incremental` build is slower code than a release build.** It is a
+  development-build mode: the program is compiled as many units, so methods
+  are not inlined across units, and short methods lose the inline hint they
+  get in a single-unit build. The answers are the same; release builds
+  (without `--incremental`) are unchanged.
 
 ### Intentional incompatibilities with CRuby
 
@@ -709,6 +714,15 @@ CRuby defines them when the file loads. So `defined?(Foo)` before the require
 that defines `Foo` answers `"constant"` where CRuby answers `nil`, and a
 method a later-required file defines can be called before that require runs.
 A file's other top-level statements run when it is loaded.
+
+#### A core class's reopened method answers from the start of the program
+
+A program that reopens a core class and redefines one of its methods
+(`class Integer; def +(o) ... end; end`, `class String; def upcase ... end;
+end`) gets the new method for every call, also for a call that runs before
+the reopening does. CRuby runs the core method until the reopening has run.
+So `p 1 + 2` ahead of the reopening above prints what the new `+` answers,
+where CRuby prints `3`. Answering per point would give one name two targets.
 
 #### Two DISTINCT self-containing Sets compare equal
 
@@ -1146,6 +1160,9 @@ any `Rational` whose value lands on a nanosecond -- is exact, and `to_s`,
 exactness (and, as its consequence, the `Rational`-form `#inspect` display
 CRuby uses for non-decimal sub-seconds) is lost.
 
+A local `Time` also accepts `+=` with a `Rational` offset. Whole
+nanoseconds are retained without converting the offset to a Float.
+
 #### Unboxed value types: identity IS the value
 
 `Complex`, `Rational`, and `Range` values are unboxed C structs with no
@@ -1306,10 +1323,11 @@ parses.
 
 A note on identity: equal frozen literals are one object, as in CRuby
 with frozen string literals. `"abc".equal?("abc")` is `true`, the same
-text in two methods (or in two parts of a `--jobs=N` split build) is the
-same object, an adjacent-literal fold (`"ab" "c"`) is the object the plain
-`"abc"` is, and a literal in a loop yields one object on every pass. An
-interpolated string (`"#{x}"`) is built anew each time, in CRuby too.
+text in two methods (or in two parts of a `--jobs=N` split build, or in two
+units of an `--incremental` build) is the same object, an adjacent-literal
+fold (`"ab" "c"`) is the object the plain `"abc"` is, and a literal in a
+loop yields one object on every pass. An interpolated string (`"#{x}"`) is
+built anew each time, in CRuby too.
 
 What still differs is the run-time intern table behind `String#-@` /
 `dedup`. CRuby puts every frozen literal in it when the code is loaded, so

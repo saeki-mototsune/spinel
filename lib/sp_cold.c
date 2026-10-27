@@ -2047,7 +2047,10 @@ static int sp_bt_is_runtime(const char *n) {
     "idiv", "imod", "gcd", "fdiv", "ipow", "iclamp", "div_", "mod_",
     /* the trampoline that puts the body on its own stack: runtime, not a
        Ruby frame, and it sits below every frame of the program */
-    "main_stack", 0
+    "main_stack",
+    /* the body of a required file's load, below the frame its Kernel
+       method keeps (spinel_rt.h, sp_Kernel_require) */
+    "load_file", 0
   };
   for (int i = 0; pfx[i]; i++) {
     size_t l = strlen(pfx[i]);
@@ -2097,6 +2100,15 @@ else {                                        /* macOS: "<idx> <image> <addr> <s
   if (strncmp(sym, "sp_", 3) != 0) return 0;     /* skip non-Spinel frames */
   const char *name = sym + 3;
   if (sp_bt_is_runtime(name)) return 0;
+  /* A required file's top level runs in sp_file_<N>_top (--load-model=graph):
+     CRuby's `<top (required)>`. No method is emitted under that name: a
+     top-level `def file_1_top` takes another, as the runtime's sp_file_
+     functions reserve the prefix. */
+  if (strncmp(name, "file_", 5) == 0) {
+    const char *d = name + 5;
+    while (*d >= '0' && *d <= '9') d++;
+    if (d > name + 5 && strcmp(d, "_top") == 0) return strdup("<top (required)>");
+  }
   /* De-mangle sp_<Class>_<method> back to Ruby. A Spinel symbol is a path of
      CamelCase class segments (each from a `::`, joined by `_`) followed by the
      method; the method is the first segment that starts lowercase. A literal
@@ -2160,6 +2172,9 @@ static void sp_bt_lines(void **buf, int n, int *lines, char **files) {
   int o = snprintf(cmd, sizeof cmd, "addr2line -e '%s'", exe);
   for (int i = 0; i < n && o < (int)sizeof cmd - 32; i++)
     o += snprintf(cmd + o, sizeof cmd - (size_t)o, " 0x%lx", (unsigned long)((uintptr_t)buf[i] - 1 - bias));
+  /* (a host without addr2line: the shell's complaint is not the program's
+     output, and the frames go without lines, as atos's below) */
+  if (o < (int)sizeof cmd - 16) snprintf(cmd + o, sizeof cmd - (size_t)o, " 2>/dev/null");
   FILE *p = popen(cmd, "r");
   if (!p) return;
   char line[2048];
@@ -2229,6 +2244,14 @@ static int sp_bt_block_depth(const char *sym, const char *file, int line) {
   return 0;
 }
 
+/* Is file, where sp_bt_lines found a frame's line, C source: the runtime's
+   (a Kernel method it implements, spinel_rt.h's sp_Kernel_require) rather
+   than the program's, whose lines are its .rb files' (#line)? */
+static int sp_bt_c_source(const char *file) {
+  size_t l = file ? strlen(file) : 0;
+  return l > 2 && file[l - 2] == '.' && (file[l - 1] == 'c' || file[l - 1] == 'h');
+}
+
 sp_StrArray *sp_bt_format(void **buf, int n) {
   sp_StrArray *a = sp_StrArray_new();
   SP_GC_ROOT(a);
@@ -2247,6 +2270,9 @@ sp_StrArray *sp_bt_format(void **buf, int n) {
   const char *src = (sp_bt_srcfile && sp_bt_srcfile[0]) ? sp_bt_srcfile : "(spinel)";
   int *lines = (int *)calloc((size_t)n, sizeof *lines);
   char **lfiles = (char **)calloc((size_t)n, sizeof *lfiles);
+  char **names = (char **)calloc((size_t)n, sizeof *names);
+  const char **files = (const char **)calloc((size_t)n, sizeof *files);
+  if (!names || !files) { free(names); free(files); free(lfiles); free(lines); free(syms); return a; }
   if (lines) sp_bt_lines(buf, n, lines, lfiles);
   for (int i = 0; i < n; i++) {
     char raw[256]; raw[0] = 0;
@@ -2267,13 +2293,29 @@ sp_StrArray *sp_bt_format(void **buf, int n) {
       free(name);
       name = strdup(bn);
     }
-    if (lines && lines[i] > 0) sp_StrArray_push_e(a, SP_SEF(sp_sprintf("%s:%d:in `%s'", file, lines[i], name)));
-    else sp_StrArray_push_e(a, SP_SEF(sp_sprintf("%s:in `%s'", file, name)));
-    free(name);
+    names[i] = name;
+    files[i] = file;
+  }
+  /* A frame in the runtime's C is at the place it was called from, as
+     CRuby's C methods are: `main.rb:2:in 'Kernel#require'` above
+     `main.rb:2:in '<main>'`. Outermost first, so a run of them takes the
+     Ruby frame below it. */
+  for (int i = n - 1, outer = -1; i >= 0; i--) {
+    if (!names[i]) continue;
+    if (lines && lfiles && sp_bt_c_source(lfiles[i]) && outer >= 0) { files[i] = files[outer]; lines[i] = lines[outer]; }
+    outer = i;
+  }
+  for (int i = 0; i < n; i++) {
+    if (!names[i]) continue;
+    if (lines && lines[i] > 0) sp_StrArray_push_e(a, SP_SEF(sp_sprintf("%s:%d:in `%s'", files[i], lines[i], names[i])));
+    else sp_StrArray_push_e(a, SP_SEF(sp_sprintf("%s:in `%s'", files[i], names[i])));
+    free(names[i]);
   }
   if (lfiles) for (int i = 0; i < n; i++) free(lfiles[i]);
   free(lfiles);
   free(lines);
+  free(names);
+  free(files);
   free(syms);
   return a;
 }
@@ -4759,7 +4801,12 @@ sp_RbVal sp_main_self(void) {
 sp_StrArray *sp_get_ARGV(void) {
   if (!sp_argv_array_cache) {
     sp_argv_array_cache = sp_StrArray_new();
-    for (sp_int i = 0; i < sp_argv.len; i++) sp_StrArray_push_e(sp_argv_array_cache, SP_SEF(sp_argv.data[i]));
+    for (sp_int i = 0; i < sp_argv.len; i++) {
+      /* frozen, as CRuby's are, and collectible like ENV's copies (sp_env_str) */
+      unsigned char *m = (unsigned char *)sp_argv.data[i] - 1;
+      if (*m == 0xfe) *m = 0xfa;
+      sp_StrArray_push_e(sp_argv_array_cache, SP_SEF(sp_argv.data[i]));
+    }
   }
   return sp_argv_array_cache;
 }
@@ -4775,7 +4822,17 @@ void sp_require_computed(const char *path, const char *const *features, int n) {
     if (memcmp(path + pl - fl, f, fl) != 0) continue;
     if (fl == pl || path[pl - fl - 1] == '/') return;
   }
-  sp_raise_cls("LoadError", sp_sprintf("cannot load such file -- %s", path));
+  sp_raise_load_error(path);
+}
+SP_NORETURN void sp_raise_load_error(const char *feature) {
+  /* (a computed require's path is often a temporary no frame roots, and a
+     copy longer than sp_sprintf's stack buffer allocates before it reads
+     the path again) */
+  SP_GC_ROOT_STR(feature);
+  const char *f = sp_sprintf("%s", feature ? feature : "");
+  SP_GC_ROOT_STR(f);
+  sp_exc_stage_key(sp_box_str(f));
+  sp_raise_cls("LoadError", sp_sprintf("cannot load such file -- %s", f));
 }
 sp_StrArray *sp_get_loaded_features(void) {
   if (!sp_loaded_features_cache) sp_loaded_features_cache = sp_StrArray_new();
@@ -6363,6 +6420,12 @@ SP_NORETURN void sp_raise_nil_cmp(int left_nil, const char *op, const char *cls)
   if (left_nil)
     sp_raise_cls("NoMethodError", sp_sprintf("undefined method '%s' for nil", op));
   sp_raise_cls("ArgumentError", sp_sprintf("comparison of %s with nil failed", cls));
+}
+
+/* A comparison of two Floats where one is NaN: CRuby's Float#<=> answers
+   nil, and the caller (min, max) reports the Float it compared with. */
+SP_NORETURN void sp_raise_float_cmp(sp_float with) {
+  sp_raise_cls("ArgumentError", sp_sprintf("comparison of Float with %s failed", sp_float_to_s(with)));
 }
 
 /* A nil that reached a strict Integer argument slot through an `Integer?`

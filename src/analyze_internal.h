@@ -29,6 +29,8 @@ extern const char *const g_sid_refusal_msg;
 int ie_class_of(Compiler *c, int node);
 int attr_reader_ty(Compiler *c, int cid, const char *name, TyKind *out);
 int ie_poly_classes_at(Compiler *c, int node, int *out, int max);
+/* an empty row a nested seed built at its kind (narrow_object_arrays) */
+int oa_seed_row_literal(int lit);
 /* Does the program make a bare Object (`Object.new`)? (analyze_infer.c) */
 int an_program_news_object(Compiler *c);
 int ie_kernel_global(const char *n);
@@ -168,6 +170,7 @@ int builtin_kernel_fn_span(const char *name, int with_block, int *lo, int *hi);
 int builtin_arity_violation(Compiler *c, int id);
 int is_handler_proc_block(Compiler *c, int id);
 int builtin_class_id(const char *name);
+int class_is_prim_reopen(Compiler *c, int k);
 int stdlib_name_from_source(const char *n);
 int builtin_class_parent_id(int id);
 int desugar_builtin_reopen_named_superclass(Compiler *c);
@@ -384,6 +387,7 @@ int new_recv_classes(Compiler *c, int recv, int *out, int cap);
 int new_recv_every_class(Compiler *c, int recv);
 int class_body_list(Compiler *c, int **out_ci, int **out_body);
 int class_def_body(Compiler *c, int def_node);
+const char *vis_arg_name(const NodeTable *nt, int arg);   /* a Symbol or String argument's method name (analyze_scope.c) */
 void register_struct_members(Compiler *c, ClassInfo *cls, int val);
 void register_structs(Compiler *c);
 void register_singleton_defs(Compiler *c);
@@ -493,6 +497,7 @@ int exc_has_nonstring_msg_override(Compiler *c);                 /* codegen_util
 int interp_is_literal_fold(const NodeTable *nt, int id);         /* codegen_expr.c */
 int is_fresh_array(Compiler *c, int v);                          /* analyze_pass.c */
 int ivar_assigned_in_initialize(Compiler *c, int k, const char *ivn);  /* analyze.c */
+int json_parse_ostruct_opts(Compiler *c, int kwh);               /* codegen_call_class.c */
 int kwh_lookup(const NodeTable *nt, int kwh, const char *kname); /* codegen_fold.c */
 int lazy_endpoint_is_infinite(Compiler *c, int right);           /* codegen_call.c */
 int proc_form_source(Compiler *c, int s);                        /* codegen_util.c */
@@ -607,6 +612,7 @@ int narrow_site_boxed_block_params(Compiler *c);
 int desugar_to_proc_block_arg(Compiler *c);
 int desugar_proc_expr_block_arg(Compiler *c);
 int desugar_to_hash_splat(Compiler *c);
+int desugar_kernel_array_conv(Compiler *c);
 int desugar_splat_to_a(Compiler *c);
 int desugar_builtin_splat_forward(Compiler *c);
 int builtin_class_arity_spec(const char *cls, const char *m, int *min, int *max,
@@ -617,6 +623,7 @@ int desugar_root_scoped_constants(Compiler *c);
 int desugar_errno_aliases(Compiler *c);
 const char *errno_canonical_name(const char *n);   /* analyze_util.c */
 void desugar_class_reopen(Compiler *c);
+int is_class_const(const NodeTable *nt, int id);   /* a `Class` constant read */
 int desugar_def_unless_method_defined(Compiler *c);
 int desugar_class_body_self_calls(Compiler *c);
 int desugar_builtins(Compiler *c);
@@ -684,6 +691,7 @@ int desugar_extend_self(Compiler *c);
 int desugar_instance_eval_defs(Compiler *c);
 int enumerator_own_with_object(Compiler *c, int id);
 int block_body_breaks(const NodeTable *nt, int node);   /* a break that leaves this block */
+const LowerRow *lower_row_nt(const NodeTable *nt, int id, int family);   /* the family's row call id's shape matches */
 int desugar_kernel_reopen(Compiler *c);
 int desugar_singleton_class_mixin(Compiler *c);
 int desugar_explicit_receiver_mixin(Compiler *c);
@@ -699,6 +707,7 @@ int desugar_fiber_prepended_init(Compiler *c);
 int desugar_handle_reopen_self_recv(Compiler *c);
 int desugar_call_or_write_reopen(Compiler *c);
 int desugar_static_class_eval(Compiler *c);
+int desugar_table_loops(Compiler *c);         /* analyze_ct.c */
 void desugar_nil_block_arg(Compiler *c);
 int desugar_compose_method_operand(Compiler *c);
 int desugar_mutator_receiver_value(Compiler *c);
@@ -863,9 +872,9 @@ int exc_subclass_defines(Compiler *c, const char *name);
 int exc_user_method_name(Compiler *c, const char *name, int argc);
 /* Defined in codegen_fold.c; 1 if class `k` is `anc` or a descendant of it. */
 int is_descendant(Compiler *c, int k, int anc);
-/* Defined in codegen_fold.c; distinct implementations of `name` across cid's
-   subtree. */
-int dispatch_impl_count(Compiler *c, int cid, const char *name);
+/* Defined in codegen_fold.c; distinct implementations of call `call`'s
+   `name` across cid's subtree. */
+int dispatch_impl_count(Compiler *c, int call, int cid, const char *name);
 /* Defined in codegen_util.c; the proc-form clone of scope `s`, or -1. */
 int scope_proc_form_of(Compiler *c, int s);
 int reopen_yields_known_container(Compiler *c, Scope *m);

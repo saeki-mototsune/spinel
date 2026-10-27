@@ -52,8 +52,10 @@ static int call_is_chain_receiver_with_block(Compiler *c, int id) {
        recognises that shape by this call being typed an Enumerator. Left in the
        guard, `arr.map.each { }` typed neither and answered NoMethodError at run
        time (#4331). */
+    /* to_a / entries ignore their block: `arr.map.to_a { }` is the
+       Enumerator's elements */
     { const char *cn = nt_str(nt, n, "name");
-      if (cn && sp_streq(cn, "each")) return 0; }
+      if (cn && (sp_streq(cn, "each") || is_to_array_alias(cn))) return 0; }
     return 1;
   }
   return 0;
@@ -406,7 +408,7 @@ int infer_numeric_call(Compiler *c, int id, TyKind rt, TyKind *out) {
        user object's result to sp_rational_to_s (#3489). */
     if (argc == 1 && is_arith_op(name) && ty_is_object(a0r) &&
         comp_method_in_chain(c, ty_object_class(a0r), "coerce", NULL) >= 0) {
-      int op_mi_r = comp_method_in_chain(c, ty_object_class(a0r), name, NULL);
+      int op_mi_r = call_target(c, id, ty_object_class(a0r), name, 0, NULL);
       if (op_mi_r >= 0) { *out = (TyKind)c->scopes[op_mi_r].ret; return 1; }
     }
     /* a user object (or an Array of them) as the operand has no bit in a
@@ -1133,7 +1135,7 @@ int infer_array_call(Compiler *c, int id, TyKind rt, TyKind *out) {
        yields the RHS BOXED (its `_t` temp is an sp_RbVal), so a poly receiver
        infers TY_POLY; a typed receiver's emitter yields the raw RHS value. */
     if (sp_streq(name, "[]=") && argc == 2) {
-      if (infer_type(c, argv[0]) == TY_RANGE)
+      if (infer_type(c, argv[0]) == TY_RANGE || infer_type(c, argv[0]) == TY_FLOAT_RANGE)
         { *out = rt == TY_POLY_ARRAY ? TY_POLY : infer_type(c, argv[1]); return 1; }
       { *out = ty_array_elem(rt); return 1; }
     }
@@ -1212,9 +1214,9 @@ int infer_arysub_call(Compiler *c, int id, TyKind *out) {
   if (!c->has_arysub) return 0;
   int recv = nt_ref(c->nt, id, "receiver");
   /* Kernel#Array hands an Array back as it is, an Array subclass instance
-     included */
+     included; a Hash or String subclass instance is not one */
   int an = comp_arysub_kernel_array(c, id);
-  if (an >= 0 && comp_ty_ary_root(c, infer_type(c, an)) >= 0) { *out = infer_type(c, an); return 1; }
+  if (an >= 0 && comp_ty_arysub_array(c, infer_type(c, an))) { *out = infer_type(c, an); return 1; }
   /* already re-inferring this receiver as its builtin: face_of reads the
      newest pin and the codegen face, so ask every pin of the inference */
   if (recv < 0 || face_of(recv) != TY_UNKNOWN || an_face_pinned(recv)) return 0;
@@ -1270,7 +1272,7 @@ int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out) {
        method storing `self` types it as the class that DEFINED the method --
        so the call dispatches at run time and its value is that union (#4023).
        The emitter routes the same shape through the poly dispatch. */
-    if (comp_method_in_chain(c, cid, name, NULL) < 0 &&
+    if (call_target(c, id, cid, name, 0, NULL) < 0 &&
         !comp_reader_in_chain(c, cid, name, NULL) && !cls->is_native_class &&
         comp_subclass_answers(c, cid, name)) {
       /* Runtime-name send arms on boxed self may include classes the descendant plan excludes. */
@@ -1284,7 +1286,7 @@ int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out) {
        below -- is the call's answer, which the emitter dispatches to: typed
        by what it returns, which need not be true or false (an
        `instance_of?` answering :tag, one an --rbs seed declares untyped) */
-    int own_rt = comp_method_in_chain(c, cid, name, NULL) >= 0;
+    int own_rt = call_target(c, id, cid, name, 0, NULL) >= 0;
     if (!own_rt &&
         (sp_streq(name, "is_a?") || sp_streq(name, "kind_of?") || sp_streq(name, "instance_of?") ||
          sp_streq(name, "respond_to?") || sp_streq(name, "==") || sp_streq(name, "!=") ||
@@ -1403,10 +1405,10 @@ int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out) {
     if (attr_reader_ty(c, cid, name, out)) {
       /* a def in a subclass overrides the reader for that subclass, as on
          self (infer_call): the call answers what either may */
-      int base_mi = comp_method_in_chain(c, cid, name, NULL);
+      int base_mi = call_target(c, id, cid, name, 0, NULL);
       for (int k = 0; k < c->nclasses; k++) {
         if (k == cid || !is_descendant(c, k, cid)) continue;
-        int kmi = comp_method_in_chain(c, k, name, NULL);
+        int kmi = call_target(c, id, k, name, 0, NULL);
         if (kmi < 0 || kmi == base_mi) continue;
         if (g_plan_check) an_user_call_record(c, id, kmi, UC_POLY, k);
         TyKind kr = (TyKind)c->scopes[kmi].ret;
@@ -1445,7 +1447,7 @@ int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out) {
          An argument not yet typed leaves the call to the method rule below,
          which the next round revisits. */
       int smi = argc == 1 && call_is_setter_assign(c->nt, id)
-                ? comp_method_in_chain(c, cid, name, NULL) : -1;
+                ? call_target(c, id, cid, name, 0, NULL) : -1;
       if (smi >= 0) {
         TyKind rhsk = infer_type(c, argv[0]);
         if (rhsk == TY_STRBUF) rhsk = TY_STRING;
@@ -1455,7 +1457,7 @@ int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out) {
         }
       }
     }
-    int mi = comp_method_in_chain(c, cid, name, NULL);
+    int mi = call_target(c, id, cid, name, 0, NULL);
     if (mi >= 0) {
       TyKind r = an_user_call(c, id, mi, UC_INST, cid);
       /* codegen's dispatch switches over every implementation in the
@@ -1542,11 +1544,11 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       ((argc == 1 && nt_kind(nt, argv[0]) != NK_SplatNode) ||
        argc == 0)) {
     int oci = comp_class_index(c, "Object");
-    int own = oci >= 0 && comp_method_in_chain(c, oci, name, NULL) >= 0;
+    int own = oci >= 0 && call_target(c, id, oci, name, 0, NULL) >= 0;
     for (int k = 0; k < c->nclasses && !own && !an_builtin_only_p(); k++)
       if (comp_poly_arm_defines_n(c, k, name, argc) ||
           (!c->classes[k].is_native_class && comp_reader_in_chain(c, k, name, NULL)) ||
-          comp_cmethod_in_chain(c, k, name, NULL) >= 0) own = 1;
+          call_target(c, id, k, name, CT_CMETHOD, NULL) >= 0) own = 1;
     if (!own) { *out = TY_ENUMERATOR; return 1; }
   }
   /* #name is a class name (a String) for a boxed Class and the method name (a
@@ -1587,7 +1589,7 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
     for (int k = 0; k < c->nclasses && !own && !an_builtin_only_p(); k++)
       if (comp_poly_arm_defines_n(c, k, name, argc) ||
           (!c->classes[k].is_native_class && comp_reader_in_chain(c, k, name, NULL)) ||
-          comp_cmethod_in_chain(c, k, name, NULL) >= 0) own = 1;
+          call_target(c, id, k, name, CT_CMETHOD, NULL) >= 0) own = 1;
     if (!own) { *out = TY_POLY; return 1; }
   }
   /* Numeric#arg / #angle / #phase (0, pi or a Complex's angle) and #rect /
@@ -1603,7 +1605,7 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
     for (int k = 0; k < c->nclasses && !own && !an_builtin_only_p(); k++)
       if (comp_poly_arm_defines_n(c, k, name, argc) ||
           (!c->classes[k].is_native_class && comp_reader_in_chain(c, k, name, NULL)) ||
-          comp_cmethod_in_chain(c, k, name, NULL) >= 0) own = 1;
+          call_target(c, id, k, name, CT_CMETHOD, NULL) >= 0) own = 1;
     if (!own) {
       *out = (is_rectangular_alias(name) || sp_streq(name, "polar")) ? TY_POLY_ARRAY : TY_POLY;
       return 1;
@@ -2023,9 +2025,7 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
         sp_streq(name, "saturday?"))
       { *out = TY_BOOL; return 1; }
     if (sp_streq(name, "zone") ||
-        ((sp_streq(name, "iso8601") || sp_streq(name, "xmlschema") || sp_streq(name, "httpdate") ||
-          sp_streq(name, "rfc2822") || sp_streq(name, "rfc822")) &&
-         sp_feature_enabled("time")))
+        (is_time_native_format(name) && sp_feature_enabled("time")))
       { *out = TY_STRING; return 1; }
     if (sp_streq(name, "asctime") || sp_streq(name, "ctime")) { *out = TY_STRING; return 1; }
     if (sp_streq(name, "subsec")) { *out = TY_POLY; return 1; }
@@ -2080,10 +2080,11 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       name[0] && name[strlen(name) - 1] != '?' && name[strlen(name) - 1] != '!' &&
       !poly_builtin_zero_arg_name(name))
     { *out = TY_POLY; return 1; }
-  /* ... and so are size, length, count and empty?, which an OpenStruct does
-     not define, where one can reach the receiver (cls_fact_may_ostruct): the
-     member, or nil, joins what the classes' methods and the containers
-     answer. Elsewhere they keep the Integer the others give. */
+  /* ... and so are the builtins' names an OpenStruct reads as a member
+     (ostruct_member_name: size, first, max, ...), where one can reach the
+     receiver (cls_fact_may_ostruct): the member, or nil, joins what the
+     classes' methods and the containers answer. Elsewhere they keep the
+     type the others give. */
   if (recv >= 0 && rt == TY_POLY && argc == 0 && nt_ref(nt, id, "block") < 0 &&
       ostruct_member_name(name) && cls_fact_may_ostruct(c, recv))
     { *out = TY_POLY; return 1; }

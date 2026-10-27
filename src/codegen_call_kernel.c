@@ -17,6 +17,30 @@
    consumer takes the oint) and otherwise reads it as the plain scalar through
    sp_oint_arg (TypeError for nil) -- the same wrap the dispatcher applies to an
    oint producer, applied here because this emitter decides the form. */
+/* The C text of a new empty value of kind t, the answer of Kernel#String,
+   Array or Hash for nil. Answers 0 for a kind that has none here. */
+static int kconv_empty_c(TyKind t, char *out, size_t n) {
+  if (t == TY_STRING) snprintf(out, n, "sp_str_frozen_empty");
+  else if (ty_is_ptr_array(t)) snprintf(out, n, "%s", ptr_array_new_c(t));
+  else if (t == TY_POLY_ARRAY) snprintf(out, n, "sp_PolyArray_new()");
+  else if (ty_is_array(t) && array_kind(t)) snprintf(out, n, "sp_%sArray_new()", array_kind(t));
+  else if (ty_is_hash(t) && ty_hash_cname(t)) snprintf(out, n, "sp_%sHash_new()", ty_hash_cname(t));
+  else return 0;
+  return 1;
+}
+
+/* Kernel#Array / Kernel#Hash of a typed container that may be nil (a NULL
+   pointer, such as a parameter whose default is nil): the container itself,
+   or a new empty one of its kind for nil. Answers 0 when it emits nothing. */
+static int emit_kconv_nil_empty(Compiler *c, int arg, Buf *b) {
+  Repr ar = repr_of(c, arg);
+  char nil_c[64];
+  if (ar.kind == RK_BOXED || !kconv_empty_c(ar.as_ty, nil_c, sizeof nil_c)) return 0;
+  /* (the repr's may_nil misses a nil-default parameter) */
+  emit_null_guarded_call(c, arg, ar.as_ty, "", nil_c, b);
+  return 1;
+}
+
 static void oint_open(Compiler *c, int id, TyKind t, Buf *b) { if (!node_is_oint(c, id)) buf_printf(b, "%s(", oint_arg(t)); }
 static void oint_close(Compiler *c, int id, Buf *b) { if (!node_is_oint(c, id)) buf_puts(b, ")"); }
 
@@ -64,15 +88,11 @@ static int emit_kconv_obj_nil(Compiler *c, int arg, int ci, const char *m1, cons
   if (mi < 0 || !repr_of(c, arg).may_nil) return 0;
   TyKind rt = (TyKind)c->scopes[mi].ret;
   char nil_c[64];
-  if (rt == TY_STRING) snprintf(nil_c, sizeof nil_c, "sp_str_frozen_empty");
-  else if (rt == TY_POLY_ARRAY) snprintf(nil_c, sizeof nil_c, "sp_PolyArray_new()");
-  else if (array_kind(rt)) snprintf(nil_c, sizeof nil_c, "sp_%sArray_new()", array_kind(rt));
-  else if (ty_is_hash(rt) && ty_hash_cname(rt)) snprintf(nil_c, sizeof nil_c, "sp_%sHash_new()", ty_hash_cname(rt));
-  else return 0;
+  if (!kconv_empty_c(rt, nil_c, sizeof nil_c)) return 0;
   const char *cn = c->classes[d].c_name;
   int t = ++g_tmp;
   buf_printf(b, "({ sp_%s *_t%d = (sp_%s *)(", cn, t, cn); emit_expr(c, arg, b);
-  buf_printf(b, "); SP_GC_ROOT(_t%d); _t%d ? sp_%s_%s(_t%d) : %s; })", t, t, cn, mc(m1), t, nil_c);
+  buf_printf(b, "); SP_GC_ROOT(_t%d); _t%d ? %s(_t%d) : %s; })", t, t, mc_method(c, &c->scopes[mi]), t, nil_c);
   return 1;
 }
 
@@ -195,7 +215,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       (is_freeze_family(name))) {
     Scope *s = comp_scope_of(c, id);
     int scid = s ? s->class_id : -1;
-    if (scid >= 0 && comp_method_in_chain(c, scid, name, NULL) < 0) {
+    if (scid >= 0 && call_target(c, id, scid, name, 0, NULL) < 0) {
       if (!s->is_cmethod && !c->classes[scid].is_value_type) {
         if (sp_streq(name, "freeze"))
           buf_printf(b, "((sp_%s *)sp_gc_freeze((void *)%s))",
@@ -271,7 +291,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
      `module_function; def format(...)` beside a sibling that calls it
      bare lost to Kernel#format (#4592). Same ownership test every
      other Kernel arm here makes. */
-  int kconv = (recv < 0 && comp_method_index(c, name) < 0 &&
+  int kconv = (recv < 0 && (nt_int(nt, id, "builtin_only", 0) || call_target(c, id, -1, name, CT_TOP, NULL) < 0) &&
                !bare_call_class_owned(c, id));
   if (!kconv && recv >= 0) {
     TyKind krt = comp_ntype(c, recv);
@@ -285,13 +305,13 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
         sp_streq(name, "Rational") || sp_streq(name, "Complex");
     if (krecv_ok && kname_ok) {
       if (ty_is_object(krt) &&
-          comp_method_in_chain(c, ty_object_class(krt), name, NULL) < 0)
+          call_target(c, id, ty_object_class(krt), name, 0, NULL) < 0)
         kconv = 1;
       /* a nil/poly/untyped receiver (e.g. an unassigned @object in specs)
          still reaches Kernel in CRuby; require that NO user class defines the
          name so a real method can never be shadowed. */
       else if ((krt == TY_NIL || krt == TY_POLY || krt == TY_UNKNOWN) &&
-               comp_method_index(c, name) < 0)
+               call_target(c, id, -1, name, CT_TOP, NULL) < 0)
         kconv = 1;
     }
   }
@@ -564,7 +584,9 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
          one-element array (matching the precise inference); everything else
          routes through the runtime coercion, which yields a poly array. */
       TyKind at = comp_ntype(c, av[0]);
-      if (ty_is_array(at)) emit_expr(c, av[0], b);
+      /* one that may be nil (a NULL pointer) answers a new [] of its kind */
+      if (ty_is_array(at) && emit_kconv_nil_empty(c, av[0], b)) {}
+      else if (ty_is_array(at)) emit_expr(c, av[0], b);
       else if (at == TY_RANGE) {
         /* Array(range) enumerates it */
         int tr6 = ++g_tmp;
@@ -609,9 +631,9 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
                 comp_method_in_chain(c, ty_object_class(at), "to_a", NULL) >= 0)) {
         int acid = ty_object_class(at), adef = acid;
         const char *anm = comp_method_in_chain(c, acid, "to_ary", NULL) >= 0 ? "to_ary" : "to_a";
-        (void)comp_method_in_chain(c, acid, anm, &adef);
+        int ami = comp_method_in_chain(c, acid, anm, &adef);
         if (expr_is_held_ref(c, av[0])) {
-          buf_printf(b, "sp_%s_%s((sp_%s *)(", c->classes[adef].c_name, mc(anm), c->classes[adef].c_name);
+          buf_printf(b, "%s((sp_%s *)(", mc_method(c, &c->scopes[ami]), c->classes[adef].c_name);
           emit_expr(c, av[0], b); buf_puts(b, "))");
         }
         else {
@@ -619,7 +641,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
           int tao = ++g_tmp;
           buf_printf(b, "({ sp_%s *_t%d = (sp_%s *)(", c->classes[adef].c_name, tao, c->classes[adef].c_name);
           emit_expr(c, av[0], b);
-          buf_printf(b, "); SP_GC_ROOT(_t%d); sp_%s_%s(_t%d); })", tao, c->classes[adef].c_name, mc(anm), tao);
+          buf_printf(b, "); SP_GC_ROOT(_t%d); %s(_t%d); })", tao, mc_method(c, &c->scopes[ami]), tao);
         }
       }
       else { buf_puts(b, "sp_kernel_array("); emit_boxed(c, av[0], b); buf_puts(b, ")"); }
@@ -643,7 +665,17 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
         int _hn = 0; nt_arr(nt, av[0], "elements", &_hn);
         if (_hn == 0) empty_arr_lit = 1;
       }
-      if (ty_is_hash(at)) { emit_expr(c, av[0], b); }
+      /* a Hash is itself; one that may be nil (a NULL pointer, such as a
+         parameter whose default is nil) answers a new {} of its kind */
+      if (ty_is_hash(at) && emit_kconv_nil_empty(c, av[0], b)) {}
+      else if (ty_is_hash(at)) { emit_expr(c, av[0], b); }
+      /* a Hash subclass instance is itself (kconv_hash_kind types it poly);
+         only a nil answers a new {} */
+      else if (ty_is_object(at) && comp_ary_is_hash(c, ty_object_class(at))) {
+        int th = ++g_tmp;
+        buf_printf(b, "({ sp_RbVal _t%d = ", th); emit_boxed(c, av[0], b);
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); _t%d.tag == SP_TAG_NIL ? sp_box_obj(sp_PolyPolyHash_new(), SP_BUILTIN_POLY_POLY_HASH) : _t%d; })", th, th, th);
+      }
       else if (ty_is_object(at) && emit_kconv_obj_nil(c, av[0], ty_object_class(at), "to_hash", NULL, b)) {}
       /* an object answers through its own #to_hash (#3721) */
       else if (ty_is_object(at) &&
@@ -651,7 +683,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
         int hci = ty_object_class(at), hdef = hci;
         int hmi = comp_method_in_chain(c, hci, "to_hash", &hdef);
         if (sp_streq(c->scopes[hmi].name, "to_hash")) buf_printf(b, "sp_%s_to_hash(", c->classes[hdef].c_name);
-        else { emit_method_cname(c, &c->scopes[hmi], b); buf_puts(b, "("); }
+        else { buf_puts(b, mc_method(c, &c->scopes[hmi])); buf_puts(b, "("); }
         buf_printf(b, "(sp_%s *)(", c->classes[hdef].c_name);
         emit_expr(c, av[0], b); buf_puts(b, "))");
       }
@@ -865,7 +897,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     Scope *xsc = comp_scope_of(c, id);
     int xcls = xsc ? xsc->class_id : -1;
     if (xcls >= 0 && (comp_reader_in_chain(c, xcls, name, NULL) ||
-                      comp_method_in_chain(c, xcls, name, NULL) >= 0)) {
+                      call_target(c, id, xcls, name, 0, NULL) >= 0)) {
       /* not Kernel#exit: leave it to the reader/method dispatch below */
     }
     else {

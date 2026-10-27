@@ -115,6 +115,140 @@ void an_nil_facts(Compiler *c);
    (analyze_const.c). Runs once the constants are registered, ahead of the
    folds that decide `defined?(K)`. */
 void an_const_presence(Compiler *c);
+/* The program's files under --load-model=graph (analyze_program.c, #9898):
+   their top-level scopes and roots, and what the model refuses for now. */
+void prog_file_scopes(Compiler *c);
+void prog_walk_files(Compiler *c);
+void prog_refuse_loads(Compiler *c);
+void prog_refuse_order(Compiler *c);
+int prog_is_top_scope(const Compiler *c, const Scope *s);
+int prog_is_root(const Compiler *c, int id);
+int prog_is_root_stmts(const Compiler *c, int st);
+int prog_root_stmts(const Compiler *c, int i);
+int prog_defines_only(const Compiler *c, int i);
+int prog_ordered_load(const Compiler *c, int id);
+void prog_top_stmts(const Compiler *c, void (*fn)(void *ud, int stmt), void *ud);
+int *prog_top_seq(const Compiler *c, int *n, int **file);
+void prog_visit_files(const Compiler *c, void (*fn)(void *ud, int node, int file), void *ud);
+/* Does node a run before node b, as the program runs its files
+   (analyze_program.c)? PROG_UNKNOWN where no order is known: a file loaded
+   only from a method, a condition or a block, against another file. */
+enum { PROG_BEFORE = -1, PROG_SAME = 0, PROG_AFTER = 1, PROG_UNKNOWN = 2 };
+int prog_order(Compiler *c, int a, int b);
+void prog_sort(Compiler *c, int *v, int n, const int *node_of);
+int prog_has_files(const Compiler *c);
+int prog_cmp(Compiler *c, int a, int b, int at, const char *reader);
+/* The load-phase record (analyze_elab.c, #9898): where each statement of
+   the load phase runs, as a point (region, seq). Region 0 is the load phase
+   the load graph places, each other region one file it does not place;
+   seq is the order statements run in. region -1: no point (a method body,
+   a lambda or a block run later). elab_cmp answers PROG_BEFORE / AFTER /
+   SAME, or PROG_UNKNOWN across regions or without a point. */
+typedef struct { int region, seq; } LoadPoint;
+typedef struct LoadRecord LoadRecord;
+LoadPoint elab_point_of(Compiler *c, int node);
+int elab_point_may(Compiler *c, int node);
+LoadPoint elab_point_from(Compiler *c, int node);
+LoadPoint elab_point_done(Compiler *c, int node);
+int elab_in_method_body(Compiler *c, int node);
+int elab_cmp(LoadPoint a, LoadPoint b);
+int elab_order(Compiler *c, int a, int b);
+void elab_top_place(Compiler *c, int node, int *file, int *rank);
+long long elab_sort_key(Compiler *c, int node);
+int elab_check_on(Compiler *c);
+void elab_check_order(Compiler *c, const char *reader, int a, int b, int now);
+void elab_check_sort(Compiler *c, const int *now, const int *rec, int n, const int *node_of);
+void elab_dump(Compiler *c, FILE *out);
+void elab_free(Compiler *c);
+extern int g_dump_load_record;   /* --dump-load-record */
+/* The load record's histories (analyze_elab.c), recorded by elab_program,
+   which takes the scope walk's place: a method's versions by (class,
+   singleton, name), with class -1 for main's (Object's) methods; a class's
+   bodies (LrOpen) and mixins; the writes of globals (named without `$`),
+   main's instance variables and constants. A version keeps its node and
+   reads its point from the map (elab_point_of), so a rebuilt map moves
+   none. The queries answer ELAB_YES / ELAB_NO / ELAB_UNKNOWN as of point
+   p: what a statement in another region, or one that may not run, did
+   before p is UNKNOWN. A p with no point (a method body) asks as of the
+   end of the load phase. */
+enum { ELAB_NO, ELAB_YES, ELAB_UNKNOWN };
+typedef enum { LR_DEF, LR_DEFINE_METHOD, LR_READER, LR_WRITER, LR_ALIAS, LR_COPY, LR_UNDEF, LR_REMOVE, LR_VIS, LR_WRITE, LR_OPAQUE } LrKind;
+typedef struct {
+  int node;
+  unsigned char kind;   /* LrKind */
+  unsigned char vis;    /* SP_VIS_*, for a method version; BVIS_*, for a bare visibility word */
+  unsigned char may;    /* recorded under a condition: may not have run */
+  unsigned char nil;    /* a write of nil */
+  const char *target;   /* an alias's or a copy's original name */
+} LrDef;
+typedef struct { int node, body; } LrOpen;
+typedef enum { LR_INCLUDE, LR_EXTEND, LR_PREPEND } LrMixKind;
+typedef struct { int node, kind, mod; } LrMixin;   /* kind: LrMixKind; mod: the module's class, -2 one the record does not know */
+typedef enum { ELAB_GVAR, ELAB_MAIN_IVAR, ELAB_CONST } ElabVar;
+void elab_program(Compiler *c);
+/* the version of cls's method `name` (singleton when sg) live at p, through
+   its ancestors as they stood at p; *out (when asked) the version found. A
+   hook (`inherited`, `included`, `method_added`, ...) is asked as the
+   singleton method it is: sg = 1. */
+int elab_method_at(Compiler *c, int cls, const char *name, int sg, LoadPoint p, const LrDef **out);
+/* the versions of method `name` the record holds, in every class's and
+   module's histories: defs, define_methods, attrs, aliases, module_function
+   copies, undefs and removes (not visibility changes) */
+int elab_method_versions(Compiler *c, const char *name);
+/* where the version recorded at def node `node` in cls's history of `name`
+   (singleton when sg) is replaced: ELAB_YES with *end the next version's
+   point; ELAB_NO when none follows, so it stays to the end; ELAB_UNKNOWN
+   when node is no version there or has no point, or the next version may
+   not run or runs in another region */
+int elab_version_end(Compiler *c, int cls, const char *name, int sg, int node, LoadPoint *end);
+/* the version of cls's method `name` (singleton when sg) live at every
+   point from p0 up to p1, as elab_method_at answers it: ELAB_UNKNOWN when
+   something recorded in between could change the answer (a version of
+   the name on cls's chain, a mixin of a module that may have it, code the
+   record cannot follow), or when p0 has no point or is not before p1 */
+int elab_method_over(Compiler *c, int cls, const char *name, int sg, LoadPoint p0, LoadPoint p1, const LrDef **out);
+/* can the program run code the record has not seen: a load whose target
+   it could not resolve (a computed path, a load the parse left)? */
+int elab_runs_unseen(Compiler *c);
+/* may a version of `name` run outside its interval: does the program name
+   the method by a Symbol or a String, name or make methods by computed
+   names, or run code the record has not seen? */
+int elab_version_captured(Compiler *c, const char *name);
+/* is module mod in the ancestors of cls (of its singleton when sg) at p? */
+int elab_mixed_at(Compiler *c, int cls, int sg, int mod, LoadPoint p);
+/* was a non-nil value written to the variable before p: a write that
+   completed before p, on every path? (a constant: one the top level writes,
+   Object's) */
+int elab_written_before(Compiler *c, ElabVar kind, const char *name, LoadPoint p);
+/* a write a pass adds after the record: stmt, a statement of the load
+   phase that writes a global or main's instance variable */
+void elab_record_write(Compiler *c, int stmt);
+/* does definition-form call node (attr_accessor, include, private :m, ...)
+   run code of the program's: a method of its own name, or a hook it fires
+   (included, method_added, ...) on the class receiving it, there? */
+int elab_form_runs(Compiler *c, int node);
+/* the bodies cls runs, in the order they run; *n their number */
+const LrOpen *elab_class_bodies(Compiler *c, int cls, int *n);
+/* the mixins run on cls (-1: main's, at a file's top level), one per
+   module, in the order they run: `include A, B` as `include B` then
+   `include A`, A nearest; *n their number */
+const LrMixin *elab_class_mixins(Compiler *c, int cls, int *n);
+/* what constant `name`, read at node, resolves to there: its lexical scopes'
+   own constants, innermost first, then the innermost one's ancestors and
+   Object's; *out the write or class definition found */
+int elab_const_at(Compiler *c, int node, const char *name, const LrDef **out);
+/* the visibility a `def` at node would take from its body: the last bare
+   `public` / `private` / `protected` / `module_function` before it in the
+   same body (BVIS_*), a class body's public and a file's top level's
+   private by default; 0 when not known */
+int elab_body_visibility_at(Compiler *c, int node);
+/* method `name`'s visibility on cls (singleton when sg) at p: SP_VIS_*,
+   -1 when not known or not defined */
+int elab_method_vis_at(Compiler *c, int cls, const char *name, int sg, LoadPoint p);
+/* did code the record cannot follow (a send, an eval of a String, a mixin
+   of a module it does not know, a computed method name, a method of the
+   program its body calls) run on cls before p? */
+int elab_opaque_before(Compiler *c, int cls, LoadPoint p);
 int nil_fact_node(const Compiler *c, int node);
 int nil_fact_ivar(const Compiler *c, int cid, const char *ivn);
 /* where a nil comes from: a node's (nil_fact_why), a slot's flag itself.
@@ -169,6 +303,7 @@ TyKind local_aset_key_type(Compiler *c, Scope *sc, const char *name, int *nwrite
 /* Run inference over the whole program: register locals, reach a fixpoint
    on their types, and fill the node type cache. */
 void analyze_program(Compiler *c);
+int lower_rows_check(const NodeTable *nt);   /* SPINEL_LOWER_ROWS_CHECK: the parse's lowering rows against the node's */
 /* The program as written gives no class a method named `nm`, beyond `defs`
    (0 or 1) defs of that name: read ahead of the desugars, by absence. */
 int an_prog_never_gives(const char *nm, int defs);
@@ -313,6 +448,7 @@ int enum_unrename(NodeTable *nt, int id);
 /* empty infer_type's memo of earlier queries' answers: the start or end of
    a pass whose writes are not all counted (#8852) */
 void infer_memo_boundary(void);
+void infer_memo_forget_since(unsigned long at);
 /* A pure read of the settled analysis (repr_of) asks its questions between
    an_pure_read_begin and an_pure_read_end. infer_type answers as usual but
    records nothing it derives: not the node-type cache, a poly call's
@@ -365,6 +501,8 @@ int masgn_const_elem_in_range(Compiler *c, int value, long long pos);
 int scalar_nil_only_call(Compiler *c, int id, TyKind rt);
 int nullable_scalar_nil_only_call(Compiler *c, int id);
 int nullable_int_elem_array(Compiler *c, int node);
+/* an Array literal with an element and no splat: it is never empty */
+int array_literal_filled(const NodeTable *nt, int v);
 int elem_nil_reach_expr(Compiler *c, int v);
 TyKind tuple_elem_read_type(Compiler *c, int node);
 TyKind tuple_elem_read_unboxed(Compiler *c, int node);

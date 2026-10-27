@@ -34,8 +34,7 @@ static void emit_exc_own_render_raw(Compiler *c, int id, int recv, int xcm, cons
   if (g_plan_check) ucall_observe(c, id, own, defc, 0);
   if (cv >= 0) view_pop(c, cv);
   if (expr_is_held_ref(c, recv)) {
-    buf_printf(b, "sp_%s_%s((sp_%s *)(", c->classes[defc].c_name,
-               mc(c->scopes[own].name), c->classes[defc].c_name);
+    buf_printf(b, "%s((sp_%s *)(", mc_method(c, &c->scopes[own]), c->classes[defc].c_name);
     emit_expr(c, recv, b); buf_puts(b, "))");
   }
   else {
@@ -44,8 +43,7 @@ static void emit_exc_own_render_raw(Compiler *c, int id, int recv, int xcm, cons
     int tex = ++g_tmp;
     buf_printf(b, "({ sp_%s *_t%d = (sp_%s *)(", c->classes[defc].c_name, tex, c->classes[defc].c_name);
     emit_expr(c, recv, b);
-    buf_printf(b, "); SP_GC_ROOT(_t%d); sp_%s_%s(_t%d); })", tex, c->classes[defc].c_name,
-               mc(c->scopes[own].name), tex);
+    buf_printf(b, "); SP_GC_ROOT(_t%d); %s(_t%d); })", tex, mc_method(c, &c->scopes[own]), tex);
   }
 }
 
@@ -67,7 +65,7 @@ static int emit_exception_object_accessor(Compiler *c, int id, int recv, const c
      every other exception the Object method, as CRuby's lookup reaches
      Object for them. Both answers ride boxed. The accessor alone raised
      NoMethodError for a RuntimeError. */
-  int xom = argc == 0 && nt_ref(nt, id, "block") < 0 ? cplan_exc_object_method(c, name) : -1;
+  int xom = argc == 0 && nt_ref(nt, id, "block") < 0 ? cplan_exc_object_method(c, id, name) : -1;
   if (xom >= 0) {
     int xt = ++g_tmp;
     const BuiltinOp *op = bop_find(TY_EXCEPTION, name, argc, 0);
@@ -76,7 +74,7 @@ static int emit_exception_object_accessor(Compiler *c, int id, int recv, const c
     Buf ab; memset(&ab, 0, sizeof ab);
     emit_builtin_op_text(c, id, recv, TY_EXCEPTION, name, xv, &ab);
     Buf ob; memset(&ob, 0, sizeof ob);
-    buf_printf(&ob, "sp_Object_%s(", mc(c->scopes[xom].name));
+    buf_printf(&ob, "%s(", mc_method(c, &c->scopes[xom]));
     emit_boxed_text(c, TY_EXCEPTION, xv, &ob);
     buf_puts(&ob, ")");
     Repr rp = repr_of(c, id);
@@ -196,7 +194,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     /* dup/clone copy the whole subclass struct via the GC header size, so
        mutating the copy's ivars leaves the original alone (#2772) */
     if ((is_copy_alias(name)) && argc == 0 &&
-        comp_method_in_chain(c, ty_object_class(comp_ntype(c, recv)), name, NULL) < 0) {
+        call_target(c, id, ty_object_class(comp_ntype(c, recv)), name, 0, NULL) < 0) {
       int xc2 = ty_object_class(repr_of(c, recv).as_ty);
       buf_printf(b, "((sp_%s *)sp_exc_%s((sp_Exception *)(", c->classes[xc2].c_name,
                  sp_streq(name, "clone") ? "clone" : "dup");
@@ -217,7 +215,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
        reader judges its class as it does a base-typed one's -- the call fell
        to the object dispatch, which knew none of them */
     if (argc == 0 && exc_gated_acc_fn(name) && nt_ref(nt, id, "block") < 0 &&
-        comp_method_in_chain(c, ty_object_class(comp_ntype(c, recv)), name, NULL) < 0 &&
+        call_target(c, id, ty_object_class(comp_ntype(c, recv)), name, 0, NULL) < 0 &&
         !comp_reader_in_chain(c, ty_object_class(comp_ntype(c, recv)), name, NULL)) {
       if (sp_streq(name, "reason") || sp_streq(name, "tag") || sp_streq(name, "key") ||
           sp_streq(name, "name"))
@@ -232,7 +230,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     /* An instance of a user exception subclass is an sp_Exception, so the
        message-taking #exception and the value #== read off it too; only the
        no-argument accessors had an arm and both were refused (#3870). */
-    if (argc == 1 && comp_method_in_chain(c, ty_object_class(comp_ntype(c, recv)), name, NULL) < 0 &&
+    if (argc == 1 && call_target(c, id, ty_object_class(comp_ntype(c, recv)), name, 0, NULL) < 0 &&
         (sp_streq(name, "exception") ||
          ((is_eq_or_eql(name)) && repr_of(c, argv[0]).exc))) {
       if (sp_streq(name, "exception")) { emit_exc_exception(c, recv, argv[0], b); return 1; }
@@ -247,7 +245,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     if ((argc == 0 || kw_only) && (sp_streq(name, "cause") || sp_streq(name, "backtrace") ||
                       sp_streq(name, "full_message") || sp_streq(name, "detailed_message") ||
                       sp_streq(name, "exception")) &&
-        comp_method_in_chain(c, ty_object_class(comp_ntype(c, recv)), name, NULL) < 0) {
+        call_target(c, id, ty_object_class(comp_ntype(c, recv)), name, 0, NULL) < 0) {
       if (sp_streq(name, "exception")) { emit_expr(c, recv, b); return 1; }
       if (sp_streq(name, "cause")) {
         buf_puts(b, "((sp_Exception *)("); emit_expr(c, recv, b); buf_puts(b, "))->cause");
@@ -314,7 +312,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
    * the legacy path already provided. */
   if (sp_streq(name, "backtrace") && argc == 0 && recv >= 0) {
     Repr rrr = repr_of(c, recv);
-    if (rrr.exc && comp_method_in_chain(c, ty_object_class(rrr.as_ty), name, NULL) < 0) {
+    if (rrr.exc && call_target(c, id, ty_object_class(rrr.as_ty), name, 0, NULL) < 0) {
       /* The base sp_Exception struct's backtrace field is the storage for
        * a builtin exception. A user exception subclass has a different
        * layout (the first 8 base fields, then its own ivars -- the base
@@ -351,7 +349,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
    * array. */
   if (argc == 1 && sp_streq(name, "set_backtrace") && recv >= 0) {
     Repr rrr = repr_of(c, recv);
-    if (rrr.exc && comp_method_in_chain(c, ty_object_class(rrr.as_ty), name, NULL) < 0) {
+    if (rrr.exc && call_target(c, id, ty_object_class(rrr.as_ty), name, 0, NULL) < 0) {
       int t = ++g_tmp;
       buf_printf(b, "({ sp_Exception *_t%d = (sp_Exception *)((void*)(", t);
       emit_expr(c, recv, b);
@@ -373,7 +371,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       repr_of(c, recv).as_ty == TY_POLY && nt_ref(nt, id, "block") < 0) {
     int pu = 0;
     for (int k = 0; k < c->nclasses && !pu; k++)
-      if (comp_method_in_class(c, k, name) >= 0) pu = 1;
+      if (call_target(c, id, k, name, CT_OWN, NULL) >= 0) pu = 1;
     if (!pu || g_poly_builtin_arm) {
       int t = ++g_tmp, ta = ++g_tmp;
       buf_printf(b, "({ sp_RbVal _t%d = ", t);
@@ -397,7 +395,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       repr_of(c, recv).as_ty == TY_POLY && nt_ref(nt, id, "block") < 0) {
     int pu = 0;
     for (int k = 0; k < c->nclasses && !pu; k++)
-      if (comp_method_in_class(c, k, name) >= 0 ||
+      if (call_target(c, id, k, name, CT_OWN, NULL) >= 0 ||
           comp_reader_in_chain(c, k, name, NULL)) pu = 1;
     if (!pu || g_poly_builtin_arm) {
       int t = ++g_tmp, ta = ++g_tmp;
@@ -558,7 +556,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     TyKind xrt = comp_ntype(c, recv);
     int xdef = -1, xob = ty_is_object(xrt) ? ty_object_class(xrt) : -1;
     int xhit = xob >= 0 && class_is_exc_subclass(c, xob)
-                 ? comp_method_in_chain(c, xob, name, &xdef) : -1;
+                 ? call_target(c, id, xob, name, 0, &xdef) : -1;
     if (xrt == TY_EXCEPTION ||
         (xob >= 0 && class_is_exc_subclass(c, xob) &&
          (xhit < 0 || (xdef >= 0 && is_builtin_reopen(c->classes[xdef].name))))) {
@@ -579,11 +577,11 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
         /* definers that answer different types meet as a boxed value */
         int xpoly = repr_of(c, id).kind == RK_BOXED;
         for (int q = 0; q < xn; q++) {
-          int mi = comp_method_in_chain(c, xr[q], name, NULL);
+          int mi = call_target(c, id, xr[q], name, 0, NULL);
           if (g_plan_check) ucall_observe(c, id, mi, xr[q], 1);   /* one definer's arm */
           if (q != xn - 1) buf_printf(b, "_xi%d == %d ? ", pk, q);
           Buf cb; memset(&cb, 0, sizeof cb);
-          buf_printf(&cb, "sp_%s_%s(_t%d", mc_reopen_cls(c, xr[q], name), mc(name), xt);
+          buf_printf(&cb, "%s(_t%d", mc_method(c, &c->scopes[mi]), xt);
           emit_args_filled(c, mi, nt_ref(nt, id, "arguments"), ", ", &cb);
           buf_puts(&cb, ")");
           TyKind mrt = (TyKind)c->scopes[mi].ret;

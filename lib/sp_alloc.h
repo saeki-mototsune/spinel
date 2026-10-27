@@ -874,6 +874,7 @@ SP_NORETURN SP_COLD void sp_nil_recv(const char *meth);          /* NoMethodErro
 SP_NORETURN SP_COLD void sp_raise_nil_to_int(int of_wording);    /* TypeError "no implicit conversion from nil to integer" (1: "of nil into Integer") */
 SP_NORETURN SP_COLD void sp_raise_nil_opnd(const char *cls);     /* TypeError "nil can't be coerced into <cls>" */
 SP_NORETURN SP_COLD void sp_raise_nil_cmp(int left_nil, const char *op, const char *cls);  /* ArgumentError "comparison of <cls> with nil failed" (left_nil: NoMethodError) */
+SP_NORETURN SP_COLD void sp_raise_float_cmp(sp_float with);          /* ArgumentError "comparison of Float with <with> failed" (a NaN) */
 /* The test of a call written under a name its function does not carry (size
    and count over a length, first over an element read): the receiver, or the
    NoMethodError for nil under that name. Passed through so the call reads it
@@ -985,6 +986,8 @@ static inline const char *sp_env_chk(const char *s, int value) {
    sp_exc_stage_recv lives in the generated TU; the ctor transfers the staged
    value onto the raised exception's xrecv slot. */
 void sp_exc_stage_recv(sp_RbVal v);
+/* LoadError#path, KeyError#key and the other carried values (sp_exc_apply_staged) */
+void sp_exc_stage_key(sp_RbVal v);
 /* the raise itself, in lib/sp_cold.c: the message carries the receiver's
    inspect, as CRuby's does ("can't modify frozen Array: [1, 2]") */
 SP_NORETURN void sp_raise_frozen_array_rv(sp_RbVal v);
@@ -1132,22 +1135,25 @@ static inline const char *sp_str_keep(const char *s) {
    as CRuby keys a frozen String. The copy can collect, which clears the
    write barrier's record of the hash: the caller issues its barrier again
    before storing. */
+/* The frozen key that copy is, made from `len` bytes at `data` (binary when
+   `bin`): a String key the Hash stores as is. The data must stay put while
+   it allocates. (one representation: the copy is a frozen handle's payload,
+   so the key's handle, sp_String_key_handle, is that one String each time) */
 #ifdef SP_ONE_STRING
-const char *sp_hash_key_handle_copy(const char *s);
+const char *sp_hash_key_from_bytes(const char *data, size_t len, int bin);
+#else
+static inline const char *sp_hash_key_from_bytes(const char *data, size_t len, int bin) {
+  char *r = (char *)sp_str_from_bytes(data, len);
+  if (bin) sp_str_mark_binary(r);
+  ((unsigned char *)r)[-1] = 0xfa;
+  return r;
+}
 #endif
 static inline const char *sp_hash_key_str(const char *s) {
   unsigned char m = ((const unsigned char *)s)[-1];
   if (m != 0xfe && m != 0xfc && m != 0xfd) return s;
   if (m == 0xfd && sp_str_fd_owner_frozen(s)) return s;
-#ifdef SP_ONE_STRING
-  /* (one representation: the copy is a frozen handle's payload, so the
-     key's handle, sp_String_key_handle, is that one String each time) */
-  return sp_hash_key_handle_copy(s);
-#endif
-  char *r = (char *)sp_str_from_bytes(s, sp_str_byte_len(s));
-  if (sp_str_is_binary(s)) sp_str_mark_binary(r);
-  ((unsigned char *)r)[-1] = 0xfa;
-  return r;
+  return sp_hash_key_from_bytes(s, sp_str_byte_len(s), sp_str_is_binary(s));
 }
 
 /* ---- relocated from spinel_rt.h: integer add/sub/mul overflow-check

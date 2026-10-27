@@ -221,7 +221,7 @@ void ucall_observe(Compiler *c, int id, int mi, int owner_ci, int add) {
     const PolyCand *pcs = pnm ? comp_poly_candidates(c, pnm, &npc) : NULL;
     for (int k = 0; k < npc; k++)
       if (pcs[k].mi == mi ||
-          (pcs[k].mi < 0 && comp_method_in_chain(c, pcs[k].cls, pnm, NULL) == mi)) {
+          (pcs[k].mi < 0 && call_target(c, id, pcs[k].cls, pnm, 0, NULL) == mi)) {
         o->flags |= UO_MATCH | UO_ARM; return;
       }
     const PolyCand *ccs = pnm ? comp_cmethod_candidates(c, pnm, &ncc) : NULL;
@@ -245,7 +245,7 @@ void ucall_observe(Compiler *c, int id, int mi, int owner_ci, int add) {
     if (yv < 0) ccls = g_ie_class_id >= 0 ? g_ie_class_id : g_emitting_class_id;
     else if (sp_yield_site_type(c, yv, &sk) && ty_is_object(sk)) ccls = ty_object_class(sk);
     const char *cnm = nt_str(c->nt, id, "name");
-    if (ccls >= 0 && cnm && comp_method_in_chain(c, ccls, cnm, NULL) == mi) {
+    if (ccls >= 0 && cnm && call_target(c, id, ccls, cnm, 0, NULL) == mi) {
       o->flags |= UO_MATCH; return;
     }
   }
@@ -809,8 +809,8 @@ int subtree_may_write_ivar(Compiler *c, int id, const char *iv, int cls, int dep
     int recv = nt_ref(nt, id, "receiver");
     const char *nm = nt_str(nt, id, "name");
     if (recv >= 0 && nt_kind(nt, recv) != NK_SelfNode) return 1;
-    int mi = cls >= 0 && nm && depth < 3 ? comp_method_in_chain(c, cls, nm, NULL) : -1;
-    if (mi < 0 || c->scopes[mi].def_node < 0 || dispatch_impl_count(c, cls, nm) != 1) return 1;
+    int mi = cls >= 0 && nm && depth < 3 ? call_target(c, id, cls, nm, 0, NULL) : -1;
+    if (mi < 0 || c->scopes[mi].def_node < 0 || dispatch_impl_count(c, id, cls, nm) != 1) return 1;
     if (subtree_may_write_ivar(c, nt_ref(nt, c->scopes[mi].def_node, "body"), iv, cls, depth + 1)) return 1;
   }
   int nr = nt_num_refs(nt, id);
@@ -906,6 +906,59 @@ const char *uid_new(void) {
   }
   uid_names[uid_n] = strdup(nm);
   return uid_names[uid_n++];
+}
+
+/* --incremental (codegen_internal.h). A setter rather than an environment
+   variable, so nothing of the flag reaches the environment of cc or of a
+   program run under -E. */
+int g_incremental = 0;
+void unit_incremental_set(int on) { g_incremental = on; }
+
+/* s with every byte outside [A-Za-z0-9_] made `_`, as unit_begin spells a
+   tag, cut to fit out: a pragma's words must lex as identifiers */
+static void unit_sanitize(const char *s, char *out, size_t sz) {
+  size_t o = 0;
+  for (; *s && o < sz - 1; s++) {
+    char ch = *s;
+    int ok = (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '_';
+    out[o++] = ok ? ch : '_';
+  }
+  out[o] = 0;
+}
+void unit_begin_in(Buf *dst, const char *tag, const char *group) {
+  unit_begin(tag);
+  if (!g_incremental) return;
+  char g[UNIT_TAG_MAX];
+  unit_sanitize(group, g, sizeof g);
+  /* g_unit_tag, not tag: a tag begun twice carries its _dN here too */
+  buf_printf(dst, "#pragma spinel unit %s %s\n", g_unit_tag, g);
+  buf_printf(&g_procs, "#pragma spinel unit %s %s\n", g_unit_tag, g);
+  buf_printf(&g_proc_protos, "#pragma spinel unit %s %s\n", g_unit_tag, g);
+}
+void unit_pragma_reset(Buf *dst) {
+  if (g_incremental) buf_puts(dst, "#pragma spinel unit prog prog\n");
+}
+/* A required file is spelled as the main file's directory joined with the
+   require path (`main.rb`, `sub/helper.rb`; or `/abs/main.rb`,
+   `/abs/sub/helper.rb`), so the path past that directory is the same
+   however the main file was named, and a unit's group with it. */
+void unit_file_key(const NodeTable *nt, int node, char *out, size_t sz) {
+  const char *path = nt_file_path(nt, (int)nt_int(nt, node, "node_file", 0));
+  if (!path || !*path) path = nt->source_file ? nt->source_file : "";
+  const char *main_file = nt->source_file ? nt->source_file : "";
+  const char *ms = strrchr(main_file, '/');
+  size_t dl = ms ? (size_t)(ms - main_file) + 1 : 0;
+  const char *rel = path;
+  if (!strncmp(path, main_file, dl)) rel = path + dl;
+  else if (strrchr(path, '/')) rel = strrchr(path, '/') + 1;
+  const char *base = strrchr(rel, '/') ? strrchr(rel, '/') + 1 : rel;
+  char stem[UNIT_TAG_MAX];
+  snprintf(stem, sizeof stem, "%s", base);
+  char *dot = strrchr(stem, '.');
+  if (dot && dot > stem) *dot = 0;
+  char clean[UNIT_TAG_MAX];
+  unit_sanitize(stem, clean, sizeof clean - 8);
+  snprintf(out, sz, "%s_%06x", clean, unit_fnv(rel) & 0xffffffu);
 }
 /* A rename-table slot keeps its Buf when the table is cut back below it,
    and the next entry there rewrites it (buf_setf), so a name of any length
@@ -2364,15 +2417,15 @@ static int ivs_body_may_observe(Compiler *c, int mi, int lvl) {
   c->pres_obs[mi] = r ? IVO_MAY : IVO_NO;
   return r;
 }
-/* ... a call named nm on self in a method of class cid: the method cid
-   resolves, or an override in a class below it, which a parent's
+/* ... call `call`, named nm, on self in a method of class cid: the method
+   cid resolves, or an override in a class below it, which a parent's
    initialize calling a hook runs for a subclass's instance */
-static int ivs_self_call_may_observe(Compiler *c, int cid, const char *nm, int lvl) {
-  int mi = comp_method_in_chain(c, cid, nm, NULL);
+static int ivs_self_call_may_observe(Compiler *c, int call, int cid, const char *nm, int lvl) {
+  int mi = call_target(c, call, cid, nm, 0, NULL);
   if (ivs_body_may_observe(c, mi, lvl)) return 1;
   for (int d = 0; d < c->nclasses; d++) {
     if (d == cid || !is_descendant(c, d, cid)) continue;
-    int md = comp_method_in_chain(c, d, nm, NULL);
+    int md = call_target(c, call, d, nm, 0, NULL);
     if (md >= 0 && md != mi && ivs_body_may_observe(c, md, lvl)) return 1;
   }
   return 0;
@@ -2400,7 +2453,7 @@ static int ivs_may_observe(Compiler *c, int n, int cid, int depth, int lvl) {
       const char *nm = nt_str(nt, n, "name");
       int r = nt_ref(nt, n, "receiver");
       if (!nm) return 1;
-      if ((r < 0 || nt_kind(nt, r) == NK_SelfNode) && ivs_self_call_may_observe(c, cid, nm, lvl)) return 1;
+      if ((r < 0 || nt_kind(nt, r) == NK_SelfNode) && ivs_self_call_may_observe(c, n, cid, nm, lvl)) return 1;
       if (is_ivar_presence_read(nm) && !is_inspect_print(nm)) return 1;
       if (is_inspect_print(nm) && r < 0) {
         int a = nt_ref(nt, n, "arguments"), ac = 0;
@@ -2642,6 +2695,77 @@ int an_calls_named_next(int id);
 static const NodeKind IVS_WK[] = { NK_InstanceVariableWriteNode, NK_InstanceVariableOrWriteNode,
                                    NK_InstanceVariableAndWriteNode, NK_InstanceVariableOperatorWriteNode,
                                    NK_InstanceVariableTargetNode };
+/* The nodes of some kinds by the name one of their fields holds: the ivar
+   writes by the ivar, the attribute op-writes by the reader and writer
+   names. ivs_base_kind asked every write of the program for each ivar of
+   each class, N*N for a class of N attributes (#10325). Nodes are only
+   appended, so the index takes the new ones as the table grows. */
+typedef struct { const char *name; int node, next; } KnEnt;
+typedef struct {
+  const NodeTable *nt;
+  int upto;              /* nodes below this are indexed */
+  int *head, cap;        /* hash of name -> first entry + 1 */
+  KnEnt *e; int n, ecap;
+} KnIdx;
+
+static unsigned kn_hash(const char *s) {
+  unsigned h = 2166136261u;
+  for (; *s; s++) h = (h ^ (unsigned char)*s) * 16777619u;
+  return h;
+}
+
+static int *kn_slot(KnIdx *x, const char *name) {
+  unsigned m = (unsigned)x->cap - 1;
+  for (unsigned k = kn_hash(name) & m; ; k = (k + 1) & m)
+    if (!x->head[k] || sp_streq(x->e[x->head[k] - 1].name, name)) return &x->head[k];
+}
+
+static void kn_add(KnIdx *x, const char *name, int node) {
+  if (!name) return;
+  if ((x->n + 1) * 2 > x->cap) {   /* grow, and put every entry back */
+    int cap = x->cap ? x->cap * 2 : 1024;
+    while ((x->n + 1) * 2 > cap) cap *= 2;
+    free(x->head);
+    x->head = calloc((size_t)cap, sizeof(int));
+    x->cap = cap;
+    for (int i = 0; i < x->n; i++) x->e[i].next = -1;
+    for (int i = 0; i < x->n; i++) {
+      int *h = kn_slot(x, x->e[i].name);
+      x->e[i].next = *h ? *h - 1 : -1;
+      *h = i + 1;
+    }
+  }
+  if (x->n == x->ecap) { x->ecap = x->ecap ? x->ecap * 2 : 1024; x->e = realloc(x->e, sizeof(KnEnt) * (size_t)x->ecap); }
+  int *h = kn_slot(x, name);
+  x->e[x->n] = (KnEnt){ name, node, *h ? *h - 1 : -1 };
+  *h = ++x->n;
+}
+
+/* Bring the index up to the table: kinds ks[0..nk), by field f (and f2) */
+static void kn_sync(KnIdx *x, const NodeTable *nt, const NodeKind *ks, int nk, const char *f, const char *f2) {
+  if (x->nt != nt || x->upto > nt->count) {
+    x->nt = nt; x->upto = 0; x->n = 0;
+    if (x->head) memset(x->head, 0, sizeof(int) * (size_t)x->cap);
+  }
+  for (int id = x->upto; id < nt->count; id++) {
+    NodeKind k = nt_kind(nt, id);
+    for (int q = 0; q < nk; q++)
+      if (k == ks[q]) { kn_add(x, nt_str(nt, id, f), id); if (f2) kn_add(x, nt_str(nt, id, f2), id); break; }
+  }
+  x->upto = nt->count;
+}
+
+/* The first entry of name, or -1; KnEnt.next walks the rest */
+static int kn_first(const KnIdx *x, const char *name) {
+  if (!x->cap || !name) return -1;
+  unsigned m = (unsigned)x->cap - 1;
+  for (unsigned k = kn_hash(name) & m; x->head[k]; k = (k + 1) & m)
+    if (sp_streq(x->e[x->head[k] - 1].name, name)) return x->head[k] - 1;
+  return -1;
+}
+
+static KnIdx g_ivs_writes, g_ivs_callwrites;
+
 static int ivs_reflect_only(Compiler *c, int cid, const char *ivn) {
   const NodeTable *nt = c->nt;
   int found = 0, scoped = 0;
@@ -2669,8 +2793,7 @@ static int ivs_reflect_only(Compiler *c, int cid, const char *ivn) {
   for (int k = 0; k < c->nclasses; k++) {
     if (scoped && !ivs_related(c, k, cid)) continue;
     ClassInfo *ci = &c->classes[k];
-    for (int j = 0; j < ci->nwriters; j++)
-      if (sp_streq(ci->writers[j], ivn + 1)) return 0;
+    if (comp_is_writer(ci, ivn + 1)) return 0;
     if (ci->is_struct) {
       int iv = comp_ivar_index(ci, ivn);
       if (iv >= 0 && iv < ci->nmembers) return 0;
@@ -2698,22 +2821,24 @@ static int ivs_base_kind(Compiler *c, int cid, const char *ivn) {
              ty_is_array(t) || ty_is_hash(t) || ty_is_object(t))) kind = 2;
   else {
     kind = 1;
-    const NodeKind *WK = IVS_WK;
-    for (int q = 0; q < 5 && kind == 1; q++)
-      NT_FOREACH_KIND(nt, WK[q], w) {
-        if (!sp_streq(nt_str(nt, w, "name"), ivn)) continue;
-        Scope *ws = comp_scope_of(c, w);
-        if (!ws || ws->is_cmethod) continue;
-        /* a write whose owner this cannot name (a top-level method, an
-           instance_eval body) may be this object's */
-        if (ws->class_id < 0 || !ivs_related(c, ws->class_id, cid)) {
-          if (ws->class_id < 0) { kind = 2; break; }
-          continue;
-        }
-        if (WK[q] == NK_InstanceVariableTargetNode) { kind = 2; break; }
-        if (WK[q] == NK_InstanceVariableOperatorWriteNode) continue;   /* answers a value or raises */
-        if (!ivs_never_nil(c, nt_ref(nt, w, "value"))) { kind = 2; break; }
+    /* (the answer is whether any write decides it: the order they are
+       met in does not matter) */
+    kn_sync(&g_ivs_writes, nt, IVS_WK, 5, "name", NULL);
+    for (int ei = kn_first(&g_ivs_writes, ivn); ei >= 0 && kind == 1; ei = g_ivs_writes.e[ei].next) {
+      int w = g_ivs_writes.e[ei].node;
+      NodeKind wk = nt_kind(nt, w);
+      Scope *ws = comp_scope_of(c, w);
+      if (!ws || ws->is_cmethod) continue;
+      /* a write whose owner this cannot name (a top-level method, an
+         instance_eval body) may be this object's */
+      if (ws->class_id < 0 || !ivs_related(c, ws->class_id, cid)) {
+        if (ws->class_id < 0) kind = 2;
+        continue;
       }
+      if (wk == NK_InstanceVariableTargetNode) { kind = 2; break; }
+      if (wk == NK_InstanceVariableOperatorWriteNode) continue;   /* answers a value or raises */
+      if (!ivs_never_nil(c, nt_ref(nt, w, "value"))) { kind = 2; break; }
+    }
     /* a write from outside: instance_variable_set, a writer, instance_eval.
        Asked per class and ivar, so the calls of those names, not every
        call: any one of them decides */
@@ -2742,11 +2867,10 @@ static int ivs_base_kind(Compiler *c, int cid, const char *ivn) {
     }
     /* `o.x ||= v` and its kin write through the writer too */
     static const NodeKind CW[] = { NK_CallOrWriteNode, NK_CallAndWriteNode, NK_CallOperatorWriteNode };
-    for (int q = 0; q < 3 && kind == 1; q++)
-      NT_FOREACH_KIND(nt, CW[q], u) {
-        const char *rn = nt_str(nt, u, "name"), *wn = nt_str(nt, u, "write_name");
-        if ((rn && (sp_streq(rn, ivn + 1) || sp_streq(rn, wr))) || (wn && sp_streq(wn, wr))) { kind = 2; break; }
-      }
+    if (kind == 1) {
+      kn_sync(&g_ivs_callwrites, nt, CW, 3, "name", "write_name");
+      if (kn_first(&g_ivs_callwrites, ivn + 1) >= 0 || kn_first(&g_ivs_callwrites, wr) >= 0) kind = 2;
+    }
   }
   if (kind == 2 && ivs_reflect_only(c, cid, ivn)) kind = 3;
   return kind;
@@ -4383,7 +4507,7 @@ int unsup_message(Compiler *c, int id, const char *what, int self_ci, char *msg,
            program's NoMethodError: that refusal is a spinel gap, and saying
            "undefined method 'send'" pointed at the wrong thing (#4850) */
         if (cid >= 0 && cid < c->nclasses && !c->classes[cid].is_native_class &&
-            comp_method_in_chain(c, cid, mname, NULL) < 0 &&
+            call_target(c, id, cid, mname, 0, NULL) < 0 &&
             !builtin_object_method_known(mname)) {
           const char *cn = class_ruby_name(c, cid);
           snprintf(msg, cap, "undefined method '%s' for an instance of %s (NoMethodError)", mname, cn ? cn : "Object");
@@ -5363,7 +5487,7 @@ static int plain_expr(Compiler *c, int n, int depth) {
       const char *cn = rk == TY_STRING ? "String" : ty_is_array(rk) ? "Array" : ty_is_hash(rk) ? "Hash" : NULL;
       if (!cn) return 0;
       int ci = comp_class_index(c, cn);
-      return ci < 0 || comp_method_in_chain(c, ci, nm, NULL) < 0;
+      return ci < 0 || call_target(c, n, ci, nm, 0, NULL) < 0;
     }
     /* under promote the receiver of an Integer ~ is boxed, and ~ still
        answers a number */
@@ -5371,7 +5495,7 @@ static int plain_expr(Compiler *c, int n, int depth) {
         !(g_promote_mode && argc == 0 && !strcmp(nm, "~") && comp_ntype(c, n) == TY_INT)) return 0;
     if (argc == 0 && (!strcmp(nm, "~") || !strcmp(nm, "-@") || !strcmp(nm, "+@"))) {
       int ci = comp_class_index(c, "Integer");
-      if (ci >= 0 && comp_method_in_chain(c, ci, nm, NULL) >= 0) return 0;
+      if (ci >= 0 && call_target(c, n, ci, nm, 0, NULL) >= 0) return 0;
       /* ~ of any word is a number; + and - hand a nil operand's word on
          (+nil raises in CRuby, and in a C int is the identity), so they
          are plain when their operand is */
@@ -5382,7 +5506,7 @@ static int plain_expr(Compiler *c, int n, int depth) {
     if (argc == 0 && (!strcmp(nm, "to_i") || !strcmp(nm, "to_int") || !strcmp(nm, "abs") ||
                       !strcmp(nm, "succ") || !strcmp(nm, "pred"))) {
       int ci = comp_class_index(c, "Integer");
-      if (ci >= 0 && comp_method_in_chain(c, ci, nm, NULL) >= 0) return 0;
+      if (ci >= 0 && call_target(c, n, ci, nm, 0, NULL) >= 0) return 0;
       return nm[0] == 't' ? plain_expr(c, recv, depth + 1) : 1;
     }
     return plain_int_op(c, nm) && argc == 1 && comp_ntype(c, argv[0]) == TY_INT;
@@ -5651,14 +5775,14 @@ int call_never_returns(Compiler *c, int id) {
   else {
     Repr rr = repr_of(c, recv);
     TyKind rt = rr.as_ty;
-    if (ty_is_object(rt)) mi = comp_method_in_chain(c, ty_object_class(rt), nm, NULL);
+    if (ty_is_object(rt)) mi = call_target(c, id, ty_object_class(rt), nm, 0, NULL);
     else if (rr.kind == RK_BOXED) {
       /* a boxed receiver dispatches to whichever class defines the name;
          every one of them must raise (a builtin answering it would have
          given the call that builtin's type, not void) */
       int any = 0;
       for (int ci = 0; ci < c->nclasses; ci++) {
-        int dc = -1, m = comp_method_in_chain(c, ci, nm, &dc);
+        int dc = -1, m = call_target(c, id, ci, nm, 0, &dc);
         if (m < 0 || dc != ci) continue;
         if (c->scopes[m].ret != TY_VOID) return 0;
         any = 1;
@@ -6639,14 +6763,23 @@ static int mc_name_fixed(const char *nm) {
   for (int i = 0; mc_fixed_names[i]; i++) if (sp_streq(nm, mc_fixed_names[i])) return 1;
   return 0;
 }
-static void mc_compose(Compiler *c, const Scope *s, char *out, size_t n) {
-  if (s->class_id < 0) snprintf(out, n, "sp_%s", mc_top(c, s->name));
+/* The C function of method s: sp_<c_name> for one given a C symbol of its
+   own, sp_<name> for a top-level method (mc_top), sp_<Class>_s_<name> for a
+   class method, sp_<stem>_<name> for an instance method (mc_reopen_cls's
+   stem). Every site that names a method's function spells it here, from
+   the method, never from a name: two methods of one name are two
+   functions. The answer stays valid for the next seven spellings. */
+const char *mc_method(Compiler *c, const Scope *s) {
+  char *out = c->mc_ring[c->mc_ring_next++ & 7], stem[256];
+  size_t n = sizeof c->mc_ring[0];
+  if (s->c_name) snprintf(out, n, "sp_%s", s->c_name);
+  else if (s->class_id < 0) snprintf(out, n, "sp_%s", mc_top(c, s->name));
   else if (s->is_cmethod) snprintf(out, n, "sp_%s_s_%s", c->classes[s->class_id].c_name, mc(s->name));
   else {
-    char stem[256];
     snprintf(stem, sizeof stem, "%s", mc_reopen_cls(c, s->class_id, s->name));
     snprintf(out, n, "sp_%s_%s", stem, mc(s->name));
   }
+  return out;
 }
 static int mc_same_method(const Scope *a, const Scope *b) {
   return a->class_id == b->class_id && a->is_cmethod == b->is_cmethod && sp_streq(a->name, b->name);
@@ -6665,7 +6798,7 @@ static int mc_find_clash(Compiler *c, int *first, int *later) {
     char nm[600];
     if (s) {
       if (!s->name || s->c_name) continue;
-      mc_compose(c, s, nm, sizeof nm);
+      snprintf(nm, sizeof nm, "%s", mc_method(c, s));
     } else {
       const ClassInfo *ci = &c->classes[(-i - 1) / 3];
       if (ci->is_builtin_const || !ci->c_name) continue;
@@ -7790,6 +7923,34 @@ void emit_slot_ctype(Compiler *c, const LocalVar *lv, Buf *b) {
    the same numbering in every struct of it and is no longer than it needs. */
 static int class_root(Compiler *c, int cid);
 static int ivar_has_nilbit_own(Compiler *c, int cid, int iv);
+/* The classes whose root is `root`, in index order, into *n: built for all
+   roots in one pass and kept while the classes and their parent links stay
+   (the count, comp_class_shape_gen), so a question asked of every ivar
+   walks its family, not every class of the program */
+static const int *class_family(Compiler *c, int root, int *n) {
+  static const NodeTable *m_nt = NULL;
+  static int m_ncls = -1;
+  static unsigned m_gen = 0;
+  static int *start = NULL, *members = NULL;
+  if (m_nt != c->nt || m_ncls != c->nclasses || m_gen != comp_class_shape_gen()) {
+    int nc = c->nclasses;
+    free(start); free(members);
+    start = calloc((size_t)nc + 2, sizeof *start);
+    members = malloc(sizeof *members * (size_t)(nc > 0 ? nc : 1));
+    int *roots = malloc(sizeof *roots * (size_t)(nc > 0 ? nc : 1));
+    if (!start || !members || !roots) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int k = 0; k < nc; k++) { roots[k] = class_root(c, k); start[roots[k] + 1]++; }
+    for (int r = 0; r < nc; r++) start[r + 1] += start[r];
+    int *fill = calloc((size_t)nc + 1, sizeof *fill);
+    if (!fill) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int k = 0; k < nc; k++) members[start[roots[k]] + fill[roots[k]]++] = k;
+    free(fill); free(roots);
+    m_nt = c->nt; m_ncls = nc; m_gen = comp_class_shape_gen();
+  }
+  if (root < 0 || root >= m_ncls) { *n = 0; return NULL; }
+  *n = start[root + 1] - start[root];
+  return members + start[root];
+}
 /* A field is one slot down its class family (a subclass lays the parent's
    fields first): a nil bit any class of the family keeps for it, every
    class keeps, so a parent's method that writes the field clears the bit a
@@ -7799,8 +7960,10 @@ int ivar_has_nilbit(Compiler *c, int cid, int iv) {
   ClassInfo *ci = &c->classes[cid];
   if (iv < 0 || iv >= ci->nivars || !oint_kind(ci->ivar_types[iv])) return 0;
   if (ivar_has_nilbit_own(c, cid, iv)) return 1;
-  int root = class_root(c, cid);
-  for (int k = 0; k < c->nclasses; k++) {
+  int root = class_root(c, cid), nfam = 0;
+  const int *fam = class_family(c, root, &nfam);
+  for (int fi = 0; fi < nfam; fi++) {
+    int k = fam[fi];
     if (k == cid) continue;
     ClassInfo *ck = &c->classes[k];
     if (iv >= ck->nivars || !ck->ivars[iv] || !ci->ivars[iv] || strcmp(ck->ivars[iv], ci->ivars[iv]) != 0) continue;
@@ -8023,11 +8186,12 @@ TyKind cg_natural_type(Compiler *c, int id) {
   return t;
 }
 /* Whether class `cid` or a class below it answers nil from its class method
-   `nm`: one with no value, or an Integer one that can be nil. */
-int cmethod_sibling_answers_nil(Compiler *c, int cid, const char *nm) {
+   `nm`, the name of call `call`: one with no value, or an Integer one that
+   can be nil. */
+int cmethod_sibling_answers_nil(Compiler *c, int call, int cid, const char *nm) {
   for (int k = 0; k < c->nclasses; k++) {
     if (k != cid && !is_descendant(c, k, cid)) continue;
-    int smi = comp_cmethod_in_chain(c, k, nm, NULL);
+    int smi = call_target(c, call, k, nm, CT_CMETHOD, NULL);
     if (smi < 0) continue;
     Scope *ss = &c->scopes[smi];
     if (method_is_void(ss) || ss->ret == TY_NIL || method_ret_is_oint(ss)) return 1;

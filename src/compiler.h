@@ -14,12 +14,12 @@
 #include "builtin_names.h"
 #include "builtin_ops.h"
 
-/* require-gate (defined in spinel_parse.c). sp_feature_enabled(name) is 1 when
-   feature `name` may be provided: always when the gate is off (g_require_gate
+/* strict-require (defined in spinel_parse.c). sp_feature_enabled(name) is 1 when
+   feature `name` may be provided: always when the gate is off (g_strict_require
    == 0), else only if `require "name"` appeared in the program. Used to gate
-   require-gated stdlib (stringio, io/console, ...) so they match CRuby's
+   require-only stdlib (stringio, io/console, ...) so they match CRuby's
    uninitialized-constant / NoMethodError when the require is absent. */
-extern int g_require_gate;
+extern int g_strict_require;
 /* the program may load a file the compiler did not read (spinel_parse.c,
    above resolve_requires): what that file would define is not in the node table */
 extern int g_require_unread;
@@ -64,6 +64,10 @@ extern unsigned long comp_ty_edits;
    none of them has moved since it was derived (analyze_infer.c). */
 extern unsigned long *comp_scope_ver, *comp_class_ver, comp_global_ver;
 extern int comp_scope_ver_cap, comp_class_ver_cap;
+/* (infer_write_types, while it re-derives the locals it reset) per scope, the
+   writes that moved it, and those that were a local's type or proc return:
+   NULL outside it */
+extern int *comp_touch_count, *comp_lv_touch_count;
 /* (diagnostics, SPINEL_IMEMO_WHY) the owner each edit moved, by edit count */
 #define COMP_TOUCH_LOG_CAP (1 << 22)
 extern int *comp_touch_log;
@@ -71,7 +75,7 @@ static inline void comp_touch_note(int key) { if (comp_touch_log) comp_touch_log
 static inline void comp_touch_global_r(int why) { (void)why; comp_global_ver = ++comp_ty_edits; comp_touch_note(-1); }
 static inline void comp_touch_global(void) { comp_touch_global_r(0); }
 static inline void comp_touch_scope(int idx) {
-  if (idx >= 0 && idx < comp_scope_ver_cap) { comp_scope_ver[idx] = ++comp_ty_edits; comp_touch_note(idx); }
+  if (idx >= 0 && idx < comp_scope_ver_cap) { comp_scope_ver[idx] = ++comp_ty_edits; comp_touch_note(idx); if (comp_touch_count) comp_touch_count[idx]++; }
   else comp_touch_global();
 }
 static inline void comp_touch_class(int idx) {
@@ -315,6 +319,9 @@ typedef struct {
                       slot has a presence flag (cst_NAME__set) that every
                       assignment sets and every read, defined?, const_defined?
                       and const_get tests (analyze_const.c) */
+  int gvar_seeded; /* (globals) gvar_seeded_before_read's answer, asked once:
+                      0 not asked yet, 1 a read can see its first nil, 2 a
+                      non-nil value is written before anything can read it */
   int or_written; /* some write to this local is a `||=`, which can run before
                      any definite assignment (`v ||= 5; v += 2`, a definite
                      write in one branch only, a block local reset each
@@ -418,11 +425,19 @@ typedef struct {
 } LocalVar;
 
 static inline TyKind lv_set_type(LocalVar *lv, TyKind t) {
-  if (lv->type != t) { *(TyKind *)&lv->type = t; comp_touch_scope(lv->owner); }
+  if (lv->type != t) {
+    *(TyKind *)&lv->type = t;
+    if (comp_lv_touch_count && lv->owner >= 0 && lv->owner < comp_scope_ver_cap) comp_lv_touch_count[lv->owner]++;
+    comp_touch_scope(lv->owner);
+  }
   return t;
 }
 static inline int lv_set_proc_ret(LocalVar *lv, int t) {
-  if (lv->proc_ret != t) { *(int *)&lv->proc_ret = t; comp_touch_scope(lv->owner); }
+  if (lv->proc_ret != t) {
+    *(int *)&lv->proc_ret = t;
+    if (comp_lv_touch_count && lv->owner >= 0 && lv->owner < comp_scope_ver_cap) comp_lv_touch_count[lv->owner]++;
+    comp_touch_scope(lv->owner);
+  }
   return t;
 }
 #define POLY_LIFT_APPENDED 1
@@ -666,6 +681,18 @@ static inline int scope_set_blk_ret(Scope *s, int t) {
   return t;
 }
 
+/* A hashed index over one of a class's append-only name lists (ivars,
+   readers, writers): the position of a name. It indexes the list as it
+   grows and starts over when the list is another (a rebuild) or shorter.
+   A class with N attributes asked N names took N*N compares (#10325). */
+typedef struct {
+  char *const *list;   /* the list it indexes */
+  int n;               /* how many of its entries are in the table */
+  int cap;             /* table slots, a power of two, or 0 */
+  int *slot;           /* entry index + 1, 0 empty */
+} NameIdx;
+int name_idx_find(NameIdx *x, char *const *list, int n, const char *name);
+
 typedef struct {
   char *name;          /* class name ("Point"); also drives semantic checks
                           (builtin reopen, name matching) and Ruby-visible output */
@@ -677,6 +704,7 @@ typedef struct {
   int def_node;        /* ClassNode id */
   int parent;          /* superclass index, or -1 */
   char **ivars;        /* instance variable names, incl. leading '@' */
+  NameIdx ivars_ix;    /* comp_ivar_index's index of ivars */
   SP_TY_FIELD TyKind *ivar_types;
   unsigned char *ivar_str_shared; /* (#3227) the slot is a shared-mutable
                                      string handle (sp_String *): survives
@@ -769,8 +797,10 @@ typedef struct {
   int ncvars, ccvars;
   char **readers;      /* attr reader method names (no '@') */
   int nreaders, creaders;
+  NameIdx readers_ix;
   char **writers;      /* attr writer base names (no '@', no '=') */
   int nwriters, cwriters;
+  NameIdx writers_ix;
   char **undefs;       /* method names removed via `undef` */
   int nundefs, cundefs;
   /* Method visibility: parallel name/kind arrays (SP_VIS_*). Covers both
@@ -959,6 +989,7 @@ typedef struct {
      superclass bring. */
   char **own_readers;
   int nown_readers, cown_readers;
+  NameIdx own_readers_ix;
   /* Modules this class extends (class indices), in the order register_extends
      meets them: its singleton's ancestors, which `Klass.is_a?(M)` asks. */
   int *extended_mods;
@@ -1029,21 +1060,21 @@ typedef struct { char *path; int module, extension, allocator; } CextClass;
    FfiFunc, arg/ret specs are the spinel type language ("any"/"string"/"int"/
    "float"/"bool"; ret also takes "cstring" -- a borrowed C string, e.g. a
    static buffer, that the call site dups onto the GC heap) and csym is the
-   C symbol to call. feat is the require-gate feature name from the module's
+   C symbol to call. feat is the strict-require feature name from the module's
    `native_lib`, or "" (always available). */
 typedef struct {
   char *mod;       /* module name */
   char *name;      /* Ruby method name */
   char *ret;       /* return type spec */
   char *csym;      /* C symbol to emit */
-  char *feat;      /* require-gate feature name, or "" */
+  char *feat;      /* strict-require feature name, or "" */
   char **args;     /* arg type specs (malloc'd) */
   int nargs;
 } NativeFunc;
 
 /* One `native_obj` declaration: a carried C object the package links on demand
    (only when its module's feature is required). path is root-relative, e.g.
-   "packages/json/sp_json.o"; feat is the require-gate feature or "". */
+   "packages/json/sp_json.o"; feat is the strict-require feature or "". */
 typedef struct { char *mod; char *path; char *feat; } NativeObj;
 
 /* One `native_method`/`native_new` binding on a native class. class_id indexes
@@ -1228,6 +1259,17 @@ typedef struct {
 
   Scope *scopes;    /* scope[0] = top level */
   int nscopes, cscopes;
+  /* the top-level scope of each file root (nt_root), by graph id: 0 for the
+     entry (analyze_program.c) */
+  int *file_scope;
+  /* the load-phase record: where each statement of the load phase runs
+     (analyze_elab.c), rebuilt when the node table changes */
+  struct LoadRecord *lrec;
+  /* the program names or makes a method by something its text does not
+     spell -- a send, a method object or a define_method of a computed name,
+     text it evaluates -- as an_note_written_names reads the tree; a module
+     mixed in and a file loaded are not counted (elab_runs_unseen) */
+  int names_by_value;
 
   /* the subset of `classes` synthesized for an anonymous Struct/Data, so
      resolving one does not walk every user class; invalidated wherever
@@ -1425,13 +1467,18 @@ typedef struct {
   int *blk_body_map;
   int blk_body_map_n;
   struct ReprChannelCheck *repr_channel_check; /* --repr-check return-channel shadow */
-  /* node id -> the number a name invented from the node carries
-     (comp_node_ord), bit 0 set for a builtin's. Extended over appended
-     nodes, never refilled. A builtin node counts within its base, the
-     builtin def (or top-level statement) it was spliced in: per base id, the
-     count so far and the text it is named by. */
+  /* parsed node id -> the number a name invented from the node carries
+     (comp_node_tag), bit 0 set for one counted in a base, and that base. A
+     node counts within its base, the def, class or module it is in or the
+     builtin def it was spliced in: per base id, the count so far and the
+     text it is named by. */
   int *node_ord, *node_base;
-  int node_ord_n, node_ord_cap, node_ord_prog, node_ord_parsed;
+  int node_ord_prog, node_ord_parsed;
+  /* appended node id - node_ord_parsed -> its tag (appended_tag), and how
+     many were named with no origin */
+  char **node_tag; int node_tag_cap, node_tag_lost;
+  /* the texts of the last eight parsed nodes named, and the next to reuse */
+  char node_tag_ring[8][64]; int node_tag_next;
   int *bi_base_cnt;
   char **bi_base_key;
   int bi_base_cap;
@@ -1449,6 +1496,8 @@ typedef struct {
   int *cg_parent;
   int cg_parent_n;
   unsigned cg_parent_ver;
+  /* the last eight method C names mc_method spelled, and the next to reuse */
+  char mc_ring[8][600]; int mc_ring_next;
   /* --share-strings: does the program make an Enumerator over a String
      handle (str_enum_h_made): 0 not asked yet, 1 no, 2 yes */
   unsigned char str_enum_h;
@@ -1569,7 +1618,6 @@ int name_list_has(char **list, int n, const char *name);
 
 /* Resize per-node arrays (ntype/nscope) after the node table grew. */
 void comp_grow_node_arrays(Compiler *c);
-int comp_node_ord(Compiler *c, int id, int *builtin);
 void comp_node_pbases(Compiler *c);   /* the parsed program nodes' bases (comp_new) */
 const char *comp_node_tag(Compiler *c, int id);
 
@@ -1672,12 +1720,28 @@ int    comp_method_index(Compiler *c, const char *name); /* -1 if none */
    top-level def (a private Object method, and so last in every ancestry) only
    as the fallback. See analyze_util.c. */
 int    comp_self_call_mi(Compiler *c, int call_node, const char *name);
-int    comp_class_self_inst_mi(Compiler *c, int class_id, const char *name);
+int    comp_class_self_inst_mi(Compiler *c, int call, int class_id, const char *name);
+/* A definition the compiler keeps for its own lowering, which CRuby has no
+   method for: a builtins/ file's own helper (is_builtin_helper_name, the
+   enumerator's `__enumw_map`) or a desugar's per-call-site copy (marked
+   `private_helper` where it is made, enumerable.rb's `__enum_count__0`).
+   Only the lowering that names it calls it. comp_method_is_private_helper:
+   the method an instance of class `cid` (-1: main) reaches by `m` is one;
+   comp_name_is_private_helper: every scope of the name is one, for a list
+   that knows no receiver. */
+int    comp_scope_is_private_helper(Compiler *c, int si);
+int    comp_method_is_private_helper(Compiler *c, int cid, const char *m);
+int    comp_name_is_private_helper(Compiler *c, const char *m);
+/* Does no Ruby method answer to `m`, though a scope has the name: a
+   private helper or another synthesized method? Reflection and a computed
+   send's dispatch leave it out. See analyze_util.c. */
+int    name_is_synth_method(Compiler *c, const char *m);
 int    comp_cbody_call_mi(Compiler *c, int call_node, const char *name);
-/* Does the receiver of a retargeted `recv.send(:name)` (send_blind) answer
-   name itself -- an instance's method or reader, a class constant's class
-   method -- rather than through a top-level def? srt is recv's type. */
-int    send_blind_recv_owns(Compiler *c, int recv, TyKind srt, const char *name);
+/* Does the receiver of a retargeted `recv.send(:name)` (send_blind), call
+   `call`, answer name itself -- an instance's method or reader, a class
+   constant's class method -- rather than through a top-level def? srt is
+   recv's type. */
+int    send_blind_recv_owns(Compiler *c, int call, int recv, TyKind srt, const char *name);
 /* What a dispatch of `name` over cid's subtree answers: r (the base method
    base_mi's answer) unified with the return of every other implementation a
    class in the subtree runs -- its chain's, so a module a subclass includes
@@ -1783,6 +1847,9 @@ int        comp_class_index(Compiler *c, const char *name);   /* -1 if none */
 int        comp_any_computed_ivar_set(Compiler *c);
 int        comp_is_wellknown_const(const char *cn);
 int        const_name_resolves_top_level(Compiler *c, const char *cn);
+/* Does constant segment node seg (a ConstantReadNode or a path's segment)
+   resolve: by its name, as a builtin, or as a program class the path names? */
+int        const_seg_resolves(Compiler *c, int seg);
 /* The class Ruby sees for `ci`: a synthesized singleton subclass reports its
    parent (CRuby hides the singleton class), every other class reports itself. */
 static inline int singleton_visible_ci(Compiler *c, int ci) {
@@ -1797,7 +1864,7 @@ int cls_user_display_mi(Compiler *c, int k, const char *nm);
 int prog_has_cls_user_display(Compiler *c, const char *nm);
 int        class_var_static_ci(Compiler *c, int node);  /* local holding one class const */
 int        class_recv_static_ci(Compiler *c, int node); /* constant or local naming one class */
-int        class_recv_user_cmethod(Compiler *c, int node, const char *name); /* its user class method of the name */
+int        class_recv_user_cmethod(Compiler *c, int call, int node, const char *name); /* call's user class method of the name on it */
 int        dynamic_new_may_reach(Compiler *c, int call_id, int cid);  /* k.new can build cid */
 int        anon_struct_ci_for_value(Compiler *c, int val);  /* k = Struct.new(...) value node */
 const char *struct_call_dup_member(Compiler *c, int callnode);  /* first duplicate member sym name, or NULL */
@@ -1826,6 +1893,7 @@ int lazy_stage_name(const char *nm);
 /* Zero-argument builtin methods the poly dispatch serves with a real arm --
    the `require "ostruct"` member-read catch-all must not swallow them. */
 int poly_builtin_zero_arg_name(const char *m);
+int ostruct_member_name(const char *n);
 int chain_is_lazy_valued(Compiler *c, int node);      /* CallNode chain evaluating to a Lazy */
 int poly_str_iter_enum(Compiler *c, int id);        /* boxed String iterator answers an Enumerator (analyze_infer_recv.c) */
 int poly_io_codepoint_enum(Compiler *c, int id);   /* boxed each_codepoint takes the IO arm (analyze_infer_recv.c) */
@@ -1856,7 +1924,7 @@ const char *time_strict_parser_call(Compiler *c, int id);
    enclosing_class resolves bare/`self.` receivers (the class whose body we are
    directly in); ignored for constant receivers. */
 int        class_eval_reopen_class(Compiler *c, int id, int enclosing_class);
-int        class_reopen_cmethod(Compiler *c, int recv, const char *name); /* a method the program adds to Class */
+int        class_reopen_cmethod(Compiler *c, int call, int recv, const char *name); /* a method the program adds to Class, run by `call` (-1: no call) */
 int        comp_ivar_index(ClassInfo *ci, const char *name);  /* -1 if none */
 int        comp_ivar_intern(ClassInfo *ci, const char *name); /* find or add; returns index */
 int        comp_member_intern(ClassInfo *ci, const char *name);
@@ -1958,7 +2026,10 @@ int        send_family_program_owns(Compiler *c, const char *name);
    the kind of the Array the chain's instances embed, TY_POLY_ARRAY once the
    inference is past its optimistic stage with no element seen. */
 int        comp_ary_root(Compiler *c, int cid);
+int        comp_implicit_to_ary_mi(Compiler *c, int cid);
 int        comp_ty_ary_root(Compiler *c, TyKind t);
+int        comp_ty_arysub_array(Compiler *c, TyKind t);
+const int *comp_strsub_own_classes(Compiler *c, const char *name, int *n);
 TyKind     comp_ary_kind(Compiler *c, int cid);
 /* Whether Array answers a call named n on an instance of Array subclass
    cid: no method, reader or writer of the class chain takes the name, it
@@ -2034,6 +2105,9 @@ int cls_fact_may_ostruct(Compiler *c, int node);
 /* the fact's own index for recv's set, which names the set uniquely: 0 or -1
    for every class (nothing to filter by) */
 int cls_fact_idx(Compiler *c, int node);
+/* Does node's fact say nothing of its classes: every class, or the closed
+   world's value from anywhere (every class, Class object and builtin)? */
+int cls_fact_unbounded(Compiler *c, int node);
 /* What else than an object of a class of the program's node's value can be,
    as the same walk follows it (analyze_cls.c), in a program that calls
    compare_by_identity: CK_UNSAFE a value whose identity is not CRuby's here

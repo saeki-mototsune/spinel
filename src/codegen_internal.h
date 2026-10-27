@@ -212,6 +212,7 @@ int masgn_flat_targets(const NodeTable *nt, int node, int *out, int n);
 int masgn_value_changes(Compiler *c, int mw, int part);
 /* ...the handle of a boxed receiver's call whose arms answer a String, or of a sequence ending in one */
 void emit_poly_arms_handle(Compiler *c, int base, Buf *b);
+void emit_poly_user_handle(Compiler *c, int v, Buf *b);
 int strbuf_call_picks_up(Compiler *c, int id);
 /* ...the call run, then the handle its target published, or a new one
    over its bytes (codegen_call.c) */
@@ -1046,6 +1047,24 @@ extern char g_unit_tag[UNIT_TAG_MAX];
 void unit_reset(void);                 /* at the start of a program's emission */
 void unit_begin(const char *tag);      /* a top-level function starts */
 const char *uid_new(void);             /* "<tag>_<n>": a file-scope symbol's name */
+/* --incremental: codegen marks where each unit's text starts with a
+   `#pragma spinel unit <tag> <group>` line, which survives cc -E for the
+   splitter to cut at, and gives up inline hints (a hinted method's callers
+   in another unit would need its body). Without the flag nothing is
+   written, so the default C stays byte for byte what it was. */
+extern int g_incremental;
+void unit_incremental_set(int on);     /* the driver, before codegen_program */
+/* unit_begin(tag) and, with g_incremental, the unit pragma written to dst
+   and to g_procs / g_proc_protos (a method's procs, fiber bodies, capture
+   structs and kinds tables are spliced ahead of every body and would
+   otherwise lose their unit). group: the key the units are packed by. */
+void unit_begin_in(Buf *dst, const char *tag, const char *group);
+/* `#pragma spinel unit prog prog`: ends a tagged region, with g_incremental */
+void unit_pragma_reset(Buf *dst);
+/* The group key of the file node stands in: its base name and a hash of its
+   path relative to the main file's directory, so the key does not change
+   with how the main file was spelled on the command line. */
+void unit_file_key(const NodeTable *nt, int node, char *out, size_t sz);
 extern int g_needs_proc_poly_argslot; /* any proc takes a TY_POLY arg via _sp_proc_poly_args */
 
 /* Static regex-literal table: each distinct (source, flags) pair compiles once
@@ -1226,12 +1245,13 @@ int scope_def_line(Compiler *c, Scope *s);
 const char *scope_def_file(Compiler *c, Scope *s);
 int display_method_scope(Compiler *c, int cid, int want_inspect, int *defcls);
 const char *obj_str_cname(Compiler *c, int cid, int want_inspect);
-const char *obj_str_mname(Compiler *c, int cid, int want_inspect);
+const char *obj_str_fn(Compiler *c, int cid, int want_inspect);
 const char *obj_str_blockarg(Compiler *c, int cid, int want_inspect);
 int obj_str_ret_poly(Compiler *c, int cid, int want_inspect);
 const char *exc_builtin_parent(Compiler *c, int ci);
-void emit_method_cname(Compiler *c, Scope *s, Buf *b);
 void emit_stmt(Compiler *c, int id, Buf *b, int indent);
+/* A require under --load-model=graph, as its value (codegen_stmt.c) */
+void emit_load_call(Compiler *c, int id, Buf *b);
 /* The statements of parentheses v that run before `tail`, the node their
    value comes from (through nested parentheses: vp_one's answer), into b,
    in order (codegen_fold.c). */
@@ -1667,7 +1687,7 @@ void nd_stamp(int id, int kind);
 extern char **g_ndtarget;
 extern int g_ndtarget_cap;
 void nd_callee(Compiler *c, int id, int mi, int owner_ci, int add);
-int cmethod_sibling_answers_nil(Compiler *c, int cid, const char *nm);
+int cmethod_sibling_answers_nil(Compiler *c, int call, int cid, const char *nm);
 /* --plan-check: a user-method binding codegen made at node id (nd_callee
    reports every one; the splices and super, which stamp nothing for
    --emit-types, call it directly), and the end-of-compile report comparing
@@ -1950,6 +1970,8 @@ void mc_resolve_clashes(Compiler *c);   /* before any method is named (codegen_p
    function of that exact spelling (sp_String_length). */
 const char *mc_reopen_cls(Compiler *c, int class_id, const char *mname);
 const char *mc_top(Compiler *c, const char *name);
+/* A method's C function, spelled from the method (codegen_util.c) */
+const char *mc_method(Compiler *c, const Scope *s);
 /* The scope a #deconstruct call on class cid runs, through an alias
    (codegen.c) */
 int comp_deconstruct_method(Compiler *c, int cid, int *defcls);
@@ -2082,6 +2104,7 @@ void emit_obj_upcast_prefix(Compiler *c, TyKind slot, TyKind val, Buf *b);
 /* Value node for keyword `name` inside a KeywordHashNode, the last when the
    key is written twice, or -1. */
 int kwh_lookup(const NodeTable *nt, int kwh, const char *kname);
+int json_parse_ostruct_opts(Compiler *c, int kwh);   /* codegen_call_class.c */
 const char *encode_opt_unread(const NodeTable *nt, const int *els, int en);   /* codegen_call_recv.c */
 int enc_const_path(const NodeTable *nt, int n);   /* Encoding::X (codegen_call_recv.c) */
 int callee_has_kwarg(Compiler *c, Scope *m, const char *name);
@@ -2147,6 +2170,11 @@ void emit_args_off_self(Compiler *c, const int *argv, int argc, Buf *b);
    binding reading the values -- a block's defaults -- and so can change what
    a read among them reads. */
 void emit_args_before(Compiler *c, const int *argv, int argc, const int *after, int nafter, Buf *b);
+/* emit_args_before, where a Range literal argument runs its ends into
+   temps and stays a literal over them, for the arms that read a literal's
+   ends: a `&.` call's value arm. Elsewhere the Range is built where it
+   stands, ahead of later arguments and an arity raise. */
+void emit_args_before_range_ends(Compiler *c, const int *argv, int argc, Buf *b);
 /* Would a binding that renders each value in place, in parameter order,
    read one out of CRuby's order? Two values with an effect -- one's setup
    drains ahead of the other's bind -- or a read a later value, or a node of
@@ -2302,6 +2330,8 @@ void arysub_box_id(Compiler *c, TyKind t, Buf *b);   /* the cls_id an object's b
 int program_has_arysub(Compiler *c);
 int program_has_strsub(Compiler *c);   /* a class of the program that subclasses String */
 void emit_obj_switch_key(Compiler *c, int tv, Buf *b);   /* codegen.c: a class switch's key, Array subclasses included */
+void emit_poly_recv_deref(Compiler *c, int recv, const char *name, Buf *b);   /* codegen.c: a dispatch receiver read as its String value, a String subclass with its own method kept */
+void emit_poly_str_guard(Compiler *c, int tv, const char *name, Buf *b);   /* codegen.c: the String arm's test, a String subclass with its own method left to the switch */
 void emit_arysub_machinery(Compiler *c, Buf *b);
 /* a call Array answers on an Array subclass instance (#7449), as an
    expression or as a statement (codegen_call_array.c) */
@@ -2311,10 +2341,10 @@ const char *class_builtin_superclass_name(Compiler *c, int i);   /* codegen.c */
 int class_builtin_parent(Compiler *c, int cid);      /* codegen.c */
 int class_includes_module_named(Compiler *c, int cid, const char *mod_name);
 int class_isa_user(Compiler *c, int k, int cid, const char *cn);  /* codegen_call.c */
-int dispatch_impl_count(Compiler *c, int cid, const char *name);
+int dispatch_impl_count(Compiler *c, int call, int cid, const char *name);
 /* do a dispatch switch's arms bind the call's arguments differently (each
    arm then lays them out itself)? the plan's CP_PER_ARM */
-int dispatch_arms_disagree(Compiler *c, int cid, const char *name);
+int dispatch_arms_disagree(Compiler *c, int call, int cid, const char *name);
 /* Do `given` positionals not fit method `m`? Answers 1 with CRuby's
    ArgumentError message in `msg`; 0 when they fit, or when the method's
    arity is not judged (arity_unjudged). The one count rule of the direct
@@ -2693,6 +2723,7 @@ int  poly_redispatch_kind(Compiler *c, int id, const char *name, int argc);
 int  face_arg_misfit(Compiler *c, unsigned kind, int arg);
 int  face_args_misfit(Compiler *c, int id, unsigned kind);
 int poly_name_user_claimed(Compiler *c, const char *name, int argc);
+int poly_ostruct_member_call(Compiler *c, int id, const char *name, int recv, int argc);
 int poly_name_cmethod_claimed(Compiler *c, const char *name);
 /* Does CRuby take argc arguments to cls#name, by the instance arity table
    (sp_builtin_arity_spec_tbl)? 1 for a name the table has no row for. */
@@ -2713,6 +2744,7 @@ int brk_wrapper_surely_light(Compiler *c, int id);
 void emit_array_splice(Compiler *c, int id, int recv, TyKind rt, int start_node, int len_node, int range_node, int rhs_node, Buf *b);
 int aset_range_held(Compiler *c, TyKind rt, const int *argv);
 void emit_aset_range_held(Compiler *c, int id, int recv, TyKind rt, const int *argv, Buf *b);
+int frange_index_view(Compiler *c, int id);
 int splice_to_ary_mi(Compiler *c, TyKind rhs_ty);
 TyKind emit_splice_to_ary_src(Compiler *c, int id, int rhs_node, TyKind rhs_ty, int mi, int ta, Buf *b, Buf *out);
 void emit_index_op_write(Compiler *c, int id, Buf *b, int indent);
@@ -2917,10 +2949,9 @@ void emit_local_ctype(Compiler *c, TyKind ty, int vol, Buf *b);
 void emit_scope_decls(Compiler *c, Scope *s, Buf *b);
 void emit_scope_decls_ends(Compiler *c, Scope *s, Buf *b, size_t *ends);
 int method_is_void(Scope *s);
-void emit_method_cname(Compiler *c, Scope *s, Buf *b);
 void emit_poly_iter_obj_normalize(Compiler *c, int tv, Buf *b);
-void emit_poly_iter_obj_reject(Compiler *c, int tv, const char *name, Buf *b);
-void emit_poly_iter_obj_reject_as(Compiler *c, int tv, const char *name, const char *shown, Buf *b);
+void emit_poly_iter_obj_reject(Compiler *c, int call, int tv, const char *name, Buf *b);
+void emit_poly_iter_obj_reject_as(Compiler *c, int call, int tv, const char *name, const char *shown, Buf *b);
 void emit_method_signature(Compiler *c, Scope *s, Buf *b);
 void emit_method(Compiler *c, Scope *s, Buf *b);
 int is_nested_block(const char *ty);
@@ -2947,7 +2978,6 @@ int is_exc_name(const char *n);
 int class_is_exc_subclass(Compiler *c, int ci);
 const char *class_ruby_name(Compiler *c, int ci);
 const char *obj_str_cname(Compiler *c, int cid, int want_inspect);
-const char *obj_str_mname(Compiler *c, int cid, int want_inspect);
 const char *obj_str_blockarg(Compiler *c, int cid, int want_inspect);
 int obj_str_ret_poly(Compiler *c, int cid, int want_inspect);
 const char *exc_builtin_parent(Compiler *c, int ci);
@@ -3044,7 +3074,7 @@ int cvar_is_oint(Compiler *c, int cid, int idx);
    oint, a nil literal, a conditional with a nullable arm. */
 int node_is_oint(Compiler *c, int node);
 /* `obj.class.name`'s dispatch switch has an arm answering an sp_oint / sp_ofloat */
-int class_switch_arm_oint(Compiler *c, int cid, const char *name);
+int class_switch_arm_oint(Compiler *c, int call, int cid, const char *name);
 /* node_is_oint, or a leaf read of a slot that is an oint (a nil guard may
    have narrowed the read): emit_oint_expr yields the bare oint for it, and
    its box reads the nil */

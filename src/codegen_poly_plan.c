@@ -396,8 +396,7 @@ static void emit_poly_user_arm0(Compiler *c, int id, const char *name, TyKind re
     else { snprintf(_dself, sizeof _dself, "(sp_%s *)_t%d.v.p", _dcn, tv); _dstruct = 1; }
     /* a yielding candidate is called through its proc-form clone (#3399) */
     int pfi9 = scope_proc_form_of(c, mi);
-    buf_printf(&cb, "sp_%s_%s(%s", mc_reopen_cls(c, defcls, c->scopes[mi].name),
-               mc(pfi9 >= 0 ? c->scopes[pfi9].name : c->scopes[mi].name), _dself);
+    buf_printf(&cb, "%s(%s", mc_method(c, &c->scopes[pfi9 >= 0 ? pfi9 : mi]), _dself);
     /* a default reading an earlier parameter (Thor's `say(message = "", color =
        nil, force_new_line = (message.to_s !~ ...))`) reads it through a local
        each argument binds to first, as the other arms do (ctor_arm_arg) */
@@ -867,12 +866,12 @@ static int poly_user_arm_n_replay(Compiler *c, int id, const char *name, const P
     return fit;
   }
   int defcls = -1;
-  int mi = comp_method_in_chain(c, k, name, &defcls);
+  int mi = call_target(c, id, k, name, 0, &defcls);
   /* an exception class with no method of its own for the name takes
      the builtin reopening's (`class Exception; def brief`) */
   if (mi < 0 && any_exc_reopen(c) && (class_has_exc_name(c, k) || class_is_exc_subclass(c, k))) {
     int xd = exc_arm_definer(c, k, name);
-    if (xd >= 0) { defcls = xd; mi = comp_method_in_chain(c, xd, name, NULL); }
+    if (xd >= 0) { defcls = xd; mi = call_target(c, id, xd, name, 0, NULL); }
   }
   if (mi < 0) return 0;
   /* the same widened arity a candidate was counted with above: a
@@ -1072,8 +1071,7 @@ static int poly_user_arm_n_replay(Compiler *c, int id, const char *name, const P
      sibling arm at the default dispatch has spelled this out since
      #2441; without it the C build stopped the moment ceaea73e gave
      `join` a user arm and that user's class was a value type. */
-  buf_printf(&cb, "sp_%s_%s(%s%s", mc_reopen_cls(c, defcls, c->scopes[mi].name),
-             mc(pfi8 >= 0 ? c->scopes[pfi8].name : c->scopes[mi].name),
+  buf_printf(&cb, "%s(%s%s", mc_method(c, &c->scopes[pfi8 >= 0 ? pfi8 : mi]),
              c->classes[defcls].is_value_type ? "*" : "", selfpbuf2);
   const char *saved_self = g_self;
   /* the defaults below read ivars off this receiver, whatever the
@@ -1229,8 +1227,7 @@ static void emit_poly_user_arm_n_plan(Compiler *c, int id, const char *name, con
      sibling arm at the default dispatch has spelled this out since
      #2441; without it the C build stopped the moment ceaea73e gave
      `join` a user arm and that user's class was a value type. */
-  buf_printf(&cb, "sp_%s_%s(%s%s", mc_reopen_cls(c, defcls, c->scopes[mi].name),
-             mc(pfi8 >= 0 ? c->scopes[pfi8].name : c->scopes[mi].name),
+  buf_printf(&cb, "%s(%s%s", mc_method(c, &c->scopes[pfi8 >= 0 ? pfi8 : mi]),
              c->classes[defcls].is_value_type ? "*" : "", selfpbuf2);
   const char *saved_self = g_self;
   /* the defaults below read ivars off this receiver, whatever the
@@ -1273,9 +1270,10 @@ static void emit_poly_user_arm_n_plan(Compiler *c, int id, const char *name, con
   if (g_plan_check) pa_observe(pf8 ? PA_PROC_FORM : PA_USER, k, mi, mret8, pconv);
 }
 
-/* Class k's arm in a poly dispatch with arguments, decided as the dispatch
-   did, without writing or noting anything: --plan-check's assertion. */
-static int poly_user_arm_n_decide(Compiler *c, const char *name, const PolyUserArgs *U, int k, PolyArm *a) {
+/* Class k's arm in call id's poly dispatch with arguments, decided as the
+   dispatch did, without writing or noting anything: --plan-check's
+   assertion. */
+static int poly_user_arm_n_decide(Compiler *c, int id, const char *name, const PolyUserArgs *U, int k, PolyArm *a) {
   memset(a, 0, sizeof *a);
   a->key = (short)k; a->mi = -1; a->def = -1; a->vty = TY_UNKNOWN; a->conv = PC_SAME;
   TyKind ret = U->ret;
@@ -1316,10 +1314,10 @@ static int poly_user_arm_n_decide(Compiler *c, const char *name, const PolyUserA
     return 1;
   }
   int defcls = -1;
-  int mi = comp_method_in_chain(c, k, name, &defcls);
+  int mi = call_target(c, id, k, name, 0, &defcls);
   if (mi < 0 && any_exc_reopen(c) && (class_has_exc_name(c, k) || class_is_exc_subclass(c, k))) {
     int xd = exc_arm_definer(c, k, name);
-    if (xd >= 0) { defcls = xd; mi = comp_method_in_chain(c, xd, name, NULL); }
+    if (xd >= 0) { defcls = xd; mi = call_target(c, id, xd, name, 0, NULL); }
   }
   if (mi < 0) return 0;
   char arm_exp[600];
@@ -1378,7 +1376,7 @@ void emit_poly_user_arms_n(Compiler *c, int id, const char *name, const PolyUser
     int nold = 0;
     for (int k = 0; k < c->nclasses; k++)
       if (!cls_fact_excludes(c, nt_ref(c->nt, id, "receiver"), k) &&   /* as the plan leaves them out (#8530) */
-          poly_user_arm_n_decide(c, name, U, k, &old[nold])) nold++;
+          poly_user_arm_n_decide(c, id, name, U, k, &old[nold])) nold++;
     poly_arms_assert(c, id, "poly-user-n", arms, n, old, nold);
     free(old);
     cplan_served("poly-user-n");
@@ -1536,10 +1534,10 @@ void poly_specials0(Compiler *c, int id, const char *name, PolySpecials0 *s) {
                    !is_lengthlike && !is_empty && !is_pred &&
                    !poly_builtin_zero_arg_name(name) &&
                    sp_feature_required("ostruct");
-  /* size, length, count and empty?, which an OpenStruct does not define,
-     read its member too where one can reach the receiver
-     (cls_fact_may_ostruct): the containers' arms read 0 for it, and a
-     class's own size took the rest */
+  /* the builtins' names an OpenStruct reads as a member
+     (ostruct_member_name: size, first, max, ...) read it too where one can
+     reach the receiver (cls_fact_may_ostruct): the containers' arms read 0,
+     nil or NoMethodError for it, and a class's own method took the rest */
   if (argc == 0 && nt_ref(nt, id, "block") < 0 && ostruct_member_name(name) &&
       cls_fact_may_ostruct(c, nt_ref(nt, id, "receiver")))
     is_ostruct = 1;
@@ -1580,7 +1578,7 @@ void poly_specials0(Compiler *c, int id, const char *name, PolySpecials0 *s) {
        all and became the terminal raise. */
     int is_call = comp_poly_arm_defines(c, k, name) ||
                   (nt_ref(nt, id, "block") >= 0 && c->classes[k].is_native_class &&
-                   comp_method_in_chain(c, k, name, NULL) >= 0);
+                   call_target(c, id, k, name, 0, NULL) >= 0);
     if (is_call || (!c->classes[k].is_native_class && comp_reader_in_chain(c, k, name, NULL))) ncand++;
     /* The root decision counts only the arms the switch below will carry:
        a class no reachable code constructs gets no arm, so it must not
@@ -1616,7 +1614,7 @@ int emit_poly_obj_default0(Compiler *c, int id, const char *name, int argc, TyKi
   { int obj_cls = comp_class_index(c, "Object");
     if (obj_cls >= 0) {
       int obj_def = -1;
-      int obj_mi = comp_method_in_chain(c, obj_cls, name, &obj_def);
+      int obj_mi = call_target(c, id, obj_cls, name, 0, &obj_def);
       /* A yielding one is reached with the call's block through its proc
          form: a user class's chain does not name Object, so without this
          arm an instance of it took the raise (#5101) */
@@ -1632,7 +1630,7 @@ int emit_poly_obj_default0(Compiler *c, int id, const char *name, int argc, TyKi
       }
       if (obj_pf >= 0) {
         Buf oc; memset(&oc, 0, sizeof oc);
-        emit_method_cname(c, &c->scopes[obj_pf], &oc);
+        buf_puts(&oc, mc_method(c, &c->scopes[obj_pf]));
         buf_printf(&oc, "(_t%d, _t%d)", tv, (*blk_tmp0));
         TyKind pr = (TyKind)c->scopes[obj_pf].ret;
         buf_puts(b, " default: ");
@@ -1661,7 +1659,7 @@ int emit_poly_obj_default0(Compiler *c, int id, const char *name, int argc, TyKi
         /* an optional parameter takes its default, spelled with the
            boxed receiver as self */
         Buf ob; memset(&ob, 0, sizeof ob);
-        buf_printf(&ob, "sp_Object_%s(_t%d", mc(c->scopes[obj_mi].name), tv);
+        buf_printf(&ob, "%s(_t%d", mc_method(c, &c->scopes[obj_mi]), tv);
         { const char *saved_self = g_self;
           char oselfbuf[32]; snprintf(oselfbuf, sizeof oselfbuf, "_t%d", tv);
           g_self = oselfbuf;
@@ -1707,13 +1705,13 @@ int emit_poly_obj_default0(Compiler *c, int id, const char *name, int argc, TyKi
   return done;
 }
 
-/* Does class 0 take a `case 0:` arm in a poly dispatch of name with argc
-   arguments (kwh, pos_argc, splat_a as poly_arm_count reads them)? The
-   dispatch key then keeps a non-object value off it. */
-int poly_key_cls0(Compiler *c, const char *name, int argc, int kwh, int pos_argc, int splat_a) {
+/* Does class 0 take a `case 0:` arm in call `call`'s poly dispatch of name
+   with argc arguments (kwh, pos_argc, splat_a as poly_arm_count reads
+   them)? The dispatch key then keeps a non-object value off it. */
+int poly_key_cls0(Compiler *c, int call, const char *name, int argc, int kwh, int pos_argc, int splat_a) {
   if (argc == 0) {
     int cls0_d = -1, cls0_rd = -1;
-    int cls0_mi = c->nclasses > 0 ? comp_method_in_chain(c, 0, name, &cls0_d) : -1;
+    int cls0_mi = c->nclasses > 0 ? call_target(c, call, 0, name, 0, &cls0_d) : -1;
     char cls0_exp[600];
     return ((cls0_mi >= 0 && c->scopes[cls0_mi].nrequired == 0) ||
             /* an arm refusing no arguments raises, and is a `case 0:` all the same */
@@ -1722,7 +1720,7 @@ int poly_key_cls0(Compiler *c, const char *name, int argc, int kwh, int pos_argc
            c->nclasses > 0 &&
            (c->classes[0].instantiated || class_is_prim_reopen(c, 0));
   }
-  int cls0_mi2 = c->nclasses > 0 ? comp_method_in_chain(c, 0, name, NULL) : -1;
+  int cls0_mi2 = c->nclasses > 0 ? call_target(c, call, 0, name, 0, NULL) : -1;
   int cls0_cand2 = cls0_mi2 >= 0 &&
                    (c->classes[0].instantiated || class_is_prim_reopen(c, 0));
   if (cls0_cand2) {
@@ -1742,15 +1740,16 @@ int poly_key_cls0(Compiler *c, const char *name, int argc, int kwh, int pos_argc
 }
 
 /* Does a primitive reopening (String, Integer, ...) take an arm in that
-   dispatch? The key then maps a runtime tag to its class (#4219). */
-int poly_key_prim(Compiler *c, const char *name, int argc, int kwh, int pos_argc, int splat_a) {
+   dispatch of call `call`? The key then maps a runtime tag to its class
+   (#4219). */
+int poly_key_prim(Compiler *c, int call, const char *name, int argc, int kwh, int pos_argc, int splat_a) {
   /* a reopening without the method takes no arm: the name's candidates */
   int npc = 0;
   const PolyCand *pcs = comp_poly_candidates(c, name, &npc);
   for (int ki = 0; ki < npc; ki++) {
     int k = pcs[ki].cls;
     if (!class_is_prim_reopen(c, k)) continue;
-    int pmi = comp_method_in_chain(c, k, name, NULL);
+    int pmi = call_target(c, call, k, name, 0, NULL);
     char pexp[600];
     if (pmi < 0) continue;
     int fits = argc == 0 ? c->scopes[pmi].nrequired == 0 || poly_arm_refuses_none(c, pmi, pexp, sizeof pexp)
@@ -1789,7 +1788,7 @@ void emit_poly_prearms0(Compiler *c, int id, const char *name, const PolySpecial
          takes its arm below instead, and so does a Symbol, which has no
          count of its own. */
       int sci = comp_class_index(c, "String"), dc = -1;
-      int str_own = sci >= 0 && comp_method_in_chain(c, sci, name, &dc) >= 0 && dc == sci;
+      int str_own = sci >= 0 && call_target(c, id, sci, name, 0, &dc) >= 0 && dc == sci;
       if (!str_own)
         buf_printf(b, "if (_t%d.tag == SP_TAG_STR) _t%d = %ssp_poly_count(_t%d)%s; else ", tv, tr, bopen, tv, bclose);
     } else {
@@ -2080,7 +2079,7 @@ void emit_poly_prearms0(Compiler *c, int id, const char *name, const PolySpecial
      receiver too, the way it now does for a concrete one. */
   int str_reopen_owns = 0;
   { int sci = comp_class_index(c, "String");
-    if (sci >= 0 && comp_method_in_chain(c, sci, name, NULL) >= 0) str_reopen_owns = 1; }
+    if (sci >= 0 && call_target(c, id, sci, name, 0, NULL) >= 0) str_reopen_owns = 1; }
   if (argc == 0 && !str_reopen_owns) {
     const BuiltinZeroOp *str_op = bop_zero_find(TY_STRING, name);
     /* The result has to fit the slot the dispatch assigns into. */
@@ -2946,7 +2945,7 @@ void poly_specials_n(Compiler *c, int id, const char *name, int argc, const int 
       }
       continue;
     }
-    int mi = comp_method_in_chain(c, k, name, NULL);
+    int mi = call_target(c, id, k, name, 0, NULL);
     /* Include if call supplies all required params (pad defaults / truncate
        extras). A collapsed keyword hash funds one of them: without counting
        it, `r.where(cond: 1)` reaching `def where(condition)` looked like an
@@ -3142,7 +3141,7 @@ void emit_poly_str_aset_prearm(Compiler *c, int recv, const PolySpecialsN *ps, c
   Buf st; memset(&st, 0, sizeof st);
   char rv[24]; snprintf(rv, sizeof rv, "_t%d", tv);
   str_aset_store_text(c, T, rv, &st);
-  buf_printf(b, "if (_t%d.tag == SP_TAG_STR || sp_poly_is_strbuf(_t%d)) { ", tv, tv);
+  buf_puts(b, "if ("); emit_poly_str_guard(c, tv, "[]=", b); buf_puts(b, ") { ");
   /* a plain String that is written back is stored after the dispatch */
   if (str_aset_writes_back(c, recv)) buf_printf(b, "if (_t%d.tag != SP_TAG_STR) ", tv);
   buf_printf(b, "%s;", st.p);
@@ -3350,19 +3349,21 @@ void emit_poly_prearms_n(Compiler *c, const char *name, const PolySpecialsN *ps,
      and a boxed one is checked at run time. */
   if (is_include) if (g_plan_check) pa_observe(PA_BUILTIN, PA_KEY_BUILTIN + PB_INCLUDE, -1, TY_UNKNOWN, PC_SAME);
   if (is_include && !sp_streq(name, "include?"))
-    buf_printf(b, "if (_t%d.tag == SP_TAG_STR || sp_poly_is_strbuf(_t%d)) sp_raise_poly_nomethod(\"%s\", _t%d);\nelse ",
-               tv, tv, name, tv);
+    { buf_puts(b, "if ("); emit_poly_str_guard(c, tv, name, b);
+      buf_printf(b, ") sp_raise_poly_nomethod(\"%s\", _t%d);\nelse ", name, tv); }
   else if (is_include && comp_ntype(c, argv[0]) == TY_STRING)
-    buf_printf(b, "if (_t%d.tag == SP_TAG_STR || sp_poly_is_strbuf(_t%d)) { _t%d = %ssp_str_include(sp_poly_recv_s(_t%d, \"include?\"), %s)%s; }\nelse ",
-               tv, tv, tr, ret == TY_POLY ? "sp_box_bool(" : "", tv, strarg,
-               ret == TY_POLY ? ")" : "");
+    { buf_puts(b, "if ("); emit_poly_str_guard(c, tv, name, b);
+      buf_printf(b, ") { _t%d = %ssp_str_include(sp_poly_recv_s(_t%d, \"include?\"), %s)%s; }\nelse ",
+                 tr, ret == TY_POLY ? "sp_box_bool(" : "", tv, strarg,
+                 ret == TY_POLY ? ")" : ""); }
   else if (is_include) {
     Buf ab6; memset(&ab6, 0, sizeof ab6);
     char tn6[24]; snprintf(tn6, sizeof tn6, "_t%d", atmp[0]);
     if (atmp_ty[0] == TY_POLY) buf_puts(&ab6, tn6);
     else emit_boxed_text(c, atmp_ty[0], tn6, &ab6);
-    buf_printf(b, "if (_t%d.tag == SP_TAG_STR || sp_poly_is_strbuf(_t%d)) { _t%d = %ssp_str_include(sp_poly_recv_s(_t%d, \"include?\"), sp_poly_arg_str_chk(sp_poly_strbuf_deref(%s)))%s; }\nelse ",
-               tv, tv, tr, ret == TY_POLY ? "sp_box_bool(" : "", tv, ab6.p ? ab6.p : "sp_box_nil()",
+    buf_puts(b, "if ("); emit_poly_str_guard(c, tv, name, b);
+    buf_printf(b, ") { _t%d = %ssp_str_include(sp_poly_recv_s(_t%d, \"include?\"), sp_poly_arg_str_chk(sp_poly_strbuf_deref(%s)))%s; }\nelse ",
+               tr, ret == TY_POLY ? "sp_box_bool(" : "", tv, ab6.p ? ab6.p : "sp_box_nil()",
                ret == TY_POLY ? ")" : "");
     free(ab6.p);
   }
@@ -3541,7 +3542,7 @@ int emit_poly_prearms_n_blk(Compiler *c, int id, const char *name, const PolySpe
       for (int k = 0; k < c->nclasses && blk_tmp2 < 0; k++) {
         /* a reopened builtin (Hash, Array, String...) is never `.new`ed, and its arm runs too */
         if (!c->classes[k].instantiated && !class_is_prim_reopen(c, k)) continue;
-        int mi2 = comp_method_in_chain(c, k, name, NULL);
+        int mi2 = call_target(c, id, k, name, 0, NULL);
         if (mi2 < 0) continue;
         Scope *cm2 = &c->scopes[mi2];
         if (!scope_has_callable_symbol(c, mi2) && !scope_needs_proc_form(c, mi2)) continue;

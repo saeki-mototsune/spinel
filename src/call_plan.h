@@ -79,6 +79,20 @@ CallPlan cplan_method_call(Compiler *c, int id);
 CallPlan cplan_send_arm(Compiler *c, int id);
 CallPlan cplan_exception_render(Compiler *c, int id, int ci);
 const CallPlan *cplan_user(Compiler *c, int id);
+/* The method scope call `id` runs when it asks for `name`: on cls's
+   instance side through its chain, CT_CMETHOD on its class side, CT_OWN
+   in cls's own table only, CT_TOP among the top-level functions (cls not
+   read); *def_class (when asked) the class whose table holds it; -1 for
+   none. The one place a site asks "what does this call run": it answers
+   from the tables by name (a redefined method's entry is its last
+   definition), and binding a call to one of a method's versions (#9898)
+   is decided here. `id` is -1 where a helper that serves calls is asked
+   with no call (class_reopen_cmethod for a respond_to? test): the name's
+   last definition. A question about a name rather than one call (is it
+   defined, which classes answer it) and a method the language calls by a
+   fixed name (`initialize`, `<=>`) ask the tables directly. */
+enum { CT_CMETHOD = 1, CT_OWN = 2, CT_TOP = 4 };
+int call_target(Compiler *c, int id, int cls, const char *name, unsigned flags, int *def_class);
 int cplan_bool_sides(Compiler *c, int id, int *tmi, int *fmi);
 void cplan_check_missing(Compiler *c, int id, int mi, int ci, const char *name, int cmeth, const char *site);
 /* The same plan resolved afresh and never kept, for a reader that runs in
@@ -122,7 +136,7 @@ TyKind cplan_poly_operator_ret(Compiler *c, int id);
 int cplan_target_binds(Compiler *c, int id, int mi);
 int cplan_boxed_cmethod(Compiler *c, int id, const char *name);
 /* Object fallback behind a class-gated exception accessor, or -1. */
-int cplan_exc_object_method(Compiler *c, const char *name);
+int cplan_exc_object_method(Compiler *c, int call, const char *name);
 
 /* ---- CP_REFUSE: a call the compiler refuses ----
    Whether codegen refuses the call node id, and in which words, decided
@@ -163,14 +177,15 @@ int cplan_plain_ctx(void);
 void cplan_served(const char *site);
 void cplan_served_report(void);
 
-/* The form a dispatch of instance method `name` on class cid takes:
-   CP_DIRECT for one implementation, CP_SWITCH when cid's subtree has more
-   than one (or any, without a base method: has_base 0), CP_PER_ARM for a
-   switch whose arms disagree on the argument layout; CP_NONE for neither
-   a base method nor a descendant's. */
+/* The form call `call`'s dispatch of instance method `name` on class cid
+   takes (call -1: a dispatch no call makes): CP_DIRECT for one
+   implementation, CP_SWITCH when cid's subtree has more than one (or any,
+   without a base method: has_base 0), CP_PER_ARM for a switch whose arms
+   disagree on the argument layout; CP_NONE for neither a base method nor a
+   descendant's. */
 /* Whether a descendant defines its own method of this name. */
 int cplan_overridden(Compiler *c, int cid, const char *name, int cmeth);
-int cplan_dispatch_form(Compiler *c, int cid, const char *name, int has_base);
+int cplan_dispatch_form(Compiler *c, int call, int cid, const char *name, int has_base);
 
 /* whether mi is the plan's method or, for a switch, one of its arms */
 int cplan_virtual_member(Compiler *c, int id, const CallPlan *p, int mi);
@@ -346,7 +361,7 @@ const PolyPlan *cplan_poly_block(Compiler *c, int id);
 /* The arms of the class-method tag switch of a call on a poly receiver
    that may hold a Class (emit_unresolved_call): each class's class method
    of the name, or its proc form. Computed afresh. */
-int cplan_cmethod_arm(Compiler *c, int k, const char *nm, int *dc, int *pfk);
+int cplan_cmethod_arm(Compiler *c, int call, int k, const char *nm, int *dc, int *pfk);
 const PolyPlan *cplan_poly_cmeth(Compiler *c, int id);
 int cplan_visibility_class(Compiler *c, int id, int ci);
 int cplan_has_method_missing(Compiler *c, int id, int ci, int cmethod);

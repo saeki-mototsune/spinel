@@ -59,6 +59,11 @@ typedef struct {
                           magic comment turns its refusals into raises where they
                           run (nt_put_file_defers); nfile_defers its length */
   int nfile_defers;
+  /* Under --load-model=graph (#9898) each file the program loads is a root:
+     its ProgramNode, by graph id (0 is the entry, the table's root). None
+     under the inline model, whose one root is root_id (nt_root). */
+  int *file_roots;
+  int nfile_roots;
   /* Bumped whenever a node is added or a string field is rewritten, i.e. by
      exactly the edits that can change which node carries which name. Caches
      keyed on node identity or name can revalidate against it. */
@@ -74,7 +79,25 @@ typedef struct {
      which version leaves out. infer_type keeps an earlier query's answers
      only while neither it nor version has moved (#8852). */
   unsigned long edits;
+  /* Per node (node_table.c): where a node appended from orig_lo on came
+     from and the pass that appended it (nt_origin), and the scratch
+     nt_clone_subtree marks its subtree with (a node is in the clone being
+     made while its mark is clone_gen), so a clone costs its subtree, not
+     the table. orig_lo is 0 until nt_track_origins. */
+  struct NtAux *aux;
+  int aux_cap, orig_lo;
+  unsigned clone_gen;
+  /* how many nodes each pass has given each origin (node_table.c), for the
+     k nt_origin answers */
+  struct NtCount *counts;
+  int counts_cap, ncounts;
+  /* the analysis pass appending nodes now (nt_set_pass), NULL outside one */
+  const char *pass;
 } NodeTable;
+
+/* The roots of the program's files, entry first (see file_roots). */
+static inline int nt_nroots(const NodeTable *nt) { return nt->nfile_roots ? nt->nfile_roots : 1; }
+static inline int nt_root(const NodeTable *nt, int i) { return nt->nfile_roots ? nt->file_roots[i] : nt->root_id; }
 
 
 /* Node-type kinds. The parser emits the type as a string ("CallNode"); to
@@ -178,11 +201,25 @@ void nt_put_file(NodeTable *nt, int fid, const char *path);
 void nt_dump(const NodeTable *nt, FILE *out);
 
 void nt_free(NodeTable *nt);
+/* Renumber the nodes to an order: order[k] is the id node k had (node_table.c). */
+void nt_renumber(NodeTable *nt, const int *order);
 
 /* Deep-clone the subtree rooted at `root`; returns the new root id (or -1).
    Appends nodes and grows nt->count -- parallel per-node arrays must be
    resized to match afterward. */
 int nt_clone_subtree(NodeTable *nt, int root);
+/* Where node `id` came from, for a node appended after nt_track_origins:
+   the node it is a copy of (*how 'c'), or the node it was first linked
+   under (*how 'r', *a the ref field's index; *how 'a', *a the array
+   field's index). *pass is a hash of the name of the pass that appended it
+   (nt_set_pass; 0 outside one), and *k counts from 1 the nodes that pass
+   gave this same origin. -1 for any other node, or one not linked anywhere
+   yet. comp_node_tag names an appended node from this, so the name is the
+   same whenever it is asked and whichever passes ran before. */
+int nt_origin(const NodeTable *nt, int id, char *how, int *a, unsigned *pass, int *k);
+void nt_track_origins(NodeTable *nt);   /* from the nodes appended next on */
+const char *nt_set_pass(NodeTable *nt, const char *pass);   /* the one before */
+void nt_subtree_blank(NodeTable *nt, int id);   /* every node of the subtree a NilNode */
 void nt_swap_nodes(NodeTable *nt, int a, int b);
 /* Copy the subtree at root of src into dst; the new root's id, or -1. */
 int nt_import_subtree(NodeTable *dst, const NodeTable *src, int root);
@@ -286,6 +323,7 @@ static inline int nt_param_repeated(const NodeTable *nt, int id) {
 #define NT_RE_IGNORE_CASE 4        /* PM_REGULAR_EXPRESSION_FLAGS_IGNORE_CASE */
 #define NT_RE_EXTENDED 8           /* PM_REGULAR_EXPRESSION_FLAGS_EXTENDED */
 #define NT_RE_MULTI_LINE 16        /* PM_REGULAR_EXPRESSION_FLAGS_MULTI_LINE */
+#define NT_RE_ONCE 32              /* PM_REGULAR_EXPRESSION_FLAGS_ONCE */
 #define NT_RE_EUC_JP 64            /* PM_REGULAR_EXPRESSION_FLAGS_EUC_JP */
 #define NT_RE_ASCII_8BIT 128       /* PM_REGULAR_EXPRESSION_FLAGS_ASCII_8BIT */
 #define NT_RE_WINDOWS_31J 256      /* PM_REGULAR_EXPRESSION_FLAGS_WINDOWS_31J */

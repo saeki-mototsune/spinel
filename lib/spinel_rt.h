@@ -8483,16 +8483,17 @@ static sp_RbVal sp_poly_arr_live_recv(sp_RbVal v, const char *m) {
 }
 static inline void sp_PolyArray_set(sp_PolyArray *a, sp_int i, sp_RbVal v);   /* fwd: defined below */
 /* `a.fill(v[, start[, len]])` on a boxed receiver with Integer offsets
-   (argc counts v): a PolyArray, and an Integer or Float Array whose span
-   is in bounds and whose kind v is, fill in place; anything else fills a
-   boxed copy and writes it back. Answers the receiver. */
-static sp_RbVal sp_poly_fill(sp_RbVal recv, sp_RbVal v, int argc, sp_int start, sp_int len) {
+   (argc counts v; a nil start is 0, a nil length runs to the end): a
+   PolyArray, and an Integer or Float Array whose span is in bounds and
+   whose kind v is, fill in place; anything else fills a boxed copy and
+   writes it back. Answers the receiver. */
+static sp_RbVal sp_poly_fill(sp_RbVal recv, sp_RbVal v, int argc, sp_oint start, sp_oint len) {
   if (!(recv.tag == SP_TAG_OBJ && sp_poly_is_array_kind(recv.cls_id))) sp_raise_nomethod(sp_nomethod_msg("fill", recv));
   if (sp_poly_array_frozen(recv)) sp_raise_frozen_array_at(recv.v.p, recv.cls_id);
   sp_PolyArray *p = recv.cls_id == SP_BUILTIN_POLY_ARRAY ? (sp_PolyArray *)recv.v.p : NULL;
   sp_int alen = sp_poly_arr_len(recv), s = 0, e = alen;
-  if (argc >= 2) { s = start < 0 ? start + alen : start; if (s < 0) s = 0; }
-  if (argc == 3) e = len < 0 ? s : s + len;
+  if (argc >= 2 && !start.nil) { s = start.v < 0 ? start.v + alen : start.v; if (s < 0) s = 0; }
+  if (argc == 3 && !len.nil) e = len.v < 0 ? s : s + len.v;
   else if (s > alen) e = s;
   if (recv.cls_id == SP_BUILTIN_POLY_ARRAY) {
     for (sp_int i = s; i < e; i++) sp_PolyArray_set(p, i, v);
@@ -12352,11 +12353,21 @@ static SP_UNUSED sp_int sp_array_fill_range(sp_Range r0, sp_int *n) {
   *n = e;
   return s;
 }
+/* ...and over a Float Range ((1.5..2), (0.5...)): each written end through
+   to_int, the begin's RangeError naming the Range as written */
+static SP_UNUSED sp_int sp_array_fill_frange(sp_FloatRange f, sp_int *n) {
+  sp_oint b = (f.omitted & SP_FRANGE_NO_BEGIN) ? sp_oint_nil() : sp_oint_of(sp_float_arg_i(f.first));
+  sp_oint e = (f.omitted & SP_FRANGE_NO_END) ? sp_oint_nil() : sp_oint_of(sp_float_arg_i(f.last));
+  if (!b.nil && b.v < -*n) sp_raise_cls("RangeError", sp_sprintf("%s out of range", sp_frange_inspect(f)));
+  return sp_array_fill_range(sp_range_new_o(b, e, f.excl), n);
+}
 /* fill(value, x) with x boxed: a Range is the span (sp_array_fill_range);
    anything else is a start filled through to *n. */
 static SP_UNUSED sp_int sp_array_fill_span(sp_RbVal v, sp_int *n) {
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_RANGE && v.v.p)
     return sp_array_fill_range(*(sp_Range *)v.v.p, n);
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_FLOAT_RANGE && v.v.p)
+    return sp_array_fill_frange(*(sp_FloatRange *)v.v.p, n);
   sp_oint o = sp_array_fill_offset_arg(v, 0);
   return o.nil ? 0 : o.v;
 }
@@ -12714,6 +12725,14 @@ static sp_RbVal sp_poly_dig_list(sp_RbVal recv, sp_PolyArray *keys) {
      across each step. */
   return sp_poly_dig_n(recv, keys->len, keys->data);
 }
+/* A boxed index of an Array or a String that is a Float Range is the
+   Integer Range of its to_int ends (sp_frange_ix); any other is itself. */
+static SP_INLINE sp_bool sp_poly_is_frange(sp_RbVal v) {
+  return v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_FLOAT_RANGE && v.v.p;
+}
+static SP_UNUSED sp_RbVal sp_poly_frange_ix(sp_RbVal v) {
+  return sp_poly_is_frange(v) ? sp_box_range(sp_frange_ix(*(sp_FloatRange *)v.v.p)) : v;
+}
 /* poly[poly_key]: dispatch on key tag at runtime. */
 static sp_RbVal sp_poly_index_poly(sp_RbVal recv, sp_RbVal idx) {
   if (recv.tag == SP_TAG_OBJ && recv.cls_id == SP_BUILTIN_THREAD) {
@@ -12735,6 +12754,12 @@ static sp_RbVal sp_poly_index_poly(sp_RbVal recv, sp_RbVal idx) {
      its live value: the String arms below all test SP_TAG_STR, and a handle
      fell past every one of them to the trailing nil (#4279). */
   if (sp_poly_is_strbuf(recv)) return sp_poly_index_poly(sp_poly_strbuf_deref(recv), idx);
+  /* a Float Range indexes an Array, a String or a Symbol as the Integer
+     Range of its to_int ends */
+  if (SP_UNLIKELY(sp_poly_is_frange(idx)) &&
+      (recv.tag == SP_TAG_STR || recv.tag == SP_TAG_SYM ||
+       (recv.tag == SP_TAG_OBJ && sp_poly_is_array_kind(recv.cls_id))))
+    return sp_poly_index_poly(recv, sp_poly_frange_ix(idx));
   /* an Integer index into an array is the common read, and it matches nothing
      below until the very last line (array kinds are builtin, so the Struct arm
      with its cls_id >= 0 test cannot claim it) */
@@ -13569,7 +13594,9 @@ static SP_NOINLINE sp_bool sp_poly_eql_strict_slow(sp_RbVal a, sp_RbVal b) {
 }
 /* equal? for a poly value: object identity. Immediates (int, symbol, nil,
    bool, flonum) are their own identity by value; everything heap-backed
-   (string buffer, boxed object, bignum) compares by pointer. */
+   (string buffer, boxed object, bignum) compares by pointer. A Float is its
+   bits, as a typed Float's equal? compares them: the same NaN is itself,
+   and 0.0 is not -0.0. */
 static sp_bool sp_poly_equal(sp_RbVal a, sp_RbVal b) {
 #ifdef SP_SHARE_STRING_LITERALS
   a = sp_poly_literal_identity(a);
@@ -13581,7 +13608,7 @@ static sp_bool sp_poly_equal(sp_RbVal a, sp_RbVal b) {
     case SP_TAG_SYM: return a.v.i == b.v.i;
     case SP_TAG_BOOL: return a.v.b == b.v.b;
     case SP_TAG_NIL: return TRUE;
-    case SP_TAG_FLT: return a.v.f == b.v.f;
+    case SP_TAG_FLT: return memcmp(&a.v.f, &b.v.f, sizeof a.v.f) == 0;
     case SP_TAG_STR: return a.v.s == b.v.s;
     /* Class objects are their own identity: two references to Object are the
        same object. Spinel's classes are name-backed, so compare by name. */
@@ -20849,6 +20876,54 @@ static sp_mutex *sp_poly_mutex_recv(sp_RbVal v) {
   sp_raise_nomethod(sp_nomethod_msg("synchronize", v));
   return NULL;
 }
+/* ---- A required file's load (#9898, CRuby's load model) ----
+   The first `require` of a file runs its top level; a later one answers
+   false. The file counts as loaded before its top level runs, so a require
+   of it from inside its own load answers false too, and no longer once its
+   top level raises (or a throw or break leaves it), so a later require runs
+   it again, as CRuby drops a feature whose load failed. A require that names
+   no file (top NULL) raises CRuby's LoadError for the feature it was given.
+   Answers whether this call ran the file. */
+#ifdef SPINEL_EXT_HOST
+int sp_Kernel_require(const char *feature, int *loaded, void (*top)(void));
+int sp_Kernel_require_relative(const char *feature, int *loaded, void (*top)(void));
+#else
+static int sp_load_file(const char *feature, int *loaded, void (*top)(void)) {
+  if (!top) sp_raise_load_error(feature);
+  if (*loaded) return 0;
+  *loaded = 1;
+  const char *ecls = NULL, *emsg = NULL; void *eobj = NULL;
+  SP_GC_ROOT_STR(emsg); SP_GC_ROOT(eobj);
+  sp_exc_check_depth();
+  sp_exc_rootmark[sp_exc_top] = sp_gc_nroots; sp_rescue_mark[sp_exc_top] = sp_rescue_sp;
+  sp_exc_msg[sp_exc_top] = 0; sp_exc_obj[sp_exc_top] = 0; sp_exc_top++;
+  if (setjmp(sp_exc_stack[sp_exc_top - 1]) == 0) {
+    top();
+    sp_exc_top--;
+    return 1;
+  }
+  sp_exc_top--;
+  sp_gc_nroots = sp_exc_rootmark[sp_exc_top]; sp_rescue_sp = sp_rescue_mark[sp_exc_top];
+  *loaded = 0;
+  if (sp_unwind_kind != SP_UNWIND_NONE) sp_unwind_resume();
+  emsg = sp_exc_msg[sp_exc_top]; ecls = sp_exc_cls[sp_exc_top]; eobj = sp_exc_obj[sp_exc_top];
+  /* the exception passes on: it keeps the frames of the raise in the file */
+  sp_pending_exc_obj = eobj; sp_bt_keep = 1;
+  sp_raise_cls(ecls, emsg);
+  return 1;
+}
+/* The two methods by their Ruby names, so a backtrace (lib/sp_cold.c,
+   sp_bt_format) names the frame of each load `Kernel#require` or
+   `Kernel#require_relative`, as CRuby does. External, as the frames of
+   methods are in a --debug build: a static function has no symbol in an ELF
+   backtrace. A release link drops them from a program that loads no file. */
+int sp_Kernel_require(const char *feature, int *loaded, void (*top)(void)) {
+  return sp_load_file(feature, loaded, top);
+}
+int sp_Kernel_require_relative(const char *feature, int *loaded, void (*top)(void)) {
+  return sp_load_file(feature, loaded, top);
+}
+#endif
 static sp_RbVal sp_Mutex_synchronize_proc(sp_mutex *m, sp_Proc *blk) {
   SP_GC_ROOT(m); SP_GC_ROOT(blk);
   sp_RbVal r = sp_box_nil();
@@ -22700,5 +22775,21 @@ static inline const char *sp_strface_write_through(const char *recv, const char 
   return nb;
 }
 #endif
+
+static SP_UNUSED sp_Time *sp_time_add_r(const sp_Time *t, sp_Rational offset) {
+  int32_t ns;
+  int64_t seconds = sp_time_sec_split_r(offset, &ns);
+  sp_Time result = *t;
+  result.tv_sec += seconds;
+  result.tv_nsec += ns;
+  return sp_time_ref(sp_timev_norm(result));
+}
+
+static SP_UNUSED sp_Time *sp_time_add_boxed(sp_Time *t, sp_RbVal offset) {
+  if (sp_poly_is_rational(offset)) return sp_time_add_r(t, sp_poly_as_rational(offset));
+  SP_GC_ROOT_RBVAL(offset);
+  sp_RbVal boxed = sp_box_time(t);
+  return sp_poly_as_time_chk(sp_poly_add(boxed, offset));
+}
 
 #endif /* SP_RUNTIME_H */

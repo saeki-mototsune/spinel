@@ -1,0 +1,12 @@
+class Table
+  @ints: Array[Array[Integer]]
+  @floats: Array[Array[Float]]
+end
+
+class NilRows
+  @rows: Array[Array[Integer]]
+end
+
+class MixedFloatRows
+  @rows: Array[Array[Float]]
+end

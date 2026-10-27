@@ -33,17 +33,17 @@ static int class_chain_depth(Compiler *c, int cid, int k) {
   return 1 << 20;
 }
 
-/* A call on an object of class `cid` dispatches to `mi` or to a subclass's
-   own `nm`: can one of them answer nil -- its answer is an oint, or it
-   answers nil itself (`def nop = nil` beside an override answering 7)? The
-   dispatch switch then holds the oint (g_disp_ro). mi is -1 for an attr
-   reader, whose own answer is its field's (reader_ivar_has_nilbit). */
-static int dispatch_answers_nil(Compiler *c, int cid, const char *nm, int mi) {
+/* Call `call` on an object of class `cid` dispatches to `mi` or to a
+   subclass's own `nm`: can one of them answer nil -- its answer is an oint,
+   or it answers nil itself (`def nop = nil` beside an override answering
+   7)? The dispatch switch then holds the oint (g_disp_ro). mi is -1 for an
+   attr reader, whose own answer is its field's (reader_ivar_has_nilbit). */
+static int dispatch_answers_nil(Compiler *c, int call, int cid, const char *nm, int mi) {
   if (mi >= 0 && method_ret_is_oint(&c->scopes[mi])) return 1;
   int any_nil = mi >= 0 && (c->scopes[mi].ret == TY_NIL || c->scopes[mi].ret == TY_VOID), overridden = 0;
   int nd = 0; const int *ds = comp_descendants(c, cid, &nd);
   for (int k = 0; k < nd; k++) {
-    int odef = -1, omi = comp_method_in_chain(c, ds[k], nm, &odef);
+    int odef = -1, omi = call_target(c, call, ds[k], nm, 0, &odef);
     if (omi < 0 || omi == mi || odef != ds[k]) continue;
     overridden = 1;
     if (method_ret_is_oint(&c->scopes[omi])) return 1;
@@ -240,7 +240,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
       return bn > 0 && oint_kind(comp_ntype(c, bs[bn - 1]));
     }
     if ((sp_streq(nm, "instance_eval") || sp_streq(nm, "instance_exec")) && blk >= 0 &&
-        ty_is_object(iert) && comp_method_in_chain(c, ty_object_class(iert), nm, NULL) < 0 &&
+        ty_is_object(iert) && call_target(c, node, ty_object_class(iert), nm, 0, NULL) < 0 &&
         nt_kind(nt, blk) == NK_BlockNode) {
       int bb = nt_ref(nt, blk, "body");
       int bn = 0; const int *bs = bb >= 0 ? nt_arr(nt, bb, "body", &bn) : NULL;
@@ -265,12 +265,12 @@ static int node_is_oint_asked(Compiler *c, int node) {
        carries a nil bit or a subclass's override can answer nil (the read
        dispatches, emit_reader_override_dispatch), the plain field
        otherwise, as with an explicit receiver below */
-    else if (src >= 0) return reader_ivar_has_nilbit(c, src, nm) || dispatch_answers_nil(c, src, nm, -1);
+    else if (src >= 0) return reader_ivar_has_nilbit(c, src, nm) || dispatch_answers_nil(c, node, src, nm, -1);
     else if (r < 0) mi = comp_self_call_mi(c, node, nm);
     else if (ty_is_object(rt)) {
       int cid = ty_object_class(rt);
       int mdef = -1, rdef = -1;
-      mi = comp_method_in_chain(c, cid, nm, &mdef);
+      mi = call_target(c, node, cid, nm, 0, &mdef);
       /* an attr reader is its ivar's read: the ivar's oint when the ivar
          carries a nil bit, the plain field otherwise (whatever the reader's
          own return mark says: the field has no other form) -- unless a
@@ -278,11 +278,11 @@ static int node_is_oint_asked(Compiler *c, int node) {
       if (an2 == 0 && blk < 0 && comp_reader_in_chain(c, cid, nm, &rdef) &&
           (mi < 0 || (mdef != cid &&
                       class_chain_depth(c, cid, rdef < 0 ? cid : rdef) <= class_chain_depth(c, cid, mdef < 0 ? cid : mdef))))
-        return reader_ivar_has_nilbit(c, cid, nm) || dispatch_answers_nil(c, cid, nm, -1);
+        return reader_ivar_has_nilbit(c, cid, nm) || dispatch_answers_nil(c, node, cid, nm, -1);
     }
     else if (nt_kind(nt, r) == NK_ConstantReadNode || nt_kind(nt, r) == NK_ConstantPathNode) {
       int rci = comp_class_index(c, nt_str(nt, r, "name"));
-      if (rci >= 0) mi = comp_cmethod_in_chain(c, rci, nm, NULL);
+      if (rci >= 0) mi = call_target(c, node, rci, nm, CT_CMETHOD, NULL);
     }
     /* `obj.class.m`: the switch over obj's class and the classes below it
        (emit_call_class_method_arms) */
@@ -291,8 +291,8 @@ static int node_is_oint_asked(Compiler *c, int node) {
       int x = nt_ref(nt, r, "receiver");
       TyKind xt = x >= 0 ? comp_ntype(c, x) : TY_UNKNOWN;
       if (nullable_int_value(c, node)) return 1;
-      if (ty_is_object(xt) && comp_cmethod_in_chain(c, ty_object_class(xt), nm, NULL) >= 0)
-        return class_switch_arm_oint(c, ty_object_class(xt), nm);
+      if (ty_is_object(xt) && call_target(c, node, ty_object_class(xt), nm, CT_CMETHOD, NULL) >= 0)
+        return class_switch_arm_oint(c, node, ty_object_class(xt), nm);
     }
     /* a class or module value only the run time knows: the switch over the
        classes with a class method of the name (#8985) */
@@ -310,7 +310,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
       int dcid = -1;
       if (r >= 0 && ty_is_object(rt)) dcid = ty_object_class(rt);
       else if (r < 0) { Scope *self = comp_scope_of(c, node); if (self && !self->is_cmethod) dcid = self->class_id; }
-      if (dcid >= 0 && dispatch_answers_nil(c, dcid, nm, mi)) return 1;
+      if (dcid >= 0 && dispatch_answers_nil(c, node, dcid, nm, mi)) return 1;
     }
     /* ...and a class method's call of a sibling: an inherited body runs for
        its class and each subclass, each calling its own class's method of the
@@ -318,7 +318,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
        Sub) makes the site's Integer nil there */
     if (r < 0 && oint_kind(comp_ntype(c, node))) {
       Scope *self = comp_scope_of(c, node);
-      if (self && self->is_cmethod && self->class_id >= 0 && cmethod_sibling_answers_nil(c, self->class_id, nm)) return 1;
+      if (self && self->is_cmethod && self->class_id >= 0 && cmethod_sibling_answers_nil(c, node, self->class_id, nm)) return 1;
     }
     if (mi >= 0) return method_ret_is_oint(&c->scopes[mi]);
     /* `<=>` answers nil for an incomparable operand: the analysis's answer
@@ -336,7 +336,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
           rt != TY_BIGINT && rt != TY_RATIONAL && rt != TY_STRING && rt != TY_SYMBOL && rt != TY_TIME &&
           !ty_is_array(rt)) {
         int oc = comp_class_index(c, "Object");
-        int omi = oc >= 0 ? comp_method_in_chain(c, oc, nm, NULL) : -1;
+        int omi = oc >= 0 ? call_target(c, node, oc, nm, 0, NULL) : -1;
         if (omi >= 0) return method_ret_is_oint(&c->scopes[omi]);
       }
       int num_l = rt == TY_INT || rt == TY_FLOAT || rt == TY_BIGINT || rt == TY_RATIONAL;
@@ -430,7 +430,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
         Scope *ss = comp_scope_of(c, node);
         if (ss && ss->is_cmethod) sgc = ss->class_id;
       }
-      if (sgc >= 0 && an2 == 0 && comp_method_in_chain(c, sgc, nm, NULL) < 0) {
+      if (sgc >= 0 && an2 == 0 && call_target(c, node, sgc, nm, 0, NULL) < 0) {
         ClassInfo *sgi = &c->classes[sgc];
         const char *rn = comp_resolve_cm_alias_at(c, sgc, nm, NULL);
         if (!rn) rn = nm;
@@ -481,8 +481,11 @@ static int node_is_oint_asked(Compiler *c, int node) {
     if (r >= 0 && (rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY)) {
       /* an Integer / Float array's element answers: nil when empty or missing */
       if (an2 == 0 && blk < 0 &&
-          (sp_streq(nm, "first") || sp_streq(nm, "last") || sp_streq(nm, "sample") ||
-           sp_streq(nm, "min") || sp_streq(nm, "max"))) return 1;
+          (sp_streq(nm, "first") || sp_streq(nm, "last") || sp_streq(nm, "sample"))) return 1;
+      /* ... and so does its extreme, except on a literal that is never
+         empty, where only an element can be nil */
+      if (an2 == 0 && blk < 0 && is_minmax_query(nm))
+        return !array_literal_filled(nt, r) || nullable_int_value(c, node);
       if (sp_streq(nm, "slice!") && an2 == 1) return 1;
       if (sp_streq(nm, "find_index")) return 1;
       /* a seedless fold, a comparator min / max: nil over an empty receiver */
@@ -874,7 +877,7 @@ int repr_call_returns_handle(Compiler *c, int v) {
      A fresh-answering target must keep the ordinary conversion's copy.
      A nil to_str falls through to to_s; a nil to_s falls to fresh object
      text in the bridge, so neither may pick up an earlier publication. */
-  if (recv < 0 && is_string_class_name(nm) && comp_method_index(c, nm) < 0 && !bare_call_class_owned(c, v)) {
+  if (recv < 0 && is_string_class_name(nm) && call_target(c, v, -1, nm, CT_TOP, NULL) < 0 && !bare_call_class_owned(c, v)) {
     int ac = 0;
     const int *av = call_args(nt, v, &ac);
     if (ac != 1 || nt_ref(nt, v, "block") >= 0) return 0;
