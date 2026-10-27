@@ -541,7 +541,42 @@ void expand_struct_forwarding_super(Compiler *c) {
 }
 
 
-void walk_scope(Compiler *c, int id, int scope_idx, int class_id);
+/* Where the scope walk is: the scope and class a node is walked in, the
+   proc it is under (-1 outside one) and whether it is in an arm that never
+   runs; the class whose body encloses it (cbody, which node_cbody keeps)
+   and the one whose body it is directly in (direct, where `self` is the
+   class: -1 inside a method or a block, mirroring codegen's
+   g_class_body_id so a self/bare `class_eval` reopen is recognized
+   identically by analyze and codegen); whether it is directly in the block
+   of `Name = Struct.new(...) do ... end`, whose class register_structs
+   makes only after the walk (fix_struct_block_scopes); and whether it is a
+   define_method of a `class << X` body, which defines a class method. pos:
+   where the load phase stands there (analyze_elab.c), as the load record's
+   walk, which this walk is, enters it; e -1 in a walk after it. */
+typedef struct {
+  int scope, cls, proc, dead;
+  int cbody, direct, struct_direct, dm_sclass;
+  ElabPos pos;
+} WalkCtx;
+
+static void walk_scope_in(Compiler *c, int id, WalkCtx w);
+
+/* A child the walk enters at w.pos: a statement of the load phase when
+   that makes it one, which the record places as the walk reaches it */
+static void walk_child(Compiler *c, int ch, WalkCtx w) {
+  int e = elab_walk_enter(c, ch, &w.pos);
+  walk_scope_in(c, ch, w);
+  elab_walk_leave(c, e);
+}
+
+/* A walk of a node the walk reaches apart from its tree walk (a statement
+   of a `class << X` body, an unrolled define_method's body), at pos, in
+   `scope` and `cls`: it is under no proc and in no dead arm, and keeps the
+   class bodies of `w`, where it is reached. */
+static void walk_scope_from(Compiler *c, int id, const WalkCtx *w, ElabPos pos, int scope, int cls, int dm_sclass) {
+  walk_child(c, id, (WalkCtx){ .scope = scope, .cls = cls, .proc = -1, .cbody = w->cbody,
+                               .direct = w->direct, .struct_direct = w->struct_direct, .dm_sclass = dm_sclass, .pos = pos });
+}
 
 /* String form of an int/string/symbol literal node, for compile-time
    `define_method` name interpolation. Returns malloc'd, or NULL. */
@@ -620,12 +655,13 @@ TyKind dm_lit_type(Compiler *c, int lit) {
    class body and synthesize one method scope per literal element, each with
    a compile-time substitution of `v`. In a Struct.new block class_id is
    still -1; fix_struct_block_scopes homes the scopes. The loop itself still
-   runs in scope_idx, binding `v` to each element there, so `v` is a local
-   of that scope too: a class body's is the program's, but a method's (a
-   class method that defines them when called) had no such local. Returns 1
-   if handled. */
-int collect_dm_each_unroll(Compiler *c, int id, int class_id, int scope_idx) {
+   runs in the walk's scope, binding `v` to each element there, so `v` is a
+   local of that scope too: a class body's is the program's, but a method's
+   (a class method that defines them when called) had no such local. Returns
+   1 if handled. */
+static int collect_dm_each_unroll(Compiler *c, int id, const WalkCtx *w) {
   const NodeTable *nt = c->nt;
+  int class_id = w->cls, scope_idx = w->scope;
   const char *nm = nt_str(nt, id, "name");
   if (!nm || !sp_streq(nm, "each")) return 0;
   int recv = nt_ref(nt, id, "receiver");
@@ -712,7 +748,7 @@ int collect_dm_each_unroll(Compiler *c, int id, int class_id, int scope_idx) {
     lv_set_type(lv, dm_lit_type(c, elems[k]));
     lv->is_param = 1;  /* not a real C param, but keeps it out of decls */
     int ms_idx = c->nscopes - 1;
-    if (kbody >= 0) walk_scope(c, kbody, ms_idx, class_id);
+    if (kbody >= 0) walk_scope_from(c, kbody, w, (ElabPos){ .e = -1 }, ms_idx, class_id, 0);
     /* the body is a method's: its `next` is a `return` */
     method_body_next_to_return((NodeTable *)nt, kbody);
   }
@@ -754,34 +790,6 @@ const char *object_fallback_class_of_type(TyKind t) {
   return builtin_class_of_type(t);
 }
 
-/* If `cname` is a constant assigned a class value (`CONST = SomeClass` or
-   `CONST = <expr>.class`), return the underlying class name so `class CONST`
-   reopens that class. Returns NULL if `cname` is a plain new class name. */
-/* Index of every ConstantWriteNode id, cached per node table. resolve_class_alias
-   is called once per class/module definition during walk_scope; scanning all
-   nodes each time made it O(class_defs * nodes) on a flattened runtime. Which
-   nodes are ConstantWriteNodes is stable across the pass (only their names may
-   have been rewritten earlier, and we re-read those fresh), so the id list can
-   be built once and reused. Rebuilt if the node table (pointer or count)
-   changes, e.g. a second compile in the same process. */
-static const NodeTable *rca_nt = NULL;
-static int *rca_ids = NULL;
-static int rca_n = 0, rca_ntcount = -1;
-static void rca_index(const NodeTable *nt) {
-  if (rca_nt != nt || rca_ntcount != nt->count) {
-    free(rca_ids);
-    rca_ids = malloc((size_t)nt->count * sizeof(int));
-    rca_n = 0;
-    if (rca_ids) {
-      for (int id = 0; id < nt->count; id++) {
-        NodeKind k = nt_kind(nt, id);
-        if (k == NK_ConstantWriteNode) rca_ids[rca_n++] = id;
-      }
-    }
-    rca_nt = nt;
-    rca_ntcount = nt->count;
-  }
-}
 /* The class constant local read `v` holds when every write of that local
    in the program assigns that one constant (`q = Module.new do ... end`, by
    now a read of the module the call defines); NULL otherwise. */
@@ -803,11 +811,12 @@ static const char *local_holds_class(Compiler *c, int v) {
   return held;
 }
 
+/* If `cname` is a constant assigned a class value (`CONST = SomeClass` or
+   `CONST = <expr>.class`), return the underlying class name so `class CONST`
+   reopens that class. Returns NULL if `cname` is a plain new class name. */
 const char *resolve_class_alias(Compiler *c, const char *cname) {
   const NodeTable *nt = c->nt;
-  rca_index(nt);
-  for (int ii = 0; ii < rca_n; ii++) {
-    int id = rca_ids[ii];
+  NT_FOREACH_KIND(nt, NK_ConstantWriteNode, id) {
     const char *n = nt_str(nt, id, "name");
     if (!n || !sp_streq(n, cname)) continue;
     int v = nt_ref(nt, id, "value");
@@ -834,9 +843,7 @@ const char *resolve_class_alias(Compiler *c, const char *cname) {
    knows, does not follow. NULL otherwise. */
 const char *const_alias_source(Compiler *c, const char *cname) {
   const NodeTable *nt = c->nt;
-  rca_index(nt);
-  for (int ii = 0; ii < rca_n; ii++) {
-    int id = rca_ids[ii];
+  NT_FOREACH_KIND(nt, NK_ConstantWriteNode, id) {
     const char *n = nt_str(nt, id, "name");
     if (!n || !sp_streq(n, cname)) continue;
     int v = nt_ref(nt, id, "value");
@@ -982,8 +989,8 @@ static const char *dm_registerable_name(const NodeTable *nt, int id) {
 
    The receiver may be a constant (`Klass` / `M::Klass`), resolved by short name;
    or `self`/absent, which reopens `enclosing_class` -- the class whose body we are
-   directly in (analyze passes g_cbody_direct, codegen passes g_class_body_id, both
-   -1 inside method bodies). Restricting to definition-only blocks keeps a
+   directly in (analyze passes its walk's direct class, codegen g_class_body_id,
+   both -1 inside method bodies). Restricting to definition-only blocks keeps a
    class_eval that runs other code falling through to the normal (unsupported) path
    instead of being silently dropped. Used by both analyze (to register the methods
    on the target) and codegen (to emit the call as a no-op). */
@@ -1128,19 +1135,28 @@ static void singleton_reopen_mark(Compiler *c, int def, int recv, int class_id) 
    if cond; def m; end; else; def m; end; end`, as Loofah defines its entry
    points, #5358). A define_method there is a class method too. Anything
    else is walked as usual. */
-static int g_dm_sclass;
-/* Directly in the block of `Name = Struct.new(...) do ... end`, whose class
-   register_structs makes only after walk_scope (fix_struct_block_scopes). */
-static int g_struct_direct;
-static void sclass_walk_stmt(Compiler *c, int s, int scope_idx, int target_class, int depth, int reopen_recv, int reopen_class) {
+static void sclass_walk_stmt(Compiler *c, int s, const WalkCtx *w, int target_class, int depth, int reopen_recv, int reopen_class);
+
+/* Child ch of node p (whose context is w) as a statement of a `class <<
+   self` body is walked: placed in the load record as walk_child places one */
+static void sclass_walk_child(Compiler *c, int p, int ch, const WalkCtx *w, int target_class, int depth, int reopen_recv, int reopen_class) {
+  if (ch < 0) return;
+  WalkCtx cw = *w;
+  cw.pos = elab_child(c->nt, p, ch, &w->pos);
+  int e = elab_walk_enter(c, ch, &cw.pos);
+  sclass_walk_stmt(c, ch, &cw, target_class, depth, reopen_recv, reopen_class);
+  elab_walk_leave(c, e);
+}
+
+static void sclass_walk_stmt(Compiler *c, int s, const WalkCtx *w, int target_class, int depth, int reopen_recv, int reopen_class) {
   const NodeTable *nt = c->nt;
+  int scope_idx = w->scope;
   if (s < 0 || s >= nt->count) return;
   NodeKind k = nt_kind(nt, s);
   if (k == NK_CallNode && dm_registerable_name(nt, s)) {
     if (reopen_recv >= 0 && nt_ref(nt, s, "receiver") < 0)
       singleton_reopen_mark(c, s, reopen_recv, reopen_class);
-    g_dm_sclass = 1;
-    walk_scope(c, s, scope_idx, target_class);
+    walk_scope_from(c, s, w, w->pos, scope_idx, target_class, 1);
     return;
   }
   /* `private def m` / `protected def m` / `public def m`: the def is the
@@ -1152,10 +1168,12 @@ static void sclass_walk_stmt(Compiler *c, int s, int scope_idx, int target_class
     if (vn && visibility_of_name(vn) > BVIS_MODULE_FUNCTION &&
         vc == 1 && nt_kind(nt, vv[0]) == NK_DefNode && nt_ref(nt, vv[0], "receiver") < 0) {
       c->nscope[s] = scope_idx;
-      c->node_cbody[s] = g_cbody_class_id;
+      c->node_cbody[s] = w->cbody;
       c->nscope[va] = scope_idx;
-      c->node_cbody[va] = g_cbody_class_id;
-      sclass_walk_stmt(c, vv[0], scope_idx, target_class, depth + 1, reopen_recv, reopen_class);
+      c->node_cbody[va] = w->cbody;
+      WalkCtx aw = *w;
+      aw.pos = elab_child(nt, s, va, &w->pos);
+      sclass_walk_child(c, va, vv[0], &aw, target_class, depth + 1, reopen_recv, reopen_class);
       return;
     }
   }
@@ -1171,31 +1189,32 @@ static void sclass_walk_stmt(Compiler *c, int s, int scope_idx, int target_class
     collect_def_params(c, s, sc);
     /* Assign scope to the def node and its body */
     c->nscope[s] = new_idx;
-    c->node_cbody[s] = g_cbody_class_id;
+    c->node_cbody[s] = w->cbody;
     /* the parameters too, as the generic def walk does: a default value
        (`def open(path = default_path)`) is evaluated in the method, whose self
        is the class -- unwalked, its receiverless call resolved in the caller's
        self and raised NameError there */
     int pn = nt_ref(nt, s, "parameters");
-    if (pn >= 0) walk_scope(c, pn, new_idx, target_class);
-    if (sc->body >= 0) walk_scope(c, sc->body, new_idx, target_class);
+    if (pn >= 0) walk_scope_from(c, pn, w, elab_child(nt, s, pn, &w->pos), new_idx, target_class, 0);
+    if (sc->body >= 0) walk_scope_from(c, sc->body, w, elab_child(nt, s, sc->body, &w->pos), new_idx, target_class, 0);
     return;
   }
   NodeKind ty_k = nt_kind(nt, s);
   int cond = k == NK_IfNode || k == NK_UnlessNode || k == NK_StatementsNode ||
              (ty_k == NK_ElseNode);
-  if (!cond || depth > 64) { walk_scope(c, s, scope_idx, target_class); return; }
+  if (!cond || depth > 64) { walk_scope_from(c, s, w, w->pos, scope_idx, target_class, 0); return; }
   c->nscope[s] = scope_idx;
-  c->node_cbody[s] = g_cbody_class_id;
+  c->node_cbody[s] = w->cbody;
   if (k == NK_StatementsNode) {
     int n = 0; const int *b = nt_arr(nt, s, "body", &n);
-    for (int i = 0; i < n; i++) sclass_walk_stmt(c, b[i], scope_idx, target_class, depth + 1, reopen_recv, reopen_class);
+    for (int i = 0; i < n; i++) sclass_walk_child(c, s, b[i], w, target_class, depth + 1, reopen_recv, reopen_class);
     return;
   }
-  walk_scope(c, nt_ref(nt, s, "predicate"), scope_idx, target_class);
-  sclass_walk_stmt(c, nt_ref(nt, s, "statements"), scope_idx, target_class, depth + 1, reopen_recv, reopen_class);
-  sclass_walk_stmt(c, nt_ref(nt, s, "subsequent"), scope_idx, target_class, depth + 1, reopen_recv, reopen_class);
-  sclass_walk_stmt(c, nt_ref(nt, s, "else_clause"), scope_idx, target_class, depth + 1, reopen_recv, reopen_class);
+  int pr = nt_ref(nt, s, "predicate");
+  if (pr >= 0) walk_scope_from(c, pr, w, elab_child(nt, s, pr, &w->pos), scope_idx, target_class, 0);
+  sclass_walk_child(c, s, nt_ref(nt, s, "statements"), w, target_class, depth + 1, reopen_recv, reopen_class);
+  sclass_walk_child(c, s, nt_ref(nt, s, "subsequent"), w, target_class, depth + 1, reopen_recv, reopen_class);
+  sclass_walk_child(c, s, nt_ref(nt, s, "else_clause"), w, target_class, depth + 1, reopen_recv, reopen_class);
 }
 
 /* The four builtin classes that also live under Thread (`Thread::Mutex`). */
@@ -1432,10 +1451,11 @@ static int sg_def_receiver(const NodeTable *nt, int recv) {
   return nt_paren_single(nt, recv);
 }
 
-static void walk_scope_in(Compiler *c, int id, int scope_idx, int class_id, int proc, int dead) {
+static void walk_scope_in(Compiler *c, int id, WalkCtx w) {
   if (id < 0 || id >= c->nt->count) return;
+  int scope_idx = w.scope, class_id = w.cls, proc = w.proc, dead = w.dead;
   c->nscope[id] = scope_idx;
-  c->node_cbody[id] = g_cbody_class_id;
+  c->node_cbody[id] = w.cbody;
   if (proc >= 0 && nt_kind(c->nt, id) == NK_CallNode &&
       (nt_int(c->nt, id, "class_new_capture", 0) || nt_int(c->nt, id, "class_new_superclass", 0) ||
        is_ivar_access(nt_str(c->nt, id, "name"))))
@@ -1449,8 +1469,6 @@ static void walk_scope_in(Compiler *c, int id, int scope_idx, int class_id, int 
   NodeKind ty_k = nt_kind(c->nt, id);
   int child = scope_idx;
   int child_class = class_id;
-  int dm_sclass = g_dm_sclass;
-  g_dm_sclass = 0;
 
   /* `class << self; def X; ...; end; end` -- treat body defs as class methods. */
   if (ty_k == NK_SingletonClassNode) {
@@ -1476,16 +1494,23 @@ static void walk_scope_in(Compiler *c, int id, int scope_idx, int class_id, int 
       }
     }
     if (supported) {
+      /* the load record still places the receiver, which this walk does
+         not enter, and a body with rescue clauses, whose statements it
+         does not register */
+      elab_walk_rest(c, sexpr, elab_child(c->nt, id, sexpr, &w.pos));
       int sbody = nt_ref(c->nt, id, "body");
       if (sbody >= 0) {
         nt_node_set_int((NodeTable *)c->nt, sbody, "singleton_body", 1);
+        WalkCtx bw = w;
+        bw.pos = elab_child(c->nt, id, sbody, &w.pos);
+        if (nt_kind(c->nt, sbody) != NK_StatementsNode) elab_walk_rest(c, sbody, bw.pos);
         int n = 0;
         const int *stmts = nt_arr(c->nt, sbody, "body", &n);
         for (int k = 0; k < n; k++) {
           int s = stmts[k];
           const char *sty = nt_type(c->nt, s);
           if (!sty) continue;
-          sclass_walk_stmt(c, s, scope_idx, target_class, 0, native_reopen ? sexpr : -1, class_id);
+          sclass_walk_child(c, sbody, s, &bw, target_class, 0, native_reopen ? sexpr : -1, class_id);
         }
         c->nscope[id] = scope_idx;
         c->nscope[sbody] = scope_idx;
@@ -1621,19 +1646,21 @@ static void walk_scope_in(Compiler *c, int id, int scope_idx, int class_id, int 
        become instance methods on it, exactly like a `class Klass ... end` reopen.
        Set child_class to the target so the generic recursion below registers them
        there (and register_locals interns any ivars first assigned inside those
-       methods). g_cbody_direct gives the enclosing class for bare/self receivers. */
+       methods). The walk's direct class gives the enclosing class for bare/self
+       receivers. */
     {
-      int ce_ci = class_eval_reopen_class(c, id, g_cbody_direct);
+      int ce_ci = class_eval_reopen_class(c, id, w.direct);
       if (ce_ci >= 0) child_class = ce_ci;
     }
     /* [lits].each { |v| define_method("m_#{v}") { body } } -- unroll into one
        method per element. Handled wholesale; skip the generic recursion so
        the inner define_method isn't also processed as a normal call. */
-    if ((class_id >= 0 || g_struct_direct) && collect_dm_each_unroll(c, id, class_id, scope_idx)) return;
+    if ((class_id >= 0 || w.struct_direct) && collect_dm_each_unroll(c, id, &w)) { elab_walk_rest(c, id, w.pos); return; }
     /* compiler_state_int/str/sa/ia :fields -- declare ivars + synthesize the
        init/dump/set methods (the metaprogramming is native, not define_method). */
     if (class_id >= 0 && cs_macro_kind(nt_str(c->nt, id, "name"))) {
       collect_compiler_state(c, id, class_id);
+      elab_walk_rest(c, id, w.pos);
       return;
     }
     /* define_method(:literal_name) { ... }: register as a method scope.
@@ -1641,7 +1668,7 @@ static void walk_scope_in(Compiler *c, int id, int scope_idx, int class_id, int 
        function (class_id stays -1), matching `def`. */
     const char *dm_cn = nt_str(c->nt, id, "name");
     int dm_recv = nt_ref(c->nt, id, "receiver");
-    if (is_define_method_name(dm_cn) && (scope_idx > 0 || g_cbody_direct >= 0 || g_struct_direct) &&
+    if (is_define_method_name(dm_cn) && (scope_idx > 0 || w.direct >= 0 || w.struct_direct) &&
         (dm_recv < 0 || nt_kind(c->nt, dm_recv) == NK_SelfNode)) {
       int an = nt_ref(c->nt, id, "arguments"), ac = 0;
       const int *av = an >= 0 ? nt_arr(c->nt, an, "arguments", &ac) : NULL;
@@ -1671,7 +1698,7 @@ static void walk_scope_in(Compiler *c, int id, int scope_idx, int class_id, int 
        a class constant receiver, `self` in a class body, or no receiver (the
        enclosing class). An arbitrary-instance singleton has no compile-time
        class, so it is not registered (the later call rejects). */
-    int dm_cmethod = dm_is_dm && dm_sclass, dm_cls = class_id, dm_ok = dm_is_dm, dm_defer = 0;
+    int dm_cmethod = dm_is_dm && w.dm_sclass, dm_cls = class_id, dm_ok = dm_is_dm, dm_defer = 0;
     if (dm_is_dsm) {
       dm_cmethod = 1;
       NodeKind dsm_rk = nt_kind(c->nt, dm_recv);
@@ -1762,21 +1789,20 @@ static void walk_scope_in(Compiler *c, int id, int scope_idx, int class_id, int 
     }
   }
 
-  int saved_cbody = g_cbody_class_id;
-  int saved_direct = g_cbody_direct;
-  int saved_struct = g_struct_direct;
+  WalkCtx cw = { .scope = child, .cls = child_class, .proc = proc, .dead = dead,
+                 .cbody = w.cbody, .direct = w.direct, .struct_direct = w.struct_direct };
   NodeKind wk = nt_kind(c->nt, id);
   if (child != scope_idx || wk == NK_ClassNode || wk == NK_ModuleNode || wk == NK_SingletonClassNode)
-    g_struct_direct = 0;
+    cw.struct_direct = 0;
   else if ((wk == NK_ConstantWriteNode || wk == NK_LocalVariableWriteNode) && class_def_body(c, id) >= 0)
-    g_struct_direct = 1;
-  if (child_class >= 0) g_cbody_class_id = child_class;
-  /* g_cbody_direct tracks the class whose body we are *directly* in (where `self`
-     is the class). A method/block scope is entered exactly when `child` was
+    cw.struct_direct = 1;
+  if (child_class >= 0) cw.cbody = child_class;
+  /* direct is the class whose body we are *directly* in (where `self` is the
+     class). A method/block scope is entered exactly when `child` was
      reassigned (DefNode/define_method/block); there `self` is no longer the class,
      so clear it. ClassNode/ModuleNode leave child == scope_idx. */
-  if (child != scope_idx) g_cbody_direct = -1;
-  else if (child_class >= 0) g_cbody_direct = child_class;
+  if (child != scope_idx) cw.direct = -1;
+  else if (child_class >= 0) cw.direct = child_class;
 
   int pred = -1, then_body = -1, else_body = -1;
   NodeKind kind = nt_kind(c->nt, id);
@@ -1786,26 +1812,41 @@ static void walk_scope_in(Compiler *c, int id, int scope_idx, int class_id, int 
     then_body = nt_ref(c->nt, id, "statements");
     else_body = nt_ref(c->nt, id, kind == NK_UnlessNode ? "else_clause" : "subsequent");
   }
-  int nr = nt_num_refs(c->nt, id);
-  for (int i = 0; i < nr; i++) {
-    int r = nt_ref_at(c->nt, id, i);
-    int arm_dead = dead || (pred == 0 && r == then_body) || (pred == 1 && r == else_body);
-    if (r >= 0) walk_scope_in(c, r, child, child_class, proc, arm_dead);
+  /* the parts in the order they run: the refs, the arrays, then the refs
+     that run after them, a case's else and a begin's ensure (elab_ref_last),
+     each where the load phase stands there (elab_child) */
+  int nr = nt_num_refs(c->nt, id), na = nt_num_arrs(c->nt, id);
+  for (int pass = 0; pass < 3; pass++) {
+    for (int i = 0; pass != 1 && i < nr; i++) {
+      int r = nt_ref_at(c->nt, id, i);
+      if (r < 0 || elab_ref_last(c->nt, id, r) != (pass == 2)) continue;
+      WalkCtx rw = cw;
+      rw.dead = dead || (pred == 0 && r == then_body) || (pred == 1 && r == else_body);
+      rw.pos = elab_child(c->nt, id, r, &w.pos);
+      walk_child(c, r, rw);
+    }
+    for (int i = 0; pass == 1 && i < na; i++) {
+      int n = 0;
+      const int *ids = nt_arr_at(c->nt, id, i, &n);
+      for (int j = 0; j < n; j++) {
+        if (ids[j] < 0) continue;
+        WalkCtx aw = cw;
+        aw.pos = elab_child(c->nt, id, ids[j], &w.pos);
+        walk_child(c, ids[j], aw);
+      }
+    }
   }
-  int na = nt_num_arrs(c->nt, id);
-  for (int i = 0; i < na; i++) {
-    int n = 0;
-    const int *ids = nt_arr_at(c->nt, id, i, &n);
-    for (int j = 0; j < n; j++)
-      if (ids[j] >= 0) walk_scope_in(c, ids[j], child, child_class, proc, dead);
-  }
-  g_cbody_class_id = saved_cbody;
-  g_cbody_direct = saved_direct;
-  g_struct_direct = saved_struct;
 }
 
+/* A walk of `id` from outside any class body */
 void walk_scope(Compiler *c, int id, int scope_idx, int class_id) {
-  walk_scope_in(c, id, scope_idx, class_id, -1, 0);
+  walk_scope_in(c, id, (WalkCtx){ .scope = scope_idx, .cls = class_id, .proc = -1, .cbody = -1, .direct = -1, .pos = { .e = -1 } });
+}
+
+/* A statement of a file's top level, entered by the load record's walk at
+   pos (analyze_elab.c): in the file's scope, outside any class body */
+void walk_scope_stmt(Compiler *c, int stmt, int scope_idx, ElabPos pos) {
+  walk_child(c, stmt, (WalkCtx){ .scope = scope_idx, .cls = -1, .proc = -1, .cbody = -1, .direct = -1, .pos = pos });
 }
 
 static void mf_mark(Compiler *c, int mi) {
@@ -7648,7 +7689,11 @@ void register_includes(Compiler *c) {
 }
 
 int cmethod_needs_specialization(Compiler *c, int mi, int ci, int def_cls, int *has_new);
-static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci);
+static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci, const char *guard);
+static int prepend_late_stmt(Compiler *c, int ci, int body);
+static int mixin_guard_body(NodeTable *nt, int body, const char *flag, int line);
+static const char *mixin_flag_name(Compiler *c, char flag[64]);
+static void mixin_guard_flag_write(Compiler *c, int late, const char *flag);
 
 /* attr_reader/attr_accessor/attr_writer and alias_method in a MODULE body
    belong to every class that includes it, just like a plain def. The transplant
@@ -7961,8 +8006,11 @@ static void extend_alias_refuse_own(Compiler *c, int mod_id, int ci, const char 
    copy here. */
 /* `prepend`: the module goes in front of the class's own class methods
    (`singleton_class.prepend M`), as a later extend goes in front of an
-   earlier one's copy. */
-static int extend_class_with(Compiler *c, int ci, int mod_id, int inherited, int prepend) {
+   earlier one's copy.
+   `flag`: the flag buffer of a prepend that a later top-level reopening
+   makes (prepend_late_stmt), NULL otherwise; the copies hand the call to the
+   class's own method until that statement has run, as a prepend's do. */
+static int extend_class_with(Compiler *c, int ci, int mod_id, int inherited, int prepend, char flag[64]) {
   int did_clone = 0;
   int snap = c->nscopes;
   for (int ms = 0; ms < snap; ms++) {
@@ -7982,6 +8030,7 @@ static int extend_class_with(Compiler *c, int ci, int mod_id, int inherited, int
        copied in under a shadow name, in front of any module extended
        earlier. With no super there, nothing can reach the copy. */
     char *own_name = NULL;
+    const char *guard = NULL;
     char behind[256] = "";
     if (own >= 0 && !c->scopes[own].is_extend_copy && !prepend) {
       extend_alias_refuse_own(c, mod_id, ci, src->name);
@@ -8022,6 +8071,11 @@ static int extend_class_with(Compiler *c, int ci, int mod_id, int inherited, int
       free(c->scopes[own].name);
       c->scopes[own].name = strdup(shadow);
       int reached = scope_body_has_super(c, ms);
+      if (prepend && flag) {
+        /* the copy's own super reaches the method it stands in front of */
+        guard = mixin_flag_name(c, flag);
+        reached = 1;
+      }
       if (reached) comp_cprep_chain_add(cif, src->name, shadow);
       /* an earlier body of the name an alias captured, renamed to the alias
          (alias_capture_earlier_def: activesupport's `alias
@@ -8060,7 +8114,7 @@ static int extend_class_with(Compiler *c, int ci, int mod_id, int inherited, int
         NT_FOREACH_KIND(nt2, ow[k], ivid)
           if (c->nscope[ivid] == ms && nt_str(nt2, ivid, "name"))
             comp_ivar_intern(&c->classes[ci], nt_str(nt2, ivid, "name")); }
-    specialize_cmethod_for(c, ms, mod_id, ci);
+    specialize_cmethod_for(c, ms, mod_id, ci, guard);
     src = &c->scopes[ms];  /* realloc-safe */
     { int cp = comp_cmethod_in_class(c, ci, src->name);
       if (cp >= 0) c->scopes[cp].is_extend_copy = 1;
@@ -8273,12 +8327,12 @@ void register_extends(Compiler *c) {
       of Class among the singleton's ancestors, so its copies, made after,
       take the place of these */
    if (cls_mod >= 0 && (ci == cls_mod || class_is_root(c, ci))) {
-     did_clone |= extend_class_with(c, ci, cls_mod, 0, 0);
+     did_clone |= extend_class_with(c, ci, cls_mod, 0, 0, NULL);
      /* `class Class; prepend P; end`: P in front of the reopening, as an
         `extend` of it would put it (see desugar_module_prepends) */
      int pre[64];
      int np = module_prepend_list(c, cls_mod, pre, 64);
-     for (int q = np - 1; q >= 0; q--) did_clone |= extend_class_with(c, ci, pre[q], 0, 0);
+     for (int q = np - 1; q >= 0; q--) did_clone |= extend_class_with(c, ci, pre[q], 0, 0, NULL);
    }
    /* Every body that defines this class, not only the first: `extend M` is
       commonly written in a REOPENING of the class, and reading def_node alone
@@ -8290,6 +8344,11 @@ void register_extends(Compiler *c) {
     int body = class_def_body(c, cn);
     int n = 0;
     const int *stmts = body >= 0 ? nt_arr(nt, body, "body", &n) : NULL;
+    /* a singleton prepend in a reopening (prepend_late_stmt, asked once, at
+       the first): its copies answer as the class's own until that
+       statement has run */
+    int late = -2;
+    char flag[64] = "";
     for (int k = 0; k < n; k++) {
       int s = stmts[k];
       NodeKind sk = nt_kind(nt, s);
@@ -8328,9 +8387,12 @@ void register_extends(Compiler *c) {
         for (int p = c->classes[ci].parent; p >= 0 && !inherited; p = c->classes[p].parent)
           for (int bj = 0; bj < nbody && !inherited; bj++)
             if (body_cls[bj] == p) inherited = body_extends_module(c, body_node[bj], mod_id);
-        did_clone |= extend_class_with(c, ci, mod_id, inherited, (int)nt_int(nt, s, "sclass_prepend", 0));
+        int sprep = (int)nt_int(nt, s, "sclass_prepend", 0);
+        if (sprep && late == -2) late = prepend_late_stmt(c, ci, body);
+        did_clone |= extend_class_with(c, ci, mod_id, inherited, sprep, sprep && late >= 0 ? flag : NULL);
       }
     }
+    if (flag[0]) mixin_guard_flag_write(c, late, flag);
    }
   }
   /* The cloned bodies introduced new local nodes, and register_locals ran
@@ -8583,7 +8645,7 @@ static int body_tail_is_bare_new(const NodeTable *nt, int body) {
   int r = nt_ref(nt, tail, "receiver");
   return nm && sp_streq(nm, "new") && (r < 0 || nt_kind(nt, r) == NK_SelfNode);
 }
-static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci) {
+static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci, const char *guard) {
   if (comp_cmethod_in_class(c, ci, c->scopes[mi].name) >= 0) return;
   NodeTable *nt = (NodeTable *)c->nt;
   int has_new = 0;
@@ -8592,6 +8654,12 @@ static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci) {
   int new_body = src_body >= 0 ? nt_clone_subtree(nt, src_body) : -1;
   if (src_body >= 0 && new_body < 0) return;  /* clone failed: skip */
   comp_grow_node_arrays(c);
+  /* a copy a later top-level reopening makes hands the call to the class's
+     own method until that statement has run (mixin_guard_body) */
+  if (guard && new_body >= 0) {
+    new_body = mixin_guard_body(nt, new_body, guard, (int)nt_int(nt, c->scopes[mi].def_node, "node_line", 0));
+    comp_grow_node_arrays(c);
+  }
   Scope *src = &c->scopes[mi];
   Scope *dst = comp_scope_new(c, src->name, src->def_node);
   src = &c->scopes[mi];  /* realloc-safe */
@@ -8640,7 +8708,7 @@ static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci) {
     if (sub_def == ci) continue;
     int sub_new = 0;
     if (cmethod_needs_specialization(c, sub_mi, ci, sub_def, &sub_new))
-      specialize_cmethod_for(c, sub_mi, sub_def, ci);
+      specialize_cmethod_for(c, sub_mi, sub_def, ci, NULL);
   }
 }
 
@@ -8777,7 +8845,7 @@ static void specialize_super_cmethod(Compiler *c, int own, int snap) {
     if (pm < 0 || pdef < 0 || !cmethod_reaches_class_ivar(c, pm, pdef, 0)) break;
     char behind[256];
     snprintf(behind, sizeof behind, "__inc %d %s", c->classes[ci].prep_shadow_count++, own_name);
-    specialize_cmethod_for(c, pm, pdef, ci);
+    specialize_cmethod_for(c, pm, pdef, ci, NULL);
     int cp = comp_cmethod_in_class(c, ci, own_name);
     if (cp < 0 || cp == own || cp == cur) break;
     free(c->scopes[cp].name);
@@ -8861,7 +8929,7 @@ void specialize_inherited_cls_new(Compiler *c) {
           }
           int has_new = 0;
           if (cmethod_needs_specialization(c, mi, k, def_cls, &has_new))
-            specialize_cmethod_for(c, mi, def_cls, k);
+            specialize_cmethod_for(c, mi, def_cls, k, NULL);
         }
       }
       continue;
@@ -8907,7 +8975,7 @@ void specialize_inherited_cls_new(Compiler *c) {
     if (!cmethod_needs_specialization(c, mi, ci, def_cls, &has_new)) continue;
     /* Clone mi for ci and, transitively, the inherited intermediates it reaches
        (#1451). nscopes growth below stands in for the old did_clone flag. */
-    specialize_cmethod_for(c, mi, def_cls, ci);
+    specialize_cmethod_for(c, mi, def_cls, ci, NULL);
   }
   /* A Class value the analysis cannot pin (`CONTAINERS.fetch(ext).open`)
      runs an inherited class method on whichever class it holds, so its bare
@@ -8934,7 +9002,7 @@ void specialize_inherited_cls_new(Compiler *c) {
       tgt = nt2; tgt[ntgt++] = k;
     }
     if (ntgt > 0 && name_called_on_dynamic_recv(c, mi, tgt, ntgt, node_count, &an))
-      for (int t = 0; t < ntgt; t++) specialize_cmethod_for(c, mi, def_cls, tgt[t]);
+      for (int t = 0; t < ntgt; t++) specialize_cmethod_for(c, mi, def_cls, tgt[t], NULL);
     free(tgt);
   }
   /* a class's own class method whose super reaches its parent's */
@@ -9115,6 +9183,11 @@ static int mixin_guard_body(NodeTable *nt, int body, const char *flag, int line)
   nt_node_set_int(nt, seq, "node_line", line);
   return seq;
 }
+/* The flag a body's guarded copies read, named on first use. */
+static const char *mixin_flag_name(Compiler *c, char flag[64]) {
+  if (!flag[0]) snprintf(flag, 64, "$__spinel_mixin_ran_%d", ++c->n_mixin_flags);
+  return flag;
+}
 /* ...and the write that sets the flag, after top-level statement `late`, in
    its file's top level, which the load record records (the global's
    readers ask it) */
@@ -9239,8 +9312,7 @@ static void process_prepend_body(Compiler *c, int ci, int body) {
                 desugar_included_bare_builtin(c, nb, c->classes[ci].name);
               }
               if (nb >= 0 && guard) {
-                if (!flag[0]) snprintf(flag, sizeof flag, "$__spinel_mixin_ran_%d", ++c->n_mixin_flags);
-                nb = mixin_guard_body((NodeTable *)nt, nb, flag, (int)nt_int(nt, sc->def_node, "node_line", 0));
+                nb = mixin_guard_body((NodeTable *)nt, nb, mixin_flag_name(c, flag), (int)nt_int(nt, sc->def_node, "node_line", 0));
                 comp_grow_node_arrays(c);
                 sc = &c->scopes[ms_i]; dst = &c->scopes[dst_i];
                 dst->mixin_guarded = 1;

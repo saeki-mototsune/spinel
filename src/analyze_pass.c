@@ -1910,15 +1910,23 @@ static int propagate_alias_widening(Compiler *c, const LWIndex *ivw) {
     NK_ClassVariableWriteNode, NK_ConstantWriteNode };
   const NodeTable *nt = c->nt;
   AliasSide *ev = NULL;   /* pairs: ev[2i] the written name, ev[2i+1] the read one */
-  int n = 0, cap = 0;
+  int n = 0, cap = 0, *big = NULL;
   for (int wk = 0; wk < (int)(sizeof alias_writes / sizeof alias_writes[0]); wk++)
     NT_FOREACH_KIND(nt, alias_writes[wk], id) {
       /* the value is a read of the other name, or a conditional or logical
          operator whose arms read them, each its own alias (a write's value, `$b = $a = [1]`, is not taken: an ivar
          write read as a value is emitted at its value's type, not its
          slot's) */
-      int arms[16];
+      int arms_s[16], *arms = arms_s;
       int na = value_leaves_ex(c, nt_ref(nt, id, "value"), arms, 0, 16, VL_NIL);
+      /* -1 is also a full buffer: a `case` of more arms takes one as large
+         as the program, so no arm is left without its alias */
+      if (na < 0) {
+        if (!big) big = (int *)malloc(sizeof(int) * (size_t)(nt->count + 1));
+        if (!big) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+        arms = big;
+        na = value_leaves_ex(c, nt_ref(nt, id, "value"), arms, 0, nt->count + 1, VL_NIL);
+      }
       AliasSide d;
       if (na <= 0 || !alias_side(c, id, &d)) continue;
       for (int a = 0; a < na; a++) {
@@ -1953,7 +1961,7 @@ static int propagate_alias_widening(Compiler *c, const LWIndex *ivw) {
       alias_ivar_widened(c, ivw, w, top);
     }
   }
-  free(ev);
+  free(ev); free(big);
   return changed;
 }
 
@@ -3133,6 +3141,38 @@ static int push_escape_widen(Compiler *c, int id, int recv, int is_push, TyKind 
 }
 
 static int container_literals(Compiler *c, int n, int *out, int nout, int cap, int depth);
+static int value_node_or_self(const NodeTable *nt, int n);
+/* Sets the Hash literals value `v` hands over to `want`. A chain of locals
+   (`a = {...}; b = a; H = b`) is followed to its end, each write once, so
+   no depth bound leaves a literal behind it at its own variant; the rest
+   is container_literals', which also takes each one's own literals. */
+static void widen_value_hash_literals(Compiler *c, int v, TyKind want) {
+  const NodeTable *nt = c->nt;
+  int cap = 16, n = 0, done = 0;
+  int *work = (int *)malloc(sizeof(int) * (size_t)cap);
+  work[n++] = v;
+  while (done < n) {
+    int x = value_node_or_self(nt, work[done++]);
+    Scope *sc = x >= 0 && nt_kind(nt, x) == NK_LocalVariableReadNode ? comp_scope_of(c, x) : NULL;
+    const char *nm = sc ? nt_str(nt, x, "name") : NULL;
+    /* a local's own literals too: a parameter's are its callers' arguments */
+    int lits[32], nl = container_literals(c, x, lits, 0, 32, 0);
+    for (int q = 0; q < nl; q++)
+      if (nt_kind(nt, lits[q]) == NK_HashNode && lits[q] < c->node_cap && c->hash_want[lits[q]] != want)
+        comp_set_hash_want(c, lits[q], want);
+    if (!nm) continue;
+    for (int r = lw_shared_first(c, nm, (int)(sc - c->scopes)); r >= 0; r = lw_shared_next(r)) {
+      int w = lw_shared_node(r), wv = nt_ref(nt, w, "value"), seen = 0;
+      if (nt_kind(nt, w) != NK_LocalVariableWriteNode || comp_scope_of(c, w) != sc ||
+          !sp_streq(nt_str(nt, w, "name"), nm)) continue;
+      for (int q = 0; q < n && !seen; q++) seen = work[q] == wv;
+      if (seen) continue;
+      if (n == cap) { cap *= 2; work = (int *)realloc(work, sizeof(int) * (size_t)cap); }
+      work[n++] = wv;
+    }
+  }
+  free(work);
+}
 /* The Hash literals constant or global `recv` is assigned, directly or
    through a local or a plain `begin` that hands one over (`T = begin h =
    {"" => ""}; h.delete(""); h end`), are built as the Hash `want` its
@@ -3154,10 +3194,7 @@ static void widen_named_hash_literals(Compiler *c, int recv, TyKind want) {
     if (!wn || !sp_streq(gv ? comp_resolve_gvar(c, wn + 1) : wn, gv ? gn : nm)) continue;
     int v = nt_ref(nt, w, "value"), one;
     if (vp_one(nt, v, VPS_BEGIN_PLAIN, &one) == VP1_NODE) v = one;
-    int lits[32], nl = container_literals(c, v, lits, 0, 32, 0);
-    for (int q = 0; q < nl; q++)
-      if (nt_kind(nt, lits[q]) == NK_HashNode && lits[q] < c->node_cap && c->hash_want[lits[q]] != want)
-        comp_set_hash_want(c, lits[q], want);
+    widen_value_hash_literals(c, v, want);
   }
 }
 
@@ -6217,6 +6254,100 @@ static int cla_layout_arg(Compiler *c, int call, int si, Scope *sc, const int *a
   return from;
 }
 
+/* The arguments the callers of method si hand its parameter pi
+   (container_literals, the parameter case), in call order. The walk took
+   every call of the method's name, asked its targets and the argument its
+   layout passes there, at every ask for the parameter in every round; on a
+   Rails application most of its time. A call's targets are held until
+   cplan_targets_drop, and its argument holds while the node table and the
+   scopes do, so the list a walk met holds as long. It is extended only as
+   far as a walk reaches (`next`, the call to read next, or -1 at the end),
+   so each call is first asked when it was before. An inference that records
+   what it reads walks the calls itself. */
+typedef struct { int si, pi, next, n, cap; int *call, *arg; } ClpEntry;
+static ClpEntry *clp_tab; static int clp_cap, clp_n;
+static const NodeTable *clp_nt; static unsigned clp_ver, clp_gen, clp_drops; static int clp_count, clp_nscopes;
+static unsigned clp_epoch;   /* bumped by each reset: a walk's entry is gone past one */
+static int clp_holds(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  return clp_nt == nt && clp_ver == nt->version && clp_count == nt->count && clp_gen == comp_scope_index_gen() &&
+         clp_nscopes == c->nscopes && clp_drops == cplan_targets_drops();
+}
+static ClpEntry *clp_find(int si, int pi) {
+  unsigned h = ((unsigned)si * 2654435761u ^ (unsigned)pi * 97u) & (unsigned)(clp_cap - 1);
+  while (clp_tab[h].cap) {
+    if (clp_tab[h].si == si && clp_tab[h].pi == pi) return &clp_tab[h];
+    h = (h + 1) & (unsigned)(clp_cap - 1);
+  }
+  return NULL;
+}
+static ClpEntry *clp_entry(Compiler *c, int si, Scope *sc, int pi) {
+  const NodeTable *nt = c->nt;
+  if (!clp_holds(c)) {
+    for (int i = 0; i < clp_cap; i++) { free(clp_tab[i].call); free(clp_tab[i].arg); }
+    if (clp_tab) memset(clp_tab, 0, sizeof *clp_tab * (size_t)clp_cap);
+    clp_n = 0; clp_epoch++;
+    clp_nt = nt; clp_ver = nt->version; clp_count = nt->count; clp_gen = comp_scope_index_gen();
+    clp_nscopes = c->nscopes; clp_drops = cplan_targets_drops();
+  }
+  if (clp_n * 2 >= clp_cap) {
+    int ncap = clp_cap ? clp_cap * 2 : 1024;
+    ClpEntry *nv = calloc((size_t)ncap, sizeof *nv);
+    if (!nv) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < clp_cap; i++) {
+      if (!clp_tab[i].cap) continue;
+      unsigned h = ((unsigned)clp_tab[i].si * 2654435761u ^ (unsigned)clp_tab[i].pi * 97u) & (unsigned)(ncap - 1);
+      while (nv[h].cap) h = (h + 1) & (unsigned)(ncap - 1);
+      nv[h] = clp_tab[i];
+    }
+    free(clp_tab); clp_tab = nv; clp_cap = ncap;
+  }
+  unsigned h = ((unsigned)si * 2654435761u ^ (unsigned)pi * 97u) & (unsigned)(clp_cap - 1);
+  while (clp_tab[h].cap) {
+    if (clp_tab[h].si == si && clp_tab[h].pi == pi) return &clp_tab[h];
+    h = (h + 1) & (unsigned)(clp_cap - 1);
+  }
+  ClpEntry *e = &clp_tab[h];
+  e->si = si; e->pi = pi; e->n = 0; e->cap = 4;
+  e->call = malloc(sizeof(int) * (size_t)e->cap);
+  e->arg = malloc(sizeof(int) * (size_t)e->cap);
+  if (!e->call || !e->arg) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  e->next = an_calls_named_first(c, sc->name);
+  clp_n++;
+  return e;
+}
+/* Reads the next call of entry (si, pi): appends the argument it hands, if
+   it reaches the method. 0 when the asks moved what the entries hold (a
+   reset since epoch ep, or a change clp_holds sees): the call is then
+   unread. */
+static int clp_extend(Compiler *c, int si, Scope *sc, int pi, unsigned ep) {
+  const NodeTable *nt = c->nt;
+  ClpEntry *e = clp_find(si, pi);
+  int call = e->next;
+  int targets[CPT_MAX], nt_ = cplan_targets(c, call, targets, CPT_MAX), hit = 0;
+  for (int t = 0; t < nt_ && !hit; t++) hit = targets[t] == si;
+  int from = -1, an = 0;
+  const int *av = NULL;
+  if (hit) {
+    int a = nt_ref(nt, call, "arguments");
+    av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
+    from = cla_layout_arg(c, call, si, sc, av, an, pi);
+  }
+  if (clp_epoch != ep || !clp_holds(c)) return 0;
+  e = clp_find(si, pi);   /* (an ask may have grown the table) */
+  if (e->next != call) return 1;   /* (a walk the asks made read it) */
+  e->next = an_calls_named_next(call);
+  if (from < 0 || from >= an) return 1;
+  if (e->n == e->cap) {
+    e->cap *= 2;
+    e->call = realloc(e->call, sizeof(int) * (size_t)e->cap);
+    e->arg = realloc(e->arg, sizeof(int) * (size_t)e->cap);
+    if (!e->call || !e->arg) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  e->call[e->n] = call; e->arg[e->n++] = av[from];
+  return 1;
+}
+
 /* Collects into out[] the container literals `n` can evaluate to, as far
    as the program shows: a literal itself, the literals a variable is
    assigned, and, for an element read `x[k]` (`fetch`, `first`, `last`),
@@ -6270,7 +6401,28 @@ static int container_literals(Compiler *c, int n, int *out, int nout, int cap, i
     if (lv && lv->is_param && !lv->is_block_param && sc->name && sc->def_node >= 0) {
       int pi = -1;
       for (int i = 0; i < sc->nparams && pi < 0; i++) if (sc->pnames[i] && sp_streq(sc->pnames[i], nm)) pi = i;
-      for (int call = pi >= 0 ? an_calls_named_first(c, sc->name) : -1; call >= 0 && nout < cap;
+      /* the held arguments (clp_entry), as long as they hold; past a
+         change the walk goes on from the call it was at */
+      int resume = -2;   /* (the call to go on from; -2: from the first) */
+      if (pi >= 0 && !imemo_dep_on) {
+        ClpEntry *e = clp_entry(c, si, sc, pi);
+        unsigned ep = clp_epoch;
+        for (int q = 0; nout < cap && resume == -2; q++) {
+          while (q == e->n && e->next >= 0) {
+            int was = e->next;
+            if (!clp_extend(c, si, sc, pi, ep)) { resume = was; break; }
+            e = clp_find(si, pi);
+          }
+          if (resume != -2 || q == e->n) break;
+          int call = e->call[q];
+          nout = container_literals(c, e->arg[q], out, nout, cap, depth + 1);
+          if (clp_epoch != ep || !clp_holds(c)) resume = an_calls_named_next(call);
+          else e = clp_find(si, pi);   /* (the walk may have grown the table) */
+        }
+        if (resume == -2) return nout;
+      }
+      for (int call = pi < 0 ? -1 : resume != -2 ? resume : an_calls_named_first(c, sc->name);
+           call >= 0 && nout < cap;
            call = an_calls_named_next(call)) {
         int targets[CPT_MAX], nt_ = cplan_targets(c, call, targets, CPT_MAX), hit = 0;
         for (int t = 0; t < nt_ && !hit; t++) hit = targets[t] == si;
@@ -12216,7 +12368,7 @@ void check_block_rest_support(Compiler *c) {
           rt == TY_ENUMERATOR || rt == TY_STRING)) continue;
     {
       /* report the param as written, not the shadow rename's slot name */
-      char disp[128]; snprintf(disp, sizeof disp, "%.*s", (int)block_param_written_len(rn), rn);
+      char disp[128]; snprintf(disp, sizeof disp, "%.*s", (int)block_param_written_len(c, rn), rn);
       long long fid = nt_int(nt, id, "node_file", -1);
       const char *file = fid >= 0 ? nt_file_path(nt, (int)fid) : NULL;
       if (!file) file = nt->source_file ? nt->source_file : "source.rb";
@@ -14520,96 +14672,93 @@ static int bdp_has_name(NodeTable *nt, int node) {
    so the receiver's kind is known; the caller re-runs the fixpoint. */
 
 
-int desugar_block_destructure_params(Compiler *c) {
-  NodeTable *nt = (NodeTable *)c->nt;
-  int changed = 0;
-  int n0 = nt->count;
-  for (int L = 0; L < n0; L++) {
-    NodeKind ty_k = nt_kind(nt, L);
-    /* DefNode too: `def m((a, b))` destructures an array parameter with the
-       same MultiTargetNode shape blocks use (its "parameters" is the bare
-       ParametersNode; the conditional unwrap below handles both). */
-    if ((ty_k != NK_BlockNode && ty_k != NK_LambdaNode &&
-                ty_k != NK_DefNode)) continue;
-    int bp = nt_ref(nt, L, "parameters");
-    if (bp < 0) continue;
-    NodeKind bpk = nt_kind(nt, bp);
-    int pn = (bpk == NK_BlockParametersNode) ? nt_ref(nt, bp, "parameters") : bp;
-    if (pn < 0) continue;
-    NodeKind pnk = nt_kind(nt, pn);
-    if (pnk != NK_ParametersNode) continue;
-    int nreq = 0; const int *reqs0 = nt_arr(nt, pn, "requireds", &nreq);
-    if (nreq == 0) continue;
-    int has_multi = 0;
-    for (int k = 0; k < nreq; k++) {
-      NodeKind rk = nt_kind(nt, reqs0[k]);
-      if (rk == NK_MultiTargetNode) { has_multi = 1; break; }
-    }
-    if (!has_multi) continue;
-    /* copy requireds: nt_new_node below may realloc the node storage reqs0 points into */
-    int *reqs = malloc(sizeof(int) * nreq);
-    if (!reqs) continue;
-    memcpy(reqs, reqs0, sizeof(int) * nreq);
-    int body = nt_ref(nt, L, "body");
+/* The ParametersNode of the block, lambda or def L when one of its required
+   parameters is a destructuring one (a MultiTargetNode), else -1. DefNode
+   too: `def m((a, b))` destructures an array parameter with the same
+   MultiTargetNode shape blocks use (its "parameters" is the bare
+   ParametersNode; the conditional unwrap handles both). */
+static int bdp_params(const NodeTable *nt, int L) {
+  int bp = nt_ref(nt, L, "parameters");
+  if (bp < 0) return -1;
+  int pn = (nt_kind(nt, bp) == NK_BlockParametersNode) ? nt_ref(nt, bp, "parameters") : bp;
+  if (pn < 0 || nt_kind(nt, pn) != NK_ParametersNode) return -1;
+  int nreq = 0; const int *reqs0 = nt_arr(nt, pn, "requireds", &nreq);
+  for (int k = 0; k < nreq; k++)
+    if (nt_kind(nt, reqs0[k]) == NK_MultiTargetNode) return pn;
+  return -1;
+}
 
-    int *newreqs = malloc(sizeof(int) * nreq);
-    int *mws = malloc(sizeof(int) * nreq);
-    if (!newreqs || !mws) { free(reqs); free(newreqs); free(mws); continue; }
-    int nmw = 0, ok = 1;
-    for (int k = 0; k < nreq && ok; k++) {
-      NodeKind rk = nt_kind(nt, reqs[k]);
-      if (rk != NK_MultiTargetNode) { newreqs[k] = reqs[k]; continue; }
-      int bind = bdp_has_name(nt, reqs[k]);
-      char nm[64]; snprintf(nm, sizeof nm, "__destr_%s_%d", comp_node_tag(c, L), k);
-      int rp = nt_new_node(nt, "RequiredParameterNode");
-      if (rp < 0) { ok = 0; break; }
-      nt_node_set_str(nt, rp, "name", nm);
-      newreqs[k] = rp;
-      if (!bind) continue;  /* anonymous splat: nothing to assign */
-      int rd = nt_new_node(nt, "LocalVariableReadNode");
-      int mw = nt_new_node(nt, "MultiWriteNode");
-      if (rd < 0 || mw < 0) { ok = 0; break; }
-      nt_node_set_str(nt, rd, "name", nm);
-      if (!bdp_fill_targets(nt, reqs[k], mw)) { ok = 0; break; }
-      nt_node_set_ref(nt, mw, "value", rd);
-      /* the assignment is ours, not the program's: a body that had no
-         statements still answers nil (#3679) */
-      nt_node_set_int(nt, mw, "destr_splice", 1);
-      mws[nmw++] = mw;
-    }
-    if (!ok) { free(reqs); free(newreqs); free(mws); continue; }
-    /* prepend the destructuring assignments (in param order) to the block body */
-    if (nmw > 0) {
-      int is_stmts = body >= 0 && nt_kind(nt, body) == NK_StatementsNode;
-      int obn = 0; const int *ob0 = is_stmts ? nt_arr(nt, body, "body", &obn) : NULL;
-      int keep_body = (!is_stmts && body >= 0) ? 1 : 0;
-      int cnt = nmw + (is_stmts ? obn : keep_body);
-      int *bb = malloc(sizeof(int) * (cnt > 0 ? cnt : 1));
-      if (!bb) ok = 0;
-      else {
-        for (int i = 0; i < nmw; i++) bb[i] = mws[i];
-        if (is_stmts) {
-          for (int i = 0; i < obn; i++) bb[nmw + i] = ob0[i];
-          nt_node_set_arr(nt, body, "body", bb, cnt);
-        }
-        else {
-          if (keep_body) bb[nmw] = body;
-          int st = nt_new_node(nt, "StatementsNode");
-          if (st < 0) ok = 0;
-          else { nt_node_set_arr(nt, st, "body", bb, cnt); nt_node_set_ref(nt, L, "body", st); }
-        }
-        free(bb);
-      }
-    }
-    /* Only swap in the throwaway params once the assignments are prepended, so a
-       mid-transform OOM never leaves params rebound with nothing destructured. */
-    if (!ok) { free(reqs); free(newreqs); free(mws); continue; }
-    nt_node_set_arr(nt, pn, "requireds", newreqs, nreq);
-    changed = 1;
-    free(reqs); free(newreqs); free(mws);
+int desugar_block_destructure_params_left(Compiler *c, LowerCtx *lc, int id) {
+  return bdp_params(c->nt, id) >= 0;
+}
+
+int desugar_block_destructure_params_at(Compiler *c, LowerCtx *lc, int id) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  int L = id;
+  int pn = bdp_params(nt, L);
+  if (pn < 0) return 0;
+  int nreq = 0; const int *reqs0 = nt_arr(nt, pn, "requireds", &nreq);
+  /* copy requireds: nt_new_node below may realloc the node storage reqs0 points into */
+  int *reqs = malloc(sizeof(int) * nreq);
+  if (!reqs) return 0;
+  memcpy(reqs, reqs0, sizeof(int) * nreq);
+  int body = nt_ref(nt, L, "body");
+
+  int *newreqs = malloc(sizeof(int) * nreq);
+  int *mws = malloc(sizeof(int) * nreq);
+  if (!newreqs || !mws) { free(reqs); free(newreqs); free(mws); return 0; }
+  int nmw = 0, ok = 1;
+  for (int k = 0; k < nreq && ok; k++) {
+    NodeKind rk = nt_kind(nt, reqs[k]);
+    if (rk != NK_MultiTargetNode) { newreqs[k] = reqs[k]; continue; }
+    int bind = bdp_has_name(nt, reqs[k]);
+    char nm[64]; snprintf(nm, sizeof nm, "__destr_%s_%d", comp_node_tag(c, L), k);
+    int rp = nt_new_node(nt, "RequiredParameterNode");
+    if (rp < 0) { ok = 0; break; }
+    nt_node_set_str(nt, rp, "name", nm);
+    newreqs[k] = rp;
+    if (!bind) continue;  /* anonymous splat: nothing to assign */
+    int rd = nt_new_node(nt, "LocalVariableReadNode");
+    int mw = nt_new_node(nt, "MultiWriteNode");
+    if (rd < 0 || mw < 0) { ok = 0; break; }
+    nt_node_set_str(nt, rd, "name", nm);
+    if (!bdp_fill_targets(nt, reqs[k], mw)) { ok = 0; break; }
+    nt_node_set_ref(nt, mw, "value", rd);
+    /* the assignment is ours, not the program's: a body that had no
+       statements still answers nil (#3679) */
+    nt_node_set_int(nt, mw, "destr_splice", 1);
+    mws[nmw++] = mw;
   }
-  if (changed) comp_grow_node_arrays(c);
-  return changed;
+  if (!ok) { free(reqs); free(newreqs); free(mws); return 0; }
+  /* prepend the destructuring assignments (in param order) to the block body */
+  if (nmw > 0) {
+    int is_stmts = body >= 0 && nt_kind(nt, body) == NK_StatementsNode;
+    int obn = 0; const int *ob0 = is_stmts ? nt_arr(nt, body, "body", &obn) : NULL;
+    int keep_body = (!is_stmts && body >= 0) ? 1 : 0;
+    int cnt = nmw + (is_stmts ? obn : keep_body);
+    int *bb = malloc(sizeof(int) * (cnt > 0 ? cnt : 1));
+    if (!bb) ok = 0;
+    else {
+      for (int i = 0; i < nmw; i++) bb[i] = mws[i];
+      if (is_stmts) {
+        for (int i = 0; i < obn; i++) bb[nmw + i] = ob0[i];
+        nt_node_set_arr(nt, body, "body", bb, cnt);
+      }
+      else {
+        if (keep_body) bb[nmw] = body;
+        int st = nt_new_node(nt, "StatementsNode");
+        if (st < 0) ok = 0;
+        else { nt_node_set_arr(nt, st, "body", bb, cnt); nt_node_set_ref(nt, L, "body", st); }
+      }
+      free(bb);
+    }
+  }
+  /* Only swap in the throwaway params once the assignments are prepended, so a
+     mid-transform OOM never leaves params rebound with nothing destructured. */
+  if (!ok) { free(reqs); free(newreqs); free(mws); return 0; }
+  nt_node_set_arr(nt, pn, "requireds", newreqs, nreq);
+  free(reqs); free(newreqs); free(mws);
+  return 1;
 }
 
 /* The assignment of `rd` to a single `for` target that is not a local: a
@@ -14688,49 +14837,47 @@ static int dfi_local_index(NodeTable *nt, int idx) {
    assigns only plain locals, so any other index binds a fresh local and the
    body opens by assigning it to the real target -- a plain write for one
    target, a multiple assignment for several. */
-int desugar_for_nonlocal_index(Compiler *c) {
+int desugar_for_nonlocal_index_left(Compiler *c, LowerCtx *lc, int id) {
   NodeTable *nt = (NodeTable *)c->nt;
-  int changed = 0;
-  int n0 = nt->count;
-  for (int F = 0; F < n0; F++) {
-    NodeKind k = nt_kind(nt, F);
-    if (k != NK_ForNode) continue;
-    int idx = nt_ref(nt, F, "index");
-    if (idx < 0 || dfi_local_index(nt, idx)) continue;
-    char nm[48]; snprintf(nm, sizeof nm, "__for_%s", comp_node_tag(c, F));
-    int lt = nt_new_node(nt, "LocalVariableTargetNode");
-    int rd = lt >= 0 ? nt_new_node(nt, "LocalVariableReadNode") : -1;
-    if (rd < 0) continue;
-    nt_node_set_str(nt, lt, "name", nm);
-    nt_node_set_str(nt, rd, "name", nm);
-    int w;
-    NodeKind ik = nt_kind(nt, idx);
-    if (ik == NK_MultiTargetNode) {
-      w = nt_new_node(nt, "MultiWriteNode");
-      if (w < 0 || !bdp_fill_targets(nt, idx, w)) continue;
-      nt_node_set_ref(nt, w, "value", rd);
-      nt_node_set_int(nt, F, "for_packed", 1);
-    }
-    else w = dfi_single_write(nt, idx, rd);
-    if (w < 0) continue;
-    int body = nt_ref(nt, F, "statements");
-    int on = 0; const int *ob = body >= 0 ? nt_arr(nt, body, "body", &on) : NULL;
-    int *bb = malloc(sizeof(int) * (on + 1));
-    if (!bb) continue;
-    bb[0] = w;
-    for (int i = 0; i < on; i++) bb[i + 1] = ob[i];
-    if (body < 0) {
-      body = nt_new_node(nt, "StatementsNode");
-      if (body < 0) { free(bb); continue; }
-      nt_node_set_ref(nt, F, "statements", body);
-    }
-    nt_node_set_arr(nt, body, "body", bb, on + 1);
-    free(bb);
-    nt_node_set_ref(nt, F, "index", lt);
-    changed = 1;
+  int idx = nt_ref(nt, id, "index");
+  return idx >= 0 && !dfi_local_index(nt, idx);
+}
+int desugar_for_nonlocal_index_at(Compiler *c, LowerCtx *lc, int id) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  int F = id;
+  if (!desugar_for_nonlocal_index_left(c, lc, id)) return 0;
+  int idx = nt_ref(nt, F, "index");
+  char nm[48]; snprintf(nm, sizeof nm, "__for_%s", comp_node_tag(c, F));
+  int lt = nt_new_node(nt, "LocalVariableTargetNode");
+  int rd = lt >= 0 ? nt_new_node(nt, "LocalVariableReadNode") : -1;
+  if (rd < 0) return 0;
+  nt_node_set_str(nt, lt, "name", nm);
+  nt_node_set_str(nt, rd, "name", nm);
+  int w;
+  NodeKind ik = nt_kind(nt, idx);
+  if (ik == NK_MultiTargetNode) {
+    w = nt_new_node(nt, "MultiWriteNode");
+    if (w < 0 || !bdp_fill_targets(nt, idx, w)) return 0;
+    nt_node_set_ref(nt, w, "value", rd);
+    nt_node_set_int(nt, F, "for_packed", 1);
   }
-  if (changed) comp_grow_node_arrays(c);
-  return changed;
+  else w = dfi_single_write(nt, idx, rd);
+  if (w < 0) return 0;
+  int body = nt_ref(nt, F, "statements");
+  int on = 0; const int *ob = body >= 0 ? nt_arr(nt, body, "body", &on) : NULL;
+  int *bb = malloc(sizeof(int) * (on + 1));
+  if (!bb) return 0;
+  bb[0] = w;
+  for (int i = 0; i < on; i++) bb[i + 1] = ob[i];
+  if (body < 0) {
+    body = nt_new_node(nt, "StatementsNode");
+    if (body < 0) { free(bb); return 0; }
+    nt_node_set_ref(nt, F, "statements", body);
+  }
+  nt_node_set_arr(nt, body, "body", bb, on + 1);
+  free(bb);
+  nt_node_set_ref(nt, F, "index", lt);
+  return 1;
 }
 
 /* A block parameter no write site in its scope assigns. Its type comes from

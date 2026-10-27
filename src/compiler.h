@@ -1357,6 +1357,8 @@ typedef struct {
 
   ClassInfo *classes;
   int nclasses, cclasses;
+  int *class_head, *class_next, class_buckets;   /* name -> class index (comp_class_index) */
+  unsigned char class_hash_check;   /* SPINEL_ELAB_CHECK: each lookup also scans the classes */
   int object_standin;   /* +1-based index (0 = none) of the empty root class an
                           `o = Object.new` binding's singleton subclass stands
                           on: Object has no user class to subclass. It answers
@@ -1608,6 +1610,23 @@ typedef struct {
      which desugar_splat_view_scalars rewrites once typed (-1 once seen) */
   int *splat_views;
   int nsplat_views;
+  /* the slot names desugar_reassigned_block_params invents, each with the
+     length of the name it stands for (reassigned_param_written_len) */
+  char **rbp_slot_names;
+  size_t *rbp_slot_lens;
+  int nrbp_slots;
+  /* the names the shadow rename invents for block parameters, each with the
+     length of the name the program wrote (block_param_written_len) and the
+     block it was invented for: an open table of mask+1 slots, nbp used */
+  char **bp_name;
+  size_t *bp_len;
+  int *bp_blk;    /* the block each was invented for (block_param_made_for) */
+  unsigned bp_mask;
+  int nbp;
+  /* the names the program wrote that hold `__bp` or `__bq`, collected when
+     the first invented name is made (bp_user_uses) */
+  char **bp_user;
+  int nbp_user, bp_user_built;
 } Compiler;
 enum { PRES_UNMARKED = 1, PRES_REMOVED = 2 };
 
@@ -1668,6 +1687,7 @@ int comp_class_extends_any(Compiler *c, int ci);
 int comp_lvw_next(const Compiler *c, int w);
 int comp_lvw_first_sc(Compiler *c, int scope_idx, const char *name);
 int comp_lvw_next_sc(const Compiler *c, int w);
+int comp_lvw_any_sc(Compiler *c, int scope_idx, const char *name);
 int comp_scall_first(Compiler *c, int scope_idx);
 int comp_scall_next(const Compiler *c, int u);
 int comp_bcall_first(Compiler *c, int scope_idx);

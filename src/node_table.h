@@ -93,7 +93,44 @@ typedef struct {
   int counts_cap, ncounts;
   /* the analysis pass appending nodes now (nt_set_pass), NULL outside one */
   const char *pass;
+  /* The ids of each kind, ascending (nt_nodes_of_kind): kind k's are
+     kind_ids[k][0 .. kind_n[k]), over the nodes below kind_count; NULL
+     until the first ask. kind_moved notes the nodes retyped since the last
+     ask, as (id, kind listed under) pairs; kind_live counts the open
+     NT_FOREACH_KIND loops, and kind_retired holds the arrays they may still
+     be reading. */
+  int **kind_ids;
+  int *kind_n, *kind_cap;
+  int kind_count;
+  int *kind_moved, nkind_moved, ckind_moved;
+  int kind_live;
+  int **kind_retired, nkind_retired, ckind_retired;
+  /* the class or module body that holds each node (fwd_lex_parent), made as
+     far as its questions need; NULL until the first */
+  struct NtHolders *holders;
 } NodeTable;
+
+/* An index of the tree kept on the table it was made of: for each node, the
+   class or module whose body holds it as a statement (or as the def a
+   visibility call wraps), the first such in node order before it. It stays
+   valid while the table's count, version and edits are the ones it saw
+   (ver, edits, cnt), and an entry counts when it carries the stamp `cur`, so
+   an edit clears nothing. The holders are entered in node order, statement by
+   statement, only as far as a question needs: the holders before `hi`, and
+   the first `k` statements of that one's body `bv`, of `bn` statements (-1:
+   not read yet). Freed with the table. */
+struct NtHolders {
+  int *par;
+  unsigned *stamp;
+  int cap;
+  unsigned cur;
+  int hi, k;
+  const int *bv;
+  int bn;
+  unsigned ver;
+  unsigned long edits;
+  int cnt;
+};
 
 /* The roots of the program's files, entry first (see file_roots). */
 static inline int nt_nroots(const NodeTable *nt) { return nt->nfile_roots ? nt->nfile_roots : 1; }
@@ -145,7 +182,7 @@ static inline NodeKind nt_kind(const NodeTable *nt, int id) {
   return k ? (NodeKind)(k - 1) : nt_kind_resolve(nt, id);
 }
 
-/* Node ids of a given kind, in ascending id order (cached per node table).
+/* Node ids of a given kind, in ascending id order (the table's kind index).
    Lets a pass iterate only the nodes it cares about instead of scanning the
    whole table and filtering by kind. *count receives the number of ids. */
 const int *nt_nodes_of_kind(const NodeTable *nt, NodeKind k, int *count);
@@ -154,18 +191,18 @@ const int *nt_nodes_of_kind(const NodeTable *nt, NodeKind k, int *count);
      NT_FOREACH_KIND(nt, NK_CallNode, id) { ... use id ... }
    Replaces `for (int id=0; id<nt->count; id++) { if (kind!=K) continue; ... }`.
    The inner one-shot loop scopes IDV; nesting/multiple uses don't collide. */
-typedef struct { const int *ids; int n, i, id; } NtKindIter;
-/* A loop body may append nodes (a desugar pass does) and, through anything
-   that asks for a kind's ids again, rebuild the cache the iterator is reading.
-   The cache keeps a count of live iterators and retires a superseded id
-   array instead of freeing it while one is open; the iterator's cleanup
-   (run at the loop's end, a break or a return alike) is what lets the
-   retired arrays go. */
-void nt_kind_iter_open(void);
+typedef struct { const NodeTable *nt; const int *ids; int n, i, id; } NtKindIter;
+/* A loop body may append or retype nodes (a desugar pass does) and, through
+   anything that asks for a kind's ids again, replace the array the iterator
+   is reading. The table keeps a count of its live iterators and retires a
+   superseded id array instead of freeing it while one is open; the
+   iterator's cleanup (run at the loop's end, a break or a return alike) is
+   what lets the retired arrays go. */
+void nt_kind_iter_open(const NodeTable *nt);
 void nt_kind_iter_close(NtKindIter *it);
 static inline NtKindIter nt_kind_iter_begin(const NodeTable *nt, NodeKind k) {
-  NtKindIter it; it.ids = nt_nodes_of_kind(nt, k, &it.n); it.i = 0; it.id = -1;
-  nt_kind_iter_open();
+  NtKindIter it; it.nt = nt; it.ids = nt_nodes_of_kind(nt, k, &it.n); it.i = 0; it.id = -1;
+  nt_kind_iter_open(nt);
   return it;
 }
 static inline int nt_kind_iter_next(NtKindIter *it) {
@@ -199,6 +236,8 @@ void nt_put_file(NodeTable *nt, int fid, const char *path);
    SOURCE_FILE and FILE header lines, then each node's N line followed by
    its S, I, F, R and A lines, in id order. --dump-ast writes it. */
 void nt_dump(const NodeTable *nt, FILE *out);
+/* A hash of every node's type, content and fields (SPINEL_LOWER_CHECK). */
+unsigned long long nt_content_hash(const NodeTable *nt);
 
 void nt_free(NodeTable *nt);
 /* Renumber the nodes to an order: order[k] is the id node k had (node_table.c). */

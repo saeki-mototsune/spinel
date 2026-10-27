@@ -7777,7 +7777,7 @@ static void emit_arg_or_default_fill(Compiler *c, Scope *m, int idx, int provide
         return;
       }
       /* Bare call inside a class/module body: analyze may not have resolved the
-         type because g_cbody_class_id is not set during fixpoint. Look it up now. */
+         type. Look it up now. */
       if (at == TY_UNKNOWN && g_class_body_id >= 0) {
         const char *ptn = nt_type(c->nt, provided);
         if (ptn && sp_streq(ptn, "CallNode") && nt_ref(c->nt, provided, "receiver") < 0) {
@@ -9753,7 +9753,7 @@ void emit_args_before(Compiler *c, const int *argv, int argc, const int *after, 
 /* See codegen_internal.h. */
 void emit_args_before_range_ends(Compiler *c, const int *argv, int argc, Buf *b) {
   int sv = g_arg_range_ends;
-  g_arg_range_ends = 1;
+  g_arg_range_ends = argc == 1;
   emit_args_before(c, argv, argc, NULL, 0, b);
   g_arg_range_ends = sv;
 }

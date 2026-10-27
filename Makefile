@@ -327,7 +327,7 @@ build/csrc/analyze_desugar.o build/csrc-work/analyze_desugar.o build/csrc/codege
 SPINEL_OBJ  = build/csrc/node_table.o build/csrc/types.o build/csrc/compiler.o \
                build/csrc/ffi_spec.o build/csrc/ct_value.o build/csrc/ct_eval.o build/csrc/analyze_ct.o \
                build/csrc/analyze.o build/csrc/analyze_util.o build/csrc/analyze_infer.o build/csrc/analyze_infer_recv.o \
-               build/csrc/analyze_cext.o build/csrc/analyze_scope.o build/csrc/analyze_pass.o build/csrc/analyze_desugar.o build/csrc/analyze_nil.o build/csrc/analyze_cls.o build/csrc/analyze_arm.o build/csrc/analyze_const.o build/csrc/analyze_program.o build/csrc/analyze_elab.o build/csrc/analyze_share.o build/csrc/repr.o build/csrc/holder.o build/csrc/codegen.o build/csrc/codegen_util.o build/csrc/ty_traits_check.o \
+               build/csrc/analyze_cext.o build/csrc/analyze_scope.o build/csrc/analyze_pass.o build/csrc/analyze_desugar.o build/csrc/analyze_nil.o build/csrc/analyze_cls.o build/csrc/analyze_arm.o build/csrc/analyze_const.o build/csrc/analyze_program.o build/csrc/analyze_elab.o build/csrc/analyze_lower.o build/csrc/analyze_share.o build/csrc/repr.o build/csrc/holder.o build/csrc/codegen.o build/csrc/codegen_util.o build/csrc/ty_traits_check.o \
                build/csrc/codegen_fold.o build/csrc/codegen_call.o build/csrc/codegen_call_poly.o build/csrc/codegen_call_method.o build/csrc/codegen_call_io.o build/csrc/codegen_call_kernel.o build/csrc/codegen_call_exception.o build/csrc/codegen_call_module.o build/csrc/codegen_call_string.o build/csrc/codegen_call_class.o build/csrc/codegen_call_operator.o build/csrc/codegen_call_object.o build/csrc/codegen_ops.o build/csrc/codegen_call_concurrency.o build/csrc/codegen_call_numeric.o build/csrc/codegen_call_hash.o build/csrc/codegen_call_array.o build/csrc/codegen_view.o build/csrc/builtin_ops.o build/csrc/builtin_names.o build/csrc/codegen_call_recv.o build/csrc/codegen_iter.o build/csrc/call_plan.o build/csrc/value_pos.o build/csrc/codegen_poly_plan.o build/csrc/share_plan.o build/csrc/codegen_str.o \
                build/csrc/codegen_expr.o build/csrc/codegen_stmt.o build/csrc/csplit.o build/csrc/main.o
 # The decision registry (--decisions, --decisions-log; `make decisions-test`).
@@ -4548,6 +4548,8 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	  grep -q 'SP_TU_NO_POLY_VALUES' "$$tmp/npu.c" || { echo "infer-test: FAIL (code the program never runs counted as a poly value)"; ok=0; }; \
 	  $(SPINEL) $$flags test/no_poly_values_dropped.rb -c --no-line-map -o "$$tmp/npd.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (no_poly_values_dropped: -c)"; ok=0; }; \
 	  grep -q 'SP_TU_NO_POLY_VALUES' "$$tmp/npd.c" || { echo "infer-test: FAIL (a value the program throws away counted as a poly value)"; ok=0; }; \
+	  $(SPINEL) $$flags test/no_poly_values_program_tail.rb -c --no-line-map -o "$$tmp/npt.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (no_poly_values_program_tail: -c)"; ok=0; }; \
+	  grep -q 'SP_TU_NO_POLY_VALUES' "$$tmp/npt.c" && grep -q 'static sp_Box sp_Box_new(' "$$tmp/npt.c" || { echo "infer-test: FAIL (the program's last statement counted as a value it answers)"; ok=0; }; \
 	  $(SPINEL) $$flags -e 'module Host' -e '  ffi_func :abs, [:int], :int' -e 'end' -e 'module Fn' -e '  def self.run = Host.abs(-3)' -e 'end' -e 'p Fn.run' -c --no-line-map -o "$$tmp/npf.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (an ffi_func program: -c)"; ok=0; }; \
 	  grep -q 'SP_TU_NO_POLY_VALUES' "$$tmp/npf.c" || { echo "infer-test: FAIL (an ffi_func's argument list counted as a poly value)"; ok=0; }; \
 	  for t in $(patsubst test/%.rb,%,$(shell grep -l '^\# spinel: infer-ivar-get$$' test/*.rb)); do \
@@ -4589,6 +4591,8 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	$(SPINEL) test/hash_one_class_value_unbox.rb -c --no-line-map -o "$$tmp/hcu.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (hash_one_class_value_unbox: -c)"; ok=0; }; \
 	awk '/^static inline void \*sp_poly_unbox_cls\(.*\)\{/,/^}/' "$$tmp/hcu.c" > "$$tmp/hcu_u.c"; \
 	grep -Eq 'sp_poly_unbox_cls\(sp_StrPolyHash_get\(lv_h, (lv_key|SP_STR_B\(\(lv_key \? sp_String_cstr\(lv_key\) : NULL\)\))\), 0,' "$$tmp/hcu.c" && grep -q 'v.cls_id==cls))return v.v.p;' "$$tmp/hcu_u.c" && ! grep -q 'sp_class_le' "$$tmp/hcu_u.c" || { echo "infer-test: FAIL (a one-class Hash's object read walks the class chain instead of checking the class id inline)"; ok=0; }; \
+	$(SPINEL) test/block_param_walk_name_collision.rb -c --no-line-map -o "$$tmp/bpc.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (block_param_walk_name_collision: -c)"; ok=0; }; \
+	grep -Eq 'sp_Pt \* lv_pt__bp[0-9]+ = NULL;' "$$tmp/bpc.c" || { echo "infer-test: FAIL (a write to a local whose name hashes alike boxed an object walk's block parameter)"; ok=0; }; \
 	$(SPINEL) test/obj_array_self_ref_walk.rb -c --no-line-map -o "$$tmp/osr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (obj_array_self_ref_walk: -c)"; ok=0; }; \
 	grep -q 'sp_PtrArray \* iv_kids;' "$$tmp/osr.c" && grep -q 'sp_PtrArray \* lv_q = NULL;' "$$tmp/osr.c" && grep -q 'sp_PolyArray \* iv_items;' "$$tmp/osr.c" || { echo "infer-test: FAIL (a tree walk ending in each made an object Array polymorphic)"; ok=0; }; \
 	$(SPINEL) test/boxed_recv_class_set_binding.rb -c --no-line-map -o "$$tmp/bcs.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (boxed_recv_class_set_binding: -c)"; ok=0; }; \
@@ -4965,7 +4969,7 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -q 'sp_int_mul(lv_g, lv_h)' "$$tmp/ysr.c" && grep -q 'sp_box_int(lv_g)' "$$tmp/ysr.c" || { echo "infer-test: FAIL (yield(*pair) of a literal local no one changes binds a nil it cannot hold)"; ok=0; }; \
 	$(SPINEL) test/infer/array_nil_flag_plain_store.rb -c --no-line-map -o "$$tmp/anf.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (array_nil_flag_plain_store: -c)"; ok=0; }; \
 	! grep -q 'sp_IntArray_set_nilable(lv_a, \|sp_IntArray_push_nilable(lv_b, \|sp_FloatArray_set_nilable(lv_f, ' "$$tmp/anf.c" && grep -q '\] = _t[0-9]*; else sp_IntArray_set(lv_a, ' "$$tmp/anf.c" && grep -q 'sp_IntArray_push(lv_b, ' "$$tmp/anf.c" && grep -q 'sp_FloatArray_set(lv_f, ' "$$tmp/anf.c" || { echo "infer-test: FAIL (a loop storing numbers into a typed array took the nil-flag-setting store)"; ok=0; }; \
-	grep -q 'sp_IntArray_push_nilable(lv_c, sp_IntArray_oget(lv_a, ' "$$tmp/anf.c" && grep -q 'sp_IntArray_push_nilable(lv_q, sp_IntArray_pop_o(lv_b))' "$$tmp/anf.c" && grep -q 'sp_IntArray_push(_t[0-9]*, self->iv_v)\|sp_IntArray_push(lv_out, self->iv_v)' "$$tmp/anf.c" || { echo "infer-test: FAIL (copying an element or an ivar into a typed array took the nil-flag-setting store)"; ok=0; }; \
+	grep -q 'sp_IntArray_push_nilable(lv_c, sp_IntArray_oget(lv_a, ' "$$tmp/anf.c" && grep -q 'sp_IntArray_push_nilable(lv_q, sp_IntArray_pop_o(lv_b))' "$$tmp/anf.c" && grep -q 'sp_IntArray_push(_t[0-9]*, self->iv_v)\|sp_IntArray_push(lv_out, self\(->\|\.\)iv_v)' "$$tmp/anf.c" || { echo "infer-test: FAIL (copying an element or an ivar into a typed array took the nil-flag-setting store)"; ok=0; }; \
 	grep -q 'sp_IntArray_sum(sp_IntArray_nil_sum_if_flagged(lv_a, 0), 0)' "$$tmp/anf.c" && grep -q 'sp_IntArray_max_o(sp_IntArray_nil_cmp_if_flagged(lv_b))' "$$tmp/anf.c" || { echo "infer-test: FAIL (a whole-array sum or max does not ask the nil flag)"; ok=0; }; \
 	grep -q 'sp_IntArray_sum(sp_IntArray_nil_sum_if_flagged(lv_m, 0), 0)' "$$tmp/anf.c" || { echo "infer-test: FAIL (the sum of an array that can hold nil does not ask its nil bitmap)"; ok=0; }; \
 	$(SPINEL) test/infer/nil_narrowing_reads.rb -c --no-line-map -o "$$tmp/nnr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (nil_narrowing_reads: -c)"; ok=0; }; \
@@ -5553,6 +5557,12 @@ CALL_SHAPES_LIMIT ?= 4.5
 # ratio read 16.04x until an answer could outlive its query (#8852); 4.38x
 # since. The limit sits about 5% above.
 STR_CHAIN_LIMIT ?= 4.6
+# Engine checks a desugar folds by id (test/scale/engine_folds.sh), at 4,000
+# and 8,000 checks, each fold retyping nodes in place. The kind index counts
+# the ids it copies and merges: moving a retyped node's id by shifting its
+# kind's ids, once per node, read 2.50x here; one merge per kind at the next
+# ask reads 2.00x.
+ENGINE_FOLDS_LIMIT ?= 2.2
 # A chain of forty bangs over a String a method answers, compiled to C with
 # --share-strings under a CPU-time limit, as the hash-literal fan-out is:
 # strbuf_bang_self_local asked each link once per path that reaches it,
@@ -5603,13 +5613,16 @@ scale-test: $(SPINEL_WORK)
 	sh test/scale/str_chain.sh 100 > "$$tmp/k1.rb"; sh test/scale/str_chain.sh 400 > "$$tmp/k4.rb"; \
 	ka=$$(sw --emit-rbs -o "$$tmp/k1.rbs" "$$tmp/k1.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	kb=$$(sw --emit-rbs -o "$$tmp/k4.rbs" "$$tmp/k4.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	sh test/scale/engine_folds.sh 4000 > "$$tmp/e4.rb"; sh test/scale/engine_folds.sh 8000 > "$$tmp/e8.rb"; \
+	ea=$$(sw -c -o "$$tmp/e4.c" "$$tmp/e4.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	eb=$$(sw -c -o "$$tmp/e8.c" "$$tmp/e8.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	sh test/scale/ie_forward_chain.sh 2 > "$$tmp/f2.rb"; sh test/scale/ie_forward_chain.sh 4 > "$$tmp/f4.rb"; \
 	fa=$$(sw -c -o "$$tmp/f2.c" "$$tmp/f2.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	fb=$$(sw -c -o "$$tmp/f4.c" "$$tmp/f4.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	rm -rf "$$tmp"; \
 	if [ -z "$$wa" ] || [ -z "$$wb" ] || [ -z "$$fa" ] || [ -z "$$fb" ] || [ -z "$$pa" ] || [ -z "$$pb" ] || \
 	   [ -z "$$ha" ] || [ -z "$$hb" ] || [ -z "$$ca" ] || [ -z "$$cb" ] || [ -z "$$sa" ] || [ -z "$$sb" ] || \
-	   [ -z "$$ka" ] || [ -z "$$kb" ]; then echo "scale-test: FAIL (the counting compiler reported no work count)"; exit 1; fi; \
+	   [ -z "$$ka" ] || [ -z "$$kb" ] || [ -z "$$ea" ] || [ -z "$$eb" ]; then echo "scale-test: FAIL (the counting compiler reported no work count)"; exit 1; fi; \
 	awk -v a="$$ha" -v b="$$hb" 'BEGIN { r = b / a; \
 	  printf "scale-test: boxed Hash store work at 2x the methods is %.2fx (limit 2.20)\n", r; exit (r > 2.20) }' || \
 	  { echo "scale-test: FAIL (a boxed Hash store rescanned unrelated method bodies)"; exit 1; }; \
@@ -5630,7 +5643,10 @@ scale-test: $(SPINEL_WORK)
 	  { echo "scale-test: FAIL (a binding or block-typing pass grew superlinearly: it rescans per call site or argument, see test/scale/call_shapes.sh)"; exit 1; }; \
 	awk -v a="$$ka" -v b="$$kb" -v lim="$(STR_CHAIN_LIMIT)" 'BEGIN { r = b / a; \
 	  printf "scale-test: the analysis of a String chain at 4x the links is %.2fx (linear 4.00, limit %.2f)\n", r, lim; exit (r > lim) }' || \
-	  { echo "scale-test: FAIL (the analysis grew superlinearly in the length of a chain: infer_type re-inferred the chain per node, see infer_memo_boundary and SPINEL_IMEMO=shadow, #8852)"; exit 1; }
+	  { echo "scale-test: FAIL (the analysis grew superlinearly in the length of a chain: infer_type re-inferred the chain per node, see infer_memo_boundary and SPINEL_IMEMO=shadow, #8852)"; exit 1; }; \
+	awk -v a="$$ea" -v b="$$eb" -v lim="$(ENGINE_FOLDS_LIMIT)" 'BEGIN { r = b / a; \
+	  printf "scale-test: engine-check folds at 2x the checks are %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
+	  { echo "scale-test: FAIL (retyping nodes grew superlinearly: the kind index moved ids per retyped node, see nki_apply_moves)"; exit 1; }
 
 .PHONY: bisect-test
 # `spinel bisect`, end to end. The search has its own corpus test

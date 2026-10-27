@@ -118,7 +118,6 @@ void an_const_presence(Compiler *c);
 /* The program's files under --load-model=graph (analyze_program.c, #9898):
    their top-level scopes and roots, and what the model refuses for now. */
 void prog_file_scopes(Compiler *c);
-void prog_walk_files(Compiler *c);
 void prog_refuse_loads(Compiler *c);
 void prog_refuse_order(Compiler *c);
 int prog_is_top_scope(const Compiler *c, const Scope *s);
@@ -182,8 +181,8 @@ typedef struct {
   const char *target;   /* an alias's or a copy's original name */
 } LrDef;
 typedef struct { int node, body; } LrOpen;
-typedef enum { LR_INCLUDE, LR_EXTEND, LR_PREPEND } LrMixKind;
-typedef struct { int node, kind, mod; } LrMixin;   /* kind: LrMixKind; mod: the module's class, -2 one the record does not know */
+typedef enum { LR_INCLUDE, LR_EXTEND, LR_PREPEND, LR_SG_PREPEND } LrMixKind;   /* LR_SG_PREPEND: a prepend of the singleton class, ahead of its own methods */
+typedef struct { int node, kind, mod, ref; } LrMixin;   /* kind: LrMixKind; mod: the module's class, -2 one the record does not know; ref: the argument naming it */
 typedef enum { ELAB_GVAR, ELAB_MAIN_IVAR, ELAB_CONST } ElabVar;
 void elab_program(Compiler *c);
 /* the version of cls's method `name` (singleton when sg) live at p, through
@@ -233,6 +232,7 @@ const LrOpen *elab_class_bodies(Compiler *c, int cls, int *n);
    module, in the order they run: `include A, B` as `include B` then
    `include A`, A nearest; *n their number */
 const LrMixin *elab_class_mixins(Compiler *c, int cls, int *n);
+int elab_mix_on_singleton(int kind);   /* an extend, or a prepend of the singleton class */
 /* what constant `name`, read at node, resolves to there: its lexical scopes'
    own constants, innermost first, then the innermost one's ancestors and
    Object's; *out the write or class definition found */
@@ -665,9 +665,10 @@ void ie_body_restore(Compiler *c, int *snap);
 /* instance_exec keyword-arg helpers: the call's trailing KeywordHashNode (or
    -1), and the value node bound to a keyword name within it (or -1). */
 int ie_call_kwhash(Compiler *c, int id);
-size_t block_param_written_len(const char *name);
-size_t reassigned_param_written_len(const char *name);
-int block_param_is_renamed(const char *name);
+size_t block_param_written_len(const Compiler *c, const char *name);
+size_t reassigned_param_written_len(const Compiler *c, const char *name);
+int block_param_is_renamed(const Compiler *c, const char *name);
+int block_param_made_for(const Compiler *c, const char *name, int blk);   /* an invented name of that block */
 char *block_param_invent_name(Compiler *c, const char *written, int blk);
 int ie_kwhash_value(Compiler *c, int kwhash, const char *name);
 TyKind ie_kwhash_computed_type(Compiler *c, int kwhash);
