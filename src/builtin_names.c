@@ -1295,19 +1295,40 @@ static int builtin_name_in(const char *name, const char *const *names) {
   return 0;
 }
 
+/* A builtin module the ancestors tables list by its (negative) builtin id
+   (Comparable, Enumerable, Kernel, Math): that id, 0 for any other name */
+int builtin_mixin_module_id(const char *n) {
+  int id = n ? builtin_class_id(n) : 0;
+  return id == -114 || id == -115 || id == -119 || id == -130 ? id : 0;
+}
 int is_include_name(const char *n) { return sp_streq(n, "include"); }
 int is_prepend_name(const char *n) { return sp_streq(n, "prepend"); }
 int is_load_name(const char *n) { return sp_streq(n, "load"); }
 int is_require_name(const char *n) { return sp_streq(n, "require") || sp_streq(n, "require_relative"); }
+int is_require_relative_name(const char *n) { return sp_streq(n, "require_relative"); }
+int is_extend_name(const char *n) { return sp_streq(n, "extend"); }
 int is_autoload_name(const char *n) { return sp_streq(n, "autoload"); }
 int is_file_load_name(const char *n) {
   return n && (is_require_name(n) || is_load_name(n) || is_autoload_name(n));
 }
 /* A LoadNode's `how` (spinel_parse.c, sp_load_resolve) that names no file
    at compile time: one not there (LoadError when it runs, for the feature
-   the node carries), or a path the require computes when it runs. */
+   the node carries), or a path the require computes when it runs
+   (is_load_how_set). */
 int is_load_how_missing(const char *how) { return how && sp_streq(how, "none"); }
-int is_load_how_computed(const char *how) { return how && sp_streq(how, "run-time"); }
+/* ...a path computed when it runs: it names one of a set of files (the
+   node's candidates, prog_load_cand), or any file of the program (open), or a
+   feature the runtime provides, or none of them */
+int is_load_how_set(const char *how) { return how && sp_streq(how, "set"); }
+/* ...and the two the runtime provides without a file: a core capability
+   (Thread, Enumerator, Rational: CRuby has it loaded already) and a native
+   library (io/console, time, socket, ostruct, monitor). */
+int is_load_how_core(const char *how) { return how && sp_streq(how, "core"); }
+int is_load_how_native(const char *how) { return how && sp_streq(how, "native"); }
+/* ...and a native library CRuby has loaded before the program runs
+   (`monitor`, which rubygems requires), whose require answers false the
+   first time as a core capability's does; the others answer true once. */
+int is_native_lib_at_boot(const char *path) { return path && sp_streq(path, "monitor"); }
 
 int is_enumerable_module_name(const char *n) {
   return n && sp_streq(n, "Enumerable");
@@ -2007,8 +2028,117 @@ int is_method_naming_call(const char *n) {
                sp_streq(n, "alias_method") || sp_streq(n, "remove_method") || sp_streq(n, "undef_method") ||
                sp_streq(n, "attr") || is_attr_reader_family(n) || is_attr_writer_family(n));
 }
+/* The attribute declarations (`attribute`/`attributes` are Spinel's own
+   compile-time class-body declarations, accessors as attr_accessor's) */
+int is_attr_decl_reader(const char *n) {
+  return n && (sp_streq(n, "attr") || is_attr_reader_family(n) || sp_streq(n, "attribute") || sp_streq(n, "attributes"));
+}
+int is_attr_decl_writer(const char *n) {
+  return n && (is_attr_writer_family(n) || sp_streq(n, "attribute") || sp_streq(n, "attributes"));
+}
+int class_method_vis_of_name(const char *n) {
+  return !n ? 0 : sp_streq(n, "private_class_method") ? BVIS_PRIVATE : sp_streq(n, "public_class_method") ? BVIS_PUBLIC : 0;
+}
 int is_refine_name(const char *n) { return n && sp_streq(n, "refine"); }
+/* The calls by which a method body changes what the load record holds:
+   ones that define, undefine or set methods, constants or variables, mix
+   a module in or refine, load a file, or run code it cannot follow from
+   the call (a send, an eval, a block or proc called) */
+int is_load_effect_call(const char *n) {
+  return n && (visibility_of_name(n) || is_method_naming_call(n) || is_mixin_call(n) || is_refine_name(n) ||
+               is_using_name(n) || is_code_eval_name(n) || is_eval_exec_family(n) || is_rebinding_reach_call(n) ||
+               is_const_set_name(n) || is_remove_const_name(n) || is_const_visibility_name(n) || is_cvar_write_name(n) ||
+               is_ivar_remove_name(n) || is_file_load_name(n));
+}
+int is_using_name(const char *n) { return n && sp_streq(n, "using"); }
+int is_remove_const_name(const char *n) { return n && sp_streq(n, "remove_const"); }
+/* private_constant public_constant deprecate_constant */
+int is_const_visibility_name(const char *n) {
+  static const char *const names[] = { "private_constant", "public_constant", "deprecate_constant", NULL };
+  return n && builtin_name_in(n, names);
+}
+/* class_variable_set remove_class_variable */
+int is_cvar_write_name(const char *n) { return n && (sp_streq(n, "class_variable_set") || sp_streq(n, "remove_class_variable")); }
+/* The names CRuby's core and standard library call on an object by
+   themselves besides the runtime protocols (method_name_implicitly_invoked):
+   an operator, method_missing and respond_to_missing?, a pattern's
+   deconstruct, a conversion, a Range's endpoints and succ, an exception's
+   readers, Marshal's and dup's hooks, a Hash's default, an IO-like's
+   writer and readers, pp's and YAML's hooks, and the Numeric helpers
+   numeric core methods call on a subclass. This is the instance side of
+   is_core_callback_name (the record's reachability work), with
+   method_missing; whichever lands second keeps one predicate. */
+int is_runtime_callback_name(const char *n) {
+  static const char *const names[] = {
+    "method_missing", "deconstruct", "deconstruct_keys", "respond_to?", "respond_to_missing?", "to_f", "to_r",
+    "to_c", "to_sym", "to_regexp", "to_open", "succ", "begin", "end", "exclude_end?", "size", "message",
+    "detailed_message", "full_message", "backtrace", "backtrace_locations", "cause", "exception", "result",
+    "marshal_dump", "_dump", "marshal_load", "initialize_dup", "initialize_clone", "default", "write", "read",
+    "readpartial", "flush", "pretty_print", "pretty_print_cycle", "encode_with", "init_with", "zero?",
+    "nonzero?", "positive?", "negative?", "integer?", "real?", "abs", "floor", "ceil", "round", "truncate",
+    "div", "modulo", "divmod", "remainder", "fdiv", "quo", NULL };
+  if (!n) return 0;
+  return !((n[0] >= 'a' && n[0] <= 'z') || (n[0] >= 'A' && n[0] <= 'Z') || n[0] == '_') || builtin_name_in(n, names);
+}
 int is_method_list_call(const char *n) {
   return n && (sp_streq(n, "attr") || is_attr_reader_family(n) || is_attr_writer_family(n) ||
                sp_streq(n, "remove_method") || sp_streq(n, "undef_method"));
+}
+
+/* The standard library's top-level names: a program that requires one
+   reaches it from anywhere */
+int is_stdlib_const_name(const char *n) {
+  static const char *const names[] = {
+    "Abbrev", "Addrinfo", "Base64", "BasicSocket", "Benchmark", "BigDecimal", "CGI", "CSV", "Coverage",
+    "DRb", "Date", "DateTime", "DelegateClass", "Delegator", "Digest", "ERB", "English", "Etc", "FFI",
+    "Fcntl", "Fiddle", "FileUtils", "Find", "Forwardable", "Gem", "GetoptLong", "IPAddr", "IPSocket",
+    "JSON", "Logger", "Matrix", "Minitest", "Monitor", "MonitorMixin", "Net", "Observable", "Open3",
+    "OpenSSL", "OpenStruct", "OptionParser", "PP", "PStore", "Prime", "Psych", "RbConfig", "Readline",
+    "Resolv", "Ripper", "SecureRandom", "Shellwords", "SimpleDelegator", "SingleForwardable", "Singleton",
+    "Socket", "StringIO", "StringScanner", "TCPServer", "TCPSocket", "TSort", "Tempfile", "Test", "Timeout",
+    "UDPSocket", "UNIXServer", "UNIXSocket", "URI", "Vector", "WeakRef", "YAML", "Zlib",
+    NULL
+  };
+  for (int i = 0; names[i]; i++) if (sp_streq(names[i], n)) return 1;
+  return 0;
+}
+
+/* A name CRuby (or a library spinel provides) answers at the top level. */
+int is_toplevel_const_name(const char *n) {
+  static const char *const names[] = {
+    "ARGF", "ARGV", "ArgumentError", "Array", "BasicObject", "Binding", "Class", "ClosedQueueError",
+    "Comparable", "Complex", "ConditionVariable", "Data", "Dir", "ENV", "EOFError", "Encoding",
+    "EncodingError", "Enumerable", "Enumerator", "Errno", "Exception", "FalseClass", "Fiber", "FiberError",
+    "File", "FileTest", "Float", "FloatDomainError", "FrozenError", "GC", "Hash", "IO",
+    "IOError", "IndexError", "Integer", "Interrupt", "Kernel", "KeyError", "LoadError", "LocalJumpError",
+    "Marshal", "MatchData", "Math", "Method", "Module", "Mutex", "NameError", "NilClass",
+    "NoMatchingPatternError", "NoMatchingPatternKeyError", "NoMemoryError", "NoMethodError", "NotImplementedError", "Numeric", "Object", "ObjectSpace",
+    "Pathname", "Proc", "Process", "Queue", "RUBY_COPYRIGHT", "RUBY_DESCRIPTION", "RUBY_ENGINE", "RUBY_ENGINE_VERSION",
+    "RUBY_PATCHLEVEL", "RUBY_PLATFORM", "RUBY_RELEASE_DATE", "RUBY_REVISION", "RUBY_VERSION", "Ractor", "Random", "Range",
+    "RangeError", "Rational", "Refinement", "Regexp", "RegexpError", "Ruby", "RubyVM", "RuntimeError",
+    "STDERR", "STDIN", "STDOUT", "ScriptError", "SecurityError", "Set", "Signal", "SignalException",
+    "SizedQueue", "StandardError", "StopIteration", "String", "Struct", "Symbol", "SyntaxError", "SystemCallError",
+    "SystemExit", "SystemStackError", "TOPLEVEL_BINDING", "Thread", "ThreadError", "ThreadGroup", "Time", "TracePoint",
+    "TrueClass", "TypeError", "UnboundMethod", "UncaughtThrowError", "UnicodeNormalize", "Warning", "ZeroDivisionError",
+    NULL
+  };
+  if (!n) return 1;
+  for (int i = 0; names[i]; i++) if (sp_streq(names[i], n)) return 1;
+  if (is_stdlib_const_name(n)) return 1;
+  return builtin_class_id(n) != 0 || is_builtin_class_name(n) || is_builtin_module_name(n) ||
+         is_builtin_exception_name(n);
+}
+
+/* A builtin ancestor with no constants of its own (CRuby 4.0's
+   `K.constants - Object.constants` is empty): the user's reopenings are all
+   it can contribute. Any other builtin ancestor may answer the name itself. */
+int is_constless_builtin_name(const char *n) {
+  static const char *const names[] = {
+    "Object", "BasicObject", "Kernel", "Comparable", "Enumerable", "Array", "Hash", "String",
+    "Integer", "Numeric", "Struct", "Data", "Symbol", "Proc", "Range", "Module", "Class", "Time",
+    "Rational", "Dir", "Fiber", "Mutex", "Queue", "SizedQueue", "ConditionVariable", "MatchData",
+    "Method", "UnboundMethod", "NilClass", "TrueClass", "FalseClass", "Signal", "Warning", NULL
+  };
+  for (int i = 0; names[i]; i++) if (sp_streq(names[i], n)) return 1;
+  return is_builtin_exception_name(n) && !strchr(n, ':');
 }

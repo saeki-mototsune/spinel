@@ -441,7 +441,7 @@ build/csrc/codegen_util.o: build/csrc/sp_rt_names.h
 
 FORCE:
 
-build/csrc/sp_parse_lib.o: src/spinel_parse.c src/sp_macro.c src/sp_const_loop.c src/ct_value.h src/inline_rbs.c src/rbs_map.h src/node_table.h src/types.h $(PRISM_LIB) $(PLATFORM_HDRS) | build/csrc
+build/csrc/sp_parse_lib.o: src/spinel_parse.c src/prism_eval.c src/sp_macro.c src/sp_const_loop.c src/ct_value.h src/inline_rbs.c src/rbs_map.h src/node_table.h src/types.h $(PRISM_LIB) $(PLATFORM_HDRS) | build/csrc
 	$(CC) $(CFLAGS) -I$(PRISM_INC) $(INLINE_RBS_CFLAGS) -c src/spinel_parse.c -o $@
 build/csrc/rbs_map.o: src/rbs_map.c src/rbs_map.h $(PLATFORM_HDRS) | build/csrc
 	$(CC) -c $(CFLAGS) -I$(RBS_INC) src/rbs_map.c -o $@
@@ -449,7 +449,7 @@ build/csrc/rbs_map.o: src/rbs_map.c src/rbs_map.h $(PLATFORM_HDRS) | build/csrc
 # Exercise the fallback even when vendor/rbs is present, without replacing
 # the parser object used by the ordinary compiler.
 SPINEL_NO_RBS = build/spinel-no-rbs
-build/csrc/sp_parse_no_rbs.o: src/spinel_parse.c src/sp_macro.c src/sp_const_loop.c src/ct_value.h src/node_table.h src/types.h $(PRISM_LIB) $(PLATFORM_HDRS) | build/csrc
+build/csrc/sp_parse_no_rbs.o: src/spinel_parse.c src/prism_eval.c src/sp_macro.c src/sp_const_loop.c src/ct_value.h src/node_table.h src/types.h $(PRISM_LIB) $(PLATFORM_HDRS) | build/csrc
 	$(CC) $(CFLAGS) -I$(PRISM_INC) -U SPINEL_INLINE_RBS -c src/spinel_parse.c -o $@
 
 # The compiler links the regexp engine so it can compile a literal at build
@@ -513,7 +513,7 @@ build/csrc-san/%.o: src/%.c $(SPINEL_HDRS) | build/csrc
 	$(CC) $(CFLAGS) $(SAN_FLAGS) -Isrc -Ibuild/csrc -c $< -o $@
 build/csrc-san/main.o: build/csrc/spinel_rev.h
 build/csrc-san/codegen_util.o: build/csrc/sp_rt_names.h
-build/csrc-san/sp_parse_lib.o: src/spinel_parse.c src/sp_macro.c src/sp_const_loop.c src/ct_value.h src/inline_rbs.c src/rbs_map.h src/node_table.h src/types.h $(PRISM_LIB) | build/csrc
+build/csrc-san/sp_parse_lib.o: src/spinel_parse.c src/prism_eval.c src/sp_macro.c src/sp_const_loop.c src/ct_value.h src/inline_rbs.c src/rbs_map.h src/node_table.h src/types.h $(PRISM_LIB) | build/csrc
 	@mkdir -p build/csrc-san
 	$(CC) $(CFLAGS) $(SAN_FLAGS) -I$(PRISM_INC) $(INLINE_RBS_CFLAGS) -c src/spinel_parse.c -o $@
 $(SPINEL_SAN): $(SPINEL_SAN_OBJ) build/csrc-san/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(INLINE_RBS_LIBS)
@@ -968,8 +968,11 @@ wasm-rt: $(SP_RT_WASI_LIB) $(BUNDLED_NATIVE_WASI_OBJS) $(SP_RT_WASI_NOEXC_LIB) $
 # A few of the corpus's programs built with --target=wasm32-wasi and run
 # under wasmtime (WASMTIME, default: the one on PATH) against their expected
 # output: exceptions (the sjlj lowering), regexps, floats, a Bignum, a
-# bundled package, a 32-bit Integer. Not in the gate: it needs the sdk and
-# an engine. `make wasm-test` where both are.
+# bundled package, a 32-bit Integer. Every program, --exceptions=abort's
+# too, is also built as a --jobs=2 split and an --incremental build, which
+# compile parts and link them with wasm-ld, and one is built again warm,
+# every unit from the cache. Not in the gate: it needs the sdk and an
+# engine. `make wasm-test` where both are.
 WASMTIME ?= wasmtime
 WASM_TESTS = $(shell grep -l '^\# spinel: wasm$$' test/*.rb)
 # --exceptions=abort: programs built without exception handling and run with
@@ -986,26 +989,44 @@ wasm-test: $(SPINEL) wasm-rt
 	  if [ -n "$(WASM_ENGINE_REQUIRED)" ]; then echo "wasm-test: FAIL (no $(WASMTIME), and WASM_ENGINE_REQUIRED is set)"; exit 1; fi; \
 	  echo "wasm-test: skipped (no $(WASMTIME))"; exit 0; fi; \
 	tmp=$$(mktemp -d /tmp/spinel-wasm.XXXXXX); ok=1; \
+	unset SPINEL_NO_CACHE; export SPINEL_SPLIT_STRICT=1 SPINEL_INCREMENTAL_STRICT=1 SPINEL_CACHE_DIR=$$tmp/cache; \
 	for t in $(WASM_TESTS); do \
 	  bn=$$(basename $$t .rb); \
-	  if ! WASI_SDK=$(WASI_SDK) $(SPINEL) --target=wasm32-wasi --no-line-map $$t -o $$tmp/$$bn.wasm >/dev/null 2>$$tmp/$$bn.build; then \
-	    echo "wasm-test: FAIL (build) $$t"; head -3 $$tmp/$$bn.build; ok=0; continue; fi; \
-	  $(WASMTIME) run -W max-wasm-stack=16777216 --dir=. $$tmp/$$bn.wasm >$$tmp/$$bn.out 2>$$tmp/$$bn.err </dev/null; \
-	  if cmp -s $$tmp/$$bn.out $$t.expected; then echo "wasm-test: pass $$t"; \
-	  else echo "wasm-test: FAIL $$t"; diff -u $$t.expected $$tmp/$$bn.out | head -6; head -3 $$tmp/$$bn.err; ok=0; fi; \
+	  for mode in plain --jobs=2 --incremental; do \
+	    case $$mode in plain) m=; lbl=;; *) m=$$mode; lbl=" ($$mode)";; esac; \
+	    if ! WASI_SDK=$(WASI_SDK) $(SPINEL) --target=wasm32-wasi $$m --no-line-map $$t -o $$tmp/$$bn.wasm >/dev/null 2>$$tmp/$$bn.build; then \
+	      echo "wasm-test: FAIL (build$$lbl) $$t"; head -3 $$tmp/$$bn.build; ok=0; continue; fi; \
+	    if grep -q 'unused' $$tmp/$$bn.build; then \
+	      echo "wasm-test: FAIL (a flag the compile or the link does not use$$lbl) $$t"; grep 'unused' $$tmp/$$bn.build | head -3; ok=0; continue; fi; \
+	    $(WASMTIME) run -W max-wasm-stack=16777216 --dir=. $$tmp/$$bn.wasm >$$tmp/$$bn.out 2>$$tmp/$$bn.err </dev/null; rc=$$?; \
+	    if ! cmp -s $$tmp/$$bn.out $$t.expected; then echo "wasm-test: FAIL$$lbl $$t"; diff -u $$t.expected $$tmp/$$bn.out | head -6; head -3 $$tmp/$$bn.err; ok=0; \
+	    elif [ $$rc -ne 0 ]; then echo "wasm-test: FAIL (exit $$rc$$lbl) $$t"; head -3 $$tmp/$$bn.err; ok=0; \
+	    else echo "wasm-test: pass$$lbl $$t"; fi; \
+	  done; \
 	done; \
 	for t in $(WASM_ABORT_TESTS); do \
 	  bn=$$(basename $$t .rb); \
-	  if ! WASI_SDK=$(WASI_SDK) $(SPINEL) --target=wasm32-wasi --exceptions=abort --no-line-map $$t -o $$tmp/$$bn.wasm >/dev/null 2>$$tmp/$$bn.build; then \
-	    echo "wasm-test: FAIL (build, --exceptions=abort) $$t"; head -3 $$tmp/$$bn.build; ok=0; continue; fi; \
-	  $(WASMTIME) run -W exceptions=n -W max-wasm-stack=16777216 --dir=. $$tmp/$$bn.wasm >$$tmp/$$bn.out 2>$$tmp/$$bn.err </dev/null; rc=$$?; \
-	  want=$$(sed -n 's/^# spinel: wasm-abort-raises: //p' $$t); \
-	  if ! cmp -s $$tmp/$$bn.out $$t.expected; then echo "wasm-test: FAIL (--exceptions=abort) $$t"; diff -u $$t.expected $$tmp/$$bn.out | head -6; head -3 $$tmp/$$bn.err; ok=0; \
-	  elif [ -n "$$want" ] && { [ $$rc -eq 0 ] || ! grep -qF "$$want" $$tmp/$$bn.err; }; then \
-	    echo "wasm-test: FAIL (--exceptions=abort: the raise did not trap with its message) $$t"; head -3 $$tmp/$$bn.err; ok=0; \
-	  elif [ -z "$$want" ] && [ $$rc -ne 0 ]; then echo "wasm-test: FAIL (--exceptions=abort: exit $$rc) $$t"; head -3 $$tmp/$$bn.err; ok=0; \
-	  else echo "wasm-test: pass (--exceptions=abort) $$t"; fi; \
+	  for mode in plain --jobs=2 --incremental; do \
+	    case $$mode in plain) m=; lbl="--exceptions=abort";; *) m=$$mode; lbl="--exceptions=abort $$mode";; esac; \
+	    if ! WASI_SDK=$(WASI_SDK) $(SPINEL) --target=wasm32-wasi --exceptions=abort $$m --no-line-map $$t -o $$tmp/$$bn.wasm >/dev/null 2>$$tmp/$$bn.build; then \
+	      echo "wasm-test: FAIL (build, $$lbl) $$t"; head -3 $$tmp/$$bn.build; ok=0; continue; fi; \
+	    if grep -q 'unused' $$tmp/$$bn.build; then \
+	      echo "wasm-test: FAIL ($$lbl: a flag the compile or the link does not use) $$t"; grep 'unused' $$tmp/$$bn.build | head -3; ok=0; continue; fi; \
+	    $(WASMTIME) run -W exceptions=n -W max-wasm-stack=16777216 --dir=. $$tmp/$$bn.wasm >$$tmp/$$bn.out 2>$$tmp/$$bn.err </dev/null; rc=$$?; \
+	    want=$$(sed -n 's/^# spinel: wasm-abort-raises: //p' $$t); \
+	    if ! cmp -s $$tmp/$$bn.out $$t.expected; then echo "wasm-test: FAIL ($$lbl) $$t"; diff -u $$t.expected $$tmp/$$bn.out | head -6; head -3 $$tmp/$$bn.err; ok=0; \
+	    elif [ -n "$$want" ] && { [ $$rc -eq 0 ] || ! grep -qF "$$want" $$tmp/$$bn.err; }; then \
+	      echo "wasm-test: FAIL ($$lbl: the raise did not trap with its message) $$t"; head -3 $$tmp/$$bn.err; ok=0; \
+	    elif [ -z "$$want" ] && [ $$rc -ne 0 ]; then echo "wasm-test: FAIL ($$lbl: exit $$rc) $$t"; head -3 $$tmp/$$bn.err; ok=0; \
+	    else echo "wasm-test: pass ($$lbl) $$t"; fi; \
+	  done; \
 	done; \
+	for t in $(firstword $(WASM_TESTS)); do \
+	  WASI_SDK=$(WASI_SDK) $(SPINEL) --target=wasm32-wasi --incremental --cache-stats --no-line-map $$t -o $$tmp/warm.wasm >/dev/null 2>$$tmp/warm.build; rc=$$?; \
+	  if [ $$rc -eq 0 ] && grep -q '^spinel: cache: units=[0-9]* hit=[1-9][0-9]* miss=0 ' $$tmp/warm.build; then echo "wasm-test: pass (--incremental, warm: every unit from the cache) $$t"; \
+	  else echo "wasm-test: FAIL (--incremental, warm: rc=$$rc, or a unit missed the cache) $$t"; grep '^spinel: cache:' $$tmp/warm.build | head -3; head -3 $$tmp/warm.build; ok=0; fi; \
+	done; \
+	unset SPINEL_SPLIT_STRICT SPINEL_INCREMENTAL_STRICT SPINEL_CACHE_DIR; \
 	for t in $(WASM_ABORT_REFUSE_TESTS); do \
 	  why=$$(sed -n 's/^# spinel: wasm-abort-refuse: //p' $$t); \
 	  if WASI_SDK=$(WASI_SDK) $(SPINEL) --target=wasm32-wasi --exceptions=abort --no-line-map $$t -o $$tmp/r.wasm >/dev/null 2>$$tmp/r.err; then \

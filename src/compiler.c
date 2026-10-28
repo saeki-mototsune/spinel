@@ -480,6 +480,7 @@ void comp_grow_node_arrays(Compiler *c) {
 
 void comp_free(Compiler *c) {
   if (!c) return;
+  for (int i = 0; i < 8; i++) free(c->mc_ring[i]);
   for (int i = 0; i < c->n_cext_extensions; i++) { free(c->cext_extensions[i].name); free(c->cext_extensions[i].init); }
   free(c->cext_extensions);
   for (int i = 0; i < c->n_cext_stubs; i++) free(c->cext_stubs[i].key);
@@ -518,7 +519,6 @@ void comp_free(Compiler *c) {
   c->pres_rank = NULL; c->pres_rank_n = 0;
   for (int i = 0; i < c->pres_ord_n; i++) free(c->pres_ord[i]);
   free(c->pres_ord); c->pres_ord = NULL; c->pres_ord_n = 0;
-  free(c->redef_calls); c->redef_calls = NULL; c->nredef_calls = 0;
   free(c->splat_views); c->splat_views = NULL; c->nsplat_views = 0;
   for (int i = 0; i < c->nrbp_slots; i++) free(c->rbp_slot_names[i]);
   free(c->rbp_slot_names); free(c->rbp_slot_lens); c->rbp_slot_names = NULL; c->rbp_slot_lens = NULL; c->nrbp_slots = 0;
@@ -1487,6 +1487,53 @@ int comp_method_in_chain(Compiler *c, int class_id, const char *name, int *def_c
   return mi;
 }
 
+/* the scope of (class_id, is_cm; top level when class_id < 0) named name
+   whose def node is def_node, or -1 */
+static int sm_version(Compiler *c, int class_id, const char *name, int is_cm, int def_node) {
+  if (!name || def_node < 0) return -1;
+  int top = class_id < 0;
+  if (!sm_frozen) {
+    for (int s = c->nscopes - 1; s >= 0; s--)
+      if (c->scopes[s].def_node == def_node && (top ? sm_toplevel(c, s) : sm_owns(c, s, class_id, is_cm)) &&
+          c->scopes[s].name && sp_streq(c->scopes[s].name, name)) return s;
+    return -1;
+  }
+  if (sm_nscopes != c->nscopes) sm_build(c);
+  if (!sm_buckets) return -1;
+  unsigned b = sm_hash(top ? -1 : class_id, name, top ? 0 : is_cm) % (unsigned)sm_buckets;
+  for (int s = top ? tm_head[b] : sm_head[b]; s >= 0; s = top ? tm_next[s] : sm_next[s])
+    if (c->scopes[s].def_node == def_node && (top ? sm_toplevel(c, s) : sm_owns(c, s, class_id, is_cm)) &&
+        c->scopes[s].name && sp_streq(c->scopes[s].name, name)) return s;
+  return -1;
+}
+
+/* the scope of (class_id, is_cm; top level when class_id < 0) whose def
+   node is def_node, under whatever name an alias that captured the def gave
+   it (alias_capture_earlier_def), or -1; not a body a mixin's copy shadows
+   (`__prep_<n>_m`), which a call reaches through the copy */
+static int sm_version_renamed(Compiler *c, int class_id, int is_cm, int def_node) {
+  for (int s = c->nscopes - 1; s >= 0; s--)
+    if (c->scopes[s].def_node == def_node && c->scopes[s].name && !c->scopes[s].is_proc_form &&
+        comp_prep_user_name(c->scopes[s].name) == c->scopes[s].name &&
+        (class_id < 0 ? sm_toplevel(c, s) : sm_owns(c, s, class_id, is_cm))) return s;
+  return -1;
+}
+
+int comp_method_version(Compiler *c, int class_id, const char *name, int is_cm, int def_node, int *def_class) {
+  int mi = -1, dc = class_id;
+  if (class_id < 0) mi = sm_version(c, -1, name, 0, def_node);
+  else for (; dc >= 0; dc = c->classes[dc].parent)
+    if ((mi = sm_version(c, dc, name, is_cm, def_node)) >= 0) break;
+  if (mi < 0) {
+    dc = class_id;
+    if (class_id < 0) mi = sm_version_renamed(c, -1, 0, def_node);
+    else for (; dc >= 0; dc = c->classes[dc].parent)
+      if ((mi = sm_version_renamed(c, dc, is_cm, def_node)) >= 0) break;
+  }
+  if (mi >= 0) { IMEMO_DEP_SCOPE(mi); if (def_class) *def_class = dc; }
+  return mi;
+}
+
 /* See compiler.h. Built on the first ask from the memo's slot, which the
    walk fills for every class, and kept with it. The walk can move the slot:
    a chain lookup inserts names (this one, an alias it resolves), and an
@@ -2205,7 +2252,12 @@ int comp_defined_guard_false(Compiler *c, int pred) {
   if (pk == NK_AndNode)
     return comp_defined_guard_false(c, nt_ref(nt, pred, "left"));
   if (pk != NK_DefinedNode) return 0;
-  int v = nt_ref(nt, pred, "value");
+  return comp_const_undefined(c, nt_ref(nt, pred, "value"));
+}
+
+/* See compiler.h. */
+int comp_const_undefined(Compiler *c, int v) {
+  const NodeTable *nt = c->nt;
   if (v < 0) return 0;
   NodeKind vk = nt_kind(nt, v);
   if (vk == NK_ConstantReadNode)
@@ -4562,11 +4614,7 @@ const char *comp_scope_def_name(Compiler *c, const Scope *s) {
   if (!nm || s->def_node < 0 || nt_kind(c->nt, s->def_node) != NK_DefNode) return nm;
   const char *dn = nt_str(c->nt, s->def_node, "name");
   if (!dn) return nm;
-  /* a def a reopening redefined keeps its earlier body under `m#redef<n>`
-     (version_redefined_reopen_defs), its def renamed too: the name is m */
   size_t dl = strlen(dn);
-  const char *rd = strstr(dn, "#redef");
-  if (rd && rd[6] >= '0' && rd[6] <= '9' && strspn(rd + 6, "0123456789") == strlen(rd + 6)) dl = (size_t)(rd - dn);
   const char *u = comp_prep_user_name(nm);
   size_t n = strlen(u);
   int pf = n > 3 && strcmp(u + n - 3, "#pf") == 0;
@@ -4670,6 +4718,8 @@ const char *poly_enum_op_for(const char *name) {
     {"transform_keys!","SP_PENUM_TRANSFORM_KEYS_BANG"}, {"transform_values!","SP_PENUM_TRANSFORM_VALUES_BANG"},
     {"select!","SP_PENUM_SELECT_BANG"}, {"filter!","SP_PENUM_FILTER_BANG"},
     {"reject!","SP_PENUM_REJECT_BANG"}, {"keep_if","SP_PENUM_KEEP_IF"}, {"delete_if","SP_PENUM_DELETE_IF"},
+    {"min","SP_PENUM_MIN"}, {"max","SP_PENUM_MAX"},
+    {"min_by","SP_PENUM_MIN_BY"}, {"max_by","SP_PENUM_MAX_BY"},
     {NULL,NULL}
   };
   if (!name) return NULL;
@@ -4761,11 +4811,13 @@ int allocate_on_own_class(Compiler *c, int id) {
 }
 
 /* A Class-valued receiver that carries its class only at run time: a variable,
-   or a call whose result is a class (`Job.set(1).run(2)` -- ActiveJob's chained
-   `set`). Excludes a constant receiver and an accessor call, which resolve
-   statically through their own dispatch. A method returning a class value was
-   left with nowhere to dispatch, so the chained call was rejected outright
-   even though the value at run time was right (#3415). */
+   a call whose result is a class (`Job.set(1).run(2)` -- ActiveJob's chained
+   `set`), or a constant assigned a class value (`K = make`,
+   const_class_value_only). Excludes a constant naming a class and an accessor
+   call, which resolve statically through their own dispatch. A method
+   returning a class value was left with nowhere to dispatch, so the chained
+   call was rejected outright even though the value at run time was right
+   (#3415). */
 int class_recv_is_dynamic(Compiler *c, int recv) {
   const NodeTable *nt = c->nt;
   const char *rty = recv >= 0 ? nt_type(nt, recv) : NULL;
@@ -4780,6 +4832,8 @@ int class_recv_is_dynamic(Compiler *c, int recv) {
       rk == NK_IfNode || rk == NK_UnlessNode || rk == NK_CaseNode ||
       rk == NK_AndNode || rk == NK_OrNode)
     return 1;
+  /* A constant assigned a class value (`K = make`) names no class it knows */
+  if (rk == NK_ConstantReadNode) return const_class_value_only(c, recv);
   if (rk != NK_CallNode) return 0;
   /* `self.class` in a class with no subclass resolves to that class
      statically and has its own arms on both sides; treating it as dynamic

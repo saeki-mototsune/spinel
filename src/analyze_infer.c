@@ -2136,8 +2136,7 @@ int an_module_defines(Compiler *c, int m, const char *nm, int *vis) {
    both define and undefine it. Then each name's answer is the nearest
    module's whatever order sibling includes take. The module has no
    class-level method of `name` of its own or from a module it extends. */
-static int an_module_tree(Compiler *c, int m, int *mods, int *n, int cap,
-                          int nb, const int *bci, const int *bnode) {
+static int an_module_tree(Compiler *c, int m, int *mods, int *n, int cap) {
   const NodeTable *nt = c->nt;
   if (m < 0 || m >= c->nclasses || *n >= cap) return 0;
   for (int j = 0; j < *n; j++) if (mods[j] == m) return 0;   /* reached twice */
@@ -2145,23 +2144,24 @@ static int an_module_tree(Compiler *c, int m, int *mods, int *n, int cap,
   if (!comp_class_is_module(c, mc) || mc->is_native_class || mc->nincluded_mod_names > 0) return 0;
   if (mc->def_node < 0 || nt_kind(nt, mc->def_node) != NK_ModuleNode) return 0;
   mods[(*n)++] = m;
+  int nb = 0;
+  const LrOpen *ob = elab_class_bodies(c, m, &nb);
   for (int b = 0; b < nb; b++) {
-    if (bci[b] != m) continue;
     int sn = 0;
-    const int *stmts = bnode[b] >= 0 ? nt_arr(nt, bnode[b], "body", &sn) : NULL;
+    const int *stmts = ob[b].body >= 0 ? nt_arr(nt, ob[b].body, "body", &sn) : NULL;
     for (int k = 0; k < sn; k++) {
       if (nt_kind(nt, stmts[k]) != NK_CallNode || nt_ref(nt, stmts[k], "receiver") >= 0) continue;
       const char *nm = nt_str(nt, stmts[k], "name");
       if (!nm) continue;
-      if (sp_streq(nm, "prepend")) return 0;
-      if (!sp_streq(nm, "include")) continue;
+      if (is_prepend_name(nm)) return 0;
+      if (!is_include_name(nm)) continue;
       int an = 0, anode = nt_ref(nt, stmts[k], "arguments");
       const int *aa = anode >= 0 ? nt_arr(nt, anode, "arguments", &an) : NULL;
       if (an == 0) return 0;
       for (int j = 0; j < an; j++) {
         NodeKind ak = nt_kind(nt, aa[j]);
         int im = ak == NK_ConstantReadNode || ak == NK_ConstantPathNode ? class_recv_static_ci(c, aa[j]) : -1;
-        if (im < 0 || !an_module_tree(c, im, mods, n, cap, nb, bci, bnode)) return 0;
+        if (im < 0 || !an_module_tree(c, im, mods, n, cap)) return 0;
       }
     }
   }
@@ -2177,6 +2177,18 @@ static int an_module_answers(Compiler *c, int m, const char *nm, int *undef) {
   for (int i = 0; i < kc->nvis; i++) if (sp_streq(kc->vis_names[i], nm)) return 1;
   return 0;
 }
+/* Is id a statement of one of class ci's bodies' own statement lists? */
+static int an_body_stmt(Compiler *c, int ci, int id) {
+  int nb = 0;
+  const LrOpen *ob = elab_class_bodies(c, ci, &nb);
+  for (int b = 0; b < nb; b++) {
+    int sn = 0;
+    const int *stmts = ob[b].body >= 0 ? nt_arr(c->nt, ob[b].body, "body", &sn) : NULL;
+    for (int k = 0; k < sn; k++) if (stmts[k] == id) return 1;
+  }
+  return 0;
+}
+
 int an_module_methods_listable(Compiler *c, int m, const char *name) {
   const NodeTable *nt = c->nt;
   if (m < 0 || m >= c->nclasses) return 0;
@@ -2184,29 +2196,22 @@ int an_module_methods_listable(Compiler *c, int m, const char *name) {
   if (comp_cmethod_in_chain(c, m, name, NULL) >= 0) return 0;
   for (int e = 0; e < mc->nextended_mods; e++)
     if (comp_method_in_class(c, mc->extended_mods[e], name) >= 0) return 0;
-  int *bci, *bnode;
-  int nb = class_body_list(c, &bci, &bnode);
   int mods[64], n = 0;
-  int ok = an_module_tree(c, m, mods, &n, 64, nb, bci, bnode);
+  int ok = an_module_tree(c, m, mods, &n, 64);
   /* an include or prepend anywhere but a body's own statement list */
   for (int id = 0; ok && id < nt->count; id++) {
     if (nt_kind(nt, id) != NK_CallNode) continue;
     const char *nm = nt_str(nt, id, "name");
-    if (!nm || !(sp_streq(nm, "include") || sp_streq(nm, "prepend"))) continue;
+    if (!nm || !(is_include_name(nm) || is_prepend_name(nm))) continue;
     int rcv = nt_ref(nt, id, "receiver");
     if (rcv >= 0 && nt_kind(nt, rcv) != NK_SelfNode) continue;   /* refused on its own */
-    int direct = 0;
-    for (int b = 0; b < nb && !direct; b++) {
-      int sn = 0;
-      const int *stmts = bnode[b] >= 0 ? nt_arr(nt, bnode[b], "body", &sn) : NULL;
-      for (int k = 0; k < sn && !direct; k++) direct = stmts[k] == id && rcv < 0;
-    }
-    if (direct) continue;
     int owner = c->node_cbody && id < c->node_cap ? c->node_cbody[id] : -1;
     if (owner < 0) { Scope *sc = comp_scope_of(c, id); owner = sc ? sc->class_id : -1; }
-    for (int j = 0; j < n; j++) if (mods[j] == owner) ok = 0;
+    int in_mods = 0;
+    for (int j = 0; j < n; j++) if (mods[j] == owner) in_mods = 1;
+    if (!in_mods || (rcv < 0 && an_body_stmt(c, owner, id))) continue;
+    ok = 0;
   }
-  free(bci); free(bnode);
   if (!ok) return 0;
   /* no two unrelated modules answer for one name */
   for (int j = 0; j < n; j++) {
@@ -3702,6 +3707,15 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
           continue;
         }
         int rdcls = pcs[pi].rdcls;
+        /* A reader takes no argument, so a call that passes one gets no
+           reader arm: the arm that answers it is the builtin's or the
+           raise. Its ivar's type is no answer, but the call still has the
+           boxed slot every such dispatch has, so it answers poly, the same
+           where the dispatch is emitted and where its value is read.
+           Taken as the ivar's Time, `md.end(1)` beside an
+           `attr_reader :end` came out a Time wherever the builtin answer
+           below was not asked (under a face pin). */
+        if (rdcls >= 0 && argc > 0) { r = TY_POLY; found = 1; continue; }
         if (rdcls >= 0) {
           /* resolve alias so `alias_method :required?, :required` reads the
              backing @required, not a bogus @required? */
@@ -3983,6 +3997,7 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
         if (sp_streq(name, "try_lock") || sp_streq(name, "locked?")) { *out = TY_BOOL; return 1; }
       }
       if (sp_streq(name, "alive?") || sp_streq(name, "dead?") || sp_streq(name, "closed?") ||
+          (sp_streq(name, "mon_owned?") && argc == 0) ||
           (sp_streq(name, "blocking?") && argc == 0) ||
           sp_streq(name, "eof?") || sp_streq(name, "tty?") || sp_streq(name, "isatty") ||
           sp_streq(name, "sync"))
@@ -5771,8 +5786,8 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
   /* TY_CLASS method dispatch -- .new on a dynamic class variable returns TY_POLY.
      Exception: self.class.new(...) resolves to the enclosing class statically. */
   if (recv >= 0 && rt == TY_CLASS && sp_streq(name, "new") &&
-      nt_type(nt, recv) && nt_kind(nt, recv) != NK_ConstantReadNode &&
-      nt_kind(nt, recv) != NK_ConstantPathNode) {
+      nt_type(nt, recv) && ((nt_kind(nt, recv) != NK_ConstantReadNode &&
+      nt_kind(nt, recv) != NK_ConstantPathNode) || class_recv_is_dynamic(c, recv))) {
     int _is_self_class = self_class_static_ci(c, recv) >= 0;
     /* a local statically holding one STRUCT class (k = Struct.new(..) /
        k = StructKlass) falls through to the static-class .new arms below --
@@ -5844,9 +5859,14 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
     if (argc == 0 && sp_streq(name, "ancestors")) { *out = TY_POLY_ARRAY; return 1; }
     if (argc == 0 && sp_streq(name, "subclasses")) { *out = TY_POLY_ARRAY; return 1; }
     if (argc == 1 && is_kind_query(name)) { *out = TY_BOOL; return 1; }
-    if (argc == 1 && sp_streq(name, "include?")) {
+    /* the Class rows (Module#include?), unless the class answers with a
+       class method of its own */
+    if (bop_find(TY_CLASS, name, argc, nt_ref(nt, id, "block") >= 0)) {
       int oci = class_recv_static_ci(c, recv);
-      if (oci < 0 || call_target(c, id, oci, name, CT_CMETHOD, NULL) < 0) { *out = TY_BOOL; return 1; }
+      if (oci < 0 || call_target(c, id, oci, name, CT_CMETHOD, NULL) < 0) {
+        *out = an_bop_find_arg(c, id, TY_CLASS, name, argc, argv, nt_ref(nt, id, "block") >= 0)->result;
+        return 1;
+      }
     }
     if (argc == 1 && sp_streq(name, "class_variable_defined?")) { *out = TY_BOOL; return 1; }
     if (sp_streq(name, "class_variable_get") || sp_streq(name, "class_variable_set")) { *out = TY_POLY; return 1; }

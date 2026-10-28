@@ -315,14 +315,23 @@ int is_string_read_only_method(const char *name);
 int str_mutator_str_args(const char *n, int argc, int *int_ok); /* the arguments a String mutator takes as Strings */
 
 int builtin_module_owns(const char *cls, const char *name); /* included ahead of Object */
+int builtin_mixin_module_id(const char *n);   /* Comparable Enumerable Kernel Math: its builtin id */
 int is_include_name(const char *n);
 int is_prepend_name(const char *n);
 int is_load_name(const char *n);
 int is_require_name(const char *n); /* require, require_relative */
+int is_require_relative_name(const char *n);
+int is_extend_name(const char *n);
+int is_stdlib_const_name(const char *n);       /* a standard library's top-level constant */
+int is_toplevel_const_name(const char *n);     /* a constant CRuby, or a library spinel provides, answers at the top level */
+int is_constless_builtin_name(const char *n);  /* a builtin class or module with no constants of its own */
 int is_autoload_name(const char *n);
 int is_file_load_name(const char *n);    /* require require_relative load autoload: a call that runs a file's text */
 int is_load_how_missing(const char *how);
-int is_load_how_computed(const char *how);
+int is_load_how_set(const char *how);
+int is_load_how_core(const char *how);
+int is_load_how_native(const char *how);
+int is_native_lib_at_boot(const char *path);
 int is_comparable_module_name(const char *n);
 int is_enumerable_module_name(const char *n);
 int is_comparable_builtin_name(const char *n);
@@ -525,6 +534,15 @@ int is_hash_self_answer(const char *n);    /* each each_pair each_key each_value
 int is_core_change_call(const char *n);    /* class_eval .. module_exec include prepend define_method send family alias_method remove_method undef_method: may change a class's methods */
 int is_singleton_reach_call(const char *n);/* define_singleton_method extend singleton_class instance_eval instance_exec: give an object methods of its own */
 int is_method_naming_call(const char *n);  /* define_method define_singleton_method alias_method remove_method undef_method attr*: give or take a method its argument names */
+int is_attr_decl_reader(const char *n);    /* attr attr_reader attr_accessor, and Spinel's class-body attribute attributes: declare a reader of each name */
+int is_attr_decl_writer(const char *n);    /* attr_writer attr_accessor attribute attributes: declare a writer of each name */
+int class_method_vis_of_name(const char *n); /* private_class_method public_class_method: BVIS_PRIVATE / BVIS_PUBLIC, else 0 */
 int is_refine_name(const char *n);         /* refine */
+int is_load_effect_call(const char *n);    /* a method body's call that defines, writes, loads or runs code the load record cannot follow */
+int is_using_name(const char *n);          /* using */
+int is_remove_const_name(const char *n);   /* remove_const */
+int is_const_visibility_name(const char *n);   /* private_constant public_constant deprecate_constant */
+int is_cvar_write_name(const char *n);     /* class_variable_set remove_class_variable */
+int is_runtime_callback_name(const char *n);   /* an operator, method_missing, deconstruct, to_f ...: what CRuby's core calls by itself */
 int is_method_list_call(const char *n);    /* attr attr_reader attr_writer attr_accessor remove_method undef_method: every argument names a method */
 #endif

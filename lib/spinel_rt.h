@@ -1125,12 +1125,13 @@ static const char *sp_str_frozen_name(const char *s) {
   static SP_TLS const char **src = NULL, **frz = NULL;
   static SP_TLS int n = 0, cap = 0;
   if (!s || sp_str_is_frozen_val(s)) return s;
-  /* A heap copy (an exception's class, named by sp_exc_class_name) is no
-     key: once it is swept another name can take its address, and the cache
-     answered the old name for it. Only a static name is kept; the interning
-     copy roots the heap one across its allocation (sp_str_dedup). */
-  if (((const unsigned char *)s)[-1] == 0xfe || ((const unsigned char *)s)[-1] == 0xfc)
-    return sp_str_uminus_val(s);
+  /* A heap copy (an exception's class, named by sp_exc_class_name, or a
+     handle's bytes, 0xfd) is no key: once it is swept another name can take
+     its address, and the cache answered the old name for it. Only a static
+     name is kept; the interning copy roots the heap one across its
+     allocation (sp_str_dedup). */
+  { unsigned char m = ((const unsigned char *)s)[-1];
+    if (m == 0xfe || m == 0xfc || m == 0xfd) return sp_str_uminus_val(s); }
   for (int i = 0; i < n; i++) if (src[i] == s) return frz[i];
   if (n == cap) {
     int nc = cap ? cap * 2 : 16;
@@ -3433,7 +3434,14 @@ static SP_THREAD_LOCAL int sp_builtin_hook_depth = 0;
    which knows only the builtin containers. `[]` goes through the binop hook
    above. handled stays FALSE when no arm takes the receiver and key. */
 typedef void (*sp_user_aset_fn)(sp_RbVal recv, sp_RbVal key, sp_RbVal val, sp_bool *handled);
+/* (kept static, with the copy lib/sp_poly_cold.c reads, as the binop hook) */
+#ifdef SPINEL_EXT_HOST
+extern sp_user_aset_fn sp_user_aset_hook_lib;
+#define sp_user_aset_hook sp_user_aset_hook_lib
+#else
 static sp_user_aset_fn sp_user_aset_hook = NULL;
+extern sp_user_aset_fn sp_user_aset_hook_lib;
+#endif
 /* eql? alone, through the same kind of table (sp_user_eql_dispatch): uniq
    and the set operations ask a program object's own eql? of any argument */
 static sp_user_binop_fn sp_user_eql_hook = NULL;
@@ -3666,6 +3674,10 @@ static SP_NOINLINE sp_int sp_poly_to_i_cold(sp_RbVal v) {
    filled speculatively, never for one the program really indexes by. */
 static sp_int sp_poly_slot_i(sp_RbVal v) {
   if (v.tag == SP_TAG_OBJ && v.cls_id >= 0) return 0;
+  /* nor is a String: to_i raises past the Integer word (#9941), and a block
+     handed a boxed String of a hundred digits raised before it ran (#10462) */
+  sp_RbVal s = sp_poly_strbuf_deref(v);
+  if (s.tag == SP_TAG_STR) return (sp_int)strtoll(s.v.s ? s.v.s : sp_str_empty, NULL, 10);
   return sp_poly_to_i(v);
 }
 
@@ -4926,6 +4938,39 @@ static SP_UNUSED int64_t sp_poly_time_sec_split(sp_RbVal v, int32_t *nsec) {
   if (v.tag == SP_TAG_FLT || sp_poly_is_brat(v)) return sp_time_sec_split_f(sp_poly_to_f_with_rational(v), nsec);
   *nsec = 0;
   return sp_poly_time_field(v, 5);
+}
+/* Time.local / Time.utc (mktime / gm) with their arguments gathered at run
+   time, a splat's among them. Ten are Time#to_a's order (sec, min, hour, day,
+   month, year, wday, yday, isdst, zone), the last four ignored; one to seven
+   are year, month, day, hour, min, sec, usec, and with eight the last two are
+   ignored. A String field reads as Integer(str, 10) does. */
+static sp_RbVal sp_kernel_Integer_val(sp_RbVal v, sp_int base, int raise);
+static SP_UNUSED int64_t sp_time_list_field(sp_RbVal v, int i, int32_t *nsec) {
+  v = sp_poly_strbuf_deref(v);
+  if (v.tag == SP_TAG_STR)
+    return i == 1 ? sp_time_month_arg(v.v.s) : sp_poly_arg_int_chk(sp_kernel_Integer_val(v, 10, 1));
+  if (v.tag == SP_TAG_NIL) return sp_poly_time_field(v, i);
+  if (i == 5) return sp_poly_time_sec_split(v, nsec);
+  return sp_poly_arg_int_chk(v);
+}
+static SP_UNUSED sp_Time *sp_time_civil_list(sp_PolyArray *a, int is_utc) {
+  SP_GC_ROOT(a);
+  sp_int n = a->len;
+  if (n != 10) sp_arity_check(n, 1, 8, NULL);
+  int64_t f[6] = {0, 1, 1, 0, 0, 0};
+  int32_t ns = 0;
+  for (int i = 0; i < 6; i++) {
+    sp_int k = n == 10 ? 5 - i : i;
+    if (k < n) f[i] = sp_time_list_field(a->data[k], i, &ns);
+  }
+  sp_Time *t = is_utc ? sp_time_new_utc(f[0], f[1], f[2], f[3], f[4], f[5])
+                      : sp_time_new(f[0], f[1], f[2], f[3], f[4], f[5]);
+  SP_GC_ROOT(t);
+  t->tv_nsec = ns;
+  /* with eight, the seventh is ignored along with the eighth */
+  if (n == 7 && a->data[6].tag != SP_TAG_NIL)
+    t = sp_time_with_usec_f(t, sp_poly_to_f_with_rational(a->data[6]));
+  return t;
 }
 static SP_UNUSED sp_int sp_ffi_int_of(sp_RbVal v) { return sp_poly_arg_int_chk(v); }
 static SP_UNUSED sp_int sp_ffi_int_of_i(sp_oint v) { if (SP_UNLIKELY(v.nil)) sp_ffi_nil_int_raise(); return v.v; }
@@ -18811,7 +18856,9 @@ sp_PolyPolyHash *sp_poly_hash_merge(sp_RbVal a, sp_RbVal b);
 /* `recv.merge(other)` on a boxed receiver: only a Hash has merge, so nil or
    any other value is CRuby's NoMethodError, with the argument staged as its
    args. sp_poly_hash_merge itself takes nil as an empty start (the keyword
-   folds call it so). */
+   folds call it so). Each member of merge's or merge!'s splatted list
+   (`h.merge!(*hs)`) converts here too: a Hash is itself, a user object
+   answers its #to_hash, and nil or any other value is a TypeError. */
 static SP_UNUSED sp_RbVal sp_poly_hash_merge_arg(sp_RbVal v) {
   if (v.tag == SP_TAG_NIL) sp_raise_cls("TypeError", "no implicit conversion of nil into Hash");
   return sp_kw_splat_conv(v, 0);
@@ -21333,7 +21380,10 @@ enum {
   /* the in-place filters of a Hash or an Array: select!/filter! and reject!
      answer nil when nothing went, keep_if and delete_if the receiver */
   SP_PENUM_SELECT_BANG, SP_PENUM_REJECT_BANG, SP_PENUM_KEEP_IF, SP_PENUM_DELETE_IF,
-  SP_PENUM_FILTER_BANG   /* select! by its other name, for the error */
+  SP_PENUM_FILTER_BANG,  /* select! by its other name, for the error */
+  /* min/max with a comparing block (two elements in), min_by/max_by with a
+     key block: the first winner is kept, as CRuby keeps it */
+  SP_PENUM_MIN, SP_PENUM_MAX, SP_PENUM_MIN_BY, SP_PENUM_MAX_BY
 };
 /* Call `blk` with one element. Both channels are filled, as every other
    proc-driving site does: a poly parameter reads the boxed side-channel, a
@@ -21488,6 +21538,16 @@ static sp_RbVal sp_poly_to_h_val(sp_RbVal v);
 static sp_RbVal sp_poly_hash_replace(sp_RbVal recv, sp_RbVal src, int keep_default);
 static sp_RbVal sp_poly_delete_key(sp_RbVal recv, sp_RbVal key);
 static sp_RbVal sp_poly_delete_at(sp_RbVal v, sp_int i);
+/* Range#min / #max with a block refuse what they cannot walk before asking
+   the block, as CRuby's do: a beginless Range, and an endless one for max */
+static void sp_penum_minmax_range_ck(sp_RbVal recv, int is_max) {
+  if (!(recv.tag == SP_TAG_OBJ && recv.cls_id == SP_BUILTIN_RANGE && recv.v.p)) return;
+  sp_Range *r = (sp_Range *)recv.v.p;
+  if (r->nobeg)
+    sp_raise_cls("RangeError", is_max ? "cannot get the maximum of beginless range with custom comparison method"
+                                      : "cannot get the minimum of beginless range");
+  if (is_max && r->noend) sp_raise_cls("RangeError", "cannot get the maximum of endless range");
+}
 static sp_RbVal sp_poly_enum_proc(sp_RbVal recv, int op, sp_Proc *blk) {
   if (op >= SP_PENUM_SELECT_BANG && op <= SP_PENUM_FILTER_BANG) {
     const char *opname = op == SP_PENUM_SELECT_BANG ? "select!" : op == SP_PENUM_FILTER_BANG ? "filter!" :
@@ -21629,9 +21689,17 @@ static sp_RbVal sp_poly_enum_proc(sp_RbVal recv, int op, sp_Proc *blk) {
      from it. A Hash's entries, a Range's members and an Enumerator's items
      are walked from a copy taken before the block runs. */
   int live = recv.tag == SP_TAG_OBJ && sp_poly_is_array_kind(recv.cls_id);
+  if (op == SP_PENUM_MIN || op == SP_PENUM_MAX) sp_penum_minmax_range_ck(recv, op == SP_PENUM_MAX);
   sp_int n = live ? 0 : sp_poly_arr_len_ex(walk);
   sp_PolyArray *src = sp_PolyArray_new(); SP_GC_ROOT(src);
-  for (sp_int i = 0; i < n; i++) sp_PolyArray_push(src, sp_poly_each_elem(walk, i));
+  /* a walker's length is only what it has pulled so far, so it is read
+     again at each step until the source runs out */
+  if (!live && sp_enum_is_walker(walk)) {
+    for (sp_int i = 0; i < sp_poly_arr_len_ex(walk); i++) sp_PolyArray_push(src, sp_poly_each_elem(walk, i));
+    n = src->len;
+  }
+  else
+    for (sp_int i = 0; i < n; i++) sp_PolyArray_push(src, sp_poly_each_elem(walk, i));
   if (first_of_pair)
     for (sp_int i = 0; i < n; i++) { sp_gc_wb((void *)src); src->data[i] = sp_yielded_first(pair, src->data[i]); }
   /* the element being handed to the block, rooted: walked live, the array
@@ -21763,6 +21831,32 @@ static sp_RbVal sp_poly_enum_proc(sp_RbVal recv, int op, sp_Proc *blk) {
         sp_PolyArray_insert(out, pos, e);
       }
       return sp_box_poly_array(out);
+    }
+    case SP_PENUM_MIN: case SP_PENUM_MAX: {
+      /* the block is asked (element, best so far), as Array#max and
+         Enumerable#max ask it; a nil answer raises as rb_cmpint does */
+      sp_RbVal best = sp_box_nil(); SP_GC_ROOT_RBVAL(best);
+      for (sp_int i = 0; i < SP_PENUM_LEN; i++) {
+        sp_RbVal e = SP_PENUM_AT(i); SP_GC_ROOT_RBVAL(e);
+        if (i == 0) { best = e; continue; }
+        sp_oint c = sp_sort_cmpint(sp_penum_call2(blk, e, best));
+        if (c.nil) sp_poly_cmp_fail(e, best);
+        if (op == SP_PENUM_MAX ? c.v > 0 : c.v < 0) best = e;
+      }
+      return best;
+    }
+    case SP_PENUM_MIN_BY: case SP_PENUM_MAX_BY: {
+      sp_RbVal best = sp_box_nil(); SP_GC_ROOT_RBVAL(best);
+      sp_RbVal bestk = sp_box_nil(); SP_GC_ROOT_RBVAL(bestk);
+      for (sp_int i = 0; i < SP_PENUM_LEN; i++) {
+        sp_RbVal e = SP_PENUM_AT(i); SP_GC_ROOT_RBVAL(e);
+        sp_RbVal k = sp_penum_call1(blk, e); SP_GC_ROOT_RBVAL(k);
+        if (i == 0) { best = e; bestk = k; continue; }
+        sp_oint c = sp_sort_key_cmp(k, bestk);
+        if (c.nil) sp_poly_cmp_fail(k, bestk);
+        if (op == SP_PENUM_MAX_BY ? c.v > 0 : c.v < 0) { best = e; bestk = k; }
+      }
+      return best;
     }
   }
 #undef SP_PENUM_LEN
@@ -22791,6 +22885,16 @@ static SP_UNUSED sp_Time *sp_time_add_boxed(sp_Time *t, sp_RbVal offset) {
   SP_GC_ROOT_RBVAL(offset);
   sp_RbVal boxed = sp_box_time(t);
   return sp_poly_as_time_chk(sp_poly_add(boxed, offset));
+}
+
+static SP_UNUSED sp_mutex *sp_monitor_check(sp_mutex *m, const char *name) {
+  if (m && m->reentrant) return m;
+  sp_raise_nomethod(sp_nomethod_msg(name, sp_box_nullable_obj(m, SP_BUILTIN_MUTEX)));
+  return NULL;
+}
+
+static SP_UNUSED sp_bool sp_poly_mutex_mon_owned(sp_RbVal value) {
+  return sp_Mutex_owned(sp_monitor_check(sp_poly_as_mutex(value, "mon_owned?"), "mon_owned?"));
 }
 
 #endif /* SP_RUNTIME_H */

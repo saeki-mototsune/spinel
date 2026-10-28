@@ -1157,22 +1157,25 @@ void conv_hold_end(int tmp) {
   buf_printf(&g_conv_hold->b, "; SP_GC_ROOT(_t%d); ", tmp);
 }
 
-static void emit_obj_conv_call_inline(Compiler *c, int node, TyKind t, int def, const char *conv, Buf *b);
-static void emit_obj_conv_call(Compiler *c, int node, TyKind t, int def, const char *conv, Buf *b) {
+/* The conversion call of node's object to method mi (from class def, its
+   receiver's cast), as the lookup that chose it found it: asked again from
+   def, a method the class has only through an alias of an inherited one
+   (`alias to_str name` in a subclass) is not there. */
+static void emit_obj_conv_call_inline(Compiler *c, int node, TyKind t, int def, int mi_c, const char *conv, Buf *b);
+static void emit_obj_conv_call(Compiler *c, int node, TyKind t, int def, int mi, const char *conv, Buf *b) {
   int tmp;
   /* an Integer answer needs no root, so #to_int renders inline -- still a
      conversion for the operand-order gate's count */
   if (sp_streq(conv, "to_int")) g_conv_emitted++;
   Buf *hb = sp_streq(conv, "to_int") ? NULL : conv_hold_begin(b, &tmp);
-  if (!hb) { emit_obj_conv_call_inline(c, node, t, def, conv, b); return; }
-  emit_obj_conv_call_inline(c, node, t, def, conv, hb);
+  if (!hb) { emit_obj_conv_call_inline(c, node, t, def, mi, conv, b); return; }
+  emit_obj_conv_call_inline(c, node, t, def, mi, conv, hb);
   conv_hold_end(tmp);
 }
-static void emit_obj_conv_call_inline(Compiler *c, int node, TyKind t, int def, const char *conv, Buf *b) {
+static void emit_obj_conv_call_inline(Compiler *c, int node, TyKind t, int def, int mi_c, const char *conv, Buf *b) {
   /* a boxed answer is judged, not merely read: a conversion that hands back
      something of the wrong kind is CRuby's TypeError, which is what these
      two raise -- the same judgement the bridge row makes for its own half */
-  int mi_c = comp_method_in_chain(c, def, conv, NULL);
   const char *unbox = NULL;
   /* Sharing can narrow a boxed conversion result to a nullable String;
      keep its result check when that representation changes. */
@@ -1233,8 +1236,9 @@ static int emit_obj_conv(Compiler *c, int node, const char *conv, TyKind want,
     buf_puts(b, "))");
     return 1;
   }
-  if (obj_conv_method(c, t, conv, want, &def) >= 0) {
-    emit_obj_conv_call(c, node, t, def, conv, b);
+  int mi = obj_conv_method(c, t, conv, want, &def);
+  if (mi >= 0) {
+    emit_obj_conv_call(c, node, t, def, mi, conv, b);
     return 1;
   }
   /* The class is static and settled here, so a missing #to_str / #to_int is
@@ -1902,11 +1906,12 @@ void emit_path_expr(Compiler *c, int node, Buf *b) {
   int cid = ty_is_object(t) ? ty_object_class(t) : -1;
   if (cid >= 0 && cid < c->nclasses && !c->classes[cid].is_native_class) {
     int def = -1;
-    if (obj_conv_method_typed(c, t, "to_path", TY_STRING, &def) >= 0) {
-      emit_obj_conv_call(c, node, t, def, "to_path", b);
+    int mi = obj_conv_method_typed(c, t, "to_path", TY_STRING, &def);
+    if (mi >= 0) {
+      emit_obj_conv_call(c, node, t, def, mi, "to_path", b);
       return;
     }
-    int mi = comp_method_in_chain(c, cid, "to_path", &def);
+    mi = comp_method_in_chain(c, cid, "to_path", &def);
     if (mi >= 0) {
       /* a #to_path the analysis could not pin to String -- one backed by an
          accessor, or with a nil branch -- answers a boxed value. CRuby checks
@@ -1917,7 +1922,7 @@ void emit_path_expr(Compiler *c, int node, Buf *b) {
         int tmp; Buf *hb = conv_hold_begin(b, &tmp);
         Buf *ob = hb ? hb : b;
         buf_puts(ob, "sp_poly_arg_str_chk(");
-        emit_obj_conv_call_inline(c, node, t, def, "to_path", ob);
+        emit_obj_conv_call_inline(c, node, t, def, mi, "to_path", ob);
         buf_puts(ob, ")");
         if (hb) conv_hold_end(tmp);
         return;
@@ -11147,10 +11152,8 @@ const char *obj_str_fn(Compiler *c, int cid, int want_inspect) {
   int mi = cid < 0 || cid >= c->nclasses ? -1 : display_method_scope(c, cid, want_inspect, NULL);
   if (mi >= 0) return mc_method(c, &c->scopes[mi]);
   /* the generated one, in mc_method's ring */
-  char *r = c->mc_ring[c->mc_ring_next++ & 7];
-  snprintf(r, sizeof c->mc_ring[0], "sp_%s_%s", cid < 0 || cid >= c->nclasses ? "" : c->classes[cid].c_name,
-           want_inspect ? "inspect" : "to_s");
-  return r;
+  return mc_ring_setf(c, "sp_%s_%s", cid < 0 || cid >= c->nclasses ? "" : c->classes[cid].c_name,
+                      want_inspect ? "inspect" : "to_s");
 }
 
 /* True when the resolved user to_s/inspect returns a boxed sp_RbVal (its
@@ -16781,7 +16784,7 @@ void emit_regex_section(Compiler *c, Buf *b) {
   if (program_has_user_eql(c))
     buf_puts(b, "  sp_user_eql_hook = sp_user_eql_dispatch;\n");
   if (g_has_user_aset)
-    buf_puts(b, "  sp_user_aset_hook = sp_user_aset_dispatch;\n");
+    buf_puts(b, "  SP_INSTALL_HOOK(sp_user_aset_hook, sp_user_aset_dispatch);\n");
   if (g_has_user_coerce)
     buf_puts(b, "  sp_user_coerce_hook = sp_user_coerce_dispatch;\n");
   if (g_has_user_to_io)
@@ -19142,12 +19145,6 @@ static void ext_generate_cruby_shim(Compiler *c) {
 }
 
 
-static int cmp_int_pair(const void *a, const void *b) {
-  const int *x = a, *y = b;
-  if (x[0] != y[0]) return x[0] < y[0] ? -1 : 1;
-  return x[1] < y[1] ? -1 : x[1] > y[1];
-}
-
 static int exc_text_method(Compiler *c, int i, int want_message, int *dcls) {
   int dmsg = -1, dtos = -1;
   int mi_msg = comp_method_in_chain(c, i, "message", &dmsg);
@@ -19526,85 +19523,32 @@ static void emit_class_machinery(const NodeTable *nt, Compiler *c, Buf *b, char 
        separately from the includes that follow the class (#2702). */
     int **cls_preps = calloc((size_t)c->nclasses, sizeof(int *));
     int  *cls_npreps = calloc((size_t)c->nclasses, sizeof(int));
-    /* One pass over every class/module body (class_body_list, a Struct.new
-       block included), in source order so each class sees its includes in
-       the order they run. Scanning the whole table once per class was
-       O(classes * N) and dominated codegen on class-heavy programs. */
-    {
-      int *bcls, *bbody;
-      int nbodies = class_body_list(c, &bcls, &bbody);
-      int (*bord)[2] = malloc((size_t)(nbodies > 0 ? nbodies : 1) * sizeof *bord);
-      if (!bord) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-      /* The order of a class's bodies is the analysis's fact, which the
-         elaborator records (part 3b of #9898); until then codegen sorts:
-         class_body_list puts the definition first, which is not source order
-         where a later body is the def_node (`class CC < Object`). Node ids
-         order one file; across files the program module does (prog_sort). */
-      if (prog_has_files(c)) {
-        int *ix = malloc(sizeof(int) * (size_t)(nbodies > 0 ? nbodies : 1));
-        if (!ix) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-        for (int bi = 0; bi < nbodies; bi++) ix[bi] = bi;
-        prog_sort(c, ix, nbodies, bbody);
-        for (int bi = 0; bi < nbodies; bi++) { bord[bi][0] = bbody[ix[bi]]; bord[bi][1] = bcls[ix[bi]]; }
-        free(ix);
-      }
-      else {
-        for (int bi = 0; bi < nbodies; bi++) { bord[bi][0] = bbody[bi]; bord[bi][1] = bcls[bi]; }
-        qsort(bord, (size_t)nbodies, sizeof *bord, cmp_int_pair);
-      }
-      for (int bx = 0; bx < nbodies; bx++) {
-        int ci = bord[bx][1];
-        int body2 = bord[bx][0];
-        int bn2 = 0;
-        const int *stmts2 = body2 >= 0 ? nt_arr(c->nt, body2, "body", &bn2) : NULL;
-        for (int k2 = 0; k2 < bn2; k2++) {
-          NodeKind sty2_k = nt_kind(c->nt, stmts2[k2]);
-          if (sty2_k != NK_CallNode) continue;
-          const char *nm2 = nt_str(c->nt, stmts2[k2], "name");
-          if (!nm2 || (!sp_streq(nm2, "include") && !sp_streq(nm2, "prepend"))) continue;
-          int is_prep2 = sp_streq(nm2, "prepend");
-          int **tgt_mods = is_prep2 ? cls_preps : cls_incs;
-          int  *tgt_n    = is_prep2 ? cls_npreps : cls_nincs;
-          if (nt_ref(c->nt, stmts2[k2], "receiver") >= 0) continue;
-          int anode2 = nt_ref(c->nt, stmts2[k2], "arguments");
-          int an2 = 0;
-          const int *aargs = anode2 >= 0 ? nt_arr(c->nt, anode2, "arguments", &an2) : NULL;
-          for (int jj = 0; jj < an2; jj++) {
-            /* `include A, B` includes B first, so A is listed in front */
-            int j2 = is_prep2 ? jj : an2 - 1 - jj;
-            NodeKind aty2_k = nt_kind(c->nt, aargs[j2]);
-            const char *mname2 = (aty2_k == NK_ConstantReadNode) ? nt_str(c->nt, aargs[j2], "name") : NULL;
-            if (!mname2 && aty2_k == NK_ConstantPathNode) mname2 = nt_str(c->nt, aargs[j2], "name");
-            int mid2 = mname2 ? comp_class_index(c, mname2) : -1;
-            /* a constant aliasing a module (`Loud = Shout`, `E = Enumerable`)
-               names it */
-            if (mid2 < 0 && mname2) {
-              const char *al = resolve_class_alias_chain(c, mname2);
-              if (al) { mid2 = comp_class_index(c, al); mname2 = al; }
-            }
-            int is_builtin_mod = 0;
-            /* a builtin module (Enumerable/Comparable/Kernel/Math) has no user
-               class index; record its (negative) builtin id so ancestors
-               reflects it -- the generic `mid2 < 0` skip must not drop it. */
-            if (mid2 < 0 && mname2) {
-              if (sp_streq(mname2, "Enumerable")) { mid2 = -115; is_builtin_mod = 1; }
-              else if (sp_streq(mname2, "Comparable")) { mid2 = -114; is_builtin_mod = 1; }
-              else if (sp_streq(mname2, "Kernel")) { mid2 = -119; is_builtin_mod = 1; }
-              else if (sp_streq(mname2, "Math")) { mid2 = -130; is_builtin_mod = 1; }
-            }
-            if (mid2 < 0 && !is_builtin_mod) continue;
-            /* deduplicate */
-            int found2 = 0;
-            for (int q = 0; q < tgt_n[ci]; q++) if (tgt_mods[ci][q] == mid2) { found2 = 1; break; }
-            if (found2) continue;
-            tgt_mods[ci] = realloc(tgt_mods[ci], sizeof(int) * (size_t)(tgt_n[ci] + 1));
-            tgt_mods[ci][tgt_n[ci]++] = mid2;
-          }
+    /* Each class's includes and prepends as the load record has them, in
+       the order they run (a Struct.new block's too): one call's modules
+       last first, as `include A, B` includes B first and `prepend A, B`
+       prepends B first. One under a condition in its body (LrMixin.cond),
+       which may not run, is left out. */
+    for (int ci = 0; ci < c->nclasses; ci++) {
+      int nmx = 0;
+      const LrMixin *mx = elab_class_mixins(c, ci, &nmx);
+      for (int g = 0, ge; g < nmx; g = ge) {
+        for (ge = g + 1; ge < nmx && mx[ge].node == mx[g].node; ge++) {}
+        int prep = mx[g].kind == LR_PREPEND;
+        if ((!prep && mx[g].kind != LR_INCLUDE) || mx[g].cond) continue;
+        int **tgt_mods = prep ? cls_preps : cls_incs;
+        int  *tgt_n    = prep ? cls_npreps : cls_nincs;
+        for (int x = g; x < ge; x++) {
+          const LrMixin *m = &mx[x];
+          int mid2 = elab_mixin_module(c, m);
+          if (mid2 == -1) continue;
+          int found2 = 0;
+          for (int q = 0; q < tgt_n[ci] && !found2; q++) found2 = tgt_mods[ci][q] == mid2;
+          if (found2) continue;
+          tgt_mods[ci] = realloc(tgt_mods[ci], sizeof(int) * (size_t)(tgt_n[ci] + 1));
+          if (!tgt_mods[ci]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+          tgt_mods[ci][tgt_n[ci]++] = mid2;
         }
       }
-      free(bord);
-      free(bcls);
-      free(bbody);
     }
     /* An `obj.extend(Mod)` records its membership on the synthesized singleton
        subclass rather than as an `include` statement in a class body, so the
@@ -21212,29 +21156,109 @@ static double cg_phase(double t0, const char *phase) {
 /* --load-model=graph (#9898): each required file's top level as a function
    of its own, which the first load of the file runs (sp_load_file), with
    the file's own locals and frame; its BEGIN blocks run first, when it
-   loads. A file that only defines things has none, and no loaded flag
-   either while no load of it is a value. Every file's flag comes first,
-   since a load in one file may name any other. */
+   loads. A file that only defines things has none while no load of it is a
+   value; one that is has an empty function (prog_file_tops). --debug: the
+   function is external, as a method is (emit_method_signature), so its
+   frame has a symbol in an ELF backtrace, which names it `<top (required)>`
+   in its own file (lib/sp_cold.c, sp_bt_symbol). */
+static const char *file_top_storage(void) { return g_debug ? "" : "static "; }
+
+/* Every file's flag and function are declared ahead of every body, since a
+   load may stand in any of them -- a method, a proc, another file's top
+   level -- and may name any file. */
+/* ...and the flag of each native library whose require stands as a value
+   (native_load_flag), once. */
+typedef struct { Compiler *c; Buf *b; } NativeFlags;
+static void emit_native_flag(void *ud, int load) {
+  NativeFlags *q = ud;
+  char fl[96], decl[128];
+  if (is_native_lib_at_boot(nt_str(q->c->nt, load, "path"))) return;
+  native_load_flag(q->c->nt, load, fl, sizeof fl);
+  snprintf(decl, sizeof decl, "static int %s;\n", fl);
+  if (!q->b->p || !strstr(q->b->p, decl)) buf_puts(q->b, decl);
+}
+/* What a path computed when it runs and known to no set may name
+   (sp_require_search): each file of the program with its flag and
+   function, each native library with its flag, each feature loaded already
+   (a core capability, a library CRuby has at boot). Declared once, where
+   the program has such a require. */
+static void emit_required_table(Compiler *c, Buf *b, const unsigned char *has) {
+  const NodeTable *nt = c->nt;
+  int n = nt_nroots(nt), open = 0;
+  NT_FOREACH_KIND(nt, NK_LoadNode, id)
+    if (prog_load_open(nt, id)) { Scope *s = comp_scope_of(c, id); open |= !s || s->reachable; }
+  if (!open) return;
+  Buf t; memset(&t, 0, sizeof t);
+  int count = 0;
+  for (int f = 1; f < n; f++) {
+    if (!has[f]) continue;
+    buf_puts(&t, "{");
+    emit_file_feature(nt, f, &t);
+    buf_printf(&t, ", &sp_loaded_%d, sp_file_%d_top}, ", f, f);
+    count++;
+  }
+  NT_FOREACH_KIND(nt, NK_LoadNode, id) {
+    const char *how = nt_str(nt, id, "how"), *path = nt_str(nt, id, "path");
+    if (!path || !(is_load_how_core(how) || is_load_how_native(how))) continue;
+    size_t len = strlen(path);
+    if (len > 3 && !strcmp(path + len - 3, ".rb")) len -= 3;
+    char *feat = strndup(path, len), flag[96];
+    if (!feat) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    Buf lit; memset(&lit, 0, sizeof lit);
+    emit_str_literal(&lit, feat);
+    char *key = malloc(strlen(lit.p) + 16);
+    if (!key) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    sprintf(key, "{NULL, %s,", lit.p);
+    if (!t.p || !strstr(t.p, key)) {
+      int own = is_load_how_native(how) && !is_native_lib_at_boot(path);
+      if (own) {
+        native_load_flag(nt, id, flag, sizeof flag);
+        buf_printf(b, "static int %s;\n", flag);
+      }
+      buf_printf(&t, "{NULL, %s, %s%s, NULL}, ", lit.p, own ? "&" : "", own ? flag : "NULL");
+      count++;
+    }
+    free(key); free(lit.p); free(feat);
+  }
+  buf_printf(b, "static const sp_LoadCand sp_load_candidates[] = {%s{NULL, NULL, NULL, NULL} };\nstatic const int sp_nload_candidates = %d;\n",
+             t.p ? t.p : "", count);
+  free(t.p);
+}
+static void emit_file_top_decls(Compiler *c, Buf *b) {
+  int n = nt_nroots(c->nt);
+  if (!prog_has_files(c)) return;
+  unsigned char *has = calloc((size_t)n, 1);
+  if (!has) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  NativeFlags nf = { c, b };
+  prog_file_tops(c, has, emit_native_flag, &nf);
+  for (int f = 1; f < n; f++)
+    if (has[f]) buf_printf(b, "static int sp_loaded_%d;\n%svoid sp_file_%d_top(void);\n", f, file_top_storage(), f);
+  emit_required_table(c, b, has);
+  free(has);
+}
 static void emit_file_tops(Compiler *c, Buf *body) {
   int n = nt_nroots(c->nt);
-  /* --debug: external, as a method is (emit_method_signature), so its frame
-     has a symbol in an ELF backtrace, which names it `<top (required)>`
-     in its own file (lib/sp_cold.c, sp_bt_symbol) */
-  const char *stor = g_debug ? "" : "static ";
-  for (int f = 1; f < n; f++)
-    if (!prog_defines_only(c, f)) buf_printf(body, "static int sp_loaded_%d;\n%svoid sp_file_%d_top(void);\n", f, stor, f);
+  if (n < 2) return;
+  const char *stor = file_top_storage();
+  unsigned char *has = calloc((size_t)n, 1);
+  if (!has) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  prog_file_tops(c, has, NULL, NULL);
   /* a void function: a top-level `return` ends the file's load, as a void
      method's return ends the method, not the program's main body */
   int sv_cv = g_c_ret_void;
   TyKind sv_rt = g_ret_type;
   g_c_ret_void = 1; g_ret_type = TY_VOID;
   for (int f = 1; f < n; f++) {
-    if (prog_defines_only(c, f)) continue;
+    if (!has[f]) continue;
     Scope *s = &c->scopes[c->file_scope[f]];
     char tag[32], group[UNIT_TAG_MAX + 8];
     snprintf(tag, sizeof tag, "file_%d", f);
     /* --incremental: with the file's top-level methods (class_unit_group) */
     unit_begin_in(body, tag, class_unit_group(c, -1, nt_root(c->nt, f), group, sizeof group));
+    if (prog_defines_only(c, f)) {
+      buf_printf(body, "%svoid sp_file_%d_top(void) { }\n", stor, f);
+      continue;
+    }
     buf_printf(body, "%svoid sp_file_%d_top(void) {\n    SP_GC_SAVE();\n", stor, f);
     if (g_debug) {
       char *sym = malloc(32);
@@ -21253,6 +21277,7 @@ static void emit_file_tops(Compiler *c, Buf *body) {
     if (!g_no_root_frame) gc_frame_build(c, body, frame_ins, tag);
   }
   g_c_ret_void = sv_cv; g_ret_type = sv_rt;
+  free(has);
 }
 
 /* The top-level bodies that run as functions of their own: each required
@@ -21296,6 +21321,7 @@ char *codegen_program(const NodeTable *nt) {
   char *repr_text = g_dump_repr ? repr_dump(c) : NULL;
   if (g_check_traits) exit(ty_traits_check(c) ? 1 : 0);
   g_scopes_settled = 1;   /* scope_is_shadowed may answer from its table now */
+  mc_number_versions(c);
   mc_resolve_clashes(c);   /* two methods spelling one C name get two */
   /* Only stack String slots selected by the existing setjmp policy seed
      borrowed volatility; a heap cell itself does not live across setjmp. */
@@ -21874,6 +21900,7 @@ char *codegen_program(const NodeTable *nt) {
                  "static sp_RbVal sp_cls_allocate(sp_RbVal v);\n"
                  "static sp_PolyArray *sp_cls_members(sp_RbVal v);\n"
                  "static sp_RbVal sp_cls_keyword_init_p(sp_RbVal v);\n");
+  emit_file_top_decls(c, &b);
   /* Constructor defs, method defs, and main go into a separate buffer. Any
      proc literals they contain accumulate static functions into g_procs /
      g_proc_protos; we splice those in ahead of these bodies, since a proc
@@ -22034,6 +22061,7 @@ char *codegen_program(const NodeTable *nt) {
   buf_puts(body, "    SP_GC_SAVE();\n");
   main_frame_ins = body->len;
   if (g_re_init_needed) buf_puts(body, "    sp_tu_init();\n");
+  emit_load_path_seed(c, body);
   /* Adopt the main thread and chain the scheduler's GC root hook. Placed after
      sp_tu_init so it chains whatever globals hook that installed. */
   if (g_uses_threads || g_uses_thread_current) buf_puts(body, "    sp_sched_init();\n");

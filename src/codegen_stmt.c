@@ -3694,7 +3694,7 @@ static int strbuf_route_nonnil(Compiler *c, int v) {
 /* --share-strings: is recv a deep-return pickup (emit_deep_return_pickup)
    that can answer nil (strbuf_pickup_answers_nil)? */
 int strbuf_pickup_may_nil(Compiler *c, int recv) {
-  return recv >= 0 && nt_kind(c->nt, recv) == NK_CallNode && c->strbuf_box[recv] &&
+  return recv >= 0 && nt_kind(c->nt, recv) == NK_CallNode && (c->strbuf_box[recv] || c->strbuf_handle_demand[recv]) &&
          strbuf_pickup_answers_nil(c, recv);
 }
 static int strbuf_route_recv(Compiler *c, int id, int recv, Buf *out);
@@ -3735,7 +3735,7 @@ int strbuf_pickup_nil_check(Compiler *c, const char *name, int recv, Buf *out) {
      own check did; its text runs the call, so it is read once. */
   Buf rb; memset(&rb, 0, sizeof rb);
   if (!strbuf_slot_text(c, recv, &rb)) { free(rb.p); return 0; }
-  if (!strbuf_pickup_may_nil(c, recv)) {
+  if (!strbuf_pickup_may_nil(c, recv) && !repr_of(c, recv).may_nil) {
     buf_puts(out, rb.p);
     free(rb.p);
     return 1;
@@ -6949,7 +6949,7 @@ int static_isa_cond(Compiler *c, int pred) {
   if (!builtin_mod && is_descendant(c, rcls, target)) return nilable ? -1 : 1;
   int is_mod = builtin_mod || comp_class_is_module(c, &c->classes[target]);
   /* a module the class (or a superclass) includes */
-  if (is_mod && class_includes_module_named(c, rcls, target_name)) return nilable ? -1 : 1;
+  if (is_mod && class_includes_module(c, rcls, builtin_mod ? elab_module_named(c, target_name) : target)) return nilable ? -1 : 1;
   /* a subclass can add any other module (with include, prepend, a module
      that includes it, or an `extend` on one object), so is_a? of a module
      is answered at run time when the class has a subclass */
@@ -7340,7 +7340,7 @@ int emit_poly_class_when(Compiler *c, int cond_id, const char *tmp, Buf *b) {
       buf_printf(b, "(%s.tag == SP_TAG_OBJ && (", tmp);
       int first = 1;
       for (int k = 0; k < c->nclasses; k++) {
-        if (class_isa_user(c, k, cid, cn)) {
+        if (class_isa_user(c, k, cid)) {
           /* an Array subclass instance is boxed as its Array (#7449) */
           if (c->classes[k].ary_root > 0)
             buf_printf(b, "%ssp_bsub_cls_of(%s) == %d", first ? "" : " || ", tmp, k);
@@ -7923,7 +7923,7 @@ static int emit_obj_class_when(Compiler *c, TyKind pt, const char *cn, int t, Bu
   int tcid = comp_class_index(c, cn);
   int is_mod = tcid >= 0 ? comp_class_is_module(c, &c->classes[tcid]) : is_builtin_module_name(cn);
   if ((tcid >= 0 && (cid == tcid || is_descendant(c, cid, tcid))) ||
-      (is_mod && class_includes_module_named(c, cid, cn))) {
+      (is_mod && class_includes_module(c, cid, tcid >= 0 ? tcid : elab_module_named(c, cn)))) {
     emit_obj_live(c, pt, t, b);
     return 1;
   }
@@ -14630,6 +14630,29 @@ static int rescue_operand_is_class_name(Compiler *c, int op) {
   return comp_class_index(c, n) >= 0 || is_builtin_class_name(n) || is_builtin_module_name(n) ||
          is_builtin_exception_name(n);
 }
+/* A rescue operand that names a constant defined nowhere (`rescue
+   Missing::Thing`): CRuby evaluates it when an exception reaches the
+   clause and raises NameError there, the exception being handled its
+   cause. The read raises (and warns at build time, emit_expr), after the
+   exception is pushed as the one being handled, as a body's raise does.
+   An int-valued expression for the clause's condition. A path counts
+   only when a segment before its last is missing: the runtime raises
+   some classes by their name alone (IO::Buffer::AccessError), which no
+   read here answers, and the name match keeps catching those. */
+static int rescue_operand_undefined(Compiler *c, int op) {
+  NodeKind k = nt_kind(c->nt, op);
+  if (k == NK_ConstantReadNode) return const_read_raises(c, op);
+  if (k != NK_ConstantPathNode) return 0;
+  int par = nt_ref(c->nt, op, "parent");
+  return par >= 0 && const_read_raises(c, par);
+}
+static void emit_rescue_undefined(Compiler *c, int op, int rc, Buf *b) {
+  buf_printf(b, "({ void *_cx_%d = sp_exc_obj[sp_exc_top] ? sp_exc_obj[sp_exc_top]"
+                " : (void *)sp_exc_new_for_catch(_rcls_%d, _rmsg_%d); sp_rescue_push(_cx_%d); (void)",
+             rc, rc, rc, rc);
+  emit_expr(c, op, b);
+  buf_puts(b, "; 0; })");
+}
 /* Can rescue clause rc, or one further along its chain, catch an exception
    of the class `above` starts with, `above` listing it and the classes and
    modules above it? A bare rescue catches StandardError's classes, as
@@ -14696,6 +14719,14 @@ void emit_rescue(Compiler *c, int id, Buf *b, int indent, int fr, const char *re
   buf_printf(b, "const char *_rcls_%d = (const char *)sp_last_exc_cls; (void)_rcls_%d;\n", rc, rc);
   emit_indent(b, indent);
   buf_printf(b, "const char *_rmsg_%d = sp_exc_msg[sp_exc_top]; (void)_rmsg_%d;\n", rc, rc);
+  /* the first operand raises as the clause is reached: its body and the
+     clauses after it never run */
+  if (nexc > 0 && rescue_operand_undefined(c, exc[0])) {
+    emit_indent(b, indent);
+    emit_rescue_undefined(c, exc[0], rc, b);
+    buf_puts(b, ";\n");
+    return;
+  }
 
   /* type-match condition: an explicit StandardError-ish type is treated as a
      catch-all; otherwise exact class-name (hierarchy-aware) match. A BARE
@@ -14712,7 +14743,7 @@ void emit_rescue(Compiler *c, int id, Buf *b, int indent, int fr, const char *re
     /* `rescue nil, Exception` raises TypeError for the nil, and a call or a
        splat before Exception runs: only class names may come before the
        catchall, else the ordered matcher below keeps their order */
-    if (!rescue_operand_is_class_name(c, exc[i])) break;
+    if (!rescue_operand_is_class_name(c, exc[i]) || rescue_operand_undefined(c, exc[i])) break;
   }
 
   const char *save_cls = g_rescue_cls, *save_msg = g_rescue_msg;
@@ -14749,6 +14780,12 @@ void emit_rescue(Compiler *c, int id, Buf *b, int indent, int fr, const char *re
           buf_puts(b, ")");
           continue;
         }
+      }
+      if (rescue_operand_undefined(c, exc[i])) {
+        if (!first) buf_puts(b, " || ");
+        first = 0;
+        emit_rescue_undefined(c, exc[i], rc, b);
+        continue;
       }
       /* any other operand (a variable, a call, an ivar, a literal): the clause
          matches by the class value's identity at run time, and a value that is
@@ -15691,28 +15728,128 @@ void emit_synth_line_marker(Buf *b) {
   g_lm_last_depth = 0;
 }
 
+/* The candidate a program file is at run time (sp_LoadCand): its path
+   without the ".rb", and the bare features that name it (the parse found
+   them by the compile-time rule for a literal require), or NULL for none. */
+void emit_file_feature(const NodeTable *nt, int f, Buf *b) {
+  const char *path = nt_str(nt, nt_root(nt, f), "file_path"), *bare = nt_str(nt, nt_root(nt, f), "bare_features");
+  size_t len = strlen(path);
+  if (len > 3 && !strcmp(path + len - 3, ".rb")) len -= 3;
+  char *copy = strndup(path, len);
+  if (!copy) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  emit_str_literal(b, copy);
+  free(copy);
+  buf_puts(b, ", ");
+  if (bare) emit_str_literal(b, bare);
+  else buf_puts(b, "NULL");
+}
+
+/* A require whose path is computed when it runs: it names one of a set of
+   files (the node's candidates, prog_load_cand), or any file of the program,
+   a native library or a feature loaded already (the table the program
+   declares, emit_required_table), as CRuby finds a file: by its absolute
+   path, relative to the current directory or (require_relative) to the
+   requiring file's, or as a feature of the load path. The runtime loads the
+   file the path names through the program's Kernel#require or
+   Kernel#require_relative, as a literal require of it does, and answers as
+   it does; a native library answers true once, a feature loaded already
+   false, and any other path raises LoadError (sp_require_search). */
+static void emit_load_set(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  int arg = nt_ref(nt, id, "argument"), nc = prog_load_ncand(nt, id), open = prog_load_open(nt, id);
+  Repr ar = repr_of(c, arg);
+  buf_puts(b, "sp_require_search(sp_str_or_empty(SP_STR_B(");
+  if (ar.as_ty == TY_STRING) emit_expr(c, arg, b);
+  else { buf_puts(b, "sp_poly_to_s("); emit_boxed(c, arg, b); buf_puts(b, ")"); }
+  buf_puts(b, "))");
+  if (open) buf_puts(b, ", sp_load_candidates, sp_nload_candidates");
+  else if (nc) buf_puts(b, ", (const sp_LoadCand[]){");
+  else buf_puts(b, ", NULL, 0");
+  for (int k = 0; !open && k < nc; k++) {
+    int f = prog_load_cand(nt, id, k);
+    buf_puts(b, k ? ", {" : "{");
+    emit_file_feature(nt, f, b);
+    buf_printf(b, ", &sp_loaded_%d, sp_file_%d_top}", f, f);
+  }
+  if (!open && nc) buf_printf(b, "}, %d", nc);
+  /* the requiring file's directory, for a require_relative */
+  int rel = is_require_relative_name(nt_str(nt, id, "method"));
+  buf_puts(b, ", ");
+  if (rel) emit_str_literal(b, nt_str(nt, id, "dir"));
+  else buf_puts(b, "NULL");
+  buf_printf(b, ", %d, sp_Kernel_%s)", rel, mc(nt_str(nt, id, "method")));
+}
+/* Under --load-model=graph, the run-time $LOAD_PATH as CRuby's starts
+   (sp_load_path_seed): the directories from -I, absolute, then the
+   compiler's feature root, which a bare computed path matches the features
+   of (sp_require_search). Emitted into main where the program needs it
+   (prog_load_path_seeded). */
+void emit_load_path_seed(Compiler *c, Buf *b) {
+  const NodeTable *nt = c->nt;
+  if (!prog_load_path_seeded(nt)) return;
+  const char *root = nt_str(nt, nt_root(nt, 0), "load_root"), *dirs = nt_str(nt, nt_root(nt, 0), "load_dirs");
+  buf_puts(b, "    { static const char *const _lp[] = {");
+  int n = 0;
+  for (const char *p = dirs; p && *p; ) {
+    const char *e = strchr(p, '\n');
+    char *one = strndup(p, e ? (size_t)(e - p) : strlen(p));
+    if (!one) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    emit_str_literal(b, one);
+    buf_puts(b, ", ");
+    free(one);
+    n++;
+    p = e ? e + 1 : p + strlen(p);
+  }
+  emit_str_literal(b, root);
+  buf_printf(b, "}; sp_load_path_seed(_lp, %d, _lp[%d]); }\n", n + 1, n);
+}
 /* A require under --load-model=graph (#9898), as the runtime's
    Kernel#require or Kernel#require_relative (lib/spinel_rt.h), named for
    the method the call makes so a backtrace shows the load's frame as CRuby
    does: it runs the file's top level (sp_file_N_top, emit_file_tops) the
    first time and answers whether it did. One that names no file raises
-   LoadError for the feature it was given, wherever it stands. */
+   LoadError for the feature it was given, wherever it stands. One of a
+   core capability, which CRuby has loaded before the program runs, runs
+   nothing and answers false. One of a native library runs nothing either,
+   but answers true the first time, as CRuby's does, from a flag of its
+   feature's (native_load_flag, declared with the files'); false for one
+   CRuby has loaded at boot. */
 void emit_load_call(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
+  const char *how = nt_str(nt, id, "how");
   int f = (int)nt_int(nt, id, "target_file", -1);
+  if (is_load_how_core(how) || (is_load_how_native(how) && is_native_lib_at_boot(nt_str(nt, id, "path")))) { buf_puts(b, "0"); return; }
+  if (is_load_how_native(how)) {
+    char fl[96];
+    native_load_flag(nt, id, fl, sizeof fl);
+    buf_printf(b, "(%s ? 0 : (%s = 1))", fl, fl);
+    return;
+  }
+  if (is_load_how_set(how)) { emit_load_set(c, id, b); return; }
   buf_printf(b, "sp_Kernel_%s(", mc(nt_str(nt, id, "method")));
-  if (is_load_how_missing(nt_str(nt, id, "how"))) {
+  if (is_load_how_missing(how)) {
     emit_str_literal(b, nt_str(nt, id, "feature"));
     buf_puts(b, ", NULL, NULL)");
   }
   else buf_printf(b, "NULL, &sp_loaded_%d, sp_file_%d_top)", f, f);
+}
+/* The C name of the loaded flag of the native library a require names:
+   its path, with the `.rb` it may carry off and every other character that
+   is no letter or digit an underscore ("io/console": sp_loaded_native_io_console) */
+void native_load_flag(const NodeTable *nt, int id, char *buf, size_t n) {
+  const char *path = nt_str(nt, id, "path");
+  size_t len = path ? strlen(path) : 0, k = (size_t)snprintf(buf, n, "sp_loaded_native_");
+  if (len > 3 && !strcmp(path + len - 3, ".rb")) len -= 3;
+  for (size_t i = 0; i < len && k + 1 < n; i++) buf[k++] = isalnum((unsigned char)path[i]) ? path[i] : '_';
+  buf[k < n ? k : n - 1] = '\0';
 }
 /* ... standing as a statement. A file that only defines things has nothing
    to run, and its load, whose value is unused, is nothing; nor is a require
    the runtime provides or a core no-op. */
 static void emit_load_stmt(Compiler *c, int id, Buf *b, int indent) {
   int f = (int)nt_int(c->nt, id, "target_file", -1);
-  if (!is_load_how_missing(nt_str(c->nt, id, "how")) && (f < 0 || prog_defines_only(c, f))) return;
+  const char *how = nt_str(c->nt, id, "how");
+  if (!is_load_how_missing(how) && !is_load_how_set(how) && (f < 0 || prog_defines_only(c, f))) return;
   emit_indent(b, indent);
   buf_puts(b, "(void)");
   emit_load_call(c, id, b);
@@ -15722,7 +15859,7 @@ static void emit_load_stmt(Compiler *c, int id, Buf *b, int indent) {
 void emit_stmt(Compiler *c, int id, Buf *b, int indent) {
   if (g_repr_check) repr_check_ask(c, id);
   emit_line_directive(c, id, b);
-  if (nt_kind(c->nt, id) == NK_LoadNode) { emit_load_stmt(c, id, b, indent); return; }
+  if (nt_kind(c->nt, id) == NK_LoadNode) { emit_with_prelude(c, id, b, indent, emit_load_stmt); return; }   /* (a computed path's temps) */
   if (emit_const_recv_stmt_wrap(c, id, b, indent, 0)) return;
   /* A constant's visibility is not enforced (constants are resolved at
      compile time), so the class body skips these declarations -- also where
@@ -18270,6 +18407,10 @@ static int emit_multi_write_stmt(Compiler *c, int id, Buf *b, int indent, const 
   for (int i = 0; i < en && !store_alloc; i++) {
     Repr vr = repr_of(c, els[i]);
     store_alloc = (vr.kind == RK_STRUCT || vr.kind == RK_VOBJ) && masgn_slot_boxes(c, id, lefts, ln, i, vr.as_ty);
+    /* a box into a general Array ivar is converted at its store, and a box
+       holding a typed Array converts to a new one */
+    if (!store_alloc && i < ln && vr.kind == RK_BOXED && nt_kind(nt, lefts[i]) == NK_InstanceVariableTargetNode)
+      store_alloc = masgn_slot_type(c, id, lefts[i]) == TY_POLY_ARRAY;
   }
   /* evaluate all RHS values into temps first (so `a, b = b, a` swaps).
      Save each temp index separately: emit_expr may consume extra g_tmp
@@ -18613,7 +18754,23 @@ static int emit_multi_write_stmt(Compiler *c, int id, Buf *b, int indent, const 
       /* a boxed element into a String ivar: a box holding a handle is that
          handle, a boxed nil the slot's NULL, as a local target's is */
       else if (ivt == TY_STRBUF && valt == TY_POLY) buf_printf(b, "sp_poly_as_strbuf(_t%d)", tmps[i]);
-      else if (ivt == TY_STRING && valt == TY_POLY) masgn_conv(c, lefts[i], ivt, valt, ivex, b);
+      /* a boxed element into any other typed ivar: unboxed, behind the
+         --rbs seed's assertion where a seed pins the slot, as the single
+         write's store is (a general Array slot converts the box, nil kept:
+         a cast would read a typed Array's elements as boxed values) */
+      else if (valt == TY_POLY && ivt != TY_POLY && ivt != TY_UNKNOWN) {
+        Buf ck; memset(&ck, 0, sizeof ck);
+        if (iv_cid >= 0 && class_ivar_pinned(&c->classes[iv_cid], ivnm))
+          emit_rbs_checked_text(c, ivt, ivnm, ivex, &ck);
+        else buf_puts(&ck, ivex);
+        if (ivt == TY_POLY_ARRAY) {
+          int tv = ++g_tmp;
+          buf_printf(b, "({ sp_RbVal _t%d = %s; _t%d.tag == SP_TAG_NIL ? NULL : sp_poly_to_poly_array(_t%d); })",
+                     tv, ck.p, tv, tv);
+        }
+        else masgn_conv(c, lefts[i], ivt, valt, ck.p, b);
+        free(ck.p);
+      }
       else buf_printf(b, "_t%d", tmps[i]);
       splice_store_close(c, lefts[i], sk, b);
       buf_puts(b, ";\n");
@@ -23554,6 +23711,15 @@ static int str_mutate_append_bang_arms(Compiler *c, int id, Buf *b, int indent, 
     }
     Buf srefC; memset(&srefC, 0, sizeof srefC);
     int slotC = nchain > 0 && strbuf_slot_text(c, cur, &srefC);
+    /* (a slot that may hold nil raises NoMethodError for the append, as a
+       read of it does: its handle is tested once, ahead of the chain) */
+    if (slotC && repr_of(c, cur).may_nil) {
+      int tn = ++g_tmp;
+      Buf w; memset(&w, 0, sizeof w);
+      buf_printf(&w, "({ sp_String *_t%d = %s; if (SP_UNLIKELY(!_t%d)) sp_nil_recv_raise(\"%s\"); _t%d; })",
+                 tn, srefC.p, tn, name, tn);
+      free(srefC.p); srefC = w;
+    }
     /* (one representation: an element read of any typed String container,
        a call's answer's included, is the handle, held once for the chain) */
     int one_elem_hold = 0;
@@ -24131,6 +24297,19 @@ static int str_mutate_sn_var_guard(Compiler *c, int id, int recv, Buf *b, int in
   return r ? 1 : -1;
 }
 
+/* A concat operand's type. Ask the SLOT, not the node: a block parameter's
+   node type can read as an array kind while its declaration is boxed, and
+   reading the boxed local as a typed pointer does not compile (#3850). */
+static TyKind concat_operand_type(Compiler *c, int node) {
+  TyKind at = comp_ntype(c, node);
+  if (nt_kind(c->nt, node) == NK_LocalVariableReadNode) {
+    Scope *asc = comp_scope_of(c, node);
+    LocalVar *alv = asc ? scope_local(asc, nt_str(c->nt, node, "name")) : NULL;
+    if (alv && alv->type != TY_UNKNOWN) at = alv->type;
+  }
+  return at;
+}
+
 static int emit_array_mutate_stmt_body(Compiler *c, int id, Buf *b, int indent) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
@@ -24651,6 +24830,14 @@ static int emit_array_mutate_stmt_body(Compiler *c, int id, Buf *b, int indent) 
     return 1;
   }
   if (sp_streq(name, "concat") && argc >= 1) {
+    /* an argument no Array conversion takes (nil, a boolean, an Integer,
+       a String, ...) is the value form's TypeError (emit_array_operand_misfit):
+       read below as an Array of the receiver's kind, one of the element's
+       own kind gave C that does not build (`a = [1]; a.concat(1)`) */
+    for (int a = 0; a < argc; a++) {
+      TyKind at = comp_ntype(c, argv[a]);
+      if (at == TY_NIL || at == TY_BOOL || conv_to_ary_impossible(at)) return 0;
+    }
     /* Every argument is evaluated, and its length taken, before anything is
        appended, as CRuby concatenates the arguments as they were: with one
        aliasing the receiver, `a.concat(a, a)` appended the grown array the
@@ -24664,21 +24851,17 @@ static int emit_array_mutate_stmt_body(Compiler *c, int id, Buf *b, int indent) 
     emit_indent(b, indent);
     /* rooted across the arguments, which can allocate */
     buf_printf(b, "{ sp_%sArray *_t%d = ", k, tr); emit_expr(c, recv, b); buf_printf(b, "; SP_GC_ROOT(_t%d);\n", tr);
-    Buf hd, lp; memset(&hd, 0, sizeof hd); memset(&lp, 0, sizeof lp);
+    Buf hd, ck, lp; memset(&hd, 0, sizeof hd); memset(&ck, 0, sizeof ck); memset(&lp, 0, sizeof lp);
+    /* the last boxed operand: its #to_ary (and an earlier one's) can change
+       a typed operand before it, which CRuby has already copied */
+    int last_boxed = -1;
+    for (int a = 0; a < argc; a++) if (concat_operand_type(c, argv[a]) == TY_POLY) last_boxed = a;
     for (int a = 0; a < argc; a++) {
       int tn = ++g_tmp, ti = ++g_tmp;
       /* the source array may be a different kind than the receiver (e.g.
          IntArray#concat(PolyArray)); read with the source's kind and coerce
          each element into the receiver's element representation. */
-      TyKind at = comp_ntype(c, argv[a]);
-      /* Ask the SLOT, not the node: a block parameter's node type can read as
-         an array kind while its declaration is boxed, and reading the boxed
-         local as a typed pointer does not compile (#3850). */
-      if (nt_kind(nt, argv[a]) == NK_LocalVariableReadNode) {
-        Scope *asc = comp_scope_of(c, argv[a]);
-        LocalVar *alv = asc ? scope_local(asc, nt_str(nt, argv[a], "name")) : NULL;
-        if (alv && alv->type != TY_UNKNOWN) at = alv->type;
-      }
+      TyKind at = concat_operand_type(c, argv[a]);
       const char *ak = (at == TY_POLY_ARRAY) ? "Poly" : array_kind(at);
       if (at == TY_POLY) {
         /* boxed source: walk it through the boxed surface */
@@ -24687,9 +24870,11 @@ static int emit_array_mutate_stmt_body(Compiler *c, int id, Buf *b, int indent) 
         buf_printf(&hd, "{ sp_RbVal _t%d = ", tv); emit_boxed(c, argv[a], &hd);
         /* (an Array, or one #to_ary answers: anything else is CRuby's
            TypeError, where its length read as 0 appended nothing) */
-        buf_printf(&hd, "; SP_GC_ROOT_RBVAL(_t%d); _t%d = sp_poly_ary_arg_ck(_t%d);\n", tv, tv, tv);
-        emit_indent(&hd, indent + 1);
-        buf_printf(&hd, "sp_int _t%d = sp_poly_length(_t%d);\n", tn, tv);
+        buf_printf(&hd, "; SP_GC_ROOT_RBVAL(_t%d);\n", tv);
+        /* (converted after the frozen test, as CRuby converts it: a frozen
+           receiver raises FrozenError ahead of the operand's TypeError) */
+        emit_indent(&ck, indent + 1);
+        buf_printf(&ck, "_t%d = sp_poly_ary_arg_ck(_t%d); sp_int _t%d = sp_poly_length(_t%d);\n", tv, tv, tn, tv);
         emit_indent(&lp, indent + 1);
         buf_printf(&lp, "for (sp_int _t%d = 0; _t%d < _t%d; _t%d++) sp_%sArray_push%s(_t%d, ",
                    ti, ti, tn, ti, k, nilable, tr);
@@ -24712,8 +24897,12 @@ static int emit_array_mutate_stmt_body(Compiler *c, int id, Buf *b, int indent) 
       emit_indent(&hd, indent + 1);
       buf_printf(&hd, "{ sp_%sArray *_t%d = ", ak, ts); emit_expr(c, argv[a], &hd);
       buf_printf(&hd, "; SP_GC_ROOT(_t%d);\n", ts);
-      emit_indent(&hd, indent + 1);
-      buf_printf(&hd, "sp_int _t%d = sp_%sArray_length(_t%d);\n", tn, ak, ts);
+      /* (read in order with the boxed operands' conversions: a later
+         operand's #to_ary can change this one, so it is copied at its turn,
+         as CRuby copies it; an earlier one's can change its length) */
+      emit_indent(&ck, indent + 1);
+      if (a < last_boxed) buf_printf(&ck, "_t%d = sp_%sArray_dup(_t%d); ", ts, ak, ts);
+      buf_printf(&ck, "sp_int _t%d = sp_%sArray_length(_t%d);\n", tn, ak, ts);
       emit_indent(&lp, indent + 1);
       /* the same number kind copies each element with its nil */
       int same_o = *nilable && sp_streq(ak, k) && (sp_streq(k, "Int") || sp_streq(k, "Float"));
@@ -24749,11 +24938,12 @@ static int emit_array_mutate_stmt_body(Compiler *c, int id, Buf *b, int indent) 
       buf_printf(b, "if (_t%d && _t%d->frozen) sp_raise_frozen_array_at(_t%d, %s);\n",
                  tr, tr, tr, array_frozen_cls(rt));
     }
+    if (ck.p) buf_puts(b, ck.p);
     if (lp.p) buf_puts(b, lp.p);
     emit_indent(b, indent + 1);
     for (int a = 0; a < argc; a++) buf_puts(b, "}");
     buf_puts(b, "\n");
-    free(hd.p); free(lp.p);
+    free(hd.p); free(ck.p); free(lp.p);
     emit_indent(b, indent);
     buf_puts(b, "}\n");
     return 1;

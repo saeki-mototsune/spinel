@@ -456,6 +456,14 @@ typedef struct {
   int class_id;     /* owning class index, or -1 for free functions */
   int yields;       /* body contains a YieldNode (inlined at call sites) */
   int reachable;    /* method name is referenced somewhere (else dead code) */
+  /* a method's versions (#9898), from the load record once it is made:
+     versioned, the record holds more than one version of the name (in any
+     class), so call_target binds a call of it to the version it runs;
+     replaced, a later version replaces this one in its class's history, so
+     only the calls bound to it reach it; version_n, codegen's number for a
+     replaced version in its C name (mc_method), 0 for none */
+  unsigned char versioned, replaced;
+  int version_n;
   unsigned char cand_bound; /* a call on a poly receiver bound its arguments
                                here as one of the methods it may reach
                                (analyze_pass.c): what its parameters hold is
@@ -1498,8 +1506,9 @@ typedef struct {
   int *cg_parent;
   int cg_parent_n;
   unsigned cg_parent_ver;
-  /* the last eight method C names mc_method spelled, and the next to reuse */
-  char mc_ring[8][600]; int mc_ring_next;
+  /* the last eight method C names mc_method spelled, and the next to reuse:
+     each grown to its name (mc_ring_setf), which no length bounds */
+  char *mc_ring[8]; size_t mc_ring_cap[8]; int mc_ring_next;
   /* --share-strings: does the program make an Enumerator over a String
      handle (str_enum_h_made): 0 not asked yet, 1 no, 2 yes */
   unsigned char str_enum_h;
@@ -1598,11 +1607,6 @@ typedef struct {
   int pres_noinit;
   int **pres_ord;
   int pres_ord_n;
-  /* the calls version_redefined_reopen_defs marked for an earlier
-     definition, which desugar_redef_version_calls resolves once their
-     receivers are typed (-1 once resolved) */
-  int *redef_calls;
-  int nredef_calls;
   /* the flags of the later prepends that guard their copies
      (mixin_guard_body): $__spinel_mixin_ran_1 .. n_mixin_flags */
   int n_mixin_flags;
@@ -1851,6 +1855,10 @@ LocalVar *comp_const_intern(Compiler *c, const char *name);
    the left arm of an `&&` chain) over a constant that resolves to nothing;
    the guarded branch is compile-time dead. */
 int comp_defined_guard_false(Compiler *c, int pred);
+/* Does constant (path) node v name nothing at compile time, so that
+   `defined?(v)` is nil and a read of it raises NameError (a segment no
+   program constant, class or builtin resolves)? */
+int comp_const_undefined(Compiler *c, int v);
 /* the dual: statically-true defined?(Const / Const::Path) guard */
 int comp_defined_guard_true(Compiler *c, int pred);
 int comp_defined_early(Compiler *c, int pred, const char **early, int cap);
@@ -1884,6 +1892,7 @@ int cls_user_display_mi(Compiler *c, int k, const char *nm);
 int prog_has_cls_user_display(Compiler *c, const char *nm);
 int        class_var_static_ci(Compiler *c, int node);  /* local holding one class const */
 int        class_recv_static_ci(Compiler *c, int node); /* constant or local naming one class */
+int        const_class_value_only(Compiler *c, int node); /* constant holding a class known only at run time */
 int        class_recv_user_cmethod(Compiler *c, int call, int node, const char *name); /* call's user class method of the name on it */
 int        dynamic_new_may_reach(Compiler *c, int call_id, int cid);  /* k.new can build cid */
 int        anon_struct_ci_for_value(Compiler *c, int val);  /* k = Struct.new(...) value node */
@@ -1945,6 +1954,7 @@ const char *time_strict_parser_call(Compiler *c, int id);
    directly in); ignored for constant receivers. */
 int        class_eval_reopen_class(Compiler *c, int id, int enclosing_class);
 int        class_reopen_cmethod(Compiler *c, int call, int recv, const char *name); /* a method the program adds to Class, run by `call` (-1: no call) */
+int        class_reopen_class(Compiler *c);   /* the module that holds the program's methods of Class (`class Class`), -1 for none */
 int        comp_ivar_index(ClassInfo *ci, const char *name);  /* -1 if none */
 int        comp_ivar_intern(ClassInfo *ci, const char *name); /* find or add; returns index */
 int        comp_member_intern(ClassInfo *ci, const char *name);
@@ -2003,6 +2013,13 @@ const char *io_super_name(const char *k);
 /* Like comp_method_in_class but walks the superclass chain. On success,
    *def_class (if non-NULL) is set to the class that defines the method. */
 int        comp_method_in_chain(Compiler *c, int class_id, const char *name, int *def_class);
+/* The method version recorded at def node def_node: the scope of that def
+   named name on class_id's superclass chain (class side when is_cm; a
+   top-level method when class_id < 0), the nearest class's when copies
+   share the node, under another name when an alias that captured the def
+   renamed its scope; *def_class (when asked) the class that holds it. -1
+   when no scope there has that def node. */
+int        comp_method_version(Compiler *c, int class_id, const char *name, int is_cm, int def_node, int *def_class);
 /* The classes whose chain answers (name, is_cm) -- comp_method_in_chain's
    or comp_cmethod_in_chain's -- ascending, two ints per class (the class,
    the scope its chain finds), *n their count. NULL with *n -1 while the
@@ -2125,6 +2142,9 @@ int cls_fact_may_ostruct(Compiler *c, int node);
 /* the fact's own index for recv's set, which names the set uniquely: 0 or -1
    for every class (nothing to filter by) */
 int cls_fact_idx(Compiler *c, int node);
+/* node, made after the pass, holds the value node `as` holds (a desugar's
+   read of a temporary it stored as into): it takes as's fact */
+void cls_fact_same(Compiler *c, int node, int as);
 /* Does node's fact say nothing of its classes: every class, or the closed
    world's value from anywhere (every class, Class object and builtin)? */
 int cls_fact_unbounded(Compiler *c, int node);

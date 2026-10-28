@@ -252,6 +252,8 @@ int struct_aset_may_reach(Compiler *c, int id);
 int an_arg_is_shared_handle(Compiler *c, int node);
 /* Last statement of a scope's body, or -1. */
 int scope_body_last(Compiler *c, int mi);
+int scope_block_given_tail(Compiler *c, Scope *sc);
+int scope_block_given_else_last(Compiler *c, Scope *sc);
 /* ...or the begin a def's own rescue makes its body (analyze_util.c). */
 int scope_body_value(Compiler *c, int mi);
 /* The expressions whose value method scope mi answers (its body's and each
@@ -372,17 +374,22 @@ void walk_scope(Compiler *c, int id, int scope_idx, int class_id);
    is in (e, its seq; -1 where no record is made) and how that statement
    runs -- its file, the top-level statement holding it, the statement whose
    body opened its class frame (-1: main's), its nesting for the dump,
-   whether it may not run or may run partly (may, partial) -- and what the
+   whether it may not run or may run partly (may, partial), the statement
+   around it whose body may run again (rep, LrStmt.rep) -- and what the
    node is to it (kind, EP_*). A statement's node and the nodes on its path
    to the bodies it runs (EP_SPINE: a branch, a rescue clause, a written
    value's call, a block run at once) lead to those bodies: a statement
    list (EP_LIST), whose elements are statements, or a lone expression
    (EP_NEW), which is one. Any other node is one of the statement's
    (EP_NODE). bits: LR_LATE / LR_BODY of the node; defer: a block whose call
-   keeps it to run later, so that its nodes are late. */
+   keeps it to run later, so that its nodes are late. fmay: may, counted
+   from the frame: a condition stands between the node and the body (or
+   main's file) holding it. sure: an else clause that runs whenever its
+   condition is reached (the condition's predicate is a constant false,
+   nt_pred_const). */
 typedef struct {
-  int e, file, top, frame, depth;
-  unsigned char may, partial, kind, bits, defer;
+  int e, file, top, frame, depth, rep;
+  unsigned char may, partial, kind, bits, defer, fmay, sure;
 } ElabPos;
 enum { EP_NODE, EP_SPINE, EP_LIST, EP_NEW };
 ElabPos elab_child(const NodeTable *nt, int p, int ch, const ElabPos *pp);
@@ -390,6 +397,10 @@ int elab_ref_last(const NodeTable *nt, int id, int ref);
 int elab_walk_enter(Compiler *c, int ch, ElabPos *pos);
 void elab_walk_leave(Compiler *c, int e);
 void elab_walk_rest(Compiler *c, int id, ElabPos pos);
+void elab_walk_site(Compiler *c, int id, const ElabPos *pos);
+int elab_header_entity(Compiler *c, int node, const ElabPos *pos);
+void elab_header_opened(Compiler *c, int node, int cls, int made);
+void elab_load_sites(Compiler *c, int stmt, void (*fn)(void *ud, int load, int in_place), void *ud);
 void walk_scope_stmt(Compiler *c, int stmt, int scope_idx, ElabPos pos);
 int scope_own_defaults(Compiler *c, int di);
 void register_module_functions(Compiler *c);
@@ -398,7 +409,6 @@ void register_locals(Compiler *c);
 int is_struct_call(Compiler *c, int val);
 int new_recv_classes(Compiler *c, int recv, int *out, int cap);
 int new_recv_every_class(Compiler *c, int recv);
-int class_body_list(Compiler *c, int **out_ci, int **out_body);
 int class_def_body(Compiler *c, int def_node);
 const char *vis_arg_name(const NodeTable *nt, int arg);   /* a Symbol or String argument's method name (analyze_scope.c) */
 void register_struct_members(Compiler *c, ClassInfo *cls, int val);
@@ -746,7 +756,7 @@ typedef struct LowerCtx {
   int parent_n, parent_live;
   unsigned parent_version;
   unsigned long parent_edits;
-  int prog_memo[3];         /* answers of the whole program a row asks for as needed: -1 until asked */
+  int prog_memo[4];         /* answers of the whole program a row asks for as needed: -1 until asked */
 } LowerCtx;
 
 typedef int LowerFn(Compiler *c, LowerCtx *lc, int id);
@@ -845,6 +855,13 @@ int desugar_method_call_runtime_name(Compiler *c);
 int desugar_builtin_method_defined_conds(Compiler *c);
 int desugar_engine_branches(Compiler *c);
 int desugar_conditional_defs(Compiler *c);
+/* A dispatcher def over arms `<sel> == <val>` calling `callee` with the
+   def's parameters passed on, and an else arm (disp_def_build,
+   analyze_desugar.c); `raise NoMethodError, msg` for that arm */
+typedef struct { const char *sel; int val; const char *callee; } DispArm;
+int disp_def_build(NodeTable *nt, int like, const char *name, int sg, int ar, int blk,
+                   const DispArm *arm, int narm, int els);
+int disp_raise_no_method(NodeTable *nt, const char *msg);
 int desugar_dynamic_respond_to(Compiler *c);
 int desugar_toplevel_instance_exec(Compiler *c);
 int desugar_binding_lvget(Compiler *c);

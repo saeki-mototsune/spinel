@@ -1191,6 +1191,10 @@ const char *rename_local(const char *nm);
 
 
 void emit_expr(Compiler *c, int id, Buf *b);
+/* Does a read of constant (path) node id raise NameError, the constant
+   being defined nowhere the program or the runtime can see? A rescue
+   operand is read so when an exception reaches its clause. */
+int const_read_raises(Compiler *c, int id);
 void emit_constant_slot(Compiler *c, int id, Buf *b);
 void emit_expr_slot(Compiler *c, int node, TyKind slot, Buf *b);
 void emit_tail_value(Compiler *c, int node, Buf *b);
@@ -1235,7 +1239,7 @@ const char *class_ruby_name(Compiler *c, int ci);
 int visible_cls_id(Compiler *c, int k);
 int cls_id_masquerades(Compiler *c, int cid);
 int visible_as_target(Compiler *c, int k, int target);
-int class_mixes_in(Compiler *c, int cid, const char *mod, int depth);
+int class_mixes_in(Compiler *c, int cid, int mod, int depth);
 int class_is_comparable(Compiler *c, int cid);
 int class_implicit_responds(Compiler *c, int cid, const char *qm);
 void emit_visible_cls_id(Compiler *c, const char *var, Buf *b);
@@ -1252,6 +1256,9 @@ const char *exc_builtin_parent(Compiler *c, int ci);
 void emit_stmt(Compiler *c, int id, Buf *b, int indent);
 /* A require under --load-model=graph, as its value (codegen_stmt.c) */
 void emit_load_call(Compiler *c, int id, Buf *b);
+void emit_file_feature(const NodeTable *nt, int f, Buf *b);
+void emit_load_path_seed(Compiler *c, Buf *b);
+void native_load_flag(const NodeTable *nt, int id, char *buf, size_t n);
 /* The statements of parentheses v that run before `tail`, the node their
    value comes from (through nested parentheses: vp_one's answer), into b,
    in order (codegen_fold.c). */
@@ -1857,6 +1864,7 @@ int nil_recv_guard(Compiler *c, int id, int *recv_out);
 int emit_held_nil_guard(Compiler *c, int id, int th, Buf *b);
 void emit_ivar_nil_guard(Compiler *c, int id, int recv, Buf *b, int indent);
 int emit_fold_recv_hold(Compiler *c, int id, int recv, Buf *b);
+int emit_fold_recv_tested(Compiler *c, int id, int recv); /* does emit_fold_recv_hold hold and test the receiver */
 void emit_fold_recv_test(Compiler *c, int id, int t, Buf *b);
 int emit_ivar_nil_guarded(Compiler *c, int id, Buf *b, int indent,
                           int (*fn)(Compiler *, int, Buf *, int));
@@ -1965,6 +1973,7 @@ const char *bigint_arith_fn(const char *op);
    (one live result at a time -- fine since each use is consumed inline). */
 const char *mc(const char *name);
 void mc_resolve_clashes(Compiler *c);   /* before any method is named (codegen_program) */
+void mc_number_versions(Compiler *c);   /* the replaced method versions' numbers, ahead of mc_resolve_clashes */
 /* The class stem to compose a REOPENED builtin's method name with: the
    plain c_name, or one with an `_oc` suffix where the runtime already has a
    function of that exact spelling (sp_String_length). */
@@ -1972,6 +1981,9 @@ const char *mc_reopen_cls(Compiler *c, int class_id, const char *mname);
 const char *mc_top(Compiler *c, const char *name);
 /* A method's C function, spelled from the method (codegen_util.c) */
 const char *mc_method(Compiler *c, const Scope *s);
+/* The next of the eight names mc_method's answers live in, set to the
+   formatted text: valid for the next seven spellings */
+const char *mc_ring_setf(Compiler *c, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 /* The scope a #deconstruct call on class cid runs, through an alias
    (codegen.c) */
 int comp_deconstruct_method(Compiler *c, int cid, int *defcls);
@@ -2267,7 +2279,6 @@ int is_arith_op(const char *op);
 int is_cmp_op(const char *op);
 const char *int_shift_fn(Compiler *c, const char *op, int v);
 int class_def_body(Compiler *c, int def_node);
-int class_body_list(Compiler *c, int **out_ci, int **out_body);
 int local_all_writes_empty_array(Compiler *c, Scope *sc, const char *name);
 TyKind an_builtin_answer(Compiler *c, int id);
 int builtin_read_ignores_block(const char *nm);
@@ -2341,8 +2352,8 @@ int emit_arysub_call(Compiler *c, int id, Buf *b);
 int emit_arysub_call_stmt(Compiler *c, int id, Buf *b, int indent);
 const char *class_builtin_superclass_name(Compiler *c, int i);   /* codegen.c */
 int class_builtin_parent(Compiler *c, int cid);      /* codegen.c */
-int class_includes_module_named(Compiler *c, int cid, const char *mod_name);
-int class_isa_user(Compiler *c, int k, int cid, const char *cn);  /* codegen_call.c */
+int class_includes_module(Compiler *c, int cid, int mod);
+int class_isa_user(Compiler *c, int k, int cid);  /* codegen_call.c */
 int dispatch_impl_count(Compiler *c, int call, int cid, const char *name);
 /* do a dispatch switch's arms bind the call's arguments differently (each
    arm then lays them out itself)? the plan's CP_PER_ARM */
@@ -2428,9 +2439,10 @@ int emit_builtin_op_unguarded(Compiler *c, int id, int recv, TyKind rt, const ch
 int emit_builtin_op_text(Compiler *c, int id, int recv, TyKind rt, const char *name,
                          const char *rtext, Buf *b);
 /* the same, for a row rendered as one arm of a boxed dispatch, which the
-   node's --plan-check comparison leaves to the arm's own record */
+   node's --plan-check comparison leaves to the arm's own record; t0 the
+   dispatch's temp for the row's $T, or 0 */
 int emit_builtin_op_arm_text(Compiler *c, int id, int recv, TyKind rt, const char *name,
-                             const char *rtext, Buf *b);
+                             const char *rtext, int t0, Buf *b);
 /* the same, with the temp t0 the family took before its arms ($T) */
 int emit_builtin_op_tmp(Compiler *c, int id, int recv, TyKind rt, const char *name,
                         int t0, Buf *b);
@@ -2668,7 +2680,6 @@ int str_enum_h_made(Compiler *c);                   /* ...does the program make 
 int emit_unresolved_call(Compiler *c, int id, Buf *b);
 int emit_array_call(Compiler *c, int id, Buf *b);
 int emit_array_splat_mutator(Compiler *c, int id, Buf *b);
-const char *call_shown_name(const NodeTable *nt, int id);
 void emit_gather_call_args(Compiler *c, const int *argv, int argc, int ta, Buf *b);
 void emit_str_insert_text(Compiler *c, int arg, Buf *b);
 int emit_hash_call(Compiler *c, int id, Buf *b);

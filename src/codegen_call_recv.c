@@ -1102,6 +1102,11 @@ static void emit_fetch_blk_param(Compiler *c, int id, int blk, TyKind kt, int tk
     char ktn[32]; snprintf(ktn, sizeof ktn, "_t%d", tk);
     buf_printf(b, "lv_%s = ", rename_local(fp0)); emit_unbox_text(c, repr_of_slot(c, own).as_ty, ktn, b); buf_puts(b, "; ");
   }
+  /* a boxed key into a parameter of a type of its own: unboxed to it */
+  else if (own && kt == TY_POLY && repr_of_slot(c, own).as_ty != TY_POLY && repr_of_slot(c, own).as_ty != TY_UNKNOWN) {
+    char ktn[32]; snprintf(ktn, sizeof ktn, "_t%d", tk);
+    buf_printf(b, "lv_%s = ", rename_local(fp0)); emit_unbox_text(c, repr_of_slot(c, own).as_ty, ktn, b); buf_puts(b, "; ");
+  }
   else buf_printf(b, "lv_%s = _t%d; ", rename_local(fp0), tk);
   free(kref.p);
 }
@@ -2437,6 +2442,9 @@ else {
      widened the receiver to poly in inference. */
   if (sp_streq(name, "concat") && argc >= 1) {
     int same = 1, all_poly = 1;
+    /* the last operand that is boxed: its #to_ary (and an earlier one's)
+       can change an operand before it, which CRuby has already copied */
+    int last_boxed = -1;
     for (int j = 0; j < argc; j++) {
       /* Ask the SLOT, not the node: a block parameter's node type can
          read as the element kind while its declaration is boxed, and
@@ -2450,6 +2458,7 @@ else {
            node, viewed as the instance's Array, is what is read) */
         if (alv && alv->type != TY_UNKNOWN && comp_ty_ary_root(c, alv->type) < 0) ar = repr_of_slot(c, alv);
       }
+      if (ar.kind == RK_BOXED) last_boxed = j;
       if (ar.elem != ty_array_elem(rt)) same = 0;
       if (ar.kind != RK_BOXED && ar.elem != TY_POLY && ar.elem != ty_array_elem(rt)) all_poly = 0;
     }
@@ -2473,16 +2482,29 @@ else {
       buf_printf(b, "({ sp_%sArray *_t%d = %s; SP_GC_ROOT(_t%d);", k, ta, ra.p ? ra.p : "NULL", ta);
       free(ra.p);
       int vbase = g_tmp + 1; g_tmp += 2 * argc;   /* each value, then its length */
+      Buf ck = {0, 0, 0};
       for (int j = 0; j < argc; j++) {
         int tv = vbase + 2 * j, tn = tv + 1;
         buf_printf(b, " sp_RbVal _t%d = ", tv); emit_boxed(c, argv[j], b);
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d);", tv);
         /* (an Array, or what #to_ary answers: anything else is CRuby's
-           TypeError, where its length read as 0 appended nothing) */
-        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); _t%d = sp_poly_ary_arg_ck(_t%d);", tv, tv, tv);
-        buf_printf(b, " sp_int _t%d = sp_poly_length(_t%d);", tn, tv);
+           TypeError, where its length read as 0 appended nothing; it
+           converts after the frozen test, as CRuby converts it) */
+        buf_printf(&ck, " _t%d = sp_poly_ary_arg_ck(_t%d);", tv, tv);
+        /* copied at its turn when a boxed operand follows (a typed
+           Array's general view is already a new array; a general Array's
+           view is the array itself) */
+        if (j < last_boxed) {
+          int tc = ++g_tmp;
+          buf_printf(&ck, " { sp_PolyArray *_t%d = sp_poly_to_poly_array(_t%d); if (_t%d == (sp_PolyArray *)_t%d.v.p) _t%d = sp_PolyArray_dup(_t%d); _t%d = sp_box_poly_array(_t%d); }",
+                     tc, tv, tc, tv, tc, tc, tv, tc);
+        }
+        buf_printf(&ck, " sp_int _t%d = sp_poly_length(_t%d);", tn, tv);
       }
       /* a frozen receiver raises even when every argument is empty */
       buf_printf(b, " if (_t%d && _t%d->frozen) sp_raise_frozen_array_at(_t%d, %s);", ta, ta, ta, array_frozen_cls(rt));
+      if (ck.p) buf_puts(b, ck.p);
+      free(ck.p);
       for (int j = 0; j < argc; j++) {
         int tv = vbase + 2 * j, tn = tv + 1, ti = ++g_tmp;
         buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d; _t%d++)", ti, ti, tn, ti);
@@ -3235,7 +3257,18 @@ static int emit_array_operand_misfit(Compiler *c, int id, const char *name, int 
   g_tmp += argc;
   Buf *sv_pre = g_pre;
   buf_puts(b, "({ ");
-  int tr = emit_fold_recv_hold(c, id, recv, b);
+  /* concat and replace change the receiver: CRuby's frozen check comes
+     before any argument converts, so a frozen one raises FrozenError, not
+     the operand's TypeError. The receiver is held for that test. */
+  TyKind rrt = repr_of(c, recv).as_ty;
+  const char *fcls = (sp_streq(name, "concat") || sp_streq(name, "replace")) ? array_frozen_cls(rrt) : NULL;
+  int tf = 0, tr;
+  if (fcls) {
+    tf = ++g_tmp;
+    emit_ctype(c, rrt, b); buf_printf(b, " _t%d = (", tf); emit_expr(c, recv, b); buf_printf(b, "); SP_GC_ROOT(_t%d); ", tf);
+    tr = emit_fold_recv_tested(c, id, recv) ? tf : 0;
+  }
+  else tr = emit_fold_recv_hold(c, id, recv, b);
   for (int ai = 0; ai < argc; ai++) {
     Buf ap = {0, 0, 0}, av = {0, 0, 0};
     Repr ar = repr_of(c, argv[ai]);
@@ -3254,6 +3287,7 @@ static int emit_array_operand_misfit(Compiler *c, int id, const char *name, int 
   }
   /* a nil receiver raises before any operand is converted */
   emit_fold_recv_test(c, id, tr, b);
+  if (fcls) buf_printf(b, "if (_t%d && _t%d->frozen) sp_raise_frozen_array_at(_t%d, %s); ", tf, tf, tf, fcls);
   for (int ai = 0; ai < bad; ai++)
     if (repr_of(c, argv[ai]).kind == RK_BOXED)
       buf_printf(b, "if (_t%d.tag != SP_TAG_OBJ || !sp_poly_is_array_kind(_t%d.cls_id))"
@@ -3604,7 +3638,9 @@ static int emit_typed_array_call(Compiler *c, int id, Buf *b, const NodeTable *n
     if (fk && fbn > 0) {
       TyKind et = ty_array_elem(frt);
       int trecv = ++g_tmp, tn = ++g_tmp, ts = ++g_tmp, te = ++g_tmp, ti = ++g_tmp;
-      const char *ip = block_param_name(c, fblk, 0); if (ip) ip = rename_local(ip);
+      /* (the scope knows the parameter by its own name, not the name an
+         inlined body renames it to) */
+      const char *ip0 = block_param_name(c, fblk, 0), *ip = ip0 ? rename_local(ip0) : NULL;
       Buf rb; memset(&rb, 0, sizeof rb);
       if (fill_conflict) { buf_puts(&rb, "sp_poly_to_poly_array("); emit_boxed(c, recv, &rb); buf_puts(&rb, ")"); }
       else rb = expr_buf(c, recv);
@@ -3645,7 +3681,7 @@ static int emit_typed_array_call(Compiler *c, int id, Buf *b, const NodeTable *n
       buf_printf(g_pre, "for (sp_int _t%d = _t%d; _t%d < _t%d; _t%d++) {\n", ti, ts, ti, te, ti);
       if (ip) {
         Scope *fic = comp_scope_of(c, fblk);
-        LocalVar *filv = fic ? scope_local(fic, ip) : NULL;
+        LocalVar *filv = fic ? scope_local(fic, ip0) : NULL;
         TyKind fit = filv ? filv->type : TY_INT;
         emit_indent(g_pre, g_indent + 1);
         if (fit == TY_POLY) buf_printf(g_pre, "lv_%s = sp_box_int(_t%d);\n", ip, ti);
@@ -3660,7 +3696,30 @@ static int emit_typed_array_call(Compiler *c, int id, Buf *b, const NodeTable *n
         ((vr.strbuf_src != RS_NONE || strbuf_value_carries(c, fbb[fbn - 1])))), g_indent + 1, &st);
       Buf vb; memset(&vb, 0, sizeof vb); vt = emit_iter_step_tail(c, &st, &vb);
       emit_indent(g_pre, g_indent + 1);
-      if (sp_streq(fk, "Poly")) {
+      /* A value of a kind the typed array cannot hold, which the analysis
+         did not see at the fill (a block inlined from one of several call
+         sites, through a yield or a forwarded &b): refused as it lands, as
+         a boxed value of another kind is (#4481). Stored as is, an Integer
+         went into a String array as nil, a Symbol into an Integer array as
+         its id, and an Integer into a Float array as a Float. */
+      int ffor = vt != TY_UNKNOWN && vt != TY_POLY && vt != TY_NIL && vt != TY_VOID &&
+                 ((sp_streq(fk, "Int") && vt != TY_INT) ||
+                  (sp_streq(fk, "Float") && vt != TY_FLOAT) ||
+                  (sp_streq(fk, "Str") && vt != TY_STRING && vt != TY_STRBUF));
+      if (ffor) {
+        Buf bx; memset(&bx, 0, sizeof bx);
+        emit_boxed_text(c, vt, vb.p ? vb.p : "sp_box_nil()", &bx);
+        /* (sp_poly_elem_f takes an Integer as a Float: refused here) */
+        if (sp_streq(fk, "Float") && vt == TY_INT)
+          buf_printf(g_pre, "sp_raise_typed_elem(%s, \"Float\");\n", bx.p ? bx.p : "");
+        else if (sp_streq(fk, "Str"))
+          buf_printf(g_pre, "sp_StrArray_set_e(_t%d, _t%d, SP_STR_HDL(sp_poly_elem_s(%s)));\n", trecv, ti, bx.p ? bx.p : "");
+        else
+          buf_printf(g_pre, "sp_%sArray_set_nilable(_t%d, _t%d, sp_poly_elem_%s(%s));\n", fk, trecv, ti,
+                     sp_streq(fk, "Int") ? "i" : "f", bx.p ? bx.p : "");
+        free(bx.p);
+      }
+      else if (sp_streq(fk, "Poly")) {
         buf_printf(g_pre, "sp_PolyArray_set(_t%d, _t%d, ", trecv, ti);
         if (vt != TY_POLY && vt != TY_UNKNOWN) emit_boxed_text(c, vt, vb.p ? vb.p : "sp_box_nil()", g_pre);
         else buf_puts(g_pre, vb.p ? vb.p : "sp_box_nil()");
@@ -3672,13 +3731,26 @@ static int emit_typed_array_call(Compiler *c, int id, Buf *b, const NodeTable *n
       }
       else {
         const char *fsfx = nil_store_sfx(c, fk, fbb[fbn - 1]);
-        buf_printf(g_pre, "sp_%sArray_set%s(_t%d, _t%d, ", fk, fsfx, trecv, ti);
         /* the _nilable store takes the value with its nil (a block
            parameter that can be nil, a nullable read); the plain store the
-           sink's plain value */
-        if (fsfx[0]) emit_oint_expr(c, fbb[fbn - 1], sp_streq(fk, "Float") ? TY_FLOAT : TY_INT, g_pre);
-        else emit_typed_sink_text(c, fbb[fbn - 1], sp_streq(fk, "Int") ? TY_INT : sp_streq(fk, "Float") ? TY_FLOAT : TY_UNKNOWN, vb.p ? vb.p : "", g_pre);
-        buf_puts(g_pre, ");\n");
+           sink's plain value; a boxed value is checked against the
+           element's kind (sp_poly_elem_i / _f), not cut to it. Rendered
+           first: a value with lines of its own (a proc's call) puts them in
+           g_pre before the store begins. */
+        Buf sv; memset(&sv, 0, sizeof sv);
+        TyKind fet = sp_streq(fk, "Float") ? TY_FLOAT : TY_INT;
+        /* a framed body (a `next` with a value) left its value in the
+           step's slot: read there, the tail not run a second time */
+        if (fsfx[0] && st.slot) {
+          if (!emit_iter_step_tail_o(c, &st, fet, &sv)) {
+            if (st.slot_ty == TY_POLY) buf_printf(&sv, "sp_poly_elem_%s(_t%d)", fet == TY_FLOAT ? "f" : "i", st.slot);
+            else buf_printf(&sv, "%s(_t%d)", oint_of(fet), st.slot);
+          }
+        }
+        else if (fsfx[0]) emit_elem_store_value(c, fk, fbb[fbn - 1], &sv);
+        else emit_typed_sink_text(c, fbb[fbn - 1], sp_streq(fk, "Int") ? TY_INT : sp_streq(fk, "Float") ? TY_FLOAT : TY_UNKNOWN, vb.p ? vb.p : "", &sv);
+        buf_printf(g_pre, "sp_%sArray_set%s(_t%d, _t%d, %s);\n", fk, fsfx, trecv, ti, sv.p ? sv.p : "");
+        free(sv.p);
       }
       free(vb.p);
       emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
@@ -7199,17 +7271,29 @@ else {
         if (inner < 0) return 0;
         TyKind it = comp_ntype(c, inner);
         if (!ty_is_array(it) && it != TY_POLY_ARRAY && it != TY_POLY) return 0;
-        int tr = ++g_tmp, ts = ++g_tmp, ti = ++g_tmp;
-        buf_printf(b, "({ %s _t%d = ", c_type_name(rt), tr); emit_expr(c, recv, b); buf_puts(b, ";");
+        int tr = ++g_tmp, ts = ++g_tmp, ti = ++g_tmp, tc = ++g_tmp;
+        /* the receiver is rooted: a member's #to_hash runs program code,
+           which can collect a receiver nothing else holds (a call's value) */
+        buf_printf(b, "({ %s _t%d = ", c_type_name(rt), tr); emit_expr(c, recv, b); buf_printf(b, "; SP_GC_ROOT(_t%d);", tr);
         buf_printf(b, " if (sp_gc_is_frozen(_t%d)) sp_raise_frozen_hash_at(_t%d, %s);", tr, tr, hash_box_cls(rt));
         buf_printf(b, " sp_RbVal _t%d = ", ts); emit_boxed(c, inner, b);
         buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d);", ts);
         buf_printf(b, " sp_int _t%d = sp_poly_arr_len_ex(_t%d);", ti, ts);
+        /* the members as the splat read them: a #to_hash that changes the
+           list does not change which members merge in, as CRuby's splat
+           copies it */
+        buf_printf(b, " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
+                      " for (sp_int _i8 = 0; _i8 < _t%d; _i8++) sp_PolyArray_push(_t%d, sp_poly_each_elem(_t%d, _i8));",
+                   tc, tc, ti, tc, ts);
         char rtxt[32]; snprintf(rtxt, sizeof rtxt, "_t%d", tr);
-        buf_printf(b, " for (sp_int _i8 = 0; _i8 < _t%d; _i8++)"
-                      " sp_poly_hash_merge_into(", ti);
+        /* an element that is no Hash converts as CRuby converts it, or
+           raises its TypeError (sp_poly_hash_merge_arg) */
+        int te = ++g_tmp;
+        buf_printf(b, " for (sp_int _i8 = 0; _i8 < _t%d; _i8++) {"
+                      " sp_RbVal _t%d = sp_poly_hash_merge_arg(sp_PolyArray_get(_t%d, _i8)); SP_GC_ROOT_RBVAL(_t%d);"
+                      " sp_poly_hash_merge_into(", ti, te, tc, te);
         emit_boxed_text(c, rt, rtxt, b);
-        buf_printf(b, ", sp_poly_each_elem(_t%d, _i8));", ts);
+        buf_printf(b, ", _t%d); }", te);
         buf_printf(b, " _t%d; })", tr);
         return 1;
       }
@@ -7518,12 +7602,14 @@ else {
         buf_printf(b, "({ sp_PolyPolyHash *_t%d = sp_poly_hash_merge(", tacc);
         emit_boxed(c, recv, b);
         buf_printf(b, ", sp_box_nil()); SP_GC_ROOT(_t%d);", tacc);
-        buf_printf(b, " sp_PolyArray *_t%d = sp_poly_to_poly_array(", tls);
+        /* (a copy: a member's #to_hash that changes the list does not change
+           which members merge in) */
+        buf_printf(b, " sp_PolyArray *_t%d = sp_PolyArray_dup(sp_poly_to_poly_array(", tls);
         if (sx >= 0) emit_boxed(c, sx, b); else buf_puts(b, "sp_box_nil()");
-        buf_printf(b, "); SP_GC_ROOT(_t%d);", tls);
+        buf_printf(b, ")); SP_GC_ROOT(_t%d);", tls);
         buf_printf(b, " for (sp_int _t%d = 0; _t%d < sp_PolyArray_length(_t%d); _t%d++)"
                       " _t%d = sp_poly_hash_merge(sp_box_nullable_obj((void *)_t%d, SP_BUILTIN_POLY_POLY_HASH),"
-                      " sp_PolyArray_get(_t%d, _t%d));",
+                      " sp_poly_hash_merge_arg(sp_PolyArray_get(_t%d, _t%d)));",
                    tmi, tmi, tls, tmi, tacc, tacc, tls, tmi);
         buf_printf(b, " _t%d; })", tacc);
         return 1;

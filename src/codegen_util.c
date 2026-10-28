@@ -6769,18 +6769,86 @@ static int mc_name_fixed(const char *nm) {
    class method, sp_<stem>_<name> for an instance method (mc_reopen_cls's
    stem). Every site that names a method's function spells it here, from
    the method, never from a name: two methods of one name are two
-   functions. The answer stays valid for the next seven spellings. */
+   functions. A replaced version (Scope.version_n) is spelled from its
+   name and its number: `f__redef<n>` at the top level, `m#redef<n>` in a
+   class (mc_number_versions). The answer stays valid for the next seven
+   spellings. */
+/* The name method s is spelled from: its own, or a replaced version's with
+   its number, in a buffer of its size the caller frees */
+static char *mc_version_name(const Scope *s) {
+  const char *fmt = s->class_id < 0 ? "%s__redef%d" : "%s#redef%d";
+  int n = s->version_n ? snprintf(NULL, 0, fmt, s->name, s->version_n) : (int)strlen(s->name);
+  char *v = n >= 0 ? malloc((size_t)n + 1) : NULL;
+  if (!v) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  if (s->version_n) snprintf(v, (size_t)n + 1, fmt, s->name, s->version_n);
+  else memcpy(v, s->name, (size_t)n + 1);
+  return v;
+}
 const char *mc_method(Compiler *c, const Scope *s) {
-  char *out = c->mc_ring[c->mc_ring_next++ & 7], stem[256];
-  size_t n = sizeof c->mc_ring[0];
-  if (s->c_name) snprintf(out, n, "sp_%s", s->c_name);
-  else if (s->class_id < 0) snprintf(out, n, "sp_%s", mc_top(c, s->name));
-  else if (s->is_cmethod) snprintf(out, n, "sp_%s_s_%s", c->classes[s->class_id].c_name, mc(s->name));
-  else {
-    snprintf(stem, sizeof stem, "%s", mc_reopen_cls(c, s->class_id, s->name));
-    snprintf(out, n, "sp_%s_%s", stem, mc(s->name));
-  }
+  char *name = mc_version_name(s);
+  const char *out;
+  if (s->c_name) out = mc_ring_setf(c, "sp_%s", s->c_name);
+  else if (s->class_id < 0) out = mc_ring_setf(c, "sp_%s", mc_top(c, name));
+  else if (s->is_cmethod) out = mc_ring_setf(c, "sp_%s_s_%s", c->classes[s->class_id].c_name, mc(name));
+  else out = mc_ring_setf(c, "sp_%s_%s", mc_reopen_cls(c, s->class_id, name), mc(name));
+  free(name);
   return out;
+}
+/* mc_method's answers live in eight slots, each grown to the name set in
+   it: a name is as long as its class's, and a fixed slot cut a long
+   class's methods short of the constructor's sp_<Class>_initialize, so
+   the C did not build. */
+const char *mc_ring_setf(Compiler *c, const char *fmt, ...) {
+  int k = c->mc_ring_next++ & 7;
+  va_list ap;
+  va_start(ap, fmt);
+  int n = vsnprintf(NULL, 0, fmt, ap);
+  va_end(ap);
+  if (n < 0) n = 0;
+  if ((size_t)n + 1 > c->mc_ring_cap[k]) {
+    char *p = realloc(c->mc_ring[k], (size_t)n + 1);
+    if (!p) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    c->mc_ring[k] = p;
+    c->mc_ring_cap[k] = (size_t)n + 1;
+  }
+  va_start(ap, fmt);
+  vsnprintf(c->mc_ring[k], (size_t)n + 1, fmt, ap);
+  va_end(ap);
+  return c->mc_ring[k];
+}
+/* Numbers the replaced method versions codegen emits, for their C names
+   (mc_method). Top-level ones: those the main file's statements define, in
+   statement order whether emitted or not, then the other emitted ones,
+   each number skipping a `f__redef<n>` the program defines itself. A
+   class's: the emitted ones, in scope order. */
+static void mc_number_top_version(Compiler *c, Scope *s, int *serial) {
+  char to[300];
+  for (;;) {
+    int taken = 0;
+    snprintf(to, sizeof to, "%s__redef%d", s->name, ++*serial);
+    NT_FOREACH_KIND(c->nt, NK_DefNode, d) {
+      const char *dn = nt_str(c->nt, d, "name");
+      if (dn && sp_streq(dn, to)) { taken = 1; break; }
+    }
+    if (!taken) break;
+  }
+  s->version_n = *serial;
+}
+void mc_number_versions(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  int body = nt_ref(nt, nt->root_id, "statements"), n = 0, top = 0, cls = 0;
+  const int *st = body >= 0 ? nt_arr(nt, body, "body", &n) : NULL;
+  for (int i = 0; i < n; i++) {
+    if (nt_kind(nt, st[i]) != NK_DefNode || nt_ref(nt, st[i], "receiver") >= 0) continue;
+    int s = comp_method_version(c, -1, nt_str(nt, st[i], "name"), 0, st[i], NULL);
+    if (s >= 0 && c->scopes[s].replaced && !c->scopes[s].version_n) mc_number_top_version(c, &c->scopes[s], &top);
+  }
+  for (int s = 1; s < c->nscopes; s++) {
+    Scope *sc = &c->scopes[s];
+    if (!sc->replaced || !sc->reachable || sc->version_n) continue;
+    if (sc->class_id < 0) mc_number_top_version(c, sc, &top);
+    else sc->version_n = ++cls;
+  }
 }
 static int mc_same_method(const Scope *a, const Scope *b) {
   return a->class_id == b->class_id && a->is_cmethod == b->is_cmethod && sp_streq(a->name, b->name);
@@ -6796,14 +6864,14 @@ static int mc_find_clash(Compiler *c, int *first, int *later) {
   int found = 0;
   for (int i = -3 * c->nclasses; i < c->nscopes && !found; i++) {
     const Scope *s = i >= 0 ? &c->scopes[i] : NULL;
-    char nm[600];
+    const char *nm;
     if (s) {
       if (!s->name || s->c_name) continue;
-      snprintf(nm, sizeof nm, "%s", mc_method(c, s));
+      nm = mc_method(c, s);
     } else {
       const ClassInfo *ci = &c->classes[(-i - 1) / 3];
       if (ci->is_builtin_const || !ci->c_name) continue;
-      snprintf(nm, sizeof nm, "sp_%s_%s", ci->c_name, mc_class_helpers[(-i - 1) % 3]);
+      nm = mc_ring_setf(c, "sp_%s_%s", ci->c_name, mc_class_helpers[(-i - 1) % 3]);
     }
     unsigned h = 2166136261u;
     for (const char *q = nm; *q; q++) h = (h ^ (unsigned char)*q) * 16777619u;
@@ -6839,22 +6907,32 @@ void mc_resolve_clashes(Compiler *c) {
   int a, b;
   /* each round renames one method or class; the bound only guards a loop */
   for (int round = 0, n = 2; round < 4096 && mc_find_clash(c, &a, &b); round++, n++) {
+    /* the name each is spelled from, a replaced version's with its number
+       (`f#redef1` meets a method `f_redef1`): renaming `f` would not move it */
+    char *nb = mc_version_name(&c->scopes[b]), *na = NULL;
+    int stop = 0;
     if (a < 0) {
-      if (mc_name_fixed(c->scopes[b].name)) break;
-      mc_rename(c->scopes[b].name, n);
-      continue;
+      if (mc_name_fixed(nb)) stop = 1;
+      else mc_rename(nb, n);
     }
-    const Scope *sa = &c->scopes[a], *sb = &c->scopes[b];
-    if (!sp_streq(sa->name, sb->name) && !mc_name_fixed(sb->name)) mc_rename(sb->name, n);
-    else if (!sp_streq(sa->name, sb->name) && !mc_name_fixed(sa->name)) mc_rename(sa->name, n);
     else {
-      int ci = sb->class_id >= 0 && !c->classes[sb->class_id].is_builtin_const ? sb->class_id : sa->class_id;
-      if (ci < 0 || c->classes[ci].is_builtin_const) break;
-      char cn[300];
-      snprintf(cn, sizeof cn, "%s__%d", c->classes[ci].c_name, n);
-      free(c->classes[ci].c_name);
-      c->classes[ci].c_name = strdup(cn);
+      const Scope *sa = &c->scopes[a], *sb = &c->scopes[b];
+      na = mc_version_name(sa);
+      if (!sp_streq(na, nb) && !mc_name_fixed(nb)) mc_rename(nb, n);
+      else if (!sp_streq(na, nb) && !mc_name_fixed(na)) mc_rename(na, n);
+      else {
+        int ci = sb->class_id >= 0 && !c->classes[sb->class_id].is_builtin_const ? sb->class_id : sa->class_id;
+        if (ci < 0 || c->classes[ci].is_builtin_const) stop = 1;
+        else {
+          char cn[300];
+          snprintf(cn, sizeof cn, "%s__%d", c->classes[ci].c_name, n);
+          free(c->classes[ci].c_name);
+          c->classes[ci].c_name = strdup(cn);
+        }
+      }
     }
+    free(na); free(nb);
+    if (stop) break;
   }
 }
 
@@ -6987,6 +7065,9 @@ static void shadow_tab_build(Compiler *c, int raw) {
 }
 int scope_is_shadowed(Compiler *c, int s) {
   if (c->scopes[s].c_name) return 0;
+  /* a replaced method version is a function of its own while a call bound
+     to it reaches it (compute_reachable) */
+  if (c->scopes[s].replaced) return !c->scopes[s].reachable;
   /* Before the scopes settle, the scan's answer holds while the scope
      index is frozen (the inference fixpoint among others): a scope is then
      only appended, and the indexed ones keep their names and classes

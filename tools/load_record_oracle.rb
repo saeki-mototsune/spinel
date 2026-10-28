@@ -32,8 +32,10 @@
 #               early on an error or the timeout);
 #   order       two events CRuby ran in one order and the record holds in
 #               the other.
-# Exits 1 when any program differs; a program --load-model=graph refuses is
-# skipped. Under graph (the default) each file has its own lines; --inline
+# Exits 1 when any program differs or spinel fails on one (any exit but a
+# refusal of --load-model=graph's); a program graph refuses is skipped, and
+# so is one CRuby stopped early on with no difference in what it ran, which
+# is said. Under graph (the default) each file has its own lines; --inline
 # is for a program of one file.
 require "rbconfig"
 require "tempfile"
@@ -140,7 +142,8 @@ def cruby_events(prog, timeout)
         Process.kill("KILL", pid); Process.wait(pid)
         false
       end
-      ev = File.readlines(out.path, chomp: true).map { |l| l.split("\t", -1) }
+      # as bytes, like spinel's record, so a name past ASCII compares equal
+      ev = File.readlines(out.path, chomp: true, mode: "rb").map { |l| l.split("\t", -1) }
                .select { |e| e[2] == "load" && e[5] != "-" && !(e[3] =~ /\A[\w:]+[#.](\S+)\z/ && !FORMS.include?($1)) }
                .map { |p, l, _, _, *rest| [p, l.to_i, *rest] }
       [ev, ok]
@@ -148,8 +151,11 @@ def cruby_events(prog, timeout)
   end
 end
 
+# spinel's output as bytes: a name or path in it need not be valid in the
+# locale's encoding (under LANG=C, any byte past ASCII), and the regexps
+# below would raise on it
 def run(*cmd)
-  out = IO.popen(cmd, err: [:child, :out], &:read)
+  out = IO.popen(cmd, "rb", err: [:child, :out], &:read)
   [$?.success?, out]
 end
 
@@ -167,19 +173,26 @@ def meth(n) = n.sub(/(#__cond\d+|#redef\d+|__redef\d+|__main\d+)\z/, "")
 
 def hidden?(name) = name.start_with?("__") || name.include?("#") || name.include?("SpinelAnon")
 
-# The record's events: [path, line, kind, owner, name, seq, may]
+# The record's events: [path, line, kind, owner, name, seq, may]; or nil,
+# what spinel said, and whether that is a refusal of the graph model
 def spinel_events(spinel, prog, inline)
   mode = inline ? [] : ["--load-model=graph"]
   ok, rec = run(spinel, *mode, "--dump-load-record", prog)
-  return [nil, rec.lines.last.to_s.strip] unless ok
+  unless ok
+    refusal = rec.lines.map(&:strip).find { |l| l.match?(/:\d+: --load-model=graph\b/) }
+    return [nil, refusal, true] if refusal
+    return [nil, rec.lines.last.to_s.strip.then { |l| l.empty? ? $?.to_s : l }, false]
+  end
   files = {}
   if inline
-    files[0] = File.expand_path(prog)
+    files[0] = File.expand_path(prog).b
   else
-    _, graph = run(spinel, "--load-model=graph", "--dump-load-graph", prog)
+    ok, graph = run(spinel, "--load-model=graph", "--dump-load-graph", prog)
+    # without the graph no entry has a file, and every one would be dropped
+    return [nil, graph.lines.last.to_s.strip.then { |l| l.empty? ? $?.to_s : l }, false] unless ok
     graph.scan(/^file (\d+) (.*)$/) { files[$1.to_i] = $2 }
   end
-  own = %w[builtins packages].map { |d| File.join(File.dirname(File.expand_path(spinel)), d, "") }
+  own = %w[builtins packages].map { |d| File.join(File.dirname(File.expand_path(spinel)), d, "").b }
   st = {}
   ev = []
   opaque = []
@@ -213,7 +226,7 @@ def spinel_events(spinel, prog, inline)
       body.scan(/(\w+)#(\d+)( may)?/) do |k, seq, may|
         kind = case k
                when "def", "define_method", "reader", "writer", "alias", "copy" then m[2] == "." ? "sadd" : "add"
-               when "undef", "remove" then k
+               when "undef", "remove" then m[2] == "." ? "s#{k}" : k
                end
         add.(kind, leaf(m[1]), name, seq.to_i, !!may) if kind
       end
@@ -270,16 +283,19 @@ abort "usage: ruby tools/load_record_oracle.rb [--spinel BIN] [--inline] [--time
 
 agree = differ = 0
 progs.each do |prog|
-  sev, opaque = spinel_events(spinel, prog, inline)
+  sev, opaque, refused = spinel_events(spinel, prog, inline)
   if sev.nil?
-    puts "#{prog}: skipped, spinel: #{opaque}"
+    puts refused ? "#{prog}: skipped, spinel: #{opaque}" : "#{prog}: spinel failed: #{opaque}"
+    differ += 1 unless refused
     next
   end
   cev, finished = cruby_events(prog, timeout)
   diffs = compare(cev, sev, opaque, finished)
-  puts "#{prog}: CRuby stopped early, its later events not compared" unless finished || diffs.empty?
+  puts "#{prog}: CRuby stopped early, its later events not compared" unless finished
   diffs.each { |d| puts d }
-  diffs.empty? ? agree += 1 : differ += 1
+  if !diffs.empty? then differ += 1
+  elsif finished then agree += 1
+  end
 end
 puts "load record oracle: #{agree} agree, #{differ} differ, #{progs.size - agree - differ} skipped" if progs.size > 1
 exit(differ.zero? ? 0 : 1)

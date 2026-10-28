@@ -1,0 +1,39 @@
+{"s":"a\"b\\c\nd\te\rf\bg\fh\u0001i\u001fjk/l","a\"b\\c\nd\te\rf\bg\fh\u0001i\u001fjk/l":1}
+["","\"","\\","\n\n","xxx","é ü 日本"]
+480 495 true 484 true 484 true
+505 520 true 508 true 508 true
+506 521 true 510 true 508 true
+507 522 true 510 true 511 true
+508 523 true 512 true 511 true
+509 524 true 512 true 511 true
+510 525 true 514 true 514 true
+511 526 true 514 true 514 true
+512 527 true 516 true 514 true
+520 535 true 524 true 523 true
+1500 1515 true 1504 true 1504 true
+{"1":2,"-3":-4,"0":0,"sym":"val","true":false,"":null,"1.5":2.25}
+[0,-1,7,1234567,-987654321,1.0,-0.0,0.1,1e+20,0.00000015,123.456,1e-10]
+834
+9615
+{"points":[{"x":0,"y":0.0,"name":"p0"},{"x":1,"y":0.5,"name"
+zzzzzzzzzzzzzzzzzzzzzzz"}],"info":"end"}
+rescued bad 3
+rescued bad 5
+935
+thrown
+thrown
+JSON::NestingError
+JSON::NestingError
+{"after":[1,"two",3.0]}
+627
+[1,"two"]
+580
+{
+  "a": [
+    1,
+    2
+  ],
+  "b": {
+    "c": null
+  }
+}

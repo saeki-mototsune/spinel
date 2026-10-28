@@ -1,0 +1,12 @@
+NoMethodError foo
+NoMethodError bar
+NoMethodError baz
+"loud t"
+[Loud, T]
+true
+true
+"hi"
+[U, Greet]
+true
+true
+true

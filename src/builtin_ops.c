@@ -1306,6 +1306,9 @@ static const BuiltinOp bop_rows[] = {
   { TY_MUTEX, "locked?",     0, BOP_ARGC_ANY, BF_ANY, TY_BOOL,  BOPE_NONE },
   { TY_MUTEX, "owned?",      0, 0,            BF_ANY, TY_BOOL,  BOPE_TEMPLATE, "sp_Mutex_owned($r)" },
   { TY_MUTEX, "owned?",      0, BOP_ARGC_ANY, BF_ANY, TY_BOOL,  BOPE_NONE },
+  { TY_MUTEX, "mon_owned?",  0, 0,            BF_ANY, TY_BOOL,  BOPE_TEMPLATE, "sp_Mutex_owned(sp_monitor_check($r, \"mon_owned?\"))" },
+  { TY_MUTEX, "mon_owned?",  0, BOP_ARGC_ANY, BF_ANY, TY_BOOL,  BOPE_NONE },
+  { TY_MUTEX, "__monitor_check", 1, 1,        BF_ANY, TY_MUTEX, BOPE_TEMPLATE, "sp_monitor_check($r, $s0)" },
   { TY_MUTEX, "synchronize", 0, BOP_ARGC_ANY, BF_ANY, TY_POLY,  BOPE_NONE },
   { TY_MUTEX, "sleep",       0, 1,            BF_ANY, TY_POLY,  BOPE_MUTEX_SLEEP },
   { TY_MUTEX, "sleep",       0, BOP_ARGC_ANY, BF_ANY, TY_POLY,  BOPE_NONE },
@@ -1637,6 +1640,14 @@ static const BuiltinOp bop_rows[] = {
   { TY_PROC, "equal?",          1,   1, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "(($r) == ($e0))", BOP_K(TY_PROC) },
   { TY_PROC, "eql?",            1,   1, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "(sp_proc_root($r) == sp_proc_root($e0))", BOP_K(TY_PROC) },
   { TY_PROC, "==",              1,   1, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "(sp_proc_root($r) == sp_proc_root($e0))", BOP_K(TY_PROC) },
+
+  /* Module (sp_Class). include?(mod): mod must be a Module, a Class is a
+     TypeError; true when mod is a proper ancestor of the receiver (#2674).
+     $T is the receiver's temp, taken by the family (or the boxed dispatch)
+     before its arms. Any other argument is answered elsewhere, still a
+     bool. */
+  { TY_CLASS, "include?",        1,   1, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "({ sp_Class _cl$T = $r; sp_Class _cl$t = $e0; if (!sp_class_is_module_val(_cl$t)) sp_raise_cls(\"TypeError\", \"wrong argument type Class (expected Module)\"); _cl$T.cls_id != _cl$t.cls_id && sp_class_le(_cl$T, _cl$t); })", BOP_K(TY_CLASS) },
+  { TY_CLASS, "include?",        1,   1, BF_ANY,      TY_BOOL,       BOPE_NONE },
 
   /* Integer and Float: the result kinds read off the name, arity and block
      form. pow, clamp, coerce, Float#fdiv(Complex), Float <=> Rational,
@@ -3445,7 +3456,7 @@ static const BopShareRow bop_share_rows[] = {
      chunk_while), cycle, find, detect, min_by and max_by with an argument,
      the seedless inject, product without an argument or zip with other
      than one. ty_block_yield reads none of the in-place filters and
-     maps, uniq, uniq!, sort_by!, inject, each_with_object, fill, the
+     maps, uniq, uniq!, sort_by!, inject, each_with_object, the
      comparators, cycle, or the run and tuple iterators but
      each_slice and each_cons. Neither reads slice_before or slice_after:
      only the share analysis does.
@@ -3550,7 +3561,7 @@ static const IterRow iter_rows[] = {
   { BOP_ANY_ARRAY, "reduce",          0, 0, 2, { YS_MEMO, YS_ELEM }, IA_MEMO, IRF_GAP_SHAPE | IRF_GAP_FWD },
   { BOP_ANY_ARRAY, "each_with_object", 1, 1, 2, { YS_ELEM, YS_MEMO }, IA_MEMO, IRF_GAP_FWD },
   { BOP_ANY_ARRAY, "each_index",      0, 0, 1, { YS_INDEX }, IA_RECV, IRF_SHAPE_BOXED },
-  { BOP_ANY_ARRAY, "fill",            0, 2, 1, { YS_INDEX }, IA_BLOCKVALS_INPLACE, IRF_GAP_FWD | IRF_SHAPE_BOXED },
+  { BOP_ANY_ARRAY, "fill",            0, 2, 1, { YS_INDEX }, IA_BLOCKVALS_INPLACE, IRF_SHAPE_BOXED },
   { BOP_ANY_ARRAY, "cycle",           0, 1, 1, { YS_ELEM }, IA_OTHER, IRF_GAP_SHAPE | IRF_GAP_FWD },
   { BOP_ANY_ARRAY, "min",             0, 0, 2, { YS_ELEM, YS_ELEM }, IA_ONE, IRF_GAP_SHAPE | IRF_GAP_FWD },
   { BOP_ANY_ARRAY, "min",             1, 1, 2, { YS_ELEM, YS_ELEM }, IA_SOME, IRF_GAP_SHAPE | IRF_GAP_FWD },
