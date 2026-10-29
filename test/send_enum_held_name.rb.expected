@@ -50,3 +50,11 @@ true
 "undefined method 'special?'"
 "undefined method 'special?'"
 "undefined method 'special?'"
+[1, 2]
+[1, 2]
+[1, 2]
+:own
+:own
+[:own, :own]
+[2, 2]
+[:plain, :plain]
