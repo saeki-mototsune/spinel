@@ -101,10 +101,13 @@ class Plain
   def initialize = @v = 1
 end
 Pair = Struct.new(:a, :b)
-[Pair.new(1, 2), Bag.new, Plain.new, /a/, 1.5r, Time.at(0), -> {}].each do |r|
-  p [r.special?, r.public_send(m)]
-rescue NoMethodError => e
-  p e.message.sub(/ for .*/, "")
+[Pair.new(1, 2), Bag.new, Plain.new, /a/, 1.5r, Time.at(0), -> {}, Dir.new(".")].each do |r|
+  got = [-> { r.special? }, -> { r.public_send(m) }].map do |f|
+    f.call
+  rescue NoMethodError => e
+    e.message.sub(/ for .*/, "")
+  end
+  p got
 end
 
 # a class of the program that defines an alias itself keeps its method, and

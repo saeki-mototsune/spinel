@@ -14131,8 +14131,8 @@ int desugar_builtin_enum_calls(Compiler *c) {
        on whatever it is handed, and a boxed String's `special?` (`count >
        1`) reached String#count and raised ArgumentError. Only a value that
        is an Enumerable -- an Array, a Hash, a Range, an Enumerator, a
-       Struct, an IO, or an instance of a program class with Enumerable
-       behind it -- takes the copy; any other takes the call as written,
+       Struct, an IO, a Dir, or an instance of a program class with
+       Enumerable behind it -- takes the copy; any other takes the call as written,
        whose answer is CRuby's NoMethodError. (`is_a?(Enumerable)` itself
        answers false for a boxed builtin.) */
     int scal_arm = rt == TY_POLY && !safe_nav && !range_arm && !wo_arm && nt_int(nt, copy, "enum_own_def", 0);
@@ -14169,7 +14169,7 @@ int desugar_builtin_enum_calls(Compiler *c) {
       if (!safe_nav) pred = range_arm ? enum_is_a_named(c, rn, "Range")
                           : wo_arm ? enum_is_a_named(c, rn, "Enumerator") : enum_is_a_chain(c, rn, defcls, exact, ndef);
       if (scal_arm) {
-        static const char *const enums[] = { "Array", "Hash", "Range", "Enumerator", "Struct", "IO" };
+        static const char *const enums[] = { "Array", "Hash", "Range", "Enumerator", "Struct", "IO", "Dir" };
         const int nenums = (int)(sizeof enums / sizeof enums[0]);
         int is_enum = -1;
         for (int k = 0; k < nenums + c->nclasses; k++) {
