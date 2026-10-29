@@ -489,6 +489,7 @@ void comp_free(Compiler *c) {
   free(c->cext_classes);
   share_facts_free(c);
   share_plan_free(c);
+  ic_free(c);
   free(c->bsl_gen);
   free(c->bsl_val);
   if (g_repr_check) repr_channel_free(c);
@@ -510,6 +511,9 @@ void comp_free(Compiler *c) {
   free(c->lazy_hoist);
   c->lazy_hoist = NULL;
   c->lazy_hoist_n = 0;
+  free(c->missing_order);
+  c->missing_order = NULL;
+  c->missing_order_n = 0;
   free(c->hash_default_arg_memo);
   c->hash_default_arg_memo = NULL;
   free(c->blk_body_map);
@@ -520,6 +524,12 @@ void comp_free(Compiler *c) {
   for (int i = 0; i < c->pres_ord_n; i++) free(c->pres_ord[i]);
   free(c->pres_ord); c->pres_ord = NULL; c->pres_ord_n = 0;
   free(c->splat_views); c->splat_views = NULL; c->nsplat_views = 0;
+  free(c->ver_entries); c->ver_entries = NULL; c->nver_entries = 0;
+  ver_hold_free(c);
+  ver_chain_free(c);
+  free(c->ver_ix); free(c->ver_ix_next); free(c->ver_names); free(c->ver_names_next);
+  c->ver_ix = c->ver_ix_next = c->ver_names = c->ver_names_next = NULL; c->ver_ix_nb = 0;
+  free(c->ver_pins); c->ver_pins = NULL; c->nver_pins = 0;
   for (int i = 0; i < c->nrbp_slots; i++) free(c->rbp_slot_names[i]);
   free(c->rbp_slot_names); free(c->rbp_slot_lens); c->rbp_slot_names = NULL; c->rbp_slot_lens = NULL; c->nrbp_slots = 0;
   if (c->bp_name) for (unsigned i = 0; i <= c->bp_mask; i++) free(c->bp_name[i]);
@@ -551,6 +561,7 @@ void comp_free(Compiler *c) {
   }
   free(c->scopes);
   free(c->file_scope);
+  free(c->load_sets_flag);
   elab_free(c);
   for (int i = 0; i < c->nsymbols; i++) free(c->symbols[i]);
   free(c->symbols);
@@ -588,6 +599,12 @@ void comp_free(Compiler *c) {
   free(c->cls_value);
   for (int i = 0; i < c->ngvars; i++) free(c->gvars[i].name);
   free(c->gvars);
+  free(c->gvar_ix);
+  gvar_writes_free(c);
+  free(c->mih_head);
+  free(c->mih_first);
+  free(c->mih_nodes);
+  free(c->mih_calls);
   for (int i = 0; i < c->nconsts; i++) free(c->consts[i].name);
   free(c->consts);
   free(c->toplevel_includes);
@@ -611,6 +628,8 @@ void comp_free(Compiler *c) {
   free(c->ivar_widen_src);
   free((TyKind *)c->hash_want);
   free((TyKind *)c->arr_want);
+  free(c->oa_walked_node);
+  free(c->oa_walked_kind);
   free(c->lw_joined);
   free((TyKind *)c->poly_builtin_ty);
   free(c->bop_inf);
@@ -622,9 +641,8 @@ static LocalVar *lv_find(LocalVar *arr, int n, const char *name) {
   for (int i = 0; i < n; i++) if (sp_streq(arr[i].name, name)) return &arr[i];
   return NULL;
 }
-static LocalVar *lv_intern(LocalVar **arr, int *n, int *cap, const char *name) {
-  LocalVar *lv = lv_find(*arr, *n, name);
-  if (lv) return lv;
+static LocalVar *lv_add(LocalVar **arr, int *n, int *cap, const char *name) {
+  LocalVar *lv;
   if (*n >= *cap) { *cap = *cap ? *cap * 2 : 8; *arr = realloc(*arr, sizeof(LocalVar) * (size_t)*cap); }
   lv = &(*arr)[(*n)++];
   memset(lv, 0, sizeof(*lv));
@@ -634,8 +652,46 @@ static LocalVar *lv_intern(LocalVar **arr, int *n, int *cap, const char *name) {
   comp_touch_global_r(4);    /* a new slot is a change of the table */
   return lv;
 }
-LocalVar *comp_gvar(Compiler *c, const char *name) { IMEMO_DEP_GLOBAL(); return lv_find(c->gvars, c->ngvars, name); }
-LocalVar *comp_gvar_intern(Compiler *c, const char *name) { return lv_intern(&c->gvars, &c->ngvars, &c->cgvars, name); }
+static LocalVar *lv_intern(LocalVar **arr, int *n, int *cap, const char *name) {
+  LocalVar *lv = lv_find(*arr, *n, name);
+  return lv ? lv : lv_add(arr, n, cap, name);
+}
+/* The globals are found by name through an index of their slots: a slot in
+   the table is its name's only one (comp_gvar_intern), and none is removed. */
+static int gvar_probe(const Compiler *c, const char *name) {
+  if (!c->gvar_ix || !name) return -1;
+  unsigned mask = (unsigned)c->gvar_ix_cap - 1, j = sp_strhash(name) & mask;
+  while (c->gvar_ix[j] >= 0 && !sp_streq(c->gvars[c->gvar_ix[j]].name, name)) j = (j + 1) & mask;
+  return (int)j;
+}
+LocalVar *comp_gvar(Compiler *c, const char *name) {
+  IMEMO_DEP_GLOBAL();
+  int j = gvar_probe(c, name);
+  return j >= 0 && c->gvar_ix[j] >= 0 ? &c->gvars[c->gvar_ix[j]] : NULL;
+}
+LocalVar *comp_gvar_intern(Compiler *c, const char *name) {
+  LocalVar *lv = comp_gvar(c, name);
+  if (lv) return lv;
+  lv = lv_add(&c->gvars, &c->ngvars, &c->cgvars, name);
+  if (c->ngvars * 2 > c->gvar_ix_cap) {   /* the index grows with the table: rebuilt over every slot */
+    int cap = c->gvar_ix_cap ? c->gvar_ix_cap * 2 : 64;
+    free(c->gvar_ix);
+    if (!(c->gvar_ix = malloc(sizeof(int) * (size_t)cap))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < cap; i++) c->gvar_ix[i] = -1;
+    c->gvar_ix_cap = cap;
+    for (int i = 0; i < c->ngvars; i++) {
+      unsigned j = sp_strhash(c->gvars[i].name) & (unsigned)(cap - 1);
+      while (c->gvar_ix[j] >= 0) j = (j + 1) & (unsigned)(cap - 1);
+      c->gvar_ix[j] = i;
+    }
+  }
+  else {
+    unsigned j = sp_strhash(name) & (unsigned)(c->gvar_ix_cap - 1);
+    while (c->gvar_ix[j] >= 0) j = (j + 1) & (unsigned)(c->gvar_ix_cap - 1);
+    c->gvar_ix[j] = c->ngvars - 1;
+  }
+  return &c->gvars[c->ngvars - 1];
+}
 const char *comp_resolve_gvar(Compiler *c, const char *name) {
   for (int i = 0; i < c->ngvar_aliases; i++)
     if (sp_streq(c->gvar_alias_from[i], name)) return c->gvar_alias_to[i];
@@ -907,6 +963,10 @@ static int sp_name_collides_runtime(const char *n) {
        rational and socket-option carriers, IO::Buffer's and Process::Status's */
     "Tms", "StrRange", "FloatRange", "BigRational", "RbValue", "SockOpt",
     "ProcessStatus", "IOBuffer",
+    /* the runtime's own carriers, named after no Ruby class: a frozen
+       literal's handle, Enumerable#sum's state, an eql? set, a require's
+       candidate file, a wide proc call's arguments, a String enumerator */
+    "StringLiteral", "SumState", "EqlSet", "LoadCand", "ProcWide", "EnumStr",
     /* Classes the runtime builds in C. A reopening is refused, but a NEW class
        of that name (`App::Mutex`, or OpenStruct without require "ostruct")
        would clash with the runtime's C names. The builtin-name checks read
@@ -1234,14 +1294,15 @@ static int sm_moved(int s) {
   return 0;
 }
 /* scope `s` is a method of (class_id, is_cm) a lookup may answer: not while
-   it is moved */
+   it is moved, and not a version entry, which only the calls call_target
+   binds to it reach */
 static int sm_owns(const Compiler *c, int s, int class_id, int is_cm) {
   return c->scopes[s].class_id == class_id && (int)c->scopes[s].is_cmethod == is_cm &&
-         (!mv_n || !sm_moved(s));
+         !c->scopes[s].entry && (!mv_n || !sm_moved(s));
 }
 /* the same for a top-level method */
 static int sm_toplevel(const Compiler *c, int s) {
-  return c->scopes[s].class_id < 0 && (!mv_n || !sm_moved(s));
+  return c->scopes[s].class_id < 0 && !c->scopes[s].entry && (!mv_n || !sm_moved(s));
 }
 
 /* (class_id, name, is_cmethod) -> scope index, cached per scope count. Both
@@ -1530,6 +1591,9 @@ int comp_method_version(Compiler *c, int class_id, const char *name, int is_cm, 
     else for (; dc >= 0; dc = c->classes[dc].parent)
       if ((mi = sm_version_renamed(c, dc, is_cm, def_node)) >= 0) break;
   }
+  /* an instance chain ends at Object, whose methods the top level defines */
+  if (mi < 0 && class_id >= 0 && !is_cm && (mi = sm_version(c, -1, name, 0, def_node)) < 0)
+    mi = sm_version_renamed(c, -1, 0, def_node);
   if (mi >= 0) { IMEMO_DEP_SCOPE(mi); if (def_class) *def_class = dc; }
   return mi;
 }
@@ -2767,6 +2831,13 @@ TyKind native_spec_to_ty(const char *spec) {
   return TY_UNKNOWN;
 }
 
+/* The value class k's binding nmi answers: `:self` is k's object, which
+   native_spec_to_ty alone cannot name. */
+TyKind comp_native_ret_ty(Compiler *c, int nmi, int k) {
+  const char *ret = c->native_methods[nmi].ret;
+  return sp_streq(ret, "self") ? ty_object(k) : native_spec_to_ty(ret);
+}
+
 /* Find a native method binding on a class: kind 0 = instance method, 1 =
    constructor. Arity-keyed -- prefer an exact nargs==argc match, else the first
    same-name binding. Returns the index in c->native_methods, or -1. */
@@ -2978,17 +3049,36 @@ static int mixin_level_answers(Compiler *c, int k, const char *name) {
    its ancestors already (the include is then a no-op). */
 /* The same positions and walker also answer Comparable membership and equality
    precedence; neither query reconstructs includes from the node table. */
-/* Whether Enumerable is among the ancestors class or module k brings: it
-   includes (or prepends) it, or includes a module that does. */
-static int mixin_reaches(Compiler *c, int k, int comparable, int depth) {
+/* What the mixin walk looks for: Enumerable, Comparable, or any core module
+   (one of those, or a builtin module named by path) */
+enum { MX_ENUM = 0, MX_CMP = 1, MX_CORE = 2 };
+static int mixin_here(const ClassInfo *ci, int what) {
+  int en = ci->enum_inc_at || ci->enum_prepended, cm = ci->cmp_inc_at || ci->cmp_prepended;
+  return what == MX_ENUM ? en : what == MX_CMP ? cm : en || cm || ci->nincluded_mod_names > 0;
+}
+/* Whether what is among the ancestors class or module k brings: it
+   includes (or prepends) it, or includes a module that does, at any depth.
+   Each module is asked once (`seen`), so a module several includes share
+   costs one visit. */
+static int mixin_reaches_from(Compiler *c, int k, int what, unsigned char *seen) {
   ClassInfo *ci = &c->classes[k];
-  if (comparable ? (ci->cmp_inc_at || ci->cmp_prepended) :
-                   (ci->enum_inc_at || ci->enum_prepended)) return 1;
-  for (int j = 0; j < ci->nincluded_mods && depth < (comparable ? c->nclasses : 16); j++) {
+  seen[k] = 1;
+  if (mixin_here(ci, what)) return 1;
+  for (int j = 0; j < ci->nincluded_mods; j++) {
     int m = ci->included_mods[j];
-    if (m >= 0 && m < c->nclasses && m != k && mixin_reaches(c, m, comparable, depth + 1)) return 1;
+    if (m >= 0 && m < c->nclasses && !seen[m] && mixin_reaches_from(c, m, what, seen)) return 1;
   }
   return 0;
+}
+static int mixin_reaches(Compiler *c, int k, int what) {
+  const ClassInfo *ci = &c->classes[k];
+  /* a class with no includes answers by its own flags, with no set */
+  if (ci->nincluded_mods == 0) return mixin_here(ci, what);
+  unsigned char *seen = (unsigned char *)calloc((size_t)c->nclasses, 1);
+  if (!seen) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  int r = mixin_reaches_from(c, k, what, seen);
+  free(seen);
+  return r;
 }
 static int mixin_level_walk(Compiler *c, int k, const char *name, int own_enum, int comparable, int depth) {
   ClassInfo *ci = &c->classes[k];
@@ -3040,7 +3130,7 @@ static int mixin_answers_first(Compiler *c, int cid, const char *name, int compa
       }
       return master;
     }
-    if (mixin_reaches(c, k, comparable, 0)) top = k;
+    if (mixin_reaches(c, k, comparable)) top = k;
     if (k == ci->parent) break;
   }
   n = 0;
@@ -3059,10 +3149,36 @@ int comp_comparable_answers_first(Compiler *c, int cid, const char *name) {
   return mixin_answers_first(c, cid, name, 1);
 }
 int comp_enum_reaches(Compiler *c, int cid) {
-  return cid >= 0 && cid < c->nclasses && mixin_reaches(c, cid, 0, 0);
+  return cid >= 0 && cid < c->nclasses && mixin_reaches(c, cid, 0);
+}
+/* Enumerable's methods are behind class `cid`: Enumerable is among its
+   ancestors (itself or a superclass includes or prepends it), or an ancestor
+   is an Array, a Struct (a Data is not one) or a native class, which answer
+   them on their own. */
+int comp_enum_behind(Compiler *c, int cid) {
+  int n = 0;
+  for (int k = cid; k >= 0 && k < c->nclasses && n < c->nclasses; k = c->classes[k].parent, n++) {
+    ClassInfo *ci = &c->classes[k];
+    if (ci->is_native_class || (ci->is_struct && !ci->is_data) || ci->nsub_root > 0 || comp_ary_root(c, k) >= 0 || comp_enum_reaches(c, k)) return 1;
+    if (k == ci->parent) break;
+  }
+  return 0;
+}
+/* A plain class: Object (or BasicObject) is the only core class behind it and
+   no core module is among its ancestors, so its instances answer a program's
+   methods and Object's and Kernel's, and no other builtin's. */
+int comp_plain_class(Compiler *c, int cid) {
+  int n = 0;
+  for (int k = cid; k >= 0 && k < c->nclasses && n < c->nclasses; k = c->classes[k].parent, n++) {
+    ClassInfo *ci = &c->classes[k];
+    if (ci->is_native_class || ci->is_struct || ci->nsub_root > 0 || comp_ary_root(c, k) >= 0 || comp_class_is_module(c, ci) ||
+        ci->def_node < 0 || mixin_reaches(c, k, MX_CORE)) return 0;
+    if (k == ci->parent) break;
+  }
+  return cid >= 0 && cid < c->nclasses && !class_is_exc_subclass(c, cid) && is_plain_builtin_superclass(class_builtin_parent(c, cid));
 }
 int comp_comparable_reaches(Compiler *c, int cid) {
-  return cid >= 0 && cid < c->nclasses && mixin_reaches(c, cid, 1, 0);
+  return cid >= 0 && cid < c->nclasses && mixin_reaches(c, cid, 1);
 }
 
 /* ---- Poly-dispatch candidates by method name ----
@@ -4287,12 +4403,15 @@ static int comp_method_index_1(Compiler *c, const char *name) {
   }
   return -1;
 }
-static int comp_method_index_direct(Compiler *c, const char *name) {
+/* The last top-level scope named name on one side: main's singleton
+   methods (`def self.k` at the top level, main) or Object's (top-level
+   `def k`). */
+static int sm_top_last(Compiler *c, const char *name, int side) {
   if (!name) return -1;
   if (!sm_frozen) {
     /* in reverse, so a redefinition wins, matching the frozen index */
     for (int s = c->nscopes - 1; s >= 0; s--)
-      if (sm_toplevel(c, s) && c->scopes[s].name &&
+      if (sm_toplevel(c, s) && !c->scopes[s].is_cmethod == !side && c->scopes[s].name &&
           sp_streq(c->scopes[s].name, name)) return s;
     return -1;
   }
@@ -4300,8 +4419,21 @@ static int comp_method_index_direct(Compiler *c, const char *name) {
   if (!sm_buckets) return -1;
   unsigned b = sm_hash(-1, name, 0) % (unsigned)sm_buckets;
   for (int s = tm_head[b]; s >= 0; s = tm_next[s])
-    if (sm_toplevel(c, s) && c->scopes[s].name && sp_streq(c->scopes[s].name, name)) return s;
+    if (sm_toplevel(c, s) && !c->scopes[s].is_cmethod == !side && c->scopes[s].name &&
+        sp_streq(c->scopes[s].name, name)) return s;
   return -1;
+}
+/* Object's method of the name, else main's singleton method: a call that
+   is not known to run on main reaches Object's (call_target asks main's
+   first for one that does). */
+static int comp_method_index_direct(Compiler *c, const char *name) {
+  int s = sm_top_last(c, name, 0);
+  return s >= 0 ? s : sm_top_last(c, name, 1);
+}
+int comp_main_method(Compiler *c, const char *name) {
+  int s = sm_top_last(c, name, 1);
+  if (s >= 0) IMEMO_DEP_SCOPE(s);
+  return s;
 }
 
 /* Does class ci descend from an explicit `< BasicObject` (a blank slate)?

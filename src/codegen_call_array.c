@@ -338,7 +338,7 @@ static int emit_array_operand_type_error(Compiler *c, const BopCtx *x, Buf *b) {
   const int *argv = call_args(c->nt, x->id, &argc);
   if (argc != 1) return 0;
   TyKind at = comp_ntype(c, argv[0]);
-  if (at != TY_NIL && at != TY_BOOL && !conv_to_ary_impossible(at)) return 0;
+  if (!conv_to_ary_misfit(c, at)) return 0;
   /* a nullable Integer or Float slot (a parameter one call site passes nil)
      names nil or its class by what it holds */
   int nil_rt = repr_opt_kind(c, argv[0]) != TY_UNKNOWN;
@@ -350,6 +350,11 @@ static int emit_array_operand_type_error(Compiler *c, const BopCtx *x, Buf *b) {
   if (nil_rt) {
     buf_printf(b, "%s _t%d = (", oint_ctype(at), tb);
     emit_oint_expr(c, argv[0], at, b); buf_puts(b, "); ");
+  }
+  /* an object names its class at run time (a subclass instance its own,
+     a nil one nil) */
+  else if (ty_is_object(at)) {
+    buf_printf(b, "sp_RbVal _t%d = ", tb); emit_boxed(c, argv[0], b); buf_puts(b, "; ");
   }
   else if (at == TY_BOOL || str_rt) {
     buf_printf(b, "%s _t%d = (", at == TY_BOOL ? "int" : "const char *", tb);
@@ -367,6 +372,8 @@ static int emit_array_operand_type_error(Compiler *c, const BopCtx *x, Buf *b) {
     buf_printf(b, "sp_raise_cls(\"TypeError\", _t%d == NULL"
                   " ? \"no implicit conversion of nil into Array\""
                   " : \"no implicit conversion of String into Array\");", tb);
+  else if (ty_is_object(at))
+    buf_printf(b, "sp_raise_cls(\"TypeError\", sp_sprintf(\"no implicit conversion of %%s into Array\", sp_convert_src_name(_t%d)));", tb);
   else if (nil_rt)
     buf_printf(b, "sp_raise_cls(\"TypeError\", _t%d.nil"
                   " ? \"no implicit conversion of nil into Array\""
@@ -1984,8 +1991,8 @@ int emit_op_array_pred_class(Compiler *c, const BopCtx *x, Buf *b) {
   int ta = ++g_tmp, tc2 = ++g_tmp, tn = ++g_tmp, tcnt = ++g_tmp, ti = ++g_tmp;
   buf_puts(b, "({ "); ta = hold_operand(c, x->recv, TY_POLY, 1, ta, 1, " ", b);
   buf_printf(b, "sp_Class _t%d = ", tc2); emit_expr(c, argv[0], b);
-  buf_puts(b, "; "); emit_poly_iter_obj_normalize(c, ta, b);
-  emit_poly_iter_obj_reject(c, x->id, ta, name, b);
+  buf_puts(b, "; "); emit_poly_iter_obj_reject(c, x->id, ta, name, b);
+  emit_poly_iter_obj_normalize(c, ta, b);
   buf_printf(b, "sp_poly_iter_check(_t%d, \"%s\"); ", ta, name);
   buf_printf(b, "sp_int _t%d = sp_poly_arr_len_ex(_t%d); sp_int _t%d = 0;"
                 " for (sp_int _t%d = 0; _t%d < _t%d; _t%d++)"
@@ -2193,12 +2200,16 @@ int emit_call_append_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
        to widen (an_push_widens_fresh): its elements, boxed, then the push */
     if (!needs_lift && an_push_widens_fresh(c, id)) {
       int t = ++g_tmp;
-      buf_printf(b, "({ sp_PolyArray *_t%d = sp_poly_to_poly_array(", t);
-      emit_boxed(c, recv, b);
-      buf_printf(b, "); SP_GC_ROOT(_t%d); ", t);
+      buf_printf(b, "({ sp_PolyArray *_t%d = ", t);
+      emit_fresh_lift_recv(c, recv, b);
+      buf_printf(b, "; SP_GC_ROOT(_t%d); ", t);
+      /* every argument runs before a frozen receiver raises, as in CRuby */
+      int vbase = g_tmp + 1; g_tmp += argc;
       for (int a = 0; a < argc; a++) {
-        buf_printf(b, "sp_PolyArray_push(_t%d, ", t); emit_boxed(c, argv[a], b); buf_puts(b, "); ");
+        buf_printf(b, "sp_RbVal _t%d = ", vbase + a); emit_boxed(c, argv[a], b);
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); ", vbase + a);
       }
+      for (int a = 0; a < argc; a++) buf_printf(b, "sp_PolyArray_push(_t%d, _t%d); ", t, vbase + a);
       buf_printf(b, "_t%d; })", t);
       return 1;
     }

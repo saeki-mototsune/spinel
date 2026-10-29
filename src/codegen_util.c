@@ -175,7 +175,7 @@ void ucall_observe(Compiler *c, int id, int mi, int owner_ci, int add) {
   const CallPlan *conversion = view_conversion(c, &id);
   if (g_repr_check) repr_channel_call(c, id, mi);
   if (conversion) {
-    int member = cplan_virtual_member(c, id, conversion, mi);
+    int member = cplan_virtual_member(c, id, conversion, mi, NULL);
     fprintf(stderr, "plan-check: conversion-%s: node %d %s: plan %d, codegen %d\n",
             member ? "agree" : "conflict", id, conversion->delegate, conversion->mi, mi);
     return;
@@ -198,7 +198,7 @@ void ucall_observe(Compiler *c, int id, int mi, int owner_ci, int add) {
     if (method.mi < 0) method = cplan_send_arm(c, id);
     const CallPlan *pl = &method;
     int member = pl->mi >= 0 &&
-                 (cplan_virtual_member(c, id, pl, mi) || (add && pl->dispatch >= CP_SWITCH) ||
+                 (cplan_virtual_member(c, id, pl, mi, NULL) || (add && pl->dispatch >= CP_SWITCH) ||
                   (c->scopes[mi].is_proc_form && scope_proc_form_of(c, pl->mi) == mi));
     if (pl->mi < 0) o->rflags |= UR_NONE;
     /* a switch's arms: agreement is the plan's method among them, decided
@@ -305,7 +305,7 @@ static void ucall_resolver_report(Compiler *c) {
                 nm ? nm : "?", xs, inf->via < 10 ? (const char *[]){ "none", "top", "inst", "cmeth", "super",
                 "send_blind", "ie", "included", "reopen", "poly" }[inf->via] : "?");
       }
-      else if (cplan_virtual_member(c, id, pl, inf->mi) ||
+      else if (cplan_virtual_member(c, id, pl, inf->mi, NULL) ||
                (inf->via == UC_POLY && pl->via == UC_POLY)) ai++;
       else {
         di++;
@@ -751,6 +751,29 @@ int call_is_scalar_op(Compiler *c, int id) {
   int scalar_r = (rt == TY_INT || rt == TY_FLOAT || rt == TY_BOOL);
   int scalar_v = (vt == TY_INT || vt == TY_FLOAT || vt == TY_BOOL);
   return scalar_r && scalar_v;
+}
+/* Can a builtin operator over scalars (call_is_scalar_op) raise? A
+   quotient of two Integers and any modulo (a Float one too) raise
+   ZeroDivisionError at a divisor that may be zero, which only a nonzero
+   literal rules out; an Integer power raises for an exponent too large
+   (ArgumentError) and for 0 ** -1; any operator but == and != raises for
+   an operand that can be nil. The rest (+, -, * and the comparisons and
+   bit operators) answer for every Integer and Float. */
+int scalar_op_may_raise(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  const char *nm = nt_str(nt, id, "name");
+  int recv = nt_ref(nt, id, "receiver"), ac = 0;
+  const int *av = call_args(nt, id, &ac);
+  int arg = ac == 1 ? av[0] : -1;
+  if (!is_eq_or_ne(nm) && (node_may_be_nil(c, recv) || node_may_be_nil(c, arg))) return 1;
+  TyKind rt = repr_of(c, recv).as_ty, at = arg >= 0 ? repr_of(c, arg).as_ty : TY_UNKNOWN;
+  int fl = rt == TY_FLOAT || at == TY_FLOAT;
+  if (is_pow_op(nm)) return !fl;
+  if (!is_div_or_mod(nm) || (fl && !is_mod_operator(nm))) return 0;
+  NodeKind k = arg >= 0 ? nt_kind(nt, arg) : NK_NilNode;
+  if (k == NK_IntegerNode) return !nt_str(nt, arg, "bigval") && nt_int(nt, arg, "value", 0) == 0;
+  if (k == NK_FloatNode) return strtod(nt_content(nt, arg) ? nt_content(nt, arg) : "0", NULL) == 0.0;
+  return 1;
 }
 
 /* The block of a call to a builtin that leaves it unused (Array#slice), so
@@ -4097,10 +4120,13 @@ int one_tail_fresh(Compiler *c, int n) {
     const CallPlan *pl = cplan_user(c, n);
     if (pl->mi >= 0 || pl->dispatch != CP_NONE) return 0;
     /* (a builtin answering its receiver, `s.tap { }`, is that String: the
-       channel is how the caller finds its handle) */
-    int r = nt_ref(c->nt, n, "receiver"), argc = 0;
+       channel is how the caller finds its handle, which the block may keep;
+       without a block it is new when the receiver is, `s[i, n].to_s`) */
+    int r = nt_ref(c->nt, n, "receiver"), argc = 0, blk = nt_ref(c->nt, n, "block") >= 0;
     call_args(c->nt, n, &argc);
-    return !(r >= 0 && bop_answers_recv(comp_ntype(c, r), nt_str(c->nt, n, "name"), argc, nt_ref(c->nt, n, "block") >= 0));
+    if (r >= 0 && bop_answers_recv(comp_ntype(c, r), nt_str(c->nt, n, "name"), argc, blk))
+      return !blk && one_tail_fresh(c, r);
+    return 1;
   }
   return 0;
 }
@@ -4597,6 +4623,7 @@ void refuse_prepass_at_emit(Compiler *c, int id) {
   refuse_from_plan(c, id, CRF_SEND, "refuse-send");
   refuse_from_plan(c, id, CRF_CONST_GET, "refuse-const-get");
   refuse_from_plan(c, id, CRF_BINDING, "refuse-binding");
+  refuse_from_plan(c, id, CRF_TOP_SELF, "refuse-top-self");
 }
 
 __attribute__((noreturn)) void unsupported(Compiler *c, int id, const char *what) {
@@ -5793,6 +5820,17 @@ int call_never_returns(Compiler *c, int id) {
   }
   return mi >= 0 && c->scopes[mi].ret == TY_VOID;
 }
+/* The general Array a fresh typed Array becomes for a push or concat of
+   another kind (an_push_widens_fresh), as an sp_PolyArray * expression: a
+   copy of its elements that keeps its frozen flag (`s.split.freeze << 1`
+   raises FrozenError, as CRuby does). */
+void emit_fresh_lift_recv(Compiler *c, int recv, Buf *b) {
+  int tv = ++g_tmp, tp = ++g_tmp;
+  buf_printf(b, "({ sp_RbVal _t%d = ", tv);
+  emit_boxed(c, recv, b);
+  buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_PolyArray *_t%d = sp_poly_to_poly_array(_t%d);"
+                " if (sp_poly_frozen(_t%d)) _t%d->frozen = 1; _t%d; })", tv, tp, tv, tv, tp, tp);
+}
 /* The runtime conversion of a typed array to the poly array; NULL for a kind
    that has none. */
 const char *array_to_poly_fn(TyKind t) {
@@ -6390,12 +6428,13 @@ void emit_str_array_handles(Compiler *c, int v, Buf *b) {
   buf_printf(b, "({ sp_StrArray *_t%d = ", ta);
   emit_expr(c, v, b);
   /* (one-String mode: a nil Array stays nil -- `s&.split(",")` -- where
-     the loop built an empty one) */
+     the loop built an empty one). The copy stands for the same Ruby
+     object, so it keeps the frozen flag (`@b = ["x"].freeze`). */
   buf_printf(b, "; SP_GC_ROOT(_t%d); sp_PolyArray *_t%d = _t%d ? sp_PolyArray_new() : NULL; SP_GC_ROOT(_t%d);"
                 " for (sp_int _t%d = 0; _t%d && _t%d < sp_StrArray_length(_t%d); _t%d++)"
                 " sp_PolyArray_push(_t%d, sp_box_nullable_obj(sp_String_new_shared(sp_StrArray_get(_t%d, _t%d)),"
-                " SP_BUILTIN_STRBUF)); _t%d; })",
-             ta, tp, ta, tp, ti, ta, ti, ta, ti, tp, ta, ti, tp);
+                " SP_BUILTIN_STRBUF)); if (_t%d) _t%d->frozen = _t%d->frozen; _t%d; })",
+             ta, tp, ta, tp, ti, ta, ti, ta, ti, tp, ta, ti, tp, tp, ta, tp);
 }
 /* --share-strings: is block parameter lv, bound to an element of kind et, a
    slot the scope holds as the shared handle (TY_STRBUF) over a String
@@ -6771,16 +6810,24 @@ static int mc_name_fixed(const char *nm) {
    the method, never from a name: two methods of one name are two
    functions. A replaced version (Scope.version_n) is spelled from its
    name and its number: `f__redef<n>` at the top level, `m#redef<n>` in a
-   class (mc_number_versions). The answer stays valid for the next seven
-   spellings. */
-/* The name method s is spelled from: its own, or a replaced version's with
-   its number, in a buffer of its size the caller frees */
+   class (mc_number_versions); a version entry (Scope.entry) as
+   `f__entry`, `m#entry`, or with the number mc_number_versions gives it,
+   `f__entry1`; a method of main's own beside Object's of the name
+   (main_n), `k__main<n>` (mc_number_versions). The answer stays valid
+   for the next seven spellings. */
+/* The name method s is spelled from: its own, or a replaced version's,
+   an entry's or main's own method's with its number, in a buffer of its
+   size the caller frees */
 static char *mc_version_name(const Scope *s) {
-  const char *fmt = s->class_id < 0 ? "%s__redef%d" : "%s#redef%d";
-  int n = s->version_n ? snprintf(NULL, 0, fmt, s->name, s->version_n) : (int)strlen(s->name);
+  const char *fmt = s->entry && !s->version_n ? (s->class_id < 0 ? "%s__entry" : "%s#entry")
+                  : s->entry ? (s->class_id < 0 ? "%s__entry%d" : "%s#entry%d")
+                  : s->main_n ? "%s__main%d"
+                  : s->class_id < 0 ? "%s__redef%d" : "%s#redef%d";
+  int num = !s->entry && s->main_n ? s->main_n : s->version_n, spelled = s->version_n || s->entry || s->main_n;
+  int n = spelled ? snprintf(NULL, 0, fmt, s->name, num) : (int)strlen(s->name);
   char *v = n >= 0 ? malloc((size_t)n + 1) : NULL;
   if (!v) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  if (s->version_n) snprintf(v, (size_t)n + 1, fmt, s->name, s->version_n);
+  if (spelled) snprintf(v, (size_t)n + 1, fmt, s->name, num);
   else memcpy(v, s->name, (size_t)n + 1);
   return v;
 }
@@ -6816,42 +6863,88 @@ const char *mc_ring_setf(Compiler *c, const char *fmt, ...) {
   va_end(ap);
   return c->mc_ring[k];
 }
+/* The program's def names, which a version's spelling must not meet
+   (mc_def_named): gathered at the first ask into a name index, so a
+   spelling is one probe (a scan of every def per spelling grew with the
+   square of the program's versions) */
+typedef struct { char **v; int n, built; NameIdx ix; } McDefNames;
 /* Numbers the replaced method versions codegen emits, for their C names
    (mc_method). Top-level ones: those the main file's statements define, in
    statement order whether emitted or not, then the other emitted ones,
    each number skipping a `f__redef<n>` the program defines itself. A
-   class's: the emitted ones, in scope order. */
-static void mc_number_top_version(Compiler *c, Scope *s, int *serial) {
-  char to[300];
-  for (;;) {
-    int taken = 0;
-    snprintf(to, sizeof to, "%s__redef%d", s->name, ++*serial);
+   class's: the emitted ones, in scope order. A version entry, `f__entry`
+   or `m#entry`, is numbered past the entries of its name its class has
+   before it (one per parameter count the calls need), `m#entry1` on, and
+   a top-level one past a `f__entry<n>` the program defines and past the
+   entries of the name on the other side (main's own and Object's share the
+   C namespace). Main's own methods beside Object's of the name: each, in
+   scope order, skipping a `k__main<n>` the program defines. */
+static int mc_def_named(Compiler *c, McDefNames *dn, const char *to) {
+  if (!dn->built) {
+    dn->built = 1;
     NT_FOREACH_KIND(c->nt, NK_DefNode, d) {
-      const char *dn = nt_str(c->nt, d, "name");
-      if (dn && sp_streq(dn, to)) { taken = 1; break; }
+      const char *nm = nt_str(c->nt, d, "name");
+      if (!nm) continue;
+      if (!(dn->n & (dn->n - 1)) && !(dn->v = realloc(dn->v, sizeof *dn->v * (size_t)(dn->n ? 2 * dn->n : 1)))) {
+        fprintf(stderr, "spinel: out of memory\n"); exit(1);
+      }
+      dn->v[dn->n++] = (char *)nm;
     }
-    if (!taken) break;
   }
-  s->version_n = *serial;
+  return name_idx_find(&dn->ix, dn->v, dn->n, to) >= 0;
+}
+static int mc_number_top(Compiler *c, McDefNames *dn, const Scope *s, const char *fmt, int *serial) {
+  char to[300];
+  do snprintf(to, sizeof to, fmt, s->name, ++*serial);
+  while (mc_def_named(c, dn, to));
+  return *serial;
+}
+/* (the entries before s of its name, through the scopes of the name) */
+static void mc_number_entry(Compiler *c, McDefNames *dn, int s) {
+  Scope *sc = &c->scopes[s];
+  char to[300];
+  int n = 0;
+  for (int t = an_scopes_named_first(c, sc->name); t >= 1 && t < s; t = an_scopes_named_next(c, sc->name, t)) {
+    const Scope *o = &c->scopes[t];
+    if (o->entry && o->reachable && o->class_id == sc->class_id &&
+        (sc->class_id < 0 || o->is_cmethod == sc->is_cmethod) && o->version_n >= n)
+      n = o->version_n + 1;
+  }
+  for (; sc->class_id < 0; n++) {
+    if (n) snprintf(to, sizeof to, "%s__entry%d", sc->name, n);
+    else snprintf(to, sizeof to, "%s__entry", sc->name);
+    if (!mc_def_named(c, dn, to)) break;
+  }
+  sc->version_n = n;
 }
 void mc_number_versions(Compiler *c) {
   const NodeTable *nt = c->nt;
-  int body = nt_ref(nt, nt->root_id, "statements"), n = 0, top = 0, cls = 0;
+  int body = nt_ref(nt, nt->root_id, "statements"), n = 0, top = 0, cls = 0, main = 0;
   const int *st = body >= 0 ? nt_arr(nt, body, "body", &n) : NULL;
+  McDefNames dn = { 0 };
+  for (int s = 1; s < c->nscopes; s++) {
+    Scope *sc = &c->scopes[s];
+    int om = sc->class_id < 0 && sc->is_cmethod && !sc->entry && sc->name ? comp_method_index(c, sc->name) : -1;
+    if (om >= 0 && !c->scopes[om].is_cmethod) sc->main_n = mc_number_top(c, &dn, sc, "%s__main%d", &main);
+  }
   for (int i = 0; i < n; i++) {
     if (nt_kind(nt, st[i]) != NK_DefNode || nt_ref(nt, st[i], "receiver") >= 0) continue;
     int s = comp_method_version(c, -1, nt_str(nt, st[i], "name"), 0, st[i], NULL);
-    if (s >= 0 && c->scopes[s].replaced && !c->scopes[s].version_n) mc_number_top_version(c, &c->scopes[s], &top);
+    if (s >= 0 && c->scopes[s].replaced && !c->scopes[s].version_n && !c->scopes[s].main_n)
+      c->scopes[s].version_n = mc_number_top(c, &dn, &c->scopes[s], "%s__redef%d", &top);
   }
   for (int s = 1; s < c->nscopes; s++) {
     Scope *sc = &c->scopes[s];
-    if (!sc->replaced || !sc->reachable || sc->version_n) continue;
-    if (sc->class_id < 0) mc_number_top_version(c, sc, &top);
+    if (sc->entry && sc->reachable) mc_number_entry(c, &dn, s);
+    if (!sc->replaced || !sc->reachable || sc->version_n || sc->main_n) continue;
+    if (sc->class_id < 0) sc->version_n = mc_number_top(c, &dn, sc, "%s__redef%d", &top);
     else sc->version_n = ++cls;
   }
+  free(dn.v);
+  free(dn.ix.slot);
 }
 static int mc_same_method(const Scope *a, const Scope *b) {
-  return a->class_id == b->class_id && a->is_cmethod == b->is_cmethod && sp_streq(a->name, b->name);
+  return a->class_id == b->class_id && a->is_cmethod == b->is_cmethod && a->entry == b->entry && sp_streq(a->name, b->name);
 }
 static const char *const mc_class_helpers[] = { "_alloc", "_dup", "_gc_scan", NULL };
 /* A method whose name another has, as *first and *later; *first is -1 when
@@ -7039,7 +7132,7 @@ static void shadow_tab_build(Compiler *c, int raw) {
   if (!g_shadow_tab || !tab) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   for (int k = n - 1; k >= 0; k--) {
     Scope *sc = &c->scopes[k];
-    if (!sc->name) continue;
+    if (!sc->name || sc->entry) continue;   /* (an entry shadows no method of its name) */
     /* by the scope's own class, whatever an instance_exec block has moved
        (comp_scope_own_class): the move defines nothing in the class it
        moves to, and the table then reads the same whenever it is built */
@@ -7065,9 +7158,9 @@ static void shadow_tab_build(Compiler *c, int raw) {
 }
 int scope_is_shadowed(Compiler *c, int s) {
   if (c->scopes[s].c_name) return 0;
-  /* a replaced method version is a function of its own while a call bound
-     to it reaches it (compute_reachable) */
-  if (c->scopes[s].replaced) return !c->scopes[s].reachable;
+  /* a replaced method version, and a version entry, is a function of its
+     own while a call bound to it reaches it (compute_reachable) */
+  if (c->scopes[s].replaced || c->scopes[s].entry) return !c->scopes[s].reachable;
   /* Before the scopes settle, the scan's answer holds while the scope
      index is frozen (the inference fixpoint among others): a scope is then
      only appended, and the indexed ones keep their names and classes
@@ -7092,7 +7185,7 @@ static int scope_is_shadowed_scan(Compiler *c, int s) {
     if (sc->def_node < 0 || nt_kind(c->nt, sc->def_node) != NK_DefNode) return 0;
     for (int k = s + 1; k < c->nscopes; k++) {
       Scope *o = &c->scopes[k];
-      if (o->class_id < 0 && o->is_cmethod == sc->is_cmethod && o->name &&
+      if (o->class_id < 0 && o->is_cmethod == sc->is_cmethod && o->name && !o->entry &&
           sp_streq(o->name, sc->name) && o->def_node >= 0 && o->def_node != sc->def_node &&
           nt_kind(c->nt, o->def_node) == NK_DefNode) return 1;
     }
@@ -7101,7 +7194,7 @@ static int scope_is_shadowed_scan(Compiler *c, int s) {
   for (int k = s + 1; k < c->nscopes; k++) {
     Scope *o = &c->scopes[k];
     if (o->class_id == sc->class_id && o->is_cmethod == sc->is_cmethod &&
-        o->name && sp_streq(o->name, sc->name)) return 1;
+        o->name && !o->entry && sp_streq(o->name, sc->name)) return 1;
   }
   return 0;
 }
@@ -7274,7 +7367,8 @@ int ctor_site_on_cycle(Compiler *c, int id, int initm) {
   return s >= 0 && s < c->nscopes && c->scopes[s].ctor_cycle == c->scopes[initm].ctor_cycle;
 }
 int scope_needs_proc_form(Compiler *c, int s) {
-  return scope_proc_form_of(c, s) >= 0;
+  int pf = scope_proc_form_of(c, s);
+  return pf >= 0 && proc_form_live(c, pf);   /* a clone that is not emitted is not called */
 }
 /* A module whose instance methods a TOP-LEVEL `include` makes callable: the
    bare-call path emits a direct call to the module's own function, so that
@@ -8038,10 +8132,38 @@ static const int *class_family(Compiler *c, int root, int *n) {
    fields first): a nil bit any class of the family keeps for it, every
    class keeps, so a parent's method that writes the field clears the bit a
    subclass's constructor seeded */
+static int ivar_has_nilbit_walk(Compiler *c, int cid, int iv);
+/* (once the analysis is done the answer holds: kept per class and ivar, as
+   the emitters ask it of every read and write of a field, and each ask
+   walked the field's whole family) */
 int ivar_has_nilbit(Compiler *c, int cid, int iv) {
   if (cid < 0 || cid >= c->nclasses) return 0;
   ClassInfo *ci = &c->classes[cid];
   if (iv < 0 || iv >= ci->nivars || !oint_kind(ci->ivar_types[iv])) return 0;
+  if (!g_scopes_settled) return ivar_has_nilbit_walk(c, cid, iv);
+  static signed char **memo = NULL;
+  static int *memo_n = NULL, memo_ncls = -1;
+  static unsigned memo_shape;
+  if (memo_ncls != c->nclasses || memo_shape != comp_class_shape_gen()) {
+    for (int k = 0; k < memo_ncls; k++) free(memo[k]);
+    free(memo); free(memo_n);
+    memo_ncls = c->nclasses; memo_shape = comp_class_shape_gen();
+    memo = calloc((size_t)(memo_ncls > 0 ? memo_ncls : 1), sizeof *memo);
+    memo_n = calloc((size_t)(memo_ncls > 0 ? memo_ncls : 1), sizeof *memo_n);
+    if (!memo || !memo_n) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  if (memo_n[cid] != ci->nivars) {
+    free(memo[cid]);
+    memo[cid] = malloc((size_t)(ci->nivars > 0 ? ci->nivars : 1));
+    if (!memo[cid]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    memset(memo[cid], -1, (size_t)(ci->nivars > 0 ? ci->nivars : 1));
+    memo_n[cid] = ci->nivars;
+  }
+  if (memo[cid][iv] < 0) memo[cid][iv] = (signed char)ivar_has_nilbit_walk(c, cid, iv);
+  return memo[cid][iv];
+}
+static int ivar_has_nilbit_walk(Compiler *c, int cid, int iv) {
+  ClassInfo *ci = &c->classes[cid];
   if (ivar_has_nilbit_own(c, cid, iv)) return 1;
   int root = class_root(c, cid), nfam = 0;
   const int *fam = class_family(c, root, &nfam);

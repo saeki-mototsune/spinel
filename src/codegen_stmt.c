@@ -6860,8 +6860,11 @@ void emit_cond(Compiler *c, int id, Buf *b) {
      (`::Time.zone ? a : b`, DateTime.current): the call raises when reached
      (the NoMethodError gate's answer), so the test that follows is never
      read -- evaluate it for the raise */
+  /* ...and a call that finds no method where it runs (cplan_missing), or
+     runs into one in an operand (`1 / n + zz`), which leaves the
+     operators around it untyped */
   if ((t == TY_UNKNOWN || t == TY_VOID) && nt_kind(c->nt, id) == NK_CallNode &&
-      call_on_builtin_class_missing(c, id)) {
+      (call_on_builtin_class_missing(c, id) || missing_call_raised(c, id) >= 0)) {
     buf_puts(b, "(("); emit_expr(c, id, b); buf_puts(b, "), 0)"); return;
   }
   if (t != TY_BOOL) unsupported(c, id, "condition (non-bool)");
@@ -15845,11 +15848,15 @@ void native_load_flag(const NodeTable *nt, int id, char *buf, size_t n) {
 }
 /* ... standing as a statement. A file that only defines things has nothing
    to run, and its load, whose value is unused, is nothing; nor is a require
-   the runtime provides or a core no-op. */
+   the runtime provides or a core no-op. Unless another load reads the flag
+   it sets (prog_load_sets_flag): that one answers false after it, as
+   CRuby's does. */
 static void emit_load_stmt(Compiler *c, int id, Buf *b, int indent) {
   int f = (int)nt_int(c->nt, id, "target_file", -1);
   const char *how = nt_str(c->nt, id, "how");
-  if (!is_load_how_missing(how) && !is_load_how_set(how) && (f < 0 || prog_defines_only(c, f))) return;
+  if (!is_load_how_missing(how) && !is_load_how_set(how) && (f < 0 || prog_defines_only(c, f)) &&
+      !prog_load_sets_flag(c, id))
+    return;
   emit_indent(b, indent);
   buf_puts(b, "(void)");
   emit_load_call(c, id, b);
@@ -17289,6 +17296,7 @@ static int emit_next_leaving_body(Compiler *c, int id, Buf *b, int indent) {
 static int class_body_name_undefined(Compiler *c, const char *nm) {
   static const char *const decls[] = { "private", "protected", "public", "module_function",
     "private_class_method", "public_class_method", "private_constant", "public_constant",
+    "deprecate_constant",
     "attr", "attr_reader", "attr_writer", "attr_accessor", "attribute", "attributes",
     "include", "extend", "prepend",
     "using", "refine", "alias_method", "define_method", "define_singleton_method",
@@ -20266,10 +20274,87 @@ static void emit_class_definition(Compiler *c, int id, Buf *b, int indent) {
   const NodeTable *nt = c->nt;
   int cp = nt_ref(nt, id, "constant_path");
   const char *name = cp >= 0 ? nt_str(nt, cp, "name") : NULL;
-  int ci = name ? comp_class_index(c, name) : g_class_body_id;
+  int ci = name ? elab_header_class(c, id, NULL, NULL) : g_class_body_id;
   emit_class_body_stmts(c, ci, nt_ref(nt, id, "body"), b, indent);
   if (nt_int(nt, id, "class_new_anonymous", 0) == 1)
     emit_class_assign_name(c, ci, class_ruby_name(c, ci), b, indent);
+}
+
+/* Does a subtree hold an operator over scalars that can raise
+   (scalar_op_may_raise: `1 / n`, `x % 0.0`, `2 ** e`)? */
+static int operand_op_may_raise(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  if (id < 0) return 0;
+  if (nt_kind(nt, id) == NK_CallNode && call_is_scalar_op(c, id) && scalar_op_may_raise(c, id)) return 1;
+  int nr = nt_num_refs(nt, id), na = nt_num_arrs(nt, id);
+  for (int i = 0; i < nr; i++) if (operand_op_may_raise(c, nt_ref_at(nt, id, i))) return 1;
+  for (int i = 0; i < na; i++) {
+    int n = 0;
+    const int *ids = nt_arr_at(nt, id, i, &n);
+    for (int j = 0; j < n; j++) if (operand_op_may_raise(c, ids[j])) return 1;
+  }
+  return 0;
+}
+/* Does an operand run nothing and raise nothing, so that a raise after it
+   shows the same whether it ran or not: self, a constant receiver the
+   load record resolves to a program class, or a pure read none of whose
+   operators can raise? */
+static int order_operand_inert(Compiler *c, int call, int op, int is_recv) {
+  NodeKind k = nt_kind(c->nt, op);
+  if (k == NK_SelfNode) return 1;
+  if (is_recv && (k == NK_ConstantReadNode || k == NK_ConstantPathNode) &&
+      cplan_const_recv_class(c, call, op) >= 0) return 1;
+  return subtree_is_pure_read(c, op) && !operand_op_may_raise(c, op);
+}
+
+/* The node v runs last when it holds a call that finds no method where it
+   runs (cplan_missing_in_order), with run->ids the operands before it, in
+   CRuby's order, that can act or raise; -1 when v holds no such call (run
+   unchanged). */
+int missing_call_in_order(Compiler *c, int v, OrderRun *run) {
+  const NodeTable *nt = c->nt;
+  int m = cplan_missing_in_order(c, v);
+  if (m < 0 || m == v) return m;
+  int argc = 0;
+  const int *argv = call_args(nt, v, &argc);
+  int r = nt_ref(nt, v, "receiver");
+  for (int i = -1; i < argc; i++) {
+    int op = i < 0 ? r : argv[i];
+    if (op < 0) continue;
+    if (cplan_missing_in_order(c, op) >= 0) return missing_call_in_order(c, op, run);
+    if (order_operand_inert(c, v, op, i < 0)) continue;
+    if (run->n == run->cap) {
+      run->cap = run->cap ? run->cap * 2 : 8;
+      int *ids = realloc(run->ids, sizeof(int) * (size_t)run->cap);
+      if (!ids) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      run->ids = ids;
+    }
+    run->ids[run->n++] = op;
+  }
+  return m;
+}
+/* The call finding no method where it runs (cplan_missing) that v runs
+   into, in CRuby's order (missing_call_in_order), and so raises at: v
+   itself or one in its operands; -1 for none */
+int missing_call_raised(Compiler *c, int v) {
+  char self[160];
+  int m = cplan_missing_in_order(c, v);
+  return m >= 0 && cplan_missing(c, m, self, sizeof self, NULL) != CM_NONE ? m : -1;
+}
+/* Run, as statements at indent, the operands of run ahead of the call m
+   that finds no method (missing_call_in_order), then m. Each operand's
+   prelude goes in front of it, not in front of the statement: an earlier
+   operand runs before a later one's. */
+static void emit_missing_run(Compiler *c, int m, const OrderRun *run, Buf *b, int indent) {
+  for (int i = 0; i <= run->n; i++) {
+    Buf op, oe; memset(&op, 0, sizeof op); memset(&oe, 0, sizeof oe);
+    Buf *sv = g_pre; g_pre = &op;
+    emit_expr(c, i < run->n ? run->ids[i] : m, &oe);
+    g_pre = sv;
+    if (op.p) buf_puts(b, op.p);
+    emit_indent(b, indent); buf_printf(b, "(void)(%s);\n", oe.p ? oe.p : "0");
+    free(op.p); free(oe.p);
+  }
 }
 
 static int emit_attr_global_const_write_stmt(Compiler *c, int id, Buf *b, int indent, const NodeTable *nt, const char *ty) {
@@ -20596,12 +20681,23 @@ static int emit_attr_global_const_write_stmt(Compiler *c, int id, Buf *b, int in
          executable statements, so without this such constants stay NULL/default
          despite being declared and typed (a method reading them, e.g. a Linedef
          FLAGS[:TWOSIDED] flag helper, silently sees an empty constant). Mirrors
-         fix_struct_block_scopes, which does the analogous fixup for DefNodes. */
+         the block's defs, which take the struct's class from the load record
+         (elab_record_builders). */
       if (!isg && v >= 0 && is_struct_call(c, v)) {
         int sci = comp_class_index(c, nm);
         emit_class_body_stmts(c, sci, class_def_body(c, id), b, indent);
         /* the block ran with the class anonymous; the write names it */
         if (comp_class_anonymous(c, sci)) emit_class_assign_name(c, sci, class_ruby_name(c, sci), b, indent);
+      }
+      /* a value that runs a call finding no method where it runs
+         (cplan_missing: `zz`, `zz + 1`, `zz.to_s`, `id(zz)`) has no type
+         either, and raises there, before the write: run the operands ahead
+         of that call for their effects, then the call */
+      else if (!isg && v >= 0) {
+        OrderRun run = { NULL, 0, 0 };
+        int m = missing_call_in_order(c, v, &run);
+        if (m >= 0) emit_missing_run(c, m, &run, b, indent);
+        free(run.ids);
       }
       return 1;
     }
@@ -21936,7 +22032,7 @@ int tail_iter_receiver(Compiler *c, int id) {
 /* `n.times { }`, `lo.upto(hi) { }`, `x.step(..) { }` and the rest of the
    numeric iterators emit_call's value form runs as a loop and answers the
    receiver of -- the same receiver types it takes. */
-static int num_iter_answers_recv(Compiler *c, int id) {
+int num_iter_answers_recv(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   const char *nm = nt_str(nt, id, "name");
   int r = nt_ref(nt, id, "receiver");
@@ -22665,7 +22761,9 @@ void emit_stmt_tail_inner(Compiler *c, int id, Buf *b, int indent) {
     /* (one representation: a String tail of either face lands in a bytes
        slot as its view, which the slot's root keeps alive) */
     int one_tail_b = !want_poly && tail_slot_ty == TY_STRING;
-    int one_unpub = one_tail_b && !g_result_var && one_tail_fresh(c, id);
+    /* (a result slot too: the function returns the slot as it is, and a
+       read in the body, a rescue's or an earlier statement's, published) */
+    int one_unpub = one_tail_b && one_tail_fresh(c, id);
     /* (...and in a handle slot as its handle) */
     int one_tail_h = !want_poly && tail_slot_ty == TY_STRBUF;
     if (one_unpub) buf_puts(b, "sp_strface_unpub(");
@@ -24836,7 +24934,7 @@ static int emit_array_mutate_stmt_body(Compiler *c, int id, Buf *b, int indent) 
        own kind gave C that does not build (`a = [1]; a.concat(1)`) */
     for (int a = 0; a < argc; a++) {
       TyKind at = comp_ntype(c, argv[a]);
-      if (at == TY_NIL || at == TY_BOOL || conv_to_ary_impossible(at)) return 0;
+      if (conv_to_ary_misfit(c, at)) return 0;
     }
     /* Every argument is evaluated, and its length taken, before anything is
        appended, as CRuby concatenates the arguments as they were: with one

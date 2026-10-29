@@ -145,7 +145,7 @@ const char *superclass_builtin_exc_name(const NodeTable *nt, int sc);   /* analy
 int is_syserr_family_name(const char *n);           /* analyze_util.c */
 int builtin_method_known(const char *cls, const char *m);
 int builtin_method_known_any(const char *m);   /* codegen_call.c */
-int builtin_object_method_known(const char *m);   /* codegen_call.c */
+int builtin_object_method_known(const char *m);   /* builtin_names.c */
 int core_method_vis(const char *cls, const char *m, int inherit);   /* codegen_call_class.c */
 const char *core_class_ancestors(const char *cls);   /* codegen_call_class.c */
 int builtin_method_arity(const char *cls, const char *m, int *out);
@@ -172,6 +172,7 @@ const char *class_ruby_name(Compiler *c, int ci); /* codegen.c */
 int builtin_object_method_known(const char *m);
 int core_method_name(const char *n);   /* analyze_desugar.c: a core class's public method */
 int object_public_method_name(const char *n); /* analyze_desugar.c: one of Object's public instance methods */
+int object_instance_method_name(const char *n);        /* analyze_desugar.c: one of Object's instance methods, public or private */
 int class_inherits_builtin_exception(Compiler *c, int ci);
 /* 1 if super node n, in instance method mi `inspect` / `to_s` of a plain
    class, reaches Kernel's, which builds a new String each call. */
@@ -209,6 +210,15 @@ int blk_locals_have(const char *locals, const char *nm);
    id >= 0; id = an_calls_named_next(id)). Check each node as before. */
 int an_calls_named_first(Compiler *c, const char *name);
 int an_calls_named_next(int id);
+/* The calls below n0 named any of names (NULL-terminated), ascending, into
+   *out, which the caller frees: their count. A pass that acts only on calls
+   of those names, and renames no call it has not reached yet, walks these
+   instead of every node of the table, and reaches the calls it would. */
+int an_calls_named_any(Compiler *c, const char *const *names, int n0, int **out);
+/* The same for the calls whose name pred accepts. */
+int an_calls_named_if(Compiler *c, int (*pred)(const char *), int n0, int **out);
+/* The same for the calls passed a block argument (`&x`). */
+int an_calls_with_block_arg(Compiler *c, int n0, int **out);
 /* The local variable writes named `name`, ascending, the same way. */
 int an_local_writes_named_first(Compiler *c, const char *name);
 int an_local_writes_named_next(int id);
@@ -325,6 +335,10 @@ int proc_lit_carrier(Compiler *c, int v, int lit);
 int widen_hash_arg_for_store(Compiler *c, int arg, TyKind hk, TyKind hv);
 int pivs_settle_hash_stores(Compiler *c);
 int pivs_hash_stores_widened(Compiler *c);
+/* A builtin iterator moved onto its copy, `__enum_each_with_index__3(recv) { }`
+   (desugar_builtin_enum_calls), iterates its first argument as `recv.each_with_index { }`
+   does: the iterator's name in buf, 1 for such a call name. */
+int pivs_enum_iter(const char *name, char *buf, size_t n);
 int subtree_has_side_effect(Compiler *c, int id);   /* codegen_util.c */
 int call_unused_block(Compiler *c, int id);   /* codegen_util.c */
 
@@ -382,14 +396,19 @@ void walk_scope(Compiler *c, int id, int scope_idx, int class_id);
    list (EP_LIST), whose elements are statements, or a lone expression
    (EP_NEW), which is one. Any other node is one of the statement's
    (EP_NODE). bits: LR_LATE / LR_BODY of the node; defer: a block whose call
-   keeps it to run later, so that its nodes are late. fmay: may, counted
+   keeps it to run later, so that its nodes are late; kept: on a block of a
+   call the record does not know (elab_block_runs 0), which may run it at
+   once or keep it to run later, so its statements may run after any later
+   point too. fmay: may, counted
    from the frame: a condition stands between the node and the body (or
-   main's file) holding it. sure: an else clause that runs whenever its
+   main's file) holding it; fpartial: partial, counted from the frame. sure:
+   an else clause that runs whenever its
    condition is reached (the condition's predicate is a constant false,
    nt_pred_const). */
 typedef struct {
   int e, file, top, frame, depth, rep;
-  unsigned char may, partial, kind, bits, defer, fmay, sure;
+  int list;   /* the statement list the node is an element of (a StatementsNode), -1 for a lone expression */
+  unsigned char may, partial, kind, bits, defer, fmay, fpartial, sure, kept;
 } ElabPos;
 enum { EP_NODE, EP_SPINE, EP_LIST, EP_NEW };
 ElabPos elab_child(const NodeTable *nt, int p, int ch, const ElabPos *pp);
@@ -410,17 +429,14 @@ int is_struct_call(Compiler *c, int val);
 int new_recv_classes(Compiler *c, int recv, int *out, int cap);
 int new_recv_every_class(Compiler *c, int recv);
 int class_def_body(Compiler *c, int def_node);
+int dm_each_inner(const NodeTable *nt, int call);   /* the define_method call of `[...].each { |v| define_method(...) { } }`, else -1 */
 const char *vis_arg_name(const NodeTable *nt, int arg);   /* a Symbol or String argument's method name (analyze_scope.c) */
 void register_struct_members(Compiler *c, ClassInfo *cls, int val);
 void register_structs(Compiler *c);
 void register_singleton_defs(Compiler *c);
 void fix_struct_block_scopes(Compiler *c);
-void register_attr_call(Compiler *c, ClassInfo *cls, int s, int singleton);
-void register_attrs_body(Compiler *c, ClassInfo *cls, int body);
 void register_attrs(Compiler *c);
-void register_aliases_body(Compiler *c, ClassInfo *cls, int body);
 void register_aliases(Compiler *c);
-void register_undefs_body(Compiler *c, ClassInfo *cls, int body);
 void register_undefs(Compiler *c);
 int is_c_ident(const char *s);
 void register_globals_consts(Compiler *c);
@@ -579,6 +595,7 @@ void ty_recv_call_extra_args(const Compiler *c, const int *av, int argc,
 /* The array a map-shaped call answers from its block's tail (analyze_infer_recv.c). */
 TyKind infer_sum_block_ty(Compiler *c, int block);
 TyKind infer_map_block_ty(Compiler *c, int id, int block);
+TyKind infer_map_block_elem_ty(Compiler *c, int block);
 void step_kw_positional(Compiler *c, NodeTable *nt, int id, int args, int to_v, int by_v, int by_first);
 int step_kw_unknown(Compiler *c, NodeTable *nt, int id, int args);
 void kw_error_message(char *out, size_t n, const char *kind, int count, const char *names);
@@ -660,10 +677,13 @@ int revert_widened_builtin_scalar_calls(Compiler *c);
 /* Block iterator the nested-table narrow pass keeps. each / map / zip stay
    on the typed emitter. each_with_index / reduce / inject are rewritten
    onto builtins/enumerable.rb; the copy's own each is what walks the table. */
+/* what a walk's block does with each row of a table (nested_row_iter_call) */
+enum { ROW_WALK_NONE, ROW_WALK_BINDS, ROW_WALK_SPLITS };
 int nested_row_iter_call(Compiler *c, int id);
 int fold_static_is_a(Compiler *c);
 int narrow_empty_array_args_by_yield(Compiler *c);
 int builtin_enum_name_index(const char *name);
+void enum_send_copy_take(NodeTable *nt, int call);
 int an_class_includes_enumerable(Compiler *c, int ci);
 int desugar_module_function_aliases(Compiler *c);
 int method_body_next_to_return(NodeTable *nt, int id);
@@ -706,8 +726,8 @@ int desugar_handle_ivars(Compiler *c);
 int desugar_fiber_prepended_init(Compiler *c);
 int desugar_handle_reopen_self_recv(Compiler *c);
 int desugar_call_or_write_reopen(Compiler *c);
-int desugar_static_class_eval(Compiler *c);
 int desugar_table_loops(Compiler *c);         /* analyze_ct.c */
+int ct_method_defined(const NodeTable *nt, const char *meth);   /* the program defines `meth` anywhere (analyze_ct.c) */
 
 /* ---- the lowering table (analyze_lower.c, #9898) ----
    The rewrites the load stage makes are the rows of one table, run by one
@@ -718,7 +738,7 @@ int desugar_table_loops(Compiler *c);         /* analyze_ct.c */
 
 /* the rows, in the order the stage runs them */
 enum {
-  LW_NIL_BLOCK_ARG, LW_THREAD_START, LW_MARSHAL_RESTORE, LW_SOCKET_OPEN, LW_SYSTEM_OPTIONS, LW_IO_POPEN_BLOCK,
+  LW_NIL_BLOCK_ARG, LW_CONST_SET_WRITE, LW_THREAD_START, LW_MARSHAL_RESTORE, LW_SOCKET_OPEN, LW_SYSTEM_OPTIONS, LW_IO_POPEN_BLOCK,
   LW_USER_BACKTICK, LW_LITERAL_UNDEF_METHOD, LW_EXPLICIT_INITIALIZE_CALLS, LW_NOARG_DISPLAY_WRAPPERS,
   LW_PAREN_BLOCK_ARG, LW_PAREN_OPERANDS, LW_SEND_CLASS_MAKERS, LW_SELF_SUPERCLASS, LW_STRUCT_SUBCLASS_NEW_WRITE,
   LW_REFUSE_SUPERCLASS_EXPRS, LW_RESCUE_BLOCK_BODIES,
@@ -742,6 +762,9 @@ typedef struct LowerCtx {
   int rewrote[LW__COUNT];   /* per row, the nodes it rewrote (the check's report) */
   int n0;                   /* the node count at the running row's entry */
   int owner, body;          /* LF_STMT: the body owner being visited and its StatementsNode */
+  int scope;                /* LF_SCOPE: the node whose tag names the scope being visited (the owner, or a splice's first statement) */
+  const int *scope_stmts;   /* ... and the scope's statements: the owner's body, or the splice's statements */
+  int scope_n;
   /* scratch of the running row, zero at each run */
   int serial;               /* the fresh-name counter of a run */
   char **used;              /* names the program wrote that a row's invented ones must step past */
@@ -757,6 +780,15 @@ typedef struct LowerCtx {
   unsigned parent_version;
   unsigned long parent_edits;
   int prog_memo[4];         /* answers of the whole program a row asks for as needed: -1 until asked */
+  /* spans (lower_span): code a step splices in after rows have run */
+  unsigned char ran[LW__COUNT];     /* the row has run over the program */
+  unsigned char settle[LW__COUNT];  /* ... and a span left it to lower_settle: LF_PROGRAM, or its gate said yes anew */
+  unsigned char gate_no[LW__COUNT]; /* its gate said 0 at its last run over the program */
+  unsigned char span_gate[LW__COUNT];   /* its gate in this step's spans: 0 not asked yet, 1 no, 2 yes */
+  int *span_ids[LW__COUNT];         /* the ids that ask collected (ids), for the step */
+  int span_nids[LW__COUNT];
+  struct LowerSpan *span;   /* the span being lowered, or NULL: the program */
+  int span_step;            /* spans were lowered since the last lower_settle */
 } LowerCtx;
 
 typedef int LowerFn(Compiler *c, LowerCtx *lc, int id);
@@ -769,6 +801,29 @@ void lower_begin(Compiler *c, LowerCtx *lc);
 void lower_check_unreachable(Compiler *c, LowerCtx *lc, const char *row, int root);   /* SPINEL_LOWER_CHECK: no root reaches the subtree at root */
 int lower_run(Compiler *c, LowerCtx *lc, int row);   /* the nodes it rewrote */
 int lower_row_once(Compiler *c, int row);   /* a row on a context of its own, for a pass the fixpoint repeats */
+int lower_span(Compiler *c, LowerCtx *lc, int owner, int body, const int *stmts, const int *scopes, int n);   /* the rows that ran, on spliced statements */
+void lower_settle(Compiler *c, LowerCtx *lc);   /* the rows spans left to the program, once per step */
+
+/* ---- the host (analyze_elab.c, #9898) ----
+   A step that splices code into a body after the load stage began, or makes
+   a block a class body (Class.new do..end), hands it to the host, which
+   makes it what the program's own code is at that point:
+   the static class_eval text in it is grafted (analyze_desugar.c's sce),
+   and its statements are lowered by the rows that have run (lower_span), at
+   host_end, once the step has spliced everything. What the text graft asks
+   of the whole program is asked once per step. */
+typedef struct HostStep {
+  LowerCtx *lc;
+  struct SceFacts *sce;    /* the graft's answers about the whole program, made at its first ask in the step */
+  int *spans;              /* (owner, body, statement, its splice's first statement) of each statement the step spliced */
+  int nspans, cspans;
+} HostStep;
+void host_begin(HostStep *h, LowerCtx *lc);
+int host_splice(Compiler *c, HostStep *h, int owner, int body, int at, int n, const char *locals, const char *gone);   /* the n statements at body[at], in a frame of locals but gone (NULL: not known): the count they become */
+void host_end(Compiler *c, HostStep *h);
+int desugar_static_class_eval(Compiler *c, HostStep *h);   /* analyze_desugar.c: the graft over every class and module body */
+int sce_span(Compiler *c, HostStep *h, int owner, int body, int at, int n, const char *locals, const char *gone);   /* ... over spliced statements */
+void sce_facts_free(struct SceFacts *f);
 void lower_finish(Compiler *c, LowerCtx *lc);   /* frees; under the check, reports and exits */
 
 /* the rows' functions, in the files that own the rewrites */
@@ -782,6 +837,8 @@ LowerFn desugar_system_options_at, desugar_system_options_left;
 LowerFn desugar_io_popen_block_at, desugar_io_popen_block_left;
 LowerGate desugar_itself_receiver_gate, desugar_builtin_kwsplat_gate;
 LowerFn desugar_itself_receiver_at, desugar_itself_receiver_left;
+LowerGate desugar_const_set_write_gate;
+LowerFn desugar_const_set_write_at, desugar_const_set_write_left;
 LowerFn desugar_struct_subclass_new_write_at, desugar_struct_subclass_new_write_left;
 LowerFn refuse_superclass_exprs_at, desugar_sym_to_proc_call_at, desugar_builtin_kwsplat_at;
 LowerGate desugar_user_backtick_gate;
@@ -862,6 +919,7 @@ typedef struct { const char *sel; int val; const char *callee; } DispArm;
 int disp_def_build(NodeTable *nt, int like, const char *name, int sg, int ar, int blk,
                    const DispArm *arm, int narm, int els);
 int disp_raise_no_method(NodeTable *nt, const char *msg);
+int disp_forward_call(NodeTable *nt, const char *callee, int ar, int blk);
 int desugar_dynamic_respond_to(Compiler *c);
 int desugar_toplevel_instance_exec(Compiler *c);
 int desugar_binding_lvget(Compiler *c);
@@ -902,8 +960,8 @@ int desugar_reader_aliases_before_redef(Compiler *c);
 int desugar_readers_over_inherited_defs(Compiler *c);
 int desugar_inline_struct_blocks(Compiler *c);
 int desugar_singleton_class_meta(Compiler *c);
-int desugar_class_new_blocks(Compiler *c);
-int desugar_included_hooks(Compiler *c);
+int desugar_class_new_blocks(Compiler *c, HostStep *h);
+int desugar_included_hooks(Compiler *c, HostStep *h);
 int desugar_class_body_object_acts(Compiler *c);
 int desugar_struct_block_anonymous(Compiler *c);
 int desugar_eval_method_block(Compiler *c);
@@ -917,6 +975,8 @@ int backprop_hash_return_types(Compiler *c);
 int backprop_call_target(Compiler *c, int call_id);
 int ivar_src_slot(Compiler *c, int v, const char **ivn);
 void cr_collect_calls(Compiler *c, const NodeTable *nt, int id, char ***out, int *n, int *cap, int instance_self);
+void cr_collect_program_end(Compiler *c, char ***out, int *n, int *cap);   /* the printer of an uncaught exception */
+int cr_ty_builtin_value(Compiler *c, TyKind t);
 void compute_reachable(Compiler *c, int typed);
 void refuse_native_singleton_reopen(Compiler *c, Scope *s);
 void compute_instantiated(Compiler *c, int early);
@@ -929,6 +989,7 @@ int anh_has(const ANameHash *st, const char *nm);
 int anh_find(const ANameHash *st, const char *nm);   /* insertion index, or -1 */
 void anh_add(ANameHash *st, const char *nm);
 void anh_free(ANameHash *st);
+void cr_class_only_names(Compiler *c, ANameHash *out);   /* the names only plain classes' methods hold */
 /* The scopes of a name, ascending: the first, and the next after s (-1 at
    the end); from a table while the scope index is frozen, else a scan
    (analyze.c). A pass walking every scope for a name's methods per call

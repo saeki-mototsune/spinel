@@ -47,7 +47,8 @@ typedef enum {
   CRF_LIMIT,       /* a documented limit (diagnose_unsupported_call) */
   CRF_EVAL,        /* Kernel#eval of a runtime string (diagnose_eval_call) */
   CRF_IO_REOPEN,   /* an IO reopening that yields (emit_io_reopen_call) */
-  CRF_BIND_CALL    /* a bind_call on a Class value with an armless class */
+  CRF_BIND_CALL,   /* a bind_call on a Class value with an armless class */
+  CRF_TOP_SELF     /* a receiverless call in a top-level def to a name main has a singleton method for (diagnose_unsupported_call) */
 } CplanRefuseFrom;
 
 typedef struct {
@@ -82,8 +83,8 @@ const CallPlan *cplan_user(Compiler *c, int id);
 /* The method scope call `id` runs when it asks for `name`: on cls's
    instance side through its chain, CT_CMETHOD on its class side, CT_OWN
    in cls's own table only, CT_TOP among the top-level functions (cls not
-   read); *def_class (when asked) the class whose table holds it; -1 for
-   none. The one place a site asks "what does this call run": it answers
+   read; main's singleton methods first for a call on main); *def_class
+   (when asked) the class whose table holds it; -1 for none. The one place a site asks "what does this call run": it answers
    from the tables by name (a redefined method's entry is its last
    definition), and binding a call to one of a method's versions (#9898)
    is decided here. `id` is -1 where a helper that serves calls is asked
@@ -99,6 +100,25 @@ enum { CT_CMETHOD = 1, CT_OWN = 2, CT_TOP = 4 };
    last version. */
 int call_node_names(const NodeTable *nt, int id, const char *out[2]);
 int call_target(Compiler *c, int id, int cls, const char *name, unsigned flags, int *def_class);
+/* the classes a call of a versioned name (ct_version_named) may run on,
+   each handed to fn with the flags call_target is asked with */
+int ct_version_named(Compiler *c, const char *nm);
+int ct_version_marked(Compiler *c, const char *nm);
+void ver_hold_free(Compiler *c);
+void ver_chain_free(Compiler *c);
+/* the method call id reaches when it can reach only main's own method of
+   name, -1 for none (a call on main where main's method is defined) */
+int ct_main_target(Compiler *c, int id, const char *name);
+typedef void (*CtClassFn)(Compiler *c, int id, const char *nm, int k, unsigned flags, void *arg);
+void ct_version_classes(Compiler *c, int id, const char *nm, CtClassFn fn, void *arg);
+/* the version entries a call whose version is known only at run time
+   reaches, and the run-time cells they read (#9898) */
+void ver_entries_build(Compiler *c);
+void ver_cells_write(Compiler *c);
+/* the methods entry scope e's arms call, its else arm's last: at most
+   VER_MAX_ARMS + 1 */
+enum { VER_MAX_ARMS = 64 };
+int ver_entry_targets(const Compiler *c, int e, int *out);
 int cplan_bool_sides(Compiler *c, int id, int *tmi, int *fmi);
 void cplan_check_missing(Compiler *c, int id, int mi, int ci, const char *name, int cmeth, const char *site);
 /* The same plan resolved afresh and never kept, for a reader that runs in
@@ -196,8 +216,28 @@ void cplan_served_report(void);
 int cplan_overridden(Compiler *c, int cid, const char *name, int cmeth);
 int cplan_dispatch_form(Compiler *c, int call, int cid, const char *name, int has_base);
 
-/* whether mi is the plan's method or, for a switch, one of its arms */
-int cplan_virtual_member(Compiler *c, int id, const CallPlan *p, int mi);
+/* The most candidate classes the statement-level block dispatch takes
+   (poly_block_dispatch_cands refuses a program with more). */
+enum { CPB_MAX_CANDS = 64 };
+
+/* The methods a boxed native-block call's statement-level dispatch reaches
+   (each arm's method and its proc form), asked once for a call and kept
+   here: a caller testing many methods against one plan owns one, zeroed
+   in `state`, and passes it to every cplan_virtual_member, so the poly-block
+   plan is built once, not once per method. It holds copies: the plan
+   cplan_poly_block answers is replaced by that function's next call. */
+typedef struct {
+  int state;       /* 0: not asked, 1: no native-block dispatch, 2: mi[0..n), 3: too many to hold, ask the plan */
+  int n;
+  /* a method and its proc form for each candidate's arm, and room for
+     the two a default or trial arm would add if one ever had a method */
+  int mi[2 * CPB_MAX_CANDS + 2];
+} PolyBlockMembers;
+
+/* whether mi is the plan's method or, for a switch, one of its arms; blk
+   is the caller's PolyBlockMembers for one plan tested against many
+   methods, or NULL for a single test */
+int cplan_virtual_member(Compiler *c, int id, const CallPlan *p, int mi, PolyBlockMembers *blk);
 
 /* ---- CP_POLY: the arms of a dispatch on a boxed (poly) receiver ----
    One arm per runtime class (or, later, builtin kind) the switch can take:
@@ -366,6 +406,7 @@ void cplan_poly_free(PolyPlan *p);
    dispatch. */
 /* The name index bounds a query for a native Ruby literal-block target. */
 int cplan_native_block_possible(Compiler *c, int id, const PolyCand *pc, int n);
+int cplan_cand_target(Compiler *c, int id, const char *name, const PolyCand *pc, unsigned flags);
 const PolyPlan *cplan_poly_block(Compiler *c, int id);
 /* The arms of the class-method tag switch of a call on a poly receiver
    that may hold a Class (emit_unresolved_call): each class's class method
@@ -431,6 +472,57 @@ int cplan_nil_answer_served(Compiler *c, int id);   /* codegen_call.c: nil's ans
    receiver's nil test answers for? One the fact cannot bound (any element,
    a global, an ivar, an unseen caller) is not. */
 int cplan_nil_written(int why);
+
+/* ---- CM_*: a call that finds no method where it runs ----
+   Whether call id -- receiverless, on self, or on a constant naming a
+   program class -- runs at a load point where the program's method of its
+   name is not defined yet (call_target answers none there, from the load
+   record) and no builtin of self's answers it: the raise CRuby makes,
+   NameError for a bare name, NoMethodError otherwise; self_text how the
+   message names the receiver ("class U", "module M", "main"), or, for an
+   anonymous class, which names itself at run time, *anon its index (-1
+   otherwise; anon may be NULL). Pure. */
+typedef enum { CM_NONE, CM_NAMEERROR, CM_NOMETHOD } CplanMissing;
+int cplan_missing(Compiler *c, int id, char *self_text, size_t cap, int *anon);
+/* Does the subtree at id hold a call cplan_missing answers, in a block or
+   an operand alike? */
+int cplan_subtree_missing(Compiler *c, int id);
+/* Does any call of the program find no method where it runs
+   (cplan_missing)? Asked once, then remembered. */
+int cplan_program_missing(Compiler *c);
+/* The node value v runs last when it holds a call cplan_missing answers,
+   walking v in CRuby's order for a call (the receiver, then the
+   arguments left to right, into nested calls; an operator is a call too):
+   that call, or the operand holding it that runs whole -- one that is no
+   call (an Array, a Hash, an interpolation), or a call whose order this
+   does not follow (`&.`, a splat, keyword, forwarded or block argument, a
+   literal block). -1 when v holds no such call. This is evaluation
+   order, which the value-position walker does not answer: it says where
+   a value comes from. Asked once per node, then remembered. */
+int cplan_missing_in_order(Compiler *c, int v);
+/* The class call id's constant receiver recv names where the call runs, as
+   the load record resolves the reference there (elab_class_ref_at): -1 for
+   none of the program's (Object's top level), below -1 for one it does not
+   know */
+int cplan_const_recv_class(Compiler *c, int id, int recv);
+/* The self where call id runs, as the load record has it there
+   (elab_self_at), asked in the plan's frame: a program class or module,
+   -1 for main, below -1 for one it does not know */
+int cplan_self_class(Compiler *c, int id);
+/* Does the plan route call id, a class body's call on self the desugar
+   spelled with the class (`rand(2)` -> `U.rand(2)`), to Kernel's module
+   function of the name: the class's own method of it is not defined where
+   it runs (call_target), as in a class with no def of it. Kernel's are
+   private, so route_self_builtin_calls makes such a call bare again; a
+   builtin the class itself answers (`U.name`) keeps its receiver and
+   reaches the builtin through call_target's answer. */
+int cplan_self_builtin(Compiler *c, int id);
+/* How a NameError or NoMethodError of call id names self, into buf:
+   "class U" or "module M" in a class or module body and "main" at the top
+   level (the record's self where the call runs, elab_self_at), else "an
+   instance of" the class ci the body is emitted for, else "main". NULL
+   for an anonymous class, which names itself at run time. */
+const char *cplan_self_text(Compiler *c, int id, int ci, char *buf, size_t cap);
 
 int cplan_reopen_runs_builtin(Compiler *c, int id, int mi);
 

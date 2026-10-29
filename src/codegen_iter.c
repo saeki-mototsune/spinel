@@ -289,7 +289,6 @@ static void yield_target_enter(int fe) {
    the inline's `_yretN`, not the real function's. Recorded per block node
    while the call holding the block is spliced, and given back after (the
    splices nest, so the recording does too). */
-typedef struct { const char *label, *var; TyKind rt; int ro, exc, ens, set; } BlockRetHome;
 static BlockRetHome *g_blk_ret_home; static int g_blk_ret_cap;
 
 BlockRetHome block_ret_home_enter(int block, int saved_block) {
@@ -1920,6 +1919,15 @@ static void emit_block_arg_coerced(Compiler *c, int node, TyKind ot, Buf *b) {
    method-tail path already routes both to the value path (codegen_stmt.c);
    a spliced block's tail needed the same, or the statement expression took
    whatever the last emitted statement happened to leave (#4155). */
+/* Whether the program gives the builtin class cn a []= of its own (a reopen,
+   or a module it includes or prepends there): the value form of `x[k] = v`
+   then answers that method's value, not v */
+static int program_defines_builtin_aset(Compiler *c, const char *cn) {
+  int ci = comp_class_index(c, cn);
+  int mi = ci >= 0 ? comp_method_in_chain(c, ci, "[]=", NULL) : -1;
+  return mi >= 0 && mi < c->nscopes && c->scopes[mi].def_node >= 0 &&
+         !nt_int(c->nt, c->scopes[mi].def_node, "node_bi", 0);
+}
 static int call_targets_yielding_method(Compiler *c, int id);
 static int block_tail_needs_value_form(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
@@ -1990,6 +1998,18 @@ static int block_tail_needs_value_form(Compiler *c, int id) {
       nt_ref(nt, id, "receiver") >= 0 && nt_ref(nt, id, "block") < 0 &&
       nt_ref(nt, id, "arguments") >= 0 && ty_is_array(comp_ntype(c, nt_ref(nt, id, "receiver"))))
     return 1;
+  /* ...and `a.clear` / `a&.clear` on an Array, `h.store(k, v)` on a Hash
+     and `x[k] = v` on either: the statement form empties or stores in a
+     compound, while the call answers the receiver or the value (`t { x.clear }` on a general Array
+     did not build) */
+  { int r = nt_ref(nt, id, "receiver");
+    TyKind rt = r >= 0 ? comp_ntype(c, r) : TY_UNKNOWN;
+    if (r >= 0 && nt_ref(nt, id, "block") < 0 &&
+        ((sp_streq(nm, "clear") && nt_ref(nt, id, "arguments") < 0 && ty_is_array(rt)) ||
+         (sp_streq(nm, "store") && ty_is_hash(rt)) ||
+         (sp_streq(nm, "[]=") && (ty_is_hash(rt) || ty_is_array(rt)) &&
+          !program_defines_builtin_aset(c, ty_is_hash(rt) ? "Hash" : "Array"))))
+      return 1; }
   /* and a String mutator on a String held as the sp_String buffer (a block
      parameter that is the shared handle): the statement form appends
      through a void C call, while the call answers the String */
@@ -2014,7 +2034,12 @@ static int block_tail_needs_value_form(Compiler *c, int id) {
   /* and a `scan` with a block on a subject that is not a plain read answers
      that subject, which the statement form leaves out */
   if (is_scan_name(nm) && tail_iter_receiver(c, id) < 0) return 1;
-  return iter_value_answers_recv(c, id) && tail_iter_receiver(c, id) < 0;
+  /* ...and `2.times { }`, `1.upto(3) { }`, `x.step(..) { }` on a receiver
+     that is not a plain read: the statement form ends in the loop (in a
+     pure loop's signal counter, whose value the block answered: 1), and the
+     value form answers the receiver */
+  return (iter_value_answers_recv(c, id) || num_iter_answers_recv(c, id)) &&
+         tail_iter_receiver(c, id) < 0;
 }
 
 /* The rename entries a spliced block's text and its yield's argument text
@@ -3796,7 +3821,7 @@ int poly_block_dispatch_cands(Compiler *c, int id, int *cand, int max) {
      block (a plain method wouldn't consume the block anyway) */
   int nc = 0;
   for (int k = 0; k < c->nclasses; k++) {
-    if (!c->classes[k].instantiated || is_builtin_reopen(c->classes[k].name)) continue;
+    if (!c->classes[k].instantiated || class_is_builtin_reopen(c, k)) continue;
     int km = call_target(c, id, k, name, 0, NULL);
     if (km < 0) continue;
     Scope *ks = &c->scopes[km];
@@ -3856,11 +3881,11 @@ static int emit_poly_recv_block_dispatch_x(Compiler *c, int id, Buf *b, int inde
   int recv = nt_ref(nt, id, "receiver");
   int block = nt_ref(nt, id, "block");
   if (g_prbd_skip == id) return 0;
-  int cand[64];
+  int cand[CPB_MAX_CANDS];
   const PolyPlan *plan = cplan_poly_block(c, id);
   int nc = 0;
   for (int i = 0; i < plan->n; i++)
-    if (plan->arm[i].kind == PA_USER && nc < 64) cand[nc++] = plan->arm[i].key;
+    if (plan->arm[i].kind == PA_USER && nc < CPB_MAX_CANDS) cand[nc++] = plan->arm[i].key;
   if (nc == 0) return 0;
   int trecv = ++g_tmp;
   /* Build the whole switch into a scratch buffer first. `emit_inline_call`
@@ -6780,6 +6805,14 @@ static int iter_enum_poly_walk_arms(Compiler *c, int id, Buf *b, int indent, con
       LocalVar *bp0 = orig_p0_name ? scope_local(blk_s, orig_p0_name) : NULL;
       TyKind bp0_type = bp0 ? bp0->type : TY_UNKNOWN;
       int np = 0; while (block_param_name(c, block, np)) np++;
+      /* a table of Integer or Float rows: each param its element of the row */
+      if (np >= 2) {
+        Buf row; memset(&row, 0, sizeof row);
+        buf_printf(&row, "sp_PtrArray_get(%s, _t%d)", rb.p ? rb.p : "NULL", t);
+        int bound = emit_table_row_params(c, block, rt, row.p, b, indent + 1);
+        free(row.p);
+        if (bound) goto each_body;
+      }
       if (np >= 2 && sp_streq(k, "Poly") && bp0_type != TY_POLY && bp0_type != TY_UNKNOWN) {
         /* Get the inner array kind from the first param's element type */
         const char *inner_k = array_kind(ty_array_of(bp0_type));
@@ -7161,11 +7194,11 @@ static int iter_ewi_zip_poly_arms(Compiler *c, int id, Buf *b, int indent, const
     /* Root the boxed receiver so a GC fired by the loop body doesn't free a
        freshly-built collection held only by this temp. */
     emit_indent(b, indent); buf_printf(b, "SP_GC_ROOT_RBVAL(_t%d);\n", ta);
-    emit_indent(b, indent); emit_poly_iter_obj_normalize(c, ta, b);
     /* inside an Enumerable definition the walk of its own receiver reports
        the method called (enum_walk_name) */
     const char *wn = enum_walk_name(c, id, recv, name);
     emit_indent(b, indent); emit_poly_iter_obj_reject_as(c, id, ta, name, wn, b);
+    emit_indent(b, indent); emit_poly_iter_obj_normalize(c, ta, b);
     emit_walk_arity_raise(c, id, recv, name, ta, indent, b);
     /* a boxed Dir walks its entries under `each` (sp_poly_block_iter_check);
        only a program that names Dir can hold one, so any other keeps the
@@ -7816,9 +7849,12 @@ static int emit_iteration_stmt_body(Compiler *c, int id, Buf *b, int indent) {
         emit_indent(b, indent);
         buf_printf(b, "sp_Proc *_t%d = %s; SP_GC_ROOT(_t%d);\n", tp0, pb0.p ? pb0.p : "NULL", tp0);
         free(pb0.p);
+        Buf rb0; memset(&rb0, 0, sizeof rb0); emit_boxed(c, irecv, &rb0);
+        /* a class with no Enumerable raises before the proc is handed on */
+        emit_poly_iter_recv_reject(c, id, inm, &rb0, b, indent);
         emit_indent(b, indent);
-        buf_puts(b, "(void)sp_poly_enum_proc("); emit_boxed(c, irecv, b);
-        buf_printf(b, ", %s, _t%d);\n", pen, tp0);
+        buf_printf(b, "(void)sp_poly_enum_proc(%s, %s, _t%d);\n", rb0.p ? rb0.p : "sp_box_nil()", pen, tp0);
+        free(rb0.p);
         return 1;
       }
       return 0;
@@ -7835,6 +7871,15 @@ static int emit_iteration_stmt_body(Compiler *c, int id, Buf *b, int indent) {
   /* loop { ... } -- infinite loop, exited by break */
   if (recv < 0 && sp_streq(name, "loop")) {
     int lbody = nt_ref(nt, block, "body");
+    /* a body nothing in which can raise StopIteration is a plain C loop: no
+       handler to open, and its locals stay out of memory */
+    if (!loop_may_stop(c, id)) {
+      emit_indent(b, indent); buf_puts(b, "for (;;) {\n");
+      g_loop_uncounted = 1;
+      emit_loop_body(c, lbody, b, indent + 1);
+      emit_indent(b, indent); buf_puts(b, "}\n");
+      return 1;
+    }
     /* Kernel#loop rescues StopIteration to terminate normally (e.g. an external
        Enumerator's #next at the end). Wrap the loop in a setjmp handler; a
        StopIteration falls through, any other exception re-raises. */

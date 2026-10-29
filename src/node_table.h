@@ -31,6 +31,10 @@
 static inline unsigned sp_field_disc(const char *k) {
   return SP_FIELD_DISC(k, __builtin_strlen(k));
 }
+/* A call rename nt_node_swap_str or nt_node_restore_str made: the name it
+   replaced and the one it set, or cut when either did not fit. */
+typedef struct { char from[32], to[32]; unsigned char cut; } NtRename;
+#define NT_RENAME_LOG 64
 typedef struct { char *key; unsigned disc; char *val; size_t val_len; } SpStrField;
 typedef struct { char *key; unsigned disc; long long val; }    SpIntField;
 typedef struct { char *key; unsigned disc; int ref; }          SpRefField;
@@ -59,6 +63,10 @@ typedef struct {
                           magic comment turns its refusals into raises where they
                           run (nt_put_file_defers); nfile_defers its length */
   int nfile_defers;
+  unsigned char *file_tier;   /* FILE id -> the resolver's SP_LIB_* tier of a
+                          library file (nt_put_file_tier); 0 (SP_LIB_NONE) for
+                          the program's own; nfile_tier its length */
+  int nfile_tier;
   /* Under --load-model=graph (#9898) each file the program loads is a root:
      its ProgramNode, by graph id (0 is the entry, the table's root). None
      under the inline model, whose one root is root_id (nt_root). */
@@ -75,6 +83,9 @@ typedef struct {
      found, so an index of the nodes by name extends over the clones when
      every bump since its build was one (an_calls_named_first). */
   unsigned read_version, rename_version, clone_version;
+  /* The last NT_RENAME_LOG of the renames rename_version counts, by that
+     count: the name each replaced and the one it set (nt_renames_spare). */
+  NtRename rename_log[NT_RENAME_LOG];
   /* Bumped by every edit of a node, an int, ref or array field's included,
      which version leaves out. infer_type keeps an earlier query's answers
      only while neither it nor version has moved (#8852). */
@@ -247,6 +258,10 @@ void nt_renumber(NodeTable *nt, const int *order);
    Appends nodes and grows nt->count -- parallel per-node arrays must be
    resized to match afterward. */
 int nt_clone_subtree(NodeTable *nt, int root);
+/* The ids of the subtrees at roots[0..n), each once, in walk order (a node
+   two roots share is listed once): a malloc'd list the caller frees, its
+   length in *out. A walk of those subtrees alone. */
+int *nt_subtree_ids(NodeTable *nt, const int *roots, int n, int *out);
 /* Where node `id` came from, for a node appended after nt_track_origins:
    the node it is a copy of (*how 'c'), or the node it was first linked
    under (*how 'r', *a the ref field's index; *how 'a', *a the array
@@ -303,6 +318,11 @@ int  nt_new_local_read(NodeTable *nt, const char *name);
 typedef struct { unsigned version, reads, renames; } NtStamp;
 NtStamp nt_stamp(const NodeTable *nt);
 int  nt_stamp_holds(const NodeTable *nt, NtStamp s, int renames);
+/* nt_stamp_holds with renames, where each rename since also replaced and
+   set names `reads` answers 0 for: an index that reads a call's name only
+   through `reads` is then still the index of the table. 0 as well when the
+   renames since outran the log. */
+int  nt_renames_spare(const NodeTable *nt, NtStamp s, int (*reads)(const char *name));
 
 /* Accessors. id must be in [0, nt->count). Out-of-range ids return the
    given defaults so callers can walk freely without bounds checks. */
@@ -312,6 +332,13 @@ const char *nt_file_path(const NodeTable *nt, int fid);
 /* The file's `# spinel: defer-refusals` magic comment: set, and asked */
 void nt_put_file_defers(NodeTable *nt, int fid);
 int nt_file_defers(const NodeTable *nt, int fid);
+/* Where `require` found a file (the parser's sp_lib_lookup): lib/, a `-I`
+   root, builtins/ or a pre-installed package; SP_LIB_NONE for a file of
+   the program's own (the entry, a require_relative, a load). */
+enum { SP_LIB_NONE, SP_LIB_LIB, SP_LIB_ROOT, SP_LIB_BUILTIN, SP_LIB_PACKAGE };
+/* The file's tier: set, and asked */
+void nt_put_file_tier(NodeTable *nt, int fid, int tier);
+int nt_file_tier(const NodeTable *nt, int fid);
 
 const char *nt_type(const NodeTable *nt, int id);          /* NULL if unset */
 static inline const char *nt_str(const NodeTable *nt, int id, const char *key) {
@@ -583,6 +610,16 @@ static inline int nt_paren_single(const NodeTable *nt, int n) {
   }
   return n;
 }
+/* A def's receiver `recv` as written inside its parentheses: `def (expr).m`,
+   where Prism gives the receiver's own parentheses the expression itself
+   as body; parentheses inside it hold statements as usual (nt_paren_single) */
+static inline int nt_def_receiver(const NodeTable *nt, int recv) {
+  if (nt_kind(nt, recv) == NK_ParenthesesNode) {
+    int b = nt_ref(nt, recv, "body");
+    if (b >= 0 && nt_kind(nt, b) != NK_StatementsNode) recv = b;
+  }
+  return nt_paren_single(nt, recv);
+}
 int nt_pred_const(const NodeTable *nt, int pred);   /* a predicate's constant truth: 1, 0, -1 not constant */
 const char *nt_content(const NodeTable *nt, int id);
 
@@ -592,6 +629,21 @@ int        nt_num_refs(const NodeTable *nt, int id);
 int        nt_ref_at(const NodeTable *nt, int id, int i);   /* ref value, may be -1 */
 int        nt_num_arrs(const NodeTable *nt, int id);
 const int *nt_arr_at(const NodeTable *nt, int id, int i, int *out_n);
+
+/* The frame an eval's text is parsed in (sp_parse_snippet_in, in
+   src/spinel_parse.c): the locals of the scopes around it, outermost
+   first; the line the text starts on; the path `__FILE__` answers in it
+   (NULL: "(eval at FILE:LINE)" of the site); and the site's line and file,
+   which its nodes take for `#line` and the reports (site_line 0: none). */
+typedef struct SnipScope { const char *const *names; int n; } SnipScope;
+typedef struct SnipFrame {
+  const SnipScope *scopes; int nscopes;
+  long long line;
+  const char *path;
+  long long site_line; int site_file;
+} SnipFrame;
+NodeTable *sp_parse_snippet(const char *src);   /* compiler-written text: no frame */
+NodeTable *sp_parse_snippet_in(const char *src, const SnipFrame *f);
 
 /* What the driver's flags ask of the parse, the analysis and codegen:
    src/main.c sets them, spinel_parse.c defines them. A string is a path to

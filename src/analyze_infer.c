@@ -811,8 +811,11 @@ int hv_value_class(Compiler *c, int recv) {
     if (iv < 0 || !hv_is_poly_hash(c->classes[sc->class_id].ivar_types[iv])) return -1;
   }
   else {
+    /* a parameter is assigned the caller's hash, which may hold values of
+       any kind before the method stores its own: only a slot that starts
+       as an empty `{}` here is known by its writes */
     LocalVar *lv = scope_local(&c->scopes[owner], name);
-    if (!lv || !hv_is_poly_hash(lv->type)) return -1;
+    if (!lv || lv->is_param || !hv_is_poly_hash(lv->type)) return -1;
   }
   return h->cls;
 }
@@ -3724,12 +3727,13 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
              reader shared by K classes formatted it K times per ask
              (rubys in #5035); an alias names another ivar */
           char ivn[256];
+          const char *ivp = ivn_same;
           if (rname != name || !ivn_same[0]) {
             snprintf(ivn, sizeof ivn, "@%s", rname);
             if (rname == name) memcpy(ivn_same, ivn, sizeof ivn_same);
+            ivp = ivn;
           }
-          else memcpy(ivn, ivn_same, sizeof ivn);
-          int iv = comp_ivar_index(&c->classes[rdcls], ivn);
+          int iv = comp_ivar_index(&c->classes[rdcls], ivp);
           TyKind rt2 = iv >= 0 ? ivar_value_ty(&c->classes[rdcls], iv) : TY_UNKNOWN;
           r = found ? ty_unify(r, rt2) : rt2; found = 1;
         }
@@ -5010,15 +5014,7 @@ static int infer_range_lazy_call(Compiler *c, int id, const NodeTable *nt, const
        codegen: select/reject/filter (fused loop). */
     if ((ty_iter_shape(name) == TY_ITER_SELECT || ty_iter_shape(name) == TY_ITER_REJECT) &&
         block >= 0) { *out = TY_INT_ARRAY; return 1; }
-    if (block >= 0 && (ty_iter_shape(name) == TY_ITER_MAP)) {
-      int body = nt_ref(nt, block, "body");
-      int bn = 0;
-      const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
-      TyKind et = bn > 0 ? yield_aware_elem_ty(c, bb[bn - 1]) : TY_UNKNOWN;
-      TyKind bnt = ie_block_break_next_ty(c, body);
-      if (bnt != TY_UNKNOWN) et = (et == TY_UNKNOWN) ? bnt : ty_unify(et, bnt);
-      { *out = ty_array_of(et); return 1; }
-    }
+    if (block >= 0 && (ty_iter_shape(name) == TY_ITER_MAP)) { *out = infer_map_block_ty(c, id, block); return 1; }
   }
 
   /* A lazy chain answers Enumerator::Lazy for #class. The chain itself has no
@@ -7456,8 +7452,9 @@ static int infer_runtime_value_call(Compiler *c, int id, const NodeTable *nt, co
      zero seed: `->(acc) { acc.push(1) }` answered nil (#4320). Poly is also the
      right answer when a user class owns the name -- it is the union of that
      return and the builtin one, which is what every other name on this surface
-     already widens to. */
-  if (recv >= 0 && rt == TY_POLY && (argc >= 1 || sp_streq(name, "push")) &&
+     already widens to. With no argument, push, append and unshift still
+     answer the receiver (prepend may be another class's). */
+  if (recv >= 0 && rt == TY_POLY && (argc >= 1 || !sp_streq(name, "prepend")) &&
       (sp_streq(name, "push") || sp_streq(name, "append") ||
        sp_streq(name, "unshift") || sp_streq(name, "prepend")))
     { *out = TY_POLY; return 1; }
@@ -8554,6 +8551,15 @@ int an_push_widens_fresh(Compiler *c, int id) {
   if (rt != TY_STR_ARRAY && rt != TY_INT_ARRAY && rt != TY_FLOAT_ARRAY) return 0;
   /* a program's own Array#push (or <<) answers what it answers */
   if (!nt_int(nt, id, "builtin_only", 0) && array_hash_reopen_owner(c, id, rt, nm) >= 0) return 0;
+  /* a fresh Array frozen in the same chain (`str.split.freeze << 1`) is
+     still held by nothing else: the general Array it becomes keeps the
+     frozen flag, so the push raises CRuby's FrozenError */
+  int fr = nt_paren_single(nt, recv);
+  int fa = nt_ref(nt, fr, "arguments");
+  if (nt_str(nt, fr, "name") && sp_streq(nt_str(nt, fr, "name"), "freeze") &&
+      nt_ref(nt, fr, "receiver") >= 0 && fa < 0 && nt_ref(nt, fr, "block") < 0 &&
+      !nt_safe_nav(nt, fr) && cplan_user_fresh(c, fr)->mi < 0)
+    recv = nt_ref(nt, fr, "receiver");
   if (!is_fresh_array(c, recv)) return 0;
   TyKind elem = ty_array_elem(rt);
   int a = nt_ref(nt, id, "arguments"), ac = 0;
@@ -10458,16 +10464,30 @@ TyKind builtin_value_kind(const char *n) {
   return TY_UNKNOWN;
 }
 
+/* The global names the program writes, as gvar_has_write last read them */
+struct GvarWrites { const NodeTable *nt; int count; char **names; int nnames; ANameHash set; };
+static void gvar_writes_clear(struct GvarWrites *g) {
+  for (int i = 0; i < g->nnames; i++) free(g->names[i]);
+  free(g->names);
+  g->names = NULL; g->nnames = 0;
+  anh_free(&g->set);
+  memset(&g->set, 0, sizeof g->set);
+}
+void gvar_writes_free(Compiler *c) {
+  if (!c->gvar_writes) return;
+  gvar_writes_clear(c->gvar_writes);
+  free(c->gvar_writes);
+  c->gvar_writes = NULL;
+}
 /* Is global `name` (resolved, without the `$`) assigned anywhere -- a write,
    an op-write, a multiple-assignment target, an alias of it? */
 int gvar_has_write(Compiler *c, const char *name) {
-  static const NodeTable *cnt = NULL; static int ccount = -1;
-  static char **names = NULL; static int nnames = 0;
   const NodeTable *nt = c->nt;
   if (!name) return 1;
-  if (cnt != nt || ccount != nt->count) {
-    for (int i = 0; i < nnames; i++) free(names[i]);
-    free(names); names = NULL; nnames = 0;
+  if (!c->gvar_writes && !(c->gvar_writes = calloc(1, sizeof *c->gvar_writes))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  struct GvarWrites *g = c->gvar_writes;
+  if (g->nt != nt || g->count != nt->count) {
+    gvar_writes_clear(g);
     int cap = 0;
     static const NodeKind WK[] = { NK_GlobalVariableWriteNode, NK_GlobalVariableOperatorWriteNode,
                                    NK_GlobalVariableOrWriteNode, NK_GlobalVariableAndWriteNode,
@@ -10478,13 +10498,13 @@ int gvar_has_write(Compiler *c, const char *name) {
         if (!wn || wn[0] != '$') continue;
         const char *rn = comp_resolve_gvar(c, wn + 1);
         if (!rn) continue;
-        if (nnames == cap) { cap = cap ? cap * 2 : 16; names = realloc(names, sizeof(char *) * (size_t)cap); }
-        names[nnames++] = strdup(rn);
+        if (g->nnames == cap) { cap = cap ? cap * 2 : 16; g->names = realloc(g->names, sizeof(char *) * (size_t)cap); }
+        g->names[g->nnames++] = strdup(rn);
+        anh_add(&g->set, g->names[g->nnames - 1]);
       }
-    cnt = nt; ccount = nt->count;
+    g->nt = nt; g->count = nt->count;
   }
-  for (int i = 0; i < nnames; i++) if (sp_streq(names[i], name)) return 1;
-  return 0;
+  return anh_has(&g->set, name);
 }
 
 /* Does the program store something other than an IO into $stdout / $stderr
@@ -10748,8 +10768,10 @@ static TyKind infer_array_literal(Compiler *c, int id) {
       return infer_empty_array_kind(c, id);
     }
     /* A callee stores elements of another kind into the literal it is
-       passed (widen_arg_array). */
-    if (c->arr_want && id < c->node_cap && (c->arr_want[id] == TY_POLY_ARRAY || c->arr_want[id] == TY_INT_ARRAY_ARRAY))
+       passed (widen_arg_array); a table of Integer or Float rows is built as
+       one where a pass decided it (block_elem_ty, oa_stamp_walked_tables). */
+    if (c->arr_want && id < c->node_cap && (c->arr_want[id] == TY_POLY_ARRAY || c->arr_want[id] == TY_INT_ARRAY_ARRAY ||
+                                            c->arr_want[id] == TY_FLOAT_ARRAY_ARRAY))
       return c->arr_want[id];
     TyKind e = TY_UNKNOWN;
     /* --share-strings: whether every element is a String and one is a

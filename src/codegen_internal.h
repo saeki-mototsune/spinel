@@ -630,6 +630,7 @@ int builtin_method_known(const char *cls, const char *m);
 int builtin_cmethod_known(const char *cls, const char *name);
 int builtin_super_cmethod_known(const char *cls, const char *name);
 int builtin_instance_name_known(const char *m);
+int builtin_instance_method_known(const char *cls, const char *m);
 int builtin_arity_violation(Compiler *c, int id);
 int builtin_object_method_known(const char *m);
 int name_is_enumerable_module_method(const char *m);
@@ -751,6 +752,13 @@ int hc_recv_cached(Compiler *c, int recv);
    a receiver seen as Repr.nil_cold (emit_nil_target_cold, codegen_call.c) */
 void emit_nil_cold_test(Compiler *c, int id, int r, Buf *b);
 int call_is_scalar_op(Compiler *c, int id);   /* a builtin operator over scalars */
+int scalar_op_may_raise(Compiler *c, int id);   /* ...that can raise (a zero divisor, an Integer power, a nil operand) */
+/* The operands a value runs before the call in it that finds no method
+   where it runs (cplan_missing), each a whole subtree its caller runs for
+   its effect; a growable list. */
+typedef struct { int *ids; int n, cap; } OrderRun;
+int missing_call_in_order(Compiler *c, int v, OrderRun *run);
+int missing_call_raised(Compiler *c, int v);
 /* Whether the subtree at `id` assigns the local `nm`: a write, an op-write
    or a multiple-assignment target by that name. */
 int subtree_writes_local(Compiler *c, int id, const char *nm);
@@ -764,6 +772,12 @@ int yield_target_push(int block, int saved_block, const char *owner, int nren,
                       const char *brk, int brk_ebase);   /* codegen_iter.c */
 void yield_target_pop(int pushed, int saved_cur);
 int yield_target_cur(void);
+/* Where a literal block's `return` goes, recorded while the call holding
+   the block is spliced (codegen_iter.c): enter when the splice makes the
+   block current, leave with what enter answered when it is done. */
+typedef struct { const char *label, *var; TyKind rt; int ro, exc, ens, set; } BlockRetHome;
+BlockRetHome block_ret_home_enter(int block, int saved_block);
+void block_ret_home_leave(int block, BlockRetHome old);
 extern const char *g_yield_self_fallback;        /* see codegen_util.c */
 extern const char *g_yield_self_fallback2;
 extern const char *g_yield_self_deref_fallback2;
@@ -1219,6 +1233,7 @@ int is_builtin_reopen(const char *name);
 int reopened_builtin_chain_id(Compiler *c, int ci);
 int is_exc_name(const char *n);
 int class_is_exc_subclass(Compiler *c, int ci);
+int class_is_builtin_reopen(Compiler *c, int ci);   /* is_builtin_reopen of class ci, kept per class table */
 int exc_class_defines(Compiler *c, const char *name);
 int class_is_exc_reopen(Compiler *c, int ci);
 int super_reaches_exc_text(Compiler *c, int id, int reopen);
@@ -1847,6 +1862,7 @@ const char *raise_tail_value(TyKind t);
 /* A builtin type that certainly has no #to_ary, and its class name for the
    "no implicit conversion of X into Array" TypeError (codegen_call_recv.c). */
 int conv_to_ary_impossible(TyKind t);
+int conv_to_ary_misfit(Compiler *c, TyKind t);
 const char *conv_builtin_class_name(TyKind t);
 void ty_traits_render(const char *cell, const char *expr, Buf *b);
 const char *raise_tail_value_c(Compiler *c, TyKind t);
@@ -1899,6 +1915,7 @@ void emit_array_frozen_checked(Compiler *c, int recv, TyKind rt, Buf *b);
    NULL for a type that is not an Array. */
 const char *array_frozen_cls(TyKind rt);
 const char *array_to_poly_fn(TyKind t);
+void emit_fresh_lift_recv(Compiler *c, int recv, Buf *b);
 int call_never_returns(Compiler *c, int id);
 /* comp_ntype for a fold seed, with an empty `[]` / `{}` literal resolved to
    its container kind rather than left TY_UNKNOWN (see types.c). */
@@ -2089,6 +2106,7 @@ int emit_predicate_expr(Compiler *c, int id, Buf *b);
 int emit_find_index_poly_expr(Compiler *c, int id, Buf *b);
 void bp_elem_read(Compiler *c, int block, const char *orig, const char *k, int ta, int ti, Buf *b);
 void emit_autosplat_params(Compiler *c, int block, int np, int elem_temp, int indent);
+int emit_table_row_params(Compiler *c, int block, TyKind rt, const char *row, Buf *out, int indent);
 int emit_tuple_block_params(Compiler *c, int id, int block, const char *tuple_src, Buf *out);
 int poly_block_call_needs_dispatch(Compiler *c, int id);
 void emit_obj_alloc_expr(Compiler *c, int cid, Buf *b);
@@ -2294,6 +2312,8 @@ int a_super_target(Compiler *c, Scope *m);
 int an_arg_is_shared_handle(Compiler *c, int node);
 int an_super_object_text(Compiler *c, int n, int mi);
 int an_user_defines_method(Compiler *c, const char *name);
+int an_scopes_named_first(Compiler *c, const char *nm);
+int an_scopes_named_next(Compiler *c, const char *nm, int s);
 int block_given_tail_then_last(Compiler *c, int last);
 int call_forwards_own_block(Compiler *c, int cid);
 int is_blk_param_call(Compiler *c, int node, int mi);
@@ -2852,6 +2872,7 @@ void emit_with_prelude(Compiler *c, int id, Buf *b, int indent, void (*inner)(Co
 void emit_stmt(Compiler *c, int id, Buf *b, int indent);
 void emit_stmt_tail(Compiler *c, int id, Buf *b, int indent);
 int tail_iter_receiver(Compiler *c, int id);
+int num_iter_answers_recv(Compiler *c, int id);
 int expr_is_arr_or_nil(Compiler *c, int v);
 void emit_stmt_inner(Compiler *c, int id, Buf *b, int indent);
 void emit_stmt_tail_inner(Compiler *c, int id, Buf *b, int indent);
@@ -2965,6 +2986,7 @@ int method_is_void(Scope *s);
 void emit_poly_iter_obj_normalize(Compiler *c, int tv, Buf *b);
 void emit_poly_iter_obj_reject(Compiler *c, int call, int tv, const char *name, Buf *b);
 void emit_poly_iter_obj_reject_as(Compiler *c, int call, int tv, const char *name, const char *shown, Buf *b);
+void emit_poly_iter_recv_reject(Compiler *c, int call, const char *name, Buf *rb, Buf *out, int indent);
 void emit_method_signature(Compiler *c, Scope *s, Buf *b);
 void emit_method(Compiler *c, Scope *s, Buf *b);
 int is_nested_block(const char *ty);

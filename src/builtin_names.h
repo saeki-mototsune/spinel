@@ -63,6 +63,8 @@ int is_equality_name(const char *n);  /* equal? eql? == */
 int is_bits_query(const char *n);     /* allbits? anybits? nobits? */
 int is_count_alias(const char *n);    /* length size count */
 int is_class_eval_family(const char *n);  /* class_eval module_eval class_exec module_exec */
+int is_class_eval_text_name(const char *n);  /* class_eval module_eval: run a String as the body's code */
+int is_eval_frame_reader(const char *n);  /* eval and exec forms, binding, __dir__: read an eval's frame */
 int is_eval_exec_family(const char *n);   /* class/module/instance eval and exec */
 int is_key_query(const char *n);      /* key? has_key? include? member?: Hash/ENV membership aliases */
 int is_hash_key_lookup(const char *n); /* [] fetch delete and is_key_query: a Hash call that only compares its key */
@@ -160,6 +162,11 @@ int is_object_copy(const char *n);   /* dup clone */
 int is_ivar_set_name(const char *n); /* instance_variable_set */
 int is_marshal_dump(const char *recv, const char *meth); /* Marshal.dump */
 int is_marshal_load(const char *recv, const char *meth); /* Marshal.load */
+int is_object_loader(const char *recv, const char *meth, int argc); /* Marshal.load/restore, YAML/Psych.load family, JSON.load, JSON.parse with options, ObjectSpace._id2ref */
+int is_method_bind_name(const char *n); /* bind bind_call */
+int is_timeout_call(const char *recv, const char *meth); /* Timeout.timeout(sec, klass) */
+int is_exception_ctor_name(const char *n); /* exception */
+int is_enumerator_maker(const char *n); /* to_enum enum_for */
 int is_allocate_name(const char *n); /* allocate */
 int is_ivar_remove_name(const char *n); /* remove_instance_variable */
 int is_ivar_presence_read(const char *n); /* instance_variables instance_variable_defined? remove_instance_variable inspect p pp */
@@ -274,7 +281,8 @@ int is_const_set_name(const char *n); /* const_set */
 int is_const_query_name(const char *n); /* const_get const_defined? const_source_location */
 int is_constants_list_name(const char *n); /* constants */
 int is_definition_hook_name(const char *n); /* inherited included extended prepended method_added singleton_method_added const_added */
-int definition_form_hooks(const char *form, int sg, const char **out); /* the hooks a definition form fires: included for include, method_added for attr_accessor, ... (up to 2) */
+int is_method_missing_name(const char *n); /* method_missing respond_to_missing?: what a call of a name an object has no method by runs */
+int definition_form_hooks(const char *form, int sg, const char **out); /* the hooks a definition form fires: included and append_features for include, method_added for attr_accessor, ... (up to 2) */
 int is_const_missing_name(const char *n); /* const_missing */
 int is_const_table_def_name(const char *n); /* __const_get__ __const_defined__ */
 int is_string_position_mutator(const char *n); /* []= clear insert setbyte slice! */
@@ -283,6 +291,10 @@ int is_array_push_family(const char *n); /* << append prepend push unshift */
 int is_io_class_name(const char *n); /* File IO */
 int is_immediate_class_name(const char *n); /* FalseClass NilClass TrueClass */
 int is_object_base_name(const char *n); /* BasicObject Object */
+/* The classes a class's singleton chain ends in, which the load record
+   holds by the header that reopens each (builtin_core_class_slot) */
+enum { CORE_OBJECT, CORE_BASIC_OBJECT, CORE_MODULE, CORE_KERNEL, CORE_N };
+int builtin_core_class_slot(const char *n);  /* CORE_* for Object BasicObject Module Kernel, -1 for any other */
 int is_builtin_method_host_name(const char *n); /* Object BasicObject Kernel Comparable Enumerable Module */
 int is_boolean_class_name(const char *n); /* FalseClass TrueClass */
 int is_numeric_literal_tag(const char *n); /* Float Int */
@@ -394,6 +406,12 @@ int is_dir_blockless_iter(const char *n);  /* foreach each_child: an Enumerator 
 
 int is_kernel_module_name(const char *n);
 int is_kernel_module_function(const char *n);
+int builtin_object_method_known(const char *m);   /* one of Object's own methods every object answers */
+/* Does a builtin answer `name` on a self of the kind: main (Kernel's,
+   Object's and main's own methods), a module (also Module's) or a class
+   (also Class's)? */
+enum { BSELF_MAIN, BSELF_MODULE, BSELF_CLASS, BSELF_N };
+int builtin_self_method_known(const char *name, int kind);
 int is_builtin_module_const_name(const char *n);
 int is_untabled_native_class_name(const char *n);
 
@@ -401,6 +419,7 @@ int is_define_method_name(const char *n); /* define_method */
 int is_define_singleton_method_name(const char *n); /* define_singleton_method */
 int is_undef_method_name(const char *n);  /* undef_method */
 int is_remove_method_name(const char *n); /* remove_method */
+int is_check_funcall_name(const char *n);   /* respond_to? respond_to_missing? method_missing: what rb_check_funcall asks */
 int is_implicitly_private_name(const char *n); /* initialize initialize_copy/_clone/_dup respond_to_missing? */
 int is_alias_method_name(const char *n);  /* alias_method */
 /* The operations a String Array (whose elements are handles) answers
@@ -521,15 +540,18 @@ const PackageFact *package_fact_at(int i);   /* the i-th row, NULL past the last
 
 /* ---- Spinel's native classes, modules and exceptions (BUILTIN_CLASSES) ----
    One row per name: which predicate accepts it (BC_*) and its negative
-   cls_id (0 when codegen has none). */
-enum { BC_CLASS = 1, BC_MODULE = 2, BC_EXCEPTION = 4, BC_SOCKET = 8 };
+   cls_id (0 when codegen has none). BC_PLAIN marks Object, BasicObject and
+   Data, below which a program's class is an object of its own. */
+enum { BC_CLASS = 1, BC_MODULE = 2, BC_EXCEPTION = 4, BC_SOCKET = 8, BC_PLAIN = 16 };
 typedef struct { const char *name; int id; unsigned flags; } BuiltinClass;
 const BuiltinClass *builtin_class_at(int i);   /* the i-th row, NULL past the last */
 int is_native_class_name(const char *n);       /* any row: a class Spinel has without a library */
+int is_plain_builtin_superclass(int id);       /* BC_PLAIN or an exception: gives a program's subclass no method of an Enumerable walk */
 /* names the compile-time evaluation and its questions ask about (ct_eval.c,
    analyze_ct.c) */
 int is_class_const_name(const char *n);    /* Class: the constant Class.new is called on */
 int is_hash_read_only(const char *n);      /* the Hash calls that read a table and leave it as it is */
+int is_to_a_name(const char *n);           /* to_a: the receiver's own Array, for an Array */
 int is_hash_self_answer(const char *n);    /* each each_pair each_key each_value freeze to_h: answer the Hash itself */
 int is_core_change_call(const char *n);    /* class_eval .. module_exec include prepend define_method send family alias_method remove_method undef_method: may change a class's methods */
 int is_singleton_reach_call(const char *n);/* define_singleton_method extend singleton_class instance_eval instance_exec: give an object methods of its own */
@@ -538,11 +560,21 @@ int is_attr_decl_reader(const char *n);    /* attr attr_reader attr_accessor, an
 int is_attr_decl_writer(const char *n);    /* attr_writer attr_accessor attribute attributes: declare a writer of each name */
 int class_method_vis_of_name(const char *n); /* private_class_method public_class_method: BVIS_PRIVATE / BVIS_PUBLIC, else 0 */
 int is_refine_name(const char *n);         /* refine */
+int is_enum_helper_name(const char *n);   /* __enum_pairs __enum_count_int: the compiler's helpers a receiverless call names */
 int is_load_effect_call(const char *n);    /* a method body's call that defines, writes, loads or runs code the load record cannot follow */
 int is_using_name(const char *n);          /* using */
 int is_remove_const_name(const char *n);   /* remove_const */
 int is_const_visibility_name(const char *n);   /* private_constant public_constant deprecate_constant */
 int is_cvar_write_name(const char *n);     /* class_variable_set remove_class_variable */
-int is_runtime_callback_name(const char *n);   /* an operator, method_missing, deconstruct, to_f ...: what CRuby's core calls by itself */
+int is_hook_protocol_name(const char *n);  /* append_features extend_object prepend_features: what include, extend and prepend send before their hooks */
+int is_port_gvar_name(const char *n);      /* $stdout $stderr $>: assigning an object makes it the port output goes to */
+
+/* A name the compiler synthesizes for a protocol method (the no-argument
+   display wrappers `__noarg to_s` and `__noarg inspect`, the Enumerable
+   materializer `__enum_to_a`): 1, and in *proto the i-th protocol name it
+   answers for, else 0. The materializer is what Enumerable#to_a runs (it
+   calls each), what a Struct's to_a and deconstruct read (its members; CRuby
+   calls nothing), so it answers for each, to_a and deconstruct. */
+int synth_stands_for(const char *name, int i, const char **proto);
 int is_method_list_call(const char *n);    /* attr attr_reader attr_writer attr_accessor remove_method undef_method: every argument names a method */
 #endif

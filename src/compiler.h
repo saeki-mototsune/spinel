@@ -104,9 +104,9 @@ static inline void comp_touch_key(int key) {
    bitset, its nw nonzero words w at word indices wi (ascending), n members.
    A member at or past nclasses is the Class object of (member - nclasses),
    which a call dispatches to class methods. `bv`: the value may also be a
-   builtin (a container, a Proc), whose own methods then answer too. Read
-   with cls_set_has and cls_set_next. */
-typedef struct { unsigned char all, bv, os; int n, nw; unsigned long long *w; int *wi; } ClsSet;
+   builtin (a container, a Proc), whose own methods then answer too; `os`
+   an OpenStruct; `pr` (with bv) a Proc, whose `[]` is its call. Read with cls_set_has and cls_set_next. */
+typedef struct { unsigned char all, bv, os, pr; int n, nw; unsigned long long *w; int *wi; } ClsSet;
 /* the position of the first word at word index q or past it */
 static inline int cls_set_word_from(const ClsSet *s, int q) {
   int lo = 0, hi = s->nw;
@@ -461,9 +461,17 @@ typedef struct {
      class), so call_target binds a call of it to the version it runs;
      replaced, a later version replaces this one in its class's history, so
      only the calls bound to it reach it; version_n, codegen's number for a
-     replaced version in its C name (mc_method), 0 for none */
-  unsigned char versioned, replaced;
-  int version_n;
+     replaced version in its C name (mc_method), 0 for none; entry, the
+     method a call whose version is known only at run time reaches
+     (call_plan.c's version entries): it calls the version the run-time
+     cells name, one per parameter count the calls need (version_n
+     numbers the later ones in C). It has the method's name, as a replaced
+     version does; no lookup of the method by name answers it (sm_owns),
+     only the calls call_target binds to it reach it; main_n, codegen's
+     number for a method of main's own whose name Object's methods have
+     too (both are top-level functions in C) */
+  unsigned char versioned, replaced, entry;
+  int version_n, main_n;
   unsigned char cand_bound; /* a call on a poly receiver bound its arguments
                                here as one of the methods it may reach
                                (analyze_pass.c): what its parameters hold is
@@ -1249,6 +1257,8 @@ typedef struct {
                         rather than from its own contents: an empty `[]`
                         literal, or a `map` that narrow_object_arrays decided
                         builds a table of rows */
+  int *oa_walked_node; TyKind *oa_walked_kind; int oa_walked_n; /* the tables that
+                        oa_stamp_walked_tables stamped last round, and their kinds */
   TyKind *lw_joined; /* [node_cap] for a local write: the type its value had when
                         the slot was last joined with it (infer_write_types,
                         rejoin_local_writes). A write whose value reads
@@ -1273,6 +1283,10 @@ typedef struct {
   /* the load-phase record: where each statement of the load phase runs
      (analyze_elab.c), rebuilt when the node table changes */
   struct LoadRecord *lrec;
+  /* the program module's memo of prog_load_sets_flag: [node] a load that
+     sets its loaded flag where its value is read by nothing, since another
+     load reads that flag (analyze_program.c); NULL until first asked */
+  unsigned char *load_sets_flag;
   /* the program names or makes a method by something its text does not
      spell -- a send, a method object or a define_method of a computed name,
      text it evaluates -- as an_note_written_names reads the tree; a module
@@ -1380,6 +1394,7 @@ typedef struct {
 
   LocalVar *gvars;    /* global variables ($g), name without '$' */
   int ngvars, cgvars;
+  int *gvar_ix, gvar_ix_cap;   /* open addressing over the names, by index into gvars (-1 free); a program with thousands of globals asks by name on every read */
   LocalVar *consts;   /* top-level constants (FOO) */
   int nconsts, cconsts;
 
@@ -1468,6 +1483,9 @@ typedef struct {
   /* the program has a `**` operand and defines #to_hash: the bridge carries
      the #to_hash row a boxed operand converts through (sp_kw_splat_conv). */
   int uses_kw_to_hash;
+  /* the methods CRuby calls that the program does not name, as the last
+     reachability run found them (implicit_calls.h); freed with the Compiler */
+  struct IcState *ic;
   int uses_exc_text_handle;  /* emitted shared exception text routes, to_s/message bits */
   char *exc_text_late;  /* the plain exception text dispatchers, defined after the globals (emit_exc_text_dispatch) */
   int exc_text_super;        /* exc_text_override_calls_super's memo: 0 unasked, 1 no, 2 yes */
@@ -1512,6 +1530,13 @@ typedef struct {
   /* --share-strings: does the program make an Enumerator over a String
      handle (str_enum_h_made): 0 not asked yet, 1 no, 2 yes */
   unsigned char str_enum_h;
+  /* does any call find no method where it runs (cplan_program_missing):
+     0 not asked yet, 1 no, 2 yes */
+  unsigned char missing_calls;
+  /* per node, once asked: the node cplan_missing_in_order answers for it,
+     + 2 (1: none; 0: not asked yet) */
+  int *missing_order;
+  int missing_order_n;
   /* per local write node, once asked: the source lazy_alias_src_hoist
      answers for it, + 2 (1: none; 0: not asked yet) */
   int *lazy_hoist;
@@ -1566,6 +1591,18 @@ typedef struct {
      (nbyref_elig scopes; NULL before it runs) */
   char *byref_elig;
   int nbyref_elig;
+  /* the names the program's global writes assign, as of the node table it
+     was made for (analyze_infer.c, gvar_has_write; NULL before the first ask) */
+  struct GvarWrites *gvar_writes;
+  /* the inline hint's call counts (codegen.c, mih_count_calls): the first
+     scope of each name, hashed (mih_head, mih_cap slots), and each scope's
+     first scope of its name (mih_first) */
+  int *mih_head, *mih_first, mih_cap;
+  /* ...and its counts: the AST nodes of each scope (mih_nodes) and the call
+     sites naming each first scope's method (mih_calls), for the node table
+     mih_nt held mih_ntcount nodes of and mih_nscopes scopes */
+  int *mih_nodes, *mih_calls, mih_nscopes, mih_ntcount;
+  const NodeTable *mih_nt;
   /* the classes a boxed receiver can be an instance of, per call, and the
      name indexes the walk that answers it reads (analyze_scope.c's
      poly_ivar_set_reaches), built on first use and freed with the compiler */
@@ -1610,6 +1647,27 @@ typedef struct {
   /* the flags of the later prepends that guard their copies
      (mixin_guard_body): $__spinel_mixin_ran_1 .. n_mixin_flags */
   int n_mixin_flags;
+  /* the version entries (call_plan.c, ver_entries_build): one method per
+     (class, side, name, parameter count) for the calls whose version is
+     known only at run time, and each of its arms' calls pinned to the
+     version it runs */
+  struct VerEntry { const char *name; int cls, sg, ar, scope; } *ver_entries;
+  int nver_entries;
+  struct VerChain *ver_chain;   /* how many versions a class's chain holds of a name, by (class, side, name) (call_plan.c, ver_chain_count) */
+  struct VerHold *ver_hold;   /* the holders of a name worth asking, by name (call_plan.c, ver_holders) */
+  /* ...by name: ver_ix chains the entries of one (class, side, name, parameter
+     count) and ver_names one scope-holding entry of each name (ver_entries_index) */
+  int *ver_ix, *ver_ix_next, *ver_names, *ver_names_next;
+  unsigned ver_ix_nb;
+  struct VerPin { int node, scope; } *ver_pins;
+  int nver_pins;
+  /* the entries are made (ver_entries_build) */
+  int ver_built;
+  /* the version each call asked on a class runs, once the entries are
+     made (call_plan.c, ct_version): open addressing, name NULL for a free
+     slot; dc the class it answers, -2 for the table's */
+  struct VerMemo { const char *name; int id, cls; unsigned flags; int vi, dc; } *ver_memo;
+  int ver_memo_cap, ver_memo_n;
   /* the operand-local reads splat_dispatch_on_length marked splat_view,
      which desugar_splat_view_scalars rewrites once typed (-1 once seen) */
   int *splat_views;
@@ -1636,6 +1694,7 @@ enum { PRES_UNMARKED = 1, PRES_REMOVED = 2 };
 
 Compiler *comp_new(const NodeTable *nt);
 void comp_free(Compiler *c);
+void ic_free(Compiler *c);   /* implicit_calls.c */
 /* Is `name` one of the n strings in `list`? (0 for a NULL name) */
 int name_list_has(char **list, int n, const char *name);
 
@@ -1740,6 +1799,7 @@ int comp_sret_first(Compiler *c, int scope_idx);
 int comp_sret_next(const Compiler *c, int r);
 int comp_bare_gets_is_argf(Compiler *c);
 int    comp_method_index(Compiler *c, const char *name); /* -1 if none */
+int    comp_main_method(Compiler *c, const char *name);  /* main's singleton method (`def self.k` at the top level); -1 if none */
 /* A receiverless call's target: the enclosing self's ancestry first, a
    top-level def (a private Object method, and so last in every ancestry) only
    as the fallback. See analyze_util.c. */
@@ -1831,6 +1891,7 @@ int comp_native_method_find_typed(Compiler *c, int class_id, const char *name, i
 int comp_poly_arm_defines(Compiler *c, int k, const char *name);
 int comp_poly_arm_defines_n(Compiler *c, int k, const char *name, int argc);
 TyKind native_spec_to_ty(const char *spec);
+TyKind comp_native_ret_ty(Compiler *c, int nmi, int k);
 /* IO::Buffer type-symbol table (index-compatible with lib/sp_iobuffer.h) */
 int comp_iob_sym_type(const char *name);
 int comp_iob_ty_is_float(int t);
@@ -1892,7 +1953,7 @@ int cls_user_display_mi(Compiler *c, int k, const char *nm);
 int prog_has_cls_user_display(Compiler *c, const char *nm);
 int        class_var_static_ci(Compiler *c, int node);  /* local holding one class const */
 int        class_recv_static_ci(Compiler *c, int node); /* constant or local naming one class */
-int        const_class_value_only(Compiler *c, int node); /* constant holding a class known only at run time */
+int        const_class_value_only(Compiler *c, int node); /* constant slot that may hold a class known only at run time */
 int        class_recv_user_cmethod(Compiler *c, int call, int node, const char *name); /* call's user class method of the name on it */
 int        dynamic_new_may_reach(Compiler *c, int call_id, int cid);  /* k.new can build cid */
 int        anon_struct_ci_for_value(Compiler *c, int val);  /* k = Struct.new(...) value node */
@@ -1937,6 +1998,8 @@ TyKind     hash_default_value_ty(Compiler *c, int dn);      /* the value type a 
 int        hash_new_blockless(Compiler *c, int recv);  /* blockless Hash.new / {} literal */
 int        const_owned_by_class(Compiler *c, const char *clsname, const char *constname);
 const char *const_get_recv_name(Compiler *c, int call, int recv);
+enum { CS_NONE, CS_SLOT, CS_AMBIG };            /* const_set_slot's answers */
+int        const_set_slot(Compiler *c, int call, const char *n, const char **key);
 int        const_get_takes_value(Compiler *c, const char *rnm, const char *cgn);
 const char *const_get_value_key(Compiler *c, const char *rnm, const char *cgn);
 int        const_get_class_index(Compiler *c, const char *rnm, const char *cgn);
@@ -1955,6 +2018,7 @@ const char *time_strict_parser_call(Compiler *c, int id);
 int        class_eval_reopen_class(Compiler *c, int id, int enclosing_class);
 int        class_reopen_cmethod(Compiler *c, int call, int recv, const char *name); /* a method the program adds to Class, run by `call` (-1: no call) */
 int        class_reopen_class(Compiler *c);   /* the module that holds the program's methods of Class (`class Class`), -1 for none */
+int        object_reopen_class(Compiler *c);  /* the class that holds the program's methods of Object and Kernel, -1 for none */
 int        comp_ivar_index(ClassInfo *ci, const char *name);  /* -1 if none */
 int        comp_ivar_intern(ClassInfo *ci, const char *name); /* find or add; returns index */
 int        comp_member_intern(ClassInfo *ci, const char *name);
@@ -2200,6 +2264,10 @@ int        comp_enum_answers_first(Compiler *c, int cid, const char *name);
 int        comp_comparable_answers_first(Compiler *c, int cid, const char *name);
 int        comp_comparable_reaches(Compiler *c, int cid);
 int        comp_enum_reaches(Compiler *c, int cid);   /* Enumerable among its ancestors */
+int        class_builtin_parent(Compiler *c, int cid);   /* codegen.c: the builtin class above the user chain of the class */
+int        class_is_exc_subclass(Compiler *c, int ci);   /* analyze.c */
+int        comp_plain_class(Compiler *c, int cid);    /* only Object's and Kernel's builtin methods behind the class: no core class or core module among its ancestors */
+int        comp_enum_behind(Compiler *c, int cid);    /* Enumerable's methods behind the class: Enumerable, or an Array, Struct or native ancestor */
 int        core_method_vis(const char *cls, const char *m, int inherit);   /* codegen_call_class.c */
 int        comp_is_writer(ClassInfo *ci, const char *name);
 int        name_is_plain_setter(const char *name);
