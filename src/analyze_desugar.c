@@ -12904,12 +12904,17 @@ static int program_defines_name(const NodeTable *nt, int n0, const char *name) {
    class body? A call that reaches such a method -- a class's or module's
    own (`C.detect`), a top-level one (a receiverless `detect`) -- is
    resolved by the name it carries, never by orig_name, so renaming it to
-   the builtin's left it no method. */
+   the builtin's left it no method. An instance method of Object or
+   BasicObject is every receiverless call's, and one of Module or Class
+   every class method's, as a top-level one is. */
 static int program_defines_name_off_class(const NodeTable *nt, int n0, const char *name) {
   for (int id = 0; id < n0; id++) {
     if (nt_kind(nt, id) != NK_DefNode || !nt_str(nt, id, "name") || !sp_streq(nt_str(nt, id, "name"), name)) continue;
     int ct = nt_ref(nt, id, "receiver") < 0 ? fwd_lex_parent(nt, id) : -1;
     if (ct < 0 || !fwd_node_is(nt, ct, "ClassNode")) return 1;
+    const char *cn = nt_str(nt, nt_ref(nt, ct, "constant_path"), "name");
+    if (!cn || sp_streq(cn, "Object") || sp_streq(cn, "BasicObject") || sp_streq(cn, "Module") || sp_streq(cn, "Class"))
+      return 1;
   }
   return 0;
 }
