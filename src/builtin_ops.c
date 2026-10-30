@@ -1114,7 +1114,7 @@ static const BuiltinOp bop_rows[] = {
   { TY_STR_RANGE, "each_with_index", 0, 0, BF_NONE,    TY_ENUMERATOR,  BOPE_TEMPLATE, "sp_srange_ewi(sp_box_srange($r))" },
   { TY_STR_RANGE, "each_slice",   1,   1, BF_NONE,     TY_ENUMERATOR,  BOPE_TEMPLATE, "({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_int _t$u = $i0; sp_srange_regroup(_t$y, _t$u, 0); })" },
   { TY_STR_RANGE, "each_cons",    1,   1, BF_NONE,     TY_ENUMERATOR,  BOPE_TEMPLATE, "({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_int _t$u = $i0; sp_srange_regroup(_t$y, _t$u, 1); })" },
-  { TY_STR_RANGE, "find_index",   1,   1, BF_NONE,     TY_POLY,        BOPE_TEMPLATE, "({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_RbVal _t$u = $b0; SP_GC_ROOT_RBVAL(_t$u); sp_box_oint(sp_srange_find_index(_t$y, _t$u)); })" },
+  { TY_STR_RANGE, "find_index",   1,   1, BF_ANY,      TY_POLY,        BOPE_TEMPLATE, "({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_RbVal _t$u = $b0; SP_GC_ROOT_RBVAL(_t$u); sp_box_oint(sp_srange_find_index(_t$y, _t$u)); })" },
   { TY_STR_RANGE, "step",         1,   1, BF_NONE,     TY_ENUMERATOR,  BOPE_TEMPLATE, "({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_srange_step_enum(_t$y, $b0, SPL(\"step\")); })" },
   { TY_STR_RANGE, "%",            1,   1, BF_NONE,     TY_ENUMERATOR,  BOPE_TEMPLATE, "({ sp_RbVal _t$y = sp_box_srange($r); SP_GC_ROOT_RBVAL(_t$y); sp_srange_step_enum(_t$y, $b0, SPL(\"%\")); })" },
   { TY_STR_RANGE, "class",        0, 127, BF_ANY,      TY_CLASS,       BOPE_NONE },
@@ -1265,7 +1265,7 @@ static const BuiltinOp bop_rows[] = {
   { TY_ENUMERATOR, "take_while",      0, 127, BF_REQUIRED, TY_POLY_ARRAY,  BOPE_NONE },  /* the same lazy driver (#3590) */
   { TY_ENUMERATOR, "include?",        1,   1, BF_NONE,     TY_BOOL,        BOPE_NONE },
   { TY_ENUMERATOR, "member?",         1,   1, BF_NONE,     TY_BOOL,        BOPE_NONE },
-  { TY_ENUMERATOR, "find_index",      1,   1, BF_NONE,     TY_INT,         BOPE_NONE },
+  { TY_ENUMERATOR, "find_index",      1,   1, BF_ANY,      TY_INT,         BOPE_NONE },
   { TY_ENUMERATOR, "next_values",     0,   0, BF_ANY,      TY_POLY_ARRAY,  BOPE_TEMPLATE, "sp_Enumerator_next_values($r)", 0 },
   { TY_ENUMERATOR, "next_values",     0, 127, BF_ANY,      TY_POLY_ARRAY,  BOPE_NONE },  /* #2482 */
   { TY_ENUMERATOR, "peek_values",     0,   0, BF_ANY,      TY_POLY_ARRAY,  BOPE_TEMPLATE, "sp_Enumerator_peek_values($r)", 0 },
@@ -1743,8 +1743,8 @@ static const BuiltinOp bop_rows[] = {
 
   /* Symbol: result kinds; emission stays in emit_call_body. <=> and
      casecmp/casecmp? are typed by the operand (nil for a non-Symbol). */
-  { TY_SYMBOL, "to_s",            0, 127, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_sym_to_s_chilled($r)", 0 },
-  { TY_SYMBOL, "id2name",         0, 127, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_sym_to_s_chilled($r)", 0 },
+  { TY_SYMBOL, "to_s",            0, 127, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_sym_to_s_frozen($r)", 0 },
+  { TY_SYMBOL, "id2name",         0, 127, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_sym_to_s_frozen($r)", 0 },
   { TY_SYMBOL, "name",            0, 127, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_str_uminus_val(sp_sym_to_s($r))", 0 },
   { TY_SYMBOL, "inspect",         0, 127, BF_ANY,      TY_STRING,     BOPE_TEMPLATE, "sp_sym_inspect($r)", 0 },
   { TY_SYMBOL, "upcase",          0, 127, BF_ANY,      TY_SYMBOL,     BOPE_TEMPLATE, "sp_sym_intern(sp_str_upcase$C(sp_sym_to_s($r)))", 0 },
@@ -1871,6 +1871,13 @@ static const BuiltinOp bop_rows[] = {
   { TY_INT,   "clone",       0,   0, BF_ANY,      TY_INT,         BOPE_NONE },
   { TY_INT,   "freeze",      0,   0, BF_ANY,      TY_INT,         BOPE_NONE },
   { TY_INT,   "size",        0,   0, BF_ANY,      TY_INT,         BOPE_TEMPLATE, "((void)($r), (sp_int)sizeof(sp_int))" },
+  /* Numeric#singleton_method_added is public, and an Integer or a Float
+     answers it with a TypeError: no singleton can be defined on one. The
+     name is converted first, as rb_to_id converts it: a Symbol, a String
+     or an object's #to_str (sp_poly_check_str), any other value CRuby's
+     TypeError naming it. A block is ignored, as CRuby ignores it. The nil
+     kind keeps the raise's slot valid. */
+  { TY_INT,   "singleton_method_added", 1, 1, BF_ANY,  TY_NIL, BOPE_TEMPLATE, "((void)($r), ({ sp_RbVal _t$t = $b0; SP_GC_ROOT_RBVAL(_t$t); if (_t$t.tag != SP_TAG_SYM && !sp_poly_check_str(_t$t)) sp_raise_cls(\"TypeError\", sp_sprintf(\"%s is not a symbol nor a string\", sp_poly_inspect(_t$t))); }), sp_raise_cls(\"TypeError\", \"can't define singleton\"), $<sp_oint_nil()$>)" },
   { TY_INT,   "to_int",      1, 127, BF_ANY,      TY_UNKNOWN,     BOPE_TEMPLATE, "($r)" },
   { TY_INT,   "ord",         1, 127, BF_ANY,      TY_UNKNOWN,     BOPE_TEMPLATE, "($r)" },
   { TY_INT,   "infinite?",   1, 127, BF_ANY,      TY_UNKNOWN,     BOPE_TEMPLATE, "((void)($r), sp_oint_nil())" },
@@ -1954,6 +1961,7 @@ static const BuiltinOp bop_rows[] = {
   { TY_INT,   "to_s",        1,   1, BF_ANY,      TY_STRING,      BOPE_TEMPLATE, "sp_int_to_s_base($r, $i0)" },
   /* Float: arms with no inference row of their own */
   /* a receiver that can be nil answers as nil does: "" / "nil" / 0.0 */
+  { TY_FLOAT, "singleton_method_added", 1, 1, BF_ANY,  TY_NIL, BOPE_TEMPLATE, "((void)($r), ({ sp_RbVal _t$t = $b0; SP_GC_ROOT_RBVAL(_t$t); if (_t$t.tag != SP_TAG_SYM && !sp_poly_check_str(_t$t)) sp_raise_cls(\"TypeError\", sp_sprintf(\"%s is not a symbol nor a string\", sp_poly_inspect(_t$t))); }), sp_raise_cls(\"TypeError\", \"can't define singleton\"), $<sp_oint_nil()$>)" },
   { TY_FLOAT, "to_s",        0, 127, BF_ANY,      TY_STRING,      BOPE_TEMPLATE, "sp_float_opt_to_s($N)" },
   { TY_FLOAT, "inspect",     0, 127, BF_ANY,      TY_STRING,      BOPE_TEMPLATE, "sp_float_opt_inspect($N)" },
   { TY_FLOAT, "arg",         1, 127, BF_ANY,      TY_UNKNOWN,     BOPE_TEMPLATE, "sp_float_arg($r)" },
@@ -2224,7 +2232,7 @@ static const BuiltinOp bop_rows[] = {
      legacy chain. Each fits only calls no row above fits. */
   { TY_STRING, "%",                   1,   1, BF_ANY,      TY_UNKNOWN,    BOPE_NONE },
   { TY_STRING, "+",                   1,   1, BF_ANY,      TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_ARGS_BUILTIN },
-  { TY_STRING, "+@",                  0,   0, BF_ANY,      TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF_CLASS },  /* the receiver, or a copy of a frozen one */
+  { TY_STRING, "+@",                  0,   0, BF_ANY,      TY_STRING,     BOPE_NONE, NULL, 0, 0, BOPF_SELF_CLASS },  /* the receiver, or a copy of a frozen one -- K-035: was a TY_UNKNOWN placeholder, never consulted for its result by the direct-call path (BOPF_SELF_CLASS alone decides that), but needed concrete for a yield site to widen (same shape as -@, already TY_STRING on the line above) */
   { TY_STRING, "-@",                  0,   0, BF_ANY,      TY_STRING,     BOPE_NONE, NULL, 0, 0, BOPF_SELF_CLASS },  /* the receiver if frozen, else a frozen copy */
   { TY_STRING, "==",                  1,   1, BF_ANY,      TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_ARGS_BUILTIN },
   { TY_STRING, "===",                 1,   1, BF_ANY,      TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_ARGS_BUILTIN },
@@ -2722,9 +2730,9 @@ static const BuiltinOp bop_rows[] = {
   { BOP_ANY_ARRAY, "dig",                   2, 127, BF_ANY,      TY_POLY,       BOPE_ARRAY_DIG_N },
   { BOP_ANY_ARRAY, "sum",                   1,   1, BF_NONE,     BOPR_ARRAY_SUM_SEED, BOPE_ARRAY_SUM1 },
   { BOP_ANY_ARRAY, "concat",                1, 127, BF_ANY,      BOPR_SELF,     BOPE_ARRAY_CONCAT, NULL, 0, 0, BOPF_SELF | BOPF_ARGS_BUILTIN },
-  { BOP_ANY_ARRAY, "index",                 1,   1, BF_NONE,     BOPR_ARRAY_INDEX, BOPE_ARRAY_INDEX_V },
-  { BOP_ANY_ARRAY, "find_index",            1,   1, BF_NONE,     BOPR_ARRAY_INDEX, BOPE_ARRAY_INDEX_V },
-  { BOP_ANY_ARRAY, "rindex",                1,   1, BF_NONE,     BOPR_ARRAY_INDEX, BOPE_ARRAY_INDEX_V },
+  { BOP_ANY_ARRAY, "index",                 1,   1, BF_ANY,      BOPR_ARRAY_INDEX, BOPE_ARRAY_INDEX_V },
+  { BOP_ANY_ARRAY, "find_index",            1,   1, BF_ANY,      BOPR_ARRAY_INDEX, BOPE_ARRAY_INDEX_V },
+  { BOP_ANY_ARRAY, "rindex",                1,   1, BF_ANY,      BOPR_ARRAY_INDEX, BOPE_ARRAY_INDEX_V },
 
   /* Array, any kind: the forms of CRuby's Array methods no row above
      covers, so that each has a row with its counts, its block rule and
@@ -2761,7 +2769,8 @@ static const BuiltinOp bop_rows[] = {
   { BOP_ANY_ARRAY, "push",                  0, 127, BF_ANY,      TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF },
   { BOP_ANY_ARRAY, "append",                0, 127, BF_ANY,      TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF },
   { BOP_ANY_ARRAY, "unshift",               0, 127, BF_ANY,      TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF },
-  { BOP_ANY_ARRAY, "prepend",               0, 127, BF_ANY,      TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF },
+  { BOP_ANY_ARRAY, "prepend",               0,   0, BF_ANY,      BOPR_SELF,     BOPE_TEMPLATE, "({ sp_$AArray *_t$t = $r; SP_GC_ROOT(_t$t); if (_t$t && _t$t->frozen) sp_raise_frozen_array_at(_t$t, $Y); _t$t; })", 0, 0, BOPF_SELF },  /* no values: self, or FrozenError (K-035, mirrors insert's identical argc-0 row) */
+  { BOP_ANY_ARRAY, "prepend",               1, 127, BF_ANY,      TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF },
   { BOP_ANY_ARRAY, "fill",                  0,   3, BF_ANY,      TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF },  /* fill(v, ...) or fill(...) { } */
   { BOP_ANY_ARRAY, "map!",                  0,   0, BF_REQUIRED, TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF },
   { BOP_ANY_ARRAY, "collect!",              0,   0, BF_REQUIRED, TY_UNKNOWN,    BOPE_NONE, NULL, 0, 0, BOPF_SELF },

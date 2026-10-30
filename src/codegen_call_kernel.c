@@ -192,10 +192,10 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
        (a direct call, or a path with no write). __method__ always answers the
        definition's name (#3729). */
     /* (a method a prepend or an extend moved behind another of its name
-       runs under a shadow name, `__prep_0_go`: the name as written) */
+       runs under a shadow name, `__prep 0 go`: the name as written) */
     /* (and one an alias captured ahead of a redefinition runs under the
        alias, alias_capture_earlier_def: the name its def has) */
-    const char *mn = s ? comp_prep_user_name(comp_scope_def_name(c, s)) : NULL;
+    const char *mn = s ? comp_scope_def_name(c, s) : NULL;
     if (mn && mn[0] && sp_streq(name, "__callee__"))
       buf_printf(b, "(_sp_cal ? sp_sym_intern(_sp_cal) : (sp_sym)%d)", comp_sym_intern(c, mn));
     else if (mn && mn[0]) buf_printf(b, "(sp_sym)%d", comp_sym_intern(c, mn));
@@ -554,7 +554,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       /* the frozen "true" / "false" true.to_s answers; a bare C literal here
          had no marker byte at all */
       else if (at == TY_BOOL) { buf_puts(b, "(("); emit_expr(c, av[0], b); buf_puts(b, ") ? sp_str_frozen_true : sp_str_frozen_false)"); }
-      else if (at == TY_SYMBOL) { buf_puts(b, "sp_sym_to_s_chilled("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
+      else if (at == TY_SYMBOL) { buf_puts(b, "sp_sym_to_s_frozen("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
       else if (at == TY_NIL || at == TY_UNKNOWN) { buf_puts(b, "sp_poly_to_s(sp_box_nil())"); }
       else if (ty_is_object(at) && emit_kconv_obj_nil(c, av[0], ty_object_class(at), "to_str", NULL, b)) {}
       /* Kernel#String asks for #to_str first, and only then #to_s (#3721) */

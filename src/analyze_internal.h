@@ -283,6 +283,7 @@ int ie_forwards_block_tail(Compiler *c, int node);
 int return_in_lambda(Compiler *c, int rid);
 /* 1 if scope `si` returns, other than at `guard_ret`, before it. */
 int return_before(Compiler *c, int si, int guard_ret);
+TyKind pinned_guard_unpin_ret(Compiler *c, int mi);
 /* A proc-typed local's proc_ret: the join of the answers of the procs it is written. 1 on a change. */
 int join_local_proc_rets(Compiler *c);
 /* Scan a subtree for BreakNode values and return their unified type.
@@ -312,6 +313,7 @@ int yield_value_diverges(Compiler *c, int mi);
 int node_is_scope_tail(Compiler *c, int mi, int id);
 TyKind yield_aware_elem_ty(Compiler *c, int node);
 int an_user_defines_method(Compiler *c, const char *name);
+int an_enum_own_find_index(Compiler *c);
 int an_native_defines_method(Compiler *c, const char *name);
 int an_user_recv_defines_method(Compiler *c, const char *name);
 int an_user_define_method(Compiler *c);
@@ -377,7 +379,7 @@ char *dm_lit_str(Compiler *c, int lit);
 char *dm_eval_name(Compiler *c, int node, const char *bv, int lit);
 TyKind dm_lit_type(Compiler *c, int lit);
 const char *builtin_class_of_type(TyKind t);
-const char *object_fallback_class_of_type(TyKind t);
+int object_fallback_class_of_type(TyKind t);
 /* Whether method `m` can take call `call_id`'s arguments (analyze_pass.c) */
 int method_takes_call_args(Compiler *c, Scope *m, int call_id);
 const char *resolve_class_alias(Compiler *c, const char *cname);
@@ -657,6 +659,12 @@ int desugar_splat_to_a(Compiler *c);
 int desugar_builtin_splat_forward(Compiler *c);
 int builtin_class_arity_spec(const char *cls, const char *m, int *min, int *max,
                              const char **lo_exp, const char **hi_exp);
+/* The row an Integer or a Float (k) answers `name` with argc arguments
+   from (and a literal block, has_block, where the row's block form takes
+   one), for a boxed value that may be either, or NULL: only where CRuby's
+   argument counts prove argc right for the class, as a row's own range can
+   be the legacy any-count one (analyze_infer.c) */
+const struct BuiltinOp *poly_scalar_row(TyKind k, const char *name, int argc, int has_block);
 int desugar_lazy_method_call(Compiler *c);
 int desugar_value_callable_forwards(Compiler *c);
 int desugar_root_scoped_constants(Compiler *c);
@@ -915,7 +923,7 @@ int desugar_conditional_defs(Compiler *c);
 /* A dispatcher def over arms `<sel> == <val>` calling `callee` with the
    def's parameters passed on, and an else arm (disp_def_build,
    analyze_desugar.c); `raise NoMethodError, msg` for that arm */
-typedef struct { const char *sel; int val; const char *callee; } DispArm;
+typedef struct { const char *sel; int val; const char *callee; int hist; } DispArm;
 int disp_def_build(NodeTable *nt, int like, const char *name, int sg, int ar, int blk,
                    const DispArm *arm, int narm, int els);
 int disp_raise_no_method(NodeTable *nt, const char *msg);
@@ -936,6 +944,7 @@ int desugar_interp_reopened_to_s(Compiler *c);
 int desugar_interp_elided_to_s(Compiler *c);
 int desugar_array_first_last(Compiler *c);
 int desugar_enum_iter_splat_args(Compiler *c);
+int desugar_index_value_block_pass(Compiler *c);
 int desugar_iter_splat_args(Compiler *c);
 int desugar_builtin_iter_block_shapes(Compiler *c);
 int desugar_enum_pair_lone_param(Compiler *c);
