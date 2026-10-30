@@ -6226,11 +6226,10 @@ void enum_send_copy_take(NodeTable *nt, int call) {
      definition has, under that name, as desugar_builtins renames a written
      one; a class with its own method of the alias keeps it, answered by
      the name the call was written with (desugar_builtin_enum_calls); a
-     class method keeps the call as written, and a top-level one a call
-     it can reach */
+     class method or a top-level one keeps the call as written (a send
+     reaches a private method too) */
   const LowerRow *alias = bi < 0 && nm ? lower_row_named(LR_ENUM_NAME, nm) : NULL;
-  if (alias && !program_defines_name_off_class(nt, nt->count, nm, nt_ref(nt, call, "receiver")))
-    bi = builtin_enum_name_index(alias->target);
+  if (alias && !program_defines_name_off_class(nt, nt->count, nm, -1)) bi = builtin_enum_name_index(alias->target);
   else alias = NULL;
   if (bi < 0 || bi >= g_enum_send_copy_n || g_enum_send_copy[bi] < 0) return;
   if (alias) {
@@ -12979,13 +12978,14 @@ static int program_defines_name(const NodeTable *nt, int n0, const char *name) {
   return 0;
 }
 
-/* is def a statement of a file's top level? */
+/* is def a statement of a file's top level (or one a visibility call
+   wraps, `private def m`)? */
 static int def_at_top_level(const NodeTable *nt, int n0, int def) {
   for (int id = 0; id < n0; id++) {
     if (nt_kind(nt, id) != NK_ProgramNode) continue;
     int st = nt_ref(nt, id, "statements"), bn = 0;
     const int *bb = st >= 0 ? nt_arr(nt, st, "body", &bn) : NULL;
-    for (int k = 0; k < bn; k++) if (bb[k] == def) return 1;
+    for (int k = 0; k < bn; k++) if (bb[k] == def || fwd_body_def(nt, bb[k]) == def) return 1;
   }
   return 0;
 }
@@ -12997,7 +12997,8 @@ static int def_at_top_level(const NodeTable *nt, int n0, int def) {
    by the name it carries, never by orig_name, so renaming it to the
    builtin's left it no method. A top-level method is private: a call on a
    receiver other than self never reaches it, and kept as written
-   `[[1], [2]].collect_concat { }` found no method of that name. */
+   `[[1], [2]].collect_concat { }` found no method of that name. A send
+   reaches it on any receiver, and passes -1. */
 static int program_defines_name_off_class(const NodeTable *nt, int n0, const char *name, int recv) {
   int other_recv = recv >= 0 && nt_kind(nt, recv) != NK_SelfNode;
   for (int id = 0; id < n0; id++) {
@@ -13455,6 +13456,7 @@ int desugar_builtins(Compiler *c) {
       if (sac >= 1 && nt_kind(nt, sav[0]) == NK_SymbolNode && nt_str(nt, sav[0], "value")) {
         cn0 = nt_str(nt, sav[0], "value");
         send_site = 1;
+        cr0 = -1;   /* a send reaches a private method: as receiverless */
       }
     }
     /* collect_concat is flat_map under another name, and detect find: the

@@ -1,16 +1,17 @@
 # A top-level collect_concat / detect is private: a call on an Array or a
 # Range never reaches it and takes the builtin (flat_map / find), while a
-# receiverless or self call still answers the program's method.
+# receiverless or self call, or a send, still answers the program's
+# method; `private def` is the same top-level method.
 def collect_concat(x = 0)
   "top #{x}"
 end
-def detect
+private def detect
   "top detect"
 end
 a = [[1], [2]]
 p a.collect_concat { |e| e }
 p a.collect_concat.each { |e| e }
-p a.send(:collect_concat) { |e| e }
+p 42.send(:detect)
 p [3, 4, 5].detect { |e| e > 3 }
 p (1..4).detect(&:even?)
 puts collect_concat(3)
