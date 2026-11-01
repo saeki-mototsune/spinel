@@ -14785,14 +14785,15 @@ int desugar_value_form_drop_block(Compiler *c) {
 }
 
 /* Is `t` a builtin value with no Enumerable in CRuby, no `each` to walk? (An
-   IO, ARGF or a Dir includes it, and a class object may extend it.) */
+   IO, ARGF or a Dir includes it, a Process::Tms is a Struct, and a class
+   object may extend it.) */
 static int ty_lacks_enumerable(TyKind t) {
   switch (t) {
   case TY_NIL: case TY_INT: case TY_BIGINT: case TY_FLOAT: case TY_STRING: case TY_STRBUF:
   case TY_SYMBOL: case TY_BOOL: case TY_TIME: case TY_COMPLEX: case TY_RATIONAL:
   case TY_MATCHDATA: case TY_REGEX: case TY_EXCEPTION: case TY_PROC: case TY_CURRY:
   case TY_METHOD: case TY_FIBER: case TY_THREAD: case TY_QUEUE: case TY_MUTEX: case TY_CONDVAR:
-  case TY_RANDOM: case TY_ADDRINFO: case TY_SOCKOPT: case TY_TMS: case TY_PROCESS_STATUS:
+  case TY_RANDOM: case TY_ADDRINFO: case TY_SOCKOPT: case TY_PROCESS_STATUS:
   case TY_OPENSTRUCT:
     return 1;
   default:
