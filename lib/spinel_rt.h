@@ -75,38 +75,6 @@ static inline sp_int sp_String_setbyte(sp_String *s, sp_int i, sp_int v) {
 #include <pwd.h>
 #include <sys/times.h>   /* struct tms for Process.times */
 
-/* Opt-in native backtrace (spinel --debug). In a -g, non-inlined build the
-   sp_<method> symbols are present, so sp_raise_cls can snapshot the live C
-   stack at raise time and Exception#backtrace / caller format it into a
-   Ruby-style backtrace -- no per-method shadow frames needed. Off unless the
-   generated main() sets sp_bt_enabled (debug builds), so non-debug behaviour
-   and cost are unchanged. execinfo is not quite POSIX-ish; it's absent on
-   Windows and other platforms. */
-#if defined(__has_include)
-#  if __has_include(<execinfo.h>)
-#    define HAVE_EXECINFO_H 1
-#  endif
-#elif defined(__GLIBC__) || defined(__APPLE__) || defined(__FreeBSD__)
-#  define HAVE_EXECINFO_H 1
-#endif
-
-#ifdef HAVE_EXECINFO_H
-#include <execinfo.h>
-#else
-/* No execinfo.h: provide no-op shims so the formatting code below compiles
-   and links unchanged. backtrace_symbols returns NULL, which the formatter
-   treats as "nothing to format" -- the backtrace is simply empty. */
-#define backtrace_symbols(buf, n) ((char **)0)
-#define backtrace(buf, sz) 0
-#endif
-#define SP_BT_AVAILABLE 1
-extern int sp_bt_enabled;          /* set to 1 by debug-build main(); defined in lib/sp_cold.c */
-extern const char *sp_bt_srcfile;  /* toplevel .rb path, set by debug main() */
-extern const char *const *sp_bt_files;  /* debug main(): C symbol, .rb file pairs of the methods of a required file, 0 ends */
-#if SP_BT_AVAILABLE
-static void *sp_bt_buf[256];       /* frames captured at the last raise */
-static int sp_bt_n = 0;
-#endif
 #include <unistd.h>
 #include <signal.h>
 #include <sys/resource.h>   /* PRIO_* selectors for Process.getpriority */
@@ -143,43 +111,8 @@ static int sp_bt_n = 0;
 #include "sp_gc.h"
 /* sp_Fiber + the Fiber API; the bodies live in libspinel_rt.a (lib/sp_fiber.c). */
 #include "sp_fiber.h"
-/* The capture of a backtrace (at a raise, and for Kernel#caller). macOS 14's
-   backtrace() on x86_64 answers no frame on a stack other than the
-   pthread's own: the one the top level runs on (sp_main_stack_run), a
-   fiber's, a green thread's (#9930). Where it answers almost none, the
-   frame-pointer chain, which the Darwin ABI keeps on both architectures, is
-   walked by hand, only within the stack the walk starts on, where every
-   frame record is mapped (the unwinder, tried first, walked past the
-   switched stack's first frame on arm64 and faulted). SPINEL_BT_WALK=1
-   takes that walk wherever backtrace() works, so it can be checked there. */
-#if defined(__APPLE__) && defined(HAVE_EXECINFO_H)
-static SP_NOINLINE SP_UNUSED int sp_bt_capture(void **buf, int max) {
-  static int forced = -1;
-  if (forced < 0) { const char *e = getenv("SPINEL_BT_WALK"); forced = e && e[0] == '1'; }
-  int n = forced ? 0 : backtrace(buf, max);
-  if (n > 2) return n;
-  char *fp = (char *)__builtin_frame_address(0), *lo = NULL, *hi = NULL;
-  sp_Fiber *f = sp_fiber_current;
-  if (f && f->stack && fp >= f->stack && fp < f->stack + sp_fiber_guard() + f->stack_size) {
-    lo = f->stack + sp_fiber_guard(); hi = lo + f->stack_size;
-  }
-  else if (sp_thread_stack_lo && fp >= sp_thread_stack_lo && fp < sp_thread_stack_hi) {
-    lo = sp_thread_stack_lo; hi = sp_thread_stack_hi;
-  }
-  if (!lo) return n;
-  n = 0;
-  while (n < max && fp >= lo && fp + 2 * sizeof(void *) <= hi && ((uintptr_t)fp & (sizeof(void *) - 1)) == 0) {
-    void **rec = (void **)fp;
-    if (!rec[1]) break;
-    buf[n++] = rec[1];
-    if ((char *)rec[0] <= fp) break;
-    fp = (char *)rec[0];
-  }
-  return n;
-}
-#else
-#define sp_bt_capture(buf, max) backtrace(buf, max)
-#endif
+/* The native backtrace and its capture (spinel --debug): lib/sp_bt.h */
+#include "sp_bt.h"
 /* sp_thread + the cooperative scheduler (Phase 0); bodies in lib/sp_sched.c. */
 #include "sp_sched.h"
 
@@ -738,7 +671,6 @@ static inline int sp_gc_bucket(size_t sz){int b=(int)(sz/16);return b<SP_GC_NBUC
    on a hot path (hashes), so the extra cache line vs. a struct field
    doesn't matter. Arrays co-locate `frozen` in the struct instead
    (see sp_IntArray); strings use the 0xff marker / wrapper bit. */
-static inline sp_bool sp_gc_is_frozen(void *p) { if (!p) return FALSE; return ((sp_gc_hdr *)((char *)p - sizeof(sp_gc_hdr)))->frozen; }
 static inline void *sp_gc_freeze(void *p) { if (p) ((sp_gc_hdr *)((char *)p - sizeof(sp_gc_hdr)))->frozen = 1; return p; }
 /* `Queue#freeze` raises rather than freezing: a frozen queue could never be
    pushed to again, so Ruby refuses it outright. Names the receiver the way
@@ -1594,6 +1526,7 @@ extern SP_TLS sp_RbVal _sp_proc_poly_ret;
    host too: sp_proc_call_blk, inlined into the host's TU, and the kernel's
    sp_proc_call and proc bodies must meet in the same slot. */
 extern SP_TLS sp_Proc *_sp_proc_blk;
+void sp_mark_rt_roots(void);   /* lib/sp_cold.c */
 static void sp_re_mark_globals(void) {
 #ifdef SP_SHARE_STRING_LITERALS
   sp_String_mark_literals();
@@ -1605,19 +1538,10 @@ static void sp_re_mark_globals(void) {
      proc-return home, a break value or fiber storage (#3404). Costs a store
      per group and only when verify is on. */
 #define SP_GLB_PHASE(x) do { if (sp_gc_verify_on()) sp_gc_dbg_phase = (x); } while (0)
-  SP_GLB_PHASE("globals:regex");
-  sp_mark_string(sp_re_last_str);
-  for (int i = 0; i < 10; i++) sp_mark_string(sp_re_captures[i]);
-  sp_mark_string(sp_re_match_str);
-  sp_mark_string(sp_re_match_pre);
-  sp_mark_string(sp_re_match_post);
-  SP_GLB_PHASE("globals:argv");
-  for (sp_int i = 0; i < sp_argv.len; i++) sp_mark_string(sp_argv.data[i]);
-  if (sp_argv_array_cache) sp_gc_mark(sp_argv_array_cache);
-  if (sp_loaded_features_cache) sp_gc_mark(sp_loaded_features_cache);
-  if (sp_load_path_cache) sp_gc_mark(sp_load_path_cache);
-  if (sp_main_obj) sp_gc_mark(sp_main_obj);   /* top-level self */
-  sp_mark_string(sp_argf_obj.fname);   /* the file ARGF took off ARGV */
+  /* the regex registers, ARGV and ARGF, the top-level self and the proc
+     calling convention's side channel: lib/sp_cold.c, compiled once rather
+     than in every program */
+  sp_mark_rt_roots();
   SP_GLB_PHASE("globals:exceptions");
   sp_mark_in_flight_exceptions();
   SP_GLB_PHASE("globals:proc-homes");
@@ -1634,19 +1558,6 @@ static void sp_re_mark_globals(void) {
      as are not heap strings, and sp_mark_string skips those. */
   SP_GLB_PHASE("globals:program-name");
   sp_mark_string(sp_program_name);
-  /* The proc calling convention's side channel holds boxed values with
-     nothing else pointing at them: a proc writes its result to
-     _sp_proc_poly_ret and returns, and the caller reads it back after, with
-     an allocation in between (the push it is on its way to); the arguments
-     are the same on the way in. Both are roots. A slot keeps its value
-     after its reader is done, so it can name a freed object by the next
-     cycle: the scratch marker skips a slab slot that is free. Marked here
-     rather than by the generated marker so that a program with no globals
-     of its own carries no marker and no startup hook at all. */
-  SP_GLB_PHASE("globals:proc-channel");
-  sp_mark_rbval_scratch(_sp_proc_poly_ret);
-  for (int i = 0; i < SP_PROC_ARG_SLOTS; i++) sp_mark_rbval_scratch(_sp_proc_poly_args[i]);
-  if (_sp_proc_poly_wide) sp_gc_mark(_sp_proc_poly_wide);
   SP_GLB_PHASE("globals");
 #undef SP_GLB_PHASE
 }
@@ -1654,10 +1565,12 @@ static void sp_re_mark_globals(void) {
 /* Hand the collector (lib/sp_gc.c) this TU's root-marking and string-heap
    sweep. Runs before main, so the hooks are set before the first
    allocation can trigger a collection. */
+#ifndef SP_GC_NONE   /* (--gc=none: no collection marks them) */
 SP_CONSTRUCTOR static void sp_gc_install_tu_hooks(void) {
   sp_gc_mark_globals_hook = sp_re_mark_globals;
   /* sp_gc_str_sweep_hook is installed by sp_alloc.c's constructor. */
 }
+#endif
 
 /* `$+` / `$LAST_PAREN_MATCH` -- contents of the highest-indexed group
    that participated in the match. Walks sp_re_captures[] from 9 down
@@ -2020,6 +1933,7 @@ static sp_Bigint *sp_poly_as_bigint(sp_RbVal v);
 static int sp_bigint_eq_f(sp_Bigint *a, double d);    /* fwd: the exact Bignum/Float pair */
 static int sp_bigint_cmp_f(sp_Bigint *a, double d);
 static sp_RbVal sp_poly_binop_bad(const char *op, sp_RbVal recv, sp_RbVal arg);  /* fwd */
+SP_COLD static const char *sp_stage_recv_args_msg(const char *msg, sp_RbVal recv, sp_int n, sp_RbVal *args);  /* fwd */
 static const char *sp_cmperr_desc(sp_RbVal v);  /* fwd: a failed coerce names its operand this way too */
 static inline int sp_poly_is_array_kind(int cls_id);            /* fwd: array set ops */
 static sp_PolyArray *sp_poly_to_poly_array(sp_RbVal v);
@@ -2030,6 +1944,8 @@ static sp_PolyArray *sp_poly_to_poly_array(sp_RbVal v);
 static sp_PolyArray *sp_zip_arg(sp_RbVal v);
 static sp_PolyArray *sp_PolyArray_intersect(sp_PolyArray *a, sp_PolyArray *b);
 static sp_PolyArray *sp_PolyArray_union(sp_PolyArray *a, sp_PolyArray *b);
+static inline int sp_poly_is_user_obj(sp_RbVal v);
+static sp_RbVal sp_poly_ary_operand(sp_RbVal v);
 static sp_RbVal sp_poly_bitop(sp_RbVal a, sp_RbVal b, int op) {  /* 0:& 1:| 2:^ */
   /* a user class's own &/|/^ comes first: coercing the object to an integer
      answered a builtin result for a method the class had written (#3501) */
@@ -2041,7 +1957,10 @@ static sp_RbVal sp_poly_bitop(sp_RbVal a, sp_RbVal b, int op) {  /* 0:& 1:| 2:^ 
   }
   /* Two ARRAYS: `&` and `|` are Array's set operations, as `+` and `-` already
      are on this path. Read as integer arithmetic they answered 0, so a fold
-     over an array of arrays lost its result silently (#3966). */
+     over an array of arrays lost its result silently (#3966). An object
+     operand converts through its #to_ary first, as sp_poly_add's does. */
+  if (a.tag == SP_TAG_OBJ && sp_poly_is_array_kind(a.cls_id) && sp_poly_is_user_obj(b) && op != 2)
+    b = sp_poly_ary_operand(b);
   if (a.tag == SP_TAG_OBJ && sp_poly_is_array_kind(a.cls_id) &&
       b.tag == SP_TAG_OBJ && sp_poly_is_array_kind(b.cls_id) && op != 2) {
     SP_GC_ROOT_RBVAL(a); SP_GC_ROOT_RBVAL(b);
@@ -3522,8 +3441,15 @@ static sp_RbVal sp_poly_binop_bad(const char *op, sp_RbVal recv, sp_RbVal arg) {
   /* CRuby names nil, true and false as THEMSELVES here, not as instances of
      their classes -- `[1, 2].reduce(nil, :+)` reads "undefined method '+' for
      nil". sp_nomethod_msg is where that wording already lives. */
-  if (!sp_poly_has_binop(recv, op))
-    sp_raise_cls("NoMethodError", sp_nomethod_msg(op, recv));
+  /* (with the receiver and the operand, for NoMethodError#receiver and
+     #args, as a compiled call's missing method stages them) */
+  if (!sp_poly_has_binop(recv, op)) {
+    /* (rooted: staging the operand allocates, and the message is a heap
+       String a collection there would take) */
+    SP_GC_ROOT_RBVAL(recv); SP_GC_ROOT_RBVAL(arg);
+    const char *msg = sp_nomethod_msg(op, recv); SP_GC_ROOT_STR(msg);
+    sp_raise_cls("NoMethodError", sp_stage_recv_args_msg(msg, recv, 1, (sp_RbVal[]){ arg }));
+  }
   /* CRuby names the offending value by its class, EXCEPT nil/true/false, which
      it spells as themselves -- and the two messages disagree about Symbol:
      "no implicit conversion" says Symbol, "can't be coerced" says :sym. */
@@ -4428,12 +4354,24 @@ static SP_UNUSED sp_RbVal sp_range_num_end(sp_RbVal v) {
     sp_raise_cls("ArgumentError", "bad value for range");
   return v;
 }
+/* A boxed Rational or Complex bound of an Integer-represented Range: the
+   representation holds it truncated to its integer part, so `(x..2) ===
+   1r/4` with x = 1r/2 answered true. Say so. A Float Range converts its
+   bounds with to_f and is not asked. `rat_ok` lets a Rational end through
+   where the Range is only walked from an Integer begin (codegen's
+   range_rat_walk): `(1..5r/2).to_a` walks 1, 2 with the end truncated. */
+static SP_UNUSED sp_RbVal sp_range_int_bound(sp_RbVal v, int rat_ok) {
+  if (SP_UNLIKELY(((sp_poly_is_rational(v) || sp_poly_is_brat(v)) && !rat_ok) ||
+                  (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_COMPLEX)))
+    sp_raise_cls("NotImplementedError", "a Range with a Rational or Complex bound is not supported by spinel");
+  return v;
+}
 /* The boxed begin of an Integer-represented Range whose end is a Float
    (`x..2.5`): nil would make it beginless with the Float end, which the
    integer representation holds truncated. Refuse that one loudly; any other
    begin converts as a Range endpoint does. */
 static SP_UNUSED sp_int sp_range_lo_float_end(sp_RbVal v) {
-  v = sp_range_num_end(v);
+  v = sp_range_int_bound(sp_range_num_end(v), 0);
   if (SP_UNLIKELY(v.tag == SP_TAG_NIL))
     sp_raise_cls("NotImplementedError", "a beginless Range with a Float end decided at run time is not supported by spinel");
   if (SP_UNLIKELY(v.tag == SP_TAG_FLT))
@@ -4571,16 +4509,21 @@ static SP_UNUSED sp_PolyArray *sp_range_minmax_poly(sp_Range r) {
 /* A Range built from a boxed end (`lo..x`): nil is the absent end, a Float
    is kept as written (sp_range_new_fend), anything else converts as an
    Integer bound does. */
-static SP_UNUSED sp_Range sp_range_new_pend(sp_oint f, sp_RbVal e, sp_int x) {
-  e = sp_range_num_end(e);
+static SP_UNUSED sp_Range sp_range_new_pend_w(sp_oint f, sp_RbVal e, sp_int x, int walk) {
+  e = sp_range_int_bound(sp_range_num_end(e), walk && sp_poly_is_rational(e));
+  /* the walk stops at the last Integer <= the end: floor, not truncation
+     ((-3..-5r/2) walks only -3) */
+  if (walk && sp_poly_is_rational(e)) e = sp_box_int(sp_rational_floor_i(sp_poly_as_rational(e)));
   if (e.tag == SP_TAG_FLT) { sp_Range r = sp_range_new_fend(f.nil ? SP_RANGE_NO_BEGIN : f.v, e.v.f, x); r.nobeg = f.nil; return r; }
   return sp_range_new_o(f, e.tag == SP_TAG_NIL ? sp_oint_nil() : sp_oint_of(sp_poly_to_i(e)), x);
 }
+static SP_UNUSED sp_Range sp_range_new_pend(sp_oint f, sp_RbVal e, sp_int x) { return sp_range_new_pend_w(f, e, x, 0); }
+static SP_UNUSED sp_Range sp_range_new_pend_walk(sp_oint f, sp_RbVal e, sp_int x) { return sp_range_new_pend_w(f, e, x, 1); }
 /* A boxed begin of an Integer-represented Range: a Float there would make it
    a Float range, which this representation cannot hold. Say so; nil is the
    absent begin. */
 static SP_UNUSED sp_oint sp_range_lo_bound(sp_RbVal v) {
-  v = sp_range_num_end(v);
+  v = sp_range_int_bound(sp_range_num_end(v), 0);
   if (SP_UNLIKELY(v.tag == SP_TAG_FLT))
     sp_raise_cls("NotImplementedError", "a Range with a Float begin decided at run time is not supported by spinel");
   return v.tag == SP_TAG_NIL ? sp_oint_nil() : sp_oint_of(sp_poly_to_i(v));
@@ -5540,6 +5483,15 @@ SP_COLD void sp_exc_stage_key(sp_RbVal v);
 #else
 SP_COLD void sp_exc_stage_key(sp_RbVal v)  { sp_pending_exc_key = v;  sp_pending_exc_flags |= 2; }
 #endif
+/* NameError#name, staged as its text (a C literal, which the collector
+   never sees) and interned when the carried exception is built */
+#ifdef SPINEL_EXT_HOST
+extern SP_TLS const char *sp_pending_exc_name;
+SP_COLD void sp_exc_stage_name(const char *nm);
+#else
+SP_TLS const char *sp_pending_exc_name;
+SP_COLD void sp_exc_stage_name(const char *nm) { sp_pending_exc_name = nm; sp_pending_exc_flags |= 8; }
+#endif
 #ifdef SPINEL_EXT_HOST
 SP_COLD void sp_exc_stage_val(sp_RbVal v);
 #else
@@ -5576,16 +5528,27 @@ static int sp_nomethod_kernel_private(const char *m) {
   for (int i = 0; k[i]; i++) if (!strcmp(m, k[i])) return 1;
   return 0;
 }
+/* How a NoMethodError's text names its receiver v: nil, true, false, "class
+   X" / "module X", or "an instance of X". */
+SP_COLD static const char *sp_nomethod_recv_desc(sp_RbVal v) {
+  return (v.tag == SP_TAG_NIL) ? "nil"
+       : (v.tag == SP_TAG_BOOL) ? (v.v.i ? "true" : "false")
+       : (v.tag == SP_TAG_CLASS)
+         ? sp_sprintf("%s %s", strcmp(sp_poly_class_name(v), "Module") ? "class" : "module",
+                      sp_class_val_name(v))
+       : sp_sprintf("an instance of %s", sp_poly_class_name(v));
+}
 SP_COLD static const char *sp_nomethod_msg(const char *m, sp_RbVal v) {
   sp_exc_stage_recv(v);
-  const char *d = (v.tag == SP_TAG_NIL) ? "nil"
-                : (v.tag == SP_TAG_BOOL) ? (v.v.i ? "true" : "false")
-                : (v.tag == SP_TAG_CLASS)
-                  ? sp_sprintf("%s %s", strcmp(sp_poly_class_name(v), "Module") ? "class" : "module",
-                               sp_class_val_name(v))
-                : sp_sprintf("an instance of %s", sp_poly_class_name(v));
+  const char *d = sp_nomethod_recv_desc(v);
   if (sp_nomethod_kernel_private(m)) return sp_sprintf("private method '%s' called for %s", m, d);
   return sp_sprintf("undefined method '%s' for %s", m, d);
+}
+/* The NameError of `recv.method(:m)` where the receiver has no such method:
+   CRuby names the receiver's class ("undefined method 'm' for class
+   'NilClass'"), where a call's NoMethodError describes the receiver. */
+SP_COLD static const char *sp_nomethod_class_msg(const char *m, sp_RbVal v) {
+  return sp_sprintf("undefined method '%s' for class '%s'", m, sp_poly_class_name(v));
 }
 /* The NoMethodError of a call on nil, as sp_raise_nomethod(sp_nomethod_msg(m,
    nil)) raises it (the receiver staged, a Kernel private name spelled as
@@ -10550,15 +10513,15 @@ static sp_StrPolyHash*sp_StrPolyHash_new(void){sp_StrPolyHash*h=(sp_StrPolyHash*
 static sp_StrPolyHash*sp_StrPolyHash_new_with_default(sp_RbVal d){SP_GC_ROOT_RBVAL(d);sp_StrPolyHash*h=sp_StrPolyHash_new();h->default_v=d;return h;}
 static sp_StrPolyHash*sp_StrPolyHash_new_dproc(sp_strpoly_dproc_t fn,void*self){sp_StrPolyHash*h=sp_StrPolyHash_new();h->dproc=fn;h->dproc_self=self;return h;}
 static void sp_StrPolyHash_grow(sp_StrPolyHash*h){ sp_gc_wb((void*)h);sp_int oc=h->cap;const char**ok=h->keys;sp_RbVal*ov=h->vals;h->cap*=2;h->mask=h->cap-1;h->keys=(const char**)sp_pl_zalloc((size_t)h->cap*sizeof(const char*));h->vals=(sp_RbVal*)sp_pl_zalloc((size_t)h->cap*sizeof(sp_RbVal));h->order=(const char**)sp_pl_realloc(h->order,sizeof(const char*)*h->cap);h->len=0;for(sp_int i=0;i<oc;i++){if(ok[i]){sp_int idx=(sp_int)(sp_str_hash(ok[i])&h->mask);while(h->keys[idx])idx=(idx+1)&h->mask;h->keys[idx]=ok[i];h->vals[idx]=ov[i];h->len++;}}sp_pl_free(ok);sp_pl_free(ov);sp_gc_payload_resize(h,(size_t)oc*SP_STRPOLYHASH_SLOT,(size_t)h->cap*SP_STRPOLYHASH_SLOT);}
-static sp_RbVal sp_StrPolyHash_get(sp_StrPolyHash*h,const char*k){if(!h)return sp_box_nil();sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_eq(h->keys[idx],k))return h->vals[idx];idx=(idx+1)&h->mask;}if(h->dproc)return h->dproc(h,k,h->dproc_self);return h->default_v;}
-static void sp_StrPolyHash_set(sp_StrPolyHash*h,const char*k,sp_RbVal v){sp_gc_wb((void*)h); if(!k){sp_raise_cls("TypeError","no implicit conversion of nil into String");return;} if(h->len*2>=h->cap)sp_StrPolyHash_grow(h);sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_eq(h->keys[idx],k)){h->vals[idx]=v;return;}idx=(idx+1)&h->mask;}{SP_GC_ROOT(h);SP_GC_ROOT_STR(k);SP_GC_ROOT_RBVAL(v);k=sp_hash_key_str(k);}sp_gc_wb((void*)h);h->keys[idx]=k;h->vals[idx]=v;h->order[h->len]=k;h->len++;}
-static sp_bool sp_StrPolyHash_has_key(sp_StrPolyHash*h,const char*k){if (SP_UNLIKELY(!h)) sp_nil_recv("key?");sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_eq(h->keys[idx],k))return TRUE;idx=(idx+1)&h->mask;}return FALSE;}
+static sp_RbVal sp_StrPolyHash_get(sp_StrPolyHash*h,const char*k){if(!h)return sp_box_nil();sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_probe_eq(h->keys[idx],k))return h->vals[idx];idx=(idx+1)&h->mask;}if(h->dproc)return h->dproc(h,k,h->dproc_self);return h->default_v;}
+static void sp_StrPolyHash_set(sp_StrPolyHash*h,const char*k,sp_RbVal v){sp_gc_wb((void*)h); if(!k){sp_raise_cls("TypeError","no implicit conversion of nil into String");return;} if(h->len*2>=h->cap)sp_StrPolyHash_grow(h);sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_probe_eq(h->keys[idx],k)){h->vals[idx]=v;return;}idx=(idx+1)&h->mask;}{SP_GC_ROOT(h);SP_GC_ROOT_STR(k);SP_GC_ROOT_RBVAL(v);k=sp_hash_key_str(k);}sp_gc_wb((void*)h);h->keys[idx]=k;h->vals[idx]=v;h->order[h->len]=k;h->len++;}
+static sp_bool sp_StrPolyHash_has_key(sp_StrPolyHash*h,const char*k){if (SP_UNLIKELY(!h)) sp_nil_recv("key?");sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_probe_eq(h->keys[idx],k))return TRUE;idx=(idx+1)&h->mask;}return FALSE;}
 static sp_int sp_StrPolyHash_length(sp_StrPolyHash*h){return h->len;}
 static sp_StrArray*sp_StrPolyHash_keys(sp_StrPolyHash*h){SP_GC_ROOT(h);sp_StrArray*a=sp_StrArray_new();SP_GC_ROOT(a);if (SP_UNLIKELY(!h)) sp_nil_recv("keys");for(sp_int i=0;i<h->len;i++)sp_StrArray_push_e(a,SP_SEK(h->order[i]));return a;}
 static sp_PolyArray*sp_StrPolyHash_values(sp_StrPolyHash*h){SP_GC_ROOT(h);sp_PolyArray*a=sp_PolyArray_new();SP_GC_ROOT(a);for(sp_int i=0;i<h->len;i++)sp_PolyArray_push(a,sp_StrPolyHash_get(h,h->order[i]));return a;}
 static sp_bool sp_StrPolyHash_has_value(sp_StrPolyHash*h,sp_RbVal v){if (SP_UNLIKELY(!h)) sp_nil_recv("value?");for(sp_int i=0;i<h->len;i++)if(sp_poly_rb_equal(sp_StrPolyHash_get(h,h->order[i]),v))return TRUE;return FALSE;}
-static void sp_StrPolyHash_delete(sp_StrPolyHash*h,const char*k){ sp_gc_wb((void*)h);sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_eq(h->keys[idx],k)){h->keys[idx]=NULL;h->vals[idx]=sp_box_nil();h->len--;sp_int j=(idx+1)&h->mask;while(h->keys[j]){sp_int nj=(sp_int)(sp_str_hash(h->keys[j])&h->mask);if((j>idx&&(nj<=idx||nj>j))||(j<idx&&nj<=idx&&nj>j)){h->keys[idx]=h->keys[j];h->vals[idx]=h->vals[j];h->keys[j]=NULL;h->vals[j]=sp_box_nil();idx=j;}j=(j+1)&h->mask;}{sp_int oi=0;while(oi<=h->len){if(strcmp(h->order[oi],k)==0){while(oi<h->len){h->order[oi]=h->order[oi+1];oi++;}break;}oi++;}}return;}idx=(idx+1)&h->mask;}}
-static void sp_StrPolyHash_delete_bytes(sp_StrPolyHash*h,const char*k){ sp_gc_wb((void*)h);sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_eq(h->keys[idx],k)){h->keys[idx]=NULL;h->vals[idx]=sp_box_nil();h->len--;sp_int j=(idx+1)&h->mask;while(h->keys[j]){sp_int nj=(sp_int)(sp_str_hash(h->keys[j])&h->mask);if((j>idx&&(nj<=idx||nj>j))||(j<idx&&nj<=idx&&nj>j)){h->keys[idx]=h->keys[j];h->vals[idx]=h->vals[j];h->keys[j]=NULL;h->vals[j]=sp_box_nil();idx=j;}j=(j+1)&h->mask;}{sp_int oi=0;while(oi<=h->len){if(sp_str_eq(h->order[oi],k)){while(oi<h->len){h->order[oi]=h->order[oi+1];oi++;}break;}oi++;}}return;}idx=(idx+1)&h->mask;}}
+static void sp_StrPolyHash_delete(sp_StrPolyHash*h,const char*k){ sp_gc_wb((void*)h);sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_probe_eq(h->keys[idx],k)){sp_order_drop_str(h->order,h->len,h->keys[idx]);h->keys[idx]=NULL;h->vals[idx]=sp_box_nil();h->len--;sp_int j=(idx+1)&h->mask;while(h->keys[j]){sp_int nj=(sp_int)(sp_str_hash(h->keys[j])&h->mask);if((j>idx&&(nj<=idx||nj>j))||(j<idx&&nj<=idx&&nj>j)){h->keys[idx]=h->keys[j];h->vals[idx]=h->vals[j];h->keys[j]=NULL;h->vals[j]=sp_box_nil();idx=j;}j=(j+1)&h->mask;}return;}idx=(idx+1)&h->mask;}}
+static void sp_StrPolyHash_delete_bytes(sp_StrPolyHash*h,const char*k){ sp_gc_wb((void*)h);sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_probe_eq(h->keys[idx],k)){sp_order_drop_str(h->order,h->len,h->keys[idx]);h->keys[idx]=NULL;h->vals[idx]=sp_box_nil();h->len--;sp_int j=(idx+1)&h->mask;while(h->keys[j]){sp_int nj=(sp_int)(sp_str_hash(h->keys[j])&h->mask);if((j>idx&&(nj<=idx||nj>j))||(j<idx&&nj<=idx&&nj>j)){h->keys[idx]=h->keys[j];h->vals[idx]=h->vals[j];h->keys[j]=NULL;h->vals[j]=sp_box_nil();idx=j;}j=(j+1)&h->mask;}return;}idx=(idx+1)&h->mask;}}
 /* Hash#merge for str_poly_hash. Same shape as the
    StrIntHash / SymPolyHash siblings -- copy recv's entries into a
    fresh hash, then overlay other's. */
@@ -10864,7 +10827,7 @@ static void sp_kwargs_check(sp_SymPolyHash *h, const char *const *allowed) {
 /* Hash#delete for sym_poly_hash. Removes key and re-tombstones the
    slot, shifting probe-chain successors backward and dropping the
    key from the insertion-order list. Issue #510. */
-static void sp_SymPolyHash_delete(sp_SymPolyHash*h,sp_sym k){ sp_gc_wb((void*)h);sp_int idx=(sp_int)(((sp_int)k)&h->mask);while(h->keys[idx]>=0){if(h->keys[idx]==k){h->keys[idx]=-1;h->vals[idx]=sp_box_nil();h->len--;sp_int j=(idx+1)&h->mask;while(h->keys[j]>=0){sp_int nj=(sp_int)(((sp_int)h->keys[j])&h->mask);if((j>idx&&(nj<=idx||nj>j))||(j<idx&&nj<=idx&&nj>j)){h->keys[idx]=h->keys[j];h->vals[idx]=h->vals[j];h->keys[j]=-1;h->vals[j]=sp_box_nil();idx=j;}j=(j+1)&h->mask;}{sp_int oi=0;while(oi<=h->len){if(h->order[oi]==k){while(oi<h->len){h->order[oi]=h->order[oi+1];oi++;}break;}oi++;}}return;}idx=(idx+1)&h->mask;}}
+static void sp_SymPolyHash_delete(sp_SymPolyHash*h,sp_sym k){ sp_gc_wb((void*)h);sp_int idx=(sp_int)(((sp_int)k)&h->mask);while(h->keys[idx]>=0){if(h->keys[idx]==k){sp_order_drop_int(h->order,h->len,k);h->keys[idx]=-1;h->vals[idx]=sp_box_nil();h->len--;sp_int j=(idx+1)&h->mask;while(h->keys[j]>=0){sp_int nj=(sp_int)(((sp_int)h->keys[j])&h->mask);if((j>idx&&(nj<=idx||nj>j))||(j<idx&&nj<=idx&&nj>j)){h->keys[idx]=h->keys[j];h->vals[idx]=h->vals[j];h->keys[j]=-1;h->vals[j]=sp_box_nil();idx=j;}j=(j+1)&h->mask;}return;}idx=(idx+1)&h->mask;}}
 sp_SymPolyHash*sp_SymPolyHash_dup(sp_SymPolyHash*h);
 /* An Object.new instance's instance variables (sp_Object): get answers nil
    for one never set, set raises FrozenError on a frozen object, as CRuby. */
@@ -11568,7 +11531,7 @@ static void sp_PolyPolyHash_delete(sp_PolyPolyHash*h,sp_RbVal k){
   sp_int idx=(sp_int)(hs&h->mask);
   while(h->occ[idx]){
     if(h->hs[idx]==hs&&sp_pph_eql_key(h,h->keys[idx],k)){
-      for(sp_int oi=0;oi<h->len;oi++)if(h->order[oi]==idx){h->len--;memmove(h->order+oi,h->order+oi+1,sizeof(sp_int)*(size_t)(h->len-oi));break;}
+      sp_order_drop_int(h->order,h->len,idx);h->len--;
       h->occ[idx]=FALSE;h->keys[idx]=sp_box_nil();h->vals[idx]=sp_box_nil();
       sp_int j=(idx+1)&h->mask;
       while(h->occ[j]){
@@ -13812,6 +13775,9 @@ static inline void sp_idset_check_big(sp_Bigint *v, const char *msg) { if (v) sp
    target is resolved inline via sp_class_le on the boxed object's cls_id. */
 extern const char *(*sp_user_exc_parent_fn)(const char *);  /* fwd: the program's exception parent table */
 static int (*sp_poly_is_a_hook)(sp_RbVal, sp_Class) = NULL;
+/* a class method `===` of the program's own: 1 when the class has one, and
+   its answer, boxed, in *out (set by sp_tu_init) */
+static int (*sp_cmeth_eqq_hook)(sp_RbVal, sp_Class, sp_RbVal *) = NULL;
 static sp_bool sp_poly_kind_of_builtin(sp_RbVal v, const char *cn) {
   if (!cn) return FALSE;
   if (strcmp(cn, "BasicObject") == 0) return TRUE;
@@ -15210,6 +15176,12 @@ static sp_RbVal sp_poly_sum_seed(sp_RbVal v, sp_RbVal seed) {
      express -- and with no arm at all it simply handed the seed back. */
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_RANGE && v.v.p)
     return sp_range_sum_seed(*(sp_Range *)v.v.p, seed);
+  /* A Float Range has no walk: the TypeError its walk raises (from Float, or
+     from NilClass when beginless), where it answered the seed */
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_FLOAT_RANGE && v.v.p) {
+    sp_frange_iter_raise(*(sp_FloatRange *)v.v.p, 0);
+    return seed;
+  }
   /* nil, a number, a boolean or a Symbol has no sum: it answered the seed */
   if (sp_poly_no_enum(v)) sp_raise_nomethod(sp_nomethod_msg_args("sum", v, 1, &seed));
   SP_GC_ROOT_RBVAL(v);
@@ -16300,71 +16272,73 @@ SP_CONSTRUCTOR static void sp_json_install_hooks(void) {
 #endif
 
 #include "sp_setjmp.h"
-/* Depth of the begin/rescue/ensure handler stack. Each entry holds a jmp_buf
-   (200-300 bytes on common targets) plus the parallel arrays below, all
-   static in every generated program. A build can set it with
-   -DSP_EXC_STACK_MAX=<n>, as it can SP_GC_STACK_MAX; the depth that matters
-   is the deepest nesting of simultaneously active handlers, not the number
-   of begin blocks in the source. Pushes are bounds-checked, so a program
-   that nests deeper raises SystemStackError (sp_stack_too_deep). */
-#ifndef SP_EXC_STACK_MAX
-#define SP_EXC_STACK_MAX 64
-#endif
+/* The begin/rescue/ensure handler stack, SP_EXC_STACK_MAX deep (sp_exc_ctx.h).
+   Each entry holds a jmp_buf (200-300 bytes on common targets) plus the
+   parallel arrays below, defined once in lib/sp_exc.c rather than in every
+   generated program. The depth that matters is the deepest nesting of
+   simultaneously active handlers, not the number of begin blocks in the
+   source. Pushes are bounds-checked, so a program that nests deeper raises
+   SystemStackError (sp_stack_too_deep). The program refers to the depths the
+   archive was built with, so a program compiled with another one fails to
+   link rather than indexing a stack of another size. */
+SP_CONSTRUCTOR static void sp_exc_depths_agree(void) {
+  (void)*(const volatile int *)&SP_EXC_DEPTHS_SYM(SP_EXC_STACK_MAX, SP_CATCH_STACK_MAX);
+}
 /* Per-worker (SP_TLS) in the threaded build: this is the active exception/ensure
    handler stack of the thread currently executing. It is swapped per fiber by
    sp_exc_ctx_save/load, which assumes a single active stack -- true at N=1, but
    with N>1 every OS worker runs a fiber concurrently, so each needs its own.
    Empty (plain static, byte-identical) in the single-threaded build. */
-static SP_TLS jmp_buf sp_exc_stack[SP_EXC_STACK_MAX];
-static SP_TLS const char *sp_exc_msg[SP_EXC_STACK_MAX];
+extern SP_TLS jmp_buf sp_exc_stack[SP_EXC_STACK_MAX];
+extern SP_TLS const char *sp_exc_msg[SP_EXC_STACK_MAX];
 /* GC-root watermark at each handler's entry: a raise longjmps past the
    __attribute__((cleanup)) pops of SP_GC_ROOT locals in the unwound frames,
    so the landing restores sp_gc_nroots from the popped slot. A side array
    (not a per-region C local) so protected regions add no stack locals --
    an extra local per region measurably shifts hot-function frames. */
-static SP_TLS int sp_exc_rootmark[SP_EXC_STACK_MAX];
+extern SP_TLS int sp_exc_rootmark[SP_EXC_STACK_MAX];
 #ifdef SP_CEXT
-static SP_TLS sp_cext_arena_mark sp_exc_cextmark[SP_EXC_STACK_MAX];
+extern SP_TLS sp_cext_arena_mark sp_exc_cextmark[SP_EXC_STACK_MAX];
 #endif
-static SP_TLS volatile int sp_exc_top = 0;
-static SP_TLS const char *sp_exc_cls[SP_EXC_STACK_MAX];
-static SP_TLS volatile const char *sp_last_exc_cls = sp_str_empty;
+extern SP_TLS volatile int sp_exc_top;
+extern SP_TLS const char *sp_exc_cls[SP_EXC_STACK_MAX];
+extern SP_TLS volatile const char *sp_last_exc_cls;
 /* The raised exception OBJECT, carried alongside (cls,msg) so a user
    exception subclass keeps its ivars across raise -> rescue (#1415).
    NULL for a bare string/builtin raise, which reconstructs on catch.
    sp_pending_exc_obj is set by sp_raise_exc just before the longjmp and
    consumed into the per-frame slot by sp_raise_cls. */
-static SP_TLS void *sp_exc_obj[SP_EXC_STACK_MAX];
-static SP_TLS void *sp_pending_exc_obj = NULL;
+extern SP_TLS void *sp_exc_obj[SP_EXC_STACK_MAX];
+extern SP_TLS void *sp_pending_exc_obj;
 /* The exception currently being handled (set by a rescue body), and the cause
    captured for the next raised exception -- Exception#cause threads the former
    into a newly raised exception's `cause` field. */
-static SP_TLS void *sp_pending_cause = NULL;
+extern SP_TLS void *sp_pending_cause;
 /* The exception unwinding through an `ensure` body: a raise from inside that
    body takes it as its cause, the way a raise inside a rescue takes $! (#3745). */
-static SP_TLS void *sp_inflight_cause = NULL;
+extern SP_TLS void *sp_inflight_cause;
 static inline void sp_inflight_restore(void **p) { sp_inflight_cause = *p; }
 /* A bare `raise` re-raises the handled exception itself, keeping the cause it
    already carries rather than becoming its own cause (#3745). */
-static SP_TLS int sp_reraise_current = 0;
+extern SP_TLS int sp_reraise_current;
 /* An exception passing on (a rescue that does not match it, a modifier
    rescue that catches StandardError only): sp_raise_cls raises it again from
    the landing, and snapshotting the stack there replaced the frames below
    with the landing's own -- a debug build's backtrace named the rescuing
    method and up, never the statement that raised (#5084). The pass-through
    sets this so the raise keeps the snapshot it already has. */
-static SP_TLS int sp_bt_keep = 0;
+extern SP_TLS int sp_bt_keep;
 /* `raise ..., cause: exc`: the explicit cause overrides the implicit
    currently-handled exception for exactly one raise. The `_set` flag records
    that a cause: was given at all, so `cause: nil` suppresses the implicit cause
    rather than reading as "no cause given" (#2990). */
-static SP_TLS void *sp_explicit_cause = NULL;
-static SP_TLS int sp_explicit_cause_set = 0;
+extern SP_TLS void *sp_explicit_cause;
+extern SP_TLS int sp_explicit_cause_set;
 /* Set by an ensure that resumes an exception it ran for: the propagation
    goes on, not a new raise, so the exception keeps the cause it was raised
    with, nil among them, where a raise in a rescue clause takes the handled
    one (#8375). */
-static SP_TLS int sp_reraise_continues = 0;
+extern SP_TLS int sp_reraise_continues;
 /* The exception handled at each active rescue-body depth (CRuby's per-rescue
    errinfo). The "currently handled" exception -- what Exception#cause threads --
    is the innermost: sp_rescue_sp>0 ? sp_exc_handling[sp_rescue_sp-1] : NULL. A
@@ -16372,12 +16346,12 @@ static SP_TLS int sp_reraise_continues = 0;
    already popped, so nested rescue bodies share an sp_exc_top. Pushed on rescue
    entry; popped on every exit -- fall-through, return/break/next/retry (codegen
    pops sp_rescue_sp), and raise-out (the landing restores sp_rescue_mark). */
-static SP_TLS void *sp_exc_handling[SP_EXC_STACK_MAX];
-static SP_TLS int sp_rescue_sp = 0;
+extern SP_TLS void *sp_exc_handling[SP_EXC_STACK_MAX];
+extern SP_TLS int sp_rescue_sp;
 /* sp_rescue_sp captured at each begin frame's arm, restored on that frame's
    exception landing so a rescue body that exits by raising doesn't leak its push
    (a side array beside the handler stack, mirroring sp_exc_rootmark). */
-static SP_TLS int sp_rescue_mark[SP_EXC_STACK_MAX];
+extern SP_TLS int sp_rescue_mark[SP_EXC_STACK_MAX];
 /* The container-walk path's depth (sp_inspect.h) at each handler's arm. Any
    non-local exit out of a guarded walk -- a raise, a throw, a break out of a
    block, a proc's non-local return -- longjmps past the sp_poly_recur_pop calls,
@@ -16391,17 +16365,8 @@ static SP_TLS int sp_rescue_mark[SP_EXC_STACK_MAX];
    a runtime call (sp_exc_check_depth, sp_catch_check_depth, sp_brk_push), so
    only the proc-return home -- a struct the method builds on its own C stack --
    needs a line in generated code. */
-static SP_TLS int sp_poly_recur_mark[SP_EXC_STACK_MAX];
-/* Called immediately before every longjmp into sp_exc_stack: the landing frame
-   is the one on top, and the walk frames pushed since it armed are about to be
-   jumped over, so give the path back the depth that frame recorded. */
-static inline void sp_poly_recur_unwind(void) {
-#ifdef SP_CEXT
-  if (sp_exc_top > 0) sp_cext_arena_restore(sp_exc_cextmark[sp_exc_top - 1]);
-#endif
-  if (sp_exc_top > 0) sp_poly_recur_pop(sp_poly_recur_mark[sp_exc_top - 1]);
-}
-#define sp_cur_handled() (sp_rescue_sp > 0 ? sp_exc_handling[sp_rescue_sp-1] : NULL)
+extern SP_TLS int sp_poly_recur_mark[SP_EXC_STACK_MAX];
+/* sp_poly_recur_unwind and sp_cur_handled: lib/sp_exc_ctx.h */
 /* `$!`: the exception being handled. A thread or fiber being killed
    unwinds through its ensures by the kill signal, which is no exception to
    the program: CRuby's $! is nil there (#8378). */
@@ -16451,22 +16416,7 @@ static inline void *sp_exc_caught_obj(void) {
    what has run out. (sp_rescue_push above keeps its own older wording, which
    names the nesting that overflowed.) */
 SP_NORETURN SP_COLD void sp_stack_too_deep(void);   /* lib/sp_exc.c */
-/* Guard an exception-frame arm. Every arm stores into sp_exc_rootmark
-   [sp_exc_top] (or sp_exc_msg[sp_exc_top]) before it bumps sp_exc_top, so what
-   the check must precede is that first indexed store, not the ++; it opens the
-   frame-arming sequence at every arm the codegen emits. The depth is not a
-   lexical property: a method whose body is a begin/rescue keeps its frame armed
-   across the calls that body makes, so ordinary recursion 65 deep reaches the
-   end of the array just as 65 nested begins do. Inside a fiber body, and inside
-   a thread's, one slot is already spent on the frame the runtime arms around it
-   (sp_exc_arm below), so 63 of the body's own is the last that fits. */
-static inline void sp_exc_check_depth(void) {
-  if (SP_UNLIKELY(sp_exc_top >= SP_EXC_STACK_MAX)) sp_stack_too_deep();
-#ifdef SP_CEXT
-  sp_exc_cextmark[sp_exc_top] = sp_cext_arena_snapshot();
-#endif
-  sp_poly_recur_mark[sp_exc_top] = sp_poly_recur_top;
-}
+/* sp_exc_check_depth: lib/sp_exc_ctx.h */
 /* ---- Native backtrace formatting (spinel --debug) ---------------------- */
 /* True for sp_<name> symbols that are runtime helpers, not user Ruby methods.
    A denylist of the lowercase runtime prefixes; user methods are sp_<rubyname>
@@ -16517,21 +16467,15 @@ static sp_StrArray *sp_caller(sp_int start, sp_bool have_len, sp_int len) {
    ensures it passes over). Declared here, before sp_raise_cls, so a real raise
    can clear it -- an exception raised inside an ensure during an unwind
    supersedes that unwind. The machinery that uses it lives further down. */
-enum { SP_UNWIND_NONE, SP_UNWIND_PROCRET, SP_UNWIND_THROW, SP_UNWIND_BREAK, SP_UNWIND_EXIT };
 struct sp_proc_home;
-static SP_TLS int sp_unwind_kind = SP_UNWIND_NONE, sp_unwind_target = -1, sp_unwind_exc_top = 0;  /* per-worker (see sp_exc_stack) */
-static SP_TLS struct sp_proc_home *sp_unwind_home = NULL;  /* PROCRET target (THROW uses sp_unwind_target) */
+extern SP_TLS int sp_unwind_kind, sp_unwind_target, sp_unwind_exc_top;  /* per-worker (see sp_exc_stack) */
+extern SP_TLS struct sp_proc_home *sp_unwind_home;  /* PROCRET target (THROW uses sp_unwind_target) */
 /* forward: materialize the exception object for a raise that carried none
    (a bare `raise "msg"` / `raise Cls, msg` / builtin runtime raise), so `$!`
    and `rescue => e` bind one real object with a stable identity. The struct
    tag is used because the sp_Exception typedef is defined further down; the
    result is stored as a void* in sp_exc_obj[]. */
 struct sp_Exception_s;
-static void *sp_exc_recover_named(const char *cls, const char *msg);
-/* forward: drop the handler-stack entries a raise unwinds past. Defined far
-   below, beside the three stacks it pops -- all of them declared after this
-   function, which is why the declaration has to come up here. */
-static void sp_handler_stacks_unwind(void);
 /* forward: run the registered at_exit hooks and answer the exit status the
    program should end with -- `status` is what the path that called it would
    have used, and a hook that exits or raises replaces it (see the definition,
@@ -16547,256 +16491,15 @@ static void sp_handler_stacks_unwind(void);
    newly reserve that verb. The list is built by scanning these sources for
    sp_ tokens, comments included, so a comment must not spell one either. */
 static int sp_at_exit_run(int status);
+extern int (*sp_at_exit_run_fn)(int);   /* lib/sp_exc.c: the raise's way to the hooks */
 void sp_fin_run_exit(void);   /* lib/sp_gc.c: finalizers still registered at exit */
 /* Print an uncaught exception in CRuby's tail format. Factored out because two
    places print it now: the end of sp_raise_cls, and a hook whose own exception
    reached the drain's protect frame. */
-static void sp_exc_print_uncaught(const char *cls, const char *msg, sp_StrArray *bt);
+void sp_exc_print_uncaught(const char *cls, const char *msg, sp_StrArray *bt);   /* lib/sp_exc.c */
 void sp_exc_resignal(const char *cls, const char *msg);   /* lib/sp_cold.c */
-/* CRuby's tail format "<message> (<ClassName>)", prefixed by the raising frame
-   and followed by its callers when the backtrace substrate is live (a --debug
-   build). Without it there is no location to print, and an uncaught raise in a
-   multi-file program said only what went wrong, never where (#3974). Frames
-   are method-granularity, so there is no `:line:`. */
-/* The text of the report: the message (the class's name when it has none) and
-   the class in parentheses. The class is shown as it prints: an unnamed
-   Class.new class prints its #<Class:0x...> form, and CRuby adds no
-   "(Class)" suffix for it. */
-static void sp_exc_print_uncaught_text(const char *cls, const char *msg) {
-  const char *shown = sp_exc_cls_display(cls);
-  const char *text = (msg && *msg) ? msg : shown;
-  if (sp_exc_cls_unnamed(shown)) fprintf(stderr, "%s\n", text);
-  else fprintf(stderr, "%s (%s)\n", text, shown);
-}
-static void sp_exc_print_uncaught(const char *cls, const char *msg, sp_StrArray *bt) {
-#if SP_BT_AVAILABLE
-  if (sp_bt_enabled) {
-    if (!bt && sp_bt_n > 0) bt = sp_bt_format(sp_bt_buf, sp_bt_n);
-    if (bt && bt->len > 0) {
-      fprintf(stderr, "%s: ", sp_StrArray_get(bt, 0));
-      sp_exc_print_uncaught_text(cls, msg);
-      for (sp_int _i = 1; _i < bt->len; _i++)
-        fprintf(stderr, "\tfrom %s\n", sp_StrArray_get(bt, _i));
-      return;
-    }
-  }
-#endif
-  sp_exc_print_uncaught_text(cls, msg);
-}
-#ifdef SPINEL_EXT_HOST
-SP_NORETURN SP_COLD void sp_raise_cls(const char *cls, const char *msg);
-#else
-/* The C stack ran out. Unlike the handler-stack exhaustion below, this one
-   CAN be rescued: the frames that filled the stack are about to be unwound,
-   and the handler that catches it sits in one of them.
-   Called from the SIGSEGV handler, on the alternate signal stack, so nothing
-   here may allocate or take a lock -- sp_raise_cls does both. These are the
-   three plain stores sp_raise_cls ends with, and the same longjmp: the
-   landing pad reads the class and message from the slots, and restores the
-   root watermark itself. With no handler armed there is nothing to jump to,
-   so the caller's report stands and the process dies as before. */
-static void sp_raise_stack_overflow(void) {
-  if (sp_exc_top <= 0) return;   /* nothing armed: let the handler report */
-  sp_exc_msg[sp_exc_top-1] = (&("\xff" "stack level too deep")[1]);
-  sp_exc_cls[sp_exc_top-1] = "SystemStackError";
-  sp_exc_obj[sp_exc_top-1] = NULL;
-  sp_pending_exc_obj = NULL;
-  sp_pending_cause = NULL;
-  sp_inflight_cause = NULL;
-  sp_explicit_cause = NULL;
-  sp_explicit_cause_set = 0;
-  sp_last_exc_cls = "SystemStackError";
-  sp_unwind_kind = SP_UNWIND_NONE;
-  sp_handler_stacks_unwind();
-  sp_poly_recur_unwind();
-  longjmp(sp_exc_stack[sp_exc_top-1], 1);
-}
-/* Whether `obj` is on the cause chain that starts at `c` (c itself
-   included). The walk stops at a cycle that does not pass through `obj`. */
-static int sp_exc_cause_chain_reaches(sp_Exception *c, void *obj) {
-  sp_Exception *slow = c;
-  while (c) {
-    if ((void *)c == obj) return 1;
-    c = c->cause;
-    if (!c) return 0;
-    if ((void *)c == obj) return 1;
-    c = c->cause;
-    slow = slow->cause;
-    if (c == slow) return 0;
-  }
-  return 0;
-}
-/* The cause a raise takes when none is named is `c`: the exception being
-   handled, else the one an ensure body has in flight. An object raised again
-   while one of its own effects is that exception (an exception whose cause
-   chain leads back to it) keeps the cause it had: the other would close a
-   ring, or make it its own cause. Every raise passes here, so the raised
-   object comes in as a local and `c` is tested first: a raise made with
-   nothing handled and nothing in flight goes on at that test. */
-/* A frozen exception takes no implicit cause, as in CRuby: one first raised
-   with `cause: nil` kept nil when raised again inside a rescue (#8276) */
-static SP_INLINE void *sp_exc_implicit_cause(void *c, void *obj) {
-  if (obj && sp_gc_is_frozen(obj)) return ((sp_Exception *)obj)->cause;
-  if (c && obj && sp_exc_cause_chain_reaches((sp_Exception *)c, obj)) return ((sp_Exception *)obj)->cause;
-  return c;
-}
-/* --exceptions=abort has no frame to jump to: every raise is reported as
-   uncaught and traps (sp_setjmp.h) */
-#ifdef SP_EXC_ABORT
-# define SP_EXC_UNWINDS 0
-#else
-# define SP_EXC_UNWINDS 1
-#endif
-SP_NORETURN SP_COLD void sp_raise_cls(const char *cls, const char *msg) {
-  /* a raise leaves any region a signal may be raised in at once (#9222):
-     what follows allocates */
-  sp_sig_async_ok = 0;
-  /* Launder the message onto the string heap and root the copy before anything
-     below allocates. `msg` is the caller's own pointer and comes in one of two
-     shapes, neither of which survives a collection here. A raiser that formats
-     its text -- sp_sprintf, as sp_raise_poly_nomethod and its kin do -- hands
-     over a heap string nothing roots, so the sweep inside sp_exc_recover_named,
-     inside sp_exc_apply_staged, or inside the slot store below freed it under
-     the reads that follow. A bare C literal, the other shape and by far the commoner one, cannot simply
-     be rooted instead: it has no marker byte, so sp_mark_string would read -- and sometimes write -- the
-     byte in front of it. Copying first and rooting the copy is the idiom
-     lib/sp_exc.c documents above sp_exc_new; sp_msg_heapify allocates without
-     giving the collector a turn, so there is no window between the two. The
-     no-message sentinel keeps its identity: that identity is what tells an
-     empty message apart from no message at all (#3711).
-     The root is never popped, because this function longjmps -- and that costs
-     nothing: every exception landing restores sp_gc_nroots to the watermark it
-     recorded before its own setjmp (sp_exc_rootmark, or a C local in the
-     Kernel#loop and enumerator landings), which discards this entry, and a
-     fiber's trampoline hands the whole root stack back to its resumer. */
-  int cont = sp_reraise_continues;   /* an ensure resuming its exception (see there) */
-  sp_reraise_continues = 0;
-  if (!sp_exc_msg_empty_given(msg)) msg = sp_msg_heapify(msg);
-  /* a frozen message (a literal's) as frozen text (sp_exc_msg_plain) */
-  if (!sp_exc_msg_empty_given(msg)) msg = sp_exc_msg_plain(msg);
-  SP_GC_ROOT_STR(msg);
-#if SP_BT_AVAILABLE
-  /* A pass-through, a bare raise, or an ensure resuming its saved exception
-     keeps the frames of the raise that made it, as CRuby does. */
-  if (sp_bt_enabled && !sp_bt_keep && !sp_reraise_current && !cont) sp_bt_n = sp_bt_capture(sp_bt_buf, 256);
-#endif
-  sp_bt_keep = 0;
-  /* A real exception supersedes any non-local unwind in flight (e.g. raised from
-     inside an `ensure` running during a proc-return / throw): clear the unwind so
-     an outer handler treats this as an exception, not a continued unwind. */
-  sp_unwind_kind = SP_UNWIND_NONE;
-  /* a bare `raise` inside a rescue re-raises the handled exception itself, so
-     it keeps the cause it already has (#3745) */
-  if (sp_reraise_current) {
-    sp_reraise_current = 0;
-    if (!sp_pending_exc_obj && sp_cur_handled()) sp_pending_exc_obj = sp_cur_handled();
-  }
-  /* NameError/NoMethodError#name: the runtime raisers' messages carry the
-     offending name as the first quoted token ("undefined method 'foo' for
-     ..."); materialize the carried object with #name set so a rescue binding
-     reads it (#2758). Keyed on the exact runtime message shapes. */
-  if (!sp_pending_exc_obj && msg && cls && sp_exc_top > 0 &&
-      (strcmp(cls, "NoMethodError") == 0 || strcmp(cls, "NameError") == 0) &&
-      (strncmp(msg, "undefined method '", 18) == 0 ||
-       strncmp(msg, "undefined local variable or method '", 36) == 0 ||   /* 36 = prefix len; 37 compared the NUL too (#3121) */
-       strncmp(msg, "private method '", 16) == 0 ||      /* visibility refusals carry the name too */
-       strncmp(msg, "protected method '", 18) == 0 ||
-       strncmp(msg, "instance variable ", 18) == 0 ||   /* remove_instance_variable of an absent ivar */
-       strncmp(msg, "uninitialized constant ", 23) == 0))   /* const_get / bad const (#3034) */
-    sp_pending_exc_obj = sp_exc_recover_named(cls, msg);
-  /* the introspection staging (receiver/key/value) rides the carried object */
-  if (sp_pending_exc_flags && msg && cls && sp_exc_top > 0)
-    sp_pending_exc_obj = sp_exc_apply_staged(cls, msg, sp_pending_exc_obj);
-  sp_pending_exc_flags = 0;
-  /* An explicit `cause:` replaces the cause the raised object already
-     carries, as CRuby's does: a rescue clause fills only an empty cause, so
-     it never saw the new one. A frozen exception is raised as a copy that
-     takes the cause, as in CRuby. A cause whose chain leads back to the
-     object would close a cycle: CRuby raises ArgumentError instead. The
-     object named as its own cause leaves its cause as it is. */
-  if (sp_exc_top > 0 && sp_explicit_cause_set && sp_explicit_cause && sp_pending_exc_obj) {
-    if (sp_explicit_cause == sp_pending_exc_obj) {
-      sp_explicit_cause = ((sp_Exception *)sp_pending_exc_obj)->cause;
-    }
-    else if (sp_exc_cause_chain_reaches((sp_Exception *)sp_explicit_cause, sp_pending_exc_obj)) {
-      sp_explicit_cause = NULL; sp_explicit_cause_set = 0; sp_pending_exc_obj = NULL;
-      sp_raise_cls("ArgumentError", "circular causes");
-    }
-    else {
-      if (sp_gc_is_frozen(sp_pending_exc_obj)) sp_pending_exc_obj = sp_exc_dup((sp_Exception *)sp_pending_exc_obj);
-      sp_gc_wb(sp_pending_exc_obj);
-      ((sp_Exception *)sp_pending_exc_obj)->cause = (sp_Exception *)sp_explicit_cause;
-    }
-  }
-  /* The slot takes the laundered copy made at the top of this function (or the
-     bare-raise sentinel, or NULL) as it stands: it is already a string-heap
-     one with a marker byte, so sp_mark_in_flight_exceptions can mark it from
-     here to the landing, and copying it a second time would only reintroduce
-     an allocation between the last read of the caller's pointer and this
-     store. */
-  /* Uncaught: CRuby's tail format "<message> (<ClassName>)", prefixed by the
-     raising frame and followed by its callers when the backtrace substrate is
-     live (a --debug build). Without it there is no location to print, and an
-     uncaught raise in a multi-file program said only what went wrong, never
-     where (#3974). Frames are method-granularity, so there is no `:line:`. */
-  /* The implicit cause is the exception being handled, unless that is the
-     very object raised: re-raised from its own rescue (a bare `raise`,
-     `raise e`, or through an ensure), it keeps the cause it had instead of
-     becoming its own -- the pending cause is that cause, so a rescue that
-     stores the pending cause outright (a modifier rescue) keeps it too. */
-  if (SP_EXC_UNWINDS && sp_exc_top > 0) { sp_exc_msg[sp_exc_top-1] = msg; sp_exc_cls[sp_exc_top-1] = cls; void *raised = sp_pending_exc_obj; sp_exc_obj[sp_exc_top-1] = raised; sp_pending_exc_obj = NULL; sp_pending_cause = cont && raised ? (void *)((sp_Exception *)raised)->cause : sp_explicit_cause_set ? sp_explicit_cause : sp_cur_handled() ? (sp_cur_handled() == raised ? (void *)((sp_Exception *)raised)->cause : sp_exc_implicit_cause(sp_cur_handled(), raised)) : sp_exc_implicit_cause(sp_inflight_cause, raised); sp_inflight_cause = NULL; sp_explicit_cause = NULL; sp_explicit_cause_set = 0; sp_last_exc_cls = cls; sp_handler_stacks_unwind(); sp_poly_recur_unwind(); longjmp(sp_exc_stack[sp_exc_top-1], 1); }
-  /* Uncaught SystemExit terminates silently with its status (Kernel#exit).
-     Read the status BEFORE the hooks run: it lives in the pending exception
-     object, which nothing roots once the hooks start allocating. */
-  if (strcmp(cls, "SystemExit") == 0) exit(sp_at_exit_run(sp_exc_exit_status(sp_pending_exc_obj)));
-  /* A killed main fiber (Fiber#kill, lib/sp_fiber.c) ends the program with
-     status 1 after the at_exit hooks, as CRuby does. */
-  if (strcmp(cls, "FiberKillSignal") == 0) exit(sp_at_exit_run(1));
-  /* CRuby's report prints what #message answers, so an exception class that
-     defines its own #message (or #to_s, which the default #message calls)
-     prints that text rather than the one stored at #new. A `raise Class`
-     carries no object, so one is made to ask. Ask before the hooks run: once
-     they allocate, nothing roots the pending object. */
-  if (sp_user_exc_message_fn) {
-    sp_Exception *e = sp_pending_exc_obj ? (sp_Exception *)sp_pending_exc_obj : sp_exc_new(cls, msg);
-    SP_GC_ROOT(e);
-    const char *own = sp_user_exc_message_fn(e);
-    if (own) { msg = sp_msg_heapify(own); SP_GC_ROOT_STR(msg); }
-  }
-  /* An uncaught exception prints its text AFTER the hooks have run, which is
-     the order CRuby prints them in, and the status is theirs to change (a hook
-     that calls `exit 5` makes an uncaught raise exit 5, still printing the
-     error). `msg` survives the hooks because it was laundered onto the string
-     heap and rooted at the top of this function and that root is never popped;
-     `cls` is a codegen-emitted literal the collector never touches. The
-     backtrace substrate is not so lucky: a hook that raises overwrites it, so
-     a debug build keeps its own copy across the drain. */
-#if SP_BT_AVAILABLE
-  /* The object may have kept its original trace across a bare raise inside
-     ensure. Hooks clear the pending object, so root its trace before draining. */
-  sp_StrArray *_bt_obj = (sp_bt_enabled && sp_pending_exc_obj)
-    ? ((sp_Exception *)sp_pending_exc_obj)->backtrace : NULL;
-  if (_bt_obj) _sp_gc_root_push((void **)&_bt_obj);
-  void *_bt_keep[256];
-  int _bt_keep_n = (sp_bt_enabled && sp_bt_n > 0) ? sp_bt_n : 0;
-  if (_bt_keep_n > 0) memcpy(_bt_keep, sp_bt_buf, sizeof(void *) * (size_t)_bt_keep_n);
-#endif
-  { int status = sp_at_exit_run(1);
-#if SP_BT_AVAILABLE
-    if (_bt_keep_n > 0) { memcpy(sp_bt_buf, _bt_keep, sizeof(void *) * (size_t)_bt_keep_n); sp_bt_n = _bt_keep_n; }
-    sp_exc_print_uncaught(cls, msg, _bt_obj);
-#else
-    sp_exc_print_uncaught(cls, msg, NULL);
-#endif
-    sp_exc_resignal(cls, msg);
-#ifdef SP_EXC_ABORT
-    (void)status;
-    sp_exc_abort_trap();   /* --exceptions=abort: the host's failure (sp_setjmp.h) */
-#else
-    exit(status);
-#endif
-  } }
-#endif
+void sp_raise_stack_overflow(void);   /* lib/sp_exc.c */
+SP_NORETURN SP_COLD void sp_raise_cls(const char *cls, const char *msg);   /* lib/sp_exc.c */
 static void sp_raise(const char *msg) { sp_raise_cls("RuntimeError", msg); }
 
 /* Unwrap a boxed Proc -- one read out of a container (#3655). */
@@ -17168,41 +16871,6 @@ size_t (*sp_user_exc_layout_fn)(const char *, void (**)(void *)) = NULL;
 void (*sp_user_exc_ivinit_fn)(void *) = NULL;
 void (*sp_exc_bivar_copy_fn)(void *, void *) = NULL;
 #endif
-/* Build the carried NameError/NoMethodError with #name recovered from the
-   message's first quoted token (see sp_raise_cls, #2758). */
-static void *sp_exc_recover_named(const char *cls, const char *msg) {
-  char nb[128];
-  const char *q1 = strchr(msg, '\'');
-  const char *q2 = q1 ? strchr(q1 + 1, '\'') : NULL;
-  if (q2 && q2 > q1 + 1 && (size_t)(q2 - q1) <= 128) {
-    size_t n = (size_t)(q2 - q1 - 1);
-    memcpy(nb, q1 + 1, n); nb[n] = 0;
-  }
-  else if (strncmp(msg, "instance variable ", 18) == 0) {
-    /* "instance variable @v not defined": the name is the unquoted token
-       after the prefix, the ivar remove_instance_variable could not find */
-    const char *p = msg + 18;
-    size_t n = 0;
-    while (p[n] && p[n] != ' ' && n < 127) n++;
-    if (n == 0) return NULL;
-    memcpy(nb, p, n); nb[n] = 0;
-  }
-  else {
-    /* "uninitialized constant NAME": the name is the unquoted trailing token,
-       the constant the message reports as missing (#3034) */
-    const char *pfx = "uninitialized constant ";
-    if (strncmp(msg, pfx, 23) != 0) return NULL;
-    const char *p = msg + 23;
-    size_t n = 0;
-    while (p[n] && (isalnum((unsigned char)p[n]) || p[n] == '_' || p[n] == ':') && n < 127) n++;
-    if (n == 0) return NULL;
-    memcpy(nb, p, n); nb[n] = 0;
-  }
-  sp_Exception *e = sp_exc_new(cls, msg);   /* launders msg into the GC heap */
-  SP_GC_ROOT(e);
-  e->xname = sp_box_sym(sp_sym_intern(nb));
-  return e;
-}
 /* Kernel#exit: raises a rescuable SystemExit carrying the status; with no
    handler in scope it terminates directly (#2761). exit! stays direct. */
 static void sp_raise_exc(volatile sp_Exception *ve);   /* defined below */
@@ -17237,6 +16905,55 @@ static void sp_raise_exc(volatile sp_Exception *ve) {
   sp_pending_exc_obj = (void *)e;
   /* a message never given is the class name, as #message answers it */
   sp_raise_cls(e->cls_name, (e->msg && !e->msg_h) ? e->msg : sp_exc_message(e));
+}
+/* A dispatcher's raise of NoMethodError for a call that finds no method,
+   out of line so the call that does not raise carries nothing for it: the
+   error names the method and holds the receiver and the call's arguments,
+   the n that follow (passed as values, so the caller keeps no array for
+   them), or a rest dispatcher's rest array and keywords (a non-empty hash is
+   the last argument). The caller passes operands that allocate nothing, but
+   some are heap values nothing else holds (an interpolated message, a
+   temporary receiver), so each is rooted on entry, before the first
+   allocation here. */
+SP_NORETURN SP_COLD SP_NOINLINE static void sp_raise_nomethod_obj(const char *msg, sp_RbVal name, sp_RbVal recv, sp_PolyArray *a) {
+  sp_Exception *e = sp_exc_new("NoMethodError", msg);
+  e->xname = name;
+  e->xkey = sp_box_poly_array(a);
+  e->xrecv = recv;
+  e->has_recv = 1;
+  sp_raise_exc(e);
+  SP_UNREACHABLE();   /* sp_raise_exc longjmps */
+}
+SP_NORETURN SP_COLD SP_NOINLINE static void sp_raise_nomethod_call(const char *msg, sp_RbVal name, sp_RbVal recv, sp_int n, ...) {
+  SP_GC_SAVE();
+  SP_GC_ROOT_STR(msg);
+  SP_GC_ROOT_RBVAL(name);
+  SP_GC_ROOT_RBVAL(recv);
+  sp_RbVal v[n > 0 ? n : 1];
+  va_list ap;
+  va_start(ap, n);
+  for (sp_int i = 0; i < n; i++) v[i] = va_arg(ap, sp_RbVal);
+  va_end(ap);
+  for (sp_int i = 0; i < n; i++) _sp_gc_root_push((void **)((uintptr_t)&v[i] | (uintptr_t)1));
+  sp_PolyArray *a = sp_PolyArray_new();
+  SP_GC_ROOT(a);
+  for (sp_int i = 0; i < n; i++) sp_PolyArray_push(a, v[i]);
+  sp_raise_nomethod_obj(msg, name, recv, a);
+}
+SP_NORETURN SP_COLD SP_NOINLINE static void sp_raise_nomethod_call_rest(const char *msg, sp_RbVal name, sp_RbVal recv, sp_RbVal rest, sp_RbVal kw) {
+  SP_GC_SAVE();
+  SP_GC_ROOT_STR(msg);
+  SP_GC_ROOT_RBVAL(name);
+  SP_GC_ROOT_RBVAL(recv);
+  SP_GC_ROOT_RBVAL(rest);
+  SP_GC_ROOT_RBVAL(kw);
+  sp_PolyArray *a = sp_PolyArray_new();
+  SP_GC_ROOT(a);
+  sp_PolyArray *r = sp_poly_to_poly_array(rest);
+  SP_GC_ROOT(r);
+  for (sp_int i = 0; r && i < r->len; i++) sp_PolyArray_push(a, r->data[i]);
+  if (sp_poly_length(kw) > 0) sp_PolyArray_push(a, kw);
+  sp_raise_nomethod_obj(msg, name, recv, a);
 }
 /* e.message as the String handle it holds (sp_Exception.msg_h), for a
    change through it (--share-strings). A message held as bytes becomes the
@@ -17590,22 +17307,19 @@ void sp_bigint_raise_zerodiv(const char *msg) { sp_raise_cls("ZeroDivisionError"
    The SP_UNWIND_* enum and sp_unwind_* state are declared earlier (before
    sp_raise_cls, which clears them when a real exception supersedes an unwind). */
 
-/* Depth of the catch/throw stack: the same jmp_buf cost and the same knob as
-   SP_EXC_STACK_MAX above (-DSP_CATCH_STACK_MAX=<n>). */
-#ifndef SP_CATCH_STACK_MAX
-#define SP_CATCH_STACK_MAX 64
-#endif
-static SP_TLS jmp_buf sp_catch_stack[SP_CATCH_STACK_MAX];   /* per-worker (see sp_exc_stack) */
-static SP_TLS const char *sp_catch_tag[SP_CATCH_STACK_MAX];
+/* The catch/throw stack, SP_CATCH_STACK_MAX deep (sp_exc_ctx.h): the same
+   jmp_buf cost as the handler stack above, defined in lib/sp_exc.c too. */
+extern SP_TLS jmp_buf sp_catch_stack[SP_CATCH_STACK_MAX];   /* per-worker (see sp_exc_stack) */
+extern SP_TLS const char *sp_catch_tag[SP_CATCH_STACK_MAX];
 /* 0 = name tag (symbol/string, matched by content); 1 = object tag (matched
    by pointer identity, CRuby's non-symbol tag semantics) */
-static SP_TLS unsigned char sp_catch_tag_kind[SP_CATCH_STACK_MAX];
+extern SP_TLS unsigned char sp_catch_tag_kind[SP_CATCH_STACK_MAX];
 /* boxed value channel, like sp_brk_val: any thrown value carries faithfully */
-static SP_TLS sp_RbVal sp_catch_val[SP_CATCH_STACK_MAX];
-static SP_TLS int sp_catch_exc_top[SP_CATCH_STACK_MAX];  /* exception depth at each catch's entry */
-static SP_TLS int sp_catch_rootmark[SP_CATCH_STACK_MAX]; /* GC-root watermark at entry (see sp_exc_rootmark) */
-static SP_TLS int sp_catch_recur_mark[SP_CATCH_STACK_MAX]; /* walk-path depth at entry (see sp_poly_recur_mark) */
-static SP_TLS volatile int sp_catch_top = 0;
+extern SP_TLS sp_RbVal sp_catch_val[SP_CATCH_STACK_MAX];
+extern SP_TLS int sp_catch_exc_top[SP_CATCH_STACK_MAX];  /* exception depth at each catch's entry */
+extern SP_TLS int sp_catch_rootmark[SP_CATCH_STACK_MAX]; /* GC-root watermark at entry (see sp_exc_rootmark) */
+extern SP_TLS int sp_catch_recur_mark[SP_CATCH_STACK_MAX]; /* walk-path depth at entry (see sp_poly_recur_mark) */
+extern SP_TLS volatile int sp_catch_top;
 /* Guard a catch push, like sp_exc_check_depth: the arm's first store is
    sp_catch_tag[sp_catch_top], so this runs in front of it -- which also makes
    it the one place every catch arm passes through, so the walk path's depth is
@@ -17706,12 +17420,12 @@ static void sp_throw(const char *tag, int kind, sp_RbVal val) {
    ~8% fps in a program that never breaks from a block. TLS holds only
    the pointers, so break-free programs pay nothing. */
 #define SP_BRK_STACK_MAX 64
-static SP_TLS jmp_buf *sp_brk_stack;              /* lazily allocated */
-static SP_TLS sp_RbVal *sp_brk_val;
-static SP_TLS sp_int *sp_brk_serial;
-static SP_TLS int *sp_brk_exc_top;                /* sp_exc_top at scope entry */
-static SP_TLS int *sp_brk_recur_mark;            /* walk-path depth at scope entry (see sp_poly_recur_mark) */
-static SP_TLS volatile int sp_brk_top = 0;
+extern SP_TLS jmp_buf *sp_brk_stack;              /* lazily allocated */
+extern SP_TLS sp_RbVal *sp_brk_val;
+extern SP_TLS sp_int *sp_brk_serial;
+extern SP_TLS int *sp_brk_exc_top;                /* sp_exc_top at scope entry */
+extern SP_TLS int *sp_brk_recur_mark;            /* walk-path depth at scope entry (see sp_poly_recur_mark) */
+extern SP_TLS volatile int sp_brk_top;
 /* shared counter (not SP_TLS) so serials are globally unique; see
    sp_proc_home_seq for the same shape */
 static sp_int sp_brk_seq = 1;
@@ -17819,7 +17533,7 @@ static void sp_mark_brk_vals(void) {
    the exception stack. sp_proc_home_seq stays a single shared counter so home ids
    are globally unique across workers (a lambda may be called on a different
    worker than it was created on); the bump is atomic in the threaded build. */
-static SP_TLS sp_proc_home *sp_proc_ret_head = NULL;
+extern SP_TLS sp_proc_home *sp_proc_ret_head;
 static sp_int sp_proc_home_seq = 0;
 static sp_int sp_proc_home_next(void) {
 #ifdef SP_THREADS
@@ -17844,42 +17558,6 @@ static void sp_proc_return(sp_int id, sp_RbVal v) {
   sp_exc_stage_key(sp_box_str((&("\xff" "return")[1])));
   sp_exc_stage_val(v);   /* LocalJumpError#exit_value carries the returned value (#3024) */
   sp_raise_cls("LocalJumpError", "unexpected return");
-}
-/* Drop the catch entries, break scopes and proc-return homes a raise unwinds
-   past. sp_raise_cls calls this just before it longjmps to sp_exc_stack
-   [sp_exc_top-1]; that handler is the frame the exception lands in, and every
-   entry opened INSIDE it dies with the C frames the longjmp skips over.
-
-   Each of the three records the exception depth at its own entry, so "opened
-   inside the landing frame" reads the same on all of them: the landing frame
-   was armed at sp_exc_top-1, so anything entered after it recorded sp_exc_top
-   or more, and anything entered before it recorded less.
-
-   The raise is the one place this can be done once. A landing pops the same
-   entries with `> sp_exc_top` after its own sp_exc_top--, but only six of the
-   ten emitted landings ever did so, and the four that did not -- Kernel#loop
-   in either form, the enumerator fold and the ext-host try -- leaked every
-   entry that unwound through them. Here it also costs the emitted code
-   nothing.
-
-   Not called for a proc return, a throw or a valued break: those longjmp to
-   sp_exc_stack themselves, and each trims its own target stack first
-   (sp_throw sets sp_catch_top, sp_brk_throw sets sp_brk_top, sp_proc_return
-   walks to a live home), so the entries between here and the target are still
-   the ones they mean to deliver to. */
-static void sp_handler_stacks_unwind(void) {
-  /* a dead catch entry is worse than a leak: sp_catch_top is fixed at 64, so a
-     raise out of a catch in a loop walks it off the end -- and a later `throw`
-     that matches one longjmps into a finished frame */
-  while (sp_catch_top > 0 && sp_catch_exc_top[sp_catch_top - 1] >= sp_exc_top)
-    sp_catch_top--;
-  /* a home node whose method the raise unwinds past: a later proc-return to it
-     must miss and raise LocalJumpError, not longjmp into a freed C frame */
-  while (sp_proc_ret_head && sp_proc_ret_head->exc_top >= sp_exc_top)
-    sp_proc_ret_head = sp_proc_ret_head->prev;
-  /* and a break scope, addressed by serial, for the same reason */
-  while (sp_brk_top > 0 && sp_brk_exc_top[sp_brk_top - 1] >= sp_exc_top)
-    sp_brk_top--;
 }
 /* GC: mark the current fiber's chain of in-flight return values (suspended fibers
    are handled by sp_exc_ctx_mark). Each node's val is sp_box_nil() until a return
@@ -17944,28 +17622,7 @@ SP_CONSTRUCTOR static void sp_install_safepoint_publish(void) {
   sp_safepoint_publish_hook = sp_publish_worker_roots;
 }
 #endif
-/* Continue a non-local unwind after a handler has run its ensure: if more ensure
-   handlers lie between here and the target, longjmp to the next; otherwise
-   deliver to the target (the proc-return home node, or the matched catch slot). */
-static void sp_unwind_resume(void) {
-  if (sp_exc_top > sp_unwind_exc_top) { sp_poly_recur_unwind(); longjmp(sp_exc_stack[sp_exc_top - 1], 1); }
-  int kind = sp_unwind_kind;
-  sp_unwind_kind = SP_UNWIND_NONE;
-  if (kind == SP_UNWIND_EXIT) exit(sp_at_exit_run(0));
-  /* the ensures are done; deliver, giving the walk path back the depth the
-     target arm recorded (the intervening exception frames restored their own on
-     the way here) */
-  if (kind == SP_UNWIND_PROCRET) {
-    sp_poly_recur_pop(sp_unwind_home->recur_mark);
-    longjmp(sp_unwind_home->jb, 1);
-  }
-  if (kind == SP_UNWIND_BREAK) {
-    sp_poly_recur_pop(sp_brk_recur_mark[sp_unwind_target]);
-    longjmp(sp_brk_stack[sp_unwind_target], 1);
-  }
-  sp_poly_recur_pop(sp_catch_recur_mark[sp_unwind_target]);
-  longjmp(sp_catch_stack[sp_unwind_target], 1);
-}
+void sp_unwind_resume(void);   /* lib/sp_exc.c */
 #if defined(SP_CEXT) && !defined(SPINEL_EXT_HOST)
 int sp_cext_unwinding(void) { return sp_unwind_kind != SP_UNWIND_NONE; }
 void sp_cext_resume_unwind(void) { sp_unwind_resume(); }
@@ -17980,135 +17637,16 @@ void sp_cext_resume_unwind(void) { sp_unwind_resume(); }
    outgoing fiber's context and loads the incoming fiber's at each switch; the
    arrays then never alias across fibers. Only the active prefix is copied
    (top == 0 for a fiber that never rescues, e.g. optcarrot's PPU, so it is
-   free there). These are non-static: reached by name from libspinel_rt.a.
-   sp_exc_ctx_t and its new/free/mark are in lib/sp_exc_ctx.h / lib/sp_exc.c:
-   they touch only the context, where save/load below read the TU's stacks. */
+   free there). sp_exc_ctx_t and its new/free/mark/save/load are in
+   lib/sp_exc_ctx.h / lib/sp_exc.c, beside the stacks. */
 
-#ifdef SPINEL_EXT_HOST
-void sp_exc_ctx_save(void *p);
-#else
-void sp_exc_ctx_save(void *p) {            /* current globals -> ctx */
-  sp_exc_ctx_t *x = (sp_exc_ctx_t *)p;
-  int n = sp_exc_top;
-  if (n > x->ecap) { x->ecap = n;
-    x->es = (jmp_buf *)realloc(x->es, sizeof(jmp_buf) * n);
-    x->em = (const char **)realloc(x->em, sizeof(char *) * n);
-    x->ec = (const char **)realloc(x->ec, sizeof(char *) * n);
-    x->eo = (void **)realloc(x->eo, sizeof(void *) * n);
-    x->rrem = (int *)realloc(x->rrem, sizeof(int) * n);
-    x->erm = (int *)realloc(x->erm, sizeof(int) * n);
-    x->ersm = (int *)realloc(x->ersm, sizeof(int) * n); }
-#ifdef SP_CEXT
-  x->cext_marks = (sp_cext_arena_mark *)realloc(x->cext_marks, sizeof(sp_cext_arena_mark) * n);
-  if (n && !x->cext_marks) sp_oom_die();
-  for (int i = 0; i < n; ++i) x->cext_marks[i] = sp_exc_cextmark[i];
-  sp_cext_arena_context_save(&x->cext_arena);
-#endif
-  for (int i = 0; i < n; i++) { memcpy(x->es[i], sp_exc_stack[i], sizeof(jmp_buf));
-    x->em[i] = sp_exc_msg[i]; x->ec[i] = sp_exc_cls[i]; x->eo[i] = sp_exc_obj[i];
-    x->erm[i] = sp_exc_rootmark[i]; x->ersm[i] = sp_rescue_mark[i];
-    /* the arm's walk-path depth travels with the arm: two green threads whose
-       handlers sit at the same index would otherwise share one slot, and a
-       raise in one would restore the other's depth -- a HIGHER one resurrects
-       frames that belong to the other context (see sp_poly_recur_mark) */
-    x->rrem[i] = sp_poly_recur_mark[i]; }
-  x->en = n;
-  int m = sp_catch_top;
-  if (m > x->ccap) { x->ccap = m;
-    x->cs = (jmp_buf *)realloc(x->cs, sizeof(jmp_buf) * m);
-    x->ct = (const char **)realloc(x->ct, sizeof(char *) * m);
-    x->ctk = (unsigned char *)realloc(x->ctk, sizeof(unsigned char) * m);
-    x->cv = (sp_RbVal *)realloc(x->cv, sizeof(sp_RbVal) * m);
-    x->cet = (int *)realloc(x->cet, sizeof(int) * m);
-    x->rrcm = (int *)realloc(x->rrcm, sizeof(int) * m);
-    x->crm = (int *)realloc(x->crm, sizeof(int) * m); }
-  for (int i = 0; i < m; i++) { memcpy(x->cs[i], sp_catch_stack[i], sizeof(jmp_buf));
-    x->ct[i] = sp_catch_tag[i]; x->ctk[i] = sp_catch_tag_kind[i];
-    x->cv[i] = sp_catch_val[i]; x->cet[i] = sp_catch_exc_top[i];
-    x->rrcm[i] = sp_catch_recur_mark[i]; x->crm[i] = sp_catch_rootmark[i]; }
-  x->cn = m;
-  int bn = sp_brk_top;
-  if (bn > x->bcap) { x->bcap = bn;
-    x->bs = (jmp_buf *)realloc(x->bs, sizeof(jmp_buf) * bn);
-    x->bv = (sp_RbVal *)realloc(x->bv, sizeof(sp_RbVal) * bn);
-    x->bser = (sp_int *)realloc(x->bser, sizeof(sp_int) * bn);
-    x->bet = (int *)realloc(x->bet, sizeof(int) * bn);
-    x->rrbm = (int *)realloc(x->rrbm, sizeof(int) * bn);
-    if (!x->bs || !x->bv || !x->bser || !x->bet || !x->rrbm) sp_oom_die(); }
-  for (int i = 0; i < bn; i++) { memcpy(x->bs[i], sp_brk_stack[i], sizeof(jmp_buf));
-    x->bv[i] = sp_brk_val[i]; x->bser[i] = sp_brk_serial[i]; x->bet[i] = sp_brk_exc_top[i];
-    x->rrbm[i] = sp_brk_recur_mark[i]; }
-  x->bn = bn;
-  x->prhead = sp_proc_ret_head;
-  x->uk = sp_unwind_kind; x->ut = sp_unwind_target; x->ue = sp_unwind_exc_top; x->uh = sp_unwind_home;
-  int rn = sp_rescue_sp;
-  if (rn > x->rcap) { x->rcap = rn;
-    x->shand = (void **)realloc(x->shand, sizeof(void *) * rn);
-    if (!x->shand) sp_oom_die(); }
-  for (int i = 0; i < rn; i++) x->shand[i] = sp_exc_handling[i];
-  x->rn = rn; x->pcause = sp_pending_cause; x->icause = sp_inflight_cause;
-  /* The container-walk path travels with the green thread, like the handler
-     stack above it: a fiber suspended in the middle of an #inspect resumes
-     still knowing what it was inside, and the fiber that runs meanwhile starts
-     from an empty path rather than reading this one's frames. Almost always
-     nothing to copy -- a yield lands between walks, not inside one. */
-  int rrn = sp_poly_recur_top;
-  if (rrn > x->rrcap) { x->rrcap = rrn;
-    x->rrf = (sp_poly_recur_frame *)realloc(x->rrf, sizeof(sp_poly_recur_frame) * rrn);
-    if (!x->rrf) sp_oom_die(); }
-  for (int i = 0; i < rrn; i++) x->rrf[i] = sp_poly_recur_stack[i];
-  x->rrn = rrn;
-}
-#endif
-#ifdef SPINEL_EXT_HOST
-void sp_exc_ctx_load(void *p);
-#else
-void sp_exc_ctx_load(void *p) {            /* ctx -> current globals */
-  sp_exc_ctx_t *x = (sp_exc_ctx_t *)p;
-#ifdef SP_CEXT
-  for (int i = 0; i < x->en; ++i) sp_exc_cextmark[i] = x->cext_marks[i];
-  sp_cext_arena_context_load(&x->cext_arena);
-#endif
-  for (int i = 0; i < x->en; i++) { memcpy(sp_exc_stack[i], x->es[i], sizeof(jmp_buf));
-    sp_exc_msg[i] = x->em[i]; sp_exc_cls[i] = x->ec[i]; sp_exc_obj[i] = x->eo[i];
-    sp_poly_recur_mark[i] = x->rrem[i];
-    sp_exc_rootmark[i] = x->erm[i]; sp_rescue_mark[i] = x->ersm[i]; }
-  sp_exc_top = x->en;
-  /* the marker covers one slot past top (handler consumption window); zero
-     it so a stale entry from another fiber's context is never chased */
-  if (x->en < SP_EXC_STACK_MAX) { sp_exc_msg[x->en] = 0; sp_exc_obj[x->en] = 0; }
-  for (int i = 0; i < x->cn; i++) { memcpy(sp_catch_stack[i], x->cs[i], sizeof(jmp_buf));
-    sp_catch_tag[i] = x->ct[i]; sp_catch_tag_kind[i] = x->ctk[i];
-    sp_catch_val[i] = x->cv[i]; sp_catch_exc_top[i] = x->cet[i];
-    sp_catch_recur_mark[i] = x->rrcm[i]; sp_catch_rootmark[i] = x->crm[i]; }
-  sp_catch_top = x->cn;
-  for (int i = 0; i < x->bn; i++) { memcpy(sp_brk_stack[i], x->bs[i], sizeof(jmp_buf));
-    sp_brk_val[i] = x->bv[i]; sp_brk_serial[i] = x->bser[i]; sp_brk_exc_top[i] = x->bet[i];
-    sp_brk_recur_mark[i] = x->rrbm[i]; }
-  sp_brk_top = x->bn;
-  sp_proc_ret_head = x->prhead;
-  sp_unwind_kind = x->uk; sp_unwind_target = x->ut; sp_unwind_exc_top = x->ue; sp_unwind_home = x->uh;
-  for (int i = 0; i < x->rn; i++) sp_exc_handling[i] = x->shand[i];
-  sp_rescue_sp = x->rn; sp_pending_cause = x->pcause; sp_inflight_cause = x->icause;
-  if (x->rrn > sp_poly_recur_cap) sp_poly_recur_grow(x->rrn);
-  for (int i = 0; i < x->rrn; i++) sp_poly_recur_stack[i] = x->rrf[i];
-  sp_poly_recur_top = x->rrn;
-  sp_poly_recur_ixtop = 0;   /* the index described the other context's frames */
-}
-#endif
+void sp_exc_ctx_save(void *p);   /* lib/sp_exc.c */
+void sp_exc_ctx_load(void *p);   /* lib/sp_exc.c */
 /* Trampoline base handler (#1474): the fiber trampoline arms a copy of its own
    setjmp buffer as the fiber's lowest handler, so an otherwise-unhandled raise
    in the fiber body unwinds back to the trampoline (on the fiber's own stack)
    instead of exiting or long-jumping across to the resumer. */
-#ifdef SPINEL_EXT_HOST
-void sp_exc_arm(jmp_buf b);
-#else
-void sp_exc_arm(jmp_buf b)     { sp_exc_check_depth();
-#ifdef SP_CEXT
-  sp_exc_rootmark[sp_exc_top] = sp_gc_nroots; sp_rescue_mark[sp_exc_top] = sp_rescue_sp;
-#endif
-  memcpy(sp_exc_stack[sp_exc_top], b, sizeof(jmp_buf)); sp_exc_msg[sp_exc_top] = 0; sp_exc_obj[sp_exc_top] = 0; sp_exc_top++; }
-#endif
+void sp_exc_arm(jmp_buf b);   /* lib/sp_exc.c */
 #ifdef SPINEL_EXT_HOST
 void sp_exc_disarm(void);
 #else
@@ -18155,21 +17693,7 @@ void *sp_exc_cur_obj(void)       { return sp_exc_top > 0 ? sp_exc_obj[sp_exc_top
 #endif
 /* Re-raise a fiber's unhandled exception in the resumer's context (the fiber
    trampoline caught it on the fiber's stack, then returned cooperatively). */
-#ifdef SPINEL_EXT_HOST
-void sp_fiber_reraise(const char *cls, const char *msg, void *obj);
-#else
-void sp_fiber_reraise(const char *cls, const char *msg, void *obj) {
-  if (obj) sp_pending_exc_obj = obj;
-  /* the message a raise left in the handler stack, or one the program
-     handed Fiber#raise / Thread#raise: a String with a marker byte. A
-     frozen one (a literal's, sp_exc_msg_plain) is handed on counted, so
-     the re-raise keeps its mark */
-  if (msg && !sp_exc_msg_empty_given(msg) && !sp_cmsg_p(msg) &&
-      (((const unsigned char *)msg)[-1] == 0xfa || ((const unsigned char *)msg)[-1] == 0xf8))
-    msg = sp_exc_msg_counted_frozen(msg, sp_str_byte_len(msg));
-  sp_raise_cls(cls, msg);
-}
-#endif
+void sp_fiber_reraise(const char *cls, const char *msg, void *obj);   /* lib/sp_exc.c */
 
 
 /* File metadata predicates (sp_file_directory/file/exist/delete) moved to
@@ -20128,8 +19652,11 @@ static sp_bool sp_range_cover_poly(sp_Range *r, sp_RbVal x) {
    sp_tu_init when the program carries it); Regexp matches a String; a Range
    covers numerics; everything else is value equality. */
 static sp_bool sp_poly_case_eq(sp_RbVal pat, sp_RbVal e) {
-  if (pat.tag == SP_TAG_CLASS)
+  if (pat.tag == SP_TAG_CLASS) {
+    sp_RbVal r;
+    if (sp_cmeth_eqq_hook && sp_cmeth_eqq_hook(e, sp_unbox_class(pat), &r)) return sp_poly_truthy(r);
     return sp_poly_is_a_hook ? (sp_bool)(sp_poly_is_a_hook(e, sp_unbox_class(pat)) != 0) : 0;
+  }
   /* a String, a shared String, a Symbol or an object's #to_str; $~ is left
      alone, as grep's is */
   if (pat.tag == SP_TAG_OBJ && pat.cls_id == SP_BUILTIN_REGEX) {
@@ -20158,6 +19685,14 @@ static sp_bool sp_poly_case_eq(sp_RbVal pat, sp_RbVal e) {
   if (sp_poly_is_strbuf(pat) || sp_poly_is_strbuf(e))
     return sp_poly_rb_equal(sp_poly_strbuf_deref(pat), sp_poly_strbuf_deref(e));
   return sp_poly_rb_equal(pat, e);
+}
+/* `pattern === element` as a value: a class method `===` of the program's
+   own answers what it answers (nil, a match index); the rest answer true or
+   false. */
+static sp_RbVal sp_poly_case_eq_val(sp_RbVal pat, sp_RbVal e) {
+  sp_RbVal r;
+  if (pat.tag == SP_TAG_CLASS && sp_cmeth_eqq_hook && sp_cmeth_eqq_hook(e, sp_unbox_class(pat), &r)) return r;
+  return sp_box_bool(sp_poly_case_eq(pat, e));
 }
 /* `pat === e` where CRuby's Regexp#=== sets $~: a `when` arm, an explicit
    ===. Every other pattern answers as sp_poly_case_eq. */
@@ -20734,6 +20269,21 @@ static inline void sp_proc_fill(sp_int P, sp_int O, sp_int Q, int R, sp_int n, s
    is not checked either, since a subclass in an ancestor-typed slot is
    correct and layout-compatible. What this catches is the reinterpretation
    family -- a pointer landing in a scalar slot and the reverse. */
+/* A box narrowed into a slot a seed types as an Array is checked in every
+   build: anything but an Array (or nil, as above) raises the TypeError a
+   seeded Array[untyped] parameter raises (sp_poly_as_poly_array), where
+   the conversion to a typed Array read it as nil and the program answered
+   something else in silence. A value that reaches the slot through an
+   untyped parameter is the case the compile-time check cannot see
+   (#10681). */
+static SP_NOINLINE SP_COLD SP_UNUSED void sp_rbs_ary_fail(sp_RbVal v) {
+  sp_raise_cls("TypeError", sp_sprintf("wrong argument type %s (expected Array)", sp_poly_class_name(v)));
+}
+static SP_INLINE SP_UNUSED sp_RbVal sp_rbs_need_ary(sp_RbVal v) {
+  if (SP_UNLIKELY(!(v.tag == SP_TAG_NIL || (v.tag == SP_TAG_OBJ && sp_poly_is_array_kind(v.cls_id)))))
+    sp_rbs_ary_fail(v);
+  return v;
+}
 #ifdef SP_RBS_CHECK
 static sp_RbVal sp_rbs_check(sp_RbVal v, int want, const char *slot, const char *wantname) {
   /* (a box of a String changed in place holds its handle, sp_String *, and
@@ -20756,8 +20306,28 @@ static sp_RbVal sp_rbs_check_cls(sp_RbVal v, int cls, const char *slot, const ch
 }
 #define SP_RBS_CHECK_TAG(v, want, slot, wantname) sp_rbs_check((v), (want), (slot), (wantname))
 #define SP_RBS_CHECK_CLS(v, cls, slot, wantname) sp_rbs_check_cls((v), (cls), (slot), (wantname))
+#define SP_RBS_CHECK_ARY(v) sp_rbs_need_ary(v)
 #else
-#define SP_RBS_CHECK_TAG(v, want, slot, wantname) (v)
+/* A box narrowed into a slot a seed types as a scalar kind (Integer, Float,
+   String, Symbol, a boolean) or a program class is checked in every build
+   too: a value of another kind raises TypeError rather than be read as the
+   slot's representation (an Integer read as a `const char *` crashed where
+   CRuby printed it, #10710). nil passes, as above, and a String changed in
+   place (its handle's box) is a String. The seed check refuses what it can
+   see at compile time; this is the value it cannot, the answer of a call
+   or of a block whose kinds the body does not show. */
+static SP_NOINLINE SP_COLD SP_UNUSED void sp_rbs_tag_fail(sp_RbVal v, const char *wantname) {
+  if (wantname[0] == 'a' && wantname[1] == ' ') wantname += 2;
+  else if (wantname[0] == 'a' && wantname[1] == 'n' && wantname[2] == ' ') wantname += 3;
+  sp_raise_cls("TypeError", sp_sprintf("wrong argument type %s (expected %s)", sp_poly_class_name(v), wantname));
+}
+static SP_INLINE SP_UNUSED sp_RbVal sp_rbs_need_tag(sp_RbVal v, int want, const char *wantname) {
+  if (SP_UNLIKELY(!(v.tag == want || v.tag == SP_TAG_NIL || (want == SP_TAG_STR && sp_poly_is_strbuf(v)))))
+    sp_rbs_tag_fail(v, wantname);
+  return v;
+}
+#define SP_RBS_CHECK_TAG(v, want, slot, wantname) sp_rbs_need_tag((v), (want), (wantname))
+#define SP_RBS_CHECK_ARY(v) sp_rbs_need_ary(v)
 /* A box narrowed into a slot a seed types as a builtin class with no
    subclass (Time, Thread, Fiber, Random, IO) is checked in every build, as
    a container's is: a value of another class raises TypeError rather than
@@ -20935,6 +20505,10 @@ static int sp_at_exit_run(int status) {
   sp_fin_run_exit();
   return st;
 }
+/* lib/sp_exc.c's raise drains the hooks through this */
+#ifndef SPINEL_EXT_HOST
+SP_CONSTRUCTOR static void sp_exc_install_at_exit(void) { sp_at_exit_run_fn = sp_at_exit_run; }
+#endif
 /* ---- Kernel#Integer / Kernel#Float on a user object ----
    CRuby's rb_convert_to_integer / rb_convert_to_float for an object of a
    user class: its #to_int, #to_str and #to_i (Integer) or its #to_f
@@ -20959,27 +20533,7 @@ enum { SP_CONV_TO_INT, SP_CONV_TO_I, SP_CONV_TO_F, SP_CONV_TO_STR };
 /* Not static: the exception stack it arms is this unit's, and lib/sp_poly_cold.c
    (which reaches it through sp_obj_conv) must run it in the unit that owns that
    stack rather than in a private copy. */
-#ifdef SPINEL_EXT_HOST
-int sp_exc_protect(void (*fn)(void *), void *ctx);
-#else
-int sp_exc_protect(void (*fn)(void *), void *ctx) {
-  int catch_top = sp_catch_top, brk_top = sp_brk_top;
-  sp_proc_home *ret_head = sp_proc_ret_head;
-  sp_exc_check_depth();
-  sp_exc_rootmark[sp_exc_top] = sp_gc_nroots; sp_rescue_mark[sp_exc_top] = sp_rescue_sp;
-  sp_exc_msg[sp_exc_top] = 0; sp_exc_obj[sp_exc_top] = 0; sp_exc_top++;
-  if (setjmp(sp_exc_stack[sp_exc_top - 1]) == 0) { fn(ctx); sp_exc_top--; return 0; }
-  sp_exc_top--;
-  sp_gc_nroots = sp_exc_rootmark[sp_exc_top]; sp_rescue_sp = sp_rescue_mark[sp_exc_top];
-  sp_catch_top = catch_top; sp_brk_top = brk_top; sp_proc_ret_head = ret_head;
-  sp_unwind_kind = SP_UNWIND_NONE;
-  /* a `raise x, cause: expr` stages its cause before evaluating expr; an
-     unwind out of expr that lands here must not leave it staged for the next
-     raise */
-  sp_explicit_cause = NULL; sp_explicit_cause_set = 0;
-  return 1;
-}
-#endif
+int sp_exc_protect(void (*fn)(void *), void *ctx);   /* lib/sp_exc.c */
 /* ---- Mutex#synchronize on a boxed receiver ----
    The receiver of `LOCKS[i].synchronize { ... }` is a poly value: the static
    arm in codegen (a TY_MUTEX receiver) cannot see it, and the generated
@@ -21117,38 +20671,7 @@ static sp_RbVal sp_Fiber_blocking_proc(sp_Proc *blk) {
    blocked for good: land here first, unblock it, then pass the raise or
    unwind on. The frame is armed before anything is rooted, so its root mark
    is the interrupted code's. */
-#ifndef SPINEL_EXT_HOST
-void sp_trap_call(sp_Proc *p, int no) {
-  sp_exc_check_depth();
-  sp_exc_rootmark[sp_exc_top] = sp_gc_nroots; sp_rescue_mark[sp_exc_top] = sp_rescue_sp;
-  sp_exc_msg[sp_exc_top] = 0; sp_exc_obj[sp_exc_top] = 0; sp_exc_top++;
-  if (setjmp(sp_exc_stack[sp_exc_top - 1]) == 0) {
-    SP_GC_ROOT(p);   /* the proc may re-trap its signal, dropping sp_trap_proc's hold */
-    sp_int slot = (sp_int)no;
-    _sp_proc_poly_args[0] = sp_box_int((sp_int)no);
-    sp_proc_call(p, 1, &slot);
-    sp_exc_top--;
-    return;
-  }
-  sp_exc_top--;
-  sp_gc_nroots = sp_exc_rootmark[sp_exc_top]; sp_rescue_sp = sp_rescue_mark[sp_exc_top];
-  /* Take the exit before unblocking: a delivery that was pending runs its
-     proc right there, reusing this slot, and must not see (or clear) an
-     unwind still in flight. */
-  const char *ecls = sp_exc_cls[sp_exc_top], *emsg = sp_exc_msg[sp_exc_top];
-  void *eobj = sp_exc_obj[sp_exc_top];
-  SP_GC_ROOT_STR(emsg); SP_GC_ROOT(eobj);
-  int uk = sp_unwind_kind, ut = sp_unwind_target, ue = sp_unwind_exc_top;
-  struct sp_proc_home *uh = sp_unwind_home;
-  sp_unwind_kind = SP_UNWIND_NONE;
-  /* out of line on purpose: glibc marks sigprocmask __leaf__, and GCC would
-     keep the unwind state in registers across a direct call */
-  sp_sig_unblock(no, 0);
-  sp_unwind_kind = uk; sp_unwind_target = ut; sp_unwind_exc_top = ue; sp_unwind_home = uh;
-  if (sp_unwind_kind != SP_UNWIND_NONE) sp_unwind_resume();
-  sp_pending_exc_obj = eobj; sp_raise_cls(ecls, emsg);
-}
-#endif
+void sp_trap_call(sp_Proc *p, int no);   /* lib/sp_exc.c */
 /* The threaded runtime runs the trap procs on a green thread of its own
    (sp_sig_thread_body, lib/sp_cold.c). A raise out of one is the main
    thread's, where CRuby runs every trap: it is handed there as Thread#raise
@@ -21538,6 +21061,9 @@ static sp_RbVal sp_poly_hash_merge_blk(sp_RbVal recv, sp_RbVal other, sp_Proc *b
     sp_raise_nomethod(sp_nomethod_msg(name, recv));
     return sp_box_nil();
   }
+  /* a user object converts through its #to_hash, when the program has one
+     (the bridge's row 5), as a typed merge! converts it */
+  if (sp_obj_conv_fn && sp_poly_is_user_obj(other)) other = sp_kw_splat_conv(other, 0);
   if (other.tag != SP_TAG_OBJ || !sp_poly_is_hash_kind(other.cls_id))
     sp_raise_cls("TypeError", sp_sprintf("no implicit conversion of %s into Hash", sp_convert_src_name(other)));
   if (sp_gc_is_frozen(recv.v.p)) sp_raise_frozen_hash_at(recv.v.p, recv.cls_id);
@@ -21562,11 +21088,14 @@ static sp_RbVal sp_poly_hash_merge_blk(sp_RbVal recv, sp_RbVal other, sp_Proc *b
   }
   return recv;
 }
-/* sum(init) { } on a boxed Array, Hash or Range: init plus each answer */
+/* sum(init) { } on a boxed Array, Hash or Range: init plus each answer.
+   A String Range walks its members; a Float Range raises the TypeError of
+   its walk in sp_poly_enum_proc, as sum { } without init does. */
 static sp_RbVal sp_poly_sum_init_proc(sp_RbVal recv, sp_RbVal init, sp_Proc *blk) {
   SP_GC_ROOT(blk); SP_GC_ROOT_RBVAL(init);
   if (!(recv.tag == SP_TAG_OBJ && (sp_poly_is_array_kind(recv.cls_id) || sp_poly_is_hash_kind(recv.cls_id) ||
-        recv.cls_id == SP_BUILTIN_RANGE || recv.cls_id == SP_BUILTIN_ENUMERATOR))) {
+        recv.cls_id == SP_BUILTIN_RANGE || recv.cls_id == SP_BUILTIN_STR_RANGE ||
+        recv.cls_id == SP_BUILTIN_FLOAT_RANGE || recv.cls_id == SP_BUILTIN_ENUMERATOR))) {
     sp_raise_nomethod(sp_nomethod_msg("sum", recv));
     return sp_box_nil();
   }
@@ -21718,6 +21247,13 @@ static sp_RbVal sp_poly_enum_proc(sp_RbVal recv, int op, sp_Proc *blk) {
       !(recv.tag == SP_TAG_OBJ && sp_poly_is_hash_kind(recv.cls_id))) {
     sp_raise_nomethod(sp_nomethod_msg(op == SP_PENUM_EACH_PAIR ? "each_pair" :
                                       op == SP_PENUM_EACH_KEY ? "each_key" : "each_value", recv));
+    return sp_box_nil();
+  }
+  /* a Float Range cannot be walked (from Float, or from NilClass when it is
+     beginless): CRuby's TypeError, as the inline walk raises it
+     (sp_poly_iter_check) */
+  if (recv.tag == SP_TAG_OBJ && recv.cls_id == SP_BUILTIN_FLOAT_RANGE && recv.v.p) {
+    sp_frange_iter_raise(*(sp_FloatRange *)recv.v.p, 0);
     return sp_box_nil();
   }
   /* a String Range (a Range of Symbols too) walks its members */
@@ -22878,6 +22414,24 @@ static sp_sym sp_sym_intern_n(const char *s, size_t n) { (void)s; (void)n; retur
    literal its own site's). The runtime's own files do not see these (they
    spell the element macros of sp_types.h); the generated TU does. */
 static inline sp_String *sp_strface_h_self(sp_String *h) { return h; }
+/* Bytes asked for as a handle are most often a String just made (an
+   interpolation, a builtin's answer, marker 0xfe): its handle is the one it
+   was born in, which the slot adopts here, ahead of sp_String_new_shared's
+   other cases; at -Oz that call and the adoption were not inlined, and an
+   interpolated String paid both calls (#10651) */
+static SP_ALWAYS_INLINE inline sp_String *sp_strface_h_bytes(const char *s) {
+  if (s && ((const unsigned char *)s)[-1] == 0xfe) {
+    sp_str_hdr *h = ((sp_str_hdr *)(void *)(s - 1)) - 1;
+    sp_String *o = (sp_String *)(void *)h->next;
+    if (o && (const char *)(o + 1) == (const char *)h) {
+      o->len = (int64_t)h->len;
+      o->binary = (h->size & SP_STR_SIZE_BINARY) != 0;
+      ((unsigned char *)s)[-1] = 0xfd;
+      return o;
+    }
+  }
+  return sp_String_new_shared(s);
+}
 static inline const char *sp_strface_b_self(const char *s) { return s; }
 static inline const char *sp_strface_b_of(sp_String *h) { return h ? h->data : NULL; }
 static inline const char *sp_strface_b_copy(sp_String *h) { return sp_strbuf_read_own(h); }
@@ -22926,7 +22480,7 @@ static inline sp_RbVal sp_strface_box_self(sp_RbVal v) { return v; }
    runtime's functions, each of which takes the one face its signature says
    (a String argument is its bytes; the runtime finds a payload view's
    handle itself, sp_String_new_shared, sp_box_str) */
-#define SP_STR_HDL(x) SP_ONE_FACE(x, sp_strface_h_self, sp_String_new_shared, sp_strface_zero_h, sp_strface_h_box)
+#define SP_STR_HDL(x) SP_ONE_FACE(x, sp_strface_h_self, sp_strface_h_bytes, sp_strface_zero_h, sp_strface_h_box)
 #define SP_STR_BOX(x) SP_ONE_FACE(x, sp_strface_box_h, sp_strface_box_new, sp_strface_zero_box, sp_strface_box_self)
 /* ...and a String of either face as the face slot `dst` has, where the
    emitter of `dst = v` knows neither (a block parameter a typed walk binds) */
@@ -22973,6 +22527,17 @@ static SP_UNUSED sp_mutex *sp_monitor_check(sp_mutex *m, const char *name) {
 
 static SP_UNUSED sp_bool sp_poly_mutex_mon_owned(sp_RbVal value) {
   return sp_Mutex_owned(sp_monitor_check(sp_poly_as_mutex(value, "mon_owned?"), "mon_owned?"));
+}
+
+static sp_StrPolyHash *sp_StrPolyHash_from_poly_hash(sp_PolyPolyHash *src) {
+  SP_GC_ROOT(src);
+  sp_StrPolyHash *h = sp_StrPolyHash_new(); SP_GC_ROOT(h);
+  for (sp_int i = 0; src && i < src->len; i++) {
+    sp_RbVal k = src->keys[src->order[i]], v = sp_PolyPolyHash_get(src, k);
+    if (k.tag != SP_TAG_STR) { sp_raise_cls("TypeError", "wrong Hash entry type for the parameter"); return h; }
+    sp_StrPolyHash_set(h, k.v.s, v);
+  }
+  return h;
 }
 
 #endif /* SP_RUNTIME_H */

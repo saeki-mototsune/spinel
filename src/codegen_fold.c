@@ -1879,6 +1879,11 @@ int emit_gsub_block_expr(Compiler *c, int id, Buf *b) {
      since it was written; the subject never was (#4369's rule, at the one site
      that walks a STRING rather than an array). */
   emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT_STR(_t%d);\n", ts);
+  /* (one representation: when the program reads the match registers, every
+     turn's match keeps its target, sp_re_set_captures, and a live payload
+     is kept as a copy; the subject is kept once here, not copied per match,
+     as the scan loop does. 80,000 matches over a 600 KB subject copied 33 GB.) */
+  if (g_reads_match_regs) { emit_indent(g_pre, g_indent); buf_printf(g_pre, "_t%d = sp_str_keep(_t%d);\n", ts, ts); }
   emit_indent(g_pre, g_indent); buf_printf(g_pre, "sp_int _t%d = 0;\n", tpos);
   /* the SUBJECT's length bounds the scan, and strlen stops at an embedded
      NUL: `"a\0b".gsub(/./m) { }` walked one character and stopped. */
@@ -3266,16 +3271,26 @@ int emit_product_inspect_expr(Compiler *c, int id, Buf *b) {
   return 1;
 }
 
+/* An Integer's step(limit[, step]) without a block, with a boxed limit: a
+   nil one is the endless walk. A Float one, or a boxed step that holds a
+   Float, is CRuby's Float walk (every value a Float, where
+   sp_poly_arg_int_chk cut 2.5 to 2); an infinite limit with an Integer
+   step stays an Integer walk, as CRuby's does. */
 static int emit_step_boxed_limit(Compiler *c, int recv, const int *sv, int sc, Buf *b) {
   int t = ++g_tmp;
   buf_printf(b, "({ sp_int _er%d = ", t); emit_int_expr(c, recv, b);
   buf_printf(b, "; sp_RbVal _el%d = ", t); emit_boxed(c, sv[0], b);
-  buf_printf(b, "; SP_GC_ROOT_RBVAL(_el%d); sp_int _es%d = ", t, t);
-  if (sc >= 2) emit_int_expr(c, sv[1], b); else buf_puts(b, "1");
-  buf_printf(b, "; if (_es%d == 0) sp_raise_cls(\"ArgumentError\", \"step can't be 0\");"
-                " _el%d.tag == SP_TAG_NIL ? sp_range_endless_step(sp_box_int(_er%d), sp_box_int(_es%d))"
-                " : (sp_poly_cmp_ck(sp_box_int(_er%d), _el%d), sp_Enumerator_new_from(sp_box_int_array(sp_IntArray_from_range_step(_er%d, sp_poly_arg_int_chk(_el%d), _es%d, 0)))); })",
-             t, t, t, t, t, t, t, t, t);
+  buf_printf(b, "; SP_GC_ROOT_RBVAL(_el%d); sp_RbVal _es%d = ", t, t);
+  if (sc >= 2) emit_boxed(c, sv[1], b); else buf_puts(b, "sp_box_int(1)");
+  buf_printf(b, "; SP_GC_ROOT_RBVAL(_es%d);"
+                " if (sp_poly_cmp_ck(_es%d, sp_box_int(0)) == 0) sp_raise_cls(\"ArgumentError\", \"step can't be 0\");"
+                " _el%d.tag == SP_TAG_NIL ? sp_range_endless_step(sp_box_int(_er%d), _es%d)"
+                " : (sp_poly_cmp_ck(sp_box_int(_er%d), _el%d), sp_Enumerator_new_from("
+                "(_el%d.tag == SP_TAG_FLT && (isfinite(_el%d.v.f) || isnan(_el%d.v.f))) || _es%d.tag == SP_TAG_FLT"
+                " ? sp_box_float_array(sp_FloatArray_from_step((sp_float)_er%d, sp_num_to_f(_el%d), sp_num_to_f(_es%d), 0))"
+                " : sp_box_int_array(sp_IntArray_from_range_step(_er%d, _el%d.tag == SP_TAG_FLT"
+                " ? (_el%d.v.f > 0 ? (sp_int)INTPTR_MAX : (sp_int)INTPTR_MIN) : sp_poly_arg_int_chk(_el%d), sp_poly_arg_int_chk(_es%d), 0)))); })",
+             t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t, t);
   return 1;
 }
 
@@ -3286,14 +3301,29 @@ static int emit_step_boxed_limit(Compiler *c, int recv, const int *sv, int sc, B
    one (an endless Range) not at all. A zero step raises, a negative one
    walks down; `guard` (or NULL) runs after the zero check. */
 void emit_boxed_step_head(Buf *b, int tc, int tl, int ts, const char *excl, const char *open, const char *guard) {
-  int td = ++g_tmp;
+  int td = ++g_tmp, tf = ++g_tmp, fb = ++g_tmp, fl = ++g_tmp, fs = ++g_tmp, fn = ++g_tmp, fi = ++g_tmp;
   buf_printf(b, "if (sp_poly_cmp_ck(_t%d, sp_box_int(0)) == 0) sp_raise_cls(\"ArgumentError\", \"step can't be 0\");", ts);
   if (guard) buf_printf(b, " %s", guard);
   buf_printf(b, " sp_bool _t%d = sp_poly_cmp_ck(_t%d, sp_box_int(0)) > 0;", td, ts);
-  buf_printf(b, " for (; (%s) || (_t%d ? ((%s) ? sp_poly_lt(_t%d, _t%d) : sp_poly_le(_t%d, _t%d))"
-                " : ((%s) ? sp_poly_gt(_t%d, _t%d) : sp_poly_ge(_t%d, _t%d)));"
-                " _t%d = sp_poly_add(_t%d, _t%d))",
-             open, td, excl, tc, tl, tc, tl, excl, tc, tl, tc, tl, tc, tc, ts);
+  /* a Float among the begin, the limit and the step (known only at run
+     time: a boxed step) makes it CRuby's Float walk: every value a Float,
+     the i-th computed as begin + i * step and the count fixed first, as
+     the typed Float loop does, rather than adding the step up. An open
+     limit (no end) is the infinity on the step's side. An infinite Float
+     limit alone leaves an Integer walk, as in CRuby. */
+  buf_printf(b, " sp_bool _t%d = _t%d.tag == SP_TAG_FLT || (!(%s) && _t%d.tag == SP_TAG_FLT && !isinf(_t%d.v.f)) || _t%d.tag == SP_TAG_FLT;"
+                " sp_float _t%d = 0, _t%d = 0, _t%d = 0, _t%d = 0; sp_int _t%d = 0;"
+                " if (_t%d) { _t%d = sp_num_to_f(_t%d); _t%d = (%s) ? (_t%d ? INFINITY : -INFINITY) : sp_num_to_f(_t%d); _t%d = sp_num_to_f(_t%d);"
+                " _t%d = sp_float_step_size(_t%d, _t%d, _t%d, (%s) ? 1 : 0); _t%d = sp_box_float(_t%d); }",
+             tf, tc, open, tl, tl, ts,
+             fb, fl, fs, fn, fi,
+             tf, fb, tc, fl, open, td, tl, fs, ts,
+             fn, fb, fl, fs, excl, tc, fb);
+  buf_printf(b, " for (; _t%d ? (sp_float)_t%d < _t%d : ((%s) || (_t%d ? ((%s) ? sp_poly_lt(_t%d, _t%d) : sp_poly_le(_t%d, _t%d))"
+                " : ((%s) ? sp_poly_gt(_t%d, _t%d) : sp_poly_ge(_t%d, _t%d))));"
+                " _t%d = _t%d ? sp_box_float(sp_float_step_at(_t%d, _t%d, _t%d, ++_t%d)) : sp_poly_add(_t%d, _t%d))",
+             tf, fi, fn, open, td, excl, tc, tl, tc, tl, excl, tc, tl, tc, tl,
+             tc, tf, fb, fl, fs, fi, tc, ts);
 }
 
 /* The boxed walk of an Integer Range by a Rational step (an_range_step_rat),
@@ -3371,10 +3401,11 @@ int emit_step_array_expr(Compiler *c, int id, Buf *b) {
     buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d);", tss);
     /* a span past 2**30 steps raises as the sp_int form below does, rather
        than pushing until memory runs out */
-    char guard[256];
+    char guard[320];
+    /* (a boxed limit that holds nil has no end to stop at) */
     snprintf(guard, sizeof guard,
-             "if (sp_poly_cmp_ck(sp_poly_div(sp_poly_sub(_t%d, _t%d), _t%d), sp_box_int(1LL << 30)) >= 0)"
-             " sp_raise_cls(\"RangeError\", \"range too large to materialize\");", tll, tcc, tss);
+             "if (_t%d.tag == SP_TAG_NIL || (sp_poly_cmp_ck(_t%d, _t%d), sp_poly_cmp_ck(sp_poly_div(sp_poly_sub(_t%d, _t%d), _t%d), sp_box_int(1LL << 30)) >= 0))"
+             " sp_raise_cls(\"RangeError\", \"range too large to materialize\");", tll, tcc, tll, tll, tcc, tss);
     buf_puts(b, " ");
     emit_boxed_step_head(b, tcc, tll, tss, "0", "0", guard);
     buf_printf(b, " sp_PolyArray_push(_t%d, _t%d);", trr, tcc);
@@ -7879,6 +7910,10 @@ static void emit_arg_or_default_fill(Compiler *c, Scope *m, int idx, int provide
         Buf bx; memset(&bx, 0, sizeof bx);
         emit_expr(c, provided, &ab);
         if (ar.elem == TY_POLY) emit_boxed_text(c, TY_POLY_ARRAY, ab.p ? ab.p : "NULL", &bx);
+        /* a box is asserted to be an Array before it is read as one: a
+           String through an untyped parameter was read as nil (#10681) */
+        else if (p && p->rbs_seeded)
+          emit_rbs_checked_text(c, pt, m->pnames[idx], ab.p ? ab.p : "sp_box_nil()", &bx);
         else buf_puts(&bx, ab.p ? ab.p : "sp_box_nil()");
         emit_unbox_text(c, pt, bx.p ? bx.p : "sp_box_nil()", out);
         free(ab.p); free(bx.p);
@@ -7959,7 +7994,10 @@ static void emit_arg_or_default_fill(Compiler *c, Scope *m, int idx, int provide
                of its own, and its result was dropped. */
             int ht = ++g_tmp;
             Buf ab2; memset(&ab2, 0, sizeof ab2);
-            emit_expr(c, provided, &ab2);
+            /* a nil one boxes: as an expression a literal nil is the C
+               scalar 0, which no sp_RbVal initializer takes (#10677) */
+            if (at == TY_NIL) emit_boxed(c, provided, &ab2);
+            else emit_expr(c, provided, &ab2);
             emit_indent(g_pre, g_indent);
             buf_printf(g_pre, "sp_RbVal _t%d = %s;\n", ht, ab2.p ? ab2.p : "sp_box_nil()");
             free(ab2.p);
@@ -8960,7 +8998,7 @@ static int kw_splat_operand_nilable(Compiler *c, int node, TyKind t) {
       int rcv = nt_ref(c->nt, node, "receiver");
       if (cn && sp_streq(cn, "new") && rcv >= 0 &&
           (nt_kind(c->nt, rcv) == NK_ConstantReadNode || nt_kind(c->nt, rcv) == NK_ConstantPathNode)) {
-        int ci = comp_class_index(c, nt_str(c->nt, rcv, "name"));
+        int ci = const_node_class_index(c, rcv);
         if (ci >= 0 && comp_cmethod_in_chain(c, ci, "new", NULL) < 0) return 0;
       }
       break;
@@ -11065,7 +11103,8 @@ int arity_count_error(Compiler *c, Scope *m, int given, char *msg, size_t n) {
    (emit_dispatch) and the inlined yield path (emit_inline_call_x): the
    dispatch kept its own count, which took keyword parameters for positional
    slots and skipped every keyword hash, so `obj.m(3, 4)` against
-   `def m(x, k: 1)` bound silently where `m(3, 4)` raised. */
+   `def m(x, k: 1)` bound silently where `m(3, 4)` raised.
+   call_arity_may_raise asks the same without emitting. */
 void emit_call_arity_check(Compiler *c, Scope *m, int argc, const int *argv) {
   const NodeTable *nt = c->nt;
   int kwh = -1;
@@ -11114,6 +11153,25 @@ void emit_call_arity_check(Compiler *c, Scope *m, int argc, const int *argv) {
     return;
   }
   args_raise(c, argv, argc, "%s", msg);
+}
+
+/* Does emit_call_arity_check raise for these arguments into `m`? Its
+   questions in its order, asked without emitting: a `**nil` method given a
+   keyword (a `**` spread's when the run time finds a key in it), a count it
+   judges here, or a keyword error (after a splat, once the run time has
+   judged the count). A positional count only the run time knows, past a
+   splat or a `**` spread that may count, is not asked: emit_call_arity_check
+   does not judge it either. A change to one is a change to the other. */
+static int call_arity_may_raise(Compiler *c, Scope *m, int argc, const int *argv) {
+  const NodeTable *nt = c->nt;
+  int kwh = nt_argv_kwh(nt, argv, argc) >= 0 ? argv[argc - 1] : -1, pos_argc = kwh >= 0 ? argc - 1 : argc;
+  KwPlan P;
+  kw_plan(c, m, kwh, &P);
+  if (P.role == KWH_REFUSED) return 1;
+  char msg[512];
+  if (!nt_argv_has_splat(nt, argv, pos_argc) && P.count != KWC_NONEMPTY &&
+      arity_count_error(c, m, pos_argc + P.count, msg, sizeof msg)) return 1;
+  return !arity_unjudged(c, m) && kw_plan_error(&P, msg, sizeof msg);
 }
 
 /* The positional layout of one call into one callee: which argument, splat
@@ -12582,8 +12640,15 @@ int is_descendant(Compiler *c, int k, int anc) {
    dispatch. */
 int dispatch_impl_count(Compiler *c, int call, int cid, const char *name) {
   int impls[256], n = 0;
-  for (int k = 0; k < c->nclasses; k++) {
-    if (!is_descendant(c, k, cid)) continue;
+  if (cid < 0 || cid >= c->nclasses) return 0;
+  /* cid and its descendants (comp_descendants, less the unreferenced ones
+     is_descendant leaves out), not every class with its parent chain: the
+     count does not depend on the order */
+  int nd = 0;
+  const int *ds = comp_descendants(c, cid, &nd);
+  for (int di = -1; di < nd; di++) {
+    int k = di < 0 ? cid : ds[di];
+    if (di >= 0 && c->classes[k].unreferenced) continue;
     int def = -1;
     if (call_target(c, call, k, name, 0, &def) < 0) continue;
     int seen = 0;
@@ -12688,6 +12753,59 @@ int dispatch_arms_disagree(Compiler *c, int call, int cid, const char *name) {
     }
   }
   return 0;
+}
+
+/* The method the shared temps of a dispatch on cid are laid out for when
+   cid's chain has none: the first arm's, which every arm takes alike
+   (dispatch_arms_disagree). NULL for none. */
+static Scope *dispatch_first_arm(Compiler *c, int call, int cid, const char *name) {
+  for (int k = 0; k < c->nclasses; k++) {
+    if (!is_descendant(c, k, cid)) continue;
+    int kmi = call_target(c, call, k, name, 0, NULL);
+    if (kmi >= 0 && scope_has_callable_symbol(c, kmi)) return &c->scopes[kmi];
+  }
+  return NULL;
+}
+
+/* Is the count of a call's arguments judged ahead of a dispatch's switch,
+   against pm? Not when an argument is forwarded or a block argument, nor
+   when a parameter is synthesized (every __-prefixed one, a __bam_
+   wrapper's too: a receiver-bound wrapper's first one is its receiver, not
+   an argument). */
+static int dispatch_count_judged(Compiler *c, const Scope *pm, const int *argv, int argc) {
+  const NodeTable *nt = c->nt;
+  if (!pm || (!argv && argc)) return 0;
+  for (int k = 0; k < argc; k++) {
+    NodeKind ak = nt_kind(nt, argv[k]);
+    if (ak == NK_ForwardingArgumentsNode || ak == NK_BlockArgumentNode) return 0;
+  }
+  for (int i = 0; i < pm->nparams; i++)
+    if (pm->pnames[i] && pm->pnames[i][0] == '_' && pm->pnames[i][1] == '_') return 0;
+  return 1;
+}
+
+/* Does a descendant of cid answer `name` through an attr reader or writer,
+   which has no scope to be an arm of its own? */
+static int dispatch_accessor_answers(Compiler *c, int call, int cid, const char *name) {
+  char wbase[256];
+  int is_wr = setter_base_name(name, wbase, sizeof wbase);
+  for (int k = 0; k < c->nclasses; k++) {
+    if (!is_descendant(c, k, cid) || dispatch_arm_scope(c, call_target(c, call, k, name, 0, NULL)) >= 0) continue;
+    if (comp_reader_in_chain(c, k, name, NULL) || (is_wr && comp_writer_in_chain(c, k, wbase, NULL))) return 1;
+  }
+  return 0;
+}
+
+/* See codegen_internal.h. */
+int dispatch_count_misfits(Compiler *c, int call, int cid, const char *name) {
+  const NodeTable *nt = c->nt;
+  if (call < 0 || nt_kind(nt, call) != NK_CallNode || !sp_streq(nt_str(nt, call, "name"), name) ||
+      cplan_dispatch_miss(c, call, cid) == CM_NONE || dispatch_accessor_answers(c, call, cid, name))
+    return 0;
+  Scope *pm = dispatch_first_arm(c, call, cid, name);
+  int argc = 0;
+  const int *argv = call_args(nt, call, &argc);
+  return dispatch_count_judged(c, pm, argv, argc) && call_arity_may_raise(c, pm, argc, argv);
 }
 
 /* One arm of a per-arm dispatch: the call of `kmi` (defined in class `kd`) with
@@ -12839,21 +12957,77 @@ int emit_arm_args_text(Compiler *c, int mi, const char *armself, const char *con
   return 1;
 }
 
+/* Self of class cid boxed: a user exception as the sp_Exception it is,
+   another object with the class its header carries. */
+static void emit_obj_self_box(Compiler *c, int cid, const char *selfptr, Buf *b) {
+  if (cid >= 0 && class_is_exc_subclass(c, cid)) buf_printf(b, "sp_box_obj((void *)(%s), SP_BUILTIN_EXCEPTION)", selfptr);
+  else buf_printf(b, "sp_box_obj((void *)(%s), (%s)->cls_id)", selfptr, selfptr);
+}
+
 /* The runtime class a virtual dispatch switches on. A user exception is an
    sp_Exception, whose header carries no cls_id, so it keys by its class
    name through sp_exc_user_cls_id. */
 void emit_obj_dispatch_key(Compiler *c, int cid, const char *selfptr, Buf *b) {
-  if (cid >= 0 && class_is_exc_subclass(c, cid))
-    buf_printf(b, "sp_exc_user_cls_id(sp_box_obj((void *)(%s), SP_BUILTIN_EXCEPTION))", selfptr);
+  if (cid >= 0 && class_is_exc_subclass(c, cid)) {
+    buf_puts(b, "sp_exc_user_cls_id(");
+    emit_obj_self_box(c, cid, selfptr, b);
+    buf_puts(b, ")");
+  }
   else
     buf_printf(b, "(%s)->cls_id", selfptr);
+}
+
+/* The default arm's value of a dispatch on self from class cid whose chain
+   holds no method of `name` (only descendants do): when the dispatch is
+   call miss_id's own (emit_dispatch_in decides it; -1 otherwise), the raise
+   the plan says self of another class gets there (cplan_dispatch_miss),
+   naming self's class as it runs and staging self as the receiver;
+   otherwise, and after the raise, the typed placeholder the result slot
+   takes. A per-arm dispatch passes its arguments (argsNode), which no
+   arm ran for this self: CRuby runs them before it finds no method. */
+static void emit_dispatch_miss_default(Compiler *c, int cid, int miss_id, const char *name, const char *selfptr,
+                                       int argsNode, int rtmp, TyKind ret, TyKind disp_ret, Buf *b) {
+  int miss = miss_id >= 0 ? cplan_dispatch_miss(c, miss_id, cid) : CM_NONE;
+  if (miss != CM_NONE) {
+    int argc = 0;
+    const int *argv = argsNode >= 0 ? nt_arr(c->nt, argsNode, "arguments", &argc) : NULL;
+    Buf pb; memset(&pb, 0, sizeof pb);
+    if (argc > 0) {
+      Buf *sv = g_pre;
+      int ov = g_n_argov;
+      g_pre = &pb;
+      emit_args_run(c, argv, argc);
+      g_pre = sv;
+      view_unbind(ov);
+    }
+    /* in a block of its own: the arguments' temps are declarations */
+    if (pb.p) buf_printf(b, "{ %s", pb.p);
+    Buf v; memset(&v, 0, sizeof v);
+    emit_obj_self_box(c, cid, selfptr, &v);
+    if (miss == CM_NAMEERROR) {
+      buf_puts(b, "sp_raise_cls(\"NameError\", sp_stage_recv_msg(sp_sprintf(\"undefined local variable or method '%s' for %s\", ");
+      emit_str_literal(b, name);
+      buf_printf(b, ", sp_nomethod_recv_desc(%s)), %s)); ", v.p, v.p);
+    }
+    else {
+      buf_puts(b, "sp_raise_poly_nomethod(");
+      emit_str_literal(b, name);
+      buf_printf(b, ", %s); ", v.p);
+    }
+    free(v.p);
+    if (pb.p) buf_puts(b, "} ");
+    free(pb.p);
+  }
+  buf_printf(b, "_t%d = %s; break;", rtmp,
+             ret == TY_POLY ? "sp_box_nil()" : g_disp_ro ? oint_nil(disp_ret) : default_value_from_compiler(c, disp_ret));
 }
 
 /* The dispatch switch for arms that disagree on their parameters: each arm
    binds the call's arguments by its own method's list, the way a direct call
    to that method would, defaults and arity check included. The argument
-   expressions sit inside the arms, so only the entered one evaluates them. */
-static void emit_dispatch_per_arm(Compiler *c, int cid, const char *name, const char *selfptr,
+   expressions sit inside the arms, so only the entered one evaluates them;
+   the default arm runs them before its miss raise (emit_dispatch_miss_default). */
+static void emit_dispatch_per_arm(Compiler *c, int cid, int miss_id, const char *name, const char *selfptr,
                                   int argsNode, int blk_node, int mi, int defcls,
                                   TyKind ret, TyKind disp_ret, Buf *b) {
   int want_blk = 0;
@@ -12893,8 +13067,7 @@ static void emit_dispatch_per_arm(Compiler *c, int cid, const char *name, const 
   if (dmi >= 0)
     emit_dispatch_arm_call(c, defcls, dmi, selfptr, argsNode, blk_tmp, ret, disp_ret, rtmp, b);
   else
-    buf_printf(b, "_t%d = %s; break;", rtmp,
-               ret == TY_POLY ? "sp_box_nil()" : g_disp_ro ? oint_nil(disp_ret) : default_value_from_compiler(c, disp_ret));
+    emit_dispatch_miss_default(c, cid, miss_id, name, selfptr, argsNode, rtmp, ret, disp_ret, b);
   buf_printf(b, " } _t%d; })", rtmp);
 }
 
@@ -13188,7 +13361,7 @@ static void emit_dispatch_in(Compiler *c, int cid, const char *name,
      assertion, looks the name up itself */
   CallPlan dpc;
   const CallPlan *dpl = NULL;
-  int mi = -1, served = 0;
+  int mi = -1, served = 0, miss_id = -1;
   int conversion_node = g_nd_call_id;
   const CallPlan *conversion = view_conversion(c, &conversion_node);
   if (conversion && sp_streq(conversion->delegate, name)) {
@@ -13207,6 +13380,7 @@ static void emit_dispatch_in(Compiler *c, int cid, const char *name,
         dpc = *cplan_user_in(c, g_nd_call_id, cid,
                              g_ie_class_id == cid ? CPX_IE : g_emitting_class_id == cid ? CPX_EMIT : CPX_ARM);
       served = 1;
+      miss_id = g_nd_call_id;
       if (dpc.chain && dpc.via == UC_INST && dpc.owner_ci == cid) {
         mi = dpc.mi;
         if (mi >= 0) defcls = c->scopes[mi].class_id;
@@ -13302,7 +13476,9 @@ static void emit_dispatch_in(Compiler *c, int cid, const char *name,
   if (!dpl || g_plan_check) {
     int impl_n = dispatch_impl_count(c, g_nd_call_id, cid, name);
     int sw = impl_n > 1 || (!m && impl_n >= 1);
-    int oform = !sw ? (m ? CP_DIRECT : CP_NONE) : dispatch_arms_disagree(c, g_nd_call_id, cid, name) ? CP_PER_ARM : CP_SWITCH;
+    int oform = !sw ? (m ? CP_DIRECT : CP_NONE)
+              : dispatch_arms_disagree(c, g_nd_call_id, cid, name) || (!m && dispatch_count_misfits(c, g_nd_call_id, cid, name))
+              ? CP_PER_ARM : CP_SWITCH;
     if (!dpl) form = oform;
     else if (form != oform)
       fprintf(stderr, "plan-check: cplan-conflict: dispatch-form node %d %s: plan %d, counted %d (%d implementations)\n",
@@ -13328,7 +13504,7 @@ static void emit_dispatch_in(Compiler *c, int cid, const char *name,
               nt_str(nt, g_nd_call_id, "name") && sp_streq(nt_str(nt, g_nd_call_id, "name"), name) &&
               node_is_oint(c, g_nd_call_id);
   if (virtual && form == CP_PER_ARM) {
-    emit_dispatch_per_arm(c, cid, name, selfptr, argsNode, blk_node, mi, defcls, ret, disp_ret, b);
+    emit_dispatch_per_arm(c, cid, miss_id, name, selfptr, argsNode, blk_node, mi, defcls, ret, disp_ret, b);
     return;
   }
 
@@ -13336,28 +13512,16 @@ static void emit_dispatch_in(Compiler *c, int cid, const char *name,
      or for a method only subclasses define the first arm's, which every arm
      takes alike (dispatch_arms_disagree). Laid out as the call's positionals
      given, a rest arm got them one by one, and the C call did not build. */
-  Scope *pm = m;
-  for (int k = 0; !pm && k < c->nclasses; k++) {
-    if (!is_descendant(c, k, cid)) continue;
-    int kmi = call_target(c, g_nd_call_id, k, name, 0, NULL);
-    if (kmi >= 0 && scope_has_callable_symbol(c, kmi)) pm = &c->scopes[kmi];
-  }
+  Scope *pm = m ? m : dispatch_first_arm(c, g_nd_call_id, cid, name);
   /* Arity check, the free-function path's own: an over- or under-supplied
      instance call went through with the extra arguments simply dropped
      (#3677). A count only a splat knows is measured with the splat below. */
   int argov_saved_d = g_n_argov;
-  /* the count is judged here, and with the splat below, unless an argument
-     is forwarded or a block argument, or a parameter is synthesized --
-     every __-prefixed one, a __bam_ wrapper's too: a receiver-bound
-     wrapper's first one is its receiver, not an argument */
-  int judged_d = pm && (argv || argc == 0);
-  for (int k = 0; k < argc && argv && judged_d; k++) {
-    const char *at = nt_type(nt, argv[k]);
-    if (at && (nt_kind(nt, argv[k]) == NK_ForwardingArgumentsNode || sp_streq(at, "BlockArgumentNode")))
-      judged_d = 0;
-  }
-  for (int i = 0; judged_d && i < pm->nparams; i++)
-    if (pm->pnames[i] && pm->pnames[i][0] == '_' && pm->pnames[i][1] == '_') judged_d = 0;
+  /* the count is judged here, and with the splat below
+     (dispatch_count_judged); a count that raises against a method only
+     descendants define is judged in their arms instead (the plan's
+     CP_PER_ARM, dispatch_count_misfits) */
+  int judged_d = dispatch_count_judged(c, pm, argv, argc);
   if (judged_d) emit_call_arity_check(c, pm, argc, argv);
   /* `callee(...)`: forward the enclosing `def foo(...)` method's synthesized
      __fwd_* params positionally (#1288), same as the emit_args_filled path. */
@@ -13828,12 +13992,14 @@ else {
   arm_texts_flush(at, nat, b);
   free(at);
   /* When the method is defined only in descendants (m == NULL), the base class
-     has no implementation. The default arm is unreachable (self is always a
-     descendant that has the method), so emit a typed placeholder rather than a
+     has no implementation: self of a class with none (the base's own
+     instance, another descendant, an object a singleton definition did not
+     reach) gets the raise the plan says (emit_dispatch_miss_default), not a
      call to a nonexistent sp_<base>_<name>. */
   if (!m) {
-    buf_printf(b, " default: _t%d = %s; break; } _t%d; })", rtmp,
-               ret == TY_POLY ? "sp_box_nil()" : g_disp_ro ? oint_nil(disp_ret) : default_value_from_compiler(c, disp_ret), rtmp);
+    buf_puts(b, " default: ");
+    emit_dispatch_miss_default(c, cid, miss_id, name, selfptr, -1, rtmp, ret, disp_ret, b);
+    buf_printf(b, " } _t%d; })", rtmp);
     free(atmp); free(atmp_ty); free(atmp_o); arg_layout_free(&L);
     return;
   }

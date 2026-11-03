@@ -50,7 +50,12 @@ typedef struct {
   int kind;            /* cached NodeKind+1; 0 = not yet computed (see nt_kind) */
 } SpNode;
 
+/* Parse inputs for each closed autoload registration. The Compiler's copy
+   adds the load record's slot and declaration ownership. */
+typedef struct { int node, file, slot, first; char *name, *path; } AutoloadRegistration;
+
 typedef struct {
+  AutoloadRegistration *autoloads; int nautoloads, cautoloads;
   SpNode *nodes;
   int count;           /* number of allocated node slots */
   int node_cap;        /* capacity of `nodes`; >= count (for append growth) */
@@ -119,6 +124,9 @@ typedef struct {
   /* the class or module body that holds each node (fwd_lex_parent), made as
      far as its questions need; NULL until the first */
   struct NtHolders *holders;
+  /* the class builder each constant write holds (class_def_builder), asked
+     node by node; NULL until the first */
+  struct NtBuilders *builders;
 } NodeTable;
 
 /* An index of the tree kept on the table it was made of: for each node, the
@@ -138,6 +146,22 @@ struct NtHolders {
   int hi, k;
   const int *bv;
   int bn;
+  unsigned ver;
+  unsigned long edits;
+  int cnt;
+};
+
+/* The class builder call each constant write holds (class_def_builder) and
+   its kind, kept on the table it was asked of: call[id] (-1: none) and
+   module[id] (Module.new) are the answer when stamp[id] is cur, and an entry
+   counts only while the table's count, version and edits are the ones it
+   saw (ver, edits, cnt), so an edit clears nothing. Freed with the table. */
+struct NtBuilders {
+  int *call;
+  unsigned char *module;
+  unsigned *stamp;
+  int cap;
+  unsigned cur;
   unsigned ver;
   unsigned long edits;
   int cnt;
@@ -250,6 +274,11 @@ void nt_dump(const NodeTable *nt, FILE *out);
 /* A hash of every node's type, content and fields (SPINEL_LOWER_CHECK). */
 unsigned long long nt_content_hash(const NodeTable *nt);
 
+void nt_add_autoload(NodeTable *nt, int node, int file, const char *name, const char *path);
+/* Does a registration of the program name constant `name`? A defined? of it
+   is then the run time's question until the load record answers it at the
+   read (elab_autoload_read): "constant" while the registration is pending. */
+int nt_autoload_named(const NodeTable *nt, const char *name);
 void nt_free(NodeTable *nt);
 /* Renumber the nodes to an order: order[k] is the id node k had (node_table.c). */
 void nt_renumber(NodeTable *nt, const int *order);
@@ -327,7 +356,10 @@ int  nt_renames_spare(const NodeTable *nt, NtStamp s, int (*reads)(const char *n
 /* Accessors. id must be in [0, nt->count). Out-of-range ids return the
    given defaults so callers can walk freely without bounds checks. */
 /* Resolve a `node_file` id to its source path, or NULL if out of range.
-   Used by codegen to emit `#line N "path"` directives in multi-file builds. */
+   Used by codegen to emit `#line N "path"` directives in multi-file builds.
+   One path can have two ids (a `#<SPINEL_SOURCE>` marker's name that a file
+   of that path and the file the marker is in disagree about deferring), so
+   two nodes are in the same file when their paths are equal, not their ids. */
 const char *nt_file_path(const NodeTable *nt, int fid);
 /* The file's `# spinel: defer-refusals` magic comment: set, and asked */
 void nt_put_file_defers(NodeTable *nt, int fid);

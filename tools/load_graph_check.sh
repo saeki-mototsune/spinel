@@ -10,7 +10,8 @@
 # its own: every test/load_graph program with an .expected prints what
 # CRuby prints and exits as CRuby does, 0 unless a `# spinel: exit N` line
 # in its first lines gives N (the others are the files they require).
-# A require that names no file raises LoadError when it runs, and a
+# A require that names no file raises LoadError when it runs (and says so
+# when it compiles, unless a rescue its begin runs catches it), and a
 # --debug build reports a required file's frames as CRuby does
 # (`<top (required)>`, `Kernel#require_relative`). What graph mode does not
 # compile yet it refuses by name: an autoload, a load of the entry file, an END
@@ -101,6 +102,14 @@ for e in test/load_graph/*.rb.expected; do
     fail "$t did not compile"; sed -n 1,5p "$tmp/$b.c.out"
   fi
 done
+
+# A require that names no file warns that it raises LoadError when it runs,
+# unless the rescue clause its begin runs for it catches that LoadError
+# (the fat-binary fallback, rescue_runs_main.rb)
+grep -q "cannot load such file" "$tmp/rescue_runs_main.c.out" &&
+  fail "a require whose LoadError a rescue catches warned"
+grep -q "load_error_uncaught_main.rb:5: cannot load such file -- load_error_uncaught_no_such_lib" "$tmp/load_error_uncaught_main.c.out" ||
+  fail "a require of no file did not warn"
 
 # ---- the load record: a test/load_graph program with a .load-record dumps
 # those points (--dump-load-record, analyze_elab.c) ----
@@ -388,10 +397,184 @@ refused() {
 mkdir "$tmp/autoload" "$tmp/entry" "$tmp/end" "$tmp/mixin"
 printf 'module Lib; end\n' > "$tmp/autoload/lib.rb"
 printf 'autoload :Lib, File.join(__dir__, "lib")\np Lib\n' > "$tmp/autoload/main.rb"
-refused autoload "an autoload's file"
+# A possible autoload definition anywhere keeps the original graph refusal.
+# Inline keeps its eager rewrite, even when the program owns the name.
+printf 'puts "must not load"\nclass Lib; end\n' > "$tmp/autoload/lib.rb"
+cat > "$tmp/autoload/main.rb" <<'RUBY'
+def autoload(*) = puts("user top")
+autoload(:Lib, File.join(__dir__, "lib"))
+RUBY
+refused autoload "--load-model=graph loads an autoload's file at its constant's first reference only later, for now"
+if "$SPINEL" --load-model=inline "$tmp/autoload/main.rb" -o "$tmp/autoload/bin" >"$tmp/autoload/cc" 2>&1; then
+  "$tmp/autoload/bin" > "$tmp/autoload/run"
+  printf 'must not load\n' | cmp -s - "$tmp/autoload/run" || fail "autoload inline changed its eager output"
+else
+  fail "autoload inline did not compile"
+fi
+cat > "$tmp/autoload/main.rb" <<'RUBY'
+class Holder
+  def x(*) = puts("user alias")
+  alias_method :autoload, :x
+  def run
+    autoload(:Lib, File.join(__dir__, "lib"))
+  end
+end
+Holder.new.run
+RUBY
+refused autoload "--load-model=graph loads an autoload's file at its constant's first reference only later, for now"
+if "$SPINEL" --load-model=inline "$tmp/autoload/main.rb" -o "$tmp/autoload/bin" >"$tmp/autoload/cc" 2>&1; then
+  "$tmp/autoload/bin" > "$tmp/autoload/run"
+  printf 'must not load\n' | cmp -s - "$tmp/autoload/run" || fail "autoload inline changed its eager output"
+else
+  fail "autoload inline did not compile"
+fi
+printf 'puts "loaded"\nclass Holder; Z = 7; end\n' > "$tmp/autoload/lib.rb"
+cat > "$tmp/autoload/main.rb" <<'RUBY'
+class Other
+  def autoload(*) = puts("user other")
+end
+class Holder
+  autoload :Z, File.join(__dir__, "lib")
+end
+puts "before"
+p Holder::Z
+RUBY
+refused autoload "--load-model=graph loads an autoload's file at its constant's first reference only later, for now"
+if "$SPINEL" --load-model=inline "$tmp/autoload/main.rb" -o "$tmp/autoload/bin" >"$tmp/autoload/cc" 2>&1; then
+  "$tmp/autoload/bin" > "$tmp/autoload/run"
+  printf 'loaded\nbefore\n7\n' | cmp -s - "$tmp/autoload/run" || fail "autoload inline changed its eager output"
+else
+  fail "autoload inline did not compile"
+fi
+# A scoped read through a class whose superclass chain the record does not
+# know may reach Object's registration: refused as on master.
+printf 'puts "loaded"\nclass Scoped; end\n' > "$tmp/autoload/lib.rb"
+cat > "$tmp/autoload/main.rb" <<'RUBY'
+Base = (ARGV.size > 5 ? Class.new(BasicObject) : Object)
+class Holder < Base; end
+autoload :Scoped, File.join(__dir__, "lib")
+begin
+  Holder::Scoped
+rescue NameError
+  puts "ne"
+end
+RUBY
+refused autoload "--load-model=graph loads an autoload's file at its constant's first reference only later, for now"
+# A top-level include of an autoloaded module, a scoped read through a builtin
+# class, and a query of the constant table beside a registration are refused.
+printf 'puts "loaded"\nmodule Lib; def hi = 1; end\n' > "$tmp/autoload/lib.rb"
+printf 'autoload :Lib, File.join(__dir__, "lib")\ninclude Lib\np hi\n' > "$tmp/autoload/main.rb"
+refused autoload "--load-model=graph loads an autoload's file at its constant's first reference only later, for now"
+# ... and so are a conditional include and a send of include in a class body.
+for form in 'include Lib if ARGV.empty?' 'send(:include, Lib)'; do
+  printf 'autoload :Lib, File.join(__dir__, "lib")\nclass Holder\n  %s\nend\np Holder.new.hi\n' "$form" > "$tmp/autoload/main.rb"
+  refused autoload "--load-model=graph loads an autoload's file at its constant's first reference only later, for now"
+done
+printf 'autoload :Lib, File.join(__dir__, "lib")\nbegin\n  String::Lib\nrescue NameError\n  puts "ne"\nend\n' > "$tmp/autoload/main.rb"
+refused autoload "--load-model=graph loads an autoload's file at its constant's first reference only later, for now"
+# A feature name with no directory is looked up on the load path, not beside the file.
+printf 'autoload :Lib, "lib"\np Lib\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload registration"
+for form in 'p Object.autoload?(:Lib)' 'p Object.constants'; do
+  printf 'autoload :Lib, File.join(__dir__, "lib")\n%s\n' "$form" > "$tmp/autoload/main.rb"
+  refused autoload "--load-model=graph: constant-table query with autoload registrations, for now"
+done
+printf 'module Lib; end\n' > "$tmp/autoload/lib.rb"
+for form in 'define_method(["other"].first.to_sym) {}' 'def old; end; alias :"#{:other}" old'; do
+  printf 'class Holder\n  %s\n  autoload :Lib, File.join(__dir__, "lib")\nend\n' "$form" > "$tmp/autoload/main.rb"
+  refused autoload "--load-model=graph loads an autoload's file at its constant's first reference only later, for now"
+done
+printf 'autoload :Lib, File.join(__dir__, "lib")\np Lib\n' > "$tmp/autoload/main.rb"
+# Closed autoload registrations compile; unresolved names and path sets are refused.
+"$SPINEL" --load-model=graph "$tmp/autoload/main.rb" -o "$tmp/autoload/bin" >"$tmp/autoload/out" 2>&1 || fail "autoload did not compile"
+printf 'autoload ARGV.first, File.join(__dir__, "lib")\np Lib\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload registration"
+printf 'autoload :Lib, ARGV.first\np Lib\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload registration"
+printf '%%w[lib other].each { |path| autoload :Lib, File.join(__dir__, path) }\np Lib\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload registration"
+# a call on the path's local may change its String before the registration
+printf 'path = File.join(__dir__, "lib")\npath.replace(File.join(__dir__, "other"))\nautoload :Lib, path\np Lib\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload registration"
+printf 'path = File.join(__dir__, "lib")\n[1].each { path << "" }\nautoload :Lib, path\np Lib\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload registration"
+# ...through another name for its String or a method it is passed to, and a
+# write that may not run leaves it nil
+printf 'path = File.join(__dir__, "lib")\nother = path\nother.replace(File.join(__dir__, "x"))\nautoload :Lib, path\np Lib\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload registration"
+printf 'def retarget(s) = s.replace(File.join(__dir__, "x"))\npath = File.join(__dir__, "lib")\nretarget(path)\nautoload :Lib, path\np Lib\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload registration"
+printf 'path = File.join(__dir__, "lib") if ARGV.size > 5\nautoload :Lib, path\np Lib\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload registration"
+# a header whose scope an autoload defines runs the file before it opens the
+# class, after the scope walk registered it; an explicit-receiver mixin
+# becomes such a header
+printf 'module Lib; class Box; end; end\n' > "$tmp/autoload/lib.rb"
+printf 'autoload :Lib, File.join(__dir__, "lib")\nmodule M; end\nclass Lib::Box; include M; end\np Lib::Box.new\n' > "$tmp/autoload/main.rb"
+refused autoload "a class header whose scope an autoload defines"
+printf 'autoload :Lib, File.join(__dir__, "lib")\nmodule M; end\nLib::Box.include(M)\np Lib::Box.new\n' > "$tmp/autoload/main.rb"
+refused autoload "a class header whose scope an autoload defines"
+# after one registration ran the shared file, CRuby answers defined? of the
+# other "constant" until its own autoload runs
+printf 'Lib = 1\n' > "$tmp/autoload/lib.rb"
+printf 'autoload :Lib, File.join(__dir__, "lib")\nautoload :Other, File.join(__dir__, "lib")\np Lib\np defined?(Other)\n' > "$tmp/autoload/main.rb"
+refused autoload "autoload registrations sharing a file that does not define each one's constant"
+# the file defines the constant only in another scope, whose class of that
+# leaf the read (bare or scoped) would take
+printf 'module Holder; class Lib; end; end\n' > "$tmp/autoload/lib.rb"
+printf 'autoload :Lib, File.join(__dir__, "lib")\nbegin; Lib; rescue NameError; end\np defined?(Lib)\n' > "$tmp/autoload/main.rb"
+refused autoload "an autoloaded constant the program defines only in another scope"
+printf 'class Lib; end\n' > "$tmp/autoload/lib.rb"
+printf 'class S\n  autoload :Lib, File.join(__dir__, "lib")\nend\nbegin; S::Lib; rescue NameError; end\np defined?(S::Lib)\n' > "$tmp/autoload/main.rb"
+refused autoload "an autoloaded constant the program defines only in another scope"
+# An implicit rescue/ensure wraps the whole body, which its emitter cannot
+# dispatch. Keep the graph refusal; an explicit begin statement is executable.
+for body in 'class Holder' 'module Holder' 'class Holder; end; class << Holder'; do
+  for clause in rescue ensure; do
+    printf '%s\n  autoload :Lib, File.join(__dir__, "lib")\n%s\n  puts "clause"\nend\n' "$body" "$clause" > "$tmp/autoload/main.rb"
+    refused autoload "--load-model=graph loads an autoload's file at its constant's first reference only later, for now"
+  done
+done
 printf 'require_relative "main"\n' > "$tmp/entry/lib.rb"
 printf 'require_relative "lib"\nputs "main"\n' > "$tmp/entry/main.rb"
 refused entry "the program's own entry file"
+# a closed set that names it beside another file, of a loop of each...
+printf 'puts "lib"\n' > "$tmp/entry/lib.rb"
+printf '%%w[lib main].each { |v| require File.join(__dir__, v) } if ARGV.size > 5\n' > "$tmp/entry/main.rb"
+refused entry "a computed require may load the program's own entry file"
+# ...and of each_with_index, whose first parameter is the word too
+printf '%%w[lib main].each_with_index { |v, i| require File.join(__dir__, v) }\n' > "$tmp/entry/main.rb"
+refused entry "a computed require may load the program's own entry file"
+# on a value no module can be, autoload is the run-time call master makes,
+# and its file is not part of the program (one that does not parse included)
+printf 'module Lib; end\n' > "$tmp/autoload/lib.rb"
+printf 'begin\n  Object.new.autoload(:Lib, File.join(__dir__, "lib"))\nrescue NoMethodError => e\n  p e.class\nend\n' > "$tmp/autoload/main.rb"
+if "$SPINEL" --load-model=graph "$tmp/autoload/main.rb" -o "$tmp/autoload/bin" >"$tmp/autoload/cc" 2>&1; then
+  [ "$("$tmp/autoload/bin")" = "NoMethodError" ] || fail "autoload on Object.new did not raise NoMethodError"
+else fail "autoload on Object.new refused"; sed -n 1,3p "$tmp/autoload/cc"; fi
+printf 'this is not ruby (\n' > "$tmp/autoload/data.rb"
+printf 'class UserAuto\n  def autoload(name, path) = puts("user #{name}")\nend\nUserAuto.new.autoload(:X, File.join(__dir__, "data"))\n' > "$tmp/autoload/main.rb"
+if "$SPINEL" --load-model=graph "$tmp/autoload/main.rb" -o "$tmp/autoload/bin" >"$tmp/autoload/cc" 2>&1; then
+  [ "$("$tmp/autoload/bin")" = "user X" ] || fail "a program's own autoload on an object did not run"
+else fail "a program's own autoload on an object parsed its argument's file"; sed -n 1,3p "$tmp/autoload/cc"; fi
+# the same on a constant holding the value: no registration, no parse
+printf 'INST = Object.new\nbegin\n  INST.autoload(:X, File.join(__dir__, "data"))\nrescue NoMethodError => e\n  p e.class\nend\n' > "$tmp/autoload/main.rb"
+if "$SPINEL" --load-model=graph "$tmp/autoload/main.rb" -o "$tmp/autoload/bin" >"$tmp/autoload/cc" 2>&1; then
+  [ "$("$tmp/autoload/bin")" = "NoMethodError" ] || fail "autoload on a constant holding Object.new did not raise NoMethodError"
+else fail "autoload on a constant holding Object.new refused"; sed -n 1,3p "$tmp/autoload/cc"; fi
+printf 'class UserAuto\n  def autoload(name, path) = puts("user #{name}")\nend\nINST = UserAuto.new\nINST.autoload(:X, File.join(__dir__, "data"))\n' > "$tmp/autoload/main.rb"
+if "$SPINEL" --load-model=graph "$tmp/autoload/main.rb" -o "$tmp/autoload/bin" >"$tmp/autoload/cc" 2>&1; then
+  [ "$("$tmp/autoload/bin")" = "user X" ] || fail "a program's own autoload on a constant did not run"
+else fail "a program's own autoload on a constant parsed its argument's file"; sed -n 1,3p "$tmp/autoload/cc"; fi
+# a value that may be a module (CRuby registers on it) stays refused
+printf 'module Holder; end\nM = [Holder].first\nM.autoload(:X, File.join(__dir__, "lib"))\np Holder::X\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload owner"
+printf 'module Holder; end\n[Holder].first.autoload(:X, File.join(__dir__, "lib"))\np Holder::X\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload owner"
+printf 'class K < Module; end\nK.new.autoload(:X, File.join(__dir__, "lib"))\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload owner"
+printf 'class Holder; end\nclass Maker\n  def self.new = Holder\nend\nMaker.new.autoload(:X, File.join(__dir__, "lib"))\n' > "$tmp/autoload/main.rb"
+refused autoload "unresolved autoload owner"
 printf 'END { puts "lib END" }\nputs "lib"\n' > "$tmp/end/lib.rb"
 printf 'require_relative "lib"\nputs "main"\n' > "$tmp/end/main.rb"
 refused end "an END block in a required file"
@@ -399,18 +582,26 @@ printf 'include Helpers\n' > "$tmp/mixin/lib.rb"
 printf 'module Helpers\n  LEVEL = 1\nend\nrequire_relative "lib"\np LEVEL\n' > "$tmp/mixin/main.rb"
 refused mixin "a top-level include in a required file"
 # an include in a required file after a call its module's method would
-# answer early: refused as in one file (refuse_mixin_after_calls reads the
-# statements in load order)
+# answer early: the call reaches what the class had then, as in one file
+# (the include's copies are guarded until its statement has run; the
+# statements are read in load order)
 mkdir "$tmp/late_include"
 printf 'module Loud\n  def speak = "LOUD"\nend\nclass Dog\nend\nd = Dog.new\nbegin\n  puts d.speak\nrescue NoMethodError\n  puts "no speak yet"\nend\nclass Dog\n  include Loud\nend\n' > "$tmp/late_include/lib.rb"
 printf 'require_relative "lib"\n' > "$tmp/late_include/main.rb"
-refused late_include "a later statement mixes module Loud into class Dog"
 # a file a method requires, once that method may run ahead of the include,
-# as a call in its body may (refuse_mixin_after_calls)
+# as a call in its body may
 mkdir "$tmp/late_include_method"
 printf 'p C.new.tag\n' > "$tmp/late_include_method/lib.rb"
 printf 'module M\n  def tag = "m"\nend\nclass C\nend\ndef load_plugin\n  require_relative "lib"\nend\nbegin\n  load_plugin\nrescue NoMethodError\n  puts "no tag yet"\nend\nclass C\n  include M\nend\n' > "$tmp/late_include_method/main.rb"
-refused late_include_method "a later statement mixes module M into class C"
+for d in late_include late_include_method; do
+  if "$SPINEL" --load-model=graph "$tmp/$d/main.rb" -o "$tmp/$d/bin" >"$tmp/$d/cc" 2>&1; then
+    "$tmp/$d/bin" >"$tmp/$d/out" 2>&1 || fail "$d exits $?"
+    case $d in late_include) want='no speak yet' ;; *) want='no tag yet' ;; esac
+    printf '%s\n' "$want" | cmp -s - "$tmp/$d/out" || { fail "$d called the module's method before its include ran"; cat "$tmp/$d/out"; }
+  else
+    fail "$d did not compile"; sed -n 1,3p "$tmp/$d/cc"
+  fi
+done
 
 # A require whose path no expression tells may name any file of the program,
 # so a file it might run first has no fixed place: a file whose require is

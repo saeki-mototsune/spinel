@@ -171,7 +171,12 @@ static int ucall_respec_ctx(Compiler *c, int id) {
   return 0;
 }
 
+static int g_ucall_arm_depth = 0;
+void ucall_arm_push(void) { g_ucall_arm_depth++; }
+void ucall_arm_pop(void) { if (g_ucall_arm_depth > 0) g_ucall_arm_depth--; }
+
 void ucall_observe(Compiler *c, int id, int mi, int owner_ci, int add) {
+  if (g_ucall_arm_depth > 0) add = 1;
   const CallPlan *conversion = view_conversion(c, &id);
   if (g_repr_check) repr_channel_call(c, id, mi);
   if (conversion) {
@@ -217,16 +222,7 @@ void ucall_observe(Compiler *c, int id, int mi, int owner_ci, int add) {
   /* a boxed receiver's union: any of its candidates is one of its arms */
   if (inf->via == UC_POLY) {
     const char *pnm = nt_str(c->nt, id, "name");
-    int npc = 0, ncc = 0;
-    const PolyCand *pcs = pnm ? comp_poly_candidates(c, pnm, &npc) : NULL;
-    for (int k = 0; k < npc; k++)
-      if (pcs[k].mi == mi ||
-          (pcs[k].mi < 0 && call_target(c, id, pcs[k].cls, pnm, 0, NULL) == mi)) {
-        o->flags |= UO_MATCH | UO_ARM; return;
-      }
-    const PolyCand *ccs = pnm ? comp_cmethod_candidates(c, pnm, &ncc) : NULL;
-    for (int k = 0; k < ncc; k++)
-      if (ccs[k].mi == mi) { o->flags |= UO_MATCH | UO_ARM; return; }
+    if (pnm && cplan_cand_arm(c, id, pnm, mi, 1)) { o->flags |= UO_MATCH | UO_ARM; return; }
   }
   /* a yielding method's proc-form clone is that method, taken as a function
      with its block as a proc */
@@ -794,7 +790,9 @@ int subtree_has_side_effect(Compiler *c, int id) {
   NodeKind k = nt_kind(nt, id);
   if (!ty) return 0;
   if (view_const_read_done(c, id)) return 0;
-  if (k == NK_ConstantPathNode && an_const_read_effect(c, nt_ref(nt, id, "parent")) != NULL) return 1;
+  ConstReadEffect ce = an_const_read_effect(c, id);
+  if (ce.autoload || ce.class_presence) return 1;
+  if (k == NK_ConstantPathNode && an_const_read_effect(c, nt_ref(nt, id, "parent")).presence != NULL) return 1;
   if (k == NK_SuperNode || k == NK_ForwardingSuperNode ||
       k == NK_YieldNode || strstr(ty, "WriteNode"))
     return 1;
@@ -2092,9 +2090,10 @@ const char *nil_value(TyKind t) {
 }
 
 /* Does the program ask whether class variable `nm` ("@@x") is set yet --
-   `defined?(@@x)` or `class_variable_defined?(:@@x)`? Only such a cvar
-   carries a cvar_<C>_<x>__set flag, so every other program's writes stay
-   plain stores. */
+   `defined?(@@x)`, `class_variable_defined?(:@@x)`, or
+   `class_variable_get(:@@x)`, which raises while it is not? Only such a
+   cvar carries a cvar_<C>_<x>__set flag, so every other program's writes
+   stay plain stores. */
 int cvar_defined_probed(Compiler *c, const char *nm) {
   const NodeTable *nt = c->nt;
   if (!nm) return 0;
@@ -2108,8 +2107,8 @@ int cvar_defined_probed(Compiler *c, const char *nm) {
       if (vk == NK_ClassVariableReadNode && nt_str(nt, v, "name") &&
           sp_streq(nt_str(nt, v, "name"), nm)) return 1;
     }
-    else if (kk == NK_CallNode && nt_str(nt, k, "name") &&
-             sp_streq(nt_str(nt, k, "name"), "class_variable_defined?")) {
+    else if (kk == NK_CallNode && is_cvar_reflection_name(nt_str(nt, k, "name")) &&
+             !is_cvar_set_name(nt_str(nt, k, "name"))) {
       int an = 0; int aa = nt_ref(nt, k, "arguments");
       const int *av = aa >= 0 ? nt_arr(nt, aa, "arguments", &an) : NULL;
       if (an < 1) continue;
@@ -2129,6 +2128,16 @@ int cvar_defined_probed(Compiler *c, const char *nm) {
 void emit_cvar_set_flag(Compiler *c, int cid, const char *nm, int as_expr, Buf *b) {
   if (cid < 0 || !nm || !cvar_defined_probed(c, nm)) return;
   buf_printf(b, "cvar_%s_%s__set = 1%s", c->classes[cid].name, nm + 2, as_expr ? ", " : "; ");
+}
+
+/* CRuby's NameError for class variable `nm` that class `cid` neither
+   declares nor has set yet, "uninitialized class variable @@x in C", its
+   receiver (the class) and name staged inside the message argument, so
+   the text still opens with the raise the tail emitters recognize */
+void emit_cvar_name_error(Compiler *c, int cid, const char *nm, Buf *b) {
+  buf_printf(b, "sp_raise_cls(\"NameError\", (sp_exc_stage_recv(sp_box_class((sp_Class){%d})), "
+                "sp_exc_stage_name(\"%s\"), \"uninitialized class variable %s in %s\"))",
+             cid, nm, nm, class_ruby_name(c, cid) ? class_ruby_name(c, cid) : c->classes[cid].name);
 }
 
 /* The flag set after the store, in value position: `(cvar = rhs` + this +
@@ -2695,7 +2704,7 @@ static int ivs_never_nil(Compiler *c, int v) {
       int r = nt_ref(nt, v, "receiver");
       if (!nm || r < 0) return 0;
       if (sp_streq(nm, "new") && nt_kind(nt, r) == NK_ConstantReadNode) {
-        int ci = comp_class_index(c, nt_str(nt, r, "name"));
+        int ci = const_node_class_index(c, r);
         return ci < 0 ? 1 : comp_cmethod_in_chain(c, ci, "new", NULL) < 0;
       }
       if (is_unary_sign(nm)) return nt_kind(nt, r) == NK_StringNode;
@@ -3298,8 +3307,8 @@ int gvar_global_slot(Compiler *c, int node, Buf *out) {
   return plain;
 }
 /* The C global a class variable read or write `node` names
-   (cvar_<owner>_<name>), by the read emitter's rule: the method's class, or
-   the class body the node is in, or the Toplevel, then the ancestor that
+   (cvar_<owner>_<name>), by the read emitter's rule (holder_cvar_owner):
+   the class it is looked up from, or the Toplevel, then the ancestor that
    owns the class variable. Appends it to `out` and answers 1, or 0. */
 int cvar_global_slot(Compiler *c, int node, Buf *out) {
   const char *nm = nt_str(c->nt, node, "name");
@@ -4742,7 +4751,22 @@ static void emit_const_recv_class(Compiler *c, int par, Buf *b) {
   if (repr_of(c, par).kind == RK_BOXED) { buf_puts(b, "sp_unbox_class("); emit_boxed(c, par, b); buf_puts(b, ")"); }
   else emit_expr(c, par, b);
 }
-static void emit_const_read_open_checked(Compiler *c, int id, const LocalVar *lv, Buf *b) {
+static void emit_const_read_open_checked(Compiler *c, int id, ConstReadEffect ce, Buf *b) {
+  const LocalVar *lv = ce.presence;
+  if (ce.autoload) {
+    char nm[256]; const_read_name(c, id, nm, sizeof nm);
+    buf_puts(b, "((");
+    if (ce.class_presence) buf_printf(b, "sp_class_present_%d ? (void)0 : ", ce.class_presence - 1);
+    else if (ce.presence) buf_printf(b, "cst_%s__set ? (void)0 : ", ce.presence->name);
+    buf_printf(b, "sp_auto_%d_registered ? (void)sp_Kernel_require(sp_auto_%d_feature, sp_auto_%d_loaded, sp_auto_%d_top)"
+                  " : sp_raise_cls(\"NameError\", \"uninitialized constant %s\")), ",
+               ce.autoload, ce.autoload, ce.autoload, ce.autoload, nm);
+  }
+  if (ce.class_presence) {
+    char nm[256]; const_read_name(c, id, nm, sizeof nm);
+    buf_printf(b, "((sp_class_present_%d ? (void)0 : sp_raise_cls(\"NameError\", \"uninitialized constant %s\")), ", ce.class_presence - 1, nm);
+  }
+  if (!lv) return;
   int par = const_value_recv(c, id);
   if (par >= 0) {
     const NodeTable *nt = c->nt;
@@ -4763,12 +4787,37 @@ static void emit_const_read_open_checked(Compiler *c, int id, const LocalVar *lv
   const_read_name(c, id, nm, sizeof nm);
   buf_printf(b, "((cst_%s__set ? (void)0 : sp_raise_cls(\"NameError\", \"uninitialized constant %s\")), ", lv->name, nm);
 }
+/* defined? evaluates the parents of a scoped path, not its leaf: a registration
+   there runs its file, without the NameError an unset parent's read raises.
+   Opens a comma expression the caller closes; 0 when no parent runs a file. */
+int emit_const_autoload_run(Compiler *c, int id, Buf *b) {
+  if (!nt_kind_is_constant(nt_kind(c->nt, id))) return 0;
+  int n = nt_kind(c->nt, id) == NK_ConstantPathNode ? emit_const_autoload_run(c, nt_ref(c->nt, id, "parent"), b) : 0;
+  ConstReadEffect ce = an_const_read_effect(c, id);
+  if (!ce.autoload) return n;
+  buf_puts(b, n ? "" : "(");
+  if (ce.class_presence) buf_printf(b, "sp_class_present_%d ? (void)0 : ", ce.class_presence - 1);
+  else if (ce.presence) buf_printf(b, "cst_%s__set ? (void)0 : ", ce.presence->name);
+  buf_printf(b, "sp_auto_%d_registered ? (void)sp_Kernel_require(sp_auto_%d_feature, sp_auto_%d_loaded, sp_auto_%d_top) : (void)0, ",
+             ce.autoload, ce.autoload, ce.autoload, ce.autoload);
+  return 1;
+}
 void emit_const_read_open(Compiler *c, int id, const LocalVar *lv, Buf *b) {
-  if (!view_const_read_done(c, id) && const_has_flag(lv)) emit_const_read_open_checked(c, id, lv, b);
+  if (view_const_read_done(c, id)) return;
+  ConstReadEffect ce = an_const_read_effect(c, id);
+  ce.presence = const_has_flag(lv) ? lv : NULL;
+  emit_const_read_open_checked(c, id, ce, b);
+}
+static void emit_const_read_close_checked(Compiler *c, int id, ConstReadEffect ce, Buf *b) {
+  if (ce.presence) buf_puts(b, const_recv_held(c, id) >= 0 ? "; })" : ")");
+  if (ce.class_presence) buf_puts(b, ")");
+  if (ce.autoload) buf_puts(b, ")");
 }
 void emit_const_read_close(Compiler *c, int id, const LocalVar *lv, Buf *b) {
-  if (view_const_read_done(c, id) || !const_has_flag(lv)) return;
-  buf_puts(b, const_recv_held(c, id) >= 0 ? "; })" : ")");
+  if (view_const_read_done(c, id)) return;
+  ConstReadEffect ce = an_const_read_effect(c, id);
+  ce.presence = const_has_flag(lv) ? lv : NULL;
+  emit_const_read_close_checked(c, id, ce, b);
 }
 /* The effects of a statically resolved path, outermost parent first. The
    opening comma expression lets a caller retain the folded value or call. */
@@ -4776,12 +4825,12 @@ int emit_const_read_prefix(Compiler *c, int id, Buf *b) {
   NodeKind k = nt_kind(c->nt, id);
   if (!nt_kind_is_constant(k) || view_const_read_done(c, id)) return 0;
   int n = k == NK_ConstantPathNode ? emit_const_read_prefix(c, nt_ref(c->nt, id, "parent"), b) : 0;
-  LocalVar *lv = an_const_read_effect(c, id);
-  if (lv) {
+  ConstReadEffect ce = an_const_read_effect(c, id);
+  if (ce.presence || ce.autoload || ce.class_presence) {
     if (!n) buf_puts(b, "(");
-    emit_const_read_open_checked(c, id, lv, b);
+    emit_const_read_open_checked(c, id, ce, b);
     buf_puts(b, "0");
-    buf_puts(b, const_recv_held(c, id) >= 0 ? "; })" : ")");
+    emit_const_read_close_checked(c, id, ce, b);
     buf_puts(b, ", ");
     n = 1;
   }
@@ -4897,7 +4946,7 @@ int emit_const_recv_stmt_wrap(Compiler *c, int id, Buf *b, int indent, int tail)
    asking it for no receiver (own 0) leaves a variable receiver unevaluated and
    unnamed. */
 void emit_const_slot_read(Compiler *c, int id, const LocalVar *lv, const char *key, int slot, int own, Buf *b) {
-  if (!const_has_flag(lv)) { buf_printf(b, "%scst_%s", slot ? "&" : "", key); return; }
+  if (!const_has_flag(lv) && !an_const_read_effect(c, id).autoload) { buf_printf(b, "%scst_%s", slot ? "&" : "", key); return; }
   int again = !own && const_recv_held(c, id) >= 0;
   if (again) {
     /* the name alone: the receiver is not this text's to run */
@@ -5266,13 +5315,20 @@ void emit_coerce(Compiler *c, int node, TyKind slot, int how, const char *what, 
   if (oint_kind(slot) && node_may_be_nil(c, node)) refuse_nil_store(c, node, slot, what);
   int plan = repr_coerce_plan(c, node, slot, how, &from);
   switch (plan) {
-  case CF_FIT:
+  case CF_FIT: ;   /* (a declaration follows: C99 takes one after a statement, not after a label) */
     /* a constant defined nowhere is untyped, so it fits any slot, and lowers
        to its NameError raise with a Class value behind it: into a slot of
        another kind (`Version = Version_C` beside `Version = "1.0"`) it
        answers that slot's zero instead */
-    if ((nt_kind_is_constant(nt_kind(c->nt, node))) &&
-        comp_ntype(c, node) == TY_UNKNOWN && slot != TY_POLY && slot != TY_CLASS && slot != TY_UNKNOWN) {
+    /* ...and so is a read of a class variable no class on its lookup chain
+       declares, which lowers to its NameError raise with a boxed nil behind
+       it (emit_cvar_undeclared_raise): `@@ready = @@missing` into a bool
+       slot did not compile */
+    NodeKind fit_k = nt_kind(c->nt, node);
+    int cvar_read = fit_k == NK_ClassVariableReadNode;
+    if ((nt_kind_is_constant(fit_k) || cvar_read) &&
+        comp_ntype(c, node) == TY_UNKNOWN && slot != TY_POLY && slot != TY_UNKNOWN &&
+        (cvar_read || slot != TY_CLASS)) {
       Buf t; memset(&t, 0, sizeof t);
       emit_expr(c, node, &t);
       const char *tx = t.p ? t.p : "";
@@ -5898,7 +5954,9 @@ int call_never_returns(Compiler *c, int id) {
       int any = 0;
       for (int ci = 0; ci < c->nclasses; ci++) {
         int dc = -1, m = call_target(c, id, ci, nm, 0, &dc);
-        if (m < 0 || dc != ci) continue;
+        /* a method nothing reaches is no arm of the dispatch: the call's
+           type left it out too (#10636) */
+        if (m < 0 || dc != ci || !c->scopes[m].reachable) continue;
         if (c->scopes[m].ret != TY_VOID) return 0;
         any = 1;
       }
@@ -6906,7 +6964,7 @@ static int mc_name_fixed(const char *nm) {
    an entry's or main's own method's with its number, in a buffer of its
    size the caller frees */
 static char *mc_version_name(const Scope *s) {
-  if (s->entry == ENTRY_TABLE) return strdup(s->name);   /* the table answer keeps the name fixed callbacks call */
+  if (s->entry == ENTRY_TABLE || s->entry == ENTRY_NAMED) return strdup(s->name);   /* the table answer keeps the name fixed callbacks call */
   const char *fmt = s->entry && !s->version_n ? (s->class_id < 0 ? "%s__entry" : "%s#entry")
                   : s->entry ? (s->class_id < 0 ? "%s__entry%d" : "%s#entry%d")
                   : s->main_n ? "%s__main%d"
@@ -7023,7 +7081,7 @@ void mc_number_versions(Compiler *c) {
   }
   for (int s = 1; s < c->nscopes; s++) {
     Scope *sc = &c->scopes[s];
-    if (sc->entry && sc->reachable) mc_number_entry(c, &dn, s);
+    if (sc->entry && sc->entry != ENTRY_NAMED && sc->reachable) mc_number_entry(c, &dn, s);
     if (!sc->replaced || !sc->reachable || sc->version_n || sc->main_n) continue;
     if (sc->class_id < 0) sc->version_n = mc_number_top(c, &dn, sc, "%s__redef%d", &top);
     else sc->version_n = ++cls;
@@ -7244,6 +7302,24 @@ static void shadow_tab_build(Compiler *c, int raw) {
   free(tab);
   g_shadow_c = c; g_shadow_n = n; g_shadow_raw = raw; g_shadow_gen = comp_scope_index_gen();
 }
+/* The table grown to scopes appended since it was built, when none of
+   them shadows a method: each has no name, or is a hidden entry (the
+   version entries the fixpoint makes, one per call's chain: a rebuild
+   for each grew with the square of their number). The others' answers
+   stand, and the new scopes' are 0, as the pass would answer. 0 when one
+   may shadow: the pass is run again. */
+static int shadow_tab_extend(Compiler *c) {
+  int n = c->nscopes;
+  if (g_shadow_n < 0 || g_shadow_n > n) return 0;
+  for (int k = g_shadow_n; k < n; k++)
+    if (c->scopes[k].name && c->scopes[k].entry != ENTRY_DISPATCH) return 0;
+  unsigned char *t = realloc(g_shadow_tab, (size_t)(n > 0 ? n : 1));
+  if (!t) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  memset(t + g_shadow_n, 0, (size_t)(n - g_shadow_n));
+  g_shadow_tab = t;
+  g_shadow_n = n;
+  return 1;
+}
 int scope_is_shadowed(Compiler *c, int s) {
   if (c->scopes[s].c_name) return 0;
   /* a replaced method version, and a version entry, is a function of its
@@ -7257,8 +7333,8 @@ int scope_is_shadowed(Compiler *c, int s) {
      planner asks per arm of every dispatch it weighs, every round. */
   int raw = !g_scopes_settled;
   if (raw && !comp_scope_index_is_frozen()) return scope_is_shadowed_scan(c, s);
-  if (g_shadow_c != c || g_shadow_n != c->nscopes || g_shadow_raw != raw ||
-      (raw && g_shadow_gen != comp_scope_index_gen()))
+  if (g_shadow_c != c || g_shadow_raw != raw || (raw && g_shadow_gen != comp_scope_index_gen()) ||
+      (g_shadow_n != c->nscopes && !shadow_tab_extend(c)))
     shadow_tab_build(c, raw);
   return g_shadow_tab[s];
 }
@@ -7554,14 +7630,13 @@ static int tmc_body_includes(const Compiler *c, int k, int mod) {
   const NodeTable *nt = c->nt;
   const char *kn = c->classes[k].name, *mn = c->classes[mod].name;
   if (!kn || !mn) return 0;
-  static const NodeKind HK[] = { NK_ClassNode, NK_ModuleNode };
-  for (int h = 0; h < 2; h++)
-    for (int m = comp_kind_first((Compiler *)c, HK[h]); m >= 0; m = comp_kind_next((Compiler *)c, m)) {
-      if (nt_kind(nt, m) != HK[h]) continue;
-      int cp = nt_ref(nt, m, "constant_path");
-      const char *cn = cp >= 0 ? nt_str(nt, cp, "name") : NULL;
+  int ndk = 0; const NodeKind *dk = class_def_kinds(&ndk);
+  for (int dh = 0; dh < ndk; dh++)
+    for (int m = comp_kind_first((Compiler *)c, dk[dh]); m >= 0; m = comp_kind_next((Compiler *)c, m)) {
+      if (nt_kind(nt, m) != dk[dh] || !class_def_opens_frame(nt, m)) continue;
+      const char *cn = class_def_name(nt, m);
       if (!cn || !sp_streq(cn, kn)) continue;
-      int body = nt_ref(nt, m, "body"), bn = 0;
+      int body = class_def_body(nt, m), bn = 0;
       const int *bb = body >= 0 && nt_kind(nt, body) == NK_StatementsNode ? nt_arr(nt, body, "body", &bn) : NULL;
       for (int i = 0; i < bn; i++) {
         if (nt_kind(nt, bb[i]) != NK_CallNode || nt_ref(nt, bb[i], "receiver") >= 0) continue;
@@ -8278,7 +8353,7 @@ static int class_is_allocated(Compiler *c, int cid) {
       const char *nm = nt_str(nt, u, "name");
       if (!nm || !sp_streq(nm, "allocate")) continue;
       int r = nt_ref(nt, u, "receiver");
-      int rc = r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode ? comp_class_index(c, nt_str(nt, r, "name")) : -1;
+      int rc = r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode ? const_node_class_index(c, r) : -1;
       if (rc >= 0) named[rc] = 1; else any = 1;
     }
   }

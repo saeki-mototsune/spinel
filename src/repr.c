@@ -52,6 +52,16 @@ static int dispatch_answers_nil(Compiler *c, int call, int cid, const char *nm, 
   return overridden && any_nil;
 }
 
+Repr repr_array_operand(Compiler *c, int node) {
+  Repr r = repr_of(c, node);
+  if (nt_kind(c->nt, node) == NK_LocalVariableReadNode) {
+    Scope *sc = comp_scope_of(c, node);
+    LocalVar *lv = sc ? scope_local(sc, nt_str(c->nt, node, "name")) : NULL;
+    if (lv && lv->type != TY_UNKNOWN && comp_ty_ary_root(c, lv->type) < 0) r = repr_of_slot(c, lv);
+  }
+  return r;
+}
+
 int file_stat_nil_call(Compiler *c, int v);   /* analyze.c */
 static int node_is_oint_asked(Compiler *c, int node);
 
@@ -289,7 +299,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
         return reader_ivar_has_nilbit(c, cid, nm) || dispatch_answers_nil(c, node, cid, nm, -1);
     }
     else if (nt_kind(nt, r) == NK_ConstantReadNode || nt_kind(nt, r) == NK_ConstantPathNode) {
-      int rci = comp_class_index(c, nt_str(nt, r, "name"));
+      int rci = const_node_class_index(c, r);
       if (rci >= 0) mi = call_target(c, node, rci, nm, CT_CMETHOD, NULL);
     }
     /* `obj.class.m`: the switch over obj's class and the classes below it
@@ -433,7 +443,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
     {
       int sgc = -1;
       if (r >= 0 && (nt_kind(nt, r) == NK_ConstantReadNode || nt_kind(nt, r) == NK_ConstantPathNode))
-        sgc = comp_class_index(c, nt_str(nt, r, "name"));
+        sgc = const_node_class_index(c, r);
       else if (r < 0 || nt_kind(nt, r) == NK_SelfNode) {
         Scope *ss = comp_scope_of(c, node);
         if (ss && ss->is_cmethod) sgc = ss->class_id;
@@ -480,9 +490,9 @@ static int node_is_oint_asked(Compiler *c, int node) {
     if (sp_streq(nm, "exitstatus") || sp_streq(nm, "termsig") ||
         sp_streq(nm, "world_readable?") || sp_streq(nm, "world_writable?")) return 1;
     if (r >= 0 && ty_is_array(rt) &&
-        (sp_streq(nm, "index") || sp_streq(nm, "rindex") || sp_streq(nm, "delete_at") || sp_streq(nm, "delete") ||
+        (sp_streq(nm, "index") || sp_streq(nm, "rindex") || sp_streq(nm, "find_index") || sp_streq(nm, "delete_at") || sp_streq(nm, "delete") ||
          ((sp_streq(nm, "pop") || sp_streq(nm, "shift")) && an2 == 0))) return 1;
-    if (r >= 0 && ty_is_hash(rt) && sp_streq(nm, "delete")) return 1;
+    if (r >= 0 && ty_is_hash(rt) && (sp_streq(nm, "delete") || sp_streq(nm, "find_index"))) return 1;
     if (r >= 0 && rt == TY_MATCHDATA && (sp_streq(nm, "bytebegin") || sp_streq(nm, "byteend"))) return 1;
     if (is_range_bound_reader(nm) && r >= 0 &&
         (rt == TY_MATCHDATA || rt == TY_RANGE || rt == TY_FLOAT_RANGE)) return 1;

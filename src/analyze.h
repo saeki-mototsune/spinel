@@ -10,7 +10,7 @@
 
 #include "compiler.h"
 
-#define SP_RUBY_VERSION "4.0.7"
+#define SP_RUBY_VERSION "4.0.9"
 
 /* Whether a boxed ivar setter's receiver can hold class k; an unproved
    receiver conservatively reaches every class. Shared by layout/emission. */
@@ -118,8 +118,16 @@ void an_nil_facts(Compiler *c);
    (analyze_const.c). Runs once the constants are registered, ahead of the
    folds that decide `defined?(K)`. */
 void an_const_presence(Compiler *c);
+/* Whether the read at node id finds constant name assigned: the load
+   record's answer at the read's point, the one an_const_presence asks of
+   every read (analyze_const.c). */
+int an_const_read_finds(Compiler *c, int id, const char *name);
 int const_has_flag(const LocalVar *lv);
-LocalVar *an_const_read_effect(Compiler *c, int id);
+typedef struct { const LocalVar *presence; int autoload, class_presence; } ConstReadEffect;
+int an_class_needs_presence(Compiler *c, int ci);
+int an_class_presence_is_read(const Compiler *c, int ci);
+int an_class_presence_write(Compiler *c, int id);
+ConstReadEffect an_const_read_effect(Compiler *c, int id);
 int an_const_read_keeps_class(Compiler *c, int id);
 int an_const_read_is_value(Compiler *c, int id);
 /* The program's files under --load-model=graph (analyze_program.c, #9898):
@@ -140,6 +148,7 @@ int prog_site_places(const Compiler *c, int id);
 int prog_load_ncand(const NodeTable *nt, int load);
 int prog_load_cand(const NodeTable *nt, int load, int k);
 int prog_load_open(const NodeTable *nt, int load);
+int prog_rescue_runs(const NodeTable *nt, int rescue);
 int prog_load_path_seeded(const NodeTable *nt);
 void prog_top_stmts(const Compiler *c, void (*fn)(void *ud, int stmt), void *ud);
 int *prog_top_seq(const Compiler *c, int *n, int **file);
@@ -166,7 +175,13 @@ typedef struct { int region, seq, node; } LoadPoint;
 typedef struct LoadRecord LoadRecord;
 LoadPoint elab_point_of(Compiler *c, int node);
 int elab_point_may(Compiler *c, int node);
+int elab_point_partial(Compiler *c, int node);
+const NodeKind *elab_const_write_kinds(int *n);   /* the node kinds that write a constant */
 LoadPoint elab_point_from(Compiler *c, int node);
+void elab_hold(Compiler *c, int on);   /* keep the map as the first question made it, until released */
+const int *elab_node_parents(Compiler *c, int *n);
+int prog_stmt_call_executable(Compiler *c, int node, int ci);
+int prog_sclass_call_executable(Compiler *c, int node);
 LoadPoint elab_point_done(Compiler *c, int node);
 int elab_in_method_body(Compiler *c, int node);
 int elab_cmp(LoadPoint a, LoadPoint b);
@@ -179,6 +194,9 @@ void elab_check_sort(Compiler *c, const int *now, const int *rec, int n, const i
 void elab_dump(Compiler *c, FILE *out);
 void elab_free(Compiler *c);
 void elab_note_const_writes(Compiler *c);   /* the source's constant writes, before any pass */
+int elab_source_writes_const(Compiler *c, const char *name, int top);   /* ...one of them writes `name` (top: where the top level finds it) */
+int elab_consts_by_value(Compiler *c, int unheld);   /* may it write a constant by a name it computes (const_set, eval; unheld: autoload, const_missing)? */
+int elab_lexical_header(const NodeTable *nt, const int *par, int id);   /* the header whose body is id's lexical scope, -1 for the top level */
 extern int g_dump_load_record;   /* --dump-load-record */
 /* The load record's histories (analyze_elab.c), recorded by elab_program,
    which takes the scope walk's place: a method's versions by (class,
@@ -191,12 +209,26 @@ extern int g_dump_load_record;   /* --dump-load-record */
    before p is UNKNOWN. A p with no point (a method body) asks as of the
    end of the load phase. */
 enum { ELAB_NO, ELAB_YES, ELAB_UNKNOWN };
+enum { LR_MAY_IN = 2 };   /* LrDef.may */
+/* When a call's block (or an END body) runs, from the syntax alone
+   (elab_block_runs): not now, at a time the syntax does not tell (a later
+   def may or may not have run by then); not known (a program method may
+   run or keep it); taken to run at once (master's reading of an
+   iterator's name, class_eval, a class builder: a method of the program's
+   the call reaches may keep it, which only the typed call target tells);
+   at once, for certain (a builtin iterator on a literal of a builtin class
+   the program does not reopen) */
+enum { ELAB_BLK_LATER = -1, ELAB_BLK_UNKNOWN, ELAB_BLK_ASSUMED, ELAB_BLK_NOW };
+int elab_block_runs(Compiler *c, int call);
 typedef enum { LR_DEF, LR_DEFINE_METHOD, LR_READER, LR_WRITER, LR_ALIAS, LR_COPY, LR_UNDEF, LR_REMOVE, LR_VIS, LR_WRITE, LR_OPAQUE } LrKind;
 typedef struct {
   int node;
   unsigned char kind;   /* LrKind */
   unsigned char vis;    /* SP_VIS_*, for a method version; BVIS_*, for a bare visibility word */
-  unsigned char may;    /* recorded under a condition: may not have run */
+  unsigned char may;    /* recorded under a condition: may not have run;
+                           LR_MAY_IN when the condition is inside its
+                           statement (`[x && (def m = 1)]`), which a later
+                           statement of its list has not run it for */
   unsigned char nil;    /* a write of nil */
   const char *target;   /* an alias's or a copy's original name, an alias
                            forwarder def's (lr_def) */
@@ -209,7 +241,8 @@ typedef struct {
                              at a point sees it */
   int scope;            /* a def's or a define_method's: the method scope
                            the scope walk made of it (its Scope index; 0,
-                           the program's top level, for none) */
+                           the program's top level, for none); a
+                           module_function copy's of one, that one's */
 } LrDef;
 typedef struct { int node, body; } LrOpen;
 typedef enum { LR_INCLUDE, LR_EXTEND, LR_PREPEND, LR_SG_PREPEND } LrMixKind;   /* LR_SG_PREPEND: a prepend of the singleton class, ahead of its own methods */
@@ -227,7 +260,8 @@ typedef enum { LR_INCLUDE, LR_EXTEND, LR_PREPEND, LR_SG_PREPEND } LrMixKind;   /
    (LrOpen.node; a file's root for main's). */
 typedef struct { int node, kind, mod, ref; unsigned char dup, cond, applied; int open; } LrMixin;
 typedef enum { ELAB_GVAR, ELAB_MAIN_IVAR, ELAB_CONST } ElabVar;
-void elab_program(Compiler *c);
+struct HostStep;
+void elab_program(Compiler *c, struct HostStep *h);
 /* the class builders' blocks recorded as their classes' bodies, once
    register_structs has made them */
 void elab_record_builders(Compiler *c);
@@ -236,6 +270,12 @@ void elab_record_builders(Compiler *c);
    hook (`inherited`, `included`, `method_added`, ...) is asked as the
    singleton method it is: sg = 1. */
 int elab_method_at(Compiler *c, int cls, const char *name, int sg, LoadPoint p, const LrDef **out);
+/* ...and whether the program gives cls's instance side a method `name` of its own at p, or through a prepend: what shadows the class's own core method (an ancestor's, a Numeric's or Object's, does not, nor an include's); ELAB_YES also for one removed, ELAB_UNKNOWN for one that may not have run (under a condition) */
+int elab_own_method_at(Compiler *c, int cls, const char *name, LoadPoint p);
+/* may a call at p run on cls: on its class object (sg) once a header has
+   opened it, on an instance once one may exist? 1 where the record cannot
+   tell */
+int elab_class_live_at(Compiler *c, int cls, int sg, LoadPoint p);
 /* is the history of cls's method `name` (singleton when sg) open: does a
    version after its last surely applied one (applied 1, lr_stmt_applied)
    stand under a run-time condition in its class body (applied 2), or in an
@@ -244,6 +284,9 @@ int elab_method_at(Compiler *c, int cls, const char *name, int sg, LoadPoint p, 
    only the run time knows? Made once for every history, as the record
    stands (a later entry asks it again). 0 before the record is made. */
 int elab_history_open(Compiler *c, int cls, int sg, const char *name);
+/* ...and open with no version applied for sure (all may not have run, or
+   are partial): the method may be absent wherever it is asked */
+int elab_history_absent(Compiler *c, int cls, int sg, const char *name);
 /* fn(arg, cls, sg, name) for each open history, in the order the record
    made them; fn does not change the record */
 void elab_open_histories(Compiler *c, void (*fn)(void *arg, int cls, int sg, const char *name), void *arg);
@@ -261,9 +304,45 @@ void elab_open_histories(Compiler *c, void (*fn)(void *arg, int cls, int sg, con
    reopening's class side, its instance side is searched too. */
 int elab_call_method(Compiler *c, int id, int cls, const char *name, int sg);
 /* the class self is where node runs at its load point: a class or module
-   body's; -1 for main's top level; -2 for any other frame (a singleton
-   class body, an eval form's or class builder's block) or no point */
+   body's, or a constant's class builder's block; -1 for main's top level;
+   -2 for any other frame (a singleton class body, an eval form's or an
+   anonymous builder's block) or no point */
 int elab_self_at(Compiler *c, int node);
+/* elab_self_at for a node no block stands between it and that body: a
+   statement of the class or module body, or of the class builder's block,
+   itself (a block of another call may run under another self, as
+   class_exec's does); -2 otherwise, and for main's top level */
+int elab_self_value_at(Compiler *c, int node);
+/* What a reflection on class cls at call id (from the first statement of
+   its window, elab_call_window) cannot answer as the load's end does: of
+   `kinds`, each whose every contributor the record cannot prove ran for
+   sure (placed, on no condition, in no body that may not run) before the
+   window. ELAB_GAIN_METHODS: its own instance side's entries and the
+   defs, aliases and attrs its tables hold; ELAB_GAIN_INHERITED: an
+   ancestor's (a top-level def, private, aside) and the mixins, and any
+   at all while main, Object, Kernel or BasicObject holds one (the
+   emitters do not list theirs); ELAB_GAIN_CONSTS: the constants written
+   into it, an ancestor or Object, a mixin, and any at all while one is
+   written in a singleton class body or by a const_set or remove_const
+   on another receiver than cls; ELAB_GAIN_CVARS: each class variable its
+   tables or an ancestor's hold, written in the body itself, a mixin, a
+   class_variable_set. Every kind where it cannot tell (no window, an
+   ancestry it does not know). keep: the call plan asks it outside any
+   view, scope move or splice, so the answer from the record and the
+   tables is kept for the passes that ask it again (by call, class and
+   window), while none of the epochs of what it reads has moved. */
+enum { ELAB_GAIN_METHODS = 1, ELAB_GAIN_INHERITED = 2, ELAB_GAIN_CONSTS = 4, ELAB_GAIN_CVARS = 8 };
+unsigned elab_class_unsettled(Compiler *c, int cls, unsigned kinds, int id, int keep);
+/* the class whose body is node's lexical scope (cref), which owns a
+   constant node writes: a class or module body's; a class builder's block
+   keeps the scope it is written in. -1 for main's top level; -2 in a
+   singleton class body or with no point */
+int elab_cref_at(Compiler *c, int node);
+/* ...the class a class variable node reads or writes looks its name up
+   from (CRuby's cvar base): the cref past singleton class bodies, for a
+   node anywhere, a method body's being its def's. -1 for main's top
+   level, -2 with no point (a node a pass made) */
+int elab_cvar_cref_at(Compiler *c, int node);
 /* the versions of method `name` the record holds, in every class's and
    module's histories: defs, define_methods, attrs, aliases, module_function
    copies, undefs and removes (not visibility changes) */
@@ -272,6 +351,10 @@ int elab_method_versions(Compiler *c, const char *name);
    main's) history of it hold more than one version, or an alias, which
    names the version it captured? */
 int elab_method_replaced(Compiler *c, const char *name);
+/* does a call of `name`, whose versions the record holds in one history,
+   run, or open the window of the bodies around it, ahead of the first
+   version, where the name is absent? */
+int elab_method_late(Compiler *c, const char *name);
 /* The record's histories of method `name`, one class and side at a time:
    the first with i -1, then the one after i; -1 past the last. *cls the
    class (-1 main's), *sg 1 for its singleton side. */
@@ -284,6 +367,10 @@ void elab_mark_versions(Compiler *c);
 /* does node run whenever the body of def node `def` runs: is it inside that
    body with no lambda, nested def or deferred block between? */
 int elab_runs_with(Compiler *c, int node, int def);
+/* does node run when its statement does, for certain: every block around
+   it runs at once (ELAB_BLK_NOW), no END body around it, and the climb
+   reaches a file's root? */
+int elab_blocks_run_now(Compiler *c, int node);
 /* the scope walk made method scope `scope` of def or define_method node
    `node`: the record's version of it holds it (LrDef.scope) */
 void elab_def_scope(Compiler *c, int node, int scope);
@@ -319,6 +406,16 @@ int elab_version_end(Compiler *c, int cls, const char *name, int sg, int node, L
    has no point there (a file the load graph does not place). */
 typedef struct { LoadPoint from, to; unsigned char closed, wraps; } ElabWindow;
 int elab_call_window(Compiler *c, int id, ElabWindow *w);
+/* ...and whether node id is in a block the record takes to run at once
+   (ELAB_BLK_ASSUMED) whose typed call target keeps it (Call node
+   `blk_kept`), with no def or lambda between: node id may then run any
+   time after its point, and elab_window_open widens w to its region's end. */
+int elab_in_kept_block(Compiler *c, int id);
+/* ...and whether node id is in a block the record answers later
+   (elab_block_runs: a lazy chain's) or in an END body: it may run any time
+   after its point too */
+int elab_runs_later(Compiler *c, int id);
+void elab_window_open(Compiler *c, ElabWindow *w);
 /* the versions of cls's method `name` (singleton when sg) a call running
    over window w can reach, each once, into out[0..cap) (NULL: none): the
    one live over each stretch of w between changes of the name on cls's
@@ -349,6 +446,9 @@ int elab_chain_settled(Compiler *c, int cls, int sg, const char *name, LoadPoint
    not hold, a mixin's module is not known, or past cap. */
 typedef struct { const LrDef *v; int hist, n; } ElabVersion;
 int elab_chain_versions(Compiler *c, int cls, int sg, const char *name, ElabVersion *out, int cap);
+/* ...and the versions of cls's own history of `name` alone, numbered as
+   there */
+int elab_history_versions(Compiler *c, int cls, int sg, const char *name, ElabVersion *out, int cap);
 /* The state of the record and the node table an answer of elab_chain_versions
    was read from: a kept answer holds while the stamp does (the table's
    version, and the record's made-ness, size and map). */
@@ -358,6 +458,9 @@ int elab_stamp_same(ElabStamp a, ElabStamp b);
 /* can the program run code the record has not seen: a load whose target
    it could not resolve (a computed path, a load the parse left)? */
 int elab_runs_unseen(Compiler *c);
+int elab_autoload_read(Compiler *c, int id);
+int elab_autoload_scope_open(Compiler *c, int id);
+int elab_autoload_file_defines(Compiler *c, int slot, int file);
 /* may a version of `name` run outside its interval: does the program name
    the method by a Symbol or a String, name or make methods by computed
    names, or run code the record has not seen? */
@@ -432,8 +535,16 @@ int elab_const_first_write(Compiler *c, const char *name, int *early);
 int elab_const_own_at(Compiler *c, int owner, const char *name, LoadPoint p, const LrDef **out);
 /* the class constant reference node (a ConstantReadNode or
    ConstantPathNode) names where it stands, as the record resolves it
-   there; -1 for Object (main's), below -1 for one it does not know */
-int elab_class_ref_at(Compiler *c, int node);
+   there; -1 for Object (main's), below -1 for one it does not know.
+   Asked after recording, it answers at the node's source position (the
+   call plan's frame), and not known for a node the frame cannot place.
+   *core (when non-NULL): the CORE_* slot of the builtin the reference
+   names when Object holds no program constant of that name (reopened,
+   reopened later, or not), else -1. */
+int elab_class_ref_at(Compiler *c, int node, int *core);
+/* is node a value no module can be there: a builtin's own constructor
+   (`Object.new`), or a constant holding one? */
+int elab_value_not_module(Compiler *c, int node);
 void gvar_writes_free(Compiler *c);   /* the names gvar_has_write kept (analyze_infer.c) */
 int elab_class_candidates(Compiler *c, int node, int **out);   /* the classes a constant read the record cannot settle may name, in a buffer *out the caller frees; -1 for no bounded answer */
 /* the node -> class map: the class class or module header `node` opens,
@@ -441,7 +552,37 @@ int elab_class_candidates(Compiler *c, int node, int **out);   /* the classes a 
    when asked, its entity: the class whose constants hold its name (-1:
    Object's; below -1 not known) and the name (NULL outside the load
    phase's walk) */
-int elab_header_class(Compiler *c, int node, int *owner, const char **leaf);
+int elab_header_class(const Compiler *c, int node, int *owner, const char **leaf);
+/* ...and the class a class builder's write opens (`X = Struct.new(:a) do`,
+   `k = Data.define(:a) do`), -1 for a write no builder made a class at */
+int elab_builder_class(Compiler *c, int node);
+/* the readers of a class definition node (analyze_scope.c), from the node
+   table alone: a class's def_node, or a node a pass walked to */
+int class_def_is_record_call(const NodeTable *nt, int val);   /* a `Struct.new(..)` / `Data.define(..)` call */
+const NodeKind *class_def_kinds(int *n);   /* the node kinds a definition can be */
+const NodeKind *class_def_module_kinds(int *n);   /* ...a module's definition can be */
+int class_def_builder(const NodeTable *nt, int def_node);   /* a constant write's Class.new / Module.new call that defines a class, -1 for none */
+int class_def_path(const NodeTable *nt, int def_node);   /* the constant node it writes: a header's path, a builder's write or path target */
+const char *class_def_name(const NodeTable *nt, int def_node);   /* the constant name it writes, NULL for none */
+const char *class_def_bare_name(const NodeTable *nt, int def_node);   /* ...written as a plain constant, NULL under a path */
+void class_def_set_body(NodeTable *nt, int def_node, int body);   /* its body statements, as a pass rebuilds them */
+int class_def_body(const NodeTable *nt, int def_node);   /* its body statements, -1 for none */
+int class_def_super(const NodeTable *nt, int def_node);   /* its superclass reference, -1 for none */
+int class_def_is_module(const NodeTable *nt, int def_node);
+int class_def_is_class(const NodeTable *nt, int def_node);   /* written as `class` */
+int class_def_opens_frame(const NodeTable *nt, int def_node);   /* self and definee are the class */
+int class_def_opens_cref(const NodeTable *nt, int def_node);   /* its constants are a scope of their own */
+int program_writes_const_in(Compiler *c, const char *pn, const char *nm);   /* in a body of pn, or `pn::nm = v` */
+/* what a class builder's call (Class.new, Module.new) makes, as the
+   builders' lowering noted it ahead of the walk (elab_builder_note); a copy
+   answers as the node it copies: EB_NONE for none noted; EB_DYNAMIC_SUPER,
+   a class of a superclass only the run time holds */
+enum { EB_NONE, EB_DYNAMIC_SUPER };
+int elab_builder_kind(const Compiler *c, int node);
+void elab_builder_note(Compiler *c, int node, int kind);
+/* nt_swap_nodes, and the record's entries of the two nodes trade places
+   with their contents */
+void elab_swap_nodes(Compiler *c, int a, int b);
 /* what constant reference ref (a ConstantReadNode or ConstantPathNode)
    names, read where statement `site` stands: ELAB_NO when it names no
    constant there and the record sees every write of the name there can
@@ -459,6 +600,16 @@ int elab_body_visibility_at(Compiler *c, int node);
 /* method `name`'s visibility on cls (singleton when sg) at p: SP_VIS_*,
    -1 when not known or not defined */
 int elab_method_vis_at(Compiler *c, int cls, const char *name, int sg, LoadPoint p);
+/* ... when no change of it follows: elab_method_vis_at's answer at p, or -1
+   where an entry of the name's histories along cls's superclass chain at or
+   after p (one in another region too, whose order is not known, and an
+   unplaced one, a visibility call in a method body that runs at a point
+   the record does not know) gives another visibility, or a call of a
+   program's method that may define something runs on the class at or after
+   p, whose body may change it (a send or an eval is passed over: the
+   record holds it opaque whatever it names, and the forms of it that
+   change a visibility are raised or refused today) */
+int elab_method_vis_held_from(Compiler *c, int cls, const char *name, int sg, LoadPoint p);
 /* The entries a class side (cls, LR_MAIN for main's; sg) has of a name
    as the load phase ends, as the registration applies them: an attr form,
    an undef, a module_function copy or an alias counts when no condition in
@@ -476,12 +627,16 @@ typedef struct {
 const ElabSurface *elab_class_surface(Compiler *c, int cls, int sg, int *n);
 /* An entry the registration applies, as the load phase ends (lr_applied):
    on class side (cls, LR_MAIN for main's; sg), of kind LrKind, by node, of
-   name (an alias's original in target); names point into the record */
-typedef struct { int cls, sg, kind, node; const char *name, *target; } ElabEntry;
+   name (an alias's original in target), with its version's scope
+   (LrDef.scope); names point into the record */
+typedef struct { int cls, sg, kind, node; const char *name, *target; int scope; } ElabEntry;
 /* every class side's entries of the kinds in mask (1 << LrKind), in the
    order the load phase makes them: by class and side, then statement, then
    the argument that names them (a reader before its writer); *n of them,
-   the caller frees the array */
+   the caller frees the array. ELAB_ENTRY_MAY in mask also takes those under
+   a run-time condition, which the registration otherwise leaves to the run
+   time (lr_stmt_applied: 2) */
+enum { ELAB_ENTRY_MAY = 1 << 30 };
 ElabEntry *elab_entries(Compiler *c, unsigned mask, int *n);
 /* did code the record cannot follow (a send, an eval of a String, a mixin
    of a module it does not know, a computed method name, a method of the

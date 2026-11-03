@@ -134,6 +134,9 @@ int object_private_method_name(const char *qm);
 const char *const *object_private_method_names(void); /* NULL-terminated */
 int respond_to_runtime_reaches(Compiler *c, TyKind rt);
 int root_reopen_defines(Compiler *c, const char *qm);
+int bool_side_responds(Compiler *c, const char *qm, int include_all, int foldable, int *ta, int *fa);
+int root_reopen_defines_own(Compiler *c, int k, const char *qm);   /* a root reopening k defines qm itself (def, attr_reader, attr_writer) */
+int root_reopen_method_vis(Compiler *c, int cid, const char *qm);   /* an Object, Kernel or BasicObject reopening's method qm: its visibility, or -1 */
 int private_answer_overridden(Compiler *c, const char *qm, TyKind rt);
 int refl_md_dynamic_used(Compiler *c);
 void emit_method_parameters_pushes(Compiler *c, int pn4, int tr4, Buf *b);
@@ -255,6 +258,9 @@ void emit_math_arg(Compiler *c, int node, Buf *out);
 int json_to_json_is_builtin(Compiler *c, int recv);
 int node_is_stringio(Compiler *c, int node);
 void emit_exc_exception(Compiler *c, int recv, int arg, Buf *b);
+int emit_name_error_new_kw(Compiler *c, const char *cn, int argc, const int *argv, int recv_v, Buf *b);
+int emit_raise_nomethod_new(Compiler *c, int call, Buf *b);
+int disp_nomethod_out_of_line(Compiler *c, int call);   /* (codegen.c's value scan asks it too) */
 const char *exc_gated_acc_fn(const char *name);
 int hoist_exc_recv(Compiler *c, int recv);
 int ctor_init_takes_block(Compiler *c, int initm);

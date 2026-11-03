@@ -310,7 +310,7 @@ int share_exact_new_class(Compiler *c, int n) {
   if (n < 0 || nt_kind(nt, n) != NK_CallNode || !sp_streq(nt_str(nt, n, "name"), "new")) return -1;
   int r = nt_ref(nt, n, "receiver");
   if (r < 0 || (nt_kind(nt, r) != NK_ConstantReadNode && nt_kind(nt, r) != NK_ConstantPathNode)) return -1;
-  int k = comp_class_index(c, nt_str(nt, r, "name"));
+  int k = const_node_class_index(c, r);
   return k >= 0 && comp_cmethod_in_chain(c, k, "new", NULL) < 0 ? k : -1;
 }
 /* Kernel#String(x) answers x for a String, and for any other value what its
@@ -996,7 +996,7 @@ int share_builtin_fresh(Compiler *c, int call) {
   int generic_raises = !builtin_object_method_known(name) && !builtin_instance_name_known(name);
   for (int i = 0; i < p->n; i++) {
     const PolyArm *a = &p->arm[i];
-    if (a->kind == PA_USER || a->kind == PA_ARITY || sh_arm_io_read_fresh(c, call, a)) continue;
+    if (a->kind == PA_USER || a->kind == PA_ARITY || a->kind == PA_VIS || sh_arm_io_read_fresh(c, call, a)) continue;
     if (a->kind == PA_TRIAL && (a->key == PA_KEY_TRIAL + PT_DEFAULT0 ||
                                a->key == PA_KEY_TRIAL + PT_DEFAULT_N)) continue;
     if (generic_raises && ((a->kind == PA_BUILTIN && a->key == PA_KEY_BUILTIN + PB_ND_GENERIC) ||
@@ -1210,6 +1210,23 @@ static int sh_self_call_targets(Compiler *c, int call, const char *nm, int *out,
   }
   return k;
 }
+/* Does any class have an attr_reader `nm`? From a set of every class's
+   reader names, built again only when a reader table grows (comp_table_gen;
+   they never shrink) or the class count changes: share_name_targets asked
+   each class at every call it was asked for. */
+static int sh_any_reader(Compiler *c, const char *nm) {
+  static ANameHash names;
+  static unsigned stamp_gen; static int stamp_ncls = -1;
+  if (stamp_ncls != c->nclasses || stamp_gen != comp_table_gen) {
+    anh_free(&names);
+    for (int ci = 0; ci < c->nclasses; ci++)
+      for (int j = 0; j < c->classes[ci].nreaders; j++)
+        if (c->classes[ci].readers[j] && !anh_has(&names, c->classes[ci].readers[j]))
+          anh_add(&names, c->classes[ci].readers[j]);
+    stamp_ncls = c->nclasses; stamp_gen = comp_table_gen;
+  }
+  return anh_has(&names, nm);
+}
 /* See share.h. */
 int share_name_targets(Compiler *c, int call, int *out, int cap) {
   const NodeTable *nt = c->nt;
@@ -1225,9 +1242,10 @@ int share_name_targets(Compiler *c, int call, int *out, int cap) {
   if (!sh_name_methods_seen(c, nm)) return -1;
   /* an attr_reader of the name answers the String its ivar holds, and is
      no method's scope the walk below sees */
-  for (int ci = 0; ci < c->nclasses; ci++) if (comp_is_reader(&c->classes[ci], nm)) return -1;
+  if (sh_any_reader(c, nm)) return -1;
   int str_cid = comp_core_class(c, CORE_STRING), k = 0;
-  for (int mi = 0; mi < c->nscopes; mi++) {
+  /* the scopes of the name, in ascending order, through the by-name index */
+  for (int mi = an_scopes_named_first(c, nm); mi >= 1; mi = an_scopes_named_next(c, nm, mi)) {
     Scope *m = &c->scopes[mi];
     if (!m->name || m->def_node < 0 || !sp_streq(m->name, nm)) continue;
     /* a String reopen's method: its self is the receiver */

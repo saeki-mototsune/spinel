@@ -18,6 +18,8 @@ int is_call_alias(const char *n);     /* call () []: a Proc/Method's invocation 
 int is_method_invoke(const char *n);  /* call () [] ===: Method invocation */
 int is_bind_call(const char *n);  /* bind_call: an UnboundMethod bound and called in one */
 int is_kind_query(const char *n);     /* is_a? kind_of? instance_of? */
+int is_instance_of_query(const char *n);   /* instance_of? */
+int is_case_eq(const char *n);        /* === */
 int is_round_family(const char *n);   /* round ceil floor truncate */
 int is_push_alias(const char *n);     /* push << append */
 int is_bit_op(const char *n);         /* & | ^ */
@@ -28,6 +30,7 @@ int is_int_bit_op(const char *n);     /* & | ^ << >>: Integer's bitwise operator
 int is_embedding_builtin(const char *nm); /* Array Hash String: subclass instances embed the builtin */
 int is_class_name_name(const char *n);   /* name */
 int is_inspect_name(const char *n);       /* inspect */
+int is_object_class_name(const char *n);   /* Object alone: the top level's constants */
 int is_object_root(const char *n);    /* Object Kernel BasicObject: the classes every object has */
 int is_send_family(const char *n);    /* send __send__ public_send */
 int is_method_name_reflection(const char *n); /* send family, method public_method instance_method define_method define_singleton_method alias_method singleton_method respond_to? method_defined? */
@@ -42,6 +45,8 @@ int is_plain_builtin_reader(const char *n); /* name: every builtin with it reads
 int is_tap_alias(const char *n);      /* tap then yield_self */
 int is_tap_name(const char *n);       /* tap */
 int is_quantifier(const char *n);     /* all? any? none? one? */
+int is_name_error_class(const char *n);   /* NameError NoMethodError: .new(msg, name, ...) */
+int is_no_method_error_class(const char *n);   /* NoMethodError: .new(msg, name, args, ...) */
 int is_set_op(const char *n);         /* & intersection | union - difference */
 int is_combination_family(const char *n);  /* combination permutation repeated_combination repeated_permutation */
 /* the visibility word a call names: module_function first, so that a
@@ -82,6 +87,7 @@ int is_call_or_yield(const char *n);  /* call () [] yield: is_call_alias's names
 int is_proc_invoke(const char *n);    /* call () [] yield ===: every name that invokes a Proc */
 int is_quantifier_or_count(const char *n);  /* all? any? none? one? count: is_quantifier's names and count */
 int is_push_unshift(const char *n);   /* << push append unshift: is_push_alias's names and unshift */
+int is_load_path_write(const char *n); /* << push append unshift prepend concat: the calls that add to $LOAD_PATH */
 int is_identity_query(const char *n); /* equal? object_id __id__ frozen?: tells an object from its copy */
 int is_len_alias(const char *n);      /* length size */
 int is_length_spelling(const char *n); /* size count empty? */
@@ -106,6 +112,7 @@ int is_instance_eval_family(const char *n); /* instance_eval instance_exec */
 int is_reflective_access(const char *n); /* instance_variable_get/set, class_variable_get/set, const_get/set, remove_* */
 int is_reflective_listing(const char *n); /* instance_variables class_variables constants */
 int is_local_reflection(const char *n); /* eval binding local_variable_get/set local_variables */
+int is_block_given_name(const char *n); /* block_given? */
 int is_find_alias(const char *n); /* find detect: Enumerable search aliases */
 
 int is_text_conversion(const char *n); /* inspect to_s */
@@ -145,6 +152,8 @@ int is_indexed_each(const char *n); /* each_index each_with_index */
 int is_to_array_alias(const char *n); /* entries to_a */
 int is_match_p_name(const char *n);   /* match? */
 int is_record_class_builder(const char *recv, const char *meth); /* Struct.new, Data.define */
+int is_class_new(const char *recv, const char *meth); /* Class.new */
+int is_module_new(const char *recv, const char *meth); /* Module.new */
 int is_class_builder(const char *recv, const char *meth); /* Struct.new, Data.define, Class.new, Module.new */
 int is_value_constructor(const char *recv, const char *meth); /* Hash.new, Array.new, String.new, Object.new */
 int is_array_new(const char *recv, const char *meth); /* Array.new */
@@ -174,6 +183,7 @@ int is_ivar_remove_name(const char *n); /* remove_instance_variable */
 int is_ivar_presence_read(const char *n); /* instance_variables instance_variable_defined? remove_instance_variable inspect p pp */
 int is_bivar_keyed_class(const char *n);  /* Array Hash Random */
 int is_string_class_name(const char *n);   /* String */
+const char *handle_attr_store(const char *n, int write); /* Thread Fiber: thread_variable_get/_set, __storage_get/_set */
 int is_frozen_value_class(const char *n); /* Integer Float Symbol NilClass TrueClass FalseClass Range */
 int is_nonblock_io(const char *n); /* read_nonblock write_nonblock */
 int is_io_read(const char *n); /* read */
@@ -270,9 +280,11 @@ int is_mixin_call(const char *n); /* include extend prepend */
    inspect === == ... respond_to? attr_* visibility. Not include, extend,
    prepend, private_constant, private_class_method and public_class_method:
    those answer their receiver. */
+int is_class_compare(const char *n);  /* == != equal? eql? */
 int is_class_plain_query(const char *n);
 int is_class_self_answer(const char *n); /* include extend prepend private_class_method public_class_method private_constant public_constant remove_method undef_method: answer their receiver */
 int is_self_rebinding_call(const char *n); /* instance_/class_/module_ eval and exec, define_singleton_method */
+int is_block_self_call(const char *recv, const char *n); /* those, define_method, a class builder: the block's self is another object */
 int is_class_relatives_query(const char *n); /* ancestors superclass subclasses descendants included_modules */
 int is_class_query(const char *n); /* class */
 int is_method_owner_query(const char *n); /* owner */
@@ -283,8 +295,15 @@ int is_constant_or_object_reflection(const char *n);
 int is_const_set_name(const char *n); /* const_set */
 int is_const_query_name(const char *n); /* const_get const_defined? const_source_location */
 int is_constants_list_name(const char *n); /* constants */
-int is_definition_hook_name(const char *n); /* inherited included extended prepended method_added singleton_method_added const_added */
+int is_autoload_query_name(const char *n); /* autoload? */
+int is_stmt_output_name(const char *n); /* puts print p */
+int is_class_body_acting_name(const char *n); /* output, raise, exit and the like */
+int is_definition_hook_name(const char *n); /* inherited included extended prepended method_added method_removed method_undefined their singleton forms const_added */
+int is_module_hook_name(const char *n); /* ...Class's and Module's: all but the singleton forms */
+int is_basic_object_hook_name(const char *n); /* ...BasicObject's: singleton_method_added singleton_method_removed singleton_method_undefined */
+int is_const_added_name(const char *n); /* const_added */
 int is_method_missing_name(const char *n); /* method_missing respond_to_missing?: what a call of a name an object has no method by runs */
+extern const char METHOD_MISSING_NAME[];   /* "method_missing", the name a lookup of that method asks */
 int definition_form_hooks(const char *form, int sg, const char **out); /* the hooks a definition form fires: included and append_features for include, method_added for attr_accessor, ... (up to 2) */
 int is_const_missing_name(const char *n); /* const_missing */
 int is_const_table_def_name(const char *n); /* __const_get__ __const_defined__ */
@@ -440,6 +459,7 @@ enum {
 /* CORE_* for any builtin row or non-row slot above, -1 for any other name. */
 int builtin_core_class_slot(const char *n);
 int core_of_type(TyKind t);
+int core_reopen_calls_proc_form(int core);   /* a reopened builtin's yielding method goes through its proc form */
 const char *core_class_name(int k);
 int is_builtin_method_host_name(const char *n); /* Object BasicObject Kernel Comparable Enumerable Module */
 int is_boolean_class_name(const char *n); /* FalseClass TrueClass */
@@ -451,6 +471,9 @@ int is_load_path_global(const char *n); /* $: $-I $LOAD_PATH */
 int is_range_or_time_class(const char *n); /* Range Time */
 int is_numeric_class_name(const char *n); /* Float Integer */
 int is_queue_class_name(const char *n); /* Queue SizedQueue */
+int is_thread_class_name(const char *n); /* Queue SizedQueue Mutex ConditionVariable */
+int is_thread_const_name(const char *n); /* Thread */
+int is_threading_name(const char *n); /* Thread Monitor and is_thread_class_name's */
 int is_array_or_object_class(const char *n); /* Array Object */
 int is_array_hash_or_object_class(const char *n); /* Array Hash Object */
 
@@ -485,6 +508,8 @@ int is_toplevel_const_name(const char *n);     /* a constant CRuby, or a library
 int is_constless_builtin_name(const char *n);  /* a builtin class or module with no constants of its own */
 int is_autoload_name(const char *n);
 int is_file_load_name(const char *n);    /* require require_relative load autoload: a call that runs a file's text */
+int is_load_error_catch_name(const char *n);   /* LoadError ScriptError Exception */
+int is_script_error_name(const char *n);       /* ScriptError LoadError NotImplementedError SyntaxError */
 int is_load_how_missing(const char *how);
 int is_load_how_set(const char *how);
 int is_load_how_core(const char *how);
@@ -492,10 +517,15 @@ int is_load_how_native(const char *how);
 int is_native_lib_at_boot(const char *path);
 int is_comparable_module_name(const char *n);
 int is_enumerable_module_name(const char *n);
+/* the index of n among the methods `extend Enumerable` sends to an
+   instance-side twin (desugar_extend_enumerable), or -1 */
+enum { EXTEND_ENUMERABLE_NNAMES = 63 };
+int extend_enumerable_name_index(const char *n);
 int is_comparable_builtin_name(const char *n);
 typedef enum { BDC_BUILTIN, BDC_IDENTITY, BDC_EQUAL } BuiltinDefaultCmp;
 BuiltinDefaultCmp builtin_default_cmp(int family);   /* asks builtin_class_id */
 int builtin_class_id(const char *name);   /* analyze_util.c: a builtin class's id, 0 for none */
+int is_comparable_module_method(const char *name); /* < <= == > >= between? clamp: Comparable's own */
 int builtin_comparable_owns(const char *cls, const char *name); /* Comparable's, on a class including it */
 int builtin_comparable_arity(const char *name);
 int builtin_numeric_owns(const char *cls, const char *name); /* Numeric's, on Integer or Float */
@@ -528,6 +558,7 @@ int is_when_node_type(const char *t);      /* WhenNode */
 int is_clear_name(const char *n); /* clear */
 int is_enumerator_with(const char *n); /* with_index with_object: an enumerator link */
 int is_lazy_name(const char *n);       /* lazy */
+int is_lazy_chain_name(const char *n);   /* a Lazy's call that answers a Lazy: map, select, take, ... */
 int is_concat_name(const char *n);     /* concat */
 int is_array_constructor(const char *recv, const char *meth); /* Array.new */
 int is_pow_name(const char *n); /* pow: Integer power, with an optional modulus */
@@ -553,6 +584,13 @@ int is_dir_blockless_iter(const char *n);  /* foreach each_child: an Enumerator 
 int is_kernel_module_name(const char *n);
 int is_kernel_module_function(const char *n);
 int builtin_object_method_known(const char *m);   /* one of Object's own methods every object answers */
+int is_method_presence_query(const char *n); /* 1: respond_to? *method_defined? (public_)instance_method (public_)method; 2: (public_)instance_methods (public_)methods, answered for the whole program; 3: private_/protected_instance_methods, private_/protected_methods, singleton_methods, answered by the receiver's chain */
+int is_instance_method_list(const char *n); /* (public_|private_|protected_)instance_methods */
+int is_instance_method_table_read(const char *n); /* is_instance_method_list names, instance_method */
+int is_class_value_reflection(const char *n); /* a listing, const_defined?, class_variable_get/set/defined?: from the receiver's class */
+int is_singleton_method_list(const char *n); /* singleton_methods */
+int builtin_every_object_answers(const char *m, int cmeth); /* Object's own, Kernel's, Object's; with cmeth Module's too */
+int builtin_class_id_answers(int id, const char *m, int cmeth); /* the builtin class of cls_id id, or one above it, has m (cmeth: a class method) */
 /* Does a builtin answer `name` on a self of the kind: main (Kernel's,
    Object's and main's own methods), a module (also Module's) or a class
    (also Class's)? */
@@ -563,6 +601,10 @@ int is_untabled_native_class_name(const char *n);
 
 int is_define_method_name(const char *n); /* define_method */
 int is_define_singleton_method_name(const char *n); /* define_singleton_method */
+int is_singleton_class_name(const char *n); /* singleton_class */
+int is_reopen_self_name(const char *n);       /* __self: the receiver of a method a builtin's reopening defines */
+int is_ffi_decl_name(const char *n);        /* ffi_lib attach_function attach_variable callback native_func ...: declarations made methods before the walk */
+int is_method_defined_query(const char *n); /* method_defined? public_/private_/protected_method_defined? */
 int is_undef_method_name(const char *n);  /* undef_method */
 int is_remove_method_name(const char *n); /* remove_method */
 int is_check_funcall_name(const char *n);   /* respond_to? respond_to_missing? method_missing: what rb_check_funcall asks */
@@ -696,6 +738,10 @@ int is_plain_builtin_superclass(int id);       /* BC_PLAIN or an exception: give
 /* names the compile-time evaluation and its questions ask about (ct_eval.c,
    analyze_ct.c) */
 int is_class_const_name(const char *n);    /* Class: the constant Class.new is called on */
+int is_module_const_name(const char *n);   /* Module: the constant Module.new is called on */
+int is_hash_const_name(const char *n);     /* Hash: the class a program's `class Hash` reopens */
+int is_erb_const_name(const char *n);      /* ERB: a class of the program's own by that name */
+int is_ffi_registry_name(const char *n);   /* FFI__Registry: the module the bundled ffi package defines */
 int is_hash_read_only(const char *n);      /* the Hash calls that read a table and leave it as it is */
 int is_to_a_name(const char *n);           /* to_a: the receiver's own Array, for an Array */
 int is_hash_self_answer(const char *n);    /* each each_pair each_key each_value freeze to_h: answer the Hash itself */
@@ -712,6 +758,10 @@ int is_using_name(const char *n);          /* using */
 int is_remove_const_name(const char *n);   /* remove_const */
 int is_const_visibility_name(const char *n);   /* private_constant public_constant deprecate_constant */
 int is_cvar_write_name(const char *n);     /* class_variable_set remove_class_variable */
+int is_cvar_set_name(const char *n);       /* class_variable_set */
+int is_cvar_get_name(const char *n);       /* class_variable_get */
+int is_cvar_defined_name(const char *n);   /* class_variable_defined? */
+int is_cvar_reflection_name(const char *n);   /* class_variable_get class_variable_set class_variable_defined? */
 int is_hook_protocol_name(const char *n);  /* append_features extend_object prepend_features: what include, extend and prepend send before their hooks */
 int is_port_gvar_name(const char *n);      /* $stdout $stderr $>: assigning an object makes it the port output goes to */
 

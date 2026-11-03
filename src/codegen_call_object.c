@@ -2628,9 +2628,9 @@ int emit_call_object_override_arms(Compiler *c, int id, Buf *b, const NodeTable 
            class the way CRuby does -- a Regexp matches, a Range covers, a
            Class tests membership. Plain equality answered false for all of
            them (#3963). */
-        buf_printf(&pb3, ") : sp_box_bool(sp_poly_case_eq(_t%d, ", tp3);
+        buf_printf(&pb3, ") : sp_poly_case_eq_val(_t%d, ", tp3);
         buf_puts(&pb3, ab3.p ? ab3.p : "sp_box_nil()"); free(ab3.p); }
-      buf_puts(&pb3, ")); })");
+      buf_puts(&pb3, "); })");
       emit_unbox_text(c, repr_of(c, id).as_ty, pb3.p ? pb3.p : "sp_box_nil()", b);
       free(pb3.p);
       return 1;
@@ -3019,8 +3019,12 @@ int emit_call_print_arms(Compiler *c, Buf *b, const NodeTable *nt, const char *n
   if (recv >= 0 && argc == 0 && sp_streq(name, "inspect") && ty_is_object(rt) &&
       !comp_ty_value_obj(c, rt)) {
     /* default Object#inspect: the generated per-class ivar walk */
-    buf_printf(b, "sp_obj_inspect_sw(%d, (void *)(", ty_object_class(rt));
-    emit_expr(c, recv, b); buf_puts(b, "))");
+    int pv = ++g_tmp;
+    char pn[24]; snprintf(pn, sizeof pn, "_oi%d", pv);
+    buf_printf(b, "({ void *%s = (void *)(", pn);
+    emit_expr(c, recv, b); buf_printf(b, "); %s ? ", pn);
+    emit_obj_default_inspect(c, ty_object_class(rt), pn, b);
+    buf_puts(b, " : \"nil\"; })");
     return 1;
   }
   if (recv >= 0 && argc == 0 && sp_streq(name, "to_s") && ty_is_object(rt) &&
@@ -3266,7 +3270,7 @@ static int ivar_list_mixed(Compiler *c, int recv, int cid) {
   if (ci->is_value_type || ci->is_struct || class_is_exc_subclass(c, cid)) return 0;
   if (recv >= 0 && nt_kind(c->nt, recv) == NK_CallNode && is_new_name(nt_str(c->nt, recv, "name"))) {
     int r = nt_ref(c->nt, recv, "receiver");
-    if (r >= 0 && nt_kind(c->nt, r) == NK_ConstantReadNode && comp_class_index(c, nt_str(c->nt, r, "name")) == cid &&
+    if (r >= 0 && nt_kind(c->nt, r) == NK_ConstantReadNode && const_node_class_index(c, r) == cid &&
         comp_cmethod_in_chain(c, cid, "new", NULL) < 0) return 0;
   }
   int ranked = ivar_ranked(c, cid);

@@ -60,6 +60,12 @@ spinel: 1 refusal, nothing written
 == test/reject/bind_call_class_value_block_target.rb [promote] rc=1
 spinel: test/reject/bind_call_class_value_block_target.rb:12: unsupported call: node N (CallNode `bind_call`) recv=CallNode/ty0 argc=1 arg0ty1001
 spinel: 1 refusal, nothing written
+== test/reject/bool_reopen_block_return_in_lambda.rb [default] rc=1
+spinel: test/reject/bool_reopen_block_return_in_lambda.rb:8: a `return` in a block given to a TrueClass's or FalseClass's yielding method, inside a lambda, is not supported by AOT compilation
+spinel: 1 refusal, nothing written
+== test/reject/bool_reopen_block_return_in_lambda.rb [promote] rc=1
+spinel: test/reject/bool_reopen_block_return_in_lambda.rb:8: a `return` in a block given to a TrueClass's or FalseClass's yielding method, inside a lambda, is not supported by AOT compilation
+spinel: 1 refusal, nothing written
 == test/reject/builtin_include_in_method.rb [default] rc=1
 spinel: test/reject/builtin_include_in_method.rb:7: String.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class String ... end` (see docs/limitations.md)
 spinel: 1 refusal, nothing written
@@ -184,6 +190,12 @@ spinel: 1 refusal, nothing written
 == test/reject/class_eval_static_dynamic_file_arg.rb [promote] rc=1
 spinel: test/reject/class_eval_static_dynamic_file_arg.rb:7: unsupported call: node N (CallNode `class_eval`) recv=-/ty-1 argc=2 arg0ty6
 spinel: 1 refusal, nothing written
+== test/reject/class_eval_static_line_block_arg.rb [default] rc=1
+spinel: test/reject/class_eval_static_line_block_arg.rb:4: unsupported call: node N (CallNode `class_eval`) recv=-/ty-1 argc=3 arg0ty6
+spinel: 1 refusal, nothing written
+== test/reject/class_eval_static_line_block_arg.rb [promote] rc=1
+spinel: test/reject/class_eval_static_line_block_arg.rb:4: unsupported call: node N (CallNode `class_eval`) recv=-/ty-1 argc=3 arg0ty6
+spinel: 1 refusal, nothing written
 == test/reject/class_eval_static_method_added_hook.rb [default] rc=1
 spinel: test/reject/class_eval_static_method_added_hook.rb:7: unsupported call: node N (CallNode `class_eval`) recv=-/ty-1 argc=1 arg0ty6
 spinel: 1 refusal, nothing written
@@ -225,6 +237,12 @@ spinel: test/reject/class_eval_text_hook_param.rb:7: unsupported call: node N (C
 spinel: 1 refusal, nothing written
 == test/reject/class_eval_text_hook_param.rb [promote] rc=1
 spinel: test/reject/class_eval_text_hook_param.rb:7: unsupported call: node N (CallNode `class_eval`) recv=-/ty-1 argc=1 arg0ty6
+spinel: 1 refusal, nothing written
+== test/reject/class_macro_called_at_run_time.rb [default] rc=1
+spinel: test/reject/class_macro_called_at_run_time.rb:5: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/class_macro_called_at_run_time.rb [promote] rc=1
+spinel: test/reject/class_macro_called_at_run_time.rb:5: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
 spinel: 1 refusal, nothing written
 == test/reject/class_named_like_monitor_path.rb [default] rc=1
 spinel: test/reject/class_named_like_monitor_path.rb:4: unsupported class name 'Monitor': collides with the builtin class of that name
@@ -296,6 +314,12 @@ spinel: 1 refusal, nothing written
 == test/reject/class_new_variable_constant_block.rb [promote] rc=1
 spinel: test/reject/class_new_variable_constant_block.rb:4: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
 spinel: 1 refusal, nothing written
+== test/reject/class_new_variable_included_hook.rb [default] rc=1
+spinel: test/reject/class_new_variable_included_hook.rb:5: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/class_new_variable_included_hook.rb [promote] rc=1
+spinel: test/reject/class_new_variable_included_hook.rb:5: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: 1 refusal, nothing written
 == test/reject/class_new_variable_local.rb [default] rc=1
 spinel: test/reject/class_new_variable_local.rb:4: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
 spinel: 1 refusal, nothing written
@@ -308,6 +332,34 @@ spinel: 1 refusal, nothing written
 == test/reject/class_new_variable_local_block.rb [promote] rc=1
 spinel: test/reject/class_new_variable_local_block.rb:4: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
 spinel: 1 refusal, nothing written
+== test/reject/class_new_variable_module_method.rb [default] rc=1
+spinel: test/reject/class_new_variable_module_method.rb:4: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: test/reject/class_new_variable_module_method.rb:4: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: 2 refusals, nothing written
+== test/reject/class_new_variable_module_method.rb [promote] rc=1
+spinel: test/reject/class_new_variable_module_method.rb:4: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: test/reject/class_new_variable_module_method.rb:4: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: 2 refusals, nothing written
+== test/reject/class_new_variable_rest_write.rb [default] rc=1
+spinel: test/reject/class_new_variable_rest_write.rb:5: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/class_new_variable_rest_write.rb [promote] rc=1
+spinel: test/reject/class_new_variable_rest_write.rb:5: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/class_new_variable_rest_write_branch.rb [default] rc=1
+spinel: test/reject/class_new_variable_rest_write_branch.rb:4: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/class_new_variable_rest_write_branch.rb [promote] rc=1
+spinel: test/reject/class_new_variable_rest_write_branch.rb:4: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/class_new_variable_rest_write_included.rb [default] rc=1
+spinel: test/reject/class_new_variable_rest_write_included.rb:6: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: test/reject/class_new_variable_rest_write_included.rb:6: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: 2 refusals, nothing written
+== test/reject/class_new_variable_rest_write_included.rb [promote] rc=1
+spinel: test/reject/class_new_variable_rest_write_included.rb:6: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: test/reject/class_new_variable_rest_write_included.rb:6: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
+spinel: 2 refusals, nothing written
 == test/reject/class_new_without_block_iterator.rb [default] rc=1
 spinel: test/reject/class_new_without_block_iterator.rb:5: Class.new(parent) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time. Declare the class with `class ... end` instead (see docs/limitations.md)
 spinel: 1 refusal, nothing written
@@ -428,6 +480,14 @@ spinel: 1 refusal, nothing written
 == test/reject/class_value_include.rb [promote] rc=1
 spinel: test/reject/class_value_include.rb:9: include / prepend on a Class held in a variable is not supported by AOT compilation: the ancestor chain is baked at compile time, so the class must be named by a constant. Write `K.include(M)` (or `include M` inside `class K ... end`) for each class (see docs/limitations.md)
 spinel: 1 refusal, nothing written
+== test/reject/cmp_builtin_recv_toplevel_comparable.rb [default] rc=1
+spinel: test/reject/cmp_builtin_recv_toplevel_comparable.rb:10: unsupported comparison: node N (CallNode `>=`) recv=LocalVariableReadNode/ty18 argc=1 arg0ty3
+spinel: test/reject/cmp_builtin_recv_toplevel_comparable.rb:16: unsupported comparison: node N (CallNode `>`) recv=CallNode/ty9 argc=1 arg0ty3
+spinel: 2 refusals, nothing written
+== test/reject/cmp_builtin_recv_toplevel_comparable.rb [promote] rc=1
+spinel: test/reject/cmp_builtin_recv_toplevel_comparable.rb:10: unsupported comparison: node N (CallNode `>=`) recv=LocalVariableReadNode/ty18 argc=1 arg0ty3
+spinel: test/reject/cmp_builtin_recv_toplevel_comparable.rb:16: unsupported comparison: node N (CallNode `>`) recv=CallNode/ty9 argc=1 arg0ty3
+spinel: 2 refusals, nothing written
 == test/reject/compact_class_internal_name_clash.rb [default] rc=1
 spinel: test/reject/compact_class_internal_name_clash.rb:5: a class or module named Foo under a module path takes the internal name X__Foo, which the program's own class X__Foo already has, and a top-level Foo is defined too; rename one of them
 == test/reject/compact_class_internal_name_clash.rb [promote] rc=1
@@ -497,21 +557,15 @@ spinel: 1 refusal, nothing written
 spinel: unsupported call: node N (CallNode `m#__cond1`) recv=-/ty-1 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/cond_def_module_function_visibility.rb [default] rc=1
-spinel: unsupported call: node N (CallNode `m#__cond1`) recv=-/ty-1 argc=0
+spinel: test/reject/cond_def_module_function_visibility.rb:16: undefined method 'm' for a Class: no class in the program defines a class method 'm' (NoMethodError)
 spinel: 1 refusal, nothing written
 == test/reject/cond_def_module_function_visibility.rb [promote] rc=1
-spinel: unsupported call: node N (CallNode `m#__cond1`) recv=-/ty-1 argc=0
+spinel: test/reject/cond_def_module_function_visibility.rb:16: undefined method 'm' for a Class: no class in the program defines a class method 'm' (NoMethodError)
 spinel: 1 refusal, nothing written
 == test/reject/const_get_runtime_name.rb [default] rc=1
 spinel: test/reject/const_get_runtime_name.rb:7: unsupported const_get with a name known only at run time and no class or module receiver (an instance has no const_get; constants are resolved at compile time): node N (CallNode `const_get`) recv=-/ty-1 argc=1 arg0ty6
 == test/reject/const_get_runtime_name.rb [promote] rc=1
 spinel: test/reject/const_get_runtime_name.rb:7: unsupported const_get with a name known only at run time and no class or module receiver (an instance has no const_get; constants are resolved at compile time): node N (CallNode `const_get`) recv=-/ty-1 argc=1 arg0ty6
-== test/reject/const_parent_array_pattern.rb [default] rc=1
-spinel: test/reject/const_parent_array_pattern.rb:6: unsupported pattern sub-form inside a container pattern: node N (ConstantPathNode)
-spinel: 1 refusal, nothing written
-== test/reject/const_parent_array_pattern.rb [promote] rc=1
-spinel: test/reject/const_parent_array_pattern.rb:6: unsupported pattern sub-form inside a container pattern: node N (ConstantPathNode)
-spinel: 1 refusal, nothing written
 == test/reject/const_set_ambiguous_receiver.rb [default] rc=1
 spinel: test/reject/const_set_ambiguous_receiver.rb:11: const_set(:X, ...) on a receiver whose class or module is known only at run time is not supported when more than one module holds a constant X: constants are compile-time globals, and which module's X this sets is not known at compile time. Write `Mod.const_set(:X, v)` or `Mod::X = v` (see docs/limitations.md)
 spinel: 1 refusal, nothing written
@@ -537,10 +591,10 @@ spinel: test/reject/def_delegators_splat.rb:10: def_delegators with arguments ot
 == test/reject/def_delegators_splat.rb [promote] rc=1
 spinel: test/reject/def_delegators_splat.rb:10: def_delegators with arguments other than a literal symbol list is not supported (write the names as symbols: `def_delegators :@target, :name, ...`)
 == test/reject/define_method_data_block_runtime_cond_in_module.rb [default] rc=1
-spinel: test/reject/define_method_data_block_runtime_cond_in_module.rb:5: a define_method under a condition only the run time decides, in a Struct.new or Data.define block, is not supported: write the class with `class`; see docs/limitations.md
+spinel: test/reject/define_method_data_block_runtime_cond_in_module.rb:9: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
 == test/reject/define_method_data_block_runtime_cond_in_module.rb [promote] rc=1
-spinel: test/reject/define_method_data_block_runtime_cond_in_module.rb:5: a define_method under a condition only the run time decides, in a Struct.new or Data.define block, is not supported: write the class with `class`; see docs/limitations.md
+spinel: test/reject/define_method_data_block_runtime_cond_in_module.rb:9: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
 == test/reject/define_method_each_integer_name.rb [default] rc=1
 spinel: test/reject/define_method_each_integer_name.rb:3: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
@@ -655,16 +709,16 @@ spinel: 1 refusal, nothing written
 spinel: test/reject/define_method_proc_ref_in_method.rb:8: Module#define_method with `&` of a block or Proc that is not a literal (`&block`, a parameter, a constant, a call's result), or with a Proc or Method passed as its body, is not supported: the defined method's body is known only at run time. Pass a block literal to define_method instead
 spinel: 1 refusal, nothing written
 == test/reject/define_method_struct_block_runtime_cond.rb [default] rc=1
-spinel: test/reject/define_method_struct_block_runtime_cond.rb:4: a define_method under a condition only the run time decides, in a Struct.new or Data.define block, is not supported: write the class with `class`; see docs/limitations.md
+spinel: test/reject/define_method_struct_block_runtime_cond.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
 == test/reject/define_method_struct_block_runtime_cond.rb [promote] rc=1
-spinel: test/reject/define_method_struct_block_runtime_cond.rb:4: a define_method under a condition only the run time decides, in a Struct.new or Data.define block, is not supported: write the class with `class`; see docs/limitations.md
+spinel: test/reject/define_method_struct_block_runtime_cond.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
 == test/reject/define_method_struct_block_runtime_cond_in_class.rb [default] rc=1
-spinel: test/reject/define_method_struct_block_runtime_cond_in_class.rb:4: a define_method under a condition only the run time decides, in a Struct.new or Data.define block, is not supported: write the class with `class`; see docs/limitations.md
+spinel: test/reject/define_method_struct_block_runtime_cond_in_class.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
 == test/reject/define_method_struct_block_runtime_cond_in_class.rb [promote] rc=1
-spinel: test/reject/define_method_struct_block_runtime_cond_in_class.rb:4: a define_method under a condition only the run time decides, in a Struct.new or Data.define block, is not supported: write the class with `class`; see docs/limitations.md
+spinel: test/reject/define_method_struct_block_runtime_cond_in_class.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
 == test/reject/defined_super_builtin_singleton.rb [default] rc=1
 spinel: test/reject/defined_super_builtin_singleton.rb:6: unsupported defined?(super) where the method super reaches is not known at compile time: node N (DefinedNode)
@@ -738,22 +792,10 @@ spinel: 1 refusal, nothing written
 == test/reject/forwarding_super_yielding_optional.rb [promote] rc=1
 spinel: test/reject/forwarding_super_yielding_optional.rb:5: `super(...)` into a method that yields and takes an optional or *rest parameter: the forwarded arguments cannot leave one out
 spinel: 1 refusal, nothing written
-== test/reject/include_after_call.rb [default] rc=1
-spinel: test/reject/include_after_call.rb:13: a later statement mixes module Kind into class Cat (include or prepend), after this call, so the call would reach the module's method before the module is there. Include or prepend the module where the class is defined, ahead of the call.
-== test/reject/include_after_call.rb [promote] rc=1
-spinel: test/reject/include_after_call.rb:13: a later statement mixes module Kind into class Cat (include or prepend), after this call, so the call would reach the module's method before the module is there. Include or prepend the module where the class is defined, ahead of the call.
-== test/reject/include_after_call_in_method.rb [default] rc=1
-spinel: test/reject/include_after_call_in_method.rb:13: a later statement mixes module Kind into class Cat (include or prepend), after this call, so the call would reach the module's method before the module is there. Include or prepend the module where the class is defined, ahead of the call.
-== test/reject/include_after_call_in_method.rb [promote] rc=1
-spinel: test/reject/include_after_call_in_method.rb:13: a later statement mixes module Kind into class Cat (include or prepend), after this call, so the call would reach the module's method before the module is there. Include or prepend the module where the class is defined, ahead of the call.
 == test/reject/include_module_from_expression.rb [default] rc=1
 spinel: test/reject/include_module_from_expression.rb:9: `include` of a module named by an expression, not a constant, is not supported (the mixin is resolved at compile time)
 == test/reject/include_module_from_expression.rb [promote] rc=1
 spinel: test/reject/include_module_from_expression.rb:9: `include` of a module named by an expression, not a constant, is not supported (the mixin is resolved at compile time)
-== test/reject/include_root_builtin_after_call.rb [default] rc=1
-spinel: test/reject/include_root_builtin_after_call.rb:6: a later statement mixes module Enumerable into class C (include or prepend), after this call, so the call would reach the module's method before the module is there. Include or prepend the module where the class is defined, ahead of the call.
-== test/reject/include_root_builtin_after_call.rb [promote] rc=1
-spinel: test/reject/include_root_builtin_after_call.rb:6: a later statement mixes module Enumerable into class C (include or prepend), after this call, so the call would reach the module's method before the module is there. Include or prepend the module where the class is defined, ahead of the call.
 == test/reject/included_hook_return_in_define_method_args.rb [default] rc=1
 spinel: test/reject/included_hook_return_in_define_method_args.rb:9: Module#define_method in a method body is supported only for a method the class does not answer yet: it is defined from the start, not when that method runs (see docs/limitations.md)
 == test/reject/included_hook_return_in_define_method_args.rb [promote] rc=1
@@ -949,15 +991,13 @@ spinel: test/reject/macro_hidden_alias.rb:5: unsupported send with a runtime met
 == test/reject/macro_hidden_alias.rb [promote] rc=1
 spinel: test/reject/macro_hidden_alias.rb:5: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
 == test/reject/macro_hidden_define.rb [default] rc=1
-spinel: test/reject/macro_hidden_define.rb:5: unsupported call: node N (CallNode `const_set`) recv=-/ty-1 argc=2 arg0ty50
 spinel: test/reject/macro_hidden_define.rb:10: unsupported call: node N (CallNode `const_set`) recv=-/ty-1 argc=2 arg0ty8
 spinel: test/reject/macro_hidden_define.rb:13: warning: uninitialized constant Calc::SIZE: defined nowhere in the program (raises NameError when reached)
-spinel: 2 refusals, nothing written
+spinel: 1 refusal, nothing written
 == test/reject/macro_hidden_define.rb [promote] rc=1
-spinel: test/reject/macro_hidden_define.rb:5: unsupported call: node N (CallNode `const_set`) recv=-/ty-1 argc=2 arg0ty50
 spinel: test/reject/macro_hidden_define.rb:10: unsupported call: node N (CallNode `const_set`) recv=-/ty-1 argc=2 arg0ty8
 spinel: test/reject/macro_hidden_define.rb:13: warning: uninitialized constant Calc::SIZE: defined nowhere in the program (raises NameError when reached)
-spinel: 2 refusals, nothing written
+spinel: 1 refusal, nothing written
 == test/reject/macro_hook_send.rb [default] rc=1
 spinel: test/reject/macro_hook_send.rb:7: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
 == test/reject/macro_hook_send.rb [promote] rc=1
@@ -1076,12 +1116,10 @@ spinel: test/reject/macro_refused_inner_write.rb:10: unsupported send with a run
 spinel: test/reject/macro_refused_inner_write.rb:10: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
 == test/reject/macro_residual_call_keeps_macro.rb [default] rc=1
 spinel: test/reject/macro_residual_call_keeps_macro.rb:8: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
-spinel: test/reject/macro_residual_call_keeps_macro.rb:16: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
-spinel: 2 refusals, nothing written
+spinel: 1 refusal, nothing written
 == test/reject/macro_residual_call_keeps_macro.rb [promote] rc=1
 spinel: test/reject/macro_residual_call_keeps_macro.rb:8: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
-spinel: test/reject/macro_residual_call_keeps_macro.rb:16: Module#define_method with a non-literal name is not supported; use a literal Symbol or String (see docs/limitations.md)
-spinel: 2 refusals, nothing written
+spinel: 1 refusal, nothing written
 == test/reject/macro_residual_value.rb [default] rc=1
 spinel: test/reject/macro_residual_value.rb:7: unsupported send with a runtime method name (AOT needs a compile-time-known name): node N (CallNode `public_send`) recv=SelfNode/ty49 argc=1 arg0ty6
 == test/reject/macro_residual_value.rb [promote] rc=1
@@ -1150,6 +1188,18 @@ spinel: 1 refusal, nothing written
 == test/reject/map_bang_with_index_untyped_proc.rb [promote] rc=1
 spinel: test/reject/map_bang_with_index_untyped_proc.rb:5: map!.with_index with a block whose value is untyped, on a typed Array
 spinel: 1 refusal, nothing written
+== test/reject/merge_boxed_block_param_shapes.rb [default] rc=1
+spinel: test/reject/merge_boxed_block_param_shapes.rb:5: a merge! conflict block with a default, keyword, post-rest or fourth required parameter over a boxed Hash
+spinel: test/reject/merge_boxed_block_param_shapes.rb:9: a merge! conflict block with a default, keyword, post-rest or fourth required parameter over a boxed Hash
+spinel: test/reject/merge_boxed_block_param_shapes.rb:13: a merge! conflict block with a default, keyword, post-rest or fourth required parameter over a boxed Hash
+spinel: test/reject/merge_boxed_block_param_shapes.rb:17: a merge! conflict block with a default, keyword, post-rest or fourth required parameter over a boxed Hash
+spinel: 4 refusals, nothing written
+== test/reject/merge_boxed_block_param_shapes.rb [promote] rc=1
+spinel: test/reject/merge_boxed_block_param_shapes.rb:5: a merge! conflict block with a default, keyword, post-rest or fourth required parameter over a boxed Hash
+spinel: test/reject/merge_boxed_block_param_shapes.rb:9: a merge! conflict block with a default, keyword, post-rest or fourth required parameter over a boxed Hash
+spinel: test/reject/merge_boxed_block_param_shapes.rb:13: a merge! conflict block with a default, keyword, post-rest or fourth required parameter over a boxed Hash
+spinel: test/reject/merge_boxed_block_param_shapes.rb:17: a merge! conflict block with a default, keyword, post-rest or fourth required parameter over a boxed Hash
+spinel: 4 refusals, nothing written
 == test/reject/method_called_reaches_its_target.rb [default] rc=1
 spinel: test/reject/method_called_reaches_its_target.rb:5: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
 spinel: test/reject/method_called_reaches_its_target.rb:5: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
@@ -1202,6 +1252,10 @@ spinel: 1 refusal, nothing written
 == test/reject/module_new_captured_local.rb [promote] rc=1
 spinel: test/reject/module_new_captured_local.rb:4: Class.new or Module.new with a block that captures outer locals is not supported; see docs/limitations.md
 spinel: 1 refusal, nothing written
+== test/reject/native_struct_bare_leaf_collision.rb [default] rc=1
+spinel: test/reject/native_struct_bare_leaf_collision.rb:10: this class shares its name with a native class declared under a qualified path (constant lookups are leaf-keyed, so the two would merge); rename the class
+== test/reject/native_struct_bare_leaf_collision.rb [promote] rc=1
+spinel: test/reject/native_struct_bare_leaf_collision.rb:10: this class shares its name with a native class declared under a qualified path (constant lookups are leaf-keyed, so the two would merge); rename the class
 == test/reject/new_receiver_class_chain_still_reached.rb [default] rc=1
 spinel: test/reject/new_receiver_class_chain_still_reached.rb:5: undefined method '[]=' for a Class: no class in the program defines a class method '[]=' (NoMethodError)
 spinel: 1 refusal, nothing written
@@ -1238,11 +1292,21 @@ spinel: 1 refusal, nothing written
 == test/reject/object_method_ivar_struct_slot.rb [promote] rc=1
 spinel: test/reject/object_method_ivar_struct_slot.rb:3: unsupported instance_variable_set to an ivar absent from the fixed object layout: node N (CallNode `instance_variable_set`) recv=SelfNode/ty50 argc=2 arg0ty8
 spinel: 1 refusal, nothing written
+== test/reject/object_override_default_class_const.rb [default] rc=1
+spinel: test/reject/object_override_default_class_const.rb:11: a parameter default of a builtin class's override of an Object method that reads a constant the class defines is not supported by AOT compilation
+== test/reject/object_override_default_class_const.rb [promote] rc=1
+spinel: test/reject/object_override_default_class_const.rb:11: a parameter default of a builtin class's override of an Object method that reads a constant the class defines is not supported by AOT compilation
 == test/reject/object_receiver_include_alias.rb [default] rc=1
 spinel: test/reject/object_receiver_include_alias.rb:8: Object.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class Object ... end` (see docs/limitations.md)
 spinel: 1 refusal, nothing written
 == test/reject/object_receiver_include_alias.rb [promote] rc=1
 spinel: test/reject/object_receiver_include_alias.rb:8: Object.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class Object ... end` (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/pattern_value_const_range.rb [default] rc=1
+spinel: test/reject/pattern_value_const_range.rb:7: unsupported value constant pattern other than an Integer, Float, String or Symbol: node N (ConstantPathNode)
+spinel: 1 refusal, nothing written
+== test/reject/pattern_value_const_range.rb [promote] rc=1
+spinel: test/reject/pattern_value_const_range.rb:7: unsupported value constant pattern other than an Integer, Float, String or Symbol: node N (ConstantPathNode)
 spinel: 1 refusal, nothing written
 == test/reject/range_prepended_alias_chain_endpoint_write.rb [default] rc=1
 spinel: test/reject/range_prepended_alias_chain_endpoint_write.rb:17: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
@@ -1252,6 +1316,14 @@ spinel: test/reject/range_prepended_alias_chain_endpoint_write.rb:17: a method t
 spinel: test/reject/range_prepended_alias_endpoint_write.rb:16: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
 == test/reject/range_prepended_alias_endpoint_write.rb [promote] rc=1
 spinel: test/reject/range_prepended_alias_endpoint_write.rb:16: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
+== test/reject/range_rational_bound.rb [default] rc=1
+spinel: test/reject/range_rational_bound.rb:7: a Range with a Rational or Complex bound: a Range holds Integer, Float or String bounds, so it has nowhere to hold one. Comparing against the bounds directly (`x >= lo && x <= hi`) needs no Range and does work
+== test/reject/range_rational_bound.rb [promote] rc=1
+spinel: test/reject/range_rational_bound.rb:7: a Range with a Rational or Complex bound: a Range holds Integer, Float or String bounds, so it has nowhere to hold one. Comparing against the bounds directly (`x >= lo && x <= hi`) needs no Range and does work
+== test/reject/range_rational_walk_own_map.rb [default] rc=1
+spinel: test/reject/range_rational_walk_own_map.rb:8: a Range with a Rational or Complex bound: a Range holds Integer, Float or String bounds, so it has nowhere to hold one. Comparing against the bounds directly (`x >= lo && x <= hi`) needs no Range and does work
+== test/reject/range_rational_walk_own_map.rb [promote] rc=1
+spinel: test/reject/range_rational_walk_own_map.rb:8: a Range with a Rational or Complex bound: a Range holds Integer, Float or String bounds, so it has nowhere to hold one. Comparing against the bounds directly (`x >= lo && x <= hi`) needs no Range and does work
 == test/reject/range_reopen_float_range.rb [default] rc=1
 spinel: test/reject/range_reopen_float_range.rb:8: a method the program defines in Range, called on a Range of Floats: only an Integer Range runs it
 == test/reject/range_reopen_float_range.rb [promote] rc=1
@@ -1260,6 +1332,12 @@ spinel: test/reject/range_reopen_float_range.rb:8: a method the program defines 
 spinel: test/reject/range_reopen_string_range.rb:12: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
 == test/reject/range_reopen_string_range.rb [promote] rc=1
 spinel: test/reject/range_reopen_string_range.rb:12: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
+== test/reject/range_reopen_yield_container.rb [default] rc=1
+spinel: test/reject/range_reopen_yield_container.rb:11: a yielding method of a reopened Integer, Float, Symbol, Random, Range, Time or NilClass that hands its block an Array or Hash is not supported by AOT compilation
+spinel: 1 refusal, nothing written
+== test/reject/range_reopen_yield_container.rb [promote] rc=1
+spinel: test/reject/range_reopen_yield_container.rb:11: a yielding method of a reopened Integer, Float, Symbol, Random, Range, Time or NilClass that hands its block an Array or Hash is not supported by AOT compilation
+spinel: 1 refusal, nothing written
 == test/reject/range_reopened_endpoint_write.rb [default] rc=1
 spinel: test/reject/range_reopened_endpoint_write.rb:11: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
 == test/reject/range_reopened_endpoint_write.rb [promote] rc=1
@@ -1316,29 +1394,83 @@ spinel: 1 refusal, nothing written
 spinel: test/reject/retry_in_ensure.rb:12: Invalid retry (SyntaxError)
 == test/reject/retry_in_ensure.rb [promote] rc=1
 spinel: test/reject/retry_in_ensure.rb:12: Invalid retry (SyntaxError)
-== test/reject/runtime_condition_def_class_new.rb [default] rc=1
-spinel: test/reject/runtime_condition_def_class_new.rb:7: a def under a condition only the run time decides, in a Class.new, Module.new, Struct.new or Data.define block, is not supported: write the class with `class`; see docs/limitations.md
+== test/reject/runtime_condition_def_initialize_in_block.rb [default] rc=1
+spinel: test/reject/runtime_condition_def_initialize_in_block.rb:7: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
 spinel: 1 refusal, nothing written
-== test/reject/runtime_condition_def_class_new.rb [promote] rc=1
-spinel: test/reject/runtime_condition_def_class_new.rb:7: a def under a condition only the run time decides, in a Class.new, Module.new, Struct.new or Data.define block, is not supported: write the class with `class`; see docs/limitations.md
+== test/reject/runtime_condition_def_initialize_in_block.rb [promote] rc=1
+spinel: test/reject/runtime_condition_def_initialize_in_block.rb:7: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
 spinel: 1 refusal, nothing written
-== test/reject/runtime_condition_def_over_accessor.rb [default] rc=1
-spinel: test/reject/runtime_condition_def_over_accessor.rb:11: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
+== test/reject/runtime_condition_def_list_inherited.rb [default] rc=1
+spinel: test/reject/runtime_condition_def_list_inherited.rb:11: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
-== test/reject/runtime_condition_def_over_accessor.rb [promote] rc=1
-spinel: test/reject/runtime_condition_def_over_accessor.rb:11: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
+== test/reject/runtime_condition_def_list_inherited.rb [promote] rc=1
+spinel: test/reject/runtime_condition_def_list_inherited.rb:11: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
-== test/reject/runtime_condition_def_override.rb [default] rc=1
-spinel: test/reject/runtime_condition_def_override.rb:10: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
+== test/reject/runtime_condition_def_list_module.rb [default] rc=1
+spinel: test/reject/runtime_condition_def_list_module.rb:11: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
-== test/reject/runtime_condition_def_override.rb [promote] rc=1
-spinel: test/reject/runtime_condition_def_override.rb:10: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
+== test/reject/runtime_condition_def_list_module.rb [promote] rc=1
+spinel: test/reject/runtime_condition_def_list_module.rb:11: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_list_two_arms.rb [default] rc=1
+spinel: test/reject/runtime_condition_def_list_two_arms.rb:10: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_list_two_arms.rb [promote] rc=1
+spinel: test/reject/runtime_condition_def_list_two_arms.rb:10: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_list_unrelated.rb [default] rc=1
+spinel: test/reject/runtime_condition_def_list_unrelated.rb:11: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_list_unrelated.rb [promote] rc=1
+spinel: test/reject/runtime_condition_def_list_unrelated.rb:11: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_module_includers.rb [default] rc=1
+spinel: test/reject/runtime_condition_def_module_includers.rb:11: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_module_includers.rb [promote] rc=1
+spinel: test/reject/runtime_condition_def_module_includers.rb:11: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_private_instance_methods.rb [default] rc=1
+spinel: test/reject/runtime_condition_def_private_instance_methods.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_private_instance_methods.rb [promote] rc=1
+spinel: test/reject/runtime_condition_def_private_instance_methods.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_private_methods.rb [default] rc=1
+spinel: test/reject/runtime_condition_def_private_methods.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_private_methods.rb [promote] rc=1
+spinel: test/reject/runtime_condition_def_private_methods.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_private_super.rb [default] rc=1
+spinel: test/reject/runtime_condition_def_private_super.rb:10: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_private_super.rb [promote] rc=1
+spinel: test/reject/runtime_condition_def_private_super.rb:10: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_protected_instance_methods.rb [default] rc=1
+spinel: test/reject/runtime_condition_def_protected_instance_methods.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_protected_instance_methods.rb [promote] rc=1
+spinel: test/reject/runtime_condition_def_protected_instance_methods.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_protected_methods.rb [default] rc=1
+spinel: test/reject/runtime_condition_def_protected_methods.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_protected_methods.rb [promote] rc=1
+spinel: test/reject/runtime_condition_def_protected_methods.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
 == test/reject/runtime_condition_def_respond_to.rb [default] rc=1
 spinel: test/reject/runtime_condition_def_respond_to.rb:9: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
 == test/reject/runtime_condition_def_respond_to.rb [promote] rc=1
 spinel: test/reject/runtime_condition_def_respond_to.rb:9: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_singleton_methods.rb [default] rc=1
+spinel: test/reject/runtime_condition_def_singleton_methods.rb:8: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
+spinel: 1 refusal, nothing written
+== test/reject/runtime_condition_def_singleton_methods.rb [promote] rc=1
+spinel: test/reject/runtime_condition_def_singleton_methods.rb:8: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
 == test/reject/scan_subject_stdin_gets.rb [default] rc=1
 spinel: test/reject/scan_subject_stdin_gets.rb:3: IO#gets or IO#readline in a program that reads $_: they do not set $_ here, so $_ would not be the line just read. Keep the line in a variable instead
@@ -1648,6 +1780,58 @@ spinel: 1 refusal, nothing written
 == test/reject/string_method_object_mutator_user_method.rb [promote] rc=1
 spinel: test/reject/string_method_object_mutator_user_method.rb:12: String#method is not supported for a method that changes the String in place (`<<`, `concat`, `upcase!`, ...): the Method object is bound to the String's value, not to the String, so calling it could not change the String it came from. Call the method on the String directly, or wrap it in a block (`->(x) { s << x }`) (see docs/limitations.md)
 spinel: 1 refusal, nothing written
+== test/reject/string_minus_argument_call.rb [default] rc=1
+spinel: test/reject/string_minus_argument_call.rb:4: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_argument_call.rb [promote] rc=0
+== test/reject/string_minus_block.rb [default] rc=1
+spinel: test/reject/string_minus_block.rb:7: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_block.rb [promote] rc=1
+spinel: test/reject/string_minus_block.rb:7: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_keyword.rb [default] rc=1
+spinel: test/reject/string_minus_keyword.rb:6: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_keyword.rb [promote] rc=1
+spinel: test/reject/string_minus_keyword.rb:6: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_keyword_splat.rb [default] rc=1
+spinel: test/reject/string_minus_keyword_splat.rb:7: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_keyword_splat.rb [promote] rc=1
+spinel: test/reject/string_minus_keyword_splat.rb:7: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_literal.rb [default] rc=1
+spinel: test/reject/string_minus_literal.rb:3: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_literal.rb [promote] rc=1
+spinel: test/reject/string_minus_literal.rb:3: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_local_argument.rb [default] rc=1
+spinel: test/reject/string_minus_local_argument.rb:7: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_local_argument.rb [promote] rc=1
+spinel: test/reject/string_minus_local_argument.rb:7: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_local_block.rb [default] rc=1
+spinel: test/reject/string_minus_local_block.rb:9: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_local_block.rb [promote] rc=0
+== test/reject/string_minus_local_safe_navigation.rb [default] rc=1
+spinel: test/reject/string_minus_local_safe_navigation.rb:5: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_local_safe_navigation.rb [promote] rc=0
+== test/reject/string_minus_receiver.rb [default] rc=1
+spinel: test/reject/string_minus_receiver.rb:3: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_receiver.rb [promote] rc=1
+spinel: test/reject/string_minus_receiver.rb:3: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_receiver_call.rb [default] rc=1
+spinel: test/reject/string_minus_receiver_call.rb:11: undefined method '-' for an instance of String (NoMethodError)
+spinel: 1 refusal, nothing written
+== test/reject/string_minus_receiver_call.rb [promote] rc=0
 == test/reject/string_mutator_jump_arm.rb [default] rc=1
 spinel: test/reject/string_mutator_jump_arm.rb:7: unsupported expression: node N (ReturnNode)
 spinel: 1 refusal, nothing written

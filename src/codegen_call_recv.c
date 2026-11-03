@@ -1447,8 +1447,8 @@ void emit_gather_call_args(Compiler *c, const int *argv, int argc, int ta, Buf *
    [1, 2, [3, 4]]) and dropped an anonymous `*` altogether. Gather the
    arguments into one poly array -- a splat contributes each of its elements --
    and apply the operation element by element. Used by the value and the
-   statement form alike. A poly receiver is taken for insert alone, which may
-   be a String's (one text) as well as an Array's. */
+   statement form alike. A poly receiver is taken for insert, which may be
+   a String's (one text), and the initial builtin concat method version. */
 int emit_array_splat_mutator(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
@@ -1467,8 +1467,9 @@ int emit_array_splat_mutator(Compiler *c, int id, Buf *b) {
   if (is_insert && nt_kind(nt, argv[0]) == NK_SplatNode) return 0;
   Repr rr = repr_of(c, recv), ir = repr_of(c, id);
   TyKind rt = rr.as_ty;
-  int poly = rr.kind == RK_BOXED && is_insert;
-  if (poly)
+  int poly_concat = rr.kind == RK_BOXED && is_concat && nt_int(nt, id, "concat_builtin_version", 0);
+  int poly = rr.kind == RK_BOXED && (is_insert || poly_concat);
+  if (poly && !poly_concat)
     for (int k2 = 0; k2 < c->nclasses; k2++)
       if (comp_poly_arm_defines(c, k2, name)) return 0;
   /* a typed literal receiver given elements of another kind is rebuilt as
@@ -1508,6 +1509,10 @@ int emit_array_splat_mutator(Compiler *c, int id, Buf *b) {
     buf_printf(b, "sp_int _t%d = ", ti); emit_int_expr(c, argv[0], b); buf_puts(b, "; ");
   }
   emit_gather_call_args(c, argv + (is_insert ? 1 : 0), argc - (is_insert ? 1 : 0), ta, b);
+  /* The builtin method version has already received its arguments. Its
+     frozen check precedes any to_ary, including an empty argument list. */
+  if (poly_concat)
+    buf_printf(b, " if (sp_poly_frozen(_t%d)) sp_raise_frozen_array_v(_t%d);", tr, tr);
   if (is_concat) {
     int tf = ++g_tmp, tc = ++g_tmp;
     buf_printf(b, " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
@@ -1519,7 +1524,7 @@ int emit_array_splat_mutator(Compiler *c, int id, Buf *b) {
   /* a frozen receiver raises even when the splats spread no element */
   if (!poly)
     buf_printf(b, " if (_t%d && _t%d->frozen) sp_raise_frozen_array_at(_t%d, %s);", tr, tr, tr, array_frozen_cls(rt));
-  else buf_printf(b, " if (_t%d.tag == SP_TAG_OBJ && sp_poly_is_array_kind(_t%d.cls_id) && sp_poly_frozen(_t%d)) sp_raise_frozen_array_v(_t%d);", tr, tr, tr, tr);
+  else if (!poly_concat) buf_printf(b, " if (_t%d.tag == SP_TAG_OBJ && sp_poly_is_array_kind(_t%d.cls_id) && sp_poly_frozen(_t%d)) sp_raise_frozen_array_v(_t%d);", tr, tr, tr, tr);
   int tj = ++g_tmp;
   /* the values come boxed, and a nil converts to an Integer or Float
      array's nil element */
@@ -1528,7 +1533,13 @@ int emit_array_splat_mutator(Compiler *c, int id, Buf *b) {
      value: nil there is the operand TypeError */
   const char *pconv = et == TY_INT ? "sp_poly_elem_i_v" : et == TY_FLOAT ? "sp_poly_elem_f_v" : conv;
   if (!nsfx[0]) conv = pconv;
-  if (is_push || is_concat)
+  if (poly_concat)
+    buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++) {"
+                  " if (_t%d.cls_id == SP_BUILTIN_SYM_ARRAY)"
+                  " sp_IntArray_push((sp_IntArray *)_t%d.v.p, sp_bm_arg_sym(_t%d->data[_t%d]));"
+                  " else sp_poly_ary_append(_t%d, _t%d->data[_t%d]); }",
+               tj, tj, ta, tj, tr, tr, ta, tj, tr, ta, tj);
+  else if (is_push || is_concat)
     buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d->len; _t%d++)"
                   " sp_%sArray_push%s(_t%d, %s(_t%d->data[_t%d]));",
                tj, tj, ta, tj, k, nsfx, tr, conv, ta, tj);
@@ -2591,120 +2602,10 @@ else {
     buf_puts(b, ")");
     { *out = 1; return 1; }
   }
-  /* concat(*arrays) as a value: append in place, evaluate to the
-     receiver (the mutating statement form lives in emit_array_mutate_stmt).
-     Same-kind arguments only; a differently-typed argument has already
-     widened the receiver to poly in inference. */
-  if (sp_streq(name, "concat") && argc >= 1) {
-    int same = 1, all_poly = 1;
-    /* the last operand that is boxed: its #to_ary (and an earlier one's)
-       can change an operand before it, which CRuby has already copied */
-    int last_boxed = -1;
-    for (int j = 0; j < argc; j++) {
-      /* Ask the SLOT, not the node: a block parameter's node type can
-         read as the element kind while its declaration is boxed, and
-         emitting the boxed local into a typed pointer does not compile
-         (#3850). */
-      Repr ar = repr_of(c, argv[j]);
-      if (nt_kind(nt, argv[j]) == NK_LocalVariableReadNode) {
-        Scope *asc = comp_scope_of(c, argv[j]);
-        LocalVar *alv = asc ? scope_local(asc, nt_str(nt, argv[j], "name")) : NULL;
-        /* (an Array subclass instance's slot holds the instance: its
-           node, viewed as the instance's Array, is what is read) */
-        if (alv && alv->type != TY_UNKNOWN && comp_ty_ary_root(c, alv->type) < 0) ar = repr_of_slot(c, alv);
-      }
-      if (ar.kind == RK_BOXED) last_boxed = j;
-      if (ar.elem != ty_array_elem(rt)) same = 0;
-      if (ar.kind != RK_BOXED && ar.elem != TY_POLY && ar.elem != ty_array_elem(rt)) all_poly = 0;
-    }
-    /* A boxed argument -- an element read out of a poly array, which is
-       what `g.each_with_object([]) { |r, acc| acc.concat(r) }` hands it --
-       is an array at run time; reading it as this array's C type did not
-       compile (#3850). Append its elements through the boxed surface. A
-       poly array argument takes the same path: `[2].concat([1, nil])`
-       as a value had no arm and raised NoMethodError. An Integer or
-       Float element goes through sp_poly_elem_i / _f, so a nil lands as
-       the slot's nil bit rather than 0. */
-    /* ...and onto a typed Array a builtin call just built, of another kind
-       (an_push_widens_fresh): nothing else holds it, so the value is the
-       general Array of its elements and every argument's */
-    int fresh = an_push_widens_fresh(c, id);
-    if ((!same && all_poly && k) || fresh) {
-      int ta = ++g_tmp;
-      Buf ra; memset(&ra, 0, sizeof ra);
-      if (fresh) { emit_fresh_lift_recv(c, recv, &ra); k = "Poly"; }
-      else ra = expr_buf(c, recv);
-      buf_printf(b, "({ sp_%sArray *_t%d = %s; SP_GC_ROOT(_t%d);", k, ta, ra.p ? ra.p : "NULL", ta);
-      free(ra.p);
-      int vbase = g_tmp + 1; g_tmp += 2 * argc;   /* each value, then its length */
-      Buf ck = {0, 0, 0};
-      for (int j = 0; j < argc; j++) {
-        int tv = vbase + 2 * j, tn = tv + 1;
-        buf_printf(b, " sp_RbVal _t%d = ", tv); emit_boxed(c, argv[j], b);
-        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d);", tv);
-        /* (an Array, or what #to_ary answers: anything else is CRuby's
-           TypeError, where its length read as 0 appended nothing; it
-           converts after the frozen test, as CRuby converts it) */
-        buf_printf(&ck, " _t%d = sp_poly_ary_arg_ck(_t%d);", tv, tv);
-        /* copied at its turn when a boxed operand follows (a typed
-           Array's general view is already a new array; a general Array's
-           view is the array itself) */
-        if (j < last_boxed) {
-          int tc = ++g_tmp;
-          buf_printf(&ck, " { sp_PolyArray *_t%d = sp_poly_to_poly_array(_t%d); if (_t%d == (sp_PolyArray *)_t%d.v.p) _t%d = sp_PolyArray_dup(_t%d); _t%d = sp_box_poly_array(_t%d); }",
-                     tc, tv, tc, tv, tc, tc, tv, tc);
-        }
-        buf_printf(&ck, " sp_int _t%d = sp_poly_length(_t%d);", tn, tv);
-      }
-      /* a frozen receiver raises even when every argument is empty */
-      /* (the fresh Array's general copy is read as the general Array) */
-      buf_printf(b, " if (_t%d && _t%d->frozen) sp_raise_frozen_array_at(_t%d, %s);", ta, ta, ta,
-                 fresh ? "SP_BUILTIN_POLY_ARRAY" : array_frozen_cls(rt));
-      if (ck.p) buf_puts(b, ck.p);
-      free(ck.p);
-      for (int j = 0; j < argc; j++) {
-        int tv = vbase + 2 * j, tn = tv + 1, ti = ++g_tmp;
-        buf_printf(b, " for (sp_int _t%d = 0; _t%d < _t%d; _t%d++)", ti, ti, tn, ti);
-        buf_printf(b, " sp_%sArray_push%s(_t%d, ", k, nil_store_sfx(c, k, NIL_STORE_BOXED), ta);
-        { char el[64]; snprintf(el, sizeof el, "sp_poly_each_elem(_t%d, _t%d)", tv, ti);
-          TyKind et = fresh ? TY_POLY : ty_array_elem(rt);
-          if (et == TY_INT) buf_printf(b, "sp_poly_elem_i(%s)", el);
-          else if (et == TY_FLOAT) buf_printf(b, "sp_poly_elem_f(%s)", el);
-          else emit_unbox_text(c, et, el, b); }
-        buf_puts(b, ");");
-      }
-      buf_printf(b, " _t%d; })", ta);
-      { *out = 1; return 1; }
-    }
-    if (same) {
-      int ta = ++g_tmp;
-      Buf ra = expr_buf(c, recv);
-      buf_printf(b, "({ sp_%sArray *_t%d = %s; SP_GC_ROOT(_t%d);", k, ta, ra.p ? ra.p : "NULL", ta);
-      free(ra.p);
-      /* every argument and its length first: one aliasing the receiver is
-         appended as it was, not as an earlier append grew it (CRuby) */
-      int base = g_tmp + 1; g_tmp += argc;
-      int lbase = g_tmp + 1; g_tmp += argc;
-      for (int j = 0; j < argc; j++) {
-        buf_printf(b, " sp_%sArray *_t%d = ", k, base + j);
-        emit_expr(c, argv[j], b);
-        buf_printf(b, "; SP_GC_ROOT(_t%d);", base + j);
-      }
-      for (int j = 0; j < argc; j++)
-        buf_printf(b, " sp_int _t%d = sp_%sArray_length(_t%d);", lbase + j, k, base + j);
-      /* a frozen receiver raises even when every argument is empty */
-      buf_printf(b, " if (_t%d && _t%d->frozen) sp_raise_frozen_array_at(_t%d, %s);", ta, ta, ta, array_frozen_cls(rt));
-      for (int j = 0; j < argc; j++) {
-        int ii = ++g_tmp, sn = lbase + j;
-        /* the appended elements carry their array's nils */
-        int onum = rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY;
-        buf_printf(b, " { for (sp_int _t%d = 0; _t%d < _t%d; _t%d++)"
-                      " sp_%sArray_push%s(_t%d, sp_%sArray_%s(_t%d, _t%d)); }",
-                   ii, ii, sn, ii, k, onum ? "_o" : "", ta, k, onum ? "oget" : "get", base + j, ii);
-      }
-      buf_printf(b, " _t%d; })", ta);
-      { *out = 1; return 1; }
-    }
+  if (sp_streq(name, "concat")) {
+    /* The ordinary typed call passed the Array-reopening route. */
+    *out = emit_builtin_array_concat(c, id, recv, rt, argv, argc, 1, b);
+    return *out;
   }
   if (sp_streq(name, "fetch") && (argc == 1 || argc == 2)) {
     int blk = fetch_fallback_block(c, id);
@@ -2956,26 +2857,6 @@ else {
     buf_printf(b, " sp_PolyArray_push(_t%d, sp_box_poly_array(_t%d));", tr, tpair);
     buf_printf(b, " } } _t%d; })", tr);
     { *out = 1; return 1; }
-  }
-  /* concat in VALUE position with a source of another kind (a general
-     Array read at run time, another typed kind): the statement emitter
-     owns the per-kind element loop, so run it inside a compound whose
-     value is the receiver. A same-kind source keeps its own arm below.
-     Reached since a typed parameter no longer widens under such a
-     concat (#4481); before, the receiver was a general Array here. */
-  if (sp_streq(name, "concat") && argc >= 1 &&
-      nt_kind(nt, recv) == NK_LocalVariableReadNode) {
-    int other = 0;
-    for (int ai = 0; ai < argc; ai++) {
-      TyKind at = comp_ntype(c, argv[ai]);
-      if (at == TY_POLY_ARRAY || at == TY_POLY || (ty_is_array(at) && at != rt)) other = 1;
-    }
-    if (other) {
-      buf_puts(b, "({ ");
-      emit_array_mutate_stmt(c, id, b, 0);
-      buf_puts(b, " "); emit_expr(c, recv, b); buf_puts(b, "; })");
-      { *out = 1; return 1; }
-    }
   }
   if (sp_streq(name, "insert") && argc >= 2 && (rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY || rt == TY_STR_ARRAY)) {
     /* insert(i, v1, v2, ...): normalize a negative index ONCE against the
@@ -6884,6 +6765,57 @@ static int emit_merge_block_same_variant(Compiler *c, int id, int recv, int arg,
   return 1;
 }
 
+/* merge!(other) { |k, v1, v2| } into a PolyPoly Hash, `other` boxed: its pairs
+   reach the block as they are (an emit_hash_call arm, kept out of that
+   function's length). 0 for any other call. Its pairs bind required parameters
+   and a rest: any other parameter would read nil, so it is refused. */
+static int emit_merge_bang_boxed_block(Compiler *c, int id, int recv, const int *argv, int argc, int blk, TyKind rt, Buf *b) {
+  const NodeTable *nt = c->nt;
+  if (!is_hash_merge_bang(nt_str(nt, id, "name")) || argc != 1 || rt != TY_POLY_POLY_HASH || blk < 0 ||
+      nt_kind(nt, blk) != NK_BlockNode || repr_of(c, argv[0]).kind != RK_BOXED || call_breaks(c, id)) return 0;
+  int bp = nt_ref(nt, blk, "parameters"), pn = bp >= 0 ? nt_ref(nt, bp, "parameters") : -1, on = 0, kn = 0, ln = 0, rn = 0;
+  if (pn >= 0) { nt_arr(nt, pn, "optionals", &on); nt_arr(nt, pn, "keywords", &kn); nt_arr(nt, pn, "posts", &ln); nt_arr(nt, pn, "requireds", &rn); }
+  /* (a fourth required parameter reads nil at every conflict, which the
+     three bindings below do not give it: a value it took at one conflict
+     would show at the next) */
+  if (on || kn || ln || rn > 3 || (pn >= 0 && nt_ref(nt, pn, "keyword_rest") >= 0)) {
+    unsupported_feature(c, id, "a merge! conflict block with a default, keyword, post-rest or fourth required parameter over a boxed Hash");
+    return 0;
+  }
+  int arg = argv[0];
+  int tr = ++g_tmp, to = ++g_tmp, tn = ++g_tmp, ti = ++g_tmp, tp = ++g_tmp, tk = ++g_tmp, tv = ++g_tmp;
+  char ks[24], vs[24], gs[96];
+  snprintf(ks, sizeof ks, "_t%d", tk);
+  snprintf(vs, sizeof vs, "_t%d", tv);
+  snprintf(gs, sizeof gs, "sp_PolyPolyHash_get(_t%d, _t%d)", tr, tk);
+  /* the argument is evaluated before merge! looks at its receiver, so a
+     frozen receiver raises after the argument's own effects; a user object
+     is converted through its #to_hash first when the program defines one
+     (Compiler.uses_kw_to_hash), as the other merge! arms convert it */
+  buf_printf(b, "({ sp_PolyPolyHash *_t%d = ", tr); emit_expr(c, recv, b); buf_printf(b, "; SP_GC_ROOT(_t%d);", tr);
+  buf_printf(b, " sp_RbVal _t%d = ", to); emit_boxed(c, arg, b); buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d);", to);
+  buf_printf(b, " if (sp_gc_is_frozen(_t%d)) sp_raise_frozen_hash_at(_t%d, %s);", tr, tr, hash_box_cls(rt));
+  if (c->uses_kw_to_hash) buf_printf(b, " if (sp_poly_is_user_obj(_t%d)) _t%d = sp_kw_splat_conv(_t%d, 0);", to, to, to);
+  buf_printf(b, " if (_t%d.tag != SP_TAG_OBJ || !sp_poly_is_hash_kind(_t%d.cls_id))"
+                " sp_raise_cls(\"TypeError\", sp_sprintf(\"no implicit conversion of %%s into Hash\", sp_convert_src_name(_t%d)));",
+             to, to, to);
+  buf_printf(b, " sp_int _t%d = sp_poly_arr_len_ex(_t%d);"
+                " for (sp_int _t%d = 0; _t%d < _t%d; _t%d++) {"
+                " sp_RbVal _t%d = sp_poly_each_elem(_t%d, _t%d); SP_GC_ROOT_RBVAL(_t%d);"
+                " sp_RbVal _t%d = sp_PolyArray_get((sp_PolyArray *)_t%d.v.p, 0);"
+                " sp_RbVal _t%d = sp_PolyArray_get((sp_PolyArray *)_t%d.v.p, 1);"
+                " if (sp_PolyPolyHash_has_key(_t%d, _t%d)) {",
+             tn, to, ti, ti, tn, ti, tp, to, ti, tp, tk, tp, tv, tp, tr, tk);
+  emit_merge_blk_param(c, blk, block_param_name(c, blk, 0), TY_POLY, ks, NULL, b);
+  emit_merge_blk_param(c, blk, block_param_name(c, blk, 1), TY_POLY, gs, NULL, b);
+  emit_merge_blk_param(c, blk, block_param_name(c, blk, 2), TY_POLY, vs, NULL, b);
+  emit_merge_rest_param_typed(c, blk, TY_POLY, ks, TY_POLY, gs, vs, 0, b);
+  buf_printf(b, " sp_PolyPolyHash_set(_t%d, _t%d, ", tr, tk);
+  emit_blk_value_as(c, blk, TY_POLY, b);
+  buf_printf(b, "); }\nelse { sp_PolyPolyHash_set(_t%d, _t%d, _t%d); } } _t%d; })", tr, tk, tv, tr);
+  return 1;
+}
+
 /* `h.fetch(k, default)` past the key: the hit or the default, as the value
    kind wants it -- boxed for a poly slot, through one fetch_or probe for an
    inert Integer default, with its nil where the hash's values may be nil
@@ -6917,9 +6849,19 @@ static void emit_hash_fetch_default_tail(Compiler *c, int id, int dflt, const ch
   }
   else if (vt == TY_STRING) {
     /* (one representation: the value is the handle; both arms as bytes) */
-    buf_printf(b, "; sp_%sHash_has_key%s(_t%d, _t%d) ? SP_STR_B(sp_%sHash_get%s(_t%d, _t%d)) : SP_STR_B(", hn, ks, th, tk, hn, ks, th, tk);
-    emit_expr(c, dflt, b);
-    buf_puts(b, ")");
+    Buf db; memset(&db, 0, sizeof db);
+    emit_expr(c, dflt, &db);
+    const char *dt_text = db.p ? db.p : "NULL";
+    /* (a shared String local's read can allocate, sp_strbuf_read_pub, and
+       the receiver is held unrooted when the key and the default are
+       inert: evaluated ahead of the probe, it has to allocate nothing) */
+    if ((fetch_operand_is_inert(c, dflt) && repr_of(c, dflt).kind != RK_STRBUF) || fzl_text_id(dt_text) >= 0)
+      /* a default that costs nothing up front (a local, nil, a frozen
+         literal's bytes): one probe */
+      buf_printf(b, "; SP_STR_B(sp_%sHash_fetch_or%s(_t%d, _t%d, SP_STR_B(%s)))", hn, ks, th, tk, dt_text);
+    else
+      buf_printf(b, "; sp_%sHash_has_key%s(_t%d, _t%d) ? SP_STR_B(sp_%sHash_get%s(_t%d, _t%d)) : SP_STR_B(%s)", hn, ks, th, tk, hn, ks, th, tk, dt_text);
+    free(db.p);
   }
   else {
     buf_printf(b, "; sp_%sHash_has_key%s(_t%d, _t%d) ? sp_%sHash_get%s(_t%d, _t%d) : ", hn, ks, th, tk, hn, ks, th, tk);
@@ -7010,6 +6952,50 @@ static int emit_hash_merge_to_hash_widen(Compiler *c, int recv, int arg, TyKind 
   free(cb.p);
   return 1;
 }
+/* `h.fetch(key[, default], &blk)` with a proc handed in (`&b` holding one,
+   or nil): the stored value, else the proc called with the key, else the
+   default, else KeyError (emit_hash_call) */
+static int emit_hash_fetch_block_arg(Compiler *c, int id, int recv, int argc, const int *argv, TyKind rt, const char *hn, Buf *b) {
+  const NodeTable *nt = c->nt;
+  Buf pp; memset(&pp, 0, sizeof pp);
+  int pb = resolve_forwarded_block(c, nt_ref(nt, id, "block"));
+  const char *fwd = forwarded_real_proc(nt_ref(nt, id, "block"), pb);
+  if (pb >= 0) emit_forwarded_proc_arg(c, pb, &pp);
+  else buf_puts(&pp, fwd ? fwd : "NULL");
+  TyKind vt = ty_hash_val(rt), kt = ty_hash_key(rt);
+  int th = ++g_tmp, tk = ++g_tmp, tp = ++g_tmp, tb = ++g_tmp, td = -1;
+  buf_printf(b, "({ %s _t%d = ", c_type_name(rt), th); emit_expr(c, recv, b);
+  buf_printf(b, "; SP_GC_ROOT(_t%d); %s _t%d = ", th, c_type_name(kt), tk);
+  emit_hash_key(c, argv[0], kt, b);
+  /* the default, an argument, evaluates before the lookup; a nil
+     block (`fetch(k, d, &nil)` is the two-argument fetch) answers it
+     where the key misses, as CRuby does, rather than KeyError */
+  if (argc == 2) {
+    td = ++g_tmp;
+    buf_printf(b, "; sp_RbVal _t%d = ", td); emit_boxed(c, argv[1], b);
+    buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d)", td);
+  }
+  buf_printf(b, "; sp_Proc *_t%d = %s; SP_GC_ROOT(_t%d); sp_RbVal _t%d; ", tp, pp.p ? pp.p : "NULL", tp, tb);
+  free(pp.p);
+  char getexpr[128], keyexpr[32];
+  snprintf(getexpr, sizeof getexpr, "sp_%sHash_get(_t%d, _t%d)", hn, th, tk);
+  snprintf(keyexpr, sizeof keyexpr, "_t%d", tk);
+  buf_printf(b, "if (sp_%sHash_has_key(_t%d, _t%d)) _t%d = ", hn, th, tk, tb);
+  emit_boxed_text(c, vt, getexpr, b);
+  buf_printf(b, "; else if (_t%d) { _sp_proc_poly_args[0] = ", tp);
+  emit_boxed_text(c, kt, keyexpr, b);
+  buf_printf(b, "; sp_int _sl[1] = { sp_poly_slot_i(_sp_proc_poly_args[0]) };"
+                " _t%d = sp_poly_callable_call(sp_box_obj(_t%d, SP_BUILTIN_PROC), 1, _sl); }", tb, tp);
+  if (td >= 0) {
+    buf_printf(b, " else _t%d = _t%d; _t%d; })", tb, td, tb);
+    return 1;
+  }
+  buf_printf(b, " else { _t%d = sp_box_nil(); sp_raise_key_not_found(", tb);
+  emit_boxed_text(c, kt, keyexpr, b);
+  buf_printf(b, "); } _t%d; })", tb);
+  return 1;
+}
+
 int emit_hash_call(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
@@ -7289,31 +7275,7 @@ int emit_hash_call(Compiler *c, int id, Buf *b) {
            at run time, after the nil check a missing block raises KeyError
            for; the call is typed boxed (infer: a block argument) */
         if (nt_kind(nt, blk) == NK_BlockArgumentNode) {
-          Buf pp; memset(&pp, 0, sizeof pp);
-          int pb = resolve_forwarded_block(c, nt_ref(nt, id, "block"));
-          const char *fwd = forwarded_real_proc(nt_ref(nt, id, "block"), pb);
-          if (pb >= 0) emit_forwarded_proc_arg(c, pb, &pp);
-          else buf_puts(&pp, fwd ? fwd : "NULL");
-          TyKind vt = ty_hash_val(rt), kt = ty_hash_key(rt);
-          int th = ++g_tmp, tk = ++g_tmp, tp = ++g_tmp, tb = ++g_tmp;
-          buf_printf(b, "({ %s _t%d = ", c_type_name(rt), th); emit_expr(c, recv, b);
-          buf_printf(b, "; SP_GC_ROOT(_t%d); %s _t%d = ", th, c_type_name(kt), tk);
-          emit_hash_key(c, argv[0], kt, b);
-          buf_printf(b, "; sp_Proc *_t%d = %s; SP_GC_ROOT(_t%d); sp_RbVal _t%d; ", tp, pp.p ? pp.p : "NULL", tp, tb);
-          free(pp.p);
-          char getexpr[128], keyexpr[32];
-          snprintf(getexpr, sizeof getexpr, "sp_%sHash_get(_t%d, _t%d)", hn, th, tk);
-          snprintf(keyexpr, sizeof keyexpr, "_t%d", tk);
-          buf_printf(b, "if (sp_%sHash_has_key(_t%d, _t%d)) _t%d = ", hn, th, tk, tb);
-          emit_boxed_text(c, vt, getexpr, b);
-          buf_printf(b, "; else if (_t%d) { _sp_proc_poly_args[0] = ", tp);
-          emit_boxed_text(c, kt, keyexpr, b);
-          buf_printf(b, "; sp_int _sl[1] = { sp_poly_slot_i(_sp_proc_poly_args[0]) };"
-                        " _t%d = sp_poly_callable_call(sp_box_obj(_t%d, SP_BUILTIN_PROC), 1, _sl); }"
-                        " else { _t%d = sp_box_nil(); sp_raise_key_not_found(", tb, tp, tb);
-          emit_boxed_text(c, kt, keyexpr, b);
-          buf_printf(b, "); } _t%d; })", tb);
-          return 1;
+          return emit_hash_fetch_block_arg(c, id, recv, argc, argv, rt, hn, b);
         }
         if (blk >= 0 && hash_key_misses(c, argv[0], ty_hash_key(rt))) {
           /* the block receives the missing key, and its parameter is typed
@@ -7600,6 +7562,7 @@ else {
         buf_printf(b, " _t%d; })", tr);
         return 1;
       }
+      if (emit_merge_bang_boxed_block(c, id, recv, argv, argc, mb_blk, rt, b)) return 1;   /* ... and with a block written here */
       if ((is_hash_merge_bang(name)) && argc == 1) {
         /* In-place merge: insert each key of `other` into the receiver (a
            conflict-resolution block, if present, picks the kept value), then
@@ -15172,6 +15135,16 @@ static TyKind emit_face_arm(Compiler *c, int id, unsigned kind, unsigned flags, 
     else emit_expr(c, recv, &rb);
   }
   const char *rs = box ? bx : rb.p ? rb.p : "sp_box_nil()";
+  /* concat converts operands at their turn on the original Array, rather
+     than a normalized copy whose writeback could lose callback changes. */
+  if (kind == PF_ARRAY && sp_streq(name, "concat")) {
+    int argc = 0, saved = g_n_argov;
+    const int *argv = call_args(nt, id, &argc);
+    view_bind(recv, "%s", rs);
+    int ok = emit_builtin_array_concat(c, id, recv, TY_POLY, argv, argc, 0, val);
+    view_unbind(saved);
+    if (ok) { free(rb.p); return TY_POLY; }
+  }
   if (kind == PF_ARRAY && face_fill_in_place(c, id)) {
     int argc = 0;
     const int *argv = call_args(nt, id, &argc);
@@ -15644,6 +15617,8 @@ int face_arg_misfit(Compiler *c, unsigned kind, int arg) {
   if (at == TY_POLY || at == TY_UNKNOWN) return 0;
   if (kind == PF_STRING && (at == TY_STRING || at == TY_STRBUF || at == TY_INT)) return 0;  /* a codepoint concatenates too */
   if (kind == PF_ARRAY && (ty_is_array(at) || at == TY_POLY_ARRAY)) return 0;
+  /* an object whose to_ary may answer an Array: the arm converts it */
+  if (kind == PF_ARRAY && ty_is_object(at) && !obj_to_ary_misfit(c, at)) return 0;
   /* a Hash, or an object whose to_hash may answer one */
   if (kind == PF_HASH && (ty_is_hash(at) || ty_is_object(at))) return 0;
   return 1;
@@ -15660,6 +15635,7 @@ int face_args_misfit(Compiler *c, int id, unsigned kind) {
   if (!nt_call_args_plain(nt, id)) return 0;
   unsigned fl = ty_poly_face_owner_flags(nt_str(nt, id, "name"), argc, nt_ref(nt, id, "block") >= 0, 1, kind);
   if (!(fl & PF_ARGS_OWN)) return 0;
+  if (kind == PF_ARRAY && sp_streq(nt_str(nt, id, "name"), "concat")) return 0;
   for (int i = 0; i < argc; i++)
     if (face_arg_misfit(c, kind, argv[i])) return 1;
   return 0;
@@ -15692,7 +15668,7 @@ static int emit_face_switch(Compiler *c, int id, unsigned own, Buf *b) {
     if (!(own & kind)) continue;
     unsigned fl = ty_poly_face_owner_flags(name, argc, has_blk, plain, kind);
     int misfit = -1;
-    if ((fl & PF_ARGS_OWN) && plain)
+    if ((fl & PF_ARGS_OWN) && plain && !(kind == PF_ARRAY && sp_streq(name, "concat")))
       for (int i = 0; i < argc && misfit < 0; i++) if (face_arg_misfit(c, kind, argv[i])) misfit = i;
     Buf pre = {0, 0, 0}, val = {0, 0, 0};
     TyKind nat = TY_UNKNOWN;
@@ -17026,6 +17002,18 @@ static int emit_poly_index_call(Compiler *c, int id, Buf *b, const NodeTable *nt
     { *out = 1; return 1; }
   }
   if (recv >= 0 && rt == TY_POLY && sp_streq(name, "[]") && argc == 1) {
+    /* An argument a length dispatch's arm reads from a boxed splat operand
+       (splat_operand_read): the read is the Array the splat makes of the
+       value (sp_splat_to_array), never a user object, so a class's own []
+       is no candidate. Taking the per-class dispatch for it found no arm and
+       raised NoMethodError for an Array (`o.send(name, *args)` with a user
+       `def [](k)` anywhere in the program). */
+    if (nt_kind(nt, recv) == NK_LocalVariableReadNode && nt_int(nt, recv, "splat_view", 0) &&
+        repr_of(c, recv).kind == RK_BOXED && nt_kind(nt, argv[0]) == NK_IntegerNode) {
+      buf_puts(b, "sp_poly_arr_get_hash("); emit_expr(c, recv, b);
+      buf_puts(b, ", "); emit_int_expr(c, argv[0], b); buf_puts(b, ")");
+      { *out = 1; return 1; }
+    }
     /* `@table[i][j]` dispatch table narrowed to int (poly_double_index_int):
        call the entry (bound method / int array) for an unboxed int result. */
     if (repr_of(c, id).as_ty == TY_INT) {

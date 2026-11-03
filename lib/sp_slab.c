@@ -792,6 +792,26 @@ void *sp_gc_alloc(size_t sz, void (*fin)(void *), void (*scn)(void *)) {
   sp_gc_bytes_add(need);
   return p + sizeof(sp_gc_hdr);
 }
+/* The lean front for a String born in its handle (sp_str_alloc_born): the
+   caller writes every field of the handle and of the bytes' header, and the
+   bytes are written before anything reads them, so only the collector's
+   header is cleared, not the whole slot with the bytes' capacity in it:
+   that clearing made an interpolated String cost more than the string
+   slab's had (#10651). */
+void *sp_gc_alloc_born(size_t sz) {
+  size_t need = sizeof(sp_gc_hdr) + sz;
+  if (SP_EXPECT(!SP_GC_CTR_GET(sp_gc_alloc_fast_ok) || need > 256, 0)) return sp_gc_alloc_full(sz, NULL, NULL);
+  if (SP_EXPECT(SP_GC_CTR_GET(sp_gc_bytes) > SP_GC_CTR_GET(sp_gc_threshold), 0)) return sp_gc_alloc_full(sz, NULL, NULL);
+  int cls = sp_slab_cls_of[(need + 15) >> 4];
+  sp_slab_worker *wk = &sp_slab_wk[SP_SLAB_WID()];
+  char *p = wk->rnext[0][cls];
+  if (SP_EXPECT(p == wk->rend[0][cls], 0)) return sp_gc_alloc_full(sz, NULL, NULL);
+  wk->rnext[0][cls] = p + sp_slab_csize[cls];
+  memset(p, 0, sizeof(sp_gc_hdr));
+  ((sp_gc_hdr *)p)->size = need;
+  sp_gc_bytes_add(need);
+  return p + sizeof(sp_gc_hdr);
+}
 /* The lean front once more, for a caller that knows the size at compile time
    and has no finalizer, which a constructor does: sizeof its class. One
    function per size class (sp_gc_alloc_sized, sp_alloc.h, picks it), so the
@@ -837,7 +857,9 @@ static SP_NOINLINE void *sp_gc_alloc_full(size_t sz, void (*fin)(void *), void (
      parked, so a push never races the sweep. The stress-threshold one-shot is
      idempotent under a race. */
   if (!sp_gc_stress_checked) { sp_gc_stress_checked = 1; const char *e = getenv("SPINEL_GC_STRESS"); if (e && *e && *e != '0') { SP_GC_CTR_SET(sp_gc_threshold, 2048); sp_gc_threshold_init = 2048; sp_gc_stress_pin = 1; } }
+#ifndef SP_GC_NONE   /* (--gc=none: nothing collects, so nothing asks; #10699) */
   if (SP_GC_CTR_GET(sp_gc_bytes) > SP_GC_CTR_GET(sp_gc_threshold)) sp_stw_collect();
+#endif
   size_t need = sizeof(sp_gc_hdr) + sz;
   sp_gc_hdr *h = (sp_gc_hdr *)sp_slab_alloc_in(need, 0, fin != NULL, 1);
   h->finalize = fin; h->scan = scn; h->size = need;
@@ -860,9 +882,11 @@ static SP_NOINLINE void *sp_gc_alloc_full(size_t sz, void (*fin)(void *), void (
      the heap lock. threshold_init stays plain -- only retune reads it, under
      stop-the-world, ordered after this by the writer's park. */
   if (!sp_gc_stress_checked) { sp_gc_stress_checked = 1; const char *e = getenv("SPINEL_GC_STRESS"); if (e && *e && *e != '0') { SP_GC_CTR_SET(sp_gc_threshold, 2048); sp_gc_threshold_init = 2048; sp_gc_stress_pin = 1; } }
+#ifndef SP_GC_NONE   /* (--gc=none: nothing collects, so nothing asks; #10699) */
   if (SP_GC_CTR_GET(sp_gc_bytes) > sp_gc_threshold) {
     sp_gc_collect_retune();
   }
+#endif
   size_t need = sizeof(sp_gc_hdr) + sz;
   sp_gc_hdr *h = (sp_gc_hdr *)sp_slab_alloc_in(need, 0, fin != NULL, 1);
   h->finalize = fin; h->scan = scn; h->size = need;

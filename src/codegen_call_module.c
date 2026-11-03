@@ -109,12 +109,13 @@ static void emit_file_join_args(Compiler *c, const int *argv, int argc, int boxe
    a lone base: keeps its own route. The pattern and the keyword values are
    evaluated once, in source order, and handed boxed to
    sp_dir_glob_keywords, which reads them. */
-static int emit_dir_glob_options(Compiler *c, const int *argv, Buf *b) {
+static int emit_dir_glob_options(Compiler *c, int pattern, int kwh, int flags, Buf *b) {
   const NodeTable *nt = c->nt;
-  int en = 0; const int *els = nt_arr(nt, argv[1], "elements", &en);
-  if (en < 1 || en > 3 || ty_is_array(comp_ntype(c, argv[0])) || nt_kind(nt, argv[0]) == NK_ArrayNode) return 0;
-  int nodes[4], n = 1, bi = -1, si = -1, fi = -1;
-  nodes[0] = argv[0];
+  int en = 0; const int *els = nt_arr(nt, kwh, "elements", &en);
+  if (en < 1 || en > 3 || ty_is_array(comp_ntype(c, pattern)) || nt_kind(nt, pattern) == NK_ArrayNode) return 0;
+  int nodes[5], n = 1, bi = -1, si = -1, fi = -1;
+  nodes[0] = pattern;
+  if (flags >= 0) { fi = n; nodes[n++] = flags; }
   for (int k = 0; k < en; k++) {
     if (nt_kind(nt, els[k]) != NK_AssocNode) return 0;
     int key = nt_ref(nt, els[k], "key"), val = nt_ref(nt, els[k], "value");
@@ -122,7 +123,7 @@ static int emit_dir_glob_options(Compiler *c, const int *argv, Buf *b) {
     if (!kn || val < 0) return 0;
     if (sp_streq(kn, "base")) bi = n;
     else if (sp_streq(kn, "sort")) si = n;
-    else if (sp_streq(kn, "flags")) fi = n;
+    else if (sp_streq(kn, "flags")) fi = n;  /* over a positional flags, as CRuby reads it */
     else return 0;
     nodes[n++] = val;
   }
@@ -844,7 +845,11 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     }
     /* Dir.glob(pattern, base:, sort:, flags: File::FNM_DOTMATCH) */
     if (sp_streq(name, "glob") && argc == 2 && nt_kind(nt, argv[1]) == NK_KeywordHashNode &&
-        emit_dir_glob_options(c, argv, b)) return 1;
+        emit_dir_glob_options(c, argv[0], argv[1], -1, b)) return 1;
+    /* Dir.glob(pattern, flags, base:, sort:): the positional flags beside the keywords */
+    if (sp_streq(name, "glob") && argc == 3 && nt_kind(nt, argv[2]) == NK_KeywordHashNode &&
+        nt_kind(nt, argv[1]) != NK_KeywordHashNode &&
+        emit_dir_glob_options(c, argv[0], argv[2], argv[1], b)) return 1;
     /* Dir[*pats] / Dir.glob(*pats), and Dir[a, b]: every pattern a splat
        holds or an argument names, gathered into one list for the union */
     if (sp_streq(name, "glob") && argc >= 1 &&
@@ -1275,6 +1280,9 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     /* the time every collection so far took (sp_gc_stat_seconds), in
        nanoseconds as CRuby answers it */
     if (sp_streq(name, "total_time") && argc == 0) { buf_puts(b, "((sp_int)(sp_gc_stat_seconds * 1e9))"); return 1; }
+    /* the collections so far, minor and full alike, as CRuby counts them
+       (sp_gc_cycle, which GC.stat reports as "cycle") */
+    if (sp_streq(name, "count") && argc == 0) { buf_puts(b, "((sp_int)sp_gc_cycle)"); return 1; }
     /* GC.stat(key): the one statistic, ArgumentError for a key not kept */
     if (sp_streq(name, "stat") && argc == 1 && nt_kind(nt, argv[0]) != NK_KeywordHashNode) {
       buf_puts(b, "sp_gc_stat_key("); emit_boxed(c, argv[0], b); buf_puts(b, ")");

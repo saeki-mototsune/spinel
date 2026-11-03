@@ -900,6 +900,7 @@ extern const char *g_method_pr_var;
 extern const char *g_proc_return_home;
 int cmethod_takes_self_cls(Compiler *c, int si);
 const char *emit_cmethod_self_cls_arg(Compiler *c, int mi, int recv_cls, Buf *b);
+int emit_class_cmethod_eqq(Compiler *c, int ci, const char *subj, TyKind pt, int node, int boxed, Buf *b);
 const char *cmethod_cls_token(Compiler *c, Scope *encl);
 Scope *open_default_method(void);
 int reopen_self_defaults(Compiler *c, int mi);
@@ -1209,6 +1210,8 @@ void emit_expr(Compiler *c, int id, Buf *b);
    being defined nowhere the program or the runtime can see? A rescue
    operand is read so when an exception reaches its clause. */
 int const_read_raises(Compiler *c, int id);
+/* The constant path as the program wrote it, for a NameError (codegen_expr.c) */
+void const_path_written(const NodeTable *nt, int id, char *out, size_t cap);
 void emit_constant_slot(Compiler *c, int id, Buf *b);
 void emit_expr_slot(Compiler *c, int node, TyKind slot, Buf *b);
 void emit_tail_value(Compiler *c, int node, Buf *b);
@@ -1247,7 +1250,6 @@ int emit_exc_reopen_pick_head(Compiler *c, const int *xr, int xn, const char *cl
 int class_has_subclass(Compiler *c, int ocid);
 int exc_has_user_msg_override(Compiler *c);
 int exc_text_override_calls_super(Compiler *c);
-int scope_calls_super(Compiler *c, int s);
 int exc_has_nonstring_msg_override(Compiler *c);
 int fi_fiber_stack_risk(Compiler *c);
 const char *class_ruby_name(Compiler *c, int ci);
@@ -1259,6 +1261,8 @@ int class_is_comparable(Compiler *c, int cid);
 int class_implicit_responds(Compiler *c, int cid, const char *qm);
 void emit_visible_cls_id(Compiler *c, const char *var, Buf *b);
 void obj_default_name(Compiler *c, int ci, char *name, size_t nn, char *arg, size_t na);
+void emit_obj_default_inspect(Compiler *c, int cid, const char *p, Buf *b);
+int class_has_ctor(const ClassInfo *ci);   /* does the class get a sp_X_new (an object of it may exist) */
 int anon_class_text(Compiler *c, int ci, const char *head, Buf *b);
 int scope_def_line(Compiler *c, Scope *s);
 const char *scope_def_file(Compiler *c, Scope *s);
@@ -1267,10 +1271,13 @@ const char *obj_str_cname(Compiler *c, int cid, int want_inspect);
 const char *obj_str_fn(Compiler *c, int cid, int want_inspect);
 const char *obj_str_blockarg(Compiler *c, int cid, int want_inspect);
 int obj_str_ret_poly(Compiler *c, int cid, int want_inspect);
+int obj_str_ret_strsub(Compiler *c, int cid, int want_inspect);
 const char *exc_builtin_parent(Compiler *c, int ci);
 void emit_stmt(Compiler *c, int id, Buf *b, int indent);
 /* A require under --load-model=graph, as its value (codegen_stmt.c) */
 void emit_load_call(Compiler *c, int id, Buf *b);
+int emit_autoload_register(Compiler *c, int id, Buf *b);
+int emit_const_autoload_run(Compiler *c, int id, Buf *b);   /* codegen_util.c */
 void emit_file_feature(const NodeTable *nt, int f, Buf *b);
 void emit_load_path_seed(Compiler *c, Buf *b);
 void native_load_flag(const NodeTable *nt, int id, char *buf, size_t n);
@@ -1303,6 +1310,7 @@ void emit_kw_flag(Compiler *c, int node, Buf *out);
 int  emit_vis_refusal(Compiler *c, int id, Buf *b);
 int  method_vis_for_caller(Compiler *c, int id, int vcid, const char *vnm);
 void emit_poly_vis_precheck(Compiler *c, int id, int tv, Buf *b);
+void emit_vis_raise_boxed(int vis, const char *vnm, int tv, Buf *b);
 /* The per-class `case` arms that store `src` into each candidate class's
    `base` writer slot through the object pointer text `objp` (codegen_stmt.c).
    box_tv is the boxed receiver's temp (-1 for a typed one), src_tv src's;
@@ -1715,6 +1723,11 @@ int cmethod_sibling_answers_nil(Compiler *c, int call, int cid, const char *nm);
    --emit-types, call it directly), and the end-of-compile report comparing
    them with inference's (codegen_util.c) */
 void ucall_observe(Compiler *c, int id, int mi, int owner_ci, int add);
+/* While the depth is above 0, ucall_observe stamps each observation as an
+   arm of a switch (add): a call emitted as a choice between nil's method
+   and the receiver's (emit_nil_program_call) */
+void ucall_arm_push(void);
+void ucall_arm_pop(void);
 void ucall_report(Compiler *c);
 /* --plan-check: codegen emitted the call node id (whatever it bound) */
 void ucall_emitted(int id);
@@ -1774,6 +1787,8 @@ const char *sg_refused_msg(Compiler *c, int def);
 void sg_refused_def(Compiler *c, int def);
 __attribute__((noreturn)) void unsupported_feature(Compiler *c, int id, const char *msg);
 void unsupported_feature_collect(Compiler *c, int id, const char *msg);
+/* a Range literal only walked from an Integer begin (codegen.c) */
+int range_rat_walk(Compiler *c, int rn);
 
 /* Compile a regexp literal with the engine and throw the result away, to
    refuse at COMPILE time a pattern that would only have failed at the
@@ -1873,6 +1888,7 @@ const char *nil_value(TyKind t);
 int cvar_defined_probed(Compiler *c, const char *nm);
 void emit_cvar_set_flag(Compiler *c, int cid, const char *nm, int as_expr, Buf *b);
 void emit_cvar_set_flag_after(Compiler *c, int cid, const char *nm, Buf *b);
+void emit_cvar_name_error(Compiler *c, int cid, const char *nm, Buf *b);
 extern int g_ivar_nil_guarded_id;
 int ivar_nil_recv_guard(Compiler *c, int id, int *recv_out);
 /* the same for any receiver the call guards: an ivar as above, or a param or
@@ -1882,6 +1898,7 @@ int emit_held_nil_guard(Compiler *c, int id, int th, Buf *b);
 void emit_ivar_nil_guard(Compiler *c, int id, int recv, Buf *b, int indent);
 int emit_fold_recv_hold(Compiler *c, int id, int recv, Buf *b);
 int emit_fold_recv_tested(Compiler *c, int id, int recv); /* does emit_fold_recv_hold hold and test the receiver */
+int emit_builtin_array_concat(Compiler *c, int id, int recv, TyKind rt, const int *argv, int argc, int bulk, Buf *b);
 void emit_fold_recv_test(Compiler *c, int id, int t, Buf *b);
 int emit_ivar_nil_guarded(Compiler *c, int id, Buf *b, int indent,
                           int (*fn)(Compiler *, int, Buf *, int));
@@ -2129,6 +2146,7 @@ void emit_own_class_alloc(Compiler *c, int id, int base, Buf *b);
 void emit_arg_or_default(Compiler *c, Scope *m, int idx, int provided, Buf *out);
 int declare_default_locals(Compiler *c, Scope *m, int dnode);
 int arg_wants_root(Compiler *c, TyKind pt, int provided);
+int boxed_arg_wants_root(Compiler *c, int node);   /* codegen_call_class.c */
 int emit_nilfree_operand(Compiler *c, int v, const char *op, int left, const char *lhs, Buf *b);
 int emit_nilfree_cmp_operand(Compiler *c, int v, const char *op, int left, const char *lhs, Buf *b);
 void emit_rooted_operand(Compiler *c, TyKind pt, int provided, const char *expr, Buf *out);
@@ -2311,7 +2329,6 @@ void emit_ds_param_extract(Compiler *c, Scope *m, int i, int ds_hash_tmp,
 int is_arith_op(const char *op);
 int is_cmp_op(const char *op);
 const char *int_shift_fn(Compiler *c, const char *op, int v);
-int class_def_body(Compiler *c, int def_node);
 int local_all_writes_empty_array(Compiler *c, Scope *sc, const char *name);
 TyKind an_builtin_answer(Compiler *c, int id);
 int builtin_read_ignores_block(const char *nm);
@@ -2329,13 +2346,14 @@ int an_arg_is_shared_handle(Compiler *c, int node);
 int an_super_object_text(Compiler *c, int n, int mi);
 int an_user_defines_method(Compiler *c, const char *name);
 int an_enum_own_find_index(Compiler *c);
+/* Can no method of the program take `name`: no def of it or of method_missing, and no alias, define_method, attr_* or Struct / Data member that names it (or names a method only the run time knows)? */
+int an_name_binder_free(Compiler *c, const char *name);
 int an_scopes_named_first(Compiler *c, const char *nm);
 int an_scopes_named_next(Compiler *c, const char *nm, int s);
 int block_given_tail_then_last(Compiler *c, int last);
 int call_forwards_own_block(Compiler *c, int cid);
 int is_blk_param_call(Compiler *c, int node, int mi);
 int ie_block_body(Compiler *c, int blk);
-int is_struct_call(Compiler *c, int val);
 int sclass_value_call(Compiler *c, int id);
 int scope_body_last(Compiler *c, int mi);
 int str_in(const char *s, const char *const *set);
@@ -2395,6 +2413,14 @@ int dispatch_impl_count(Compiler *c, int call, int cid, const char *name);
 /* do a dispatch switch's arms bind the call's arguments differently (each
    arm then lays them out itself)? the plan's CP_PER_ARM */
 int dispatch_arms_disagree(Compiler *c, int call, int cid, const char *name);
+/* would the shared switch of a dispatch on cid, whose chain has no method of
+   name, raise ArgumentError for call's arguments ahead of the switch, where
+   self of a class without one raises the plan's miss (cplan_dispatch_miss)?
+   Then each arm judges the count for itself: the plan's CP_PER_ARM. Not
+   when the plan has no miss to raise, nor when a descendant answers through
+   an attr reader or writer, which has no arm of its own: those keep the
+   shared switch */
+int dispatch_count_misfits(Compiler *c, int call, int cid, const char *name);
 /* Do `given` positionals not fit method `m`? Answers 1 with CRuby's
    ArgumentError message in `msg`; 0 when they fit, or when the method's
    arity is not judged (arity_unjudged). The one count rule of the direct
@@ -2510,6 +2536,12 @@ const void *view_conversion(Compiler *c, int *node);
 /* The effective method for this call emission; the node keeps its own name. */
 int view_push_target(Compiler *c, int node, const char *name);
 const char *view_call_name(Compiler *c, int node);
+/* A Class-valued receiver that names class ci for this emission; the class,
+   or -1 with no such view open (the read marks the entry with what the
+   emitter answers from, ELAB_GAIN_*: view_class_is_read) */
+int view_push_class_is(Compiler *c, int node, int ci);
+int view_class_is(Compiler *c, int node, unsigned reads);
+unsigned view_class_is_read(int tok);
 int emit_delegated_equality(Compiler *c, int id, int negate, Buf *b);
 int view_type_top(int node, TyKind *kind);   /* the open type view on node, if any */
 void view_pop(Compiler *c, int tok);
@@ -2804,6 +2836,7 @@ void emit_aset_range_held(Compiler *c, int id, int recv, TyKind rt, const int *a
 int frange_index_view(Compiler *c, int id);
 int splice_to_ary_mi(Compiler *c, TyKind rhs_ty);
 TyKind emit_splice_to_ary_src(Compiler *c, int id, int rhs_node, TyKind rhs_ty, int mi, int ta, Buf *b, Buf *out);
+void emit_to_ary_dispatch(Compiler *c, int id, int cid, const char *selfptr, Buf *out);
 void emit_index_op_write(Compiler *c, int id, Buf *b, int indent);
 void emit_index_and_or_write(Compiler *c, int id, Buf *b, int indent, int is_or);
 int scope_has_return(Compiler *c, int scope_idx);

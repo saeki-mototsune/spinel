@@ -1355,7 +1355,7 @@ static const BuiltinOp bop_rows[] = {
   { TY_FIBER, "transfer",      0, BOP_ARGC_ANY, BF_ANY, TY_POLY,    BOPE_FIBER_TRANSFER },
   { TY_FIBER, "raise",         0, BOP_ARGC_ANY, BF_ANY, TY_POLY,    BOPE_FIBER_RAISE },
   /* the fiber's own storage by a literal key: what a `Fiber.attr_accessor`
-     reader and writer (desugar_handle_attr_accessor) read and write on self */
+     reader and writer (handle_attr_form) read and write on self */
   { TY_FIBER, "__storage_get", 1, 1, BF_ANY, TY_POLY, BOPE_TEMPLATE, "sp_Fiber_attr_get($r, $e0)", BOP_K(TY_SYMBOL) },
   { TY_FIBER, "__storage_get", 0, BOP_ARGC_ANY, BF_ANY, TY_POLY,    BOPE_NONE },
   { TY_FIBER, "__storage_set", 2, 2, BF_ANY, TY_POLY, BOPE_TEMPLATE,
@@ -1850,6 +1850,32 @@ static const BuiltinOp bop_rows[] = {
      bool. */
   { TY_CLASS, "include?",        1,   1, BF_ANY,      TY_BOOL,       BOPE_TEMPLATE, "({ sp_Class _cl$T = $r; sp_Class _cl$t = $e0; if (!sp_class_is_module_val(_cl$t)) sp_raise_cls(\"TypeError\", \"wrong argument type Class (expected Module)\"); _cl$T.cls_id != _cl$t.cls_id && sp_class_le(_cl$T, _cl$t); })", BOP_K(TY_CLASS) },
   { TY_CLASS, "include?",        1,   1, BF_ANY,      TY_BOOL,       BOPE_NONE },
+  /* Class#inherited and Module's method_added, singleton_method_added,
+     method_undefined and singleton_method_undefined: private no-ops
+     answering nil (inherited is Class's alone). A call of one
+     on a class the program defines no such hook for, which a class made or a
+     method added fires where the record cannot tell whether the program
+     does (lr_fire_inherited, elab_fire_after), reaches this. */
+  { TY_CLASS, "inherited", 1, 1, BF_ANY, TY_NIL, BOPE_TEMPLATE, "((void)($r), (void)($e0), 0)", 0, 0, BOPF_PRIVATE | BOPF_CLASS_ONLY },
+  { TY_CLASS, "method_added", 1, 1, BF_ANY, TY_NIL, BOPE_TEMPLATE, "((void)($r), (void)($e0), 0)", 0, 0, BOPF_PRIVATE },
+  /* Module#included, #extended and #prepended: a mixin's event fires them
+     where the record cannot tell whether the program's hook is there
+     (lr_fire_mixin) */
+  { TY_CLASS, "included", 1, 1, BF_ANY, TY_NIL, BOPE_TEMPLATE, "((void)($r), (void)($e0), 0)", 0, 0, BOPF_PRIVATE },
+  { TY_CLASS, "extended", 1, 1, BF_ANY, TY_NIL, BOPE_TEMPLATE, "((void)($r), (void)($e0), 0)", 0, 0, BOPF_PRIVATE },
+  { TY_CLASS, "prepended", 1, 1, BF_ANY, TY_NIL, BOPE_TEMPLATE, "((void)($r), (void)($e0), 0)", 0, 0, BOPF_PRIVATE },
+  { TY_CLASS, "singleton_method_added", 1, 1, BF_ANY, TY_NIL, BOPE_TEMPLATE, "((void)($r), (void)($e0), 0)", 0, 0, BOPF_PRIVATE | BOPF_BASIC_OBJECT },
+  { TY_CLASS, "method_removed", 1, 1, BF_ANY, TY_NIL, BOPE_TEMPLATE, "((void)($r), (void)($e0), 0)", 0, 0, BOPF_PRIVATE },
+  { TY_CLASS, "method_undefined", 1, 1, BF_ANY, TY_NIL, BOPE_TEMPLATE, "((void)($r), (void)($e0), 0)", 0, 0, BOPF_PRIVATE },
+  { TY_CLASS, "singleton_method_removed", 1, 1, BF_ANY, TY_NIL, BOPE_TEMPLATE, "((void)($r), (void)($e0), 0)", 0, 0, BOPF_PRIVATE | BOPF_BASIC_OBJECT },
+  { TY_CLASS, "singleton_method_undefined", 1, 1, BF_ANY, TY_NIL, BOPE_TEMPLATE, "((void)($r), (void)($e0), 0)", 0, 0, BOPF_PRIVATE | BOPF_BASIC_OBJECT },
+  /* ...name, to_s and inspect, which every class and module answers on
+     itself: the facts a version entry's else arm reads (the builtin runs
+     where no version of the program's runs yet); typed and emitted
+     elsewhere. */
+  { TY_CLASS, "name",            0,   0, BF_NONE,     TY_UNKNOWN,    BOPE_NONE },
+  { TY_CLASS, "to_s",            0,   0, BF_NONE,     TY_UNKNOWN,    BOPE_NONE },
+  { TY_CLASS, "inspect",         0,   0, BF_NONE,     TY_UNKNOWN,    BOPE_NONE },
 
   /* Integer and Float: the result kinds read off the name, arity and block
      form. pow, clamp, coerce, Float#fdiv(Complex), Float <=> Rational,
@@ -2966,6 +2992,17 @@ const BuiltinOp *bop_find(TyKind rt, const char *name, int argc, int has_block) 
   return bop_find_arg(rt, name, argc, has_block, NULL, NULL);
 }
 
+int bop_flags(TyKind rt, const char *name) {
+  const BuiltinOp *r = bop_find(rt, name, 1, 0);
+  return r ? r->flags : 0;
+}
+
+/* See builtin_ops.h. */
+int bop_class_answers(const char *name, int argc, int has_block) {
+  const BuiltinOp *r = argc >= 0 ? bop_find(TY_CLASS, name, argc, has_block) : NULL;
+  return r && !(r->flags & BOPF_PRIVATE);
+}
+
 const BuiltinOp *bop_find_arg(TyKind rt, const char *name, int argc, int has_block,
                               BopArgKind arg_of, const void *ud) {
   return bop_find_stage(rt, name, argc, has_block, arg_of, ud, -1);
@@ -3033,6 +3070,11 @@ int bop_answers_recv(TyKind rt, const char *name, int argc, int has_block) {
   if (bop_answers_self(rt, name, argc, has_block) & (BOPF_SELF | BOPF_SELF_OR_NIL | BOPF_SELF_EXACT)) return 1;
   const IterRow *r = has_block ? iter_row_of(rt, name, argc) : NULL;
   return r && (r->answer == IA_RECV || r->answer == IA_BLOCKVALS_INPLACE);
+}
+
+int iter_hands_recv(const char *name) {
+  const IterRow *r = iter_row(BOP_ANY_RECV, name, 0, 0);
+  return r && r->nyield == 1 && r->yield[0] == YS_RECV;
 }
 
 int bop_args_as_builtin(TyKind rt, const char *name, int argc, int has_block) {
@@ -3952,6 +3994,10 @@ const IterRow *iter_row(TyKind fam, const char *name, int argc, unsigned skip) {
     return r;
   }
   return NULL;
+}
+
+int object_iter_runs_now(const char *name) {
+  return builtin_object_method_known(name) && iter_row(BOP_ANY_RECV, name, -1, 0) && !is_deferred_block_call(NULL, name);
 }
 
 int iter_row_named(const char *name) {

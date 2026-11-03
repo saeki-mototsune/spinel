@@ -53,8 +53,10 @@ enum {
   LF_MARKS = 1,   /* sets marks only: no shape is eliminated, so no left */
   LF_STMT = 2,    /* enters at the statements of the bodies of its kinds, not at the nodes */
   LF_PROGRAM = 4, /* a pass over the whole program: visited once, with id -1, and nothing is asked of a node */
-  LF_SCOPE = 8    /* names the locals of the scope a node of its kinds opens: visited at the node, with the
+  LF_SCOPE = 8,   /* names the locals of the scope a node of its kinds opens: visited at the node, with the
                      scope's statements and the node that names it in the lowering context (lc->scope) */
+  LF_FRAMES = 16  /* enters, besides at its kinds, at every definition whose body opens a frame (class_def_opens_frame):
+                     self and definee are the class there, which is what a def, alias or define_method in the body asks */
 };
 enum { LW_MAX_KINDS = 6 };
 
@@ -67,6 +69,8 @@ typedef struct {
   const char *shape;                /* the shape it eliminates, for the check's report */
   LowerGate *gate;                  /* NULL: none. Asked once at the start of a run; 0 skips it. */
   int fix;                          /* 0: one run. n: runs again while a run changed the table, n runs at most */
+  LowerFn *span;                    /* LF_PROGRAM: its form over a span of the walk's (lower_span_ids), run as
+                                       the splice is made, before the walk registers what it holds; NULL: none */
 } Lowering;
 
 /* In the order the stage runs the rows; a row run twice (nil_block_arg) is
@@ -90,11 +94,11 @@ static const Lowering lowerings[LW__COUNT] = {
     desugar_io_popen_block_at, desugar_io_popen_block_left, "`IO.popen(cmd) { }` in read mode", desugar_io_popen_block_gate },
   [LW_USER_BACKTICK] = { "desugar_user_backtick", 0, { NK_XStringNode, NK_InterpolatedXStringNode },
     desugar_user_backtick_at, NULL, "a backtick literal in a program that defines ` itself", desugar_user_backtick_gate },
-  [LW_LITERAL_UNDEF_METHOD] = { "desugar_literal_undef_method", LF_STMT, { NK_ClassNode, NK_ModuleNode },
+  [LW_LITERAL_UNDEF_METHOD] = { "desugar_literal_undef_method", LF_STMT | LF_FRAMES, { NK_NONE },
     desugar_literal_undef_method_at, desugar_literal_undef_method_left, "`undef_method :a` in a body" },
   [LW_EXPLICIT_INITIALIZE_CALLS] = { "desugar_explicit_initialize_calls", LF_PROGRAM, { NK_NONE },
     desugar_explicit_initialize_calls_at, NULL, "`initialize(x)` called in a method" },
-  [LW_NOARG_DISPLAY_WRAPPERS] = { "desugar_noarg_display_wrappers", LF_STMT, { NK_ClassNode, NK_ModuleNode },
+  [LW_NOARG_DISPLAY_WRAPPERS] = { "desugar_noarg_display_wrappers", LF_STMT | LF_FRAMES, { NK_NONE },
     desugar_noarg_display_wrappers_at, desugar_noarg_display_wrappers_left, "`def inspect(i = 0)` in a body" },
   [LW_PAREN_BLOCK_ARG] = { "desugar_paren_block_arg", 0, { NK_BlockArgumentNode },
     desugar_paren_block_arg_at, desugar_paren_block_arg_left, "`&(e)`: a block argument in parentheses" },
@@ -103,7 +107,7 @@ static const Lowering lowerings[LW__COUNT] = {
     desugar_paren_operands_at, desugar_paren_operands_left, "`(e).m`, `x = (e)`: a receiver or value in parentheses" },
   [LW_SEND_CLASS_MAKERS] = { "desugar_send_class_makers", 0, { NK_CallNode },
     desugar_send_class_makers_at, desugar_send_class_makers_left, "`Struct.send(:new, ..)`, `Data.send(:define, ..)`" },
-  [LW_SELF_SUPERCLASS] = { "desugar_self_superclass", LF_STMT, { NK_ClassNode },
+  [LW_SELF_SUPERCLASS] = { "desugar_self_superclass", LF_STMT | LF_FRAMES, { NK_NONE },
     desugar_self_superclass_at, desugar_self_superclass_left, "`class I < self` in a class body" },
   [LW_STRUCT_SUBCLASS_NEW_WRITE] = { "desugar_struct_subclass_new_write", 0, { NK_ConstantWriteNode },
     desugar_struct_subclass_new_write_at, desugar_struct_subclass_new_write_left, "`X = K.new(..)` where K < Struct" },
@@ -113,7 +117,9 @@ static const Lowering lowerings[LW__COUNT] = {
     desugar_rescue_block_bodies_at, desugar_rescue_block_bodies_left, "a block whose body is not a StatementsNode" },
   [LW_MARK_SYM_PROC_BLOCKS] = { "mark_sym_proc_blocks", LF_MARKS, { NK_BlockNode },
     mark_sym_proc_blocks_at, NULL, NULL },
-  [LW_BODY_LOCAL_SCOPES] = { "desugar_body_local_scopes", LF_SCOPE, { NK_ClassNode, NK_ModuleNode, NK_SingletonClassNode },
+  [LW_BUILDER_BLOCK_PARAM] = { "desugar_builder_block_param", 0, { NK_ConstantWriteNode, NK_ConstantPathWriteNode },
+    desugar_builder_block_param_at, desugar_builder_block_param_left, "a class builder's block parameter `|k|`" },
+  [LW_BODY_LOCAL_SCOPES] = { "desugar_body_local_scopes", LF_SCOPE | LF_FRAMES, { NK_ClassNode, NK_ModuleNode, NK_SingletonClassNode },
     desugar_body_local_scopes_at, NULL, "a local of a class body" },
   [LW_ERRNO_ALIASES] = { "desugar_errno_aliases", 0, { NK_ConstantPathNode },
     desugar_errno_aliases_at, desugar_errno_aliases_left, "`Errno::EWOULDBLOCK`, an alias of another errno's class" },
@@ -130,7 +136,7 @@ static const Lowering lowerings[LW__COUNT] = {
     desugar_encoding_queries_at, desugar_encoding_queries_left, "`Encoding.default_internal`, `Encoding.find(\"utf-8\")`" },
   [LW_ALIAS_METHOD_STRING_NAMES] = { "desugar_alias_method_string_names", 0, { NK_CallNode },
     desugar_alias_method_string_names_at, desugar_alias_method_string_names_left, "`alias_method \"a\", \"b\"`" },
-  [LW_ALIAS_METHOD_VALUES] = { "desugar_alias_method_values", LF_STMT, { NK_ClassNode, NK_ModuleNode, NK_SingletonClassNode },
+  [LW_ALIAS_METHOD_VALUES] = { "desugar_alias_method_values", LF_STMT | LF_FRAMES, { NK_SingletonClassNode },
     desugar_alias_method_values_at, desugar_alias_method_values_left, "a value-used `alias_method` in a body" },
   [LW_REASSIGNED_BLOCK_PARAMS] = { "desugar_reassigned_block_params", 0, { NK_BlockNode },
     desugar_reassigned_block_params_at, desugar_reassigned_block_params_left, "a block parameter the body assigns" },
@@ -154,20 +160,21 @@ static const Lowering lowerings[LW__COUNT] = {
     desugar_stored_enum_each_at, NULL, "`e.each { }` on a stored enumerator" },
   [LW_SCOPE_NUMBERED_BLOCK_PARAMS] = { "scope_numbered_block_params", LF_PROGRAM, { NK_NONE },
     scope_numbered_block_params_at, NULL, "two blocks of one scope with numbered parameters" },
-  [LW_SINGLETON_CLASS_DEFINE_METHOD] = { "desugar_singleton_class_define_method", LF_STMT, { NK_ClassNode, NK_ModuleNode },
+  [LW_SINGLETON_CLASS_DEFINE_METHOD] = { "desugar_singleton_class_define_method", LF_STMT | LF_FRAMES, { NK_NONE },
     desugar_singleton_class_define_method_at, desugar_singleton_class_define_method_left, "`singleton_class.define_method` in a body" },
   [LW_EMPTY_HASH_COMPARE_BY_IDENTITY] = { "desugar_empty_hash_compare_by_identity", 0, { NK_CallNode },
     desugar_empty_hash_compare_by_identity_at, desugar_empty_hash_compare_by_identity_left, "`{}.compare_by_identity`" },
-  [LW_DEFINE_METHOD_PROC_ARG] = { "desugar_define_method_proc_arg", LF_STMT, { NK_ClassNode, NK_ModuleNode, NK_SingletonClassNode },
+  [LW_DEFINE_METHOD_PROC_ARG] = { "desugar_define_method_proc_arg", LF_STMT | LF_FRAMES, { NK_SingletonClassNode },
     desugar_define_method_proc_arg_at, NULL, "`define_method(:m, proc)` in a body" },
-  [LW_DEFINE_METHOD_CAPTURES] = { "desugar_define_method_captures", 0, { NK_ProgramNode, NK_ClassNode, NK_ModuleNode, NK_SingletonClassNode },
+  [LW_DEFINE_METHOD_CAPTURES] = { "desugar_define_method_captures", LF_FRAMES, { NK_ProgramNode, NK_ClassNode, NK_ModuleNode, NK_SingletonClassNode },
     desugar_define_method_captures_at, NULL, "a body local a define_method block captures" },
-  [LW_DEFINE_METHOD_KEYWORDS] = { "desugar_define_method_keywords", LF_STMT, { NK_ClassNode, NK_ModuleNode, NK_SingletonClassNode },
+  [LW_DEFINE_METHOD_KEYWORDS] = { "desugar_define_method_keywords", LF_STMT | LF_FRAMES, { NK_SingletonClassNode },
     desugar_define_method_keywords_at, NULL, "a `define_method` block with keyword or rest parameters" },
   [LW_NAME_ANON_BLOCK_KWREST] = { "name_anon_block_kwrest", 0, { NK_BlockNode, NK_LambdaNode },
     name_anon_block_kwrest_at, name_anon_block_kwrest_left, "an anonymous `**` block parameter" },
   [LW_RENAME_SHADOWING_BLOCK_PARAMS] = { "rename_shadowing_block_params", LF_PROGRAM, { NK_NONE },
-    rename_shadowing_block_params_at, NULL, "a block parameter that shadows a local" },
+    rename_shadowing_block_params_at, NULL, "a block parameter that shadows a local", NULL, 0,
+    rename_shadowing_block_params_span },
   [LW_SYM_TO_PROC_CALL] = { "desugar_sym_to_proc_call", 0, { NK_CallNode },
     desugar_sym_to_proc_call_at, NULL, "`:m.to_proc.call(r, a)`" },
   [LW_ENUM_CHAIN_SHAPES] = { "desugar_enum_chain_shapes", 0, { NK_CallNode },
@@ -215,6 +222,12 @@ static KindSet kind_set_of(const Lowering *w) {
 }
 
 static int kind_set_has(const KindSet *s, NodeKind k) { return (int)(s->w[k >> 6] >> (k & 63) & 1); }
+
+/* Does row w enter at node id: a node of its kinds (set), or for a row that
+   enters at frames (LF_FRAMES) a definition that opens one */
+static int lower_enters(const NodeTable *nt, const Lowering *w, const KindSet *set, int id) {
+  return kind_set_has(set, nt_kind(nt, id)) || ((w->flags & LF_FRAMES) && class_def_opens_frame(nt, id));
+}
 
 /* ---- the parent map ---- */
 
@@ -309,11 +322,11 @@ static int lower_scope(Compiler *c, LowerCtx *lc, const Lowering *w, int owner, 
 static int lower_site(Compiler *c, LowerCtx *lc, const Lowering *w, int id, int ask, int *first) {
   const NodeTable *nt = c->nt;
   if (w->flags & LF_SCOPE) {
-    int body = nt_ref(nt, id, "body");
+    int body = class_def_body(nt, id);
     return body >= 0 ? lower_scope(c, lc, w, id, id, &body, 1, ask, first) : 0;
   }
   if (w->flags & LF_STMT) {
-    int body = nt_ref(nt, id, "body");
+    int body = class_def_body(nt, id);
     if (body < 0 || nt_kind(nt, body) != NK_StatementsNode) return 0;
     int sn = 0;
     const int *sv = nt_arr(nt, body, "body", &sn);
@@ -346,7 +359,7 @@ static int lower_sites(Compiler *c, LowerCtx *lc, const Lowering *w, int ask, in
   }
   if (lc->span && !ask) return lower_span_sites(c, lc, w);
   for (int id = 0; id < end; id++)
-    if (kind_set_has(&set, nt_kind(nt, id))) n += lower_site(c, lc, w, id, ask, first);
+    if (lower_enters(nt, w, &set, id)) n += lower_site(c, lc, w, id, ask, first);
   return n;
 }
 
@@ -402,7 +415,7 @@ static int lower_pass(Compiler *c, LowerCtx *lc, const Lowering *w) {
 
 /* ---- SPINEL_LOWER_CHECK ---- */
 
-static void lower_say(LowerCtx *lc, const char *row, const char *what) {
+void lower_say(LowerCtx *lc, const char *row, const char *what) {
   lc->findings++;
   fprintf(stderr, "spinel: lower check: %s: %s\n", row, what);
 }
@@ -511,6 +524,8 @@ static void lower_release(LowerCtx *lc) {
   lc->span = NULL;
   lower_scratch_reset(lc);
   free(lc->parent);
+  free(lc->later);
+  blkp_step_free(lc->blkp);
 }
 
 /* ---- spans ---- */
@@ -536,6 +551,34 @@ static void lower_span_collect(NodeTable *nt, LowerSpan *s) {
   qsort(s->nodes, (size_t)s->nnodes, sizeof(int), int_cmp);
 }
 
+int *lower_span_ids(const LowerCtx *lc, int *n) {
+  const LowerSpan *s = lc->span;
+  int m = s->nnodes + (lc->n0 > s->count0 ? lc->n0 - s->count0 : 0);
+  int *ids = malloc(sizeof(int) * (size_t)(m > 0 ? m : 1));
+  if (!ids) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  memcpy(ids, s->nodes, sizeof(int) * (size_t)s->nnodes);
+  for (int id = s->count0; id < lc->n0; id++) ids[s->nnodes + id - s->count0] = id;
+  *n = m;
+  return ids;
+}
+
+/* A row that visits a span's owner, in a span of the walk's: left to
+   lower_settle, which visits each owner once for all the spans of its body
+   (the walk splices one call at a time, and the visit takes the whole
+   body). A pair already noted for the row's last owner is not noted again. */
+static void lower_later(LowerCtx *lc, int row, int owner) {
+  int k = lc->nlater - 1;
+  while (k >= 0 && lc->later[2 * k] != row) k--;
+  if (k >= 0 && lc->later[2 * k + 1] == owner) return;
+  if (lc->nlater == lc->clater) {
+    lc->clater = lc->clater ? lc->clater * 2 : 16;
+    lc->later = realloc(lc->later, sizeof(int) * 2 * (size_t)lc->clater);
+    if (!lc->later) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  lc->later[2 * lc->nlater] = row;
+  lc->later[2 * lc->nlater++ + 1] = owner;
+}
+
 /* A row's sites in the span: the frame's owner where the row enters at its
    kind (only the spliced statements, for a row that enters at statements;
    each splice's, as a scope of its own, for a row that names a scope's
@@ -546,19 +589,20 @@ static int lower_span_sites(Compiler *c, LowerCtx *lc, const Lowering *w) {
   const LowerSpan *s = lc->span;
   KindSet set = kind_set_of(w);
   int n = 0;
-  if (s->owner >= 0 && kind_set_has(&set, nt_kind(nt, s->owner))) {
+  if (s->owner >= 0 && lower_enters(nt, w, &set, s->owner)) {
     if (w->flags & LF_STMT) n += lower_stmts(c, lc, w, s->owner, s->body, s->stmts, s->nstmts, 0, NULL);
     else if (w->flags & LF_SCOPE)
       for (int i = 0, j; i < s->nstmts; i = j) {
         for (j = i + 1; j < s->nstmts && s->scopes[j] == s->scopes[i]; j++) {}
         n += lower_scope(c, lc, w, s->owner, s->scopes[i], s->stmts + i, j - i, 0, NULL);
       }
+    else if (lc->span_now) lower_later(lc, (int)(w - lowerings), s->owner);
     else n += lower_site(c, lc, w, s->owner, 0, NULL);
   }
   for (int i = 0; i < s->nnodes; i++)
-    if (s->nodes[i] < lc->n0 && kind_set_has(&set, nt_kind(nt, s->nodes[i]))) n += lower_site(c, lc, w, s->nodes[i], 0, NULL);
+    if (s->nodes[i] < lc->n0 && lower_enters(nt, w, &set, s->nodes[i])) n += lower_site(c, lc, w, s->nodes[i], 0, NULL);
   for (int id = s->count0; id < lc->n0; id++)
-    if (kind_set_has(&set, nt_kind(nt, id))) n += lower_site(c, lc, w, id, 0, NULL);
+    if (lower_enters(nt, w, &set, id)) n += lower_site(c, lc, w, id, 0, NULL);
   return n;
 }
 
@@ -582,9 +626,17 @@ int lower_span(Compiler *c, LowerCtx *lc, int owner, int body, const int *stmts,
   for (int row = 0; row < LW__COUNT; row++) {
     if (!lc->ran[row]) continue;
     const Lowering *w = &lowerings[row];
-    if (w->flags & LF_PROGRAM) { lc->settle[row] = 1; continue; }
+    if (w->flags & LF_PROGRAM) lc->settle[row] = 1;
+    if ((w->flags & LF_PROGRAM) && !(lc->span_now && w->span)) continue;
     const char *was = nt_set_pass(nt, w->name);
-    int r = lower_pass(c, lc, w);
+    int r;
+    if (w->flags & LF_PROGRAM) {   /* its span form: the span's nodes, the count at its entry */
+      lc->n0 = nt->count;
+      lower_scratch_reset(lc);
+      r = w->span(c, lc, -1);
+      comp_grow_node_arrays(c);
+    }
+    else r = lower_pass(c, lc, w);
     lc->rewrote[row] += r;
     rewrote += r;
     nt_set_pass(nt, was);
@@ -598,21 +650,44 @@ int lower_span(Compiler *c, LowerCtx *lc, int owner, int body, const int *stmts,
 
 /* The end of a step that lowered spans: each row they left runs once more
    over the program, in the order of the table, and the answers the spans
-   kept are dropped */
+   kept are dropped. A row left an owner of the walk's spans visits it once
+   (lower_later). A row with a span form has already run on the walk's
+   spans, before the walk registered what they hold; under
+   SPINEL_LOWER_CHECK its run here must change nothing. */
 void lower_settle(Compiler *c, LowerCtx *lc) {
   if (!lc->span_step) return;
+  NodeTable *nt = (NodeTable *)c->nt;
+  int now = lc->span_now;
   lc->span_step = 0;
+  lc->span_now = 0;
   lower_scratch_reset(lc);
+  blkp_step_free(lc->blkp);
+  lc->blkp = NULL;
   for (int row = 0; row < LW__COUNT; row++) {
     free(lc->span_ids[row]);
     lc->span_ids[row] = NULL;
     lc->span_gate[row] = 0;
   }
   for (int row = 0; row < LW__COUNT; row++) {
+    for (int k = 0; k < lc->nlater; k++) {
+      if (lc->later[2 * k] != row) continue;
+      const char *was = nt_set_pass(nt, lowerings[row].name);
+      lc->n0 = nt->count;
+      lower_scratch_reset(lc);
+      lc->rewrote[row] += lower_site(c, lc, &lowerings[row], lc->later[2 * k + 1], 0, NULL);
+      comp_grow_node_arrays(c);
+      nt_set_pass(nt, was);
+    }
     if (!lc->settle[row]) continue;
     lc->settle[row] = 0;
+    unsigned long long h = lc->check && now && lowerings[row].span ? nt_content_hash(nt) : 0;
     lower_run(c, lc, row);
+    if (h && nt_content_hash(nt) != h)
+      lower_say(lc, lowerings[row].name, "its run at the end of the walk changed the table, after the walk registered what its spans hold");
   }
+  free(lc->later);
+  lc->later = NULL;
+  lc->nlater = lc->clater = 0;
 }
 
 int lower_row_once(Compiler *c, int row) {

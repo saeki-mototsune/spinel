@@ -318,6 +318,19 @@ typedef struct BuiltinOp {
    answers anywhere else, an Enumerator. Only the rows that carry the flag
    pay for the test, which walks the calls. */
 #define BOPF_NOT_CHAIN_RECV 256
+/* The method is private in CRuby: only a call that ignores visibility
+   (`__send__`, `send`, a call with no receiver or with `self`) reaches the
+   row; an explicit receiver is NoMethodError, and the call is left to the
+   rules after the lookup (cplan_class_row, bop_flags). */
+#define BOPF_PRIVATE 512
+/* The method is Class's, not Module's (Class#inherited): a Module value
+   has none. Spinel types a module as a class too, so the row answers a call
+   only on a receiver proven a Class (cplan_recv_class). */
+#define BOPF_CLASS_ONLY 1024
+/* The method is BasicObject's (singleton_method_added): it stands after
+   Object's methods, so a top-level def of the name is the one a send
+   reaches (send_blind_recv_owns does not count the row). */
+#define BOPF_BASIC_OBJECT 2048
 
 /* A row's recv may name a family of kinds rather than one; a caller looks
    the family up with the family's value. Not a TyKind any value has. */
@@ -398,6 +411,16 @@ typedef struct BuiltinOp {
 int bop_row_count(void);
 const BuiltinOp *bop_row(int i);
 const BuiltinOp *bop_find(TyKind rt, const char *name, int argc, int has_block);
+/* The flags (BOPF_*) of the row of kind rt for `name`, 0 for none */
+int bop_flags(TyKind rt, const char *name);
+/* Does the builtin answer `name` on a class (or module) itself, taking argc
+   arguments and a block when has_block, where no method of the program's
+   of the name runs yet: Module's own, as its builtin-op rows (TY_CLASS)
+   list them (`name`, `to_s`, `inspect`, `include?`)? A negative argc (no
+   one count) is not answered, nor a private row: a hook (`inherited`,
+   `included`, ...) whose version entry falls back to super, the core's
+   no-op (ver_named_kind). */
+int bop_class_answers(const char *name, int argc, int has_block);
 
 /* bop_find, with arg_of(ud, i) answering argument i's kind for the rows
    that guard it. It is called at most once per argument, and only when
@@ -456,6 +479,10 @@ int bop_answers_self(TyKind rt, const char *name, int argc, int has_block);
    IA_BLOCKVALS_INPLACE (each, tap, map!). The value is then another name
    of the receiver's object, not a copy of it. */
 int bop_answers_recv(TyKind rt, const char *name, int argc, int has_block);
+/* Is `name` a method every value answers that hands its block the receiver
+   itself, once (an any-receiver iterator row yielding YS_RECV: tap, then,
+   yield_self)? Its answer is the receiver or the block's value. */
+int iter_hands_recv(const char *name);
 /* Whether that call reads its arguments of the receiver's builtin class as
    that builtin (BOPF_ARGS_BUILTIN), looked up as bop_answers_self does. */
 int bop_args_as_builtin(TyKind rt, const char *name, int argc, int has_block);
@@ -636,6 +663,10 @@ const IterRow *iter_row(TyKind fam, const char *name, int argc, unsigned skip);
    one that yields to its block before it answers? (The load-phase record
    asks it of a block whose receiver is not typed yet.) */
 int iter_row_named(const char *name);
+/* Does Object's builtin of `name` run its block before it answers, on
+   any receiver: an any-receiver iterator row of a name Object's surface
+   answers (tap, then, yield_self)? */
+int object_iter_runs_now(const char *name);
 /* The iterator row a call with a block reads on a receiver of kind rt:
    any receiver's (tap, then, each_with_object), else its family's (an
    Array's, a Hash's, a Range's, ...), or NULL. */

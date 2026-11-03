@@ -26,7 +26,9 @@ static void emit_obj_to_s(Compiler *c, int arg, TyKind t, Buf *b) {
   /* A to_s that unions a String with another branch type (e.g. nil)
      returns a boxed sp_RbVal; route it through sp_poly_to_s rather than a
      pointer cast (#3266). */
-  buf_puts(b, ret_poly ? "sp_poly_to_s(" : "(const char *)(");
+  /* one answering a String subclass instance: that String's bytes */
+  int ret_strsub = !ret_poly && obj_str_ret_strsub(c, ty_object_class(t), 0);
+  buf_puts(b, ret_poly ? "sp_poly_to_s(" : ret_strsub ? "sp_str_or_empty(sp_strbuf_read((sp_String *)(" : "(const char *)(");
   buf_printf(b, "%s((sp_%s *)", obj_str_fn(c, ty_object_class(t), 0), cn);
   NodeKind rk = nt_kind(c->nt, arg);
   if (rk == NK_LocalVariableReadNode || rk == NK_InstanceVariableReadNode || rk == NK_SelfNode || rk == NK_ConstantReadNode) {
@@ -46,7 +48,7 @@ static void emit_obj_to_s(Compiler *c, int arg, TyKind t, Buf *b) {
     if (!comp_ty_value_obj(c, t)) { emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", tt); }
     buf_printf(b, "_t%d", tt);
   }
-  buf_printf(b, "%s))", obj_str_blockarg(c, ty_object_class(t), 0));
+  buf_printf(b, "%s))%s", obj_str_blockarg(c, ty_object_class(t), 0), ret_strsub ? "))" : "");
 }
 
 static int emit_splat_io(Compiler *c, int arg, const char *fn, Buf *b, int indent) {
@@ -272,11 +274,11 @@ void emit_puts_one(Compiler *c, int arg, Buf *b, int indent) {
     buf_puts(b, "(void)("); emit_expr(c, arg, b); buf_puts(b, "); putchar('\\n');  /* puts nil */\n");
   }
   else if (nt_kind(c->nt, arg) == NK_ConstantReadNode &&
-           nt_str(c->nt, arg, "name") && comp_class_index(c, nt_str(c->nt, arg, "name")) >= 0) {
+           nt_str(c->nt, arg, "name") && const_node_class_index(c, arg) >= 0) {
     /* `puts SomeClass` -- a bare class constant renders its name, or what
        its own class method to_s answers */
     emit_const_read_stmt(c, arg, b, 0);
-    int pci = comp_class_index(c, nt_str(c->nt, arg, "name"));
+    int pci = const_node_class_index(c, arg);
     if (cls_user_display_mi(c, pci, "to_s") >= 0)
       buf_printf(b, "sp_puts_line(sp_class_to_s_disp((sp_Class){%d, NULL}));\n", pci);
     else buf_printf(b, "puts(\"%s\");\n", nt_str(c->nt, arg, "name"));
@@ -717,7 +719,9 @@ void emit_p_one(Compiler *c, int arg, Buf *b, int indent) {
     }
     else {
       buf_printf(b, "{ void *_po = (void *)("); emit_expr(c, arg, b);
-      buf_printf(b, "); sp_puts_line(_po ? sp_obj_inspect_sw(%d, _po) : \"nil\"); }\n", cid);
+      buf_puts(b, "); sp_puts_line(_po ? ");
+      emit_obj_default_inspect(c, cid, "_po", b);
+      buf_puts(b, " : \"nil\"); }\n");
     }
   }
   else if (ty_is_ptr_array(t) || ty_is_obj_array(t)) {
@@ -7279,6 +7283,7 @@ void emit_class_val_when(const char *cn, int t, Buf *b) {
 
 static int emit_poly_class_when_value(Compiler *c, int cond_id, const char *tmp, Buf *b);
 static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj, Buf *b);
+static int emit_when_class_cmethod_eq(Compiler *c, int cond, int t, TyKind pt, Buf *b);
 /* Both class-condition routes retain a read under a view. A declined
    condition must also discard its prefix, so its caller can refuse it.
    A non-NULL tmp is the poly when caller's named boxed scrutinee; the
@@ -7695,14 +7700,30 @@ static int emit_pm_subcond_expr(Compiler *c, int spat, const char *elem, Buf *b)
    constraint), or PM_HASH_VAL_REJECT for a shape we emit no check for (a
    literal, range, pin, or nested pattern) so the caller can reject it. */
 #define PM_HASH_VAL_REJECT (-2)
-static int pm_hash_value_class(const NodeTable *nt, int vpat) {
+static int pm_value_const(Compiler *c, int pat, const char *cn);
+/* A ConstantReadNode pattern that names a class, not a value constant
+   (`in LIMIT` is LIMIT === v, a value test the recursive matcher emits) */
+static int pm_class_const_read(Compiler *c, int n) {
+  if (n < 0 || nt_kind(c->nt, n) != NK_ConstantReadNode) return 0;
+  const char *cn = nt_str(c->nt, n, "name");
+  return cn && !pm_value_const(c, n, cn);
+}
+/* the class name a class pattern tests: the class an alias constant
+   (`AI = Integer`) names, or the name itself */
+static const char *pm_class_name(Compiler *c, int n) {
+  const char *cn = nt_str(c->nt, n, "name");
+  const char *ra = cn ? resolve_class_alias(c, cn) : NULL;
+  return ra ? ra : cn;
+}
+static int pm_hash_value_class(Compiler *c, int vpat) {
+  const NodeTable *nt = c->nt;
   if (vpat < 0 || !nt_type(nt, vpat)) return -1;
   NodeKind vk = nt_kind(nt, vpat);
-  if (vk == NK_ConstantReadNode) return vpat;
+  if (pm_class_const_read(c, vpat)) return vpat;
   if (vk == NK_ImplicitNode || vk == NK_LocalVariableTargetNode) return -1;
   if (vk == NK_CapturePatternNode) {
     int cv = nt_ref(nt, vpat, "value");
-    if (cv >= 0 && nt_kind(nt, cv) == NK_ConstantReadNode) return cv;
+    if (pm_class_const_read(c, cv)) return cv;
   }
   return PM_HASH_VAL_REJECT;
 }
@@ -7896,9 +7917,10 @@ static int const_toplevel_alias(Compiler *c, const char *name) {
     int inside = st[--sp], id = st[--sp];
     if (id < 0 || id >= nt->count) continue;
     NodeKind k = nt_kind(nt, id);
-    if (k == NK_ClassNode || k == NK_ModuleNode) {
-      int cp = nt_ref(nt, id, "constant_path");
-      const char *nm = cp >= 0 ? nt_str(nt, cp, "name") : NULL;
+    /* a definition whose constants are its own; a write in a Class.new
+       block is its cref's, and the write arm below counts it */
+    if (class_def_opens_cref(nt, id)) {
+      const char *nm = class_def_name(nt, id);
       if (nm && sp_streq(nm, name)) ok = 0;
       inside = 1;
     }
@@ -8099,6 +8121,43 @@ int emit_pm_cond(Compiler *c, int pat, int t, TyKind pt, Buf *b) {
 static int emit_pm_cond_subj(Compiler *c, int pat, int t, TyKind pt, int subj, Buf *b) {
   return emit_class_condition(c, pat, NULL, t, pt, subj, b);
 }
+static int when_builtin_value_const(Compiler *c, int cond);
+/* emit_pm_eq, but an Integer or Float subject that holds nil (its nil flag,
+   the oint of emit_case_match) is equal to no value: read as a number, nil
+   matched a 0 */
+static void emit_pm_eq_nonnil(Compiler *c, int t, TyKind pt, int valnode, Buf *b) {
+  if (t != g_pm_sentinel_t || (pt != TY_INT && pt != TY_FLOAT)) { emit_pm_eq(c, t, pt, valnode, b); return; }
+  char ref[24]; snprintf(ref, sizeof ref, "_o%d", t);
+  buf_puts(b, "("); emit_slot_truthy(pt, ref, b); buf_puts(b, " && ");
+  emit_pm_eq(c, t, pt, valnode, b); buf_puts(b, ")");
+}
+/* A constant in a pattern that holds a value, not a class or module: a
+   program constant typed a value (`LIMIT = 3`), an ffi_const, or a builtin's
+   value constant (`Float::INFINITY`). The same three checks as `when`. */
+static int pm_value_const(Compiler *c, int pat, const char *cn) {
+  LocalVar *lv = comp_const(c, cn);
+  if (lv && lv->type != TY_UNKNOWN && lv->type != TY_CLASS) return 1;
+  if (comp_ffi_const_at(c, pat, NULL)) return 1;
+  return when_builtin_value_const(c, pat);
+}
+/* the kinds whose === is ==, so the arm is the equality test of `in ^x` */
+static int pm_eq_scalar(TyKind k) {
+  return k == TY_INT || k == TY_FLOAT || k == TY_STRING || k == TY_SYMBOL;
+}
+/* `in LIMIT` for a value constant: LIMIT === subject. An Integer, Float,
+   String or Symbol value compares by ==. A subject of another such kind is
+   never equal (Integer and Float do compare). Any other value kind (a Regexp,
+   a Range, a Proc, an object with its own ===) is refused. */
+static void emit_pm_value_const(Compiler *c, int pat, int t, TyKind pt, Buf *b) {
+  TyKind vt = comp_ntype(c, pat);
+  if (!pm_eq_scalar(vt) || repr_of(c, pat).kind == RK_BOXED) {
+    unsupported(c, pat, "value constant pattern other than an Integer, Float, String or Symbol");
+  }
+  int num = (vt == TY_INT || vt == TY_FLOAT) && (pt == TY_INT || pt == TY_FLOAT);
+  if (pt == TY_POLY || pt == vt || num) { emit_pm_eq_nonnil(c, t, pt, pat, b); return; }
+  if (pm_eq_scalar(pt) || pt == TY_NIL || pt == TY_BOOL) { buf_puts(b, "0"); return; }
+  unsupported(c, pat, "value constant pattern against this subject");
+}
 static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj, Buf *b) {
   const NodeTable *nt = c->nt;
   const char *pty = nt_type(nt, pat);
@@ -8107,7 +8166,7 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj, 
   /* literal value patterns: scrutinee == literal */
   if (pk == NK_IntegerNode || pk == NK_FloatNode ||
       pk == NK_StringNode || pk == NK_SymbolNode) {
-    emit_pm_eq(c, t, pt, pat, b);
+    emit_pm_eq_nonnil(c, t, pt, pat, b);
     return 1;
   }
   /* a Regexp literal pattern is Regexp#===, as in `when /re/`: a String
@@ -8165,10 +8224,26 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj, 
     else buf_puts(b, "0");
     return 1;
   }
-  /* class pattern: runtime tag/class test for poly, compile-time fold otherwise */
-  if (pk == NK_ConstantReadNode) {
-    const char *cn2 = nt_str(nt, pat, "name");
-    if (!cn2) return 0;
+  /* class pattern: runtime tag/class test for poly, compile-time fold
+     otherwise. A constant path (`in Mod::Klass`) is the same test: with no
+     branch here it reached the caller as "no condition" and the arm matched
+     every subject. A constant that holds a value is `value === subject`. */
+  if (pk == NK_ConstantReadNode || pk == NK_ConstantPathNode) {
+    char cq[192];
+    const char *cn2 = pk == NK_ConstantReadNode ? nt_str(nt, pat, "name")
+                                                : isa_match_name(nt, pat, cq, sizeof cq);
+    if (!cn2) unsupported(c, pat, "constant pattern with a computed scope");
+    if (pm_value_const(c, pat, cn2)) {
+      emit_pm_value_const(c, pat, t, pt, b);
+      return 1;
+    }
+    /* a constant that names a class (`AK = K`, `M::AI = Integer`) tests
+       that class, as `when` does */
+    const char *ra = resolve_class_alias(c, cn2);
+    int aliased = ra && !sp_streq(ra, cn2);
+    if (ra) cn2 = ra;
+    /* (a class method `===` of the program's own answers, as in `when`) */
+    if (emit_when_class_cmethod_eq(c, pat, t, pt, b)) return 1;
     if (pt == TY_POLY) {
       char tmp[32]; snprintf(tmp, sizeof tmp, "_t%d", t);
       if (!emit_poly_class_when(c, pat, tmp, b)) buf_puts(b, "0");
@@ -8176,7 +8251,10 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj, 
     }
     if (pt == TY_EXCEPTION) {
       /* an exception scrutinee matches by name up its class chain (#2759) */
-      buf_printf(b, "sp_exc_is_a((sp_Exception *)_t%d, \"%s\")", t, exc_when_cls_name(c, pat, NULL, 0));
+      int eci = comp_class_index(c, cn2);
+      const char *en = eci >= 0 ? class_ruby_name(c, eci) : NULL;
+      buf_printf(b, "sp_exc_is_a((sp_Exception *)_t%d, \"%s\")", t,
+                 aliased ? (en ? en : cn2) : exc_when_cls_name(c, pat, cq, sizeof cq));
       return 1;
     }
     if (pt == TY_BOOL && (is_boolean_class_name(cn2)) &&
@@ -8381,14 +8459,13 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj, 
         int pn2 = gi < apn ? reqs[gi] : posts[gi - apn];
         NodeKind rk = nt_kind(nt, pn2);
         int classpat = -1;
-        if (rk == NK_ConstantReadNode) classpat = pn2;
+        if (pm_class_const_read(c, pn2)) classpat = pn2;
         else if (rk == NK_CapturePatternNode) {
           int val = nt_ref(nt, pn2, "value");
-          if (val >= 0 && nt_kind(nt, val) == NK_ConstantReadNode)
-            classpat = val;
+          if (pm_class_const_read(c, val)) classpat = val;
         }
         if (classpat >= 0) {
-          const char *cn2 = nt_str(nt, classpat, "name");
+          const char *cn2 = pm_class_name(c, classpat);
           if (cn2 && ty_matches_class(c, et2, cn2, 0) <= 0 &&
               !(et2 == TY_STRING && sp_streq(cn2, "NilClass"))) class_mismatch = 1;
         }
@@ -8526,7 +8603,7 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj, 
     for (int i = 0; i < en; i++) {
       if (nt_kind(nt, elms[i]) != NK_AssocNode) return 0;
       if (nt_ref(nt, elms[i], "key") < 0) return 0;
-      int classpat = pm_hash_value_class(nt, nt_ref(nt, elms[i], "value"));
+      int classpat = pm_hash_value_class(c, nt_ref(nt, elms[i], "value"));
       if (classpat == PM_HASH_VAL_REJECT) {
         /* a value sub-pattern (literal, range, alternation, pin, container):
            trial-emit the recursive condition against the fetched value's type
@@ -8556,7 +8633,7 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj, 
     for (int i = 0; i < en; i++) {
       int key = nt_ref(nt, elms[i], "key");
       int vchk = nt_ref(nt, elms[i], "value");
-      int classpat = pm_hash_value_class(nt, vchk);
+      int classpat = pm_hash_value_class(c, vchk);
       emit_indent(hs, hi);
       buf_printf(hs, "_t%d = _t%d && sp_%sHash_has_key(_t%d, ", hcond, hcond, hn, t);
       emit_hash_key(c, key, ty_hash_key(pt), hs); buf_puts(hs, ");\n");
@@ -8589,7 +8666,7 @@ static int emit_pm_cond_value(Compiler *c, int pat, int t, TyKind pt, int subj, 
         buf_puts(hs, " }\n");
       }
       else {
-        const char *cn = nt_str(nt, classpat, "name");
+        const char *cn = pm_class_name(c, classpat);
         if (cn && ty_matches_class(c, hvt, cn, 0) <= 0) {
           emit_indent(hs, hi); buf_printf(hs, "_t%d = 0;\n", hcond);
         }
@@ -9066,8 +9143,14 @@ static int pm_diag_ok(Compiler *c, int pat) {
   switch (ty_k) {
   case NK_LocalVariableTargetNode: case NK_ImplicitNode: case NK_SplatNode: case NK_ImplicitRestNode:
   case NK_IntegerNode: case NK_FloatNode: case NK_StringNode: case NK_SymbolNode: case NK_NilNode:
-  case NK_TrueNode: case NK_FalseNode: case NK_ConstantReadNode: case NK_PinnedVariableNode:
+  case NK_TrueNode: case NK_FalseNode: case NK_PinnedVariableNode:
     return 1;
+  /* a class with its own class method `===` would run it a second time
+     for the message: the plain subject-only message is raised instead */
+  case NK_ConstantReadNode: case NK_ConstantPathNode: {
+    int ci = const_node_class_index(c, pat);
+    return ci < 0 || class_own_cmethod_eqq(c, ci) < 0;
+  }
   default:
     break;
   }
@@ -9188,7 +9271,7 @@ static void emit_pm_diag(Compiler *c, int pat, const char *v, PmDiag *d, int ind
   if (!is_arr && !is_find && !is_hash) {
     Buf cb; memset(&cb, 0, sizeof cb);
     if (emit_pm_subcond_expr(c, pat, v, &cb) && cb.p) {
-      if (ty_k != NK_ConstantReadNode) emit_pm_diag_bail_obj(d, v, ind, b);
+      if (!nt_kind_is_constant(ty_k)) emit_pm_diag_bail_obj(d, v, ind, b);
       Buf mb; memset(&mb, 0, sizeof mb);
       buf_puts(&mb, "sp_pm_eqq_msg(");
       emit_pm_diag_pat_s(c, pat, &mb);
@@ -9365,6 +9448,18 @@ static void emit_pm_nomatch_raise(Compiler *c, int pred, int pat, int guarded, i
      hashes; an object, a MatchData or a Time is not. */
   int walk = pat >= 0 && pm_diag_ok(c, pat) &&
              (!pm_diag_deconstructs(c, pat) || !pm_subject_deconstructs_apart(c, pt));
+  /* The pattern is one class whose own class method `===` answered no:
+     the arm ran it once, so the message is known without a second call */
+  int one = pat >= 0 && nt_kind(c->nt, pat) == NK_CapturePatternNode ? nt_ref(c->nt, pat, "value") : pat;
+  if (!walk && one >= 0 && !guarded && nt_kind_is_constant(nt_kind(c->nt, one)) &&
+      !pm_diag_ok(c, one)) {
+    emit_indent(b, indent);
+    buf_printf(b, "sp_pm_raise_nomatch(%s, sp_pm_eqq_msg(", sb.p);
+    emit_pm_diag_pat_s(c, one, b);
+    buf_printf(b, ", %s), 0);\n", sb.p);
+    free(sb.p);
+    return;
+  }
   if (!walk) {
     emit_indent(b, indent);
     buf_printf(b, "sp_pm_raise_nomatch(%s, NULL, 0);\n", sb.p);
@@ -10598,6 +10693,53 @@ static void emit_when_boxed_user_arms(Compiler *c, int cond, int t, TyKind pt, i
   }
 }
 
+/* Call class `ci`'s own class method `===` (see class_own_cmethod_eqq) with
+   the value in C variable `subj` of type `pt`, and test the answer as `if`
+   does (or give it boxed). The value is boxed when the method's parameter
+   is. 0: no such method, or one this call cannot pass the value to. */
+int emit_class_cmethod_eqq(Compiler *c, int ci, const char *subj, TyKind pt, int node, int boxed, Buf *b) {
+  int mi = class_own_cmethod_eqq(c, ci);
+  if (mi < 0 || !c->scopes[mi].reachable) return 0;
+  Scope *ws = &c->scopes[mi];
+  LocalVar *wp = ws->nparams == 1 ? scope_local(ws, ws->pnames[0]) : NULL;
+  int raw = wp && wp->type == pt && pt != TY_POLY;
+  int ret_ptr = needs_root(ws->ret) && !comp_ty_value_obj(c, ws->ret);
+  if (!wp || (wp->type != TY_POLY && !raw) || ws->rest_idx >= 0 || ws->kwrest_idx >= 0 || ws->blk_param ||
+      ws->yields || ws->ret == TY_UNKNOWN) {
+    return 0;
+  }
+  Buf cl; memset(&cl, 0, sizeof cl);
+  buf_printf(&cl, "%s(", mc_method(c, ws));
+  buf_puts(&cl, emit_cmethod_self_cls_arg(c, mi, ci, &cl));
+  if (raw || pt == TY_POLY) buf_puts(&cl, subj);
+  else emit_boxed_text(c, pt, subj, &cl);
+  buf_puts(&cl, ")");
+  const char *call = cl.p ? cl.p : "";
+  /* boxed: the answer itself, as a boxed value */
+  int nil_ret = ws->ret == TY_NIL || ws->ret == TY_VOID;
+  if (boxed) {
+    if (nil_ret) buf_printf(b, "((void)%s, sp_box_nil())", call);
+    else if (ws->ret == TY_POLY) buf_puts(b, call);
+    else emit_boxed_ret_call(c, ws, call, b);
+  }
+  /* (a method that answers nil is called for what it does, and is false;
+     any other answer is tested as `if` tests it) */
+  else if (ws->ret == TY_POLY) buf_printf(b, "sp_poly_truthy(%s)", call);
+  else if (ws->ret == TY_BOOL && !method_ret_is_oint(ws)) buf_printf(b, "(%s)", call);
+  else if (ret_ptr && !method_ret_is_oint(ws)) buf_printf(b, "(NULL != %s)", call);
+  else if (nil_ret) buf_printf(b, "((void)%s, 0)", call);
+  else { buf_puts(b, "sp_poly_truthy("); emit_boxed_ret_call(c, ws, call, b); buf_puts(b, ")"); }
+  free(cl.p);
+  return 1;
+}
+
+/* `when Klass` where Klass (or a class above it) defines its own class
+   method `===`: the arm calls it with the subject. 0: no such method. */
+static int emit_when_class_cmethod_eq(Compiler *c, int cond, int t, TyKind pt, Buf *b) {
+  char sref[24]; snprintf(sref, sizeof sref, "_t%d", t);
+  return emit_class_cmethod_eqq(c, const_node_class_index(c, cond), sref, pt, cond, 0, b);
+}
+
 static int when_boxed_has_user_arm(Compiler *c) {
   for (int k = 0; k < c->nclasses; k++)
     if (when_boxed_arm_class(c, k)) return 1;
@@ -11078,14 +11220,16 @@ void emit_case(Compiler *c, int id, Buf *b, int indent) {
              comp_const with a real type) in `when` is an equality test,
              not Module#=== -- treating it as a class name folded every
              arm of doom's Menu#render state dispatch to `if (0)`. */
-          if (cn2 && ({ LocalVar *_wv = comp_const(c, cn2); _wv && _wv->type != TY_UNKNOWN && _wv->type != TY_CLASS; })) cn2 = NULL;
-        /* An `ffi_const` is a value too, and it lives in its own table
-           rather than the constant one: read as a class name the arm folded
-           to a constant false and the branch was never taken. */
-        if (cn2 && comp_ffi_const_at(c, conds[j], NULL)) cn2 = NULL;
-        /* ...and so is a builtin's value constant (`Socket::AF_INET`,
-           `File::SEPARATOR`): typed a number or a String, not a class */
-        if (cn2 && when_builtin_value_const(c, conds[j])) cn2 = NULL;
+          /* An `ffi_const` is a value too, and it lives in its own table
+             rather than the constant one: read as a class name the arm folded
+             to a constant false and the branch was never taken. So is a
+             builtin's value constant (`Socket::AF_INET`, `File::SEPARATOR`):
+             typed a number or a String, not a class (pm_value_const). */
+          if (cn2 && pm_value_const(c, conds[j], cn2)) cn2 = NULL;
+        /* a class whose own class method `===` (or an ancestor's) answers
+           `when Klass`: that method with the subject, as CRuby calls it */
+        if (cn2 && emit_when_class_cmethod_eq(c, conds[j], t, pt, b)) { }
+        else {
         int effect = cn2 && pt != TY_POLY ? emit_const_read_prefix(c, conds[j], b) : 0;
         if (cn2 && pt == TY_POLY) {
             char tmp[32]; snprintf(tmp, sizeof tmp, "_t%d", t);
@@ -11170,6 +11314,7 @@ void emit_case(Compiler *c, int id, Buf *b, int indent) {
           }
           } /* close non-ConstantReadNode else */
           if (effect) buf_puts(b, ")");
+        } /* close the class-method `===` else */
           } /* close else { int reidx... } */
         }
       }
@@ -11516,14 +11661,11 @@ static void emit_case_expr_in(Compiler *c, int id, Buf *b) {
         const char *cn2 = (cty2_k == NK_ConstantReadNode || cty2_k == NK_ConstantPathNode)
                          ? isa_match_name(nt, conds[j], cq2, sizeof cq2) : NULL;
         /* value constant in `when`: equality, not a class test (see above) */
-        if (cn2 && ({ LocalVar *_wv = comp_const(c, cn2); _wv && _wv->type != TY_UNKNOWN && _wv->type != TY_CLASS; })) cn2 = NULL;
-        /* An `ffi_const` is a value too, and it lives in its own table
-           rather than the constant one: read as a class name the arm folded
-           to a constant false and the branch was never taken. */
-        if (cn2 && comp_ffi_const_at(c, conds[j], NULL)) cn2 = NULL;
-        /* ...and so is a builtin's value constant (`Socket::AF_INET`,
-           `File::SEPARATOR`): typed a number or a String, not a class */
-        if (cn2 && when_builtin_value_const(c, conds[j])) cn2 = NULL;
+        if (cn2 && pm_value_const(c, conds[j], cn2)) cn2 = NULL;
+        /* a class whose own class method `===` (or an ancestor's) answers
+           `when Klass`: that method with the subject, as CRuby calls it */
+        if (cn2 && emit_when_class_cmethod_eq(c, conds[j], t, pt, b)) { }
+        else {
         int effect = cn2 && pt != TY_POLY ? emit_const_read_prefix(c, conds[j], b) : 0;
         if (cn2 && pt == TY_POLY) {
           char tmp[32]; snprintf(tmp, sizeof tmp, "_t%d", t);
@@ -11583,6 +11725,7 @@ static void emit_case_expr_in(Compiler *c, int id, Buf *b) {
         else emit_case_obj_eq(c, conds[j], t, pt, b);
         } /* close non-ConstantReadNode else */
         if (effect) buf_puts(b, ")");
+        } /* close the class-method `===` else */
       }
       else {
         buf_puts(b, "(");
@@ -15853,6 +15996,33 @@ void emit_load_path_seed(Compiler *c, Buf *b) {
    but answers true the first time, as CRuby's does, from a flag of its
    feature's (native_load_flag, declared with the files'); false for one
    CRuby has loaded at boot. */
+int emit_autoload_register(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  int n, argc; const int *av = call_args(nt, id, &argc);
+  int name = argc ? av[0] : -1;
+  const AutoloadRegistration *a = comp_autoloads(c, id, &n);
+  if (!n) return 0;
+  buf_puts(b, "({ ");
+  emit_const_read_stmt(c, nt_ref(nt, id, "receiver"), b, 0);
+  buf_puts(b, "const char *_an = ");
+  if (nt_kind(nt, name) == NK_SymbolNode) emit_str_literal(b, nt_str(nt, name, "value"));
+  else emit_str_expr(c, name, b);
+  buf_puts(b, nt_kind(nt, name) == NK_SymbolNode ? "; (void)(" : "; SP_GC_ROOT(_an); (void)(");
+  emit_str_expr(c, av[1], b);
+  buf_puts(b, "); ");
+  for (int k = 0; k < n; k++) {
+    int slot = a[k].slot, f = a[k].file;
+    buf_puts(b, "if (strcmp(_an, "); emit_str_literal(b, a[k].name); buf_puts(b, ") == 0) { ");
+    buf_printf(b, "if (!sp_auto_%d_loaded || !*sp_auto_%d_loaded) { sp_auto_%d_registered = 1; ", slot, slot, slot);
+    if (f >= 0) buf_printf(b, "sp_auto_%d_loaded = &sp_loaded_%d; sp_auto_%d_top = sp_file_%d_top; ", slot, f, slot, f);
+    else buf_printf(b, "sp_auto_%d_loaded = NULL; sp_auto_%d_top = NULL; ", slot, slot);
+    buf_printf(b, "sp_auto_%d_feature = ", slot);
+    emit_str_literal(b, a[k].path);
+    buf_puts(b, "; } } ");
+  }
+  buf_puts(b, "0; })");
+  return 1;
+}
 void emit_load_call(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   const char *how = nt_str(nt, id, "how");
@@ -15899,11 +16069,27 @@ static void emit_load_stmt(Compiler *c, int id, Buf *b, int indent) {
   buf_puts(b, ";\n");
 }
 
+static void emit_class_presence_store(Compiler *c, int id, Buf *b, int indent) {
+  int flag = an_class_presence_write(c, id);
+  if (flag) { emit_indent(b, indent); buf_printf(b, "sp_class_present_%d = 1;\n", flag - 1); }
+}
+
+/* include, extend and prepend are declarations the emitters drop, but their
+   arguments are constant reads that run where the call stands: an autoload's
+   file loads there. */
+static void emit_mixin_arg_reads(Compiler *c, int id, Buf *b, int indent) {
+  int argc = 0;
+  const int *av = c->nautoloads && is_mixin_call(nt_str(c->nt, id, "name")) ? call_args(c->nt, id, &argc) : NULL;
+  for (int i = 0; av && i < argc; i++)
+    if (emit_const_read_stmt(c, av[i], b, indent)) buf_puts(b, "\n");
+}
+
 void emit_stmt(Compiler *c, int id, Buf *b, int indent) {
   if (g_repr_check) repr_check_ask(c, id);
   emit_line_directive(c, id, b);
   if (nt_kind(c->nt, id) == NK_LoadNode) { emit_with_prelude(c, id, b, indent, emit_load_stmt); return; }   /* (a computed path's temps) */
   if (emit_const_recv_stmt_wrap(c, id, b, indent, 0)) return;
+  if (nt_kind(c->nt, id) == NK_CallNode) emit_mixin_arg_reads(c, id, b, indent);
   /* A constant's visibility is not enforced (constants are resolved at
      compile time), so the class body skips these declarations -- also where
      one stands inside a conditional or a block of the body, which reaches
@@ -15931,6 +16117,8 @@ void emit_stmt(Compiler *c, int id, Buf *b, int indent) {
   if (nt_kind(c->nt, id) == NK_CallNode && call_is_setter_assign(c->nt, id))
     g_setter_stmt_id = id;
   emit_with_prelude(c, id, b, indent, emit_stmt_inner);
+  if (nt_kind(c->nt, id) == NK_ConstantWriteNode || nt_kind(c->nt, id) == NK_ConstantPathWriteNode)
+    emit_class_presence_store(c, id, b, indent);
   g_setter_stmt_id = saved_setter;
   /* a call the statement emitters placed themselves (puts, an iterator with
      its block) never reached emit_call's stamp: the same default (#4522) */
@@ -16412,6 +16600,7 @@ static int masgn_target_writes(const NodeTable *nt, int t, int id) {
   return 0;
 }
 static int masgn_store_runs_user_code(Compiler *c, int tgt);
+static void emit_const_target_class_name(Compiler *c, int tgt, const char *nm, Buf *b, int indent);
 /* A part that answers the same whenever it runs: a read, a literal, or
    arithmetic over them -- unless a target assigned before its store writes
    what it reads (`i, a[i] = 1, 2`). */
@@ -16568,6 +16757,15 @@ static int masgn_writer_takes_nil(Compiler *c, int tgt) {
   return ix < 0 || ivt == TY_POLY || (oint_kind(ivt) && ivar_has_nilbit(c, wcls, ix));
 }
 static int masgn_index_writer(Compiler *c, TyKind rt, int *cdef, TyKind *kt);
+/* The class holding class variable `nm` that multiple assignment `id`
+   stores into, in the method or the class body being emitted
+   (holder_cvar_owner); -1 at main's top level, where infer_cvar_types
+   registers no target */
+static int masgn_cvar_class(Compiler *c, int id, const char *nm) {
+  Scope *sc = comp_scope_of(c, id);
+  if (!(sc && sc->class_id >= 0) && g_class_body_id < 0) return -1;
+  return holder_cvar_owner(c, id, nm, g_class_body_id);
+}
 /* Can the slot a global, class variable, index or call target stores into
    take an element with its nil: a boxed slot, one that holds its nil, an Array
    store that notes one, a writer as masgn_writer_takes_nil says? A plain
@@ -16583,9 +16781,7 @@ static int masgn_target_takes_nil(Compiler *c, int id, int tgt) {
     return !gv || gv->type == TY_POLY || gvar_is_oint(c, gv);
   }
   if (tk == NK_ClassVariableTargetNode && nm) {
-    Scope *sc = comp_scope_of(c, id);
-    int cid = (sc && sc->class_id >= 0) ? sc->class_id : g_class_body_id;
-    if (cid >= 0) cid = comp_cvar_owner(c, cid, nm);
+    int cid = masgn_cvar_class(c, id, nm);
     int cx = cid >= 0 ? comp_cvar_index(&c->classes[cid], nm) : -1;
     return cx < 0 || c->classes[cid].cvar_types[cx] == TY_POLY || cvar_is_oint(c, cid, cx);
   }
@@ -16723,9 +16919,7 @@ static TyKind masgn_slot_type(Compiler *c, int id, int tgt) {
     return ix >= 0 ? c->classes[cid].ivar_types[ix] : TY_UNKNOWN;
   }
   if (k == NK_ClassVariableTargetNode) {
-    Scope *sc = comp_scope_of(c, id);
-    int cid = (sc && sc->class_id >= 0) ? sc->class_id : g_class_body_id;
-    if (cid >= 0) cid = comp_cvar_owner(c, cid, nm);
+    int cid = masgn_cvar_class(c, id, nm);
     int cx = cid >= 0 ? comp_cvar_index(&c->classes[cid], nm) : -1;
     return cx >= 0 ? c->classes[cid].cvar_types[cx] : TY_UNKNOWN;
   }
@@ -16926,9 +17120,7 @@ static int masgn_store(Compiler *c, int id, const MasgnTmps *mt, int tgt, const 
     return 1;
   }
   if (ty_k == NK_ClassVariableTargetNode && nm) {
-    Scope *sc = comp_scope_of(c, id);
-    int cid = (sc && sc->class_id >= 0) ? sc->class_id : g_class_body_id;
-    if (cid >= 0) cid = comp_cvar_owner(c, cid, nm);
+    int cid = masgn_cvar_class(c, id, nm);
     int cx = cid >= 0 ? comp_cvar_index(&c->classes[cid], nm) : -1;
     if (cx < 0) { unsupported(c, id, "multiple assignment class variable target"); return 1; }
     emit_indent(b, indent);
@@ -16951,6 +17143,7 @@ static int masgn_store(Compiler *c, int id, const MasgnTmps *mt, int tgt, const 
     if (ow) buf_puts(b, ")");
     buf_puts(b, ";\n");
     emit_const_flag_set(cv, nm, b, indent);
+    if (cv->type == TY_CLASS) emit_const_target_class_name(c, tgt, nm, b, indent);
     return 1;
   }
   if (ty_k == NK_IndexTargetNode) {
@@ -16962,6 +17155,21 @@ static int masgn_store(Compiler *c, int id, const MasgnTmps *mt, int tgt, const 
     if (argc == 2) return masgn_store_slice(c, id, mt, tgt, recv, argv, val, vt, recv_tmp, key_tmp, indent, b);
     Repr rr = repr_of(c, recv);
     TyKind rt = rr.as_ty;
+    /* an object Array holds the class's own pointers: the single store's
+       sp_PtrArray_set_grow, which grows past the end and refuses a frozen
+       Array (`list[0], list[1] = list[1], list[0]` was refused) */
+    if (ty_is_obj_array(rt)) {
+      if (comp_ntype(c, argv[0]) == TY_RANGE) { unsupported(c, id, "multiple assignment array index target"); return 1; }
+      masgn_recv_guard(c, recv, recv_tmp, "[]=", indent, b);
+      emit_indent(b, indent);
+      buf_puts(b, "sp_PtrArray_set_grow(");
+      emit_node_or_tmp(c, recv, recv_tmp, b); buf_puts(b, ", ");
+      if (key_tmp >= 0) buf_printf(b, "_t%d", key_tmp); else emit_int_expr(c, argv[0], b);
+      buf_puts(b, ", ");
+      masgn_conv(c, id, ty_array_elem(rt), vt, val, b);
+      buf_puts(b, ");\n");
+      return 1;
+    }
     if (ty_is_array(rt)) {
       const char *k = rt == TY_POLY_ARRAY ? "Poly" : array_kind(rt);
       if (!k || comp_ntype(c, argv[0]) == TY_RANGE) { unsupported(c, id, "multiple assignment array index target"); return 1; }
@@ -17383,7 +17591,7 @@ static void emit_class_body_stmts(Compiler *c, int ci, int body, Buf *b, int ind
       int sx = nt_ref(nt, stmts[k], "expression");
       NodeKind sxk = sx >= 0 ? nt_kind(nt, sx) : NK_NilNode;
       int named = (sxk == NK_ConstantReadNode || sxk == NK_ConstantPathNode) &&
-                  comp_class_index(c, nt_str(nt, sx, "name")) >= 0;
+                  const_node_class_index(c, sx) >= 0;
       if (sxk == NK_SelfNode || named || sg_activates_ci(c, stmts[k]) >= 0)
         emit_stmt_or_defer(c, stmts[k], b, indent);
       continue;
@@ -17420,38 +17628,19 @@ static void emit_class_body_stmts(Compiler *c, int ci, int body, Buf *b, int ind
         emit_stmt_or_defer(c, stmts[k], b, indent);
         continue;
       }
-      /* Kernel calls that act (output, an exception, exit) run where they
-         stand, as CRuby runs a class body top to bottom: `raise` or `warn`
-         in a class body was skipped as a declaration */
-      static const char *const kernel_acts[] = { "puts", "print", "p", "pp", "printf",
-        "putc", "warn", "raise", "fail", "exit", "exit!", "abort", "sleep", "at_exit",
-        "srand", "loop", "catch", NULL };
-      int is_output = 0;
-      for (int q = 0; cn && kernel_acts[q] && !is_output; q++) is_output = sp_streq(cn, kernel_acts[q]);
-      int is_user = cn && call_target(c, stmts[k], -1, cn, CT_TOP, NULL) >= 0;
-      /* a class_eval family call given a `&blk` runs it: not the reopen a
-         literal block of defs is */
-      int blk_arg = cn && is_eval_exec_family(cn) &&
-                    nt_kind(nt, nt_ref(nt, stmts[k], "block")) == NK_BlockArgumentNode;
-      /* self in a class body is the class, so a receiver-less call naming one
-         of its class methods (its own or an ancestor's) is a real call, not a
-         declaration macro -- the shape every declarative DSL uses (`key :a`,
-         `validates :name`). Skipping it left the state it establishes unset
-         and nothing said so (#4051). */
-      if (!is_user && cn && g_class_body_id >= 0)
-        is_user = call_target(c, stmts[k], g_class_body_id, cn, CT_CMETHOD, NULL) >= 0;
+      int executable = prog_stmt_call_executable(c, stmts[k], ci);
       /* A name nothing defines -- no method of any class or module in the
          program, no Module or Object method, no declaration the analysis
          reads -- is CRuby's NoMethodError at that point of the body, not a
          declaration to skip silently. */
-      if (!is_output && !is_user && cn && class_body_name_undefined(c, cn)) {
+      if (!executable && cn && class_body_name_undefined(c, cn)) {
         const char *rn = ci >= 0 ? class_ruby_name(c, ci) : NULL;
         emit_indent(b, indent);
         buf_printf(b, "sp_raise_cls(\"NoMethodError\", \"undefined method '%s' for %s %s\");\n",
                    cn, ci >= 0 && comp_class_is_module(c, &c->classes[ci]) ? "module" : "class", rn ? rn : "Object");
         continue;
       }
-      if (!is_output && !is_user && !blk_arg) continue;
+      if (!executable) { emit_mixin_arg_reads(c, stmts[k], b, indent); continue; }
     }
     emit_stmt_or_defer(c, stmts[k], b, indent);
   }
@@ -17478,8 +17667,9 @@ static int emit_multi_write_scalar(Compiler *c, int id, Buf *b, int indent, cons
   /* a TY_POLY value can hold an array at runtime (doom's
      `lump_name, mirrored = @sprite_index[key]` read through a local),
      so it must take the runtime-destructure path below, not the
-     scalar fill -- which handed the whole array to the first target. */
-  if (vty && !multi_src && !ty_is_array(st) && !ty_is_hash(st) && st != TY_UNKNOWN && st != TY_POLY) {
+     scalar fill -- which handed the whole array to the first target. So
+     must an Array of a class's objects. */
+  if (vty && !multi_src && !ty_is_array(st) && !ty_is_obj_array(st) && !ty_is_hash(st) && st != TY_UNKNOWN && st != TY_POLY) {
     for (int i = 0; i < ln; i++) {
       const char *lty = nt_type(nt, lefts[i]);
       NodeKind lk = nt_kind(nt, lefts[i]);
@@ -17622,9 +17812,11 @@ static int emit_multi_write_scalar(Compiler *c, int id, Buf *b, int indent, cons
     }
     return 1;
   }
-  /* any expression returning a typed array: runtime destructure */
-  if (ty_is_array(st) && st != TY_UNKNOWN) {
-    const char *k = (st == TY_POLY_ARRAY) ? "Poly" : array_kind(st);
+  /* any expression returning a typed array: runtime destructure. An Array
+     of a class's objects, or a table's rows, reads its elements as their
+     pointers, NULL (nil) past the end. */
+  if ((ty_is_array(st) || ty_is_obj_array(st)) && st != TY_UNKNOWN) {
+    const char *k = array_iter_kind(st);
     if (!k) k = "Int";
     TyKind elem = ty_array_elem(st);
     int tarr = ++g_tmp;
@@ -17637,7 +17829,7 @@ static int emit_multi_write_scalar(Compiler *c, int id, Buf *b, int indent, cons
        reads below take the source's length and its elements. A source the
        nil fact says is never nil keeps its C. */
     {
-      const char *nk = st == TY_POLY_ARRAY ? "Poly" : array_kind(st);
+      const char *nk = array_iter_kind(st);
       if (nk && !recv_never_nil(c, value)) {
         emit_indent(b, indent);
         buf_printf(b, "if (!_t%d) _t%d = sp_%sArray_new();\n", tarr, tarr, nk);
@@ -17740,6 +17932,7 @@ static int emit_multi_write_scalar(Compiler *c, int id, Buf *b, int indent, cons
           buf_puts(b, cgx);
         buf_puts(b, ";\n");
         emit_const_flag_set(cv_rt, cnm_rt, b, indent);
+        if (cv_rt->type == TY_CLASS) emit_const_target_class_name(c, lefts[i], cnm_rt, b, indent);
       }
       else {
         char gx[80], ix[32]; snprintf(ix, sizeof ix, "%dLL", i);
@@ -18329,17 +18522,18 @@ static void masgn_hoist_targets(Compiler *c, int id, MasgnTmps *mt) {
     if (index && nt_int(nt, flat[i], "struct_aset", 0)) { obj_ix = 1; okt = TY_UNKNOWN; }
     int k2 = index ? masgn_target_key2(nt, flat[i]) : -1;
     if (k2 >= 0) obj_ix = 0;   /* a user `[]=` takes one key here */
-    if (index && (k < 0 || !(poly_r || obj_ix || ty_is_array(rt) || (ty_is_hash(rt) && ty_hash_cname(rt))))) continue;
+    int arr_ix = index && (ty_is_array(rt) || ty_is_obj_array(rt));
+    if (index && (k < 0 || !(poly_r || obj_ix || arr_ix || (ty_is_hash(rt) && ty_hash_cname(rt))))) continue;
     /* an attribute's receiver is an object or a boxed value, whose store
        dispatches on its class */
     if (!index && !ty_is_object(rt) && rt != TY_POLY) continue;
     mt->recv[i] = masgn_hoist_part(c, r, poly_r || rr.kind == RK_BOXED ? TY_POLY : rt, hb);
     if (obj_ix) mt->key[i] = masgn_hoist_part(c, k, okt == TY_UNKNOWN ? repr_of(c, k).as_ty : okt, hb);
-    else if (index) mt->key[i] = masgn_hoist_part(c, k, poly_r || ty_is_array(rt) ? TY_INT : ty_hash_key(rt), hb);
+    else if (index) mt->key[i] = masgn_hoist_part(c, k, poly_r || arr_ix ? TY_INT : ty_hash_key(rt), hb);
     /* a Hash raises for two keys, so its second key is only evaluated */
     if (k2 >= 0 && !obj_ix) {
       TyKind k2t = repr_of(c, k2).as_ty;
-      mt->key2[i] = masgn_hoist_part(c, k2, poly_r || ty_is_array(rt) ? TY_INT : k2t == TY_NIL || k2t == TY_VOID || k2t == TY_UNKNOWN ? TY_POLY : k2t, hb);
+      mt->key2[i] = masgn_hoist_part(c, k2, poly_r || arr_ix ? TY_INT : k2t == TY_NIL || k2t == TY_VOID || k2t == TY_UNKNOWN ? TY_POLY : k2t, hb);
     }
   }
 }
@@ -18393,12 +18587,13 @@ static int emit_multi_write_stmt(Compiler *c, int id, Buf *b, int indent, const 
      the runtime-destructure path evaluate the whole ArrayNode (the literal
      emitter splices splats) and slice it. An empty literal (`a, *r = []`)
      stays a tuple, of no elements: every target takes nil and a splat
-     target an empty array. */
+     target an empty array. So does a `**h` element, which the literal
+     leaves out when every spread is empty (`a, b = [1, **{}]`). */
   int tuple = vk == NK_ArrayNode;
   if (els) {
     for (int i = 0; i < en; i++) {
       NodeKind ety0_k = nt_kind(nt, els[i]);
-      if (ety0_k == NK_SplatNode) { els = NULL; en = 0; tuple = 0; break; }
+      if (ety0_k == NK_SplatNode || kwh_only_spreads(nt, els[i])) { els = NULL; en = 0; tuple = 0; break; }
     }
   }
   int rn = 0;
@@ -18744,6 +18939,7 @@ static int emit_multi_write_stmt(Compiler *c, int id, Buf *b, int indent, const 
       else buf_printf(b, "_t%d", tmps[i]);
       buf_puts(b, ";\n");
       emit_const_flag_set(comp_const(c, cnm_l), cnm_l, b, indent);
+      if (comp_const(c, cnm_l)->type == TY_CLASS) emit_const_target_class_name(c, lefts[i], cnm_l, b, indent);
     }
     else if (lk == NK_InstanceVariableTargetNode) {
       const char *ivnm = nt_str(nt, lefts[i], "name");
@@ -18918,8 +19114,9 @@ static int emit_multi_write_stmt(Compiler *c, int id, Buf *b, int indent, const 
       if (recv_id < 0 || idx_argc < 1 || idx_argc > 2) { unsupported(c, id, "multiple assignment index target"); continue; }
       Repr recv_tr = repr_of(c, recv_id);
       TyKind recv_t = recv_tr.as_ty;
-      /* two keys (`a[i, n], x = ...`) store a slice, which masgn_store takes */
-      if (ty_is_object(recv_t) || nt_int(nt, lefts[i], "struct_aset", 0) || idx_argc == 2) {
+      /* two keys (`a[i, n], x = ...`) store a slice, which masgn_store
+         takes, as it takes an object Array's element */
+      if (ty_is_object(recv_t) || ty_is_obj_array(recv_t) || nt_int(nt, lefts[i], "struct_aset", 0) || idx_argc == 2) {
         char rv[32]; snprintf(rv, sizeof rv, "_t%d", tmps[i]);
         masgn_store(c, id, mt, lefts[i], masgn_nil_el(c, els[i]) ? NULL : rv, tmpts[i], ttr[i], ttk[i], indent, b);
         continue;
@@ -19011,10 +19208,8 @@ static int emit_multi_write_stmt(Compiler *c, int id, Buf *b, int indent, const 
     else if (lk == NK_ClassVariableTargetNode) {
       const char *cnm = nt_str(nt, lefts[i], "name");
       if (!cnm || cnm[0] != '@' || cnm[1] != '@') { unsupported(c, id, "multiple assignment class variable target"); continue; }
-      Scope *cv_sc = comp_scope_of(c, id);
-      int cv_cid = (cv_sc && cv_sc->class_id >= 0) ? cv_sc->class_id : g_class_body_id;
+      int cv_cid = masgn_cvar_class(c, id, cnm);
       if (cv_cid < 0) { unsupported(c, id, "multiple assignment class variable target no class"); continue; }
-      cv_cid = comp_cvar_owner(c, cv_cid, cnm);
       int cv_idx = comp_cvar_index(&c->classes[cv_cid], cnm);
       if (cv_idx < 0) { unsupported(c, id, "multiple assignment class variable target unregistered"); continue; }
       emit_indent(b, indent);
@@ -19023,6 +19218,11 @@ static int emit_multi_write_stmt(Compiler *c, int id, Buf *b, int indent, const 
       TyKind cvt = c->classes[cv_cid].cvar_types[cv_idx];
       TyKind valt = tmpts ? tmpts[i] : repr_of(c, els[i]).as_ty;
       if (cvt == TY_POLY && valt != TY_POLY) emit_boxed_tmp(c, valt, tmps[i], b);
+      /* an oint static takes the element with its nil, as a global's does */
+      else if (cvar_is_oint(c, cv_cid, cv_idx)) {
+        char ex[32]; snprintf(ex, sizeof ex, "_t%d", tmps[i]);
+        masgn_conv_o(c, cvt, valt, masgn_nil_el(c, els[i]) ? NULL : ex, b);
+      }
       else if (one_str_to_open(b, cvt, "cvar_%s_%s", c->classes[cv_cid].name, cnm + 2)) buf_printf(b, "_t%d)", tmps[i]);
       else buf_printf(b, "_t%d", tmps[i]);
       buf_puts(b, ";\n");
@@ -19193,7 +19393,10 @@ static int emit_call_stmt(Compiler *c, int id, Buf *b, int indent, const NodeTab
   {
     const char *nm = nt_str(nt, id, "name");
     int recv = nt_ref(nt, id, "receiver");
-    if (recv < 0 && nm && (sp_streq(nm, "include") || sp_streq(nm, "extend") ||
+    /* `singleton_class.attr_reader :x`: an attr of the body's singleton,
+       registered from the load record as `class << self`'s are */
+    int sc_attr = recv >= 0 && nt_int(nt, id, "sg_attr_decl", 0);
+    if ((recv < 0 || sc_attr) && nm && (sp_streq(nm, "include") || sp_streq(nm, "extend") ||
                            sp_streq(nm, "prepend") || sp_streq(nm, "module_function") ||
                            sp_streq(nm, "private") || sp_streq(nm, "protected") ||
                            sp_streq(nm, "public") || sp_streq(nm, "attr_reader") ||
@@ -20259,6 +20462,15 @@ static int cpath_in_singleton(Compiler *c, int id) {
   return 0;
 }
 
+/* Does the receiver of `recv::X = v` name Object (the core answer of
+   elab_class_ref_at)? CRuby names a class so written `X`, as `::X = v` does,
+   not `Object::X`. */
+static int cpath_recv_is_object(Compiler *c, int recv) {
+  int core = -1;
+  if (recv >= 0) elab_class_ref_at(c, recv, &core);
+  return core == CORE_OBJECT;
+}
+
 /* The receiver of `recv::X = v` that no compile-time fact names. A constant
    that resolves to a class or module the program defines is read flat, by its
    leaf, and so is a local holding one named class (class_recv_static_ci).
@@ -20269,10 +20481,12 @@ static int cpath_in_singleton(Compiler *c, int id) {
    CRuby runs it, and must be a Class or Module when the write is made. A
    receiver typed a Class or Module with no effect of its own, given a value
    that is no class, has nothing to check or name: the flat write is all of
-   it. */
+   it. `Object` is none of them: it is always a class, and names its
+   constants as the root does. */
 static int cpath_recv_dynamic(Compiler *c, int recv, int value_is_class) {
   if (recv < 0) return 0;
   if (nt_kind(c->nt, recv) == NK_SelfNode) return g_class_body_id < 0;
+  if (cpath_recv_is_object(c, recv)) return 0;
   int ci = class_recv_static_ci(c, recv);
   if (ci >= 0 && !comp_class_anonymous(c, ci)) return 0;
   if (ci < 0 && comp_ntype(c, recv) == TY_CLASS && !subtree_has_side_effect(c, recv) && !value_is_class)
@@ -20284,6 +20498,47 @@ static int cpath_recv_dynamic(Compiler *c, int recv, int value_is_class) {
    prelude (hold_operand_pre), ahead of any prelude the value leaves there. */
 static int emit_cpath_recv_hold(Compiler *c, int recv) {
   return hold_operand_pre(c, recv, TY_POLY, 1, ++g_tmp, 1);
+}
+
+/* The namespace a class value takes its name under at a constant write's
+   target `tgt` (a ConstantWriteNode, a ConstantTargetNode, a
+   ConstantPathTargetNode or a path write's ConstantPathNode): the cref for a
+   bare constant; for a path, `self` in a body, the root (-1) for `::X`, for
+   `Object::X` and in the body of a `class << self`, else the class the path's
+   receiver names. *owner is that class, -1 for none. 0 when only the run time
+   knows the namespace (cpath_recv_dynamic). */
+static int const_name_owner(Compiler *c, int tgt, int *owner) {
+  const NodeTable *nt = c->nt;
+  int k = nt_kind(nt, tgt);
+  if (k != NK_ConstantPathTargetNode && k != NK_ConstantPathNode) {
+    int cref = elab_cref_at(c, tgt);
+    *owner = cref >= -1 ? cref : g_class_body_id;
+  }
+  else {
+    int recv = nt_ref(nt, tgt, "parent");
+    if (recv >= 0 && nt_kind(nt, recv) == NK_SelfNode) {
+      int self = elab_self_at(c, tgt);   /* (a class reopened in a `class << self` body is self there) */
+      *owner = self >= -1 ? self : cpath_in_singleton(c, tgt) ? -1 : g_class_body_id;
+    }
+    else if (cpath_recv_is_object(c, recv)) *owner = -1;
+    else if (cpath_recv_dynamic(c, recv, 1)) return 0;
+    else *owner = class_recv_static_ci(c, recv);
+  }
+  /* Object's own constants are top-level ones: CRuby names them bare */
+  if (*owner >= 0 && *owner == comp_core_class(c, CORE_OBJECT)) *owner = -1;
+  return 1;
+}
+
+/* A path or multiple-assignment constant target that holds a class value: the
+   class takes the target's name, as the plain write `X = v` names it
+   (emit_class_const_name). A target whose namespace only the run time knows
+   leaves the class as it was. Named by the leaf as written, not the C name a
+   collision gave it. */
+static void emit_const_target_class_name(Compiler *c, int tgt, const char *nm, Buf *b, int indent) {
+  int owner;
+  if (!const_name_owner(c, tgt, &owner)) return;
+  const char *wn = nt_str(c->nt, tgt, "qc_orig_name");
+  emit_class_const_name(c, nm, wn ? wn : nm, owner, b, indent);
 }
 
 /* After the value is evaluated, before it is stored: a receiver that is not a
@@ -20306,14 +20561,26 @@ static void emit_cpath_recv_name(Compiler *c, const char *name, int t, Buf *b, i
              name, name, t, name);
 }
 
+/* A class builder's write (`X = Class.new do ... end`, `A::B = Module.new
+   do ... end`, `P = Struct.new(:a) do ... end`), whose class the record
+   holds (elab_builder_class): the block's statements run here, with the
+   class anonymous, then the write names it. A path write's namespace is a
+   class or module of the program (class_def_builder), read for nothing. */
+static void emit_builder_write(Compiler *c, int id, Buf *b, int indent) {
+  int sci = elab_builder_class(c, id);
+  emit_class_body_stmts(c, sci, class_def_body(c->nt, id), b, indent);
+  if (comp_class_anonymous(c, sci)) emit_class_assign_name(c, sci, class_ruby_name(c, sci), b, indent);
+}
+
 static void emit_class_definition(Compiler *c, int id, Buf *b, int indent) {
   const NodeTable *nt = c->nt;
   int cp = nt_ref(nt, id, "constant_path");
-  int reads[] = { nt_ref(nt, cp, "parent"), nt_ref(nt, id, "superclass") };
+  int reads[] = { an_const_read_effect(c, cp).autoload ? cp : nt_ref(nt, cp, "parent"), nt_ref(nt, id, "superclass") };
   for (int i = 0; i < 2; i++)
     if (emit_const_read_stmt(c, reads[i], b, indent)) buf_puts(b, "\n");
   const char *name = cp >= 0 ? nt_str(nt, cp, "name") : NULL;
   int ci = name ? elab_header_class(c, id, NULL, NULL) : g_class_body_id;
+  emit_class_presence_store(c, id, b, indent);
   emit_class_body_stmts(c, ci, nt_ref(nt, id, "body"), b, indent);
   if (nt_int(nt, id, "class_new_anonymous", 0) == 1)
     emit_class_assign_name(c, ci, class_ruby_name(c, ci), b, indent);
@@ -20713,21 +20980,17 @@ static int emit_attr_global_const_write_stmt(Compiler *c, int id, Buf *b, int in
     LocalVar *lv = isg ? comp_gvar(c, key) : comp_const(c, key);
     int v = nt_ref(nt, id, "value");
     if (!lv || (!isg && lv->type == TY_UNKNOWN)) {
-      /* The struct-def constant itself (`Foo = Struct.new(...) do ... end`) has
-         no C runtime value and is skipped -- but any top-level constant writes
-         INSIDE that block still need init code emitted. register_structs only
+      /* The struct-def constant itself (`Foo = Struct.new(...) do ... end`,
+         and a class builder's write) has no C runtime value and is skipped
+         -- but any top-level constant writes INSIDE that block still need
+         init code emitted. register_structs only
          consumes the block for class/ivar/method registration, never as
          executable statements, so without this such constants stay NULL/default
          despite being declared and typed (a method reading them, e.g. a Linedef
          FLAGS[:TWOSIDED] flag helper, silently sees an empty constant). Mirrors
          the block's defs, which take the struct's class from the load record
          (elab_record_builders). */
-      if (!isg && v >= 0 && is_struct_call(c, v)) {
-        int sci = comp_class_index(c, nm);
-        emit_class_body_stmts(c, sci, class_def_body(c, id), b, indent);
-        /* the block ran with the class anonymous; the write names it */
-        if (comp_class_anonymous(c, sci)) emit_class_assign_name(c, sci, class_ruby_name(c, sci), b, indent);
-      }
+      if (!isg && v >= 0 && elab_builder_class(c, id) >= 0) emit_builder_write(c, id, b, indent);
       /* a value that runs a call finding no method where it runs
          (cplan_missing: `zz`, `zz + 1`, `zz.to_s`, `id(zz)`) has no type
          either, and raises there, before the write: run the operands ahead
@@ -20865,14 +21128,25 @@ static int emit_attr_global_const_write_stmt(Compiler *c, int id, Buf *b, int in
       if (repr_of_slot(c, lv).elems_handle && comp_ntype(c, v) == TY_STR_ARRAY) emit_str_array_handles(c, v, b);
       else emit_poly_array_from(c, v, b);
     }
+    /* `NONE = Array.new(n) { Obj.new }` into a constant narrow_object_arrays
+       made an object table: the constructor builds in place at the slot's
+       kind, as a local's and an ivar's write already do. Without it the
+       call was emitted at its own poly type and the write refused, since
+       no conversion keeps a poly array in an sp_PtrArray slot. */
+    else if (ty_is_ptr_array(lv->type) && emit_ptr_array_build(c, v, lv->type, b)) { }
     else emit_coerce(c, v, lv->type, CO_HOLD, isg ? "a global variable write" : "a constant write", b);
     buf_puts(b, ";\n");
     if (!isg && lv->init_guarded) {
       emit_indent(b, indent); buf_printf(b, "sp_init_in_progress_%s = 0;\n", key);
     }
     if (!isg) emit_const_flag_set(lv, key, b, indent);
-    if (!isg && lv->type == TY_CLASS)
-      emit_class_const_name(c, key, nm, g_class_body_id, b, indent);
+    /* the name is the constant's under its lexical scope: a builder's block
+       (`X = Class.new do K = self end`) names K at the top level */
+    if (!isg && lv->type == TY_CLASS) {
+      int owner;
+      const_name_owner(c, id, &owner);
+      emit_class_const_name(c, key, nm, owner, b, indent);
+    }
     if (!isg) emit_const_write_last_value(c, lv, key, b, indent);
     return 1;
   }
@@ -20882,6 +21156,12 @@ static int emit_attr_global_const_write_stmt(Compiler *c, int id, Buf *b, int in
        operator/or/and path-write forms. */
     int tgt = nt_ref(nt, id, "target");
     const char *nm = tgt >= 0 ? nt_str(nt, tgt, "name") : NULL;
+    /* `A::B = Class.new do ... end`: the class the record holds for the
+       write, made there (emit_builder_write) */
+    if (elab_builder_class(c, id) >= 0) {
+      emit_builder_write(c, id, b, indent);
+      return 1;
+    }
     LocalVar *cv = nm ? comp_const(c, nm) : NULL;
     if (!cv || cv->type == TY_UNKNOWN) { unsupported(c, id, "constant path write"); return 1; }
     int v = nt_ref(nt, id, "value");
@@ -20928,6 +21208,9 @@ static int emit_attr_global_const_write_stmt(Compiler *c, int id, Buf *b, int in
     /* a boxed constant slot (widened under promote, or a union) takes the
        value boxed, as the plain ConstantWriteNode does */
     else if (cv->type == TY_POLY && repr_of(c, v).kind != RK_BOXED) emit_boxed(c, v, b);
+    /* `Mod::X = Array.new(n) { Obj.new }` into an object table builds in
+       place at the slot's kind, as the plain ConstantWriteNode does. */
+    else if (ty_is_ptr_array(cv->type) && emit_ptr_array_build(c, v, cv->type, b)) { }
     else if (val_t < 0 && one_str_to_open(b, cv->type, "cst_%s", nm)) { emit_expr(c, v, b); buf_puts(b, ")"); }
     else emit_expr(c, v, b);
     buf_puts(b, ";\n");
@@ -20938,12 +21221,7 @@ static int emit_attr_global_const_write_stmt(Compiler *c, int id, Buf *b, int in
       else buf_printf(b, "cst_%s = _t%d;\n", nm, val_t);
       if (cv->type == TY_CLASS) emit_cpath_recv_name(c, nm, recv_t, b, indent);
     }
-    else if (cv->type == TY_CLASS) {
-      int owner = class_recv_static_ci(c, crecv);
-      if (crecv >= 0 && nt_kind(nt, crecv) == NK_SelfNode)
-        owner = cpath_in_singleton(c, id) ? -1 : g_class_body_id;
-      emit_class_const_name(c, nm, nm, owner, b, indent);
-    }
+    else if (cv->type == TY_CLASS) emit_const_target_class_name(c, tgt, nm, b, indent);
     emit_const_flag_set(cv, nm, b, indent);
     return 1;
   }
@@ -21317,9 +21595,9 @@ static void emit_stmt_node(Compiler *c, int id, Buf *b, int indent) {
     emit_assign(c, id, b, indent);
     /* `k = Struct.new(...) do ... end`: the block's statements run too */
     int v = nt_ref(nt, id, "value");
-    if (v >= 0 && is_struct_call(c, v)) {
-      int sci = anon_struct_ci_for_value(c, v);
-      if (sci >= 0) emit_class_body_stmts(c, sci, class_def_body(c, id), b, indent);
+    if (v >= 0 && class_def_is_record_call(nt, v)) {
+      int sci = elab_builder_class(c, id);
+      if (sci >= 0) emit_class_body_stmts(c, sci, class_def_body(nt, id), b, indent);
     }
     return;
   }
@@ -21580,11 +21858,8 @@ static void emit_stmt_node(Compiler *c, int id, Buf *b, int indent) {
             sk == NK_InstanceVariableOrWriteNode || sk == NK_InstanceVariableAndWriteNode ||
             sk == NK_InstanceVariableOperatorWriteNode)
           continue;
-        if (sk == NK_CallNode && nt_ref(nt, stmts[k], "receiver") < 0) {
-          const char *cn = nt_str(nt, stmts[k], "name");
-          if (!cn || (!sp_streq(cn, "puts") && !sp_streq(cn, "print") && !sp_streq(cn, "p")))
-            continue;
-        }
+        if (sk == NK_CallNode && nt_ref(nt, stmts[k], "receiver") < 0 &&
+            !prog_sclass_call_executable(c, stmts[k])) continue;
         emit_stmt(c, stmts[k], b, indent);
       }
       return;
@@ -22185,6 +22460,9 @@ void emit_stmt_tail_inner(Compiler *c, int id, Buf *b, int indent) {
   if (k == NK_IfNode)     { emit_if(c, id, b, indent, 0, 1); return; }
   if (k == NK_UnlessNode) { emit_if(c, id, b, indent, 1, 1); return; }
   if (k == NK_CaseMatchNode) { emit_case_match(c, id, b, indent, 1, -1); return; }
+  /* a class builder's write in a value's place (one the record opens its
+     class at, elab_header_class): the expression arm refuses it */
+  if (k == NK_ConstantWriteNode && elab_header_class(c, id, NULL, NULL) >= 0) { emit_expr(c, id, b); return; }
   if (k == NK_ReturnNode) { emit_return(c, id, b, indent); return; }
   /* a tail `retry` diverges (goto back to its begin); the value is dead */
   if (k == NK_RetryNode) { emit_stmt_inner(c, id, b, indent); return; }
@@ -22293,6 +22571,14 @@ void emit_stmt_tail_inner(Compiler *c, int id, Buf *b, int indent) {
         emit_unbox_nilable_text(c, slot_t, ex, &ux);
         buf_printf(b, "%s;\n", ux.p ? ux.p : "0"); free(ux.p);
       }
+      /* a typed Array begin value into a general Array slot (an --rbs
+         `Array[untyped]` return answering an `Array[String]` parameter) is
+         rebuilt with its elements boxed, as a plain tail's is
+         (emit_ret_poly_array_conv): handed back as it was, the C build
+         stopped (#10680) */
+      else if (slot_t == TY_POLY_ARRAY && (rt == TY_INT_ARRAY || rt == TY_STR_ARRAY || rt == TY_FLOAT_ARRAY))
+        buf_printf(b, "sp_PolyArray_from_%s_array(_t%d);\n",
+                   rt == TY_INT_ARRAY ? "int" : rt == TY_STR_ARRAY ? "str" : "float", t);
       else buf_printf(b, "_t%d;\n", t);
       return;
     }
@@ -24447,19 +24733,6 @@ static int str_mutate_sn_var_guard(Compiler *c, int id, int recv, Buf *b, int in
   return r ? 1 : -1;
 }
 
-/* A concat operand's type. Ask the SLOT, not the node: a block parameter's
-   node type can read as an array kind while its declaration is boxed, and
-   reading the boxed local as a typed pointer does not compile (#3850). */
-static TyKind concat_operand_type(Compiler *c, int node) {
-  TyKind at = comp_ntype(c, node);
-  if (nt_kind(c->nt, node) == NK_LocalVariableReadNode) {
-    Scope *asc = comp_scope_of(c, node);
-    LocalVar *alv = asc ? scope_local(asc, nt_str(c->nt, node, "name")) : NULL;
-    if (alv && alv->type != TY_UNKNOWN) at = alv->type;
-  }
-  return at;
-}
-
 static int emit_array_mutate_stmt_body(Compiler *c, int id, Buf *b, int indent) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
@@ -24479,6 +24752,10 @@ static int emit_array_mutate_stmt_body(Compiler *c, int id, Buf *b, int indent) 
     return 1;
   }
   TyKind rt = comp_ntype(c, recv);
+  /* A contextual user target (or refusal) owns this Array call. Decline
+     before output, including the fresh route; the ordinary path emits
+     that plan. Other receiver families keep their own admission. */
+  if (ty_is_array(rt) && sp_streq(name, "concat") && cplan_user(c, id)->dispatch != CP_NONE) return 0;
   /* a `&.` String mutator's guard, unless the receiver is a shim's shadow
      (sb_shadowed_reader): the shim took the receiver and tested it, and the
      guard read the shadow ahead of the statement, before the shim declared it */
@@ -24980,122 +25257,13 @@ static int emit_array_mutate_stmt_body(Compiler *c, int id, Buf *b, int indent) 
     return 1;
   }
   if (sp_streq(name, "concat") && argc >= 1) {
-    /* an argument no Array conversion takes (nil, a boolean, an Integer,
-       a String, ...) is the value form's TypeError (emit_array_operand_misfit):
-       read below as an Array of the receiver's kind, one of the element's
-       own kind gave C that does not build (`a = [1]; a.concat(1)`) */
-    for (int a = 0; a < argc; a++) {
-      TyKind at = comp_ntype(c, argv[a]);
-      if (conv_to_ary_misfit(c, at)) return 0;
-    }
-    /* Every argument is evaluated, and its length taken, before anything is
-       appended, as CRuby concatenates the arguments as they were: with one
-       aliasing the receiver, `a.concat(a, a)` appended the grown array the
-       second time (8 elements where CRuby has 6). The appends follow in
-       order, each over its argument's own snapshot length. */
-    int tr = ++g_tmp;
-    TyKind et = ty_array_elem(rt);
-    /* an Integer or Float receiver takes a boxed nil as its nil bit, which
-       the _nilable store sets (sp_array.h) */
-    const char *nilable = (rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY) ? "_nilable" : "";
-    emit_indent(b, indent);
-    /* rooted across the arguments, which can allocate */
-    buf_printf(b, "{ sp_%sArray *_t%d = ", k, tr); emit_expr(c, recv, b); buf_printf(b, "; SP_GC_ROOT(_t%d);\n", tr);
-    Buf hd, ck, lp; memset(&hd, 0, sizeof hd); memset(&ck, 0, sizeof ck); memset(&lp, 0, sizeof lp);
-    /* the last boxed operand: its #to_ary (and an earlier one's) can change
-       a typed operand before it, which CRuby has already copied */
-    int last_boxed = -1;
-    for (int a = 0; a < argc; a++) if (concat_operand_type(c, argv[a]) == TY_POLY) last_boxed = a;
-    for (int a = 0; a < argc; a++) {
-      int tn = ++g_tmp, ti = ++g_tmp;
-      /* the source array may be a different kind than the receiver (e.g.
-         IntArray#concat(PolyArray)); read with the source's kind and coerce
-         each element into the receiver's element representation. */
-      TyKind at = concat_operand_type(c, argv[a]);
-      const char *ak = (at == TY_POLY_ARRAY) ? "Poly" : array_kind(at);
-      if (at == TY_POLY) {
-        /* boxed source: walk it through the boxed surface */
-        int tv = ++g_tmp;
-        emit_indent(&hd, indent + 1);
-        buf_printf(&hd, "{ sp_RbVal _t%d = ", tv); emit_boxed(c, argv[a], &hd);
-        /* (an Array, or one #to_ary answers: anything else is CRuby's
-           TypeError, where its length read as 0 appended nothing) */
-        buf_printf(&hd, "; SP_GC_ROOT_RBVAL(_t%d);\n", tv);
-        /* (converted after the frozen test, as CRuby converts it: a frozen
-           receiver raises FrozenError ahead of the operand's TypeError) */
-        emit_indent(&ck, indent + 1);
-        buf_printf(&ck, "_t%d = sp_poly_ary_arg_ck(_t%d); sp_int _t%d = sp_poly_length(_t%d);\n", tv, tv, tn, tv);
-        emit_indent(&lp, indent + 1);
-        buf_printf(&lp, "for (sp_int _t%d = 0; _t%d < _t%d; _t%d++) sp_%sArray_push%s(_t%d, ",
-                   ti, ti, tn, ti, k, nilable, tr);
-        /* the _nilable store takes the element whole, its nil included, as
-           the value-form concat does; the plain unbox raised on nil and
-           handed the store an sp_int */
-        { char el[64]; snprintf(el, sizeof el, "sp_poly_each_elem(_t%d, _t%d)", tv, ti);
-          if (et == TY_INT) buf_printf(&lp, "sp_poly_elem_i(%s)", el);
-          else if (et == TY_FLOAT) buf_printf(&lp, "sp_poly_elem_f(%s)", el);
-          else emit_unbox_text(c, et, el, &lp); }
-        buf_puts(&lp, ");\n");
-        continue;
-      }
-      if (!ak) ak = k;
-      /* Evaluate the source ONCE. It used to be re-emitted for the length and
-         again for every element, so `result.concat(str.bytes)` rebuilt the
-         whole byte array per element -- quadratic, and any side effect ran
-         n+1 times. Rooted: pushing into the receiver can collect. */
-      int ts = ++g_tmp;
-      emit_indent(&hd, indent + 1);
-      buf_printf(&hd, "{ sp_%sArray *_t%d = ", ak, ts); emit_expr(c, argv[a], &hd);
-      buf_printf(&hd, "; SP_GC_ROOT(_t%d);\n", ts);
-      /* (read in order with the boxed operands' conversions: a later
-         operand's #to_ary can change this one, so it is copied at its turn,
-         as CRuby copies it; an earlier one's can change its length) */
-      emit_indent(&ck, indent + 1);
-      if (a < last_boxed) buf_printf(&ck, "_t%d = sp_%sArray_dup(_t%d); ", ts, ak, ts);
-      buf_printf(&ck, "sp_int _t%d = sp_%sArray_length(_t%d);\n", tn, ak, ts);
-      emit_indent(&lp, indent + 1);
-      /* the same number kind copies each element with its nil */
-      int same_o = *nilable && sp_streq(ak, k) && (sp_streq(k, "Int") || sp_streq(k, "Float"));
-      /* one Integer Array onto another: one runtime move, nils and all,
-         rather than a loop whose push the C inliner may leave out of line */
-      if (same_o && argc == 1 && sp_streq(k, "Int")) {
-        buf_printf(&lp, "sp_IntArray_append_o(_t%d, _t%d);\n", tr, ts);
-        continue;
-      }
-      buf_printf(&lp, "for (sp_int _t%d = 0; _t%d < _t%d; _t%d++) sp_%sArray_push%s(_t%d, ",
-                 ti, ti, tn, ti, k, same_o ? "_o" : sp_streq(ak, "Poly") ? nilable : "", tr);
-      char getexpr[256];
-      snprintf(getexpr, sizeof getexpr, "sp_%sArray_%s(_t%d, _t%d)", ak, same_o ? "oget" : "get", ts, ti);
-      if (sp_streq(k, "Poly") && !sp_streq(ak, "Poly")) {
-        /* box the source scalar into the poly receiver */
-        emit_boxed_text(c, ty_array_elem(at), getexpr, &lp);
-      }
-      else if (!sp_streq(k, "Poly") && sp_streq(ak, "Poly")) {
-        /* unbox the source poly element into the receiver's scalar */
-        if (et == TY_INT) buf_printf(&lp, "sp_poly_elem_i(%s)", getexpr);
-        else if (et == TY_STRING) buf_printf(&lp, "sp_poly_elem_s(%s)", getexpr);
-        else if (et == TY_FLOAT) buf_printf(&lp, "sp_poly_elem_f(%s)", getexpr);
-        else buf_puts(&lp, getexpr);
-      }
-      else buf_puts(&lp, getexpr);
-      buf_puts(&lp, ");");
-      buf_puts(&lp, "\n");
-    }
-    if (hd.p) buf_puts(b, hd.p);
-    /* a frozen receiver raises even when every argument is empty */
-    if (array_frozen_cls(rt)) {
-      emit_indent(b, indent + 1);
-      buf_printf(b, "if (_t%d && _t%d->frozen) sp_raise_frozen_array_at(_t%d, %s);\n",
-                 tr, tr, tr, array_frozen_cls(rt));
-    }
-    if (ck.p) buf_puts(b, ck.p);
-    if (lp.p) buf_puts(b, lp.p);
-    emit_indent(b, indent + 1);
-    for (int a = 0; a < argc; a++) buf_puts(b, "}");
-    buf_puts(b, "\n");
-    free(hd.p); free(ck.p); free(lp.p);
-    emit_indent(b, indent);
-    buf_puts(b, "}\n");
+    Buf cat = {0};
+    /* The contextual plan declined a user target above, and this route's
+       receiver-kind gate established Array's builtin arm. */
+    if (!emit_builtin_array_concat(c, id, recv, rt, argv, argc, 1, &cat)) return 0;
+    emit_indent(b, indent); buf_puts(b, "(void)"); buf_puts(b, cat.p);
+    free(cat.p);
+    buf_puts(b, ";\n");
     return 1;
   }
   return 0;
@@ -25275,6 +25443,23 @@ static char *iow_guarded_hash_rhs(Compiler *c, int v, TyKind rt, Buf *b, int *op
   g_pre = sv;
   return rb.p ? rb.p : strdup("");
 }
+/* The right side of a Hash slot's `||=` / `&&=` write, then the frozen
+   test the write takes (as `h[k] = v` and `h[k] += v` raise FrozenError,
+   #3001): the value first, as in CRuby, so its own error or side effect
+   comes before the FrozenError. Takes rhs and gives a new string. */
+static char *iow_frozen_hash_rhs(char *rhs, int ta, TyKind rt) {
+  if (!rhs || !rhs[0]) return rhs ? rhs : strdup("");
+  Buf w; memset(&w, 0, sizeof w);
+  int t = ++g_tmp;
+  const char *cls = hash_box_cls(rt);
+  /* (__auto_type: the right side is written once; written twice, in a
+     __typeof__ and as the value, a case/in prelude inside it would carry
+     its label twice) */
+  buf_printf(&w, "({ __auto_type _t%d = (%s); if (sp_gc_is_frozen(_t%d)) sp_raise_frozen_hash_at(_t%d, %s); _t%d; })",
+             t, rhs, ta, ta, cls ? cls : "0", t);
+  free(rhs);
+  return w.p ? w.p : strdup("");
+}
 static void iow_guard_close(char *rhs, int open, Buf *b) {
   if (open) buf_puts(b, "; }");
   free(rhs);
@@ -25387,7 +25572,21 @@ void emit_index_op_write(Compiler *c, int id, Buf *b, int indent) {
        that holds nil (D3b-ii), is `nil + 1`, CRuby's NoMethodError. The
        default is a run-time property (default_nil), so the plain getter,
        which answers default_v (0) for a miss, would fold it as 0. */
-    if ((rt == TY_STR_INT_HASH || rt == TY_INT_INT_HASH) && vt == TY_INT)
+    /* With a key of the hash's own kind and a right-hand side that cannot
+       touch the hash, the read finds the slot once and the store writes it
+       (opw_slot / opw_get / opw_put): a counting loop's `h[k] += 1` was two
+       probes, the second half its time. The right-hand side is a plain
+       Integer: a boxed one or an object is converted by a call (to_int,
+       coerce) that could change the hash between the read and the store. */
+    int ts = 0;
+    Repr rv = repr_of(c, v);
+    if ((rt == TY_STR_INT_HASH || rt == TY_INT_INT_HASH) && vt == TY_INT && !ok &&
+        rv.kind == RK_SCALAR && rv.as_ty == TY_INT && !subtree_has_side_effect(c, v)) {
+      ts = ++g_tmp;
+      buf_printf(b, "sp_int _t%d = sp_%sHash_opw_slot(_t%d, %s); ", ts, hn, ta, rk);
+      snprintf(slot, sizeof slot, "sp_oint_val(sp_%sHash_opw_get(_t%d, _t%d), \"%s\")", hn, ta, ts, op);
+    }
+    else if ((rt == TY_STR_INT_HASH || rt == TY_INT_INT_HASH) && vt == TY_INT)
       snprintf(slot, sizeof slot, "sp_oint_val(sp_%sHash_oget%s(_t%d, %s), \"%s\")", hn, rs, ta, rk, op);
     else
       snprintf(slot, sizeof slot, "sp_%sHash_get%s(_t%d, %s)", hn, rs, ta, rk);
@@ -25407,7 +25606,8 @@ void emit_index_op_write(Compiler *c, int id, Buf *b, int indent) {
     free(rhs);
     buf_puts(b, "; ");
     buf_printf(b, "if (sp_gc_is_frozen(_t%d)) sp_raise_frozen_hash_at(_t%d, %s); ", ta, ta, hash_box_cls(rt));
-    buf_printf(b, "sp_%sHash_set(_t%d, %s, %s_t%d%s); }\n", hn, ta, sk, ONE_HV_O(hn), tv, ONE_HV_C(hn));
+    if (ts) buf_printf(b, "sp_%sHash_opw_put(_t%d, _t%d, %s, _t%d); }\n", hn, ta, ts, sk, tv);
+    else buf_printf(b, "sp_%sHash_set(_t%d, %s, %s_t%d%s); }\n", hn, ta, sk, ONE_HV_O(hn), tv, ONE_HV_C(hn));
     return;
   }
 
@@ -25727,7 +25927,7 @@ void emit_index_and_or_write(Compiler *c, int id, Buf *b, int indent, int is_or)
     if (vt == TY_POLY) {
       buf_printf(b, "if (%ssp_poly_truthy(sp_%sHash_get(_t%d, _t%d))) ", is_or ? "!" : "", hn, ta, tb);
       int open = 0;
-      char *rhs = iow_guarded_rhs(c, v, IOW_RHS_BOXED, b, &open);
+      char *rhs = iow_frozen_hash_rhs(iow_guarded_rhs(c, v, IOW_RHS_BOXED, b, &open), ta, rt);
       buf_printf(b, "sp_%sHash_set(_t%d, _t%d, %s)", hn, ta, tb, rhs);
       iow_guard_close(rhs, open, b);
     }
@@ -25745,7 +25945,7 @@ void emit_index_and_or_write(Compiler *c, int id, Buf *b, int indent, int is_or)
       emit_slot_nil_test(c, vt, tc, is_or, b);
       buf_puts(b, ") ");
       int open = 0, oset = 0;
-      char *rhs = iow_guarded_hash_rhs(c, v, rt, b, &open, &oset);
+      char *rhs = iow_frozen_hash_rhs(iow_guarded_hash_rhs(c, v, rt, b, &open, &oset), ta, rt);
       /* (one-String mode: a String-valued Hash takes the value's bytes face) */
       buf_printf(b, "sp_%sHash_%s(_t%d, %s, %s%s%s)", hn, oset ? "oset" : "set", ta, sk, ONE_HV_O(hn), rhs, ONE_HV_C(hn));
       iow_guard_close(rhs, open, b);

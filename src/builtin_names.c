@@ -6,6 +6,7 @@
 #include <string.h>
 #include "types.h"
 #include "builtin_names.h"
+#include "analyze_internal.h"
 
 int is_zip_name(const char *n) {
   return sp_streq(n, "zip");
@@ -27,11 +28,15 @@ int is_record_class_builder(const char *recv, const char *meth) {
                           (sp_streq(recv, "Data") && sp_streq(meth, "define")));
 }
 
+/* Class.new: the builder of an anonymous class */
+int is_class_new(const char *recv, const char *meth) { return is_new_name(meth) && is_class_const_name(recv); }
+/* Module.new: the builder of an anonymous module */
+int is_module_new(const char *recv, const char *meth) { return is_new_name(meth) && is_module_const_name(recv); }
+
 /* Struct.new, Data.define, Class.new, Module.new: the builders of a class or a
    module, whose block runs as its body */
 int is_class_builder(const char *recv, const char *meth) {
-  return is_record_class_builder(recv, meth) ||
-         (recv && meth && sp_streq(meth, "new") && (sp_streq(recv, "Class") || sp_streq(recv, "Module")));
+  return is_record_class_builder(recv, meth) || is_class_new(recv, meth) || is_module_new(recv, meth);
 }
 
 /* Hash.new, Array.new, String.new, Object.new: a builtin's own constructor */
@@ -63,6 +68,9 @@ int is_kind_query(const char *n) {
   return sp_streq(n, "is_a?") || sp_streq(n, "kind_of?") || sp_streq(n, "instance_of?");
 }
 
+int is_instance_of_query(const char *n) { return n && sp_streq(n, "instance_of?"); }
+int is_case_eq(const char *n) { return n && sp_streq(n, "==="); }
+
 
 int is_round_family(const char *n) {
   return sp_streq(n, "round") || sp_streq(n, "ceil") || sp_streq(n, "floor") || sp_streq(n, "truncate");
@@ -82,6 +90,10 @@ int is_basic_arith(const char *n) {
 
 int is_int_arith_op(const char *n) {
   return is_basic_arith(n) || sp_streq(n, "%");
+}
+
+int is_object_class_name(const char *n) {
+  return sp_streq(n, "Object");
 }
 
 int is_object_root(const char *n) {
@@ -198,6 +210,15 @@ int is_tap_alias(const char *n) {
 
 int is_quantifier(const char *n) {
   return sp_streq(n, "all?") || sp_streq(n, "any?") || sp_streq(n, "none?") || sp_streq(n, "one?");
+}
+
+/* NameError or NoMethodError, whose .new takes the missing name second */
+int is_name_error_class(const char *n) {
+  return n && (sp_streq(n, "NameError") || sp_streq(n, "NoMethodError"));
+}
+
+int is_no_method_error_class(const char *n) {
+  return n && sp_streq(n, "NoMethodError");
 }
 
 int is_set_op(const char *n) {
@@ -374,6 +395,11 @@ int is_push_unshift(const char *n) {
          sp_streq(n, "unshift");
 }
 
+/* The names of the calls that add to $LOAD_PATH: Array's pushes and concat. */
+int is_load_path_write(const char *n) {
+  return is_array_push_family(n) || is_concat_name(n);
+}
+
 /* A call whose answer tells an object from a copy of it: its identity, or
    whether it is frozen (a copy of a String later frozen is not). */
 int is_identity_query(const char *n) {
@@ -478,6 +504,11 @@ int is_reflective_listing(const char *n) {
 int is_local_reflection(const char *n) {
   return sp_streq(n, "eval") || sp_streq(n, "binding") || sp_streq(n, "local_variable_get") ||
          sp_streq(n, "local_variable_set") || sp_streq(n, "local_variables");
+}
+
+/* Kernel#block_given?, which asks of the method it is written in */
+int is_block_given_name(const char *n) {
+  return sp_streq(n, "block_given?");
 }
 
 int is_find_alias(const char *n) {
@@ -590,6 +621,21 @@ int is_text_print(const char *n) {
   return sp_streq(n, "puts") || sp_streq(n, "print");
 }
 
+/* the output calls a singleton-class body runs where they stand */
+int is_stmt_output_name(const char *n) {
+  return n && (sp_streq(n, "puts") || sp_streq(n, "print") || sp_streq(n, "p"));
+}
+
+/* the Kernel calls that act (output, an exception, exit) and so run where
+   they stand in a class body, as CRuby runs it top to bottom */
+int is_class_body_acting_name(const char *n) {
+  static const char *const names[] = { "puts", "print", "p", "pp", "printf",
+    "putc", "warn", "raise", "fail", "exit", "exit!", "abort", "sleep", "at_exit",
+    "srand", "loop", "catch", NULL };
+  for (int i = 0; n && names[i]; i++) if (sp_streq(n, names[i])) return 1;
+  return 0;
+}
+
 int is_printf_name(const char *n) {
   return sp_streq(n, "printf");
 }
@@ -641,6 +687,10 @@ int is_class_plain_query(const char *n) {
   return visibility_of_name(n) != 0;
 }
 
+int is_class_compare(const char *n) {
+  return sp_streq(n, "==") || sp_streq(n, "!=") || sp_streq(n, "equal?") || sp_streq(n, "eql?");
+}
+
 int is_class_self_answer(const char *n) {
   return n && (is_mixin_call(n) || sp_streq(n, "private_class_method") || sp_streq(n, "public_class_method") ||
                sp_streq(n, "private_constant") || sp_streq(n, "public_constant") ||
@@ -649,6 +699,12 @@ int is_class_self_answer(const char *n) {
 
 int is_self_rebinding_call(const char *n) {
   return is_eval_exec_family(n) || sp_streq(n, "define_singleton_method");
+}
+/* ...and every call whose block runs with another self than the code
+   around it: those, define_method's (an instance), a class builder's (the
+   new class) */
+int is_block_self_call(const char *recv, const char *n) {
+  return n && (is_self_rebinding_call(n) || is_define_method_name(n) || is_class_builder(recv, n));
 }
 
 int is_class_relatives_query(const char *n) {
@@ -688,13 +744,35 @@ int is_constants_list_name(const char *n) {
   return sp_streq(n, "constants");
 }
 
+int is_autoload_query_name(const char *n) {
+  return sp_streq(n, "autoload?");
+}
+
+/* the hook a constant's definition calls on its namespace */
+int is_const_added_name(const char *n) {
+  return sp_streq(n, "const_added");
+}
+
 /* the methods a definition runs when the program defines them: inherited
-   (class), included, extended, prepended, method_added and its singleton
-   kin, const_added */
+   (class), included, extended, prepended, method_added, method_removed,
+   method_undefined and their singleton kin, const_added */
 int is_definition_hook_name(const char *n) {
+  return is_module_hook_name(n) || is_basic_object_hook_name(n);
+}
+
+/* ...the ones Class and Module define: their methods stand before Object's,
+   so a top-level def of the name is no hook */
+int is_module_hook_name(const char *n) {
   return sp_streq(n, "inherited") || sp_streq(n, "included") || sp_streq(n, "extended") ||
-         sp_streq(n, "prepended") || sp_streq(n, "method_added") ||
-         sp_streq(n, "singleton_method_added") || sp_streq(n, "const_added");
+         sp_streq(n, "prepended") || sp_streq(n, "method_added") || sp_streq(n, "method_removed") ||
+         sp_streq(n, "method_undefined") || is_const_added_name(n);
+}
+
+/* ...and the ones BasicObject defines (the singleton forms): its methods
+   stand after Object's, so a top-level def of the name is one */
+int is_basic_object_hook_name(const char *n) {
+  return sp_streq(n, "singleton_method_added") || sp_streq(n, "singleton_method_removed") ||
+         sp_streq(n, "singleton_method_undefined");
 }
 
 /* The hooks definition form `form` (given its arguments) fires, on the
@@ -717,8 +795,9 @@ int definition_form_hooks(const char *form, int sg, const char **out) {
   return 0;
 }
 
+const char METHOD_MISSING_NAME[] = "method_missing";
 int is_method_missing_name(const char *n) {
-  return n && (sp_streq(n, "method_missing") || sp_streq(n, "respond_to_missing?"));
+  return n && (sp_streq(n, METHOD_MISSING_NAME) || sp_streq(n, "respond_to_missing?"));
 }
 
 int is_const_missing_name(const char *n) {
@@ -814,6 +893,15 @@ int is_bivar_keyed_class(const char *n) {
   /* (a String's table is keyed by its shared handle: the share walk gives
      a String an instance variable is kept on that identity) */
   return sp_streq(n, "Array") || sp_streq(n, "Hash") || sp_streq(n, "Random") || sp_streq(n, "String");
+}
+/* A runtime handle with no ivar slots whose attributes live in a store of
+   its own (the walk's attr form, desugar_handle_ivars): the store's reader
+   (write 0) or writer, a Thread's thread-local table or a Fiber's storage;
+   NULL for any other class */
+const char *handle_attr_store(const char *n, int write) {
+  if (sp_streq(n, "Thread")) return write ? "thread_variable_set" : "thread_variable_get";
+  if (sp_streq(n, "Fiber")) return write ? "__storage_set" : "__storage_get";
+  return NULL;
 }
 int is_string_class_name(const char *n) {
   return sp_streq(n, "String");
@@ -1272,6 +1360,19 @@ int is_queue_class_name(const char *n) {
   return sp_streq(n, "Queue") || sp_streq(n, "SizedQueue");
 }
 
+/* The four builtin classes that also live under Thread (`Thread::Mutex`). */
+int is_thread_class_name(const char *n) {
+  return is_queue_class_name(n) || sp_streq(n, "Mutex") || sp_streq(n, "ConditionVariable");
+}
+
+int is_thread_const_name(const char *n) { return n && sp_streq(n, "Thread"); }
+
+/* A constant whose use makes the program threaded: Thread, Monitor and the
+   classes under Thread. */
+int is_threading_name(const char *n) {
+  return is_thread_const_name(n) || sp_streq(n, "Monitor") || is_thread_class_name(n);
+}
+
 int is_standard_output_global(const char *n) {
   return sp_streq(n, "$stdout") || sp_streq(n, "$stderr");
 }
@@ -1404,6 +1505,16 @@ int is_autoload_name(const char *n) { return sp_streq(n, "autoload"); }
 int is_file_load_name(const char *n) {
   return n && (is_require_name(n) || is_load_name(n) || is_autoload_name(n));
 }
+/* The builtin exception classes a `rescue` names that catch a LoadError:
+   LoadError and the classes above it (ScriptError, Exception) */
+int is_load_error_catch_name(const char *n) {
+  return n && (sp_streq(n, "LoadError") || sp_streq(n, "ScriptError") || sp_streq(n, "Exception"));
+}
+/* ...and the ScriptError family: ScriptError and the classes below it */
+int is_script_error_name(const char *n) {
+  return n && (sp_streq(n, "ScriptError") || sp_streq(n, "LoadError") || sp_streq(n, "NotImplementedError") ||
+               sp_streq(n, "SyntaxError"));
+}
 /* A LoadNode's `how` (spinel_parse.c, sp_load_resolve) that names no file
    at compile time: one not there (LoadError when it runs, for the feature
    the node carries), or a path the require computes when it runs
@@ -1425,6 +1536,25 @@ int is_native_lib_at_boot(const char *path) { return path && sp_streq(path, "mon
 
 int is_enumerable_module_name(const char *n) {
   return n && sp_streq(n, "Enumerable");
+}
+
+/* The index of n among the methods `extend Enumerable` sends from a class
+   to an instance-side twin, unless a class method of the name comes first
+   (desugar_extend_enumerable), or -1 */
+int extend_enumerable_name_index(const char *n) {
+  static const char *const names[] = {
+    "all?", "any?", "chain", "chunk", "chunk_while", "collect", "collect_concat", "compact", "count",
+    "cycle", "detect", "drop", "drop_while", "each_cons", "each_entry", "each_slice", "each_with_index",
+    "each_with_object", "entries", "filter", "filter_map", "find", "find_all", "find_index", "first",
+    "flat_map", "grep", "grep_v", "group_by", "include?", "inject", "lazy", "map", "max", "max_by",
+    "member?", "min", "min_by", "minmax", "minmax_by", "none?", "one?", "partition", "reduce", "reject",
+    "reverse_each", "select", "slice_after", "slice_before", "slice_when", "sort", "sort_by", "sum",
+    "take", "take_while", "tally", "to_a", "to_h", "to_set", "uniq", "zip",
+    "is_a?", "kind_of?",   /* (the test of Enumerable itself, which a class method may answer too) */
+    NULL };
+  _Static_assert(sizeof names / sizeof names[0] == EXTEND_ENUMERABLE_NNAMES + 1, "EXTEND_ENUMERABLE_NNAMES counts the names");
+  for (int i = 0; n && i < EXTEND_ENUMERABLE_NNAMES; i++) if (sp_streq(names[i], n)) return i;
+  return -1;
 }
 
 int is_comparable_module_name(const char *n) {
@@ -1451,12 +1581,17 @@ BuiltinDefaultCmp builtin_default_cmp(int family) {
    public methods as CRuby 4.0 lists them: Integer and Float are Numeric and
    Comparable, String and Symbol Comparable, Array, Hash and Range
    Enumerable. The builtin table holds each class's own methods only. */
+/* Comparable's own instance methods, which a class that includes the
+   module answers */
+int is_comparable_module_method(const char *m) {
+  static const char *const cmp[] = { "<", "<=", "==", ">", ">=", "between?", "clamp", NULL };
+  return builtin_name_in(m, cmp);
+}
+
 /* Comparable's own methods on a builtin class that includes it: Integer,
    Float, String and Symbol. */
 int builtin_comparable_owns(const char *cls, const char *m) {
-  static const char *const cmp[] = { "<", "<=", "==", ">", ">=", "between?", "clamp", NULL };
-  return is_comparable_builtin_name(cls) &&
-         builtin_name_in(m, cmp);
+  return is_comparable_builtin_name(cls) && is_comparable_module_method(m);
 }
 
 /* Method#arity of a Comparable method: between?(min, max), clamp(min, max)
@@ -1613,6 +1748,15 @@ int is_enumerator_with(const char *n) {
   return sp_streq(n, "with_index") || sp_streq(n, "with_object");
 }
 int is_lazy_name(const char *n) { return n && sp_streq(n, "lazy"); }
+/* A call that answers a lazy enumerator on one (Enumerator::Lazy's own
+   methods that return one, `lazy` too): its block runs once the chain is
+   forced. zip, eager, force and to_enum are not among them. */
+int is_lazy_chain_name(const char *n) {
+  static const char *const LAZY[] = { "chunk", "chunk_while", "collect", "collect_concat", "compact", "drop", "drop_while",
+    "filter", "filter_map", "find_all", "flat_map", "grep", "grep_v", "lazy", "map", "reject", "select", "slice_after",
+    "slice_before", "slice_when", "take", "take_while", "uniq", "with_index", NULL };
+  return n && builtin_name_in(n, LAZY);
+}
 int is_concat_name(const char *n) { return sp_streq(n, "concat"); }
 
 /* `Array.new(...)`, by its receiver's constant name and the method */
@@ -1715,6 +1859,61 @@ int builtin_object_method_known(const char *m) {
   return m && builtin_name_in(m, OBJM2);
 }
 
+/* A question whether a receiver has a method: of one by name (1), or a
+   list of its methods: one that answers the whole program (2), or one a
+   receiver's own chain decides (3) */
+int is_method_presence_query(const char *n) {
+  static const char *const by_name[] = { "respond_to?", "method_defined?", "public_method_defined?",
+    "private_method_defined?", "protected_method_defined?", "instance_method", "public_instance_method",
+    "method", "public_method", NULL };
+  static const char *const lists[] = { "instance_methods", "public_instance_methods", "methods", "public_methods", NULL };
+  static const char *const chain_lists[] = { "private_instance_methods", "protected_instance_methods",
+    "private_methods", "protected_methods", "singleton_methods", NULL };
+  return builtin_name_in(n, by_name) ? 1 : builtin_name_in(n, lists) ? 2 : builtin_name_in(n, chain_lists) ? 3 : 0;
+}
+/* A list of an object's own singleton methods (a class's, asked of the class) */
+int is_singleton_method_list(const char *n) { return n && sp_streq(n, "singleton_methods"); }
+/* A list of a class's instance methods, asked of the class or module itself
+   (the others, asked of a class, list its class methods) */
+int is_instance_method_list(const char *n) {
+  static const char *const names[] = { "instance_methods", "public_instance_methods", "private_instance_methods",
+    "protected_instance_methods", NULL };
+  return builtin_name_in(n, names);
+}
+/* The Module methods that read a class's method table: the instance-method
+   lists and instance_method */
+int is_instance_method_table_read(const char *n) { return n && (is_instance_method_list(n) || sp_streq(n, "instance_method")); }
+/* Does the builtin Module / Class method n answer from its receiver's
+   class: an instance-method listing, const_defined?, class_variable_get,
+   class_variable_set, class_variable_defined? (the Class emitters a
+   class-tag arm tells its class, view_push_class_is)? */
+int is_class_value_reflection(const char *n) {
+  static const char *const names[] = { "const_defined?", "class_variable_get", "class_variable_set",
+    "class_variable_defined?", NULL };
+  return n && (is_instance_method_list(n) || builtin_name_in(n, names));
+}
+/* Does every object (with cmeth, every class and module too) answer m with
+   a builtin method: one of Object's own, Kernel's or Object's (Module's)? */
+int builtin_every_object_answers(const char *m, int cmeth) {
+  return builtin_object_method_known(m) || builtin_method_known("Kernel", m) || builtin_method_known("Object", m) ||
+         (cmeth && builtin_method_known("Module", m));
+}
+/* Does the builtin class of cls_id id (class_builtin_parent's answer), or
+   a builtin class above it, answer m with a method of its own (with
+   cmeth, a class method)? Every name the facts carry counts, the
+   instance-count rows (Exception#message, ...) included */
+int builtin_class_id_answers(int id, const char *m, int cmeth) {
+  for (int depth = 0; id && m && depth < 16; id = builtin_class_parent_id(id), depth++) {
+    const BuiltinClass *r = NULL;
+    for (int i = 0; (r = builtin_class_at(i)) && r->id != id; i++) {}
+    const char *nm[2] = { r ? r->name : NULL, r && (r->flags & BC_EXCEPTION) ? "Exception" : NULL };
+    for (int j = 0; j < 2; j++)
+      if (nm[j] && (cmeth ? builtin_cmethod_known(nm[j], m) : builtin_instance_method_known(nm[j], m))) return 1;
+    if (id == builtin_class_parent_id(id)) break;   /* (Object) */
+  }
+  return 0;
+}
+
 /* The names CRuby's own facts give Object, BasicObject, Kernel, Module and
    Class (builtin_arity.inc), sorted once per self kind for
    builtin_self_method_known */
@@ -1777,6 +1976,25 @@ int is_define_method_name(const char *n) {
   return n && sp_streq(n, "define_method");
 }
 int is_define_singleton_method_name(const char *n) { return n && sp_streq(n, "define_singleton_method"); }
+/* Kernel#singleton_class */
+int is_singleton_class_name(const char *n) { return n && sp_streq(n, "singleton_class"); }
+/* The receiver parameter of a method a builtin's reopening defines (String,
+   Array): `def self.m` there names it, and the object it is a method of is the
+   builtin one, whose class-method filing the walk keeps */
+int is_reopen_self_name(const char *n) { return n && sp_streq(n, "__self"); }
+/* The ffi gem's and native_func's declarations, which a step before the
+   registration's walk turns into methods (desugar_ffi_library_functions,
+   desugar_native_func_defs) */
+int is_ffi_decl_name(const char *n) {
+  return n && (sp_streq(n, "ffi_lib") || sp_streq(n, "ffi_lib_flags") || sp_streq(n, "ffi_convention") ||
+               sp_streq(n, "attach_function") || sp_streq(n, "attach_variable") || sp_streq(n, "callback") ||
+               sp_streq(n, "native_func") || sp_streq(n, "ffi_func"));
+}
+/* Module#method_defined? and its visibility kin */
+int is_method_defined_query(const char *n) {
+  return n && (sp_streq(n, "method_defined?") || sp_streq(n, "public_method_defined?") ||
+               sp_streq(n, "private_method_defined?") || sp_streq(n, "protected_method_defined?"));
+}
 int is_undef_method_name(const char *n) { return n && sp_streq(n, "undef_method"); }
 int is_remove_method_name(const char *n) { return n && sp_streq(n, "remove_method"); }
 
@@ -2033,6 +2251,15 @@ static const BuiltinClass BUILTIN_CLASSES[] = { SP_BUILTIN_CLASSES(X) };
 const BuiltinClass *builtin_class_at(int i) {
   return i >= 0 && i < BUILTIN_CLASS_N ? &BUILTIN_CLASSES[i] : NULL;
 }
+/* Is a yielding method a program's reopening of builtin class `core`
+   (CORE_*) defines called through its proc form, with the call's block as a
+   proc, since it has no function of its own? (The Array, Hash, NilClass,
+   Numeric and Object reopenings are reached another way.) */
+int core_reopen_calls_proc_form(int core) {
+  return core == CORE_STRING || core == CORE_INTEGER || core == CORE_FLOAT || core == CORE_SYMBOL ||
+         core == CORE_RANDOM || core == CORE_FIBER || core == CORE_THREAD || core == CORE_RANGE ||
+         core == CORE_TIME;
+}
 /* The core class of a receiver kind; each reader keeps its own kind filter. */
 int core_of_type(TyKind t) {
   if (t == TY_INT || t == TY_BIGINT) return CORE_INTEGER;
@@ -2056,6 +2283,7 @@ int core_of_type(TyKind t) {
   if (t == TY_COMPLEX) return CORE_COMPLEX;
   if (t == TY_PROC) return CORE_PROC;
   if (t == TY_QUEUE) return CORE_QUEUE;
+  if (t == TY_MUTEX) return CORE_MUTEX;
   if (t == TY_EXCEPTION) return CORE_EXCEPTION;
   return -1;
 }
@@ -2094,6 +2322,10 @@ int is_plain_builtin_superclass(int id) {
 
 /* ---- the compile-time evaluation and its questions ---- */
 int is_class_const_name(const char *n) { return n && sp_streq(n, "Class"); }
+int is_module_const_name(const char *n) { return n && sp_streq(n, "Module"); }
+int is_hash_const_name(const char *n) { return n && sp_streq(n, "Hash"); }
+int is_erb_const_name(const char *n) { return n && sp_streq(n, "ERB"); }
+int is_ffi_registry_name(const char *n) { return n && sp_streq(n, "FFI__Registry"); }
 int is_hash_read_only(const char *n) {
   static const char *const R[] = { "each", "each_pair", "[]", "fetch", "key?", "has_key?", "include?",
     "member?", "key", "keys", "values", "size", "length", "empty?", "dig", "to_a", "frozen?", "freeze",
@@ -2158,6 +2390,15 @@ int is_const_visibility_name(const char *n) {
 }
 /* class_variable_set remove_class_variable */
 int is_cvar_write_name(const char *n) { return n && (sp_streq(n, "class_variable_set") || sp_streq(n, "remove_class_variable")); }
+int is_cvar_set_name(const char *n) { return n && sp_streq(n, "class_variable_set"); }
+int is_cvar_get_name(const char *n) { return n && sp_streq(n, "class_variable_get"); }
+int is_cvar_defined_name(const char *n) { return n && sp_streq(n, "class_variable_defined?"); }
+/* class_variable_get class_variable_set class_variable_defined?: the
+   reflection on one class variable of self's class, by its name */
+int is_cvar_reflection_name(const char *n) {
+  static const char *const names[] = { "class_variable_get", "class_variable_set", "class_variable_defined?", NULL };
+  return n && builtin_name_in(n, names);
+}
 int is_hook_protocol_name(const char *n) {
   return n && (sp_streq(n, "append_features") || sp_streq(n, "extend_object") || sp_streq(n, "prepend_features"));
 }
@@ -2231,7 +2472,7 @@ int is_constless_builtin_name(const char *n) {
   static const char *const names[] = {
     "Object", "BasicObject", "Kernel", "Comparable", "Enumerable", "Array", "Hash", "String",
     "Integer", "Numeric", "Struct", "Data", "Symbol", "Proc", "Range", "Module", "Class", "Time",
-    "Rational", "Dir", "Fiber", "Mutex", "Queue", "SizedQueue", "ConditionVariable", "MatchData",
+    "Rational", "Fiber", "Mutex", "Queue", "SizedQueue", "ConditionVariable", "MatchData",
     "Method", "UnboundMethod", "NilClass", "TrueClass", "FalseClass", "Signal", "Warning", NULL
   };
   for (int i = 0; names[i]; i++) if (sp_streq(names[i], n)) return 1;

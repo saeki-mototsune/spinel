@@ -403,11 +403,12 @@ static int nf_class_excludes_nil(Compiler *c, int p) {
      nil is no instance of one, but it is of a builtin module */
   if (comp_class_index(c, k) < 0)
     return ak == NK_ConstantReadNode && is_builtin_class_name(k) && !is_builtin_module_name(k);
-  NT_FOREACH_KIND(nt, NK_ModuleNode, m) {
-    int cp = nt_ref(nt, m, "constant_path");
-    const char *mn = cp >= 0 ? nt_str(nt, cp, "name") : NULL;
-    if (mn && sp_streq(mn, k)) return 0;
-  }
+  int ndk = 0; const NodeKind *dk = class_def_module_kinds(&ndk);
+  for (int dh = 0; dh < ndk; dh++)
+    NT_FOREACH_KIND(nt, dk[dh], m) {
+      const char *mn = class_def_is_module(nt, m) ? class_def_name(nt, m) : NULL;
+      if (mn && sp_streq(mn, k)) return 0;
+    }
   return 1;
 }
 static int nf_truthy_implies(Compiler *c, int p, const char *nm) {
@@ -1653,7 +1654,7 @@ static void nf_calls(NF *f, int **yields, int *nyields) {
     if (mi < 0 && sp_streq(cn, "new")) {
       int k = -1;
       if (r >= 0 && (nt_kind(nt, r) == NK_ConstantReadNode || nt_kind(nt, r) == NK_ConstantPathNode))
-        k = comp_class_index(c, nt_str(nt, r, "name"));
+        k = const_node_class_index(c, r);
       else if (r < 0 || nt_kind(nt, r) == NK_SelfNode) {
         Scope *s = comp_scope_of(c, id);
         if (s && s->is_cmethod && s->class_id >= 0) k = s->class_id;

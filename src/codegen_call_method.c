@@ -601,11 +601,20 @@ int emit_op_method_parameters(Compiler *c, const BopCtx *x, Buf *b) {
   return 0;
 }
 
-static void emit_method_owner_class(Compiler *c, int mi, Buf *b) {
+/* Is method mi a method of its class's singleton, as a Method of it names
+   its owner: a class method of the class's own, not a copy (a module's, an
+   inherited one specialized for the class, an extend's), unless taken as an
+   instance method (unbound; a module function is both) */
+static int method_owner_singleton(Compiler *c, int mi, int unbound) {
+  const Scope *m = &c->scopes[mi];
+  return m->is_cmethod && !m->origin_module_ci && !m->is_cmethod_copy && m->class_id >= 0 && !unbound;
+}
+
+static void emit_method_owner_class(Compiler *c, int mi, int unbound, Buf *b) {
   const Scope *m = &c->scopes[mi];
   int ci = m->origin_module_ci ? m->origin_module_ci - 1 : m->class_id;
   if (ci < 0) buf_puts(b, "((sp_Class){(sp_int)-1, SPL(\"Object\")})");
-  else if (m->is_cmethod && !m->origin_module_ci) buf_printf(b, "((sp_Class){sp_sclass_id(%d), NULL})", ci);
+  else if (method_owner_singleton(c, mi, unbound)) buf_printf(b, "((sp_Class){sp_sclass_id(%d), NULL})", ci);
   else buf_printf(b, "((sp_Class){%d, NULL})", ci);
 }
 
@@ -616,13 +625,14 @@ int emit_op_method_owner(Compiler *c, const BopCtx *x, Buf *b) {
   int recv = x->recv;
   CallPlan plan = cplan_method_call(c, x->id);
   int mn = plan.method_node, target = plan.mi;
+  int unbound = mn >= 0 && is_instance_method_name(nt_str(nt, mn, "name"));
   if (plan.dispatch == CP_SWITCH) {
     int to[VER_MAX_ARMS + 1], n = ver_entry_targets(c, target, to, NULL), tr = ++g_tmp;
     buf_printf(b, "({ sp_BoundMethod *_t%d = ", tr); emit_expr(c, recv, b);
     buf_printf(b, "; SP_GC_ROOT(_t%d); ", tr);
     for (int i = 0; i < n; i++) {
       if (i < n - 1) buf_printf(b, "_t%d->fn == (sp_int)(uintptr_t)&%s ? ", tr, mc_method(c, &c->scopes[to[i]]));
-      emit_method_owner_class(c, to[i], b);
+      emit_method_owner_class(c, to[i], unbound, b);
       if (i < n - 1) buf_puts(b, " : ");
     }
     buf_puts(b, "; })");
@@ -633,14 +643,17 @@ int emit_op_method_owner(Compiler *c, const BopCtx *x, Buf *b) {
   int mrecv = mn >= 0 ? nt_ref(nt, mn, "receiver") : -1;
   if (target >= 0 && !is_bam) {
     /* a method a module provides is owned by that module, however many
-       classes include it (#3662) */
+       classes include it (#3662); a class method by its class's singleton */
     int ocid = c->scopes[target].origin_module_ci
                  ? c->scopes[target].origin_module_ci - 1
                  : c->scopes[target].class_id;
     const char *ocn = ocid >= 0 ? (class_ruby_name(c, ocid) ? class_ruby_name(c, ocid)
                                                             : c->classes[ocid].name) : "Object";
     buf_printf(b, "((void)("); emit_expr(c, recv, b);
-    buf_printf(b, "), ((sp_Class){(sp_int)-1, SPL(\"%s\")}))", ocn);
+    buf_puts(b, "), ");
+    if (method_owner_singleton(c, target, unbound)) emit_method_owner_class(c, target, unbound, b);
+    else buf_printf(b, "((sp_Class){(sp_int)-1, SPL(\"%s\")})", ocn);
+    buf_puts(b, ")");
     return 1;
   }
   if (mrecv >= 0) {
@@ -1704,7 +1717,7 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
     if (recv >= 0 && !bam_poly && repr_of(c, recv).kind == RK_BOXED) {
       buf_puts(b, "({ sp_RbVal _rpm = ");
       emit_expr(c, recv, b);
-      buf_puts(b, "; SP_GC_ROOT_RBVAL(_rpm); sp_raise_cls(\"NoMethodError\", sp_nomethod_msg(");
+      buf_puts(b, "; SP_GC_ROOT_RBVAL(_rpm); sp_raise_cls(\"NameError\", sp_nomethod_class_msg(");
       emit_str_literal(b, sym);
       buf_puts(b, ", _rpm)); (sp_BoundMethod *)0; })");
       return 1;
@@ -1921,7 +1934,9 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
         /* An undefined name is CRuby's immediate NameError (#2752): with a
            concretely-typed receiver, accept only names the builtin table (or
            the universal Object surface) knows; everything else raises now,
-           not at call time. A poly/unknown receiver keeps the lenient path. */
+           not at call time. A poly/unknown receiver keeps the lenient path.
+           The message names the receiver's class, as CRuby's does
+           ("for class 'NilClass'"), the program's own by its Ruby name. */
         TyKind nrt = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN;
         const char *ncls = nrt == TY_STRING ? "String" : nrt == TY_INT ? "Integer"
                          : nrt == TY_FLOAT ? "Float" : nrt == TY_SYMBOL ? "Symbol"
@@ -1933,10 +1948,17 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
         if (ncls && builtin_method_arity(ncls, sym, &nba)) nknown = 1;
         if (builtin_object_method_known(sym)) nknown = 1;
         if (ncls && !nknown) {
-          buf_printf(b, "(sp_int)(sp_raise_cls(\"NameError\","
-                        " sp_sprintf(\"undefined method '%s' for %%s\","
-                        " \"an instance of %s\")), 0)",
-                     sym, ncls);
+          const char *shown = nrt == TY_NIL ? "NilClass" : ncls;
+          if (ty_is_object(nrt)) {
+            const char *rn = class_ruby_name(c, ty_object_class(nrt));
+            shown = rn ? rn : c->classes[ty_object_class(nrt)].name;
+          }
+          buf_puts(b, "(sp_int)(sp_raise_cls(\"NameError\", sp_sprintf(\"undefined method '");
+          buf_puts(b, sym);
+          buf_puts(b, "' for class '%s'\", ");
+          if (nrt == TY_BOOL) { buf_puts(b, "("); emit_expr(c, recv, b); buf_puts(b, ") ? \"TrueClass\" : \"FalseClass\""); }
+          else buf_printf(b, "\"%s\"", shown);
+          buf_puts(b, ")), 0)");
         }
         else buf_puts(b, "(sp_int)0");  /* builtin/Kernel method: no callable address */
       }
@@ -2182,14 +2204,30 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
      Proc slot into NoMethodError. */
   /* Proc#yield is #call as well; a Method has no `yield`, so one read out
      of the slot raises NoMethodError, as anything else that is no Proc
-     does (is_yield below) */
+     does (is_yield below). So is a Proc's or a Method's `[]` with no
+     argument, which the index paths, all of one argument or more, never
+     take: `fs[0][]` raised NoMethodError for a Proc. A String, an Array or
+     a Hash there has raised its ArgumentError already (the arity guard),
+     and a program class with a `[]` of its own keeps the dispatch. So does
+     one with a class method of the name that has an arm there
+     (cplan_cmethod_arm): its class-value dispatch tests for a Class first
+     and emits the call again for anything else (g_cls_tag_skip), and there
+     the Proc or the Method is called here. A class method nothing calls has
+     no arm, so it leaves the call here. A `class << self` accessor of the
+     name (`attr_accessor :call`) is read by the same dispatch, which comes
+     back here for anything else. */
+  int is_aref0 = sp_streq(name, "[]") && argc == 0;
   if (recv >= 0 &&
-      (sp_streq(name, "call") || sp_streq(name, "()") || sp_streq(name, "yield")) &&
-      repr_of(c, recv).kind == RK_BOXED) {
+      (sp_streq(name, "call") || sp_streq(name, "()") || sp_streq(name, "yield") || is_aref0) &&
+      repr_of(c, recv).kind == RK_BOXED &&
+      (g_cls_tag_skip == id || !cls_value_sg_accessor_named(c, name, argc))) {
     int has_user_call = 0;
     for (int _k = 0; _k < c->nclasses && !has_user_call; _k++) {
       int umi = call_target(c, id, _k, name, CT_OWN, NULL);
-      if ((umi >= 0 && argc >= c->scopes[umi].nrequired) || (argc == 0 && comp_reader_in_chain(c, _k, name, NULL)))
+      int cmi = g_cls_tag_skip != id ? cplan_cmethod_arm(c, id, _k, name, NULL, NULL) : -1;
+      if ((umi >= 0 && (is_aref0 || argc >= c->scopes[umi].nrequired)) ||
+          (cmi >= 0 && (is_aref0 || argc >= c->scopes[cmi].nrequired)) ||
+          (argc == 0 && comp_reader_in_chain(c, _k, name, NULL)))
         has_user_call = 1;
     }
     /* A call of any count: the slots are sized for it, and an argument past
@@ -2217,11 +2255,13 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
          NoMethodError for anything else, a Method included */
       int is_yield = sp_streq(name, "yield");
       char yield_else[96] = "";
-      if (is_yield) {
+      if (is_yield || is_aref0) {
         buf_printf(b, "(_t%d.tag == SP_TAG_OBJ && _t%d.v.p && (_t%d.cls_id == SP_BUILTIN_PROC ||"
-                      " _t%d.cls_id == SP_BUILTIN_CURRY) ? ", t, t, t, t);
+                      " _t%d.cls_id == SP_BUILTIN_CURRY", t, t, t, t);
+        if (is_aref0) buf_printf(b, " || _t%d.cls_id == SP_BUILTIN_METHOD", t);
+        buf_puts(b, ") ? ");
         snprintf(yield_else, sizeof yield_else,
-                 " : (sp_raise_nomethod(sp_nomethod_msg(\"yield\", _t%d)), sp_box_nil()))", t);
+                 " : (sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), sp_box_nil()))", name, t);
       }
       /* the poly callable may be a Proc or a bound Method (different ABIs).
          Under promote the bound method is poly-signatured, so call it through

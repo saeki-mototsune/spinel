@@ -69,11 +69,15 @@ typedef struct {
   unsigned char rkind;     /* CP_REFUSE: CplanRefuse */
   const char *msg;         /* CP_REFUSE: the message, as the compiler prints it */
   unsigned char rfrom;     /* CP_REFUSE: CplanRefuseFrom */
+  unsigned char core_hook; /* a super in a class method that reaches only a core hook's no-op: nothing of the program's answers it, and emit_super answers nil */
   const char *delegate;     /* the protocol method name, before alias resolution */
 } CallPlan;
 
 int cplan_accessor_classes(Compiler *c, int id, int *out, int cap);
 int cplan_super_chain_mi(Compiler *c, int id, Scope *s, int par, const char *name);
+/* ...and the method `super` in s reaches (its prepend chain's next, else
+   that), *at the class it is found from */
+int cplan_super_target(Compiler *c, int id, Scope *s, int *at);
 /* A conversion performed by a helper, separately from the enclosing call. */
 CallPlan cplan_conversion(Compiler *c, int ci, const char *name);
 CallPlan cplan_method_call(Compiler *c, int id);
@@ -105,6 +109,17 @@ enum { CT_CMETHOD = 1, CT_OWN = 2, CT_TOP = 4, CT_REACH = 8, CT_CAPTURE = 16 };
    last version. Super contributes the enclosing method's original name. */
 int call_node_names(Compiler *c, int id, const char *out[2]);
 int call_target(Compiler *c, int id, int cls, const char *name, unsigned flags, int *def_class);
+/* Does the Class row for call id, named name, on the class value recv answer
+   the call? Not where a class method of the program's does (the plan binds
+   it a target), nor where the row is a private method's and the call names
+   an explicit receiver and does not ignore visibility (a send does): that is
+   NoMethodError. */
+int cplan_class_row(Compiler *c, int id, int recv, const char *name);
+/* Is class value recv, of call id, proven a Class and not a Module: a program
+   class (not a module) it names, a core class, `Class.new`, `self` in a class
+   body, or a superclass reference of a class made (the fired hook's receiver)?
+   A Class-only row (BOPF_CLASS_ONLY) answers a call on such a receiver only. */
+int cplan_recv_class(Compiler *c, int id, int recv);
 /* the classes a call of a versioned name (ct_version_named) may run on,
    each handed to fn with the flags call_target is asked with */
 int ct_version_named(Compiler *c, const char *nm);
@@ -124,8 +139,17 @@ void ver_prepend_cell_name(int cell, char out[32]);
    when after): the write, for the caller to record (elab_record_write) */
 int ver_cell_put(Compiler *c, const char *cell, int list, int at, int after, int v);
 void ver_cells_write(Compiler *c);
+/* forgets the versions the calls were answered (Compiler.ver_memo), for a
+   fact they read that changed */
+void ver_memo_drop(Compiler *c);
+int ver_entries_demand(Compiler *c);
+/* Is call id the builtin an entry's else arm runs on self (VK_BUILTIN)? It
+   renders the class by the builtin's own table, not by a class method the
+   program defines: that method is the one the entry has not reached */
+int cplan_pinned_builtin(const Compiler *c, int id);
 /* the methods entry scope e's arms call, its else arm's last: at most
-   VER_MAX_ARMS + 1 */
+   VER_MAX_ARMS + 1; an open history's else arm, which calls none, as its
+   last version (the method a Method object of it captured before) */
 enum { VER_MAX_ARMS = 64 };
 int ver_entry_targets(const Compiler *c, int e, int *out, int *tests);
 int cplan_bool_sides(Compiler *c, int id, int *tmi, int *fmi);
@@ -154,6 +178,12 @@ int cplan_initializers(Compiler *c, int id, int *out, int cap);
    receiver and add members, and nothing here promises a set only grows. */
 enum { CPT_UNKNOWN = -1, CPT_MAX = 64 };
 int cplan_targets(Compiler *c, int id, int *out, int cap);
+/* cplan_targets, for a reader that wants the code the call's emission
+   names (reachability): the same answer, but for a call on a boxed receiver
+   the methods of the arms its dispatch has, which the receiver's class
+   facts bound, not every class's method of the name; and for a send on one,
+   the top-level method it falls back to (send_fallback). */
+int cplan_emitted_targets(Compiler *c, int id, int *out, int cap);
 /* Why cplan_targets answers CPT_UNKNOWN for call id: its members are more
    than cap (CPT_WHY_CAP), or its receiver is of a type the analysis did not
    settle (CPT_WHY_RECV_UNTYPED) -- the two ct_resolve gives up on, whose
@@ -172,6 +202,17 @@ unsigned cplan_targets_drops(void);
    can only raise ArgumentError, and answers nothing. */
 TyKind cplan_poly_operator_ret(Compiler *c, int id);
 int cplan_target_binds(Compiler *c, int id, int mi);
+/* Can method mi run with argc plain positional arguments (no keyword hash)?
+   A def the program writes says (cplan_target_binds' judgement); anything
+   else -- a define_method block, an accessor, a wrapper the compiler made --
+   takes every count. */
+int cplan_def_takes_argc(Compiler *c, int mi, int argc);
+/* Is call id a class body's call on self (receiverless or `self.`) that
+   the plan binds to one method of the body's class (UC_CMETH, CP_DIRECT)?
+   That binding is the one method the call runs, so reachability follows it
+   instead of the name: a same-name method the class's lookup does not find
+   there (a module method a singleton def shadows) is no target of it. */
+int cplan_cbody_direct(Compiler *c, int id);
 int cplan_boxed_cmethod(Compiler *c, int id, const char *name);
 /* Object fallback behind a class-gated exception accessor, or -1. */
 int cplan_exc_object_method(Compiler *c, int call, const char *name);
@@ -260,6 +301,7 @@ typedef enum {
   PA_READER,      /* an attr reader's ivar load */
   PA_NATIVE,      /* a native class's C binding */
   PA_ARITY,       /* the call's count is refused: ArgumentError */
+  PA_VIS,         /* the target's visibility refuses the explicit receiver: NoMethodError */
   PA_SYNTH_ENUM,  /* a Struct's synthesized each/each_pair: an Enumerator */
   PA_STRUCT_SET,  /* a Struct's builtin member write */
   PA_BUILTIN,     /* a builtin value's arm (key PA_KEY_BUILTIN + its PolyFamily) */
@@ -349,6 +391,11 @@ typedef struct {
   short def;            /* the class the arm reads from: the method's defining
                            class (an exception reopening's for its definer), the
                            reader's ivar class; -1 for others */
+  unsigned char vis;    /* a PA_VIS arm's SP_VIS_*: the visibility that refuses */
+  unsigned char unsettled;  /* a class-value trial arm's: what of its class
+                               the record cannot prove settled before the
+                               call (ELAB_GAIN_*, elab_class_unsettled),
+                               which an emitter reading it cannot answer from */
   int mi;               /* the user method scope, or -1 */
 } PolyArm;
 
@@ -370,6 +417,12 @@ static inline int face_kind_index(unsigned kind) {
 /* a class value's class-side arm, by its class (the pre-arm ahead of the
    instance switch) */
 #define PA_KEY_CLASS_VALUE 0x2000
+/* a class-value trial arm's class (cplan_poly_cmeth: the builtin Module /
+   Class answer for a Class value no class method takes), or -1 */
+static inline int pa_class_value_trial(const PolyArm *a) {
+  return a->kind == PA_TRIAL && a->key >= PA_KEY_CLASS_VALUE && a->key < PA_KEY_BUILTIN
+         ? a->key - PA_KEY_CLASS_VALUE : -1;
+}
 
 /* how the dispatch holds its receiver and keys its switch */
 enum {
@@ -378,6 +431,8 @@ enum {
   PPF_KEY_CLS0 = 4,   /* class 0 has an arm: a non-object value is kept off it */
   PPF_KEY_PRIM = 8,   /* a primitive reopening has an arm: the tag maps to its class */
   PPF_KEY_EXC  = 16,  /* a user exception class answers: the exception is re-keyed */
+  PPF_KEY_CLSV = 32,  /* a class whose Class object may be a value has an arm: a Class
+                         value, which carries its class's index, is kept off it */
   PPF_SEEN     = 256  /* (--plan-check) the flags were observed */
 };
 
@@ -419,6 +474,12 @@ void cplan_poly_free(PolyPlan *p);
 /* The name index bounds a query for a native Ruby literal-block target. */
 int cplan_native_block_possible(Compiler *c, int id, const PolyCand *pc, int n);
 int cplan_cand_target(Compiler *c, int id, const char *name, const PolyCand *pc, unsigned flags);
+/* Is mi a method an arm of call id's boxed dispatch on name reaches: a
+   candidate class's table method or, for a name with versions, the
+   version or entry call_target binds on that class, which the arm calls
+   (cplan_cand_target); a reader candidate's; or the same for a class
+   value's class methods. inst 0 asks the class-method arms alone. */
+int cplan_cand_arm(Compiler *c, int id, const char *name, int mi, int inst);
 const PolyPlan *cplan_poly_block(Compiler *c, int id);
 /* A boxed receiver's `each { }` that the run-time dispatch serves because a
    class of the program takes a block for `each`: one arm, PB_ENUM_INLINE,
@@ -430,6 +491,10 @@ const PolyPlan *cplan_each_split(Compiler *c, int id);
    of the name, or its proc form. Computed afresh. */
 int cplan_cmethod_arm(Compiler *c, int call, int k, const char *nm, int *dc, int *pfk);
 const PolyPlan *cplan_poly_cmeth(Compiler *c, int id);
+/* cplan_poly_cmeth's class-value trial arms alone (pa_class_value_trial),
+   without the cost of asking every class for a class method of the name.
+   Computed afresh, into a plan the caller drops with cplan_poly_free. */
+PolyPlan *cplan_poly_cls_values(Compiler *c, int id);
 int cplan_visibility_class(Compiler *c, int id, int ci);
 int cplan_has_method_missing(Compiler *c, int id, int ci, int cmethod);
 int cplan_cmethod_visible(Compiler *c, int id, int ci, const char *name);
@@ -476,13 +541,22 @@ void pa_report(void);
 typedef enum {
   CN_NONE,     /* not nil here, a `&.` call, or a method the program gives nil */
   CN_RAISE,    /* nil has no such method: NoMethodError, after the operands */
-  CN_ANSWER    /* nil has it (is_nil_method): NilClass answers, where its
+  CN_ANSWER,   /* nil has it (is_nil_method): NilClass answers, where its
                   answer has the call's type (nil_answer_text); a call whose
                   answer has not is emitted as before, untested */
+  CN_PROGRAM   /* the program gives nil the method (NilClass's or Object's,
+                  cplan_nil_program_method), and the receiver's class runs
+                  another or none: nil runs nil's, where its answer has the
+                  call's type (cplan_nil_program_served) */
 } CplanNil;
 const char *cplan_call_name(const NodeTable *nt, int id);
 int cplan_nil(Compiler *c, int id);
 int cplan_nil_answer_served(Compiler *c, int id);   /* codegen_call.c: nil's answer has the call's type */
+/* The program's method call `call` runs for a nil receiver: NilClass's,
+   else Object's (-1 for none, or one only Kernel, BasicObject or the top
+   level gives it); *nilcls whether it is NilClass's. */
+int cplan_nil_program_method(Compiler *c, int call, const char *name, int *nilcls);
+int cplan_nil_program_served(Compiler *c, int id);  /* codegen_call.c: nil's method's answer has the call's type */
 /* Is a nil fact's source `why` (nil_fact_why) a nil the program writes --
    a literal, a missing else, a safe navigation, a slot read before its
    write, an element of an Array the program stores nil into -- which a
@@ -501,6 +575,16 @@ int cplan_nil_written(int why);
    otherwise; anon may be NULL). Pure. */
 typedef enum { CM_NONE, CM_NAMEERROR, CM_NOMETHOD } CplanMissing;
 int cplan_missing(Compiler *c, int id, char *self_text, size_t cap, int *anon);
+/* The raise of call id's dispatch on self from class cid when cid's chain
+   holds no method of its name and only descendants do: the switch's arms
+   are theirs, and self of any other class (cid's own instance, a
+   descendant without one, an object no singleton definition reached) gets
+   CRuby's NameError for a bare name, NoMethodError otherwise. CM_NONE when
+   cid's chain, a builtin of every object or a builtin module cid includes
+   (Comparable, Enumerable) answers, a builtin superclass may, or the
+   program defines a method_missing anywhere: spinel does not dispatch to
+   one, and the call keeps the answer it had. Pure. */
+CplanMissing cplan_dispatch_miss(Compiler *c, int id, int cid);
 /* Does the subtree at id hold a call cplan_missing answers, in a block or
    an operand alike? */
 int cplan_subtree_missing(Compiler *c, int id);
@@ -534,6 +618,15 @@ int cplan_self_class(Compiler *c, int id);
    builtin the class itself answers (`U.name`) keeps its receiver and
    reaches the builtin through call_target's answer. */
 int cplan_self_builtin(Compiler *c, int id);
+/* Is every class method `name` of program class cls defined after call id,
+   as the record proves at the call's load point (call_target's answer for
+   a call there)? A reflection asked there (`C.respond_to?(:z)` before
+   `def C.z`) then finds none. 0 unless the call has a point and runs when
+   its statement does: not in a method body, a lambda or an END body, and
+   in a block only when every block around it is certain to run at once
+   (elab_blocks_run_now: a builtin iterator on a literal); 0 too for a class
+   whose chain the record does not know. */
+int cplan_cmethod_later(Compiler *c, int id, int cls, const char *name);
 /* How a NameError or NoMethodError of call id names self, into buf:
    "class U" or "module M" in a class or module body and "main" at the top
    level (the record's self where the call runs, elab_self_at), else "an

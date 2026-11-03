@@ -207,6 +207,7 @@ typedef struct {
     char *lookup;          /* the namespace a bare type name is looked up in first */
     int is_cmethod;
     int in_def;            /* writes: 0 class body / top level, 1 instance method, 2 class method */
+    const char *self_class;   /* a def or attribute of a class's instances: owner, which `self` names; else NULL */
     ir_ann **anns;
     int nanns;
 } ir_target;
@@ -234,6 +235,8 @@ typedef struct {
     const char *owner;     /* "" at top level */
     const char *lookup;    /* the parent namespace of owner */
     int in_def;            /* 0, 1 instance method, 2 class method */
+    int in_class;          /* directly in a class body, not a module's or a block's */
+    int in_sclass;         /* a def directly in owner's `class << self`: one of owner's class methods */
 } ir_ctx;
 
 static void ir_name_into(const ir_file *f, pm_constant_id_t id, sbuf_t *out) {
@@ -337,12 +340,12 @@ static bool ir_makes_class(const ir_file *f, const pm_node_t *v) {
 }
 
 static void ir_class_body(ir_ctx *cx, const pm_node_t *container, const pm_node_t *body,
-                          const char *leaf_path) {
+                          const char *leaf_path, int is_class) {
     char *owner = ir_join(cx->owner, leaf_path);
     ir_container_add(cx->w, container, 0, owner, cx->owner);
     cx->w->conts[cx->w->nconts - 1].body = body;
     known_names_add(owner, strlen(owner));
-    ir_ctx sub = { cx->w, owner, cx->owner, 0 };
+    ir_ctx sub = { cx->w, owner, cx->owner, 0, is_class, 0 };
     if (body != NULL) pm_visit_node(body, ir_visit, &sub);
     free(owner);
 }
@@ -388,18 +391,45 @@ static bool ir_visit(const pm_node_t *n, void *data) {
                 pm_visit_node(((const pm_class_node_t *) n)->superclass, ir_visit, cx);
             sbuf_t p;
             sbuf_init(&p);
-            if (ir_const_path(f, path, &p) && p.buf) ir_class_body(cx, n, body, p.buf);
+            if (ir_const_path(f, path, &p) && p.buf) ir_class_body(cx, n, body, p.buf, PM_NODE_TYPE_P(n, PM_CLASS_NODE));
             sbuf_free(&p);
             return false;
         }
-        case PM_SINGLETON_CLASS_NODE:
+        case PM_SINGLETON_CLASS_NODE: {
+            const pm_singleton_class_node_t *sc = (const pm_singleton_class_node_t *) n;
             ir_container_add(w, n, 2, cx->owner, cx->lookup);
+            /* `class << self` in a class or module body: a def directly in it
+               is a `def self.` of the owner. Its other declarations belong to
+               the singleton class, which has no pins. */
+            if (cx->owner[0] && !cx->in_def && PM_NODE_TYPE_P(sc->expression, PM_SELF_NODE) &&
+                sc->body && PM_NODE_TYPE_P(sc->body, PM_STATEMENTS_NODE)) {
+                const pm_statements_node_t *st = (const pm_statements_node_t *) sc->body;
+                ir_ctx sub = *cx;
+                sub.in_class = 0;
+                sub.in_sclass = 1;
+                /* only a receiverless def: `def self.m` here is a method of
+                   the singleton class's own singleton, which has no pins and
+                   keeps the placement warning it had */
+                for (size_t i = 0; i < st->body.size; i++)
+                    if (PM_NODE_TYPE_P(st->body.nodes[i], PM_DEF_NODE) &&
+                        ((const pm_def_node_t *) st->body.nodes[i])->receiver == NULL)
+                        ir_visit(st->body.nodes[i], &sub);
+            }
             return false;
+        }
         case PM_BLOCK_NODE:
         case PM_LAMBDA_NODE:
             /* Generic receiverless calls and lambdas preserve the lexical
                class for declarations, but do not declare class-body ivars. */
             ir_container_add(w, n, 3, cx->owner, cx->lookup);
+            if (!cx->in_def && cx->in_class) {
+                /* a def in `Struct.new do ... end` or `class_eval do` is not
+                   necessarily one of the class's own instance methods */
+                ir_ctx sub = *cx;
+                sub.in_class = 0;
+                pm_visit_child_nodes(n, ir_visit, &sub);
+                return false;
+            }
             return !cx->in_def;
         case PM_CONSTANT_WRITE_NODE:
             /* `CType = Data.define(...)` makes a class as `class CType` does:
@@ -424,7 +454,8 @@ static bool ir_visit(const pm_node_t *n, void *data) {
             if (!cx->owner[0] || cx->in_def ||
                 (d->receiver && !PM_NODE_TYPE_P(d->receiver, PM_SELF_NODE))) return false;
             ir_target *t = ir_target_new(w, IT_DEF, n, cx);
-            t->is_cmethod = d->receiver != NULL;
+            t->is_cmethod = d->receiver != NULL || cx->in_sclass;
+            if (cx->in_class && !t->is_cmethod) t->self_class = t->owner;
             /* the line a trailing return annotation is written on: after `)`,
                or after the name of a def with no parentheses */
             const uint8_t *se = d->rparen_loc.start ? d->rparen_loc.end : d->name_loc.end;
@@ -442,7 +473,8 @@ static bool ir_visit(const pm_node_t *n, void *data) {
             if (call->receiver != NULL) return false;
             if (ir_is_attr_call(f, call)) {
                 if (!cx->owner[0]) return false;
-                ir_target_new(w, IT_ATTR, n, cx);
+                ir_target *t = ir_target_new(w, IT_ATTR, n, cx);
+                if (cx->in_class) t->self_class = t->owner;
                 return false;
             }
             pm_constant_t *name = pm_constant_pool_id_to_constant(&f->pm->constant_pool, call->name);
@@ -528,11 +560,17 @@ typedef struct {
     int leading;
 } ir_comment;
 
+/* The bytes a continuation line's comment marker takes: `#|` (ruby/rbs's
+   continuation of a signature over several lines), or `#` and one space */
+static size_t ir_cont_prefix(const char *s, size_t n) {
+    return n >= 2 && (s[1] == '|' || s[1] == ' ') ? 2 : 1;
+}
+
 static void ir_ann_add_comment(const ir_file *f, ir_ann *a, const ir_comment *cm) {
     const char *s = (const char *) f->src + cm->start;
     size_t n = cm->end - cm->start;
     while (n > 0 && (s[n - 1] == '\r' || s[n - 1] == '\n')) n--;
-    size_t pre = n >= 2 && s[1] == ' ' ? 2 : 1;
+    size_t pre = ir_cont_prefix(s, n);
     ir_ann_add_line(a, s + pre, n - pre, cm->line, cm->col + (int) pre);
 }
 
@@ -630,12 +668,93 @@ static void ir_names_merge(sbuf_t *into, const sbuf_t *from) {
     }
 }
 
-/* map_type with the owner's lexical scope, as traverse_members sets it up */
+/* `top`, or core's `boolish` (`type boolish = top`, which flag parameters
+ * are written with): any value at all, which says nothing about the slot.
+ * It pins nothing ("-", as a `void` return reads), and the rest of the
+ * signature still applies, as --rbs leaves such a slot to inference. A
+ * program's own `boolish` alias is mapped as written. */
+static bool ir_says_nothing(rbs_parser_t *p, rbs_node_t *type) {
+    if (type->type == RBS_TYPES_OPTIONAL) type = ((rbs_types_optional_t *) type)->type;
+    if (type->type == RBS_TYPES_BASES_TOP) return true;
+    if (type->type != RBS_TYPES_ALIAS) return false;
+    rbs_types_alias_t *a = (rbs_types_alias_t *) type;
+    if ((a->args && a->args->length > 0) || a->name == NULL ||
+        (a->name->rbs_namespace && a->name->rbs_namespace->path && a->name->rbs_namespace->path->length > 0) ||
+        (a->name->rbs_namespace && a->name->rbs_namespace->absolute)) return false;
+    sbuf_t n; sbuf_init(&n);
+    name_of_type_name(p, a->name, &n);
+    bool b = n.buf && strcmp(n.buf, "boolish") == 0;
+    sbuf_free(&n);
+    return b;
+}
+
+/* The type variables core RBS declares for a builtin generic
+   (`class Array[unchecked out Elem]`), which a reopening's inline
+   signatures use without declaring them: NULL when `owner` has none. */
+static const char *const *ir_core_type_params(const char *owner) {
+    static const char *const elem[] = { "Elem", NULL };
+    static const char *const kv[] = { "K", "V", NULL };
+    static const char *const set[] = { "A", NULL };
+    static const char *const en[] = { "Elem", "Return", NULL };
+    if (strcmp(owner, "Array") == 0 || strcmp(owner, "Enumerable") == 0 || strcmp(owner, "Range") == 0 ||
+        strcmp(owner, "Struct") == 0) return elem;
+    if (strcmp(owner, "Hash") == 0) return kv;
+    if (strcmp(owner, "Set") == 0) return set;
+    if (strcmp(owner, "Enumerator") == 0 || strcmp(owner, "Enumerator_Lazy") == 0) return en;
+    return NULL;
+}
+
+/* Does `type` name one of `params` (`Elem`, `Array[Elem]`, `Elem?`)? Such
+   a type is the receiver's element type, which differs from receiver to
+   receiver, so no one type stands for it. */
+static bool ir_names_type_param(rbs_parser_t *p, rbs_node_t *type, const char *const *params) {
+    if (type == NULL || params == NULL) return false;
+    switch (type->type) {
+        case RBS_TYPES_VARIABLE:
+            return true;
+        case RBS_TYPES_OPTIONAL:
+            return ir_names_type_param(p, ((rbs_types_optional_t *) type)->type, params);
+        case RBS_TYPES_UNION:
+        case RBS_TYPES_INTERSECTION: {
+            rbs_node_list_t *l = type->type == RBS_TYPES_UNION ? ((rbs_types_union_t *) type)->types
+                                                               : ((rbs_types_intersection_t *) type)->types;
+            for (rbs_node_list_node_t *e = l ? l->head : NULL; e; e = e->next)
+                if (ir_names_type_param(p, e->node, params)) return true;
+            return false;
+        }
+        case RBS_TYPES_CLASS_INSTANCE: {
+            rbs_types_class_instance_t *ci = (rbs_types_class_instance_t *) type;
+            for (rbs_node_list_node_t *e = ci->args ? ci->args->head : NULL; e; e = e->next)
+                if (ir_names_type_param(p, e->node, params)) return true;
+            if (ci->args && ci->args->length > 0) return false;
+            if (ci->name == NULL || (ci->name->rbs_namespace &&
+                (ci->name->rbs_namespace->absolute ||
+                 (ci->name->rbs_namespace->path && ci->name->rbs_namespace->path->length > 0)))) return false;
+            sbuf_t n; sbuf_init(&n);
+            name_of_type_name(p, ci->name, &n);
+            bool hit = false;
+            for (int i = 0; params[i] && n.buf && !hit; i++) hit = strcmp(n.buf, params[i]) == 0;
+            sbuf_free(&n);
+            return hit;
+        }
+        default:
+            return false;
+    }
+}
+
+/* map_type with the owner's lexical scope, as traverse_members sets it up.
+   A type naming one of the owner's core type variables pins nothing ("-"),
+   as `top` does, and the rest of the signature applies: --rbs, where
+   `class Array[Elem]` declares the variable, leaves that slot alone too. */
 static bool ir_map(rbs_parser_t *p, rbs_node_t *type, const ir_target *t, sbuf_t *out) {
-    const char *sv = g_self_scope;
+    if (ir_names_type_param(p, type, ir_core_type_params(t->owner))) { sbuf_set(out, "-", 1); return true; }
+    const char *sv = g_self_scope, *st = g_self_type;
     g_self_scope = strcmp(t->owner, "Object") == 0 ? "" : t->owner;
+    g_self_type = t->self_class;
     bool ok = map_type(p, type, t->lookup, out);
     g_self_scope = sv;
+    g_self_type = st;
+    if (!ok && ir_says_nothing(p, type)) { sbuf_set(out, "-", 1); return true; }
     if (ok && out->buf && type->location.end_byte > type->location.start_byte)
         ir_names_add(&g_ir_names, out->buf, p->lexer->string.start + type->location.start_byte,
                      (size_t) (type->location.end_byte - type->location.start_byte));
@@ -645,7 +764,7 @@ static bool ir_map(rbs_parser_t *p, rbs_node_t *type, const ir_target *t, sbuf_t
 /* the def's parameters, in order, with what each is */
 typedef struct {
     char *name;
-    char kind;        /* 'r' required, 'k' keyword, 'o' optional, '*' rest, 'p' post, '&' block, 'K' **, 'x' other */
+    char kind;        /* 'r' required, 'k' keyword, 'o' optional, '*' rest, 'p' post, '&' block, 'K' **, 'f' ..., 'x' other */
 } ir_param;
 
 static int ir_def_params(const ir_file *f, const pm_def_node_t *d, ir_param **out) {
@@ -676,7 +795,7 @@ static int ir_def_params(const ir_file *f, const pm_def_node_t *d, ir_param **ou
         IR_PUSH(ir_strdup(s.buf ? s.buf : ""), 'k');
         sbuf_free(&s);
     }
-    if (pn->keyword_rest) IR_PUSH(ir_strdup(""), 'K');
+    if (pn->keyword_rest) IR_PUSH(ir_strdup(""), PM_NODE_TYPE_P(pn->keyword_rest, PM_FORWARDING_PARAMETER_NODE) ? 'f' : 'K');
     if (pn->block) IR_PUSH(ir_strdup(""), '&');
 #undef IR_PUSH
     *out = ps;
@@ -697,19 +816,26 @@ static char *ir_sym_name(rbs_parser_t *p, rbs_ast_symbol_t *sym) {
 }
 
 /* Has the def any parameter a seed cannot address by position? Seed
- * parameter slots follow the def's own order, required positionals then
- * keywords; anything between them shifts every slot after it. */
+ * parameter slots follow the def's own order: required, optional, rest and
+ * trailing positionals, then keywords. A destructuring parameter is one slot
+ * the signature types as a whole, which the seed cannot split. */
 static const char *ir_unseedable_params(const ir_param *ps, int n) {
-    for (int i = 0; i < n; i++) {
-        switch (ps[i].kind) {
-            case 'o': return "the method has an optional positional parameter";
-            case '*': return "the method has a rest parameter";
-            case 'p': return "the method has a parameter after its rest parameter";
-            case 'x': return "the method has a destructuring parameter";
-            default: break;
-        }
-    }
+    for (int i = 0; i < n; i++)
+        if (ps[i].kind == 'x') return "the method has a destructuring parameter";
     return NULL;
+}
+
+/* The `k`th node of an RBS list, NULL past its end. */
+static rbs_node_t *ir_list_at(rbs_node_list_t *l, int k) {
+    rbs_node_list_node_t *c = l ? l->head : NULL;
+    for (; c && k > 0; k--) c = c->next;
+    return c ? c->node : NULL;
+}
+
+static int ir_list_len(rbs_node_list_t *l) {
+    int n = 0;
+    if (l) for (rbs_node_list_node_t *c = l->head; c; c = c->next) n++;
+    return n;
 }
 
 /* A method type (`(T, k: U) -> R`) against the def: fills ret/ptypes, or
@@ -724,25 +850,61 @@ static const char *ir_method_type(rbs_parser_t *p, rbs_node_t *mtn, const ir_tar
     if (mt->type == NULL || mt->type->type != RBS_TYPES_FUNCTION)
         return "an untyped parameter list (`(?)`) has no Spinel equivalent";
     rbs_types_function_t *fn = (rbs_types_function_t *) mt->type;
-    if ((fn->optional_positionals && fn->optional_positionals->head) || fn->rest_positionals ||
-        (fn->trailing_positionals && fn->trailing_positionals->head) || fn->rest_keywords)
-        return "optional, rest and trailing parameters are not seeded";
     const char *why = ir_unseedable_params(ps, np);
     if (why) return why;
-    int nreq = 0, nkw = 0;
-    for (int i = 0; i < np; i++) { if (ps[i].kind == 'r') nreq++; else if (ps[i].kind == 'k') nkw++; }
-    int sreq = 0;
-    if (fn->required_positionals) for (rbs_node_list_node_t *c = fn->required_positionals->head; c; c = c->next) sreq++;
-    if (sreq != nreq) return "the signature's positional parameters do not match the method's";
+    /* Each positional kind of the def takes the signature's list of that
+       kind, one to one: `(Integer, ?String, *Symbol, Float)` for
+       `def m(a, b = "", *c, d)`. A rest or `**` slot is typed by
+       construction, as the gathered array or hash, and takes no field, as
+       --rbs gives it none. One optional past the def's own, where the def
+       gathers the rest (`(Symbol, ?untyped)` for `def fetch(key, *default)`),
+       describes what the rest gathers: it lands on the rest slot, which
+       --rbs leaves as gathered. A def that forwards with `...` hands every
+       argument past its named positionals on to the method it calls: those
+       take the signature's leading positionals, required ones first, and
+       the rest of the signature is the forwarded call's, which --rbs pins
+       nothing of either. */
+    int nreq = 0, nopt = 0, nrest = 0, npost = 0, nkw = 0, nkwrest = 0, nfwd = 0;
+    for (int i = 0; i < np; i++)
+        switch (ps[i].kind) {
+            case 'r': nreq++; break;
+            case 'o': nopt++; break;
+            case '*': nrest++; break;
+            case 'p': npost++; break;
+            case 'k': nkw++; break;
+            case 'K': nkwrest++; break;
+            case 'f': nfwd++; break;
+            default: break;
+        }
+    int sreq = ir_list_len(fn->required_positionals), sopt = ir_list_len(fn->optional_positionals);
+    if (nfwd) {
+        if (sreq < nreq || sreq + sopt < nreq + nopt)
+            return "the signature's positional parameters do not match the method's";
+    }
+    else {
+        bool opt_on_rest = nrest > 0 && fn->rest_positionals == NULL && sopt == nopt + 1 &&
+                           npost == 0 && ir_list_len(fn->trailing_positionals) == 0;
+        if (sreq != nreq || (sopt != nopt && !opt_on_rest) ||
+            ((fn->rest_positionals != NULL) != (nrest > 0) && !opt_on_rest) || ir_list_len(fn->trailing_positionals) != npost)
+            return "the signature's positional parameters do not match the method's";
+        if (fn->rest_keywords != NULL && nkwrest == 0)
+            return "the signature's keyword parameters do not match the method's";
+    }
     for (int i = 0; i < np; i++) {
         sbuf_t tag; sbuf_init(&tag);
-        if (ps[i].kind == 'r') {
+        if (ps[i].kind == 'r' || ps[i].kind == 'o' || ps[i].kind == 'p') {
             int k = 0;
-            rbs_node_list_node_t *c = fn->required_positionals->head;
-            for (int j = 0; j < i; j++) if (ps[j].kind == 'r') k++;
-            for (; k > 0; k--) c = c->next;
-            rbs_types_function_param_t *fp = (rbs_types_function_param_t *) c->node;
-            if (c->node->type != RBS_TYPES_FUNCTION_PARAM || !ir_map(p, fp->type, t, &tag)) {
+            for (int j = 0; j < i; j++) if (ps[j].kind == ps[i].kind) k++;
+            rbs_node_list_t *l = ps[i].kind == 'r' ? fn->required_positionals
+                               : ps[i].kind == 'o' ? fn->optional_positionals
+                                                   : fn->trailing_positionals;
+            /* ahead of `...`, an optional takes the signature's next
+               positional, a required one while any is left */
+            if (nfwd && ps[i].kind == 'o' && nreq + k < sreq) { l = fn->required_positionals; k += nreq; }
+            else if (nfwd && ps[i].kind == 'o') k -= sreq - nreq;
+            rbs_node_t *n = ir_list_at(l, k);
+            rbs_types_function_param_t *fp = (rbs_types_function_param_t *) n;
+            if (n == NULL || n->type != RBS_TYPES_FUNCTION_PARAM || !ir_map(p, fp->type, t, &tag)) {
                 sbuf_free(&tag);
                 return "a parameter type is outside the types Spinel can pin";
             }
@@ -769,7 +931,7 @@ static const char *ir_method_type(rbs_parser_t *p, rbs_node_t *mtn, const ir_tar
     int skw = 0;
     const rbs_hash_t *hs2[] = { fn->required_keywords, fn->optional_keywords };
     for (int h = 0; h < 2; h++) if (hs2[h]) for (rbs_hash_node_t *e = hs2[h]->head; e; e = e->next) skw++;
-    if (skw != nkw) return "the signature's keyword parameters do not match the method's";
+    if (!nfwd && skw != nkw) return "the signature's keyword parameters do not match the method's";
     sbuf_t r; sbuf_init(&r);
     if (!ir_map(p, fn->return_type, t, &r)) { sbuf_free(&r); return "the return type is outside the types Spinel can pin"; }
     *ret = ir_strdup(r.buf);
@@ -1219,14 +1381,17 @@ static void ir_associate(ir_file *f, ir_walk *w) {
                 pending_blank = -1;
             }
             else if (cur != NULL) {
-                size_t pre = n >= 2 && s[1] == ' ' ? 2 : 1;
+                /* a continuation: `#|` and the rest of the signature, or an
+                   indented line after `# ` */
+                bool bar = n >= 2 && s[1] == '|';
+                size_t pre = ir_cont_prefix(s, n);
                 bool blank = true;
                 for (size_t z = pre; z < n; z++)
                     if (s[z] != ' ' && s[z] != '\t') { blank = false; break; }
                 if (blank) {
                     if (pending_blank < 0) pending_blank = k;
                 }
-                else if (s[pre] == ' ' || s[pre] == '\t') {
+                else if (bar || s[pre] == ' ' || s[pre] == '\t') {
                     /* Internal blank comment lines belong to a continuation;
                        trailing blank comment lines do not. */
                     if (pending_blank >= 0)
@@ -1327,7 +1492,7 @@ static void ir_walk_open(ir_file *f, ir_walk *w, pm_parser_t *parser, pm_node_t 
     for (size_t i = 0; i < len; i++) if (source[i] == '\n') f->line_starts[l++] = i + 1;
     memset(w, 0, sizeof *w);
     w->f = f;
-    ir_ctx cx = { w, "", "", 0 };
+    ir_ctx cx = { w, "", "", 0, 0, 0 };
     pm_visit_node(root, ir_visit, &cx);
 }
 

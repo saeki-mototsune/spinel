@@ -1,0 +1,33 @@
+"sub step"
+"sub step"
+42
+NameError: undefined local variable or method 'step' for an instance of Base
+NoMethodError: undefined method 'step' for an instance of Base
+NameError: undefined local variable or method 'step' for an instance of Other
+NameError: undefined local variable or method 'tally' for an instance of Base
+"tw"
+NameError: undefined local variable or method 'hi' for an instance of Foo
+"ho"
+NameError: undefined local variable or method 'ho' for an instance of Bar
+[:step, true]
+[:step, true]
+ArgumentError: wrong number of arguments (given 0, expected 1)
+ArgumentError: wrong number of arguments (given 2, expected 1)
+ArgumentError: wrong number of arguments (given 2, expected 1)
+NoMethodError: undefined method 'pace' for an instance of Walk
+NoMethodError: undefined method 'pace' for an instance of Walk
+NoMethodError: undefined method 'pace' for an instance of Walk
+1
+1
+1
+3
+3
+3
+NoMethodError
+NoMethodError
+NoMethodError
+[:tick, :arr, :pr, :tick, :arr, :pr, :tick, :arr, :pr]
+ArgumentError: wrong number of arguments (given 1, expected 0)
+ArgumentError: wrong number of arguments (given 0, expected 1)
+ArgumentError: wrong number of arguments (given 1, expected 0)
+ArgumentError: wrong number of arguments (given 0, expected 1)

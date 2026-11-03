@@ -4,9 +4,8 @@
  * the proc-return home node whose chain it carries.
  *
  * Types only, plus the three context operations that touch nothing else
- * (sp_exc_ctx_new/free/mark, lib/sp_exc.c). sp_exc_ctx_save/load copy the
- * handler stacks in and out, and those stacks are TU-local statics of
- * spinel_rt.h, so the two stay there. */
+ * (sp_exc_ctx_new/free/mark, lib/sp_exc.c). The handler stacks themselves are
+ * defined in lib/sp_exc.c and declared in spinel_rt.h. */
 #include "sp_setjmp.h"
 #include "sp_types.h"   /* sp_int */
 #include "sp_gc.h"      /* sp_RbVal */
@@ -14,6 +13,23 @@
 #ifdef SP_CEXT
 #include "sp_cext.h"
 #endif
+
+/* Depth of the begin/rescue/ensure handler stack and of the catch/throw
+   stack. The stacks themselves are defined in lib/sp_exc.c, so the depth is
+   the one the runtime archive was built with: -DSP_EXC_STACK_MAX=<n> (or
+   SP_CATCH_STACK_MAX) goes to the archive's build, and a program compiled
+   with another value fails to link (sp_exc_stacks_<exc>_<catch>). */
+#ifndef SP_EXC_STACK_MAX
+#define SP_EXC_STACK_MAX 64
+#endif
+#ifndef SP_CATCH_STACK_MAX
+#define SP_CATCH_STACK_MAX 64
+#endif
+#define SP_EXC_DEPTHS_SYM_(e, c) sp_exc_stacks_##e##_##c
+#define SP_EXC_DEPTHS_SYM(e, c) SP_EXC_DEPTHS_SYM_(e, c)
+extern const int SP_EXC_DEPTHS_SYM(SP_EXC_STACK_MAX, SP_CATCH_STACK_MAX);
+/* What an ensure body runs for while the unwind it interrupts is held */
+enum { SP_UNWIND_NONE, SP_UNWIND_PROCRET, SP_UNWIND_THROW, SP_UNWIND_BREAK, SP_UNWIND_EXIT };
 
 /* A non-lambda proc's home method: a node on that method's C stack, linked
    onto the per-fiber chain sp_proc_ret_head (see the proc-return machinery in
@@ -62,4 +78,40 @@ void *sp_exc_ctx_new(void);
 void sp_exc_ctx_free(void *p);
 void sp_exc_ctx_mark(void *p);   /* GC: a suspended fiber's carried exc objects */
 
+/* The stacks the two helpers below read, declared (and documented) with the
+   rest in spinel_rt.h and defined in lib/sp_exc.c */
+extern SP_TLS volatile int sp_exc_top;
+extern SP_TLS int sp_poly_recur_mark[SP_EXC_STACK_MAX];
+extern SP_TLS void *sp_exc_handling[SP_EXC_STACK_MAX];
+extern SP_TLS int sp_rescue_sp;
+#ifdef SP_CEXT
+extern SP_TLS sp_cext_arena_mark sp_exc_cextmark[SP_EXC_STACK_MAX];
+#endif
+/* Called immediately before every longjmp into sp_exc_stack: the landing frame
+   is the one on top, and the walk frames pushed since it armed are about to be
+   jumped over, so give the path back the depth that frame recorded. */
+static inline void sp_poly_recur_unwind(void) {
+#ifdef SP_CEXT
+  if (sp_exc_top > 0) sp_cext_arena_restore(sp_exc_cextmark[sp_exc_top - 1]);
+#endif
+  if (sp_exc_top > 0) sp_poly_recur_pop(sp_poly_recur_mark[sp_exc_top - 1]);
+}
+#define sp_cur_handled() (sp_rescue_sp > 0 ? sp_exc_handling[sp_rescue_sp-1] : NULL)
+SP_NORETURN SP_COLD void sp_stack_too_deep(void);   /* lib/sp_exc.c */
+/* Guard an exception-frame arm. Every arm stores into sp_exc_rootmark
+   [sp_exc_top] (or sp_exc_msg[sp_exc_top]) before it bumps sp_exc_top, so what
+   the check must precede is that first indexed store, not the ++; it opens the
+   frame-arming sequence at every arm the codegen emits. The depth is not a
+   lexical property: a method whose body is a begin/rescue keeps its frame armed
+   across the calls that body makes, so ordinary recursion 65 deep reaches the
+   end of the array just as 65 nested begins do. Inside a fiber body, and inside
+   a thread's, one slot is already spent on the frame the runtime arms around it
+   (sp_exc_arm below), so 63 of the body's own is the last that fits. */
+static inline void sp_exc_check_depth(void) {
+  if (SP_UNLIKELY(sp_exc_top >= SP_EXC_STACK_MAX)) sp_stack_too_deep();
+#ifdef SP_CEXT
+  sp_exc_cextmark[sp_exc_top] = sp_cext_arena_snapshot();
+#endif
+  sp_poly_recur_mark[sp_exc_top] = sp_poly_recur_top;
+}
 #endif

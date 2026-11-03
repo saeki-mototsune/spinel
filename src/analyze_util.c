@@ -74,14 +74,14 @@ static int const_path_is(const NodeTable *nt, int node, const char *pn, const ch
 }
 /* Does the program write the constant nm into the class or module named pn:
    in a body of it, or through the path `pn::nm = v`? */
-static int program_writes_const_in(Compiler *c, const char *pn, const char *nm) {
+int program_writes_const_in(Compiler *c, const char *pn, const char *nm) {
   const NodeTable *nt = c->nt;
-  static const NodeKind bodies[] = { NK_ClassNode, NK_ModuleNode };
-  for (int i = 0; i < 2; i++)
-    NT_FOREACH_KIND(nt, bodies[i], d) {
-      int cp = nt_ref(nt, d, "constant_path");
-      if (cp < 0 || !sp_streq(nt_str(nt, cp, "name"), pn)) continue;
-      if (body_writes_const(nt, nt_ref(nt, d, "body"), nm)) return 1;
+  int ndk = 0; const NodeKind *dk = class_def_kinds(&ndk);
+  for (int dh = 0; dh < ndk; dh++)
+    NT_FOREACH_KIND(nt, dk[dh], d) {
+      const char *dn = class_def_opens_cref(nt, d) ? class_def_name(nt, d) : NULL;
+      if (!dn || !sp_streq(dn, pn)) continue;
+      if (body_writes_const(nt, class_def_body(nt, d), nm)) return 1;
     }
   static const NodeKind writes[] = { NK_ConstantPathWriteNode, NK_ConstantPathOrWriteNode,
                                      NK_ConstantPathAndWriteNode, NK_ConstantPathOperatorWriteNode };
@@ -90,6 +90,9 @@ static int program_writes_const_in(Compiler *c, const char *pn, const char *nm) 
       if (const_path_is(nt, nt_ref(nt, w, "target"), pn, nm)) return 1;
   NT_FOREACH_KIND(nt, NK_ConstantPathTargetNode, t)
     if (const_path_is(nt, t, pn, nm)) return 1;
+  /* a self-alias write the desugaring dropped (desugar_constant_path_self_alias) */
+  NT_FOREACH_KIND(nt, NK_NilNode, d)
+    if (const_path_is(nt, (int)nt_int(nt, d, "dropped_target", -1), pn, nm)) return 1;
   return 0;
 }
 /* The Ruby leaf of a class's name: a name qualify_colliding_classes gave
@@ -180,6 +183,7 @@ static int program_places_const_dynamically(Compiler *c, const char *nm) {
   return 0;
 }
 int const_seg_builtin(Compiler *c, int id);
+static int builtin_scope_lacks_member(Compiler *c, int seg);
 /* The scope a constant path segment names, for defined?: a class or module
    of the program (its index), or -1 for one whose constants are not the
    program's to list (a builtin, the top level, a value, a dynamic parent).
@@ -205,6 +209,9 @@ static int const_path_scope(Compiler *c, int seg, int *missing) {
   if (pkk != NK_ConstantReadNode && pkk != NK_ConstantPathNode) return -1;
   pk = const_path_scope(c, par, missing);
   if (*missing || pk < 0) {
+    /* a builtin scope holds only its own members (String::Foo, with Foo
+       defined at the top level, names nothing) */
+    if (!*missing && builtin_scope_lacks_member(c, seg)) { *missing = 1; return -1; }
     /* a builtin, the top level, a value: the leaf decides, by its name */
     int k = comp_class_index(c, nm);
     return !*missing && k >= 0 && !c->classes[k].is_builtin_const && !comp_const(c, nm) ? k : -1;
@@ -229,6 +236,47 @@ int const_path_misses_member(Compiler *c, int id) {
   int missing = 0;
   const_path_scope(c, id, &missing);
   return missing;
+}
+/* The program class a constant or constant path names by its leaf, as
+   comp_class_index answers for the name; -1 for a path to a top-level
+   class whose parent, a class or module of the program, holds no member of
+   that name: an explicit scope does not fall back to Object's constants
+   (Holder::Target with Target defined at the top level names nothing,
+   #10577). Only a top-level class is checked: a nested one a path reaches
+   through a constant write or a compact class header (AS::CoreExt::Err =
+   ..., `class Invoice::Line` in a subclass) is a member the walk does not
+   list, and so is one a constant holding a module reaches. Any other node
+   is its name's. */
+int const_node_class_index(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  int k = comp_class_index(c, nt_str(nt, id, "name"));
+  /* (a class named under another by a compact header carries that name,
+     ruby_name_cache, P::Foo for `class AliasP::Foo`: no top-level one; nor
+     is a native struct, whose module the walk does not list it in) */
+  if (k < 0 || c->classes[k].enclosing_class >= 0 || c->classes[k].ruby_name_cache ||
+      c->classes[k].is_native_class || nt_kind(nt, id) != NK_ConstantPathNode) return k;
+  /* (nor a path whose leaf the qualifying pass found a member for and
+     renamed, qc_orig_name: module M; A = Foo; end makes M::A Foo, renamed
+     to the alias's class afterwards) */
+  if (nt_str(nt, id, "qc_orig_name")) return builtin_scope_lacks_member(c, id) ? -1 : k;
+  /* (a parent that is a class's own name, not a constant holding one:
+     AliasP = P; AliasP::Foo is P::Foo, which the walk does not follow) */
+  int par = nt_ref(nt, id, "parent");
+  NodeKind pk = par >= 0 ? nt_kind(nt, par) : NK_NilNode;
+  const char *pn = pk == NK_ConstantReadNode || pk == NK_ConstantPathNode ? nt_str(nt, par, "name") : NULL;
+  int pk2 = pn ? comp_class_index(c, pn) : -1;
+  if (!pn || is_object_class_name(pn) || comp_const(c, pn)) return k;
+  /* (a builtin scope the program never reopened has no class entry,
+     String::Foo) */
+  if (pk2 < 0) return builtin_scope_lacks_member(c, id) ? -1 : k;
+  /* (nor a constant the parent holds by that name, a value constant the
+     walk does not list: module Rhs; Leaf = Lhs::Leaf; end) */
+  const char *nm = nt_str(nt, id, "name");
+  int *cands, ncands = comp_const_tail_cands(c, nm, &cands);
+  int owned = comp_class_owned_const(c, pk2, nm, cands, ncands);
+  free(cands);
+  if (owned >= 0) return k;
+  return const_path_misses_member(c, id) ? -1 : k;
 }
 /* The class or module of the program a constant path names, by the
    membership walk above (A::B where two modules each nest a B, renamed
@@ -319,7 +367,7 @@ int const_path_in_closed_builtin(Compiler *c, int id) {
     return 0;
   const char *pn = nt_str(nt, par, "name"), *nm = nt_str(nt, id, "name");
   if (!pn || !nm || sp_streq(pn, "Object")) return 0;
-  if (!is_builtin_class_name(pn) && !is_builtin_module_name(pn)) return 0;
+  if (!is_builtin_class_name(pn) && !is_builtin_module_name(pn) && !is_builtin_exception_name(pn)) return 0;
   if (comp_const(c, pn)) return 0;
   /* the walks below look at the whole program: once per path while the
      tree and the class table stay as they are */
@@ -401,8 +449,148 @@ static int cw_name(const NodeTable *nt, const char *nm) {
         if (t >= 0) cw_add(1, nt_str(nt, t, "name"), t);
       }
     NT_FOREACH_KIND(nt, NK_ConstantPathTargetNode, t) cw_add(1, nt_str(nt, t, "name"), t);
+    /* a self-alias write the desugaring dropped keeps its target */
+    NT_FOREACH_KIND(nt, NK_NilNode, d) {
+      int t = (int)nt_int(nt, d, "dropped_target", -1);
+      if (t >= 0) cw_add(1, nt_str(nt, t, "name"), t);
+    }
   }
   return anh_find(&g_cw.names, nm);
+}
+/* The names the program gives to builtin scopes, built once per tree and
+   class table (the key const_path_in_closed_builtin keeps): a body of a
+   reopened builtin (Object's are the top level's), a `B::NAME = v` path
+   write or a dropped self-alias into one, a class nested in one, a module
+   mixed into one with its own members. A constant the program puts into
+   Exception is reached as StandardError::NAME and ArgumentError::NAME, into
+   Comparable as String::NAME, into Enumerable as Array::NAME: the ancestors
+   of a builtin without constants are builtins too, and the program's
+   reopenings are all they can add. */
+struct BuiltinGiven { const NodeTable *nt; unsigned ver, mixins; int ncls, ncon, dynamic; const int *cbody; ANameHash names; };
+void builtin_given_free(Compiler *c) {
+  if (!c->builtin_given) return;
+  anh_free(&c->builtin_given->names);
+  free(c->builtin_given);
+  c->builtin_given = NULL;
+}
+static void builtin_given_build(Compiler *c, struct BuiltinGiven *g) {
+  const NodeTable *nt = c->nt;
+  char *held = calloc((size_t)(c->nclasses ? c->nclasses : 1), 1);   /* scopes whose members a builtin sees */
+  if (!held) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int j = 0; j < c->nclasses; j++)
+    if (c->classes[j].is_builtin_const && c->classes[j].name && !is_object_class_name(c->classes[j].name)) held[j] = 1;
+  /* a mixin the class table did not record, wherever it stands (a method
+     body, a condition, a block, the top level, which is Object's): a module
+     it names counts as mixed into every builtin, and a computed one gives
+     any name, as a write through a dynamic parent does. The table records
+     the calls the load phase applies (LrMixin.applied) */
+  char *rec = calloc((size_t)(nt->count > 0 ? nt->count : 1), 1);
+  if (!rec) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int j = 0; j < c->nclasses; j++) {
+    int nm = 0;
+    const LrMixin *mx = elab_class_mixins(c, j, &nm);
+    for (int i = 0; i < nm; i++) if (mx[i].applied && mx[i].node >= 0 && mx[i].node < nt->count) rec[mx[i].node] = 1;
+  }
+  NT_FOREACH_KIND(nt, NK_CallNode, id) {
+    int a = !rec[id] && is_mixin_call(nt_str(nt, id, "name")) ? nt_ref(nt, id, "arguments") : -1, an = 0;
+    const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
+    for (int i = 0; i < an; i++) {
+      NodeKind ak = nt_kind(nt, av[i]);
+      if (ak != NK_ConstantReadNode && ak != NK_ConstantPathNode) { g->dynamic = 1; continue; }
+      const char *mn = nt_str(nt, av[i], "name"), *al = resolve_class_alias_chain(c, mn);
+      int m = comp_class_index(c, al ? al : mn);
+      if (m >= 0) held[m] = 1;
+    }
+  }
+  for (int pass = 0; pass < 32; pass++) {      /* modules mixed into a builtin, and into those */
+    int grew = 0;
+    for (int j = 0; j < c->nclasses; j++) {
+      if (!held[j] && !c->classes[j].is_builtin_const) continue;
+      const ClassInfo *kj = &c->classes[j];
+      for (int i = 0; i < kj->nincluded_mods + kj->nprepended_mods; i++) {
+        int m = i < kj->nincluded_mods ? kj->included_mods[i] : kj->prepended_mods[i - kj->nincluded_mods];
+        if (m >= 0 && m < c->nclasses && !held[m]) held[m] = grew = 1;
+      }
+    }
+    if (!grew) break;
+  }
+  for (int j = 0; j < c->nclasses; j++) {
+    int e = c->classes[j].enclosing_class;
+    if (e >= 0 && held[e] && c->classes[j].name) anh_add(&g->names, class_leaf_name(c->classes[j].name));
+  }
+  for (int i = 0; i < c->nconsts; i++) {       /* a body constant is keyed OWNER__NAME */
+    const char *key = c->consts[i].name, *sep = NULL, *own = key;
+    for (const char *p = key; (p = strstr(p, "__")) != NULL; p += 2) { own = sep ? sep + 2 : key; sep = p; }
+    if (!sep || sep == key) continue;
+    char ob[256];
+    snprintf(ob, sizeof ob, "%.*s", (int)(sep - own), own);
+    int o = comp_class_index(c, ob);
+    if (o >= 0 && held[o]) anh_add(&g->names, sep + 2);
+  }
+  (void)cw_name(nt, "");
+  for (int i = 0; i < g_cw.names.n; i++) {
+    /* a constant written in such a body, by the name the program wrote (a
+       class alias, `SA = Foo`, included) */
+    for (int w = g_cw.head[0][i]; w >= 0 && c->node_cbody; w = g_cw.next[w]) {
+      int o = w < c->node_cap ? c->node_cbody[w] : -1;
+      if (o >= 0 && held[o]) anh_add(&g->names, nt_str(nt, w, "qc_orig_name") ? nt_str(nt, w, "qc_orig_name") : g_cw.names.key[i]);
+    }
+    for (int t = g_cw.head[1][i]; t >= 0; t = g_cw.next[t]) {
+      int q = nt_ref(nt, t, "parent");
+      NodeKind qk = q >= 0 ? nt_kind(nt, q) : NK_NilNode;
+      const char *qn = qk == NK_ConstantReadNode || qk == NK_ConstantPathNode ? nt_str(nt, q, "name") : NULL;
+      int qi = qn ? comp_class_index(c, qn) : -1;
+      if (qn && is_object_class_name(qn)) continue;
+      if (!qn || qi < 0 || held[qi] || c->classes[qi].is_builtin_const) anh_add(&g->names, g_cw.names.key[i]);
+    }
+  }
+  free(rec);
+  free(held);
+}
+/* stale when the tree, the class table, a mixin recorded after the classes
+   were counted (c->mixin_gen) or the class-body map changed */
+static int program_gives_builtin_const(Compiler *c, const char *nm) {
+  struct BuiltinGiven *g = c->builtin_given;
+  if (!g) {
+    g = c->builtin_given = calloc(1, sizeof *g);
+    if (!g) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  if (g->nt != c->nt || g->ver != c->nt->version || g->ncls != c->nclasses || g->ncon != c->nconsts || g->mixins != c->mixin_gen ||
+      g->cbody != c->node_cbody) {
+    anh_free(&g->names);
+    memset(&g->names, 0, sizeof g->names);
+    g->dynamic = 0;
+    g->nt = c->nt; g->ver = c->nt->version; g->ncls = c->nclasses; g->ncon = c->nconsts; g->mixins = c->mixin_gen; g->cbody = c->node_cbody;
+    builtin_given_build(c, g);
+  }
+  return g->dynamic || anh_has(&g->names, nm);
+}
+/* `P::NAME` through a builtin class, module or exception P without
+   constants of its own (is_constless_builtin_name: String, Comparable,
+   StandardError), NAME a top-level class of the program: no member of P
+   unless the program gives NAME to P (const_path_in_closed_builtin: its
+   body, a path write, a lexically nested namesake) or to any builtin scope
+   (program_gives_builtin_const), or a write through a dynamic parent may
+   place it. A builtin with constants (File, Process, Float) lists members
+   the compiler has no table of, so its paths keep the leaf's class. */
+static int builtin_scope_lacks_member(Compiler *c, int seg) {
+  const NodeTable *nt = c->nt;
+  if (!const_path_in_closed_builtin(c, seg)) return 0;
+  const char *pn = nt_str(nt, nt_ref(nt, seg, "parent"), "name"), *nm = nt_str(nt, seg, "name");
+  /* the name the program wrote, a collision key (Holds__Qux) by its leaf */
+  const char *wn = nt_str(nt, seg, "qc_orig_name");
+  nm = class_leaf_name(wn ? wn : nm);
+  /* a top-level class: a constant aliasing one (`SA = Foo`) is asked once its
+     path is renamed, with the name written (the alias pass runs before the
+     mixins are recorded, so it cannot tell yet) */
+  int k = comp_class_index(c, nt_str(nt, seg, "name"));
+  if (!is_constless_builtin_name(pn)) return 0;
+  /* a top-level builtin class or module (Array::String) is no member
+     either, unless the program reopens it or gives it its own entry */
+  int top_builtin = k < 0 && !strchr(nm, ':') && builtin_class_id(nm) != 0 &&
+                    !(sp_streq(pn, "BasicObject") && sp_streq(nm, "BasicObject"));   /* BasicObject holds its own name */
+  if (!top_builtin && (k < 0 || c->classes[k].enclosing_class >= 0)) return 0;
+  return !program_gives_builtin_const(c, nm) && !program_places_const_dynamically(c, nm);
 }
 /* `P::NAME` where P is a class or module of the program (not Object) and
    NAME is a constant the program writes only at the top level: Object's
@@ -529,7 +717,7 @@ const char *superclass_builtin_exc_name(const NodeTable *nt, int sc) {
 }
 int class_inherits_builtin_exception(Compiler *c, int ci) {
   for (int k = ci; k >= 0; k = c->classes[k].parent)
-    if (superclass_builtin_exc_name(c->nt, nt_ref(c->nt, c->classes[k].def_node, "superclass")))
+    if (superclass_builtin_exc_name(c->nt, class_def_super(c->nt, c->classes[k].def_node)))
       return 1;
   return 0;
 }
@@ -809,6 +997,17 @@ int str_in(const char *s, const char *const *set) {
   for (int i = 0; set[i]; i++) if (sp_streq(s, set[i])) return 1;
   return 0;
 }
+/* recv is `singleton_class` or `self.singleton_class`, with no arguments and
+   no block: in a class or module body, the body's own singleton class, on
+   which `singleton_class.attr_reader :x` defines what `class << self;
+   attr_reader :x; end` does */
+int nt_self_singleton_class(const NodeTable *nt, int recv) {
+  if (recv < 0 || nt_kind(nt, recv) != NK_CallNode || !is_singleton_class_name(nt_str(nt, recv, "name")) ||
+      nt_ref(nt, recv, "arguments") >= 0 || nt_ref(nt, recv, "block") >= 0) return 0;
+  int r = nt_ref(nt, recv, "receiver");
+  return r < 0 || nt_kind(nt, r) == NK_SelfNode;
+}
+
 /* A construct whose VALUE is an empty container. Its type reads UNKNOWN
    because it carries no element type, which is not the same as producing no
    value -- and the two were conflated wherever an expression's type decides
@@ -953,7 +1152,7 @@ int class_var_static_ci(Compiler *c, int node) {
   NodeKind ty_k = nt_kind(nt, node);
   /* an inline `Struct.new(...)` / `Data.define(...)` receiver resolves to the
      anon class synthesized for that call node (#2682) */
-  if (ty_k == NK_CallNode && is_struct_call(c, node))
+  if (ty_k == NK_CallNode && class_def_is_record_call(nt, node))
     return anon_struct_ci_for_value(c, node);
   if (ty_k != NK_LocalVariableReadNode) return -1;
   const char *vn = nt_str(nt, node, "name");
@@ -973,12 +1172,12 @@ int class_var_static_ci(Compiler *c, int node) {
     /* a constant, or a path to one by its leaf (`k = Outer::Foo`), as
        class_recv_static_ci reads a receiver */
     int ci = (vk == NK_ConstantReadNode || vk == NK_ConstantPathNode)
-             ? comp_class_index(c, nt_str(nt, val, "name")) : -1;
+             ? const_node_class_index(c, val) : -1;
     /* k = Struct.new(:a, :b): resolve to the anonymous struct class that
        register_structs synthesized for this write (keyed by def_node) */
-    if (ci < 0 && is_struct_call(c, val)) {
-      for (int k = 0; k < c->nclasses; k++)
-        if (c->classes[k].is_anon_struct && c->classes[k].def_node == w) { ci = k; break; }
+    if (ci < 0 && class_def_is_record_call(nt, val)) {
+      for (int k = comp_class_of_def(c, w); k >= 0; k = comp_class_def_next(c, k))
+        if (c->classes[k].is_anon_struct) { ci = k; break; }
     }
     if (ci < 0) return -1;                   /* a non-class write: dynamic */
     if (found >= 0 && found != ci) return -1; /* two classes: dynamic */
@@ -994,7 +1193,7 @@ int class_recv_static_ci(Compiler *c, int node) {
   NodeKind k = nt_kind(nt, node);
   if ((k == NK_ConstantReadNode || k == NK_ConstantPathNode) &&
       nt_str(nt, node, "name"))
-    return comp_class_index(c, nt_str(nt, node, "name"));
+    return const_node_class_index(c, node);
   return class_var_static_ci(c, node);
 }
 
@@ -1006,12 +1205,21 @@ int class_recv_static_ci(Compiler *c, int node) {
    the program, a builtin class or an alias has its own static dispatch. */
 int const_class_value_only(Compiler *c, int node) {
   const NodeTable *nt = c->nt;
-  const char *nm = nt_kind(nt, node) == NK_ConstantReadNode ? nt_str(nt, node, "name") : NULL;
+  NodeKind k = nt_kind(nt, node);
+  const char *nm = k == NK_ConstantReadNode || k == NK_ConstantPathNode ? nt_str(nt, node, "name") : NULL;
   if (!nm || class_recv_static_ci(c, node) >= 0 || is_builtin_class_name(nm)) return 0;
   LocalVar *lv = comp_const(c, nm);
+  if (!lv || (lv->type != TY_CLASS && lv->type != TY_POLY) || resolve_class_alias_chain(c, nm)) return 0;
   const LrDef *d = NULL;
-  return lv && (lv->type == TY_CLASS || lv->type == TY_POLY) && !resolve_class_alias_chain(c, nm) &&
-    elab_const_at(c, node, nm, (LoadPoint){ -1, -1, -1 }, &d) != ELAB_NO && d && d->kind == LR_WRITE;
+  if (k == NK_ConstantReadNode)
+    return elab_const_at(c, node, nm, (LoadPoint){ -1, -1, -1 }, &d) != ELAB_NO && d && d->kind == LR_WRITE;
+  /* `M::X` (or `::X`): the write must be the constant of the class or
+     module the parent names (Object's for `::X`) where the read stands, as
+     `M::X` looks it up; a parent known only at run time names none */
+  int par = nt_ref(nt, node, "parent");
+  int owner = par < 0 ? -1 : class_recv_static_ci(c, par);
+  if (par >= 0 && owner < 0) return 0;
+  return elab_const_own_at(c, owner, nm, elab_point_of(c, node), &d) != ELAB_NO && d && d->kind == LR_WRITE;
 }
 
 /* The class method `name` the program defines for the class a class-valued
@@ -1569,16 +1777,18 @@ static const char *cvo_body_key(const NodeTable *nt, const char *clsname, const 
   return key;
 }
 /* The key of value constant CONSTNAME written directly in the body of class
-   or module CLSNAME, or NULL when it holds none. */
-static const char *const_value_owned_key(Compiler *c, const char *clsname, const char *constname) {
+   or module RK (CG_OBJECT: Object, not reopened), or NULL when it holds none. */
+static const char *const_value_owned_key(Compiler *c, int rk, const char *constname) {
   const NodeTable *nt = c->nt;
+  const char *clsname = rk >= 0 ? c->classes[rk].name : rk == CG_OBJECT ? "Object" : NULL;
+  if (!clsname) return NULL;
   const char *key = cvo_body_key(nt, clsname, constname);
   if (key) return key;
   /* ... or a path write through it (`Base::N = v`, or through an alias of
      it), under the key the constant qualifier gave it. The qualifier
      resolved the whole path (qc_owner): `Left::Base` is not a top-level
      Base. */
-  const char *rn = class_ruby_name(c, comp_class_index(c, clsname));
+  const char *rn = class_ruby_name(c, rk);
   if (!rn) return NULL;
   static const NodeKind pw[] = { NK_ConstantPathWriteNode, NK_ConstantPathOrWriteNode,
                                  NK_ConstantPathAndWriteNode, NK_ConstantPathOperatorWriteNode };
@@ -1592,8 +1802,8 @@ static const char *const_value_owned_key(Compiler *c, const char *clsname, const
     }
   return NULL;
 }
-static int const_value_owned(Compiler *c, const char *clsname, const char *constname) {
-  return const_value_owned_key(c, clsname, constname) != NULL;
+static int const_value_owned(Compiler *c, int rk, const char *constname) {
+  return const_value_owned_key(c, rk, constname) != NULL;
 }
 /* The classes of each name's leaf, ascending, while a caller asks const_get
    of every class in turn (const_get_leaves_begin .. _end): the class table
@@ -1659,25 +1869,35 @@ static int class_leaf_any(Compiler *c, const char *leaf) {
   }
   return 0;
 }
-/* Does class or module CLSNAME hold constant CONSTNAME itself -- a value
-   written in its body, or a class or module nested in it? */
-int const_owned_by_class(Compiler *c, const char *clsname, const char *constname) {
-  if (!clsname || !constname) return 0;
-  if (sp_streq(clsname, "Object") && const_name_resolves_top_level(c, constname)) return 1;
-  if (const_value_owned(c, clsname, constname)) return 1;
-  return class_nested_leaf(c, comp_class_index(c, clsname), constname) >= 0;
+/* Does class or module RK hold constant CONSTNAME itself -- a value
+   written in its body, or a class or module nested in it? A receiver the
+   class table lacks (CG_UNTABLED) holds none: its header would have made
+   it a class. */
+int const_owned_by_class(Compiler *c, int rk, const char *constname) {
+  if (rk == CG_NONE || rk == CG_UNTABLED || !constname) return 0;
+  if ((rk == CG_OBJECT || rk == comp_core_class(c, CORE_OBJECT)) && const_name_resolves_top_level(c, constname)) return 1;
+  if (const_value_owned(c, rk, constname)) return 1;
+  return class_nested_leaf(c, rk, constname) >= 0;
 }
-/* The module a `recv.const_get` searches, by name: a constant receiver's, or
-   for `self` the class or module whose method or body the call is in. */
-const char *const_get_recv_name(Compiler *c, int call, int recv) {
+/* The module a `recv.const_get` searches: a constant receiver's class, or
+   for `self` the class or module whose method or body the call is in.
+   Object, when no class of the program reopens it, is CG_OBJECT; a name
+   the class table lacks, CG_UNTABLED; no receiver the call names, CG_NONE. */
+int const_get_recv_class(Compiler *c, int call, int recv) {
   const NodeTable *nt = c->nt;
   NodeKind rk = nt_kind(nt, recv);
-  if (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) return nt_str(nt, recv, "name");
+  if (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) {
+    const char *nm = nt_str(nt, recv, "name");
+    if (!nm) return CG_NONE;
+    int k = comp_class_index(c, nm);
+    if (k >= 0) return k;
+    return builtin_core_class_slot(nm) == CORE_OBJECT ? CG_OBJECT : CG_UNTABLED;
+  }
   if (rk == NK_SelfNode) {
     Scope *s = comp_scope_of(c, call);
-    if (s && s->class_id >= 0 && s->class_id < c->nclasses) return c->classes[s->class_id].name;
+    if (s && s->class_id >= 0 && s->class_id < c->nclasses && c->classes[s->class_id].name) return s->class_id;
   }
-  return NULL;
+  return CG_NONE;
 }
 /* The class or module a `recv.const_set` sets its constant in, when the
    analysis knows it: a constant naming one, a local holding one class,
@@ -1716,7 +1936,7 @@ int const_set_slot(Compiler *c, int call, const char *n, const char **key) {
   if ((rn && is_object_base_name(rn)) || (cn && is_object_base_name(cn))) {
     *key = comp_const(c, n) ? n : NULL;
   } else if (cn) {
-    *key = const_value_owned_key(c, cn, n);
+    *key = const_value_owned_key(c, ci, n);
   } else if (qc_leaf_qualified(n)) {
     return CS_AMBIG;
   } else {
@@ -1726,18 +1946,23 @@ int const_set_slot(Compiler *c, int call, const char *n, const char **key) {
 }
 /* What `R.const_get(:N)` reads. Like Ruby, R first and then each superclass,
    taking at each the value constant or the class it holds under N; past them
-   the top-level constant or the class keyed N. Answers the value's key (N, or
-   the qualified name R's own carries) or NULL with *cls the class, -1 when
-   there is neither. */
-static const char *const_get_resolve(Compiler *c, const char *rnm, const char *cgn, int *cls) {
+   the top-level constant or the class keyed N. Constants live in one flat
+   namespace keyed by the leaf, so N may be both a class and a value constant
+   of the program: the value when R or a superclass holds it first, else the
+   class. Answers the value's key (N, or the qualified name R's own carries)
+   or NULL with *cls the class, -1 when there is neither. RK is R's class
+   (CG_NONE, CG_OBJECT, CG_UNTABLED when it has none, is Object not reopened,
+   or is a name the class table lacks). */
+const char *const_get_resolve(Compiler *c, int rk, const char *cgn, int *cls) {
   *cls = -1;
   /* A qualified path ("A::B", "::A::B") is read segment by segment: each
      but the last names a class or module, which the next is looked up in,
      a leading `::` from the top level; a segment that is none is the
      NameError of the whole path. */
   if (cgn && strstr(cgn, "::")) {
-    const char *p = cgn, *cur = rnm;
-    if (p[0] == ':' && p[1] == ':') { p += 2; cur = NULL; }
+    const char *p = cgn;
+    int cur = rk;
+    if (p[0] == ':' && p[1] == ':') { p += 2; cur = CG_NONE; }
     for (const char *sep; (sep = strstr(p, "::")); p = sep + 2) {
       char seg[256];
       size_t l = (size_t)(sep - p);
@@ -1745,16 +1970,15 @@ static const char *const_get_resolve(Compiler *c, const char *rnm, const char *c
       memcpy(seg, p, l); seg[l] = '\0';
       int k = -1;
       if (const_get_resolve(c, cur, seg, &k) || k < 0) return NULL;
-      cur = c->classes[k].name;
+      cur = k;
     }
     return *p ? const_get_resolve(c, cur, p, cls) : NULL;
   }
   LocalVar *cv = comp_const(c, cgn);
   /* the common case, one constant of that leaf and no class: no body scan */
   if (cv && cv->type != TY_UNKNOWN && !qc_leaf_qualified(cgn) && !class_leaf_any(c, cgn)) return cgn;
-  int rk = rnm ? comp_class_index(c, rnm) : -1;
   for (int k = rk, n = 0; k >= 0 && n < 64; k = c->classes[k].parent, n++) {
-    const char *own = c->classes[k].name ? const_value_owned_key(c, c->classes[k].name, cgn) : NULL;
+    const char *own = const_value_owned_key(c, k, cgn);
     if (own) {
       LocalVar *ov = comp_const(c, own);
       if (ov && ov->type != TY_UNKNOWN) return own;
@@ -1762,9 +1986,9 @@ static const char *const_get_resolve(Compiler *c, const char *rnm, const char *c
     int nk = class_nested_leaf(c, k, cgn);
     if (nk >= 0) { *cls = nk; return NULL; }
   }
-  /* a receiver the class table lacks (a builtin module): its body still counts */
-  if (rk < 0 && rnm) {
-    const char *own = const_value_owned_key(c, rnm, cgn);
+  /* Object, when no class reopens it: its body still counts */
+  if (rk == CG_OBJECT) {
+    const char *own = const_value_owned_key(c, rk, cgn);
     LocalVar *ov = own ? comp_const(c, own) : NULL;
     if (ov && ov->type != TY_UNKNOWN) return own;
   }
@@ -1772,12 +1996,15 @@ static const char *const_get_resolve(Compiler *c, const char *rnm, const char *c
   if (!cv || cv->type == TY_UNKNOWN) return NULL;
   return *cls < 0 ? cgn : NULL;
 }
-/* Does the program know constant N, for `R.const_defined?(:N)` (R's name
-   or NULL): a constant or class keyed N, a wellknown one, or the class R's
-   const_get finds under a qualified key. */
-int const_defined_known(Compiler *c, const char *rnm, const char *cgn) {
+/* Does the program know constant N, for `R.const_defined?(:N)` (R's class,
+   CG_NONE for none): a constant or class keyed N, a wellknown one, or the
+   class R's const_get finds under a qualified key. A named receiver the
+   class table lacks still reaches that lookup. */
+int const_defined_known(Compiler *c, int rk, const char *cgn) {
   if (comp_const(c, cgn) || comp_class_index(c, cgn) >= 0 || comp_is_wellknown_const(cgn)) return 1;
-  return rnm && const_get_class_index(c, rnm, cgn) >= 0;
+  int cls = -1;
+  if (rk != CG_NONE) const_get_resolve(c, rk, cgn, &cls);
+  return cls >= 0;
 }
 /* Does class or module K see constant CGN as `K.const_defined?(CGN)` looks:
    K, its ancestors and the modules they include. (A top-level constant,
@@ -1786,7 +2013,7 @@ int const_seen_by_class(Compiler *c, int k, const char *cgn) {
   static int depth = 0;
   if (depth > 8) return 0;
   for (int n = 0; k >= 0 && k < c->nclasses && n < 64; k = c->classes[k].parent, n++) {
-    if (c->classes[k].name && const_owned_by_class(c, c->classes[k].name, cgn)) return 1;
+    if (const_owned_by_class(c, k, cgn)) return 1;
     for (int i = 0; i < c->classes[k].nincluded_mods; i++) {
       depth++;
       int seen = const_seen_by_class(c, c->classes[k].included_mods[i], cgn);
@@ -1796,39 +2023,15 @@ int const_seen_by_class(Compiler *c, int k, const char *cgn) {
   }
   return 0;
 }
-/* `R.const_defined?(:N)` with R's name: N known to the program and seen
+/* `R.const_defined?(:N)` with R's class: N known to the program and seen
    from R. The table is flat, keyed by the leaf, so a constant another class
    holds answered for every receiver (#9876). A receiver the class table
    lacks (a builtin module), a qualified N and a top-level N keep the
    answer the flat table gives. */
-int const_defined_from(Compiler *c, const char *rnm, const char *cgn) {
-  if (!const_defined_known(c, rnm, cgn)) return 0;
-  if (!rnm || !cgn || strstr(cgn, "::") || const_name_resolves_top_level(c, cgn)) return 1;
-  int rk = comp_class_index(c, rnm);
-  if (rk < 0) return 1;
+int const_defined_from(Compiler *c, int rk, const char *cgn) {
+  if (!const_defined_known(c, rk, cgn)) return 0;
+  if (rk < 0 || !cgn || strstr(cgn, "::") || const_name_resolves_top_level(c, cgn)) return 1;
   return const_seen_by_class(c, rk, cgn);
-}
-/* `R.const_get(:N)` with N both a class and a value constant of the program
-   (constants live in one flat namespace, keyed by the leaf): the value when
-   R or a superclass holds it first, else the class. */
-int const_get_takes_value(Compiler *c, const char *rnm, const char *cgn) {
-  return const_get_value_key(c, rnm, cgn) != NULL;
-}
-/* ... and the key of the value constant it reads then, or NULL when it
-   answers the class. */
-const char *const_get_value_key(Compiler *c, const char *rnm, const char *cgn) {
-  int cls;
-  return const_get_resolve(c, rnm, cgn, &cls);
-}
-/* The class `R.const_get(:N)` answers, -1 when there is none. */
-int const_get_class_index(Compiler *c, const char *rnm, const char *cgn) {
-  int cls;
-  const_get_resolve(c, rnm, cgn, &cls);
-  return cls;
-}
-/* Both at once: the value's key, or NULL with *cls the class (-1 for none). */
-const char *const_get_lookup(Compiler *c, const char *rnm, const char *cgn, int *cls) {
-  return const_get_resolve(c, rnm, cgn, cls);
 }
 
 /* Does this receiver denote a Hash built by a blockless `Hash.new` (or an
@@ -1898,6 +2101,11 @@ int struct_member_idx_float(Compiler *c, ClassInfo *sc, int keynode) {
   int idx = (int)fv;
   if (idx < 0) idx += sc->nmembers;
   return idx >= 0 && idx < sc->nmembers ? idx : -1;
+}
+/* Whether index argument `n` is a Range (`a[1..2]`, `a[r]`): the call
+   reads or stores a slice, not one element. */
+int an_range_index(Compiler *c, int n) {
+  return n >= 0 && (nt_kind(c->nt, nt_paren_single(c->nt, n)) == NK_RangeNode || infer_type(c, n) == TY_RANGE);
 }
 int scope_body_last(Compiler *c, int mi) {
   int body = c->scopes[mi].body;
@@ -2379,7 +2587,7 @@ static int yvt_callee_index_scan(Compiler *c, int cid) {
     else if (cn && sp_streq(cn, "new") && nt_type(nt, crecv) &&
              (nt_kind(nt, crecv) == NK_ConstantReadNode ||
               nt_kind(nt, crecv) == NK_ConstantPathNode)) {
-      int nci = comp_class_index(c, nt_str(nt, crecv, "name"));
+      int nci = const_node_class_index(c, crecv);
       if (nci >= 0) rmi = comp_method_in_chain(c, nci, "initialize", NULL);
     }
     /* `Klass.m { block }` / `Mod.m { block }` / `NS::Klass.m { block }`: a
@@ -2390,7 +2598,7 @@ static int yvt_callee_index_scan(Compiler *c, int cid) {
     else if (nt_type(nt, crecv) &&
              (nt_kind(nt, crecv) == NK_ConstantReadNode ||
               nt_kind(nt, crecv) == NK_ConstantPathNode)) {
-      int nci = comp_class_index(c, nt_str(nt, crecv, "name"));
+      int nci = const_node_class_index(c, crecv);
       if (nci >= 0) rmi = call_target(c, cid, nci, cn, CT_CMETHOD, NULL);
     }
   }
@@ -2554,6 +2762,26 @@ static TyKind yvt_proc_arg_value(Compiler *c, int blk) {
   return pt == TY_UNKNOWN ? TY_POLY : pt;
 }
 
+/* The value a literal block `blk` hands the yield that runs it: its tail
+   (a `{ return e }` types as e, see below), joined with what its `next`
+   statements answer; nil for an empty block or a void tail. */
+static TyKind yvt_literal_block_value(Compiler *c, int blk) {
+  const NodeTable *nt = c->nt;
+  int bb = nt_ref(nt, blk, "body");
+  int bn = 0; const int *bd = bb >= 0 ? nt_arr(nt, bb, "body", &bn) : NULL;
+  TyKind bt;
+  if (bn == 0) bt = TY_NIL;
+  else if (nt_kind(nt, bd[bn - 1]) == NK_ReturnNode)
+    /* `{ return e }`: a non-local return -- the yield never produces a
+       value, but typing it as e's type keeps the enclosing method's
+       return shape consistent (the inline emits `return e` directly). */
+    bt = return_node_type(c, bd[bn - 1]);
+  else bt = infer_type(c, bd[bn - 1]);
+  if (bt == TY_VOID) bt = TY_NIL;
+  TyKind nx = block_next_value_ty(c, bb);
+  if (nx != TY_UNKNOWN) bt = (bt == TY_UNKNOWN) ? nx : ty_unify(bt, nx);
+  return bt;
+}
 TyKind yield_value_type(Compiler *c, int mi) {
   for (int i = 0; i < g_yvt_depth; i++)
     if (g_yvt_mi[i] == mi) return TY_UNKNOWN;
@@ -2624,21 +2852,7 @@ TyKind yield_value_type(Compiler *c, int mi) {
       result = ty_unify(result, ft);
       continue;
     }
-    int bb = nt_ref(nt, blk, "body");
-    int bn = 0; const int *bd = bb >= 0 ? nt_arr(nt, bb, "body", &bn) : NULL;
-    TyKind bt;
-    if (bn == 0) bt = TY_NIL;
-    else if (nt_kind(nt, bd[bn - 1]) == NK_ReturnNode)
-      /* `{ return e }`: a non-local return -- the yield never produces a
-         value, but typing it as e's type keeps the enclosing method's
-         return shape consistent (the inline emits `return e` directly). */
-      bt = return_node_type(c, bd[bn - 1]);
-    else bt = infer_type(c, bd[bn - 1]);
-    if (bt == TY_VOID) bt = TY_NIL;
-    {
-      TyKind nx = block_next_value_ty(c, bb);
-      if (nx != TY_UNKNOWN) bt = (bt == TY_UNKNOWN) ? nx : ty_unify(bt, nx);
-    }
+    TyKind bt = yvt_literal_block_value(c, blk);
     /* A yield-inlined (or self-recursive-lowered) method is specialized per
        call site, so its internal block type is the first concrete block. A
        non-inlined method (an escaping &block called via the proc ABI) has one
@@ -2678,7 +2892,9 @@ TyKind yield_value_type(Compiler *c, int mi) {
    nested blocks', lambdas', defs' and loops' own `next` excluded). Only the
    nil question asks for them (nullable_int_value). */
 int yield_block_tails_next = 0;
+static int ybt_cut;   /* the walk below stopped at its depth cap */
 static int ybt_collect_next(const NodeTable *nt, int id, int *out, int max, int depth) {
+  if (depth > 200) ybt_cut = 1;
   if (id < 0 || max <= 0 || depth > 200) return 0;
   NodeKind k = nt_kind(nt, id);
   if (k == NK_NextNode) { out[0] = id; return 1; }
@@ -2693,6 +2909,12 @@ static int ybt_collect_next(const NodeTable *nt, int id, int *out, int max, int 
     for (int j = 0; j < an && n < max; j++) n += ybt_collect_next(nt, ids[j], out + n, max - n, depth + 1);
   }
   return n;
+}
+
+int an_block_nexts(const NodeTable *nt, int body, int *out, int max) {
+  ybt_cut = 0;
+  int n = ybt_collect_next(nt, body, out, max, 0);
+  return ybt_cut ? -1 : n;
 }
 
 int yield_block_tails(Compiler *c, int mi, int *out, int max) {
@@ -2796,8 +3018,15 @@ TyKind yield_value_type_via_super(Compiler *c, int mi) {
        include's or extend's copy), or the superclass chain */
     int rmi = a_super_target(c, cs);
     if (rmi != mi) continue;
-    TyKind ft = yield_value_type(c, cmi);
-    if (ft == TY_UNKNOWN) ft = yield_value_type_via_super(c, cmi);
+    /* `super(a) { }` in the child: its own literal block is what mi's
+       yield runs, not a block of the child's callers (none reaches it) */
+    int sb = nt_ref(nt, yvt_sup_ids[ii], "block");
+    TyKind ft;
+    if (sb >= 0 && nt_kind(nt, sb) == NK_BlockNode) ft = yvt_literal_block_value(c, sb);
+    else {
+      ft = yield_value_type(c, cmi);
+      if (ft == TY_UNKNOWN) ft = yield_value_type_via_super(c, cmi);
+    }
     if (ft == TY_VOID) ft = TY_NIL;
     if (ft == TY_UNKNOWN) continue;
     result = (result == TY_UNKNOWN) ? ft : ty_unify(result, ft);
@@ -3194,6 +3423,37 @@ TyKind pinned_guard_unpin_ret(Compiler *c, int mi) {
   return r;
 }
 
+/* Is `node`, the tail of method mi, a `super` that hands mi's block on
+   (`super()`, a bare `super`, `super(&b)` naming mi's own &b) to a parent
+   whose tail is a yield, a call of its &block, or such a super again? The
+   parent is spliced into mi's caller as a yield-tailed body is
+   (emit_super_inline), so a call of mi with a block answers that site's
+   block value, not a value mi's other call sites gave the chain. */
+static int super_hands_block_tail(Compiler *c, int node, int mi, int depth) {
+  const NodeTable *nt = c->nt;
+  if (node < 0 || mi < 0 || mi >= c->nscopes || depth > 8) return 0;
+  NodeKind k = nt_kind(nt, node);
+  if (k != NK_SuperNode && k != NK_ForwardingSuperNode) return 0;
+  int blk = nt_ref(nt, node, "block");
+  if (blk >= 0) {
+    const char *bp = c->scopes[mi].blk_param;
+    int be = nt_kind(nt, blk) == NK_BlockArgumentNode ? nt_ref(nt, blk, "expression") : -1;
+    if (!bp || !*bp || be < 0 || nt_kind(nt, be) != NK_LocalVariableReadNode ||
+        !sp_streq(nt_str(nt, be, "name"), bp))
+      return 0;
+  }
+  int pmi = a_super_target(c, &c->scopes[mi]);
+  if (pmi < 0 || pmi >= c->nscopes || pmi == mi) return 0;
+  int plast = scope_body_last(c, pmi);
+  if (plast < 0) return 0;
+  if (nt_kind(nt, plast) == NK_YieldNode || is_blk_param_call(c, plast, pmi)) return 1;
+  return super_hands_block_tail(c, plast, pmi, depth + 1);
+}
+/* Does method mi fall off its end through such a super? */
+int method_hands_block_tail(Compiler *c, int mi) {
+  if (mi < 0 || mi >= c->nscopes) return 0;
+  return super_hands_block_tail(c, scope_body_last(c, mi), mi, 0);
+}
 TyKind method_call_ret(Compiler *c, int mi, int call_id) {
   IMEMO_DEP_SCOPE(mi);   /* (the method's value is read here) */
   int last = scope_body_last(c, mi);
@@ -3230,7 +3490,8 @@ TyKind method_call_ret(Compiler *c, int mi, int call_id) {
     return c->scopes[mi].ret;
   /* A yield-tailed inlined method, or a tail that calls the &block param:
      the block is spliced per call site, so use that site's block body type. */
-  if (is_yield || is_blk_param_call(c, last, mi) || ie_forwards_block_tail(c, last)) {
+  if (is_yield || is_blk_param_call(c, last, mi) || ie_forwards_block_tail(c, last) ||
+      super_hands_block_tail(c, last, mi, 0)) {
     int blk = nt_ref(c->nt, call_id, "block");
     /* `callee(&b)` / `callee(...)` forwards the block active in the enclosing
        method (a `...` forward carries it implicitly, with no block node), so
@@ -3741,8 +4002,16 @@ int send_blind_recv_owns(Compiler *c, int call, int recv, TyKind srt, const char
      come before Object's private top-level def */
   NodeKind rk = nt_kind(c->nt, recv);
   int ci = rk == NK_ConstantReadNode || rk == NK_ConstantPathNode
-           ? comp_class_index(c, nt_str(c->nt, recv, "name")) : self_class_static_ci(c, recv);
+           ? const_node_class_index(c, recv) : self_class_static_ci(c, recv);
   if (ci >= 0 && call_target(c, call, ci, name, CT_CMETHOD, NULL) >= 0) return 1;
+  /* then Class's and Module's own (the Class rows), which stand before
+     Object's methods, a top-level def among them */
+  if (srt == TY_CLASS) {
+    int an = nt_ref(c->nt, call, "arguments"), ac = 0;
+    if (an >= 0) nt_arr(c->nt, an, "arguments", &ac);
+    const BuiltinOp *row = bop_find(TY_CLASS, name, ac, nt_ref(c->nt, call, "block") >= 0);
+    if (row && !(row->flags & BOPF_BASIC_OBJECT) && (!(row->flags & BOPF_CLASS_ONLY) || cplan_recv_class(c, call, recv))) return 1;
+  }
   if (srt == TY_POLY) {
     /* any class's chain, from the by-name lists while the chain memo can
        be trusted, class by class otherwise */
@@ -3922,7 +4191,7 @@ int class_value_bind_call_target(Compiler *c, int ci, const char *sym, int *arml
   if (mi < 0) return -1;
   const ClassInfo *k = &c->classes[ci];
   Scope *tm = &c->scopes[mi];
-  if (k->is_value_type || (k->def_node >= 0 && nt_kind(c->nt, k->def_node) == NK_ModuleNode) ||
+  if (k->is_value_type || class_def_is_module(c->nt, k->def_node) ||
       tm->yields || (tm->blk_param && tm->blk_param[0])) {
     if (armless) *armless = 1;
     return -1;
@@ -4942,7 +5211,7 @@ static int si_class_may_stop(Compiler *c, int ref, int depth) {
     ClassInfo *ci = &c->classes[k];
     if (ci->name && (sp_streq(ci->name, "StopIteration") || sp_streq(ci->name, "ClosedQueueError"))) return 1;
     if (ci->parent >= 0) { k = ci->parent; continue; }
-    int sup = ci->def_node >= 0 ? nt_ref(c->nt, ci->def_node, "superclass") : -1;
+    int sup = class_def_super(c->nt, ci->def_node);
     if (sup < 0) return 0;
     NodeKind sk = nt_kind(c->nt, sup);
     if (sk != NK_ConstantReadNode && sk != NK_ConstantPathNode) return 1;
@@ -5003,7 +5272,7 @@ static void si_by_name(SiFacts *f, int from, const char *nm, int *hit) {
 static void si_call_targets(Compiler *c, SiFacts *f, int from, int id, const char *nm, int r, TyKind rt, int *hit) {
   const NodeTable *nt = c->nt;
   if (r >= 0 && sp_streq(nm, "new") && (nt_kind(nt, r) == NK_ConstantReadNode || nt_kind(nt, r) == NK_ConstantPathNode)) {
-    int k = comp_class_index(c, nt_str(nt, r, "name"));
+    int k = const_node_class_index(c, r);
     if (k >= 0) {
       int mi = comp_method_in_chain(c, k, "initialize", NULL);
       if (mi >= 0) si_target(f, from, mi, hit);

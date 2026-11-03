@@ -1231,10 +1231,22 @@ int emit_inline_call_x(Compiler *c, int id, Buf *b, int indent, int as_expr) {
   if (reopen_self_defaults(c, mi) && !repr_self_handle(c, mi)) return 0;
   /* A subclass overriding the method takes its own arm of the cls_id switch;
      splicing this body answered for every class with the base's method. The
-     switch reaches this one through its proc-form clone. */
-  if (takes_class_dispatch(c, id, mi, implicit_self ? comp_scope_of(c, id)->class_id : recv_class,
-                           name))
-    return 0;
+     switch reaches this one through its proc-form clone. A bare call counts
+     the overrides from the class whose method is being emitted, as the plain
+     call does (emit_call_class's dispatch_cid): a base method spliced into a
+     subclass's method runs with that subclass's self, whose descendants may
+     share one implementation where the base's do not. Counted from the base,
+     label_tag's `content_tag ..., &block` spliced into Label#render was left
+     to the plain call, which named the yielding content_tag's function --
+     one that is never emitted -- because another Base subclass takes
+     content_tag from a module included after it. */
+  int disp_cls = recv_class;
+  if (implicit_self) {
+    disp_cls = comp_scope_of(c, id)->class_id;
+    if (g_emitting_class_id >= 0 && disp_cls >= 0 && is_descendant(c, g_emitting_class_id, disp_cls))
+      disp_cls = g_emitting_class_id;
+  }
+  if (takes_class_dispatch(c, id, mi, disp_cls, name)) return 0;
   /* a private or protected method refuses an outside receiver before its body
      is spliced in, as the plain call does */
   {
@@ -4636,6 +4648,9 @@ int emit_tap_then_expr(Compiler *c, int id, Buf *b) {
   TyKind et = repr_of(c, recv).as_ty;
   /* an object whose class writes its own tap / then is called */
   if (ty_is_object(et) && call_target(c, id, ty_object_class(et), name, 0, NULL) >= 0) return 0;
+  /* a boxed receiver that may be one goes through the dispatch, whose
+     builtin arm comes back here (user_defines_or_reads is 0 inside it) */
+  if (et == TY_POLY && user_defines_or_reads(c, name)) return 0;
   /* An empty array literal receiver (`[].tap { |a| a << x }.join`) has no
      element type of its own, so comp_ntype leaves it unknown. Adopt the block
      param's container type (it was typed from the pushes) and materialize a
@@ -4802,7 +4817,10 @@ int emit_tap_then_expr(Compiler *c, int id, Buf *b) {
       emit_cell_shadow_store(c, tsc, p0, g_pre, g_indent);
   }
 
+  /* the block's own calls are not the arm's: a builtin arm's reading of
+     its value (g_poly_builtin_arm) stays outside it (step_arm_begin) */
   int sv = g_indent; g_indent = din;
+  int arm = step_arm_begin();
   if (is_then) {
     /* The body goes through the next-aware substrate: `next <v>` inside a
        `then` block leaves the block WITH that value, and this splice has no
@@ -4837,6 +4855,7 @@ int emit_tap_then_expr(Compiler *c, int id, Buf *b) {
     g_loop_exc_base = sv_lexcw; g_loop_rescue_base = sv_lexcw_rb; g_loop_ensure_base = sv_lensw;
     g_ie_next_var = sv_nxv;
   }
+  step_arm_end(c, arm);
   g_indent = sv;
   if (use_shadow) { emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n"); }
   if (tlv0) lv_set_type(tlv0, tsaved0);
@@ -8345,7 +8364,10 @@ static int emit_iteration_stmt_body(Compiler *c, int id, Buf *b, int indent) {
     if (sargc >= 2) emit_boxed(c, sargv[1], b); else buf_puts(b, "sp_box_int(1)");
     buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d);\n", ts);
     emit_indent(b, indent);
-    emit_boxed_step_head(b, tc, tl, ts, "0", "0", NULL);
+    /* a boxed limit that holds nil is no end: the walk goes on until the
+       block breaks */
+    char open[48]; snprintf(open, sizeof open, "_t%d.tag == SP_TAG_NIL", tl);
+    emit_boxed_step_head(b, tc, tl, ts, "0", open, NULL);
     buf_puts(b, " {\n");
     if (p0) { char cs[32]; snprintf(cs, sizeof cs, "_t%d", tc); emit_iter_param_assign(c, block, p0_orig, p0, TY_POLY, cs, b, indent + 1); }
     { char rs_es[32]; snprintf(rs_es, sizeof rs_es, "_t%d", tc);

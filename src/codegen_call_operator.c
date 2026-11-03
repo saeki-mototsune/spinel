@@ -428,6 +428,48 @@ static int kind_query_to_dispatch(Compiler *c, int id, const char *name, TyKind 
   return rt == TY_POLY && g_pd_skip != id && kind_query_overridden(c, name);
 }
 
+/* Does `<`, `<=`, `>` or `>=` (`name`) find no method on a receiver of the
+   builtin type rt, whatever it holds at run time: true or false, or one of
+   the classes with no `<=>` of their own (obj_cmp_by_identity: Regexp,
+   Exception, Proc, ...), none of which has Comparable or the operators.
+   Only while the program cannot give one: no method of it takes the name
+   (a def, an alias, method_missing, ...), no Comparable reaches a builtin
+   class or module (a reopened Regexp, Object or Kernel) or an exception
+   class, which an Exception-typed value may be an instance of, and no
+   include or prepend at the top level (which gives Object the module) may
+   bring Comparable in: one of Comparable itself or of a module the record
+   does not know, one reaching it, also one under a condition. */
+static int builtin_recv_lacks_cmp(Compiler *c, TyKind rt, const char *name) {
+  if (rt != TY_BOOL && !obj_cmp_by_identity(rt)) return 0;
+  if (!an_name_binder_free(c, name)) return 0;
+  for (int k = 0; k < c->nclasses; k++)
+    if (comp_comparable_reaches(c, k) &&
+        (class_is_exc_subclass(c, k) || is_native_class_name(c->classes[k].name))) return 0;
+  int nmx = 0;
+  const LrMixin *mx = elab_class_mixins(c, -1, &nmx);
+  for (int i = 0; i < nmx; i++)
+    if (mx[i].kind != LR_EXTEND && (mx[i].mod < 0 || comp_comparable_reaches(c, mx[i].mod))) return 0;
+  return 1;
+}
+
+/* `<`, `<=`, `>` or `>=` on such a receiver (builtin_recv_lacks_cmp):
+   CRuby's NoMethodError once the argument has run. An `e >= 0` in a method
+   only a computed `send(name, e)` may reach was refused, though CRuby runs
+   the program and raises only if the call is made. Asked ahead of the
+   operand arms, in emit_call_operator_arms and emit_call_compare_arms: a
+   boxed argument (an Integer under --int-overflow=promote) took the
+   run-time compare, which raised ArgumentError. Answers whether it emitted
+   the call. */
+static int emit_builtin_recv_cmp_raise(Compiler *c, const char *name, int recv, int argc, const int *argv, TyKind rt, Buf *b) {
+  if (recv < 0 || argc != 1 || !(sp_streq(name, "<") || sp_streq(name, "<=") || sp_streq(name, ">") || sp_streq(name, ">=")) ||
+      !builtin_recv_lacks_cmp(c, rt, name)) return 0;
+  int tv = hoist_boxed_rooted(c, recv);
+  buf_puts(b, "({ (void)(");
+  emit_expr(c, argv[0], b);
+  buf_printf(b, "); (sp_bool)(sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), 0); })", name, tv);
+  return 1;
+}
+
 /* `<`, `<=`, `>`, `>=` on a receiver with no static type (an unresolved
    call, a slot the fixpoint could not settle): it still has a boxed form,
    so compare at run time, as the arithmetic operators do (#3781). */
@@ -442,6 +484,7 @@ static int emit_untyped_recv_cmp(Compiler *c, const char *name, int recv, int ar
 
 int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt) {
   if (emit_compare_lead_arms(c, id, name, recv, argc, argv, rt, b)) return 1;
+  if (emit_builtin_recv_cmp_raise(c, name, recv, argc, argv, rt, b)) return 1;
   /* a literal `<<` whose result overflowed int64 (`1 << 64`): the node is typed
      bigint, but the int receiver would otherwise emit a UB C `1LL << 64LL`.
      Promote to a bigint shift. */
@@ -1985,6 +2028,7 @@ int emit_call_operator_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
       c->args_in_call = recv;
       return 1;
     }
+    if (emit_builtin_recv_cmp_raise(c, name, recv, argc, argv, rt, b)) return 1;
     const char *cfn = NULL;
     if (sp_streq(name, "<")) cfn = "sp_poly_lt";
     else if (sp_streq(name, ">")) cfn = "sp_poly_gt";

@@ -728,8 +728,11 @@ static const char *sp_glob_sep(const char *fsdir) {
 #define SP_GLOB_ROOT "/"
 #endif
 
-static void sp_glob_walk(const char *fsdir, const char *outprefix,
-                         char **comps, int ncomp, int ci, sp_StrArray *a) {
+/* `descended`: a ** has gone down at least one directory on the way here.
+   CRuby lists "." under FNM_DOTMATCH only above that: a recursive
+   star-star pattern answers "." but neither "sub/." nor "sub/x/.". */
+static void sp_glob_walk_at(const char *fsdir, const char *outprefix,
+                            char **comps, int ncomp, int ci, sp_StrArray *a, int descended) {
   if (ci >= ncomp) return;
   const char *comp = comps[ci];
   int last = (ci == ncomp - 1);
@@ -744,7 +747,7 @@ static void sp_glob_walk(const char *fsdir, const char *outprefix,
   if (strcmp(comp, "**") == 0) {
     /* ** matches zero or more directories. Zero first: the rest of the pattern
        applies right here. */
-    if (!last) sp_glob_walk(fsdir, outprefix, comps, ncomp, ci + 1, a);
+    if (!last) sp_glob_walk_at(fsdir, outprefix, comps, ncomp, ci + 1, a, descended);
     DIR *d = opendir(fsdir[0] ? fsdir : ".");
     if (!d) return;
     struct dirent *e;
@@ -765,7 +768,7 @@ static void sp_glob_walk(const char *fsdir, const char *outprefix,
           char sub[sizeof outpath + 1];   /* outpath and its trailing slash, whatever outpath holds */
           snprintf(sub, sizeof sub, "%s%s/", outprefix, name);
           /* stay on the same component: ** consumes any number of levels */
-          sp_glob_walk(fspath, sub, comps, ncomp, ci, a);
+          sp_glob_walk_at(fspath, sub, comps, ncomp, ci, a, 1);
         } }
     }
     closedir(d);
@@ -780,7 +783,7 @@ static void sp_glob_walk(const char *fsdir, const char *outprefix,
     if (sp_glob_is_dir(fspath)) {
       char sub[sizeof outpath + 1];   /* outpath and its trailing slash, whatever outpath holds */
       snprintf(sub, sizeof sub, "%s/", outpath);
-      sp_glob_walk(fspath, sub, comps, ncomp, ci + 1, a);
+      sp_glob_walk_at(fspath, sub, comps, ncomp, ci + 1, a, descended);
     }
     return;
   }
@@ -793,7 +796,7 @@ static void sp_glob_walk(const char *fsdir, const char *outprefix,
     /* "." is an answer under FNM_DOTMATCH -- CRuby lists it for `*` there --
        while ".." never is. Both stay hidden without the flag. */
     if (name[0] == '.' && name[1] == '.' && name[2] == 0) continue;
-    if (name[0] == '.' && name[1] == 0 && !sp_glob_dotmatch) continue;
+    if (name[0] == '.' && name[1] == 0 && (!sp_glob_dotmatch || descended)) continue;
     if (!sp_glob_comp_match(comp, name)) continue;
     if (sp_glob_bad) break;
     snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, SP_GLOB_SEP(fsdir), name);
@@ -802,10 +805,15 @@ static void sp_glob_walk(const char *fsdir, const char *outprefix,
     if (sp_glob_is_dir(fspath)) {
       char sub[sizeof outpath + 1];   /* outpath and its trailing slash, whatever outpath holds */
       snprintf(sub, sizeof sub, "%s/", outpath);
-      sp_glob_walk(fspath, sub, comps, ncomp, ci + 1, a);
+      sp_glob_walk_at(fspath, sub, comps, ncomp, ci + 1, a, descended);
     }
   }
   closedir(d);
+}
+
+static void sp_glob_walk(const char *fsdir, const char *outprefix,
+                         char **comps, int ncomp, int ci, sp_StrArray *a) {
+  sp_glob_walk_at(fsdir, outprefix, comps, ncomp, ci, a, 0);
 }
 
 static void sp_glob_start(void) { sp_glob_defer = 1; sp_glob_bad = 0; }
@@ -2031,6 +2039,8 @@ sp_PolyArray *sp_str_chars_poly(const char *s) {SP_GC_ROOT_STR(s);
 #endif
 #include "sp_exc.h"     /* sp_bt_block */
 int sp_bt_enabled = 0;          /* set to 1 by debug-build main() */
+void *sp_bt_buf[256];           /* frames captured at the last raise */
+int sp_bt_n = 0;
 const char *sp_bt_srcfile = ""; /* toplevel .rb path, set by debug main() */
 const char *const *sp_bt_files = 0;
 const sp_bt_block *sp_bt_blocks = 0;
@@ -2491,15 +2501,14 @@ const char *sp_File_gets_sep(sp_File *f, const char *sep, sp_int limit, sp_bool 
   while ((ch = SP_SIG_BLOCKING(fgetc(f->fp))) != EOF) {
     if (len + 2 > cap) { cap *= 2; char *nb = (char *)realloc(buf, cap); if (!nb) { free(buf); return NULL; } buf = nb; }
     buf[len++] = (char)ch;
-    /* as CRuby's getline: a byte that ends the separator is not checked
-       against the limit while fewer bytes than the separator are read, or
-       while the separator would start inside a character, and a limit
-       passed unchecked never stops that line */
-    if (sl && (unsigned char)ch == (unsigned char)sep[sl - 1]) {
-      if (len < sl) continue;
-      if (((unsigned char)buf[len - sl] & 0xC0) == 0x80 && len > sl) continue;
-      if (memcmp(buf + len - sl, sep, sl) == 0) { ended = 1; break; }
-    }
+    /* the separator ends the line where it is matched whole, and not where
+       it would start inside a character (on a continuation byte) */
+    if (sl && (unsigned char)ch == (unsigned char)sep[sl - 1] && len >= sl &&
+        !(((unsigned char)buf[len - sl] & 0xC0) == 0x80 && len > sl) &&
+        memcmp(buf + len - sl, sep, sl) == 0) { ended = 1; break; }
+    /* the limit cuts the line wherever it falls (CRuby 4.0.9; 4.0.7's
+       getline let a byte that could end a longer separator pass it
+       unchecked, and read on to the end) */
     if (lim > 0 && (sp_int)len == lim) {
       /* as CRuby's getline: a limit that falls inside a character reads on to
          its end (by up to 16 bytes) */
@@ -6852,4 +6861,43 @@ void sp_raise_frozen_array_rv(sp_RbVal v) {
   SP_GC_ROOT_STR(msg);
   sp_exc_stage_recv(v);
   sp_raise_cls("FrozenError", msg);
+}
+
+/* The roots the runtime itself holds, marked from the generated TU's
+   sp_re_mark_globals at each collection: the regex registers, ARGV and
+   ARGF, the top-level self, and the proc calling convention's side channel.
+   That channel holds boxed values with nothing else pointing at them: a proc
+   writes its result to _sp_proc_poly_ret and returns, and the caller reads it
+   back after, with an allocation in between (the push it is on its way to);
+   the arguments are the same on the way in. A slot keeps its value after its
+   reader is done, so it can name a freed object by the next cycle: the
+   scratch marker skips a slab slot that is free. Here rather than in the
+   header, every program compiled its own copy of these marks, with each
+   sp_mark_string inlined: the marker was the largest function a small
+   program compiled. Under verify, each group is named as the generated
+   marker names its own (#3404). */
+#include "sp_gc.h"
+#include "sp_re.h"
+#include "sp_argf.h"
+#include "sp_proc.h"
+void sp_mark_rt_roots(void) {
+#define SP_RT_PHASE(x) do { if (sp_gc_verify_on()) sp_gc_dbg_phase = (x); } while (0)
+  SP_RT_PHASE("globals:regex");
+  sp_mark_string(sp_re_last_str);
+  for (int i = 0; i < 10; i++) sp_mark_string(sp_re_captures[i]);
+  sp_mark_string(sp_re_match_str);
+  sp_mark_string(sp_re_match_pre);
+  sp_mark_string(sp_re_match_post);
+  SP_RT_PHASE("globals:argv");
+  for (sp_int i = 0; i < sp_argv.len; i++) sp_mark_string(sp_argv.data[i]);
+  if (sp_argv_array_cache) sp_gc_mark(sp_argv_array_cache);
+  if (sp_loaded_features_cache) sp_gc_mark(sp_loaded_features_cache);
+  if (sp_load_path_cache) sp_gc_mark(sp_load_path_cache);
+  if (sp_main_obj) sp_gc_mark(sp_main_obj);   /* top-level self */
+  sp_mark_string(sp_argf_obj.fname);   /* the file ARGF took off ARGV */
+  SP_RT_PHASE("globals:proc-channel");
+  sp_mark_rbval_scratch(_sp_proc_poly_ret);
+  for (int i = 0; i < SP_PROC_ARG_SLOTS; i++) sp_mark_rbval_scratch(_sp_proc_poly_args[i]);
+  if (_sp_proc_poly_wide) sp_gc_mark(_sp_proc_poly_wide);
+#undef SP_RT_PHASE
 }
