@@ -9,6 +9,7 @@
 #include "repr.h"
 #include "codegen_call_arms.h"
 #include "implicit_calls.h"
+#include "implied_calls.h"
 
 static CallPlan *g_cp_memo = NULL;
 static unsigned char *g_cp_have = NULL;
@@ -474,7 +475,7 @@ static void cplan_resolve_call(Compiler *c, int id, CallPlan *p) {
     const char *own = rt == TY_NIL ? "NilClass" : rt == TY_FLOAT ? "Float" : "Integer";
     const char *anc = rt == TY_NIL ? "NilClass" : "Numeric";
     if (!builtin_method_known(own, name) && !builtin_object_method_known(name)) {
-      int aci = comp_class_index(c, anc);
+      int aci = comp_builtin_class_named(c, anc);
       int ami = aci >= 0 ? call_target(c, id, aci, name, 0, NULL) : -1;
       if (ami >= 0 && c->scopes[ami].class_id == aci) { cplan_set(p, ami, aci, UC_REOPEN, CP_DIRECT); return; }
     }
@@ -778,14 +779,18 @@ static int ct_calls(Compiler *c, int id, const char *name) {
    side when sg; main when rcls < 0), as the record answered it: a def's
    scope (rcls's copy of it, when a mixin copied it); for an alias, the
    version of its target live where the alias was made, in the class whose
-   body made it. -1 for any other version (a define_method's, an
-   attribute's) or an alias made where the record has no point. A chain of
+   body made it; for a class-side accessor a later def replaces, the method
+   made of it (elab_attr_scope). -1 for any other version (a
+   define_method's, any other attribute's) or an alias made where the
+   record has no point. A chain of
    aliases ends: each step asks for the version live at an alias's point,
    one recorded ahead of that point, so the points only go back. */
 static int ct_def_version(Compiler *c, int rcls, const char *name, int sg, const LrDef *d, int *dc) {
   int cls = rcls;
   while (d) {
     if (d->kind == LR_DEF) return comp_method_version(c, rcls, name, sg, d->node, dc);
+    if ((d->kind == LR_READER || d->kind == LR_WRITER) && d->scope > 0)
+      return comp_method_version(c, rcls, name, sg, c->scopes[d->scope].def_node, dc);
     if (d->kind != LR_ALIAS || !d->target) return -1;
     int at = d->node;
     name = d->target;
@@ -885,6 +890,10 @@ static int ver_call_n(Compiler *c, int id) {
 }
 static int ver_arity(Compiler *c, int id, const int *to, int nto) {
   int n = ver_call_n(c, id);
+  int a = nt_ref(c->nt, id, "arguments"), ac = 0;
+  const int *av = a >= 0 ? nt_arr(c->nt, a, "arguments", &ac) : NULL;
+  /* not the versions' required ones: a boxed receiver's arm cannot gather a splat into __cond0.. (arg_layout_gathers) */
+  if (nt_argv_has(c->nt, av, ac, NT_ARG_SPLAT)) return -1;
   int ar = ver_plain_arity(c, to[0]), fits = 1;
   for (int i = 0; i < nto; i++) {
     if (ver_plain_arity(c, to[i]) != ar) ar = -1;
@@ -978,6 +987,7 @@ static int ct_pin_of(const Compiler *c, int id) {
   return -1;
 }
 int cplan_pinned_builtin(const Compiler *c, int id) { return ct_pin_of(c, id) == CT_PIN_BUILTIN; }
+int cplan_pinned(const Compiler *c, int id) { return ct_pin_of(c, id) != -1; }
 /* Is version vi a top-level method (Object's) that a call asked on a
    class's chain reaches past the class's own versions? The class's table
    holds no such method: the call's top-level ask (CT_TOP) binds it. */
@@ -990,11 +1000,14 @@ static unsigned ver_mix(unsigned h) {
   h ^= h >> 15; h *= 0xC2B2AE35u; h ^= h >> 13;
   return h;
 }
-/* How many versions rcls's chain holds of name (two at most counted: 0, 1 or
-   2 for more), and whether the first is a plain def, kept by (class, side,
-   name) for the record as it stands (elab_stamp): every call
-   asked of every class of a name asks it, and the answer is the chain's. */
-struct VerChain { struct VerChainSlot { const char *name; int rcls, sg, n, def; } *slot; int cap, used; ElabStamp stamp; };
+/* How many versions rcls's chain holds of name (-1 past VER_MAX_ARMS),
+   whether the first is a plain def, whether a method body makes one
+   (LrDef.body: a call may run before that body does, where the chain may
+   hold none of them), and the late bit of the chain's histories
+   (elab_versions_late), kept by (class, side, name) for the record as it
+   stands (elab_stamp): every call asked of every class of a name asks it,
+   and the answer is the chain's. */
+struct VerChain { struct VerChainSlot { const char *name; int rcls, sg, n, def, body, late; } *slot; int cap, used; ElabStamp stamp; };
 void ver_chain_free(Compiler *c) {
   if (!c->ver_chain) return;
   free(c->ver_chain->slot);
@@ -1004,7 +1017,7 @@ void ver_chain_free(Compiler *c) {
 static unsigned ver_chain_hash(const char *name, int rcls, int sg) {
   return ver_mix(sp_strhash(name) + (unsigned)rcls * 0x9E3779B1u + (unsigned)sg * 0x85EBCA6Bu);
 }
-static int ver_chain_count(Compiler *c, int rcls, int sg, const char *name, int *first_def) {
+static int ver_chain_count(Compiler *c, int rcls, int sg, const char *name, int *first_def, int *body, int *late) {
   struct VerChain *m = c->ver_chain;
   if (m && !elab_stamp_same(m->stamp, elab_stamp(c))) { ver_chain_free(c); m = NULL; }
   if (!m) {
@@ -1028,13 +1041,18 @@ static int ver_chain_count(Compiler *c, int rcls, int sg, const char *name, int 
   for (; m->slot[j].name; j = (j + 1) & (m->cap - 1))
     if (m->slot[j].rcls == rcls && m->slot[j].sg == sg && sp_streq(m->slot[j].name, name)) {
       *first_def = m->slot[j].def;
+      *body = m->slot[j].body;
+      *late = m->slot[j].late;
       return m->slot[j].n;
     }
-  ElabVersion one[2];
-  int n = elab_chain_versions(c, rcls, sg, name, one, 2), def = n >= 1 && one[0].v->kind == LR_DEF;
-  m->slot[j] = (struct VerChainSlot){ name, rcls, sg, n, def };
+  ElabVersion vs[VER_MAX_ARMS];
+  int n = elab_chain_versions(c, rcls, sg, name, vs, VER_MAX_ARMS), def = n >= 1 && vs[0].v->kind == LR_DEF, any = 0;
+  for (int k = 0; k < n; k++) any |= vs[k].v->body != 0;
+  m->slot[j] = (struct VerChainSlot){ name, rcls, sg, n, def, any, elab_versions_late(c, name, vs, n) };
   m->used++;
   *first_def = def;
+  *body = any;
+  *late = m->slot[j].late;
   return n;
 }
 /* Does call id run any time after its point: in a block the record
@@ -1042,6 +1060,74 @@ static int ver_chain_count(Compiler *c, int rcls, int sg, const char *name, int 
    to run at once that its call's typed target keeps (an_mark_kept_blocks)? */
 static int ct_after_point(Compiler *c, int id) {
   return elab_runs_later(c, id) || elab_in_kept_block(c, id);
+}
+/* Does node id make the implied call `name` on operand op (a node, or an
+   NTI_ word): a row of tools/implied_calls.yml says so (nt_implied_calls),
+   the rows the load record reads */
+static int ct_implied_row(Compiler *c, int id, const char *name, int op) {
+  NtImplied rows[16];
+  int n = nt_implied_calls(c->nt, id, rows, 16);
+  for (int i = 0; i < n && i < 16; i++)
+    if (rows[i].operand == op && sp_streq(rows[i].name, name)) return 1;
+  return 0;
+}
+/* The method the implied call `name` node id makes on operand op (a row:
+   a multiple assignment's to_ary of its value, ct_implied_row) runs on an
+   instance of cls: the one version of `name` on cls's chain over the
+   statements id may run in (elab_call_window, elab_method_span), a def
+   that ran there for sure, as cls's copy of it when a mixin brought it
+   (ct_def_version); -1 where no row makes the call, or the record cannot
+   prove one -- no version yet at some point of the window (a def or the
+   include that brings it comes later), more than one, or one that may
+   not have run (under a condition, or after a statement that may raise
+   in a begin body with rescue clauses: elab_point_partial). The call is
+   lowered as a call of `name`, which binds through the method table:
+   where an undef of the name on cls's chain leaves the table without it
+   (comp_is_undeffed_in_chain), that call is not the version proved, and
+   there is no answer either. */
+static int ct_implied_version_at(Compiler *c, int id, const char *name, int op, int cls) {
+  ElabWindow w;
+  const LrDef *ds[2];
+  if (cls < 0 || !ct_implied_row(c, id, name, op) || comp_is_undeffed_in_chain(c, cls, name) ||
+      elab_call_window(c, id, &w) != ELAB_YES) return -1;
+  if (ct_after_point(c, id)) elab_window_open(c, &w);
+  int n = elab_method_span(c, cls, name, 0, &w, ds, 2);
+  if (n != 1 || !ds[0] || ds[0]->kind != LR_DEF || ds[0]->may || ds[0]->unplaced ||
+      elab_point_partial(c, ds[0]->node)) return -1;
+  int dc = -1;
+  return ct_def_version(c, cls, name, 0, ds[0], &dc);
+}
+/* ...asked in the record's frame for the call plan (elab_plan_enter), as
+   ct_version asks: the passes that ask it append nodes between the asks */
+int cplan_implied_version(Compiler *c, int id, const char *name, int op, int cls) {
+  int framed = elab_plan_enter(c, id), vi = ct_implied_version_at(c, id, name, op, cls);
+  if (framed) elab_plan_leave(c);
+  return vi;
+}
+/* The classes whose own to_ary the implied to_ary call node id makes on
+   operand op reaches when the operand is boxed (a multiple assignment's
+   value, the value a block of several parameters takes apart): each
+   class a box can hold (comp_poly_candidates) whose no-argument to_ary is
+   the version the record proves there (cplan_implied_version). An Array
+   subclass is an Array already. A nested target's element converts at
+   its own level, as its MultiTargetNode's implied to_ary of the element
+   it takes (emit_massign_poly_target). An operand node of a program
+   class's type (op >= 0) is boxed as that object, and reaches only the
+   to_ary of its class or a subclass; one of another type (a Hash, a
+   scalar) none. Into out[0..cap), ascending; the count. */
+int cplan_boxed_to_ary_classes(Compiler *c, int id, int op, int *out, int cap) {
+  int n = 0, np = 0;
+  TyKind ot = op >= 0 ? comp_ntype(c, op) : TY_POLY;
+  int oc = ty_is_object(ot) ? ty_object_class(ot) : -1;
+  if (oc < 0 && ot != TY_POLY) return 0;
+  const PolyCand *pc = comp_poly_candidates(c, "to_ary", &np);
+  for (int i = 0; i < np && n < cap; i++) {
+    int k = pc[i].cls, mi = comp_implicit_to_ary_mi(c, k);
+    if (pc[i].native || mi < 0 || mi != pc[i].mi || c->scopes[mi].nparams != 0 || !c->classes[k].instantiated) continue;
+    if (oc >= 0 && !is_descendant(c, k, oc)) continue;
+    if (cplan_implied_version(c, id, "to_ary", op, k) == mi) out[n++] = k;
+  }
+  return n;
 }
 /* A chain a typed call may meet with no version made yet (ct_version_at),
    kept for ver_entries_demand to make its entry (Compiler.ver_late) */
@@ -1090,7 +1176,7 @@ static int ver_mm_at(Compiler *c, int rcls, int sg, LoadPoint p, int at, const E
 }
 
 /* The version of `name` call id runs, when the method has more than one
-   (#9898), or one the call may run before (elab_method_late): a call at
+   (#9898), or one the call may run before (elab_versions_late): a call at
    a load point gets the version live there; any other (a load point in a
    body that runs again, a method body, a block kept to run later), the
    one version it can reach over the statements it may run in
@@ -1103,20 +1189,36 @@ static int ver_mm_at(Compiler *c, int rcls, int sg, LoadPoint p, int at, const E
    (ver_absent_note), and made by ver_entries_demand. mi, the table's
    answer (the last version), where the record cannot tell or no entry
    was made. *span (when asked): how many versions the window reaches
-   (elab_method_span), 0 when no window was asked. */
+   (elab_method_span), 0 when no window was asked, -1 when the answer is
+   mi for want of a version or an entry. */
 static int ct_version_at(Compiler *c, int id, int cls, const char *name, unsigned flags, int mi, int *def_class, int *span) {
-  int sg = (flags & CT_CMETHOD) != 0, rcls = flags & CT_TOP ? -1 : cls, vi = -1, dc = -1, n = 0, first_def = 0, none = 0;
-  int late = elab_method_late(c, name);
+  int sg = (flags & CT_CMETHOD) != 0, rcls = flags & CT_TOP ? -1 : cls, vi = -1, dc = -1, n = 0, first_def = 0, none = 0, body = 0, cl = 0;
   const LrDef *d = NULL, *ds[VER_MAX_ARMS];
+  /* a call may meet the chain with no version made yet: the late bit of
+     its histories, or a version a method body makes on the chain (its
+     extent opens where that body first runs). Not for a capture
+     (CT_CAPTURE): a Method made where no version is live would need an
+     entry that checks the method is there, which captures do not have
+     yet, so a capture keeps the table's answer until presence-checked
+     captures retire this */
+  int nc = ver_chain_count(c, rcls, sg, name, &first_def, &body, &cl), late = cl == 2 || (body && !(flags & CT_CAPTURE));
   /* one def on rcls's whole chain, which no call runs ahead of: the
      table's (a name with versions on other chains only) */
-  if (ver_chain_count(c, rcls, sg, name, &first_def) == 1 && first_def && !late) {
+  if (nc == 1 && first_def && !late) {
     if (span) *span = 0;
     return mi;
   }
   LoadPoint p = elab_point_of(c, id);
   /* An unplaced capture chooses at construction through the existing
-     entry, even when a later wrapper changes the call's live window. */
+     entry, even when a later wrapper changes the call's live window. Not
+     where a reader that answers from the table names the method
+     (elab_method_reflected, the fact that keeps the name off the late
+     bit): a respond_to? guarding the capture says it is there, so the
+     capture binds the table's method too, as the guarded call does. */
+  if ((flags & CT_CAPTURE) && p.region < 0 && elab_method_reflected(c, name)) {
+    if (span) *span = 0;
+    return mi;
+  }
   if ((flags & CT_CAPTURE) && p.region < 0 &&
       (vi = ct_entry_of(c, 0, rcls, sg, name, ver_call_arity(c, id, rcls, sg, name, mi))) >= 0) {
     if (def_class && !(flags & CT_TOP)) *def_class = rcls;
@@ -1132,6 +1234,7 @@ static int ct_version_at(Compiler *c, int id, int cls, const char *name, unsigne
     if (kept) elab_window_open(c, &w);
     n = elab_method_span(c, rcls, name, sg, &w, ds, VER_MAX_ARMS);
     for (int k = 0; k < n && k < VER_MAX_ARMS; k++) none |= late && !ds[k];
+    if (n == ELAB_SPAN_ANY) none |= body;   /* (a method body's version may not be made yet) */
     if (n == 1 && ds[0]) vi = ct_def_version(c, rcls, name, sg, d = ds[0], &dc);
   }
   if (vi < 0 && (n >= 2 || n == ELAB_SPAN_ANY || none)) {
@@ -1155,8 +1258,12 @@ static int ct_version_at(Compiler *c, int id, int cls, const char *name, unsigne
   if (span) *span = n;
   /* only a version that is a function of its own: a replaced one
      (lr_mark_versions), an entry, or one no later scope of its name
-     shadows; not one a scope no def made (a define_method's) passes over */
-  if (vi < 0 || (!c->scopes[vi].replaced && !c->scopes[vi].entry && scope_is_shadowed(c, vi))) return mi;
+     shadows; not one a scope no def made (a define_method's) passes over.
+     (*span -1: no version told and no entry asked, the table's answer) */
+  if (vi < 0 || (!c->scopes[vi].replaced && !c->scopes[vi].entry && scope_is_shadowed(c, vi))) {
+    if (span && !n) *span = -1;
+    return mi;
+  }
   if (ct_top_version(c, vi, flags)) return -1;
   if (def_class && !(flags & CT_TOP)) *def_class = dc;
   return vi;
@@ -1228,11 +1335,44 @@ static int cm_self_kind(Compiler *c, int self) {
    answers on any self (`U.format`, private in CRuby). */
 static int ct_undefined_at(Compiler *c, int id, int cls, const char *name, unsigned flags) {
   if (!(flags & (CT_CMETHOD | CT_TOP)) || !elab_method_versions(c, name)) return 0;
+  /* (a capture on a chain a method body makes a version on keeps the
+     table's answer, as in ct_version_at, until captures check presence) */
+  int first_def = 0, body = 0, cl = 0;
+  if ((flags & CT_CAPTURE) && (ver_chain_count(c, flags & CT_TOP ? -1 : cls, (flags & CT_CMETHOD) != 0, name, &first_def, &body, &cl), body)) return 0;
   int framed = elab_plan_enter(c, id);
   int none = elab_call_method(c, id, flags & CT_TOP ? -1 : cls, name, (flags & CT_CMETHOD) != 0) == ELAB_NO;
   if (framed) elab_plan_leave(c);
   return none && !(nt_ref(c->nt, id, "receiver") >= 0 && !nt_int(c->nt, id, "self_call", 0) &&
                    builtin_self_method_known(name, cm_self_kind(c, flags & CT_TOP ? -1 : cls)));
+}
+/* See call_plan.h. */
+int cplan_sg_accessor(Compiler *c, int id, int ci, const char *name, char *slot, size_t cap) {
+  if (name_is_plain_setter(name)) {
+    if (!comp_sg_writer_reached(c, ci, name, slot, cap)) return CP_SG_NONE;
+  }
+  else {
+    const char *rn = comp_resolve_cm_alias_at(c, ci, name, NULL);
+    if (!comp_is_sg_reader(&c->classes[ci], rn ? rn : name)) return CP_SG_NONE;
+    snprintf(slot, cap, "%s", rn ? rn : name);
+  }
+  /* the slot where the call runs the accessor's own version, and where the
+     record tells no version (master's answer: the table's would be the
+     def's, which nothing proves runs there) */
+  return cplan_sg_version(c, id, ci, name) == CP_SG_METHOD ? CP_SG_METHOD : CP_SG_SLOT;
+}
+/* See call_plan.h. */
+int cplan_sg_version(Compiler *c, int id, int ci, const char *name) {
+  if (id < 0 || !elab_attr_replaced(c, ci, name)) return CP_SG_NONE;
+  int m = call_target(c, id, ci, name, CT_CMETHOD, NULL), told = 0;
+  if (m < 0 || c->scopes[m].attr_version) return CP_SG_SLOT;
+  if (!c->scopes[m].entry) ct_version(c, id, ci, name, CT_CMETHOD, m, NULL, &told);
+  return told < 0 ? CP_SG_UNTOLD : CP_SG_METHOD;
+}
+/* See call_plan.h. */
+int cplan_sg_slot_call(Compiler *c, int id, int ci, const char *name) {
+  char slot[256];
+  const char *nm = id >= 0 && nt_kind(c->nt, id) == NK_CallNode ? nt_str(c->nt, id, "name") : NULL;
+  return nm && name && sp_streq(nm, name) && cplan_sg_accessor(c, id, ci, name, slot, sizeof slot) == CP_SG_SLOT;
 }
 /* See call_plan.h. */
 int cplan_cmethod_later(Compiler *c, int id, int cls, const char *name) {
@@ -1735,16 +1875,17 @@ const CallPlan *cplan_user_fresh(Compiler *c, int id) {
   return cplan_dep(&fresh);
 }
 
-/* The class a constructor call builds: a constant receiver's, or the class
-   its method runs for, as inference types it (bare or `self.new` in a class
-   method, `self.class.new` in an instance method). *own is set for the
-   second kind, which a subclass receiving the method builds its own of. */
+/* The class a constructor call builds: a constant receiver's or a local's
+   that holds one class (class_recv_static_ci), or the class its method
+   runs for, as inference types it (bare or `self.new` in a class method,
+   `self.class.new` in an instance method). *own is set for the last kind,
+   which a subclass receiving the method builds its own of. */
 static int cplan_new_class(Compiler *c, int id, int *own) {
   const NodeTable *nt = c->nt;
   int r = nt_ref(nt, id, "receiver");
   NodeKind k = r >= 0 ? nt_kind(nt, r) : NK_NONE;
   *own = 0;
-  if (k == NK_ConstantReadNode || k == NK_ConstantPathNode) return const_node_class_index(c, r);
+  if (k == NK_ConstantReadNode || k == NK_ConstantPathNode || k == NK_LocalVariableReadNode) return class_recv_static_ci(c, r);
   Scope *s = comp_scope_of(c, id);
   int ci = -1;
   if (s && s->is_cmethod && (r < 0 || k == NK_SelfNode)) ci = s->class_id;
@@ -1756,31 +1897,48 @@ static int cplan_new_class(Compiler *c, int id, int *own) {
   return ci;
 }
 
-/* A constructor's result can be discarded, so resolve from its receiver
-   after the user new plan has declined, rather than from its result type. */
-int cplan_initialize(Compiler *c, int id) {
-  const NodeTable *nt = c->nt;
-  if (id < 0 || nt_kind(nt, id) != NK_CallNode || !is_new_name(nt_str(nt, id, "name"))) return -1;
-  int own, ci = cplan_new_class(c, id, &own);
-  if (ci < 0 || cplan_user_fresh(c, id)->dispatch != CP_NONE) return -1;
-  return comp_method_in_chain(c, ci, "initialize", NULL);
-}
-
-/* Every initialize a constructor call may run: cplan_initialize's, and for
-   a `new` on the class its method runs for the initialize of each subclass
-   too, which may be the one that receives the method. Answers the count. */
-int cplan_initializers(Compiler *c, int id, int *out, int cap) {
-  const NodeTable *nt = c->nt;
-  if (id < 0 || nt_kind(nt, id) != NK_CallNode || !is_new_name(nt_str(nt, id, "name"))) return 0;
-  int own, ci = cplan_new_class(c, id, &own), n = 0;
-  if (ci < 0 || cplan_user_fresh(c, id)->dispatch != CP_NONE) return 0;
-  for (int k = ci; k < c->nclasses && n < cap; k++) {
+/* The initialize methods a builtin `new` runs that builds class ci, or with
+   own an instance of ci or of any subclass (into out, at most CPT_MAX;
+   CPT_UNKNOWN past it). */
+static int ct_class_initializers(Compiler *c, int ci, int own, int *out) {
+  int n = 0;
+  for (int k = ci; ci >= 0 && k < c->nclasses; k++) {
     if (k != ci && (!own || !is_descendant(c, k, ci))) continue;
     int mi = comp_method_in_chain(c, k, "initialize", NULL), dup = 0;
     for (int j = 0; j < n; j++) dup |= out[j] == mi;
-    if (mi >= 0 && !dup) out[n++] = mi;
+    if (mi < 0 || dup) continue;
+    if (n == CPT_MAX) return CPT_UNKNOWN;
+    out[n++] = mi;
   }
   return n;
+}
+/* A builtin `new` (no program `new` answers it): the initialize methods it
+   may run. A constructor's result can be discarded, so this resolves from
+   its receiver, not from its result type.
+   The class it builds is cplan_new_class's, with each subclass's for a
+   `new` on the class its method runs for, which a subclass receiving the
+   method builds its own of; a constant naming a builtin (or one the
+   builtin class table lacks, is_untabled_native_class_name), one the
+   program assigns no constant of its name to, runs none of the program's;
+   any other receiver that may be a class (a variable's value of more than
+   one class, a call's answer, a constant the program assigns, an untyped
+   one) is no closed set. -2 for any other call. The methods a builtin
+   `new` enters, never what it answers (cplan_entries). */
+static int ct_new_initializers(Compiler *c, int id, int *out) {
+  const NodeTable *nt = c->nt;
+  if (!is_new_name(nt_str(nt, id, "name"))) return -2;
+  int own, ci = cplan_new_class(c, id, &own), n = ci >= 0 ? ct_class_initializers(c, ci, own, out) : 0;
+  int r = nt_ref(nt, id, "receiver");
+  if (ci >= 0 || r < 0) return ci >= 0 ? n : -2;
+  NodeKind k = nt_kind(nt, r);
+  /* (an untabled builtin runs no program initialize only while reopening,
+     subclassing, prepend, class_eval and define_method on it are refused:
+     revisit when they are lifted) */
+  if ((k == NK_ConstantReadNode || k == NK_ConstantPathNode) && !comp_const(c, nt_str(nt, r, "name")) &&
+      (const_seg_builtin(c, r) || (k == NK_ConstantReadNode && is_untabled_native_class_name(nt_str(nt, r, "name")))))
+    return 0;
+  TyKind rt = comp_ntype(c, r);
+  return rt == TY_POLY || rt == TY_UNKNOWN || rt == TY_CLASS ? CPT_UNKNOWN : -2;
 }
 
 /* ---- cplan_targets: the user methods a call may reach ---- */
@@ -2071,6 +2229,103 @@ int cplan_targets(Compiler *c, int id, int *out, int cap) {
   return n;
 }
 
+/* A super, bare or not, in a program `new` that reaches the builtin
+   Class#new (no program `new` above the method): the initialize methods it
+   runs, those of the method's class and its subclasses, which self is one
+   of. Open (CPT_UNKNOWN) for a module's `new`, which a class's singleton
+   takes by extend or prepend, and for a method under a prepend chain,
+   whose super the chain decides. -2 for any other super. */
+static int ct_super_new_initializers(Compiler *c, int id, int *out) {
+  Scope *s = comp_scope_of(c, id);
+  if (!s || s->class_id < 0 || !is_new_name(comp_scope_def_name(c, s))) return -2;
+  int at;
+  if (cplan_super_target(c, id, s, &at) >= 0) return -2;
+  int mod = comp_class_is_module(c, &c->classes[s->class_id]);
+  if (mod ? !s->is_cmethod : comp_super_shadow(c, s) != NULL) return CPT_UNKNOWN;
+  return !mod && s->is_cmethod ? ct_class_initializers(c, s->class_id, 1, out) : -2;
+}
+/* A `new` call id that a program `new` answers for some class its
+   receiver may be: those methods (its cplan_targets), and the initialize
+   methods of each class it may be that takes the builtin `new` instead.
+   The classes are cplan_new_class's (with its subclasses for the class a
+   method runs for) or, for a class value, those its class facts list
+   (cls_fact_node); CPT_UNKNOWN where they cannot be listed. */
+static int ct_mixed_new_entries(Compiler *c, int id, int *out) {
+  int n = cplan_targets(c, id, out, CPT_MAX), own, ci = cplan_new_class(c, id, &own);
+  if (n < 0) return n;
+  int r = nt_ref(c->nt, id, "receiver"), cls[CPT_MAX], ncls = 0;
+  if (ci >= 0) {
+    for (int k = ci; k < c->nclasses; k++)
+      if (k == ci || (own && is_descendant(c, k, ci))) {
+        if (ncls == CPT_MAX) return CPT_UNKNOWN;
+        cls[ncls++] = k;
+      }
+  } else if (r >= 0) {
+    const ClsSet *cs = cls_fact_node(c, r);
+    if (!cs || cs->all || cs->bv) return CPT_UNKNOWN;
+    /* (a member past nclasses is a class value: its class methods answer) */
+    for (int m = cls_set_next(cs, -1); m >= 0; m = cls_set_next(cs, m)) {
+      if (m < c->nclasses) continue;
+      if (ncls == CPT_MAX) return CPT_UNKNOWN;
+      cls[ncls++] = m - c->nclasses;
+    }
+  }
+  for (int i = 0; i < ncls; i++) {
+    int k = cls[i], init[CPT_MAX];
+    if (comp_class_is_module(c, &c->classes[k]) || comp_cmethod_in_chain(c, k, "new", NULL) >= 0) continue;
+    int ni = ct_class_initializers(c, k, 0, init);
+    if (ni < 0) return CPT_UNKNOWN;
+    for (int j = 0; j < ni; j++) {
+      int dup = 0;
+      for (int q = 0; q < n && !dup; q++) dup = out[q] == init[j];
+      if (dup) continue;
+      if (n == CPT_MAX) return CPT_UNKNOWN;
+      out[n++] = init[j];
+    }
+  }
+  return n;
+}
+/* A `new` call id's entries: a builtin one's (ct_new_initializers), one a
+   program `new` answers for some class (ct_mixed_new_entries), into out;
+   or a super's that reaches the builtin one (ct_super_new_initializers);
+   -2 for any other call, whose entries are its targets. */
+static int ct_new_entries(Compiler *c, int id, int *out) {
+  if (id < 0 || id >= c->node_cap) return -2;
+  NodeKind k = nt_kind(c->nt, id);
+  if (k == NK_SuperNode || k == NK_ForwardingSuperNode) return ct_super_new_initializers(c, id, out);
+  if (k != NK_CallNode || !is_new_name(nt_str(c->nt, id, "name"))) return -2;
+  return cplan_user_fresh(c, id)->dispatch != CP_NONE ? ct_mixed_new_entries(c, id, out) : ct_new_initializers(c, id, out);
+}
+
+int cplan_entries(Compiler *c, int id, int *out, int cap) {
+  int tmp[CPT_MAX], n = ct_new_entries(c, id, tmp);
+  if (n == -2) return cplan_targets(c, id, out, cap);
+  if (n > cap) return CPT_UNKNOWN;
+  if (n > 0) memcpy(out, tmp, (size_t)n * sizeof *tmp);
+  /* (the entries are what the asker reads next: their parameters) */
+  for (int i = 0; i < n; i++) IMEMO_DEP_SCOPE(out[i]);
+  return n;
+}
+
+int cplan_entries_bound_names(Compiler *c, int id, const char *names[2]) {
+  if (id < 0 || id >= c->node_cap) return 0;
+  NodeKind k = nt_kind(c->nt, id);
+  const Scope *s = k == NK_SuperNode || k == NK_ForwardingSuperNode ? comp_scope_of(c, id) : NULL;
+  /* (a super's name is its method's) */
+  const char *nm = k == NK_CallNode ? nt_str(c->nt, id, "name") : s ? comp_scope_def_name(c, s) : NULL;
+  return nm ? cplan_name_bound_names(nm, names) : 0;
+}
+int cplan_name_bound_names(const char *name, const char *names[2]) {
+  int n = 0;
+  names[n++] = name;
+  /* (the builtin `new` runs the initialize of the class it builds. The
+     bound takes `new` by its name: an alias of it, or a class-side
+     method_missing that builds, is refused today, else its bound would
+     miss initialize) */
+  if (is_new_name(name)) names[n++] = "initialize";
+  return n;
+}
+
 /* See call_plan.h. A boxed receiver's cplan_targets lists every class's
    method of the name; its dispatch has an arm only for the classes its
    receiver can hold (comp_poly_candidates_at) and that fit the call, one
@@ -2086,7 +2341,7 @@ int cplan_emitted_targets(Compiler *c, int id, int *out, int cap) {
     out[n++] = fb;
   }
   if (p->via != UC_POLY || p->mi < 0 || p->dispatch == CP_REFUSE) {
-    int m = cplan_targets(c, id, out + n, cap - n);
+    int m = cplan_entries(c, id, out + n, cap - n);
     if (m == CPT_UNKNOWN) return m;
     for (int i = n; i < n + m; i++)
       if (out[i] == fb) { out[i] = out[n + m - 1]; m--; break; }
@@ -2346,7 +2601,8 @@ static int ver_refl_named(Compiler *c, int id) {
    dispatcher a lone def under a run-time condition is lowered to
    (cond_lone_disp)? */
 static int ver_cond_scope(Compiler *c, const Scope *s) {
-  return s->def_node >= 0 && (nt_int(c->nt, s->def_node, "cond_def_refl", 0) || nt_int(c->nt, s->def_node, "cond_lone_disp", 0));
+  return s->def_node >= 0 && (nt_int(c->nt, s->def_node, "cond_def_refl", 0) ||
+                              (nt_int(c->nt, s->def_node, "cond_lone_disp", 0) && !nt_int(c->nt, s->def_node, "cond_all_arms", 0)));
 }
 /* Does a class's chain (its class side when sg) find, for a method of a
    conditional scope, such a scope, so that a list of its methods names a
@@ -3233,6 +3489,10 @@ static void cpoly_cases_n(Compiler *c, int id, const char *name, int argc, const
       !ps->pvalues_at && !ps->pfirstn && !ps->pmerge) {
     cpoly_family(p, cap, PB_ND_GENERIC);
     if (sp_streq(name, "replace") && argc == 1 && splat_a < 0 && ret == TY_POLY) cpoly_family(p, cap, PB_ND_REPLACE);
+    /* a blockless upto / downto's Enumerator, as emit_poly_defaults_n takes it */
+    else if ((sp_streq(name, "upto") || sp_streq(name, "downto")) && argc == 1 && ps->pos_argc == 1 &&
+             splat_a < 0 && nt_ref(c->nt, id, "block") < 0 && ret == TY_POLY)
+      cpoly_family(p, cap, PB_ND_UPTO);
     else if (is_round_family(name) && argc == 1 && splat_a < 0)
       cpoly_family(p, cap, PB_ND_ROUND);
     /* by the positional count, as emit_poly_defaults_n takes the arm */
@@ -3342,6 +3602,7 @@ static void cpoly_prearms_n(Compiler *c, int id, const char *name, int argc, con
     cpoly_trial(p, cap, PT_STR);
   cpoly_cases_n(c, id, name, argc, argv, ret, atmp_ty, &ps, splat_a, p, cap);
   if (cpoly_has_family(p, PB_ND_GENERIC) && !cpoly_has_family(p, PB_ND_REPLACE) &&
+      !cpoly_has_family(p, PB_ND_UPTO) &&
       !cpoly_has_family(p, PB_ND_ROUND) && !cpoly_has_family(p, PB_ND_NUM) &&
       !cpoly_obj_default_n(c, id, name, kwh, pos_argc, splat_a, p, cap))
     cpoly_trial(p, cap, PT_GENERIC_TAIL);
@@ -3799,6 +4060,26 @@ const PolyPlan *cplan_poly_fresh(Compiler *c, int id) {
   return &fresh;
 }
 
+/* (call_plan.h) */
+int cplan_reopen_own_block(Compiler *c, int id, int mi) {
+  const NodeTable *nt = c->nt;
+  int blk = nt_ref(nt, id, "block");
+  if (blk < 0) return ROB_NONE;
+  const Scope *m = &c->scopes[mi];
+  if (m->yields) return ROB_DECLINE;   /* (reached through its proc form) */
+  if (m->blk_param && m->blk_param[0]) return ROB_PASS;
+  int bx = nt_kind(nt, blk) == NK_BlockArgumentNode ? nt_ref(nt, blk, "expression") : -1;
+  return bx >= 0 && nt_kind(nt, bx) != NK_LocalVariableReadNode ? ROB_DECLINE : ROB_DROP;
+}
+/* (call_plan.h) The driver walks a value as a builtin container; an object
+   of a class with an `each` of its own is read as an empty one, where
+   CRuby's Enumerable runs that each. And it runs the callable on every
+   element: a nil one is no block in CRuby, where the call answers as
+   written without one (an Enumerator for most names). */
+int cplan_driver_walks_recv(Compiler *c, int id) {
+  return !poly_recv_defines(c, id, "each") && !an_fwd_block_may_be_nil(c, id);
+}
+
 /* (call_plan.h) Only `each`: its inline walk is what sp_poly_enum_proc does
    for the kinds it serves, reading the length at every step. The inline
    forms of reverse_each, each_pair and the rest differ from it on a
@@ -3891,6 +4172,97 @@ int cplan_has_method_missing(Compiler *c, int id, int ci, int cmethod) {
     if (ci < 0 && !self_is_main(c, id)) return 0;
   }
   return cplan_mm_method(c, ci, cmethod) >= 0;
+}
+
+/* The super a method's body is, unconditionally (`super`, `super(n, *a)`):
+   its only statement; -1 for any other body */
+static int cplan_body_super(Compiler *c, int mi) {
+  int b = c->scopes[mi].body, n = 0;
+  if (b >= 0 && nt_kind(c->nt, b) == NK_StatementsNode) {
+    const int *st = nt_arr(c->nt, b, "body", &n);
+    b = st && n == 1 ? st[0] : -1;
+  }
+  NodeKind k = b >= 0 ? nt_kind(c->nt, b) : NK_NONE;
+  return k == NK_SuperNode || k == NK_ForwardingSuperNode ? b : -1;
+}
+
+enum { SSF_DEAD_ASKED = 1, SSF_DEAD_SUPER = 2, SSF_MM_ASKED = 4, SSF_MM_ANSWERS = 8 };
+/* Method scope mi's super facts (Compiler.scope_super_facts), each filled
+   when first asked: SSF_DEAD_SUPER (cplan_value_dead_super), SSF_MM_ANSWERS
+   (cplan_mm_answers). */
+static unsigned char *cplan_scope_facts(Compiler *c, int mi) {
+  if (c->nscope_super_facts != c->nscopes) {
+    free(c->scope_super_facts);
+    c->scope_super_facts = calloc((size_t)(c->nscopes > 0 ? c->nscopes : 1), 1);
+    if (!c->scope_super_facts) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    c->nscope_super_facts = c->nscopes;
+  }
+  return &c->scope_super_facts[mi];
+}
+
+/* A value position of a method's body: one that answers a value of its own
+   (not a super whose plan reaches no method, nor a bare raise,
+   an_call_diverges) stops the walk; a dead super is noted in dead */
+typedef struct { Compiler *c; int dead; } DeadSuperWalk;
+static int cplan_own_value_leaf(const VpLeaf *leaf, void *ud) {
+  DeadSuperWalk *w = ud;
+  if (leaf->kind != VPK_EXPR && leaf->kind != VPK_GAVE_UP) return 1;
+  NodeKind k = leaf->kind == VPK_EXPR ? nt_kind(w->c->nt, leaf->node) : NK_NONE;
+  /* (a walk that gave up is taken as dead: the refusal is the safe answer) */
+  if (leaf->kind == VPK_GAVE_UP ||
+      ((k == NK_SuperNode || k == NK_ForwardingSuperNode) && cplan_user(w->c, leaf->node)->mi < 0)) {
+    w->dead = 1;
+    return 0;
+  }
+  return !an_call_diverges(w->c, leaf->node);
+}
+/* Is method scope mi's value a super whose plan reaches no method, where
+   CRuby answers what its method_missing does: some value position of its
+   body (for_each_value_position) is one, and none answers a value of its
+   own? One that can (an untaken arm's nil, a statement after the super)
+   answers it as CRuby does there, and a body that only raises, throws or
+   exits answers nothing. */
+static int cplan_value_dead_super(Compiler *c, int mi) {
+  unsigned char *f = cplan_scope_facts(c, mi);
+  if (!(*f & SSF_DEAD_ASKED)) {
+    *f |= SSF_DEAD_ASKED;
+    DeadSuperWalk w = { c, 0 };
+    int b = c->scopes[mi].body;
+    if (b >= 0 && !for_each_value_position(c->nt, b, VP_ALL_FLAGS & ~VP_CASE_IN_RAISE_NIL, cplan_own_value_leaf, &w) &&
+        w.dead)
+      *f |= SSF_DEAD_SUPER;
+  }
+  return (*f & SSF_DEAD_SUPER) != 0;
+}
+
+/* Does method_missing scope mm answer for self? One whose value is its own
+   super, unconditionally, hands the name on: CRuby then asks the
+   method_missing that super reaches, and past the last one raises
+   NoMethodError, as Spinel does. Any other answers, or may (one that
+   answers some names and supers on for the rest). */
+static int cplan_mm_answers(Compiler *c, int mm) {
+  unsigned char *f = cplan_scope_facts(c, mm);
+  if (!(*f & SSF_MM_ASKED)) {
+    *f |= SSF_MM_ASKED;   /* (a cycle of hand-ons answers nothing) */
+    int sup = cplan_body_super(c, mm), up = sup >= 0 ? cplan_user(c, sup)->mi : -1;
+    if (sup < 0 || (up >= 0 && cplan_mm_answers(c, up))) *f |= SSF_MM_ANSWERS;
+  }
+  return (*f & SSF_MM_ANSWERS) != 0;
+}
+/* Does super `id` reach a method whose value is its own super that reaches
+   no method (cplan_value_dead_super), where CRuby calls a method_missing
+   Spinel does not dispatch: one that answers for self (cplan_mm_answers), on
+   the chain of the class or of a descendant, as self may be one? */
+int cplan_super_needs_method_missing(Compiler *c, int id) {
+  const CallPlan *p = cplan_user(c, id);
+  Scope *s = comp_scope_of(c, id);
+  if (!s || p->via != UC_SUPER || p->mi < 0 || !cplan_value_dead_super(c, p->mi)) return 0;
+  for (int k = -1; k < c->nclasses; k++) {
+    if (k >= 0 && (k == s->class_id || !is_descendant(c, k, s->class_id))) continue;
+    int mm = cplan_mm_method(c, k < 0 ? s->class_id : k, s->is_cmethod);
+    if (mm >= 0 && cplan_mm_answers(c, mm)) return 1;
+  }
+  return 0;
 }
 
 /* Whether the boxed class arm calls the method rather than raising for
@@ -4354,10 +4726,15 @@ static int ver_builtin_chain(Compiler *c, int cls, int sg, const char *name, int
     if (c->classes[k].is_builtin_const && !is_object_base_name(c->classes[k].name)) return 1;
   return 0;
 }
+/* The version entry of name on rcls's chain (side sg) for ar arguments:
+   an arm per version, nearest history first, each testing its history's
+   cell; asked for a call that may meet no version (q), its else arm what
+   the lookup finds past every version of the chain (ver_absent_else),
+   when they share a visibility. -1 for none. */
 static int ver_entry_make(Compiler *c, const struct VerNamedAsks *q, int rcls, int sg, const char *name, int mi, int ar, int mm, int *absent) {
   ElabVersion vs[VER_MAX_ARMS];
   DispArm arm[VER_MAX_ARMS];
-  int to[VER_MAX_ARMS], na = 0, blk = c->scopes[mi].blk_param || c->scopes[mi].yields, dc, same = 1, one = 1, els = -1, fallback = mi;
+  int to[VER_MAX_ARMS], na = 0, blk = c->scopes[mi].blk_param || c->scopes[mi].yields, dc, same = 1, vis = 1, els = -1, fallback = mi;
   int spliced = c->scopes[mi].yields;
   char sel[VER_MAX_ARMS][32];
   int nv = elab_chain_versions(c, rcls, sg, name, vs, VER_MAX_ARMS);
@@ -4368,14 +4745,14 @@ static int ver_entry_make(Compiler *c, const struct VerNamedAsks *q, int rcls, i
       return -1;
     blk |= c->scopes[s].blk_param || c->scopes[s].yields;
     spliced &= c->scopes[s].yields;
-    one &= vs[i].hist == vs[0].hist && vs[i].v->vis == vs[0].v->vis;
+    vis &= vs[i].v->vis == vs[0].v->vis;
     ver_cell_name(vs[i].hist, sel[na]);
     arm[na] = (DispArm){ sel[na], vs[i].n, name, vs[i].hist + 1 };
     to[na++] = s;
     if (nt_int(c->nt, c->scopes[s].def_node, "concat_builtin_version", 0)) fallback = s;
     same &= ver_same_source(c->nt, c->scopes[s].def_node, c->scopes[mi].def_node);
   }
-  if (q && na && one && !ver_builtin_chain(c, rcls, sg, name, ar, blk)) els = ver_absent_else(c, q, rcls, sg, name, vs[0].hist, vs[0].v->vis, to, na, ar, mm, &blk, &spliced);
+  if (q && na && vis && !ver_builtin_chain(c, rcls, sg, name, ar, blk)) els = ver_absent_else(c, q, rcls, sg, name, vs[nv - 1].hist, vs[0].v->vis, to, na, ar, mm, &blk, &spliced);
   if (absent) *absent = els >= 0;
   if (els < 0 && (q || nv < 2 || !na || same)) return -1;   /* (asked for its else arm only: ver_late_make stores no scope for an entry without one) */
   return ver_entry_emit(c, rcls, sg, name, ar, blk, spliced, arm, to, na, fallback, els);
@@ -4621,10 +4998,11 @@ static int ver_else_block(Compiler *c, int cls, int sg, int last, int els) {
   return t < 0 || !(c->scopes[t].blk_param || c->scopes[t].yields) ? 0 : c->scopes[t].yields ? 2 : 1;
 }
 /* The else arm of rcls's version entry for a call that may meet no
-   version of the chain yet (ver_entries_demand), the versions to[0..na), one
-   history's of visibility vis: what the lookup finds with none of them
-   made, as an open history's entry answers for none run (ver_named_kind,
-   ver_named_else), at the last version's line; -1 where that is VK_KEEP,
+   version of the chain yet (ver_entries_demand), the versions to[0..na),
+   of one visibility vis, past the farthest of whose histories (hist) the
+   lookup goes on: what it finds with none of them made, as an open
+   history's entry answers for none run (ver_named_kind, ver_named_else),
+   at the last version's line; -1 where that is VK_KEEP,
    for which the entry keeps the last version (the table's answer). It
    may take the caller's block on (ver_else_block). */
 static int ver_absent_else(Compiler *c, const VerNamedAsks *q, int rcls, int sg, const char *name, int hist, int vis,
@@ -5174,7 +5552,7 @@ int ver_cell_put(Compiler *c, const char *cell, int list, int at, int after, int
    own history's versions. The writes are placed list by list, one rebuild
    of each list's statements: ahead of a statement in the order made, after
    it in the reverse order, as one insertion at a time placed them. */
-typedef struct { int list, stmt, node, n, hist, after, k, g; } VerWrite;
+typedef struct { int list, stmt, node, n, hist, after, k, g, body; } VerWrite;   /* body: a method body's version (LrDef.body) */
 /* The statement of a list a cell write of the version def `node` makes
    goes beside: the def's own; for a def in a class_eval-family block,
    whose defs the reopen registers and whose call runs none of its
@@ -5197,6 +5575,37 @@ static int ver_write_cmp(const void *a, const void *b) {
   if (x->stmt != y->stmt) return x->stmt < y->stmt ? -1 : 1;
   if (x->after != y->after) return x->after - y->after;
   return x->after ? y->k - x->k : x->k - y->k;
+}
+/* ...and beside each copy of a method body's version (VerWrite.body): a
+   module's method cloned into each class that includes, prepends or
+   extends it (nt_clone_subtree) holds a copy of a def its body makes
+   (LrDef.body), which writes the same cell where the copy runs. Only those:
+   a version at a point writes its cell at its own statement. A copy names
+   the node it copies (nt_origin, 'c'), along a chain of up to 64 copies;
+   only the writes made now are copied, since a copy made after an earlier
+   write carries that write */
+static void ver_copy_writes(Compiler *c, const int *par, unsigned char *seen, VerWrite **wp, int *nwp) {
+  const NodeTable *nt = c->nt;
+  int nw0 = *nwp, *of = nw0 ? calloc((size_t)nt->count + 1, sizeof(int)) : NULL;
+  if (!nw0) return;
+  if (!of) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int k = 0; k < nw0; k++) if ((*wp)[k].node >= 0 && (*wp)[k].body) of[(*wp)[k].node] = k + 1;
+  NT_FOREACH_KIND(nt, NK_DefNode, d) {
+    int o = d, k = 0, st;
+    for (int depth = 0; depth < 64 && !k; depth++) {
+      char how = 0; int a = 0, n = 0; unsigned pass = 0;
+      if ((o = nt_origin(nt, o, &how, &a, &pass, &n)) < 0 || how != 'c' || o >= nt->count) break;
+      k = of[o];
+    }
+    if (!k || seen[d] || (st = ver_write_stmt(nt, par, d)) < 0 || par[st] < 0) continue;
+    seen[d] = 1;
+    if (!(*nwp & (*nwp - 1)) && !(*wp = realloc(*wp, sizeof **wp * (size_t)(*nwp ? 2 * *nwp : 1)))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    VerWrite x = (*wp)[k - 1];
+    x.list = par[st]; x.stmt = st; x.node = d;
+    x.after = nt_kind(nt, st) != NK_DefNode && nt_kind(nt, st) != NK_AliasMethodNode && nt_kind(nt, st) != NK_UndefNode;
+    (*wp)[(*nwp)++] = x;
+  }
+  free(of);
 }
 void ver_cells_write(Compiler *c) {
   NodeTable *nt = (NodeTable *)c->nt;
@@ -5235,7 +5644,7 @@ void ver_cells_write(Compiler *c) {
       NodeKind sk = nt_kind(nt, st);
       /* (ahead of a def, an alias or an undef, which runs no program code: after one that ends a branch, the write would be the branch's value) */
       w[nw++] = (VerWrite){ par[st], st, node, vs[j].v->kind == LR_REMOVE ? 0 : vs[j].n, vs[j].hist,
-                            sk != NK_DefNode && sk != NK_AliasMethodNode && sk != NK_UndefNode, 0, -1 };
+                            sk != NK_DefNode && sk != NK_AliasMethodNode && sk != NK_UndefNode, 0, -1, vs[j].v->body != 0 };
       if (vs[j].hist >= nh) nh = vs[j].hist + 1;
       /* Not the lone conditional def's dispatcher alone: it stands after the condition, and the
          method is there as soon as an arm (`name#__condN`) runs in its branch */
@@ -5253,6 +5662,7 @@ void ver_cells_write(Compiler *c) {
       }
     }
   }
+  ver_copy_writes(c, par, seen, &w, &nw);
   free(seen); free(par);
   /* the zero writes: one per cell, at its first write, none where the first statement writes it */
   unsigned char *hz = calloc((size_t)nh + 1, 1);

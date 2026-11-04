@@ -65,6 +65,7 @@ src/analyze.c rd_builtin_string_method a name's presence
 src/analyze_desugar.c fwd_io_one_param_iter a name's presence in a File or IO reopening
 src/analyze_desugar.c iter_name_program_defined a name's presence in a reopened Array, Hash, Range or Enumerable
 src/analyze_desugar.c send_family_program_owns a name's presence
+src/analyze_desugar.c send_split_by_owner the classes that define a send-family name of their own
 src/analyze_infer.c an_any_class_cmethod a name's presence
 src/analyze_infer.c an_module_defines a name's presence
 src/analyze_infer.c an_module_methods_listable a name's presence
@@ -169,7 +170,7 @@ src/analyze_pass.c infer_param_types_ex =s->name super, by its def's name
 src/analyze_pass.c propagate_prep_params a prepended method's own name
 src/analyze_scope.c cmethod_reaches_class_ivar_walk =c->scopes[mi].name a scope's own name
 src/analyze_scope.c forwarding_target_scan =s->name a scope's own name
-src/analyze_scope.c specialize_cmethod_for =c->scopes[mi].name a scope's own name
+src/analyze_scope.c specialize_cmethod_for =as the copy's own name (its scope's, or the hidden name of a module's hidden copy)
 src/analyze_scope.c specialize_inherited_cls_new =mname a scope's own name
 src/analyze_scope.c specialize_super_cmethod super, by its def's name
 src/analyze_scope.c super_lands_on_attr super, by its def's name
@@ -294,3 +295,4 @@ src/codegen_util.c strbuf_reader_field_boxed the String sharing routes
 src/analyze_pass.c cr_mark_implied the implicit-callback rows' method-table names
 src/call_plan.c ver_entries_build the current own body of each public name before entries are installed
 src/call_plan.c ver_named_one the method an includer holds of a module's open history's name, its copy's or its own
+src/compiler.c comp_time_reopen_defines whether the program's reopen of Time defines a name, so a Time subclass's call of it is not taken for Time's in-place conversion or copy

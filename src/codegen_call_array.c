@@ -360,7 +360,7 @@ static int emit_array_operand_type_error(Compiler *c, const BopCtx *x, Buf *b) {
     buf_printf(b, "%s _t%d = (", at == TY_BOOL ? "int" : "const char *", tb);
     emit_expr(c, argv[0], b); buf_puts(b, "); ");
   }
-  else { buf_puts(b, "(void)("); emit_expr(c, argv[0], b); buf_puts(b, "); "); }
+  else { buf_puts(b, "(void)("); emit_expr_for_effect(c, argv[0], b); buf_puts(b, "); "); }
   emit_fold_recv_test(c, x->id, tr, b);
   if (at == TY_NIL)
     buf_puts(b, "sp_raise_cls(\"TypeError\", \"no implicit conversion of nil into Array\");");
@@ -1173,7 +1173,7 @@ int emit_op_array_flatten(Compiler *c, const BopCtx *x, Buf *b) {
         int cfl = hold_recv_open(c, recv, 0, "sp_PolyArray *", "SP_GC_ROOT", b, &rfl);
         buf_printf(b, "sp_PolyArray_flatten_n(%s, ", rfl.p);
         /* a nil depth is legal and means "no limit" (flatten_n: < 0) */
-        if (comp_ntype(c, argv[0]) == TY_NIL) { buf_puts(b, "((void)("); emit_expr(c, argv[0], b); buf_puts(b, "), (sp_int)-1)"); }
+        if (comp_ntype(c, argv[0]) == TY_NIL) { buf_puts(b, "((void)("); emit_expr_for_effect(c, argv[0], b); buf_puts(b, "), (sp_int)-1)"); }
         else emit_int_expr(c, argv[0], b);
         buf_puts(b, ")");
         free(rfl.p);
@@ -1467,7 +1467,7 @@ int emit_op_array_assoc(Compiler *c, const BopCtx *x, Buf *b) {
   if (rt != TY_POLY_ARRAY && argc == 1 && (sp_streq(name, "assoc") || sp_streq(name, "rassoc"))) {
     TyKind et = ty_array_elem(rt);
     if (et == TY_INT || et == TY_FLOAT || et == TY_STRING || et == TY_SYMBOL || et == TY_BOOL) {
-      buf_puts(b, "((void)("); emit_expr(c, recv, b); buf_puts(b, "), (void)(");
+      buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), (void)(");
       emit_boxed(c, argv[0], b); buf_puts(b, "), sp_box_nil())");
       return 1;
     }
@@ -1662,7 +1662,7 @@ int emit_op_array_fetch_values0(Compiler *c, const BopCtx *x, Buf *b) {
   if (rt == TY_POLY_ARRAY) return 0;
   /* fetch_values with no keys reads nothing: an empty Array */
   if (sp_streq(name, "fetch_values") && argc == 0) {
-    buf_printf(b, "((void)("); emit_expr(c, recv, b); buf_printf(b, "), sp_%sArray_new())", k);
+    buf_printf(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_printf(b, "), sp_%sArray_new())", k);
     return 1;
   }
   return 0;
@@ -3116,7 +3116,10 @@ int emit_scalar_array_transpose(Compiler *c, int id, int recv, TyKind rt,
    under the kind the inference pinned it to (infer_arysub_call), as a boxed
    receiver's face does (emit_face_arm). A call whose answer is its receiver
    answers the instance. */
-typedef struct { int bound, vr, vf, vi, nv, views[16]; TyKind nat; int copy, copy_class; } ArysubView;
+typedef struct { int bound, vr, vf, vi, nv, views[16]; TyKind nat; int copy, copy_class, trecv, tcls; } ArysubView;
+/* The receiver a view reads as its Time, and its Time subclass (-1: none):
+   the Time emitters see the face, so they ask here what it stands for */
+int g_timesub_view_recv = -1, g_timesub_view_cls = -1;
 
 /* Bind node n, an Array subclass instance, to its Array -- the same pointer
    cast -- evaluating anything but a variable once, ahead of the call. */
@@ -3173,9 +3176,12 @@ static int arysub_view_open(Compiler *c, int id, ArysubView *v) {
   int recv = nt_ref(nt, id, "receiver");
   TyKind rt = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN, k = TY_UNKNOWN;
   v->bound = -1; v->vr = v->vf = v->vi = -1; v->nv = 0; v->nat = TY_UNKNOWN; v->copy = 0; v->copy_class = 0;
+  v->trecv = g_timesub_view_recv; v->tcls = g_timesub_view_cls;
   int str = recv >= 0 && ty_is_object(rt) && comp_ary_is_str(c, ty_object_class(rt));
-  if (comp_arysub_call(c, id, rt, &k) && (array_new_copies(k) || ty_is_hash(k) || str)) {
-    int hash = str ? 2 : ty_is_hash(k) ? 1 : 0;
+  int tim = recv >= 0 && ty_is_object(rt) && comp_ary_is_time(c, ty_object_class(rt));
+  if (comp_arysub_call(c, id, rt, &k) && (array_new_copies(k) || ty_is_hash(k) || str || tim)) {
+    int hash = tim ? 3 : str ? 2 : ty_is_hash(k) ? 1 : 0;
+    if (tim) { g_timesub_view_recv = recv; g_timesub_view_cls = ty_object_class(rt); }
     v->bound = arysub_bind(c, recv, k);
     v->vr = view_push(c, recv, k);
     v->vf = view_push_face(recv, k);
@@ -3196,6 +3202,7 @@ static int arysub_view_open(Compiler *c, int id, ArysubView *v) {
        BOPF_COPY_CLASS) answers an instance of the receiver's class, with its
        instance variables: the Hash emitter's answer is put into a dup */
     else if (hash == 1 && (comp_arysub_answer(c, id, hash) & BOPF_COPY_CLASS)) v->copy_class = 1;
+    else if (hash == 3 && comp_timesub_copy_name(c, nt_str(nt, id, "name"))) v->copy_class = 1;
     rt = k;
   }
   int args = nt_ref(nt, id, "arguments"), an = 0;
@@ -3216,6 +3223,7 @@ static int arysub_view_open(Compiler *c, int id, ArysubView *v) {
   return v->bound >= 0;
 }
 static void arysub_view_close(Compiler *c, ArysubView *v) {
+  g_timesub_view_recv = v->trecv; g_timesub_view_cls = v->tcls;
   for (int i = v->nv - 1; i >= 0; i--) view_pop(c, v->views[i]);
   if (v->vi >= 0) view_pop(c, v->vi);
   if (v->vf >= 0) view_pop(c, v->vf);
@@ -3259,6 +3267,15 @@ int emit_arysub_call(Compiler *c, int id, Buf *b) {
     buf_printf(ob, "%s_dup(", arysub_array_ctype(c, ty_object_class(rt)));
     emit_call(c, id, ob);
     buf_puts(ob, ")");
+  }
+  else if (v.copy_class && cn && comp_ary_is_time(c, ty_object_class(rt))) {
+    /* a copy of the Time, as a fresh instance of the receiver's runtime class
+       (a descendant's, when the receiver is one), without its ivars */
+    int t = ++g_tmp;
+    buf_printf(ob, "({ sp_Time *_t%d = ", t);
+    emit_call(c, id, ob);
+    buf_printf(ob, "; SP_GC_ROOT(_t%d); (sp_%s *)sp_timesub_copy(sp_bsub_cls_of(sp_box_obj((void *)(%s), SP_BUILTIN_TIME)), _t%d); })",
+               t, cn, g_argov_text[v.bound], t);
   }
   else if (v.copy_class) {
     const char *at = arysub_array_ctype(c, ty_object_class(rt));

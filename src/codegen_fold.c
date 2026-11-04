@@ -1,4 +1,5 @@
 #include "codegen_internal.h"
+#include "implied_calls.h"
 #include "repr.h"
 #include "call_plan.h"
 #include "codegen_call_arms.h"
@@ -1250,12 +1251,12 @@ int emit_bsearch_expr(Compiler *c, int id, Buf *b) {
       int excl = nt_range_excl(nt, rn9);
       emit_indent(g_pre, g_indent);
       buf_printf(g_pre, "int64_t _t%d = sp_f2key(", klo);
-      if (blt9 == TY_NIL) { if (rleft >= 0) { buf_puts(g_pre, "((void)("); emit_expr(c, rleft, g_pre); buf_puts(g_pre, "), -HUGE_VAL)"); } else buf_puts(g_pre, "-HUGE_VAL"); }
+      if (blt9 == TY_NIL) { if (rleft >= 0) { buf_puts(g_pre, "((void)("); emit_expr_for_effect(c, rleft, g_pre); buf_puts(g_pre, "), -HUGE_VAL)"); } else buf_puts(g_pre, "-HUGE_VAL"); }
       else emit_float_expr(c, rleft, g_pre);
       buf_puts(g_pre, ") - 1;\n");
       emit_indent(g_pre, g_indent);
       buf_printf(g_pre, "int64_t _t%d = sp_f2key(", khi);
-      if (brt9 == TY_NIL) { if (rright >= 0) { buf_puts(g_pre, "((void)("); emit_expr(c, rright, g_pre); buf_puts(g_pre, "), HUGE_VAL)"); } else buf_puts(g_pre, "HUGE_VAL"); }
+      if (brt9 == TY_NIL) { if (rright >= 0) { buf_puts(g_pre, "((void)("); emit_expr_for_effect(c, rright, g_pre); buf_puts(g_pre, "), HUGE_VAL)"); } else buf_puts(g_pre, "HUGE_VAL"); }
       else emit_float_expr(c, rright, g_pre);
       buf_printf(g_pre, ")%s;\n", excl ? "" : " + 1");
     }
@@ -1448,6 +1449,8 @@ static void splat_poly_elem(const LocalVar *lvp, int j, const void *src, Buf *ou
    each param's pinned type. Used where a multi-param block iterates a poly array
    whose elements are themselves arrays (map/select/reject/sort_by). */
 void emit_autosplat_params(Compiler *c, int block, int np, int elem_temp, int indent) {
+  /* (the parameters' implied to_ary of the element: its row) */
+  if (indent >= 0) elem_temp = emit_boxed_to_ary(c, nt_ref(c->nt, block, "parameters"), NTI_YIELDED, elem_temp, g_pre, indent);
   char src[24]; snprintf(src, sizeof src, "_t%d", elem_temp);
   emit_splat_params(c, block, np, splat_poly_elem, src, g_pre, indent);
 }
@@ -4147,6 +4150,12 @@ int emit_reduce_block_expr(Compiler *c, int id, Buf *b) {
   else buf_printf(b, "_t%d; })", tacc);
   if (rlv0) lv_set_type(rlv0, rpt0);
   if (rlv1) lv_set_type(rlv1, rpt1);
+  /* the body's nodes back to the parameters' own types: they were typed
+     for this fold's accumulator, and the block emitted again elsewhere (a
+     program class's inject beside it takes the block as a proc, whose
+     parameters are boxed) read `a` as the seed's Array (#10931) */
+  if (rlv0 || rlv1)
+    for (int j = 0; j < bn; j++) infer_subtree(c, bb[j]);
   return 1;
 }
 
@@ -7630,7 +7639,7 @@ static void emit_arg_or_default_fill(Compiler *c, Scope *m, int idx, int provide
       nt_kind(c->nt, provided) != NK_NilNode && !(p && (p->byref_out || p->str_shared))) {
     TyKind at = repr_of(c, provided).as_ty;
     if (at == TY_NIL || at == TY_VOID) {
-      buf_puts(out, "({ (void)("); emit_expr(c, provided, out); buf_puts(out, "); NULL; })");
+      buf_puts(out, "({ (void)("); emit_expr_for_effect(c, provided, out); buf_puts(out, "); NULL; })");
       return;
     }
   }
@@ -7716,7 +7725,7 @@ static void emit_arg_or_default_fill(Compiler *c, Scope *m, int idx, int provide
       int sve = g_emitting_class_id;
       char dself[32];
       dflt_self_enter(m, dvP, dself, sizeof dself);
-      buf_puts(out, "({ (void)("); emit_expr(c, dvP, out); buf_puts(out, "); NULL; })");
+      buf_puts(out, "({ (void)("); emit_expr_for_effect(c, dvP, out); buf_puts(out, "); NULL; })");
       g_self = svs; g_self_deref = svd; g_emitting_class_id = sve;
       return;
     }
@@ -8093,7 +8102,7 @@ static void emit_arg_or_default_fill(Compiler *c, Scope *m, int idx, int provide
           snprintf(pw, sizeof pw, "parameter %s of %s", m->pnames[idx] ? m->pnames[idx] : "?", m->name ? m->name : "?");
           refuse_nil_store(c, provided, pt, pw);
         }
-        else if (at == TY_NIL && pt == TY_STRING) { buf_puts(out, "((void)("); emit_expr(c, provided, out); buf_puts(out, "), NULL)"); }
+        else if (at == TY_NIL && pt == TY_STRING) { buf_puts(out, "((void)("); emit_expr_for_effect(c, provided, out); buf_puts(out, "), NULL)"); }
         else if (at == TY_POLY && pt == TY_STRING) { buf_puts(out, "sp_poly_to_s_or_nil("); emit_expr(c, provided, out); buf_puts(out, ")"); }
         /* An unresolved call typed TY_UNKNOWN whose emitted value is the gate's
            sp_raise_nomethod(...) poly token, landing in a concretely-typed
@@ -10706,6 +10715,25 @@ void emit_pd_param_bind(Compiler *c, Scope *m, int i, int uid, const char *val, 
   snprintf(name, cap, byref ? "_cell_%s" : "lv_%s", uniq);
 }
 
+/* After every parameter of m is bound (emit_pd_param_bind, uid): a
+   parameter a closure captures lives in its cell once a default has run,
+   which a later default may have written (`b = (-> { a = 7 }.call)`), so
+   the call passes the alias, which takes the cell's value. names[i] is
+   parameter i's bound name. */
+void emit_pd_cell_copyback(Compiler *c, Scope *m, int uid, char names[][64]) {
+  for (int i = 0; i < m->nparams && i < 64; i++) {
+    LocalVar *cp = m->pnames[i] ? scope_local(m, m->pnames[i]) : NULL;
+    if (!cp || !cp->is_cell || cp->byref_out) continue;
+    for (int j = i + 1; j < m->nparams; j++)
+      if (m->pdefault && m->pdefault[j] >= 0 && subtree_writes_local(c, m->pdefault[j], m->pnames[i])) {
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "%s = %s*_cell__pd%d_%d;\n", names[i],
+                   cp->type == TY_PROC ? "(sp_Proc *)(uintptr_t)" : "", uid, i);
+        break;
+      }
+  }
+}
+
 /* True if some parameter's default expression references an EARLIER parameter
    (reads or assigns it: `b = (a = 4)`). Ruby evaluates defaults left-to-right in the callee where earlier params are
    already bound; spinel fills defaults at the call site, where those bindings
@@ -12345,20 +12373,7 @@ void emit_args_filled_argv(Compiler *c, int callee_idx, const int *argv, int arg
       emit_pd_param_bind(c, m, i, uid, vb.p, tmpnames[i], sizeof tmpnames[0]);
       free(vb.p);
     }
-    /* a parameter a closure captures lives in its cell once a default has
-       run, which a later default may have written (`b = (-> { a = 7 }.call)`):
-       the call passes the alias, which takes the cell's value */
-    for (int i = 0; i < m->nparams; i++) {
-      LocalVar *cp = m->pnames[i] ? scope_local(m, m->pnames[i]) : NULL;
-      if (!cp || !cp->is_cell || cp->byref_out) continue;
-      for (int j = i + 1; j < m->nparams; j++)
-        if (m->pdefault && m->pdefault[j] >= 0 && subtree_writes_local(c, m->pdefault[j], m->pnames[i])) {
-          emit_indent(g_pre, g_indent);
-          buf_printf(g_pre, "%s = %s*_cell__pd%d_%d;\n", tmpnames[i],
-                     cp->type == TY_PROC ? "(sp_Proc *)(uintptr_t)" : "", uid, i);
-          break;
-        }
-    }
+    emit_pd_cell_copyback(c, m, uid, tmpnames);
     g_nren = ren_base;  /* pop the renames before emitting the call args */
     for (int i = 0; i < m->nparams; i++) {
       buf_puts(out, i == 0 ? lead : ", ");

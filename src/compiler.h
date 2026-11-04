@@ -481,8 +481,11 @@ typedef struct {
      method by name: the table answers it, and the versions it arms are
      replaced; main_n, codegen's
      number for a method of main's own whose name Object's methods have
-     too (both are top-level functions in C) */
-  unsigned char versioned, replaced;
+     too (both are top-level functions in C); attr_version, the method
+     made of a class-side accessor a later def replaces
+     (register_attr_versions), whose calls the slot stands in for
+     (cplan_sg_accessor) */
+  unsigned char versioned, replaced, attr_version;
   enum { ENTRY_NONE, ENTRY_DISPATCH, ENTRY_TABLE, ENTRY_NAMED } entry;
   int version_n, main_n;
   unsigned char cand_bound; /* a call on a poly receiver bound its arguments
@@ -499,6 +502,9 @@ typedef struct {
   int is_transplanted_source; /* method was copied into another class via include/prepend */
   int origin_module_ci;      /* +1-based module this copy came from (0 = none):
                                 Method#owner names the module, not the includer */
+  int def_module_ci;         /* a hidden copy's inner module, once asked
+                                (mixin_def_module): +1-based, -1 none, 0 not
+                                asked yet */
   int is_include_copy;        /* this scope IS such a copy: a later include of a
                                  module defining the same name replaces it, and
                                  the replacement's super chains to it (#3731) */
@@ -596,6 +602,10 @@ typedef struct {
   const int *ps_kws;
   int ps_fwd;             /* a `...` keyword rest: every name binds by keyword */
   int ps_obr;             /* an optional with posts beside it; -1: no list says */
+  /* How its calls enter it (an_block_presence's BP_* bits), kept while
+     infer_type's memo keeps this edit count, plus one (0: not read). */
+  unsigned long bp_edits;
+  int bp_bits;
 
   SP_TY_FIELD TyKind ret;     /* inferred return type */
   SlotWhy ret_why;  /* how `ret` came to be untyped, if it is */
@@ -712,6 +722,14 @@ typedef struct {
    is both, the module's own method and its private instance method */
 static inline int scope_on_side(const Scope *s, int cm) {
   return cm ? s->is_cmethod : !s->is_cmethod || s->is_module_function;
+}
+
+/* Is s a method no lookup by name answers, and which shadows none: a
+   version entry (ENTRY_DISPATCH), or the method made of an accessor a
+   later def replaces (attr_version)? Only the calls call_target binds to
+   it reach it. */
+static inline int scope_by_name_hidden(const Scope *s) {
+  return s->entry == ENTRY_DISPATCH || s->attr_version;
 }
 
 static inline TyKind scope_set_ret(Scope *s, TyKind t) {
@@ -958,11 +976,14 @@ typedef struct {
      class of the chain. The comp_ary_* / comp_arysub_* functions answer for
      both; the Array-only ones say so. A String subclass is the same with its
      String, a mutable handle (sp_String) by value: ary_str is set on every
-     class of the chain and ary_kind is TY_STRBUF. */
+     class of the chain and ary_kind is TY_STRBUF. A Time subclass embeds
+     its Time value (sp_Time) the same way: ary_time is set on every class of
+     the chain and ary_kind is TY_TIME. */
   int ary_root;
   TyKind ary_kind;
   int ary_hash;
   int ary_str;
+  int ary_time;
   char *c_struct;      /* e.g. "sp_StringIO", or NULL */
   char *native_free;   /* finalizer C symbol, or NULL */
   /* native_subclass "header", "scan": the class may be subclassed (#9269);
@@ -1256,6 +1277,10 @@ typedef struct {
                           (VR_HEAD_HELD) around the call's own emission,
                           where an arm that holds the operand reads that
                           temp (hold_operand) */
+  unsigned char *value_discarded; /* [node_cap] a node emitted where its value
+                          is thrown away (emit_expr_for_effect: `((void)(...))`,
+                          the left of a comma): set only as a view
+                          (VR_DISCARDED) around that emission */
   SP_TY_FIELD TyKind *nilnarrow; /* [node_cap] param-read narrowed by a `return .. if p.nil?`
                         guard: the read's non-nil type (codegen unboxes the poly
                         slot at the read site); TY_UNKNOWN = not narrowed */
@@ -1743,7 +1768,7 @@ typedef struct {
   char **rsc_names;   /* the names a class or module body defines, which `::Name` must not be read as the bare Name for (analyze_desugar.c, desugar_root_scoped_constants) */
   int n_rsc_names;
   int nomethod_init;   /* 1 none, 2 a class NoMethodError defines an initialize (analyze_desugar.c, disp_raise_with); 0 not asked yet */
-  int ncond_lone_disp;  /* those of them a lone def is lowered to (call_plan.c, feature_limit) */
+  int ncond_lone_disp;  /* those of them a lone def at the top level, in a module or in Object or BasicObject is lowered to (call_plan.c, feature_limit) */
   /* the open histories no reader names yet, sorted by name (call_plan.c,
      ver_named_one): made once a call names one, taken 1 when asked for and
      2 once made (ver_entries_demand) */
@@ -1751,6 +1776,11 @@ typedef struct {
   int nver_defer;
   struct VerChain *ver_chain;   /* how many versions a class's chain holds of a name, by (class, side, name) (call_plan.c, ver_chain_count) */
   struct VerHold *ver_hold;   /* the holders of a name worth asking, by name (call_plan.c, ver_holders) */
+  /* per method scope, made once (call_plan.c, cplan_scope_facts): whether
+     it holds a super that reaches no method, and whether a method_missing
+     answers for self or hands the name on */
+  unsigned char *scope_super_facts;
+  int nscope_super_facts;
   /* ...by name: ver_ix chains the entries of one (class, side, name, parameter
      count) and ver_names one scope-holding entry of each name (ver_entries_index) */
   int *ver_ix, *ver_ix_next, *ver_names, *ver_names_next;
@@ -2038,6 +2068,8 @@ int comp_defined_reads(Compiler *c, int pred, int *reads, int cap);
 /* a constant path whose leaf is no member of the class or module its parent
    names (analyze_util.c) */
 int const_path_misses_member(Compiler *c, int id);
+int class_lacks_own_const(Compiler *c, int k, const char *nm);   /* private_constant :nm in k is a NameError */
+int const_visibility_call_is_builtin(Compiler *c, int call, int k);   /* ... when the call is Module's own */
 int const_node_class_index(Compiler *c, int id);
 /* Does scope s call `super` in its body or its parameter defaults (analyze.c).
    Analysis and codegen both ask it. */
@@ -2054,6 +2086,7 @@ int        comp_class_index(Compiler *c, const char *name);   /* -1 if none */
 /* The first-created class for a CORE_* slot, -1 if no class has been made
    or the slot is negative. */
 int        comp_core_class(const Compiler *c, int k);   /* CORE_* or a negative slot; -1 if none */
+int        comp_builtin_class_named(Compiler *c, const char *name);   /* by core slot, else by name */
 /* The classes whose def_node is node, lowest index first: a builder write
    makes several. -1 if none (or node < 0). */
 int        comp_class_of_def(const Compiler *c, int node);
@@ -2061,6 +2094,7 @@ int        comp_class_def_next(const Compiler *c, int k);   /* the next class of
 void       comp_class_set_def(Compiler *c, int k, int node);   /* the one writer after comp_class_new */
 int        comp_any_computed_ivar_set(Compiler *c);
 int        comp_is_wellknown_const(const char *cn);
+const char *comp_wellknown_const_at(int i);
 int        const_name_resolves_top_level(Compiler *c, const char *cn);
 /* Does constant segment node seg (a ConstantReadNode or a path's segment)
    resolve: by its name, as a builtin, or as a program class the path names? */
@@ -2188,6 +2222,7 @@ unsigned   comp_scope_index_gen(void);
 void       comp_class_shape_changed(void);
 /* ... and how many times it has: a memo over the chain's answers stamps it. */
 unsigned   comp_class_shape_gen(void);
+int        comp_scope_moving(void);   /* a scope is moved for an instance_exec block right now */
 /* Find the class (singleton) method scope for class_id + name, or -1 (no chain). */
 int        comp_cmethod_in_class(Compiler *c, int class_id, const char *name);
 /* Find the class (singleton) method scope, walking the superclass chain. */
@@ -2289,6 +2324,8 @@ int        comp_array_method_name(const char *n);
 /* the class chain of cid embeds a Hash, not an Array */
 int        comp_ary_is_hash(Compiler *c, int cid);
 int        comp_ary_is_str(Compiler *c, int cid);
+int        comp_ary_is_time(Compiler *c, int cid);
+int        comp_timesub_copy_name(Compiler *c, const char *n);
 int        comp_arysub_emb(Compiler *c, int cid);
 int        comp_arysub_str_boxed(const char *n);
 int        comp_arysub_builtin(Compiler *c, int cid);
@@ -2409,6 +2446,7 @@ int        comp_plain_class(Compiler *c, int cid);    /* only Object's and Kerne
 int        comp_enum_behind(Compiler *c, int cid);    /* Enumerable's methods behind the class: Enumerable, or an Array, Struct or native ancestor */
 int        core_method_vis(const char *cls, const char *m, int inherit);   /* codegen_call_class.c */
 int        comp_is_writer(ClassInfo *ci, const char *name);
+int        comp_any_class_accessor(Compiler *c, const char *name);   /* any class declares a reader or writer of the name */
 int        name_is_plain_setter(const char *name);
 int        call_is_setter_assign(const NodeTable *nt, int id);
 int        proc_parameters_lambda_mode(const NodeTable *nt, int argc, const int *argv);

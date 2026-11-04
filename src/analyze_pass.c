@@ -4165,6 +4165,13 @@ static int infer_write_container_usage(Compiler *c, const NodeTable *nt, int nfb
       }
       else if (grecv >= 0 && nt_kind(nt, grecv) != NK_SelfNode) {
         TyKind grt = infer_type(c, grecv);
+        /* An unfinished receiver supplies no getter-owner evidence yet.
+           If it stays unknown, the conservative phase still visits every
+           possible owner; a runtime-broad receiver does so in both phases. */
+        if (!is_push && grt == TY_UNKNOWN && g_infer_optimistic) {
+          g_infer_getter_write_pending = 1;
+          continue;
+        }
         gcid = ty_is_object(grt) ? ty_object_class(grt) : -1;
         /* An index write through a receiver of a known non-object type is
            no user getter's; a boxed or still-settling one may be any class
@@ -6588,7 +6595,7 @@ static int clp_extend(Compiler *c, int si, Scope *sc, int pi, unsigned ep) {
   const NodeTable *nt = c->nt;
   ClpEntry *e = clp_find(si, pi);
   int call = e->next;
-  int targets[CPT_MAX], nt_ = cplan_targets(c, call, targets, CPT_MAX), hit = 0;
+  int targets[CPT_MAX], nt_ = cplan_entries(c, call, targets, CPT_MAX), hit = 0;
   for (int t = 0; t < nt_ && !hit; t++) hit = targets[t] == si;
   int from = -1, an = 0;
   const int *av = NULL;
@@ -6690,7 +6697,7 @@ static int container_literals(Compiler *c, int n, int *out, int nout, int cap, i
       for (int call = pi < 0 ? -1 : resume != -2 ? resume : an_calls_named_first(c, sc->name);
            call >= 0 && nout < cap;
            call = an_calls_named_next(call)) {
-        int targets[CPT_MAX], nt_ = cplan_targets(c, call, targets, CPT_MAX), hit = 0;
+        int targets[CPT_MAX], nt_ = cplan_entries(c, call, targets, CPT_MAX), hit = 0;
         for (int t = 0; t < nt_ && !hit; t++) hit = targets[t] == si;
         if (!hit) continue;
         int a = nt_ref(nt, call, "arguments"), an = 0;
@@ -8672,16 +8679,9 @@ static int cext_widen_containers(Compiler *c, int v, CextWalk *seen) {
     if (scope) for (int j = 0; j < scope->nparams; j++)
       if (scope->pnames[j] && sp_streq(scope->pnames[j], name)) { pi = j; break; }
     if (pi >= 0) NT_FOREACH_KIND(nt, NK_CallNode, call) {
-      int targets[CPT_MAX], n = cplan_targets(c, call, targets, CPT_MAX), reaches = 0;
+      /* (a builtin `new` enters the initialize of the class it builds) */
+      int targets[CPT_MAX], n = cplan_entries(c, call, targets, CPT_MAX), reaches = 0;
       for (int q = 0; q < n; q++) reaches |= targets[q] == si;
-      if(!reaches && scope->name && sp_streq(scope->name,"initialize") &&
-         nt_str(nt,call,"name") && sp_streq(nt_str(nt,call,"name"),"new")) {
-        int receiver=nt_ref(nt,call,"receiver");
-        int klass=receiver>=0 ? class_recv_static_ci(c,receiver) : -1;
-        if(klass<0 && receiver>=0 && (nt_kind(nt,receiver)==NK_ConstantReadNode || nt_kind(nt,receiver)==NK_ConstantPathNode))
-          klass=comp_class_index(c,nt_str(nt,receiver,"name"));
-        reaches=klass>=0 && comp_method_in_chain(c,klass,"initialize",NULL)==si;
-      }
       if (!reaches) continue;
       int arg = nt_ref(nt, call, "arguments"), ac = 0;
       const int *av = arg >= 0 ? nt_arr(nt, arg, "arguments", &ac) : NULL;
@@ -10277,6 +10277,47 @@ static int struct_with_types_members(Compiler *c, int id, int ci) {
   return changed;
 }
 
+/* ... and on a Data with an initialize of its own (imi): CRuby builds the
+   copy as `self.class.new(**to_h.merge(k: v))`, so the values are
+   initialize's keywords, not the members': a given one binds as a call's
+   keyword does, and a member the call leaves out binds the keyword of its
+   name with the member's type. The members take what its `super` gives.
+   Each `**hash` can carry any keyword (the binder reads the first). */
+static int struct_with_binds_initialize(Compiler *c, int id, int ci, int imi) {
+  const NodeTable *nt = c->nt;
+  ClassInfo *cls = &c->classes[ci];
+  Scope *m = &c->scopes[imi];
+  int changed = bind_call_params(c, id, imi);
+  int args = nt_ref(nt, id, "arguments");
+  int an = 0;
+  const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+  int kwh = an == 1 && nt_kind(nt, argv[0]) == NK_KeywordHashNode ? argv[0] : -1;
+  int en = 0; const int *els = kwh >= 0 ? nt_arr(nt, kwh, "elements", &en) : NULL;
+  for (int e = 0; e < en; e++) {
+    if (nt_kind(nt, els[e]) != NK_AssocSplatNode) continue;
+    int hv = nt_ref(nt, els[e], "value");
+    TyKind ht = hv >= 0 ? infer_type(c, hv) : TY_UNKNOWN;
+    TyKind vt = ty_is_hash(ht) ? ty_hash_val(ht) : ht == TY_POLY ? TY_POLY : TY_UNKNOWN;
+    if (vt == TY_UNKNOWN) continue;
+    if (vt == TY_NIL) vt = TY_POLY;
+    for (int j = 0; j < m->nparams; j++) {
+      if (!m->pnames[j] || !callee_param_is_declared_kwarg(c, m, m->pnames[j])) continue;
+      LocalVar *p = scope_local(m, m->pnames[j]);
+      if (p && !p->rbs_seeded) changed |= slot_take(c, p, vt, kwh);
+    }
+  }
+  for (int a = 0; a < cls->nmembers; a++) {
+    const char *mname = cls->ivars[a] + 1;
+    if (kwh >= 0 && kwh_lookup(nt, kwh, mname) >= 0) continue;
+    if (!callee_param_is_declared_kwarg(c, m, mname)) continue;
+    LocalVar *p = scope_local(m, mname);
+    TyKind mt = cls->ivar_types[a];
+    if (!p || p->rbs_seeded || mt == TY_UNKNOWN) continue;
+    changed |= slot_take(c, p, mt == TY_STRBUF ? TY_STRING : mt, -1);
+  }
+  return changed;
+}
+
 /* The argument `v` (of type at) a Struct member that is the general
    container `mt` is built from: an attribute's ivar (`S.new(o.items)`)
    widens as the alias step widens it, anything else is followed back to
@@ -11476,7 +11517,10 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
     TyKind rt = infer_type(c, recv);
     if (name && sp_streq(name, "with") && ty_is_object(rt) && c->classes[ty_object_class(rt)].is_struct &&
         comp_method_in_chain(c, ty_object_class(rt), "with", NULL) < 0) {
-      changed |= struct_with_types_members(c, id, ty_object_class(rt));
+      int wci = ty_object_class(rt);
+      int wimi = comp_method_in_chain(c, wci, "initialize", NULL);
+      changed |= wimi >= 0 ? struct_with_binds_initialize(c, id, wci, wimi)
+                           : struct_with_types_members(c, id, wci);
       continue;
     }
     /* A receiver that settled on NO type is emitted BOXED, exactly as a poly
@@ -15207,6 +15251,7 @@ int desugar_block_destructure_params_at(Compiler *c, LowerCtx *lc, int id) {
     int rp = nt_new_node(nt, "RequiredParameterNode");
     if (rp < 0) { ok = 0; break; }
     nt_node_set_str(nt, rp, "name", nm);
+    nt_node_set_int(nt, rp, "desugared_param", DPN_NAMELESS);
     newreqs[k] = rp;
     if (!bind) continue;  /* anonymous splat: nothing to assign */
     int rd = nt_new_node(nt, "LocalVariableReadNode");
@@ -17639,7 +17684,7 @@ int infer_block_params(Compiler *c) {
     NT_FOREACH_KIND(nt, NK_CallNode, id) {
       int block = nt_ref(nt, id, "block");
       if (block < 0 || nt_kind(nt, block) != NK_BlockNode) continue;
-      int targets[CPT_MAX], count = cplan_targets(c, id, targets, CPT_MAX), reaches = 0;
+      int targets[CPT_MAX], count = cplan_entries(c, id, targets, CPT_MAX), reaches = 0;
       for (int t = 0; t < count; t++) reaches |= cext_scope(c, targets[t]);
       if (!reaches) continue;
       int pn = a_proc_params_node(c, id);
@@ -18365,7 +18410,7 @@ static int scope_tail_unresolved_call(Compiler *c, int s) {
                    : rt == TY_FLOAT ? "Float"
                    : rt == TY_SYMBOL ? "Symbol" : NULL;
     if (bn) {
-      int bc = comp_class_index(c, bn);
+      int bc = comp_builtin_class_named(c, bn);
       if (bc >= 0 && (call_target(c, last, bc, nm, 0, NULL) >= 0 ||
                       comp_reader_in_chain(c, bc, nm, NULL))) return 0;
     }
@@ -19569,16 +19614,17 @@ static void cr_mark_version(Compiler *c, int id, const char *nm, int k, unsigned
   if (nt_kind(c->nt, id) == NK_CallNode && is_method_object_maker(nt_str(c->nt, id, "name"))) flags |= CT_CAPTURE;
   int mi = call_target(c, id, k, nm, flags, NULL);
   char mark[24];
-  if (mi < 0) return;
+  if (mi < 0 || (c->scopes[mi].attr_version && cplan_sg_slot_call(c, id, k, nm))) return;
   snprintf(mark, sizeof mark, "\x01%d", mi);
   cr_add_name(m->out, m->n, m->cap, mark);
 }
 static void cr_collect_versions(Compiler *c, const NodeTable *nt, int id, char ***out, int *n, int *cap) {
   const char *names[2];
   CrMarks m = { out, n, cap };
-  if (ct_version_marked(c, "initialize")) {
-    int init[CPT_MAX], ni = cplan_initializers(c, id, init, CPT_MAX);
-    for (int i = 0; i < ni; i++) {
+  /* a builtin `new`: the initialize methods the plan says it enters */
+  if (ct_version_marked(c, "initialize") && is_new_name(nt_str(nt, id, "name"))) {
+    int init[CPT_MAX], ni = cplan_entries(c, id, init, CPT_MAX);
+    for (int i = 0; i < ni && is_initialize_name(c->scopes[init[i]].name); i++) {
       char mark[24];
       snprintf(mark, sizeof mark, "\x01%d", init[i]);
       cr_add_name(out, n, cap, mark);
@@ -19816,6 +19862,10 @@ void cr_collect_calls(Compiler *c, const NodeTable *nt, int id,
         if (ak == NK_SymbolNode) msym = nt_str(nt, mav[0], "value");
         else if (ak == NK_StringNode) { msym = nt_str(nt, mav[0], "content"); if (!msym) msym = nt_str(nt, mav[0], "unescaped"); }
         if (msym) cr_add_name(out, n, cap, msym);
+        /* and an accessor's helper for a bind_call of it (desugar_bind_attr_helpers) */
+        char hn[300];
+        if (msym && sp_streq(nm, "instance_method") && snprintf(hn, sizeof hn, "__bind %s", msym) < (int)sizeof hn)
+          cr_add_name(out, n, cap, hn);
       }
     }
   }
@@ -19838,7 +19888,9 @@ void cr_collect_calls(Compiler *c, const NodeTable *nt, int id,
     const char *cn = (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) ? nt_str(nt, r, "name") : NULL;
     int k = cn ? comp_class_index(c, cn) : -1;
     int mi = k >= 0 ? call_target(c, id, k, nm, CT_CMETHOD, NULL) : -1;
-    if (mi >= 0) { snprintf(resolved, sizeof resolved, "\x01%d", mi); names[0] = resolved; }
+    /* (a call the plan compiles to the accessor's slot reaches nothing) */
+    if (mi >= 0 && c->scopes[mi].attr_version && cplan_sg_slot_call(c, id, k, nm)) names[0] = NULL;
+    else if (mi >= 0) { snprintf(resolved, sizeof resolved, "\x01%d", mi); names[0] = resolved; }
   }
   /* a call on main that finds main's own method reaches that one, not an
      Object method of the name (ct_main_target) */
@@ -19916,6 +19968,11 @@ void cr_collect_calls(Compiler *c, const NodeTable *nt, int id,
     builtin_recv = 1;
   if (!builtin_recv && k0 == NK_CallNode && nm && names[0] == nm) builtin_recv = cr_recv_builtin_class(c, nt, id, nm);
   if (builtin_recv) names[0] = NULL;
+  /* An entry's arm call is pinned to the method it runs, which the entry
+     reaches by scope (ver_entry_targets, above), or to the builtin: by name
+     it reached every other method of the name, a class method's entry the
+     instance methods too */
+  if (k0 == NK_CallNode && cplan_pinned(c, id)) names[0] = NULL;
   /* Once the types are settled, a plain name, or one on a known instance,
      reaches the scopes of that name that can take the call's argument count
      (cr_count_name, compute_reachable). A 0-argument `r.attribute` kept a

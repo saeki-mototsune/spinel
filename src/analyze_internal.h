@@ -81,6 +81,7 @@ extern int an_ie_class_id;
 /* method(:sym) helpers (defined in analyze_util.c, shared with codegen) */
 const char *method_sym_arg(Compiler *c, int node);
 int is_method_obj_call(Compiler *c, int node);
+int method_user_override_recv(Compiler *c, int node);
 int method_obj_target_mi(Compiler *c, int node);
 int method_recv_node(Compiler *c, int recv);
 int method_recv_nodes(Compiler *c, int recv, int **out);
@@ -89,6 +90,8 @@ int proc_to_proc_method_nodes(Compiler *c, int recv, int **out);
 int local_sole_range_node(Compiler *c, int recv);
 int const_array_elems_all_int_array(Compiler *c, const char *cname);
 int *an_parent_map(const NodeTable *nt);
+/* (borrowed: an edit that changes the table's version or count, followed by
+   another ask, frees it; see analyze_util.c) */
 const int *comp_parent_map(Compiler *c);
 /* The definite-assignment walk (analyze.c), shared with the nil facts
    (analyze_nil.c): the program's parent map, each statement's place in its
@@ -334,6 +337,7 @@ int node_is_scope_tail(Compiler *c, int mi, int id);
 TyKind yield_aware_elem_ty(Compiler *c, int node);
 int an_user_defines_method(Compiler *c, const char *name);
 int an_enum_own_find_index(Compiler *c);
+int an_enum_prog_method(Compiler *c, const char *nm);
 /* Can no method of the program take `name`: no def of it or of method_missing, and no alias, define_method, attr_* or Struct / Data member that names it (or names a method only the run time knows)? */
 int an_name_binder_free(Compiler *c, const char *name);
 int an_native_defines_method(Compiler *c, const char *name);
@@ -436,6 +440,7 @@ typedef struct {
 } ElabPos;
 enum { EP_NODE, EP_SPINE, EP_LIST, EP_NEW };
 ElabPos elab_child(Compiler *c, int p, int ch, const ElabPos *pp);
+int elab_write_value_kind(NodeKind k, int *may);   /* a write whose value the load walk places where the write stands */
 int elab_ref_last(const NodeTable *nt, int id, int ref);
 int elab_walk_enter(Compiler *c, int ch, ElabPos *pos);
 void elab_walk_leave(Compiler *c, int e);
@@ -459,6 +464,7 @@ void register_struct_members(Compiler *c, ClassInfo *cls, int val);
 void register_structs(Compiler *c);
 void register_singleton_defs(Compiler *c);
 void fix_struct_block_scopes(Compiler *c);
+void register_attr_versions(Compiler *c);
 void register_attrs(Compiler *c);
 void register_aliases(Compiler *c);
 void register_undefs(Compiler *c);
@@ -711,6 +717,7 @@ int revert_widened_builtin_scalar_calls(Compiler *c);
 enum { ROW_WALK_NONE, ROW_WALK_BINDS, ROW_WALK_SPLITS };
 int nested_row_iter_call(Compiler *c, int id);
 int fold_static_is_a(Compiler *c);
+extern int g_infer_getter_write_pending;
 int merge_block_recorded(Compiler *c);
 int narrow_empty_array_args_by_yield(Compiler *c);
 int builtin_enum_name_index(const char *name);
@@ -736,7 +743,6 @@ int desugar_io_console_modes(Compiler *c);
 int desugar_reader_index_write(Compiler *c);
 int desugar_body_self_call(Compiler *c);
 int desugar_body_module_eval(Compiler *c);
-int desugar_extend_self(Compiler *c);
 int desugar_instance_eval_defs(Compiler *c);
 int enumerator_own_with_object(Compiler *c, int id);
 int block_body_breaks(const NodeTable *nt, int node);   /* a break that leaves this block */
@@ -766,12 +772,12 @@ int ct_method_defined(const NodeTable *nt, const char *meth);   /* the program d
 /* the rows, in the order the stage runs them */
 enum {
   LW_NIL_BLOCK_ARG, LW_CONST_SET_WRITE, LW_THREAD_START, LW_MARSHAL_RESTORE, LW_SOCKET_OPEN, LW_SYSTEM_OPTIONS, LW_IO_POPEN_BLOCK,
-  LW_USER_BACKTICK, LW_LITERAL_UNDEF_METHOD, LW_EXPLICIT_INITIALIZE_CALLS, LW_NOARG_DISPLAY_WRAPPERS,
+  LW_USER_BACKTICK, LW_LITERAL_UNDEF_METHOD, LW_EXPLICIT_INITIALIZE_CALLS, LW_NOARG_DISPLAY_WRAPPERS, LW_BIND_ATTR_HELPERS,
   LW_PAREN_BLOCK_ARG, LW_PAREN_OPERANDS, LW_SEND_CLASS_MAKERS, LW_SELF_SUPERCLASS, LW_STRUCT_SUBCLASS_NEW_WRITE,
   LW_REFUSE_SUPERCLASS_EXPRS, LW_RESCUE_BLOCK_BODIES,
   LW_MARK_SYM_PROC_BLOCKS, LW_BUILDER_BLOCK_PARAM, LW_BODY_LOCAL_SCOPES, LW_ERRNO_ALIASES, LW_PAREN_DEF_BODY, LW_MARK_MATCH_RANGES,
   LW_MARK_RANGE_LOCALS, LW_DUPLICATE_UNDERSCORE_PARAMS, LW_ENCODING_QUERIES, LW_ALIAS_METHOD_STRING_NAMES,
-  LW_ALIAS_METHOD_VALUES, LW_REASSIGNED_BLOCK_PARAMS,
+  LW_ALIAS_METHOD_VALUES, LW_REASSIGNED_BLOCK_PARAMS, LW_CLASS_BODY_VALUES,
   LW_ITSELF_RECEIVER, LW_TAP_VALUE_WRITE, LW_BLK_PARAM_WRITES, LW_REST_PARAM_WRITES, LW_YIELD_IN_CLOSURE,
   LW_SAFE_NAV_ATTR_WRITE, LW_CONST_ATTR_OP_ASSIGN, LW_STORED_ENUM_EACH, LW_SCOPE_NUMBERED_BLOCK_PARAMS,
   LW_SINGLETON_CLASS_DEFINE_METHOD, LW_EMPTY_HASH_COMPARE_BY_IDENTITY, LW_DEFINE_METHOD_PROC_ARG,
@@ -899,10 +905,13 @@ LowerFn desugar_forwarding_to_rest_callee_at, desugar_recursive_param_defaults_a
 LowerFn desugar_stored_enum_each_at;                                         /* analyze_desugar.c */
 LowerFn desugar_literal_undef_method_at, desugar_literal_undef_method_left;
 LowerFn desugar_alias_method_values_at, desugar_alias_method_values_left;
+LowerFn desugar_class_body_values_at, desugar_class_body_values_left;
 LowerFn desugar_singleton_class_define_method_at, desugar_singleton_class_define_method_left;
 LowerFn desugar_define_method_proc_arg_at, desugar_define_method_keywords_at;
 LowerFn desugar_block_implicit_rest_at, desugar_block_implicit_rest_left;
 LowerFn desugar_noarg_display_wrappers_at, desugar_noarg_display_wrappers_left;   /* analyze.c */
+LowerFn desugar_bind_attr_helpers_at, desugar_bind_attr_helpers_left;
+LowerGate desugar_bind_attr_helpers_gate;
 LowerFn desugar_self_superclass_at, desugar_self_superclass_left;
 LowerFn desugar_enum_chain_shapes_at;
 LowerFn desugar_paren_block_arg_at, desugar_paren_block_arg_left;           /* analyze.c */
@@ -942,6 +951,10 @@ int desugar_curry_arity_to_int(Compiler *c);
 int desugar_int_enum_with_index(Compiler *c);
 int desugar_hash_iter_with_index(Compiler *c);
 int desugar_array_op_to_ary(Compiler *c);
+int desugar_masgn_to_ary(Compiler *c);
+/* Does multiple assignment (or nested target list) id destructure into a
+   nested target list? */
+int masgn_nests(const NodeTable *nt, int id);
 int widen_shared_cmp_params(Compiler *c);
 int desugar_reduce_proc_arg(Compiler *c);
 int desugar_reduce_splat_args(Compiler *c);
@@ -963,6 +976,8 @@ int desugar_builtin_method_defined_conds(Compiler *c);
 int desugar_engine_branches(Compiler *c);
 int desugar_conditional_defs(Compiler *c);
 int desugar_concat_builtin_version(Compiler *c);
+int desugar_method_override_super(Compiler *c);
+int attr_as_def(NodeTable *nt, int call, const char *base, int writer);   /* `def x = @x` / `def x=(value) = (@x = value)` (analyze_desugar.c) */
 /* A dispatcher def over arms `<sel> == <val>` calling `callee` with the
    def's parameters passed on, and an else arm (disp_def_build,
    analyze_desugar.c); for that arm `raise NoMethodError.new(msg, :name,
@@ -1005,6 +1020,7 @@ int desugar_ffi_library_functions(Compiler *c);
 int desugar_native_func_defs(Compiler *c);
 int comp_ffi_library_module(const NodeTable *nt, const char *mn);
 int rewrite_ffi_dynamic_calls(Compiler *c);
+int desugar_builtin_reopen_const_reads(Compiler *c);
 int desugar_builtin_reopen_self_calls(Compiler *c);
 int desugar_builtin_reopen_methods(Compiler *c);
 int desugar_object_method_builtin_overrides(Compiler *c);
@@ -1098,6 +1114,7 @@ void mark_ie_subtree(Compiler *c, int node, int cls);
 void build_ie_map(Compiler *c);
 int ie_block_body(Compiler *c, int blk);
 int ie_class_of(Compiler *c, int node);
+int ie_own_class_of(Compiler *c, int node);
 int blkp_params_node(Compiler *c, int create);
 int blkp_binds_param(Compiler *c, int create, const char *name);
 void blkp_rewrite_refs(Compiler *c, int node, const char *oldn, const char *newn);
@@ -1144,7 +1161,7 @@ extern const char *g_ext_entries;
 
 /* the class every value of a boxed-value hash slot holds, or -1 (#4846) */
 int hv_value_class(Compiler *c, int recv);
-int comp_class_is_module(Compiler *c, ClassInfo *ci);
+int comp_class_is_module(Compiler *c, const ClassInfo *ci);
 int poly_ivar_set_class(Compiler *c, int k);
 int is_builtin_reopen(const char *name);
 char **dsend_candidates(Compiler *c, int *out_n);

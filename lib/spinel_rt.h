@@ -3536,6 +3536,7 @@ static SP_INLINE sp_int sp_poly_to_i(sp_RbVal v) {
   return sp_poly_to_i_cold(v);
 }
 static SP_NOINLINE sp_int sp_poly_arg_int_obj(sp_RbVal v);   /* the object arm, below */
+sp_int sp_obj_to_int_answer(int cls_id, sp_RbVal r);   /* a user #to_int's answer judged: sp_poly_cold.c */
 /* Does this Bignum fit the Integer slot? The width is sp_int's, not a
    64-bit constant: under -m32 sp_int is 32 bits, so a 40-bit value passed a
    `<= 63` test and was then silently cut by the cast -- the very shape of
@@ -3904,7 +3905,7 @@ static SP_NOINLINE sp_int sp_complex_to_int(sp_Complex c) {
     sp_raise_cls("RangeError", sp_sprintf("can't convert %s into Integer", sp_complex_to_s(c)));
   if (!isfinite(c.re))
     sp_raise_cls("FloatDomainError", isnan(c.re) ? "NaN" : c.re > 0 ? "Infinity" : "-Infinity");
-  return (sp_int)c.re;
+  return sp_float_fit_i(trunc(c.re));
 }
 static SP_NOINLINE sp_int sp_poly_arg_int_chk_slow(sp_RbVal v) {
   if (v.tag == SP_TAG_FLT) return sp_float_arg_i(v.v.f);
@@ -3930,8 +3931,16 @@ static SP_NOINLINE sp_int sp_poly_arg_int_chk_slow(sp_RbVal v) {
                                          sp_poly_class_name(v)));
   }
   if (v.tag == SP_TAG_OBJ && v.cls_id >= 0) return sp_poly_arg_int_obj(v);
-  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_COMPLEX && v.v.p)
-    return sp_complex_to_int(*(sp_Complex *)v.v.p);
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_COMPLEX && v.v.p) {
+    sp_Complex c = *(sp_Complex *)v.v.p;
+    /* a real part past the slot, once truncated: CRuby's to_int answers a
+       Bignum, which then does not fit, as below */
+    sp_float t = trunc(c.re);
+    if (c.im == 0.0 && !(c.fl & SP_CPLX_IM_F) && isfinite(c.re) &&
+        (t >= -(sp_float)INTPTR_MIN || t < (sp_float)INTPTR_MIN))
+      sp_raise_cls("RangeError", "bignum too big to convert into 'long'");
+    return sp_complex_to_int(c);
+  }
   /* a Bignum the slot cannot hold is CRuby's RangeError, not its low word:
      `a.delete_at(2**70)` deleted a[0] */
   if (v.tag == SP_TAG_BIGINT && v.v.p) {
@@ -6612,6 +6621,30 @@ static sp_bool sp_poly_lt(sp_RbVal a, sp_RbVal b) { SP_POLY_NIL_RECV("<"); SP_PO
 static sp_bool sp_poly_le(sp_RbVal a, sp_RbVal b) { SP_POLY_NIL_RECV("<="); SP_POLY_CLASS_CMP(<=); if (a.tag == SP_TAG_INT && b.tag == SP_TAG_INT) return a.v.i <= b.v.i;   /* see sp_poly_eq */ SP_POLY_USER_CMP("<="); sp_poly_recv_ck(a, "<="); SP_POLY_COERCE_CMP("<="); if ((sp_poly_num_is_nan(a) || sp_poly_num_is_nan(b)) && sp_poly_tower_p(a) && sp_poly_tower_p(b)) return FALSE; sp_bool comparable; sp_int cmp = sp_poly_cmp(a, b, &comparable); if (!comparable) sp_poly_cmp_fail(a, b); return cmp <= 0; }
 static sp_bool sp_poly_gt(sp_RbVal a, sp_RbVal b) { SP_POLY_NIL_RECV(">"); SP_POLY_CLASS_CMP(>); if (a.tag == SP_TAG_INT && b.tag == SP_TAG_INT) return a.v.i > b.v.i;   /* see sp_poly_eq */ SP_POLY_USER_CMP(">"); sp_poly_recv_ck(a, ">"); SP_POLY_COERCE_CMP(">"); if ((sp_poly_num_is_nan(a) || sp_poly_num_is_nan(b)) && sp_poly_tower_p(a) && sp_poly_tower_p(b)) return FALSE; sp_bool comparable; sp_int cmp = sp_poly_cmp(a, b, &comparable); if (!comparable) sp_poly_cmp_fail(a, b); return cmp > 0; }
 static sp_bool sp_poly_ge(sp_RbVal a, sp_RbVal b) { SP_POLY_NIL_RECV(">="); SP_POLY_CLASS_CMP(>=); if (a.tag == SP_TAG_INT && b.tag == SP_TAG_INT) return a.v.i >= b.v.i;   /* see sp_poly_eq */ SP_POLY_USER_CMP(">="); sp_poly_recv_ck(a, ">="); SP_POLY_COERCE_CMP(">="); if ((sp_poly_num_is_nan(a) || sp_poly_num_is_nan(b)) && sp_poly_tower_p(a) && sp_poly_tower_p(b)) return FALSE; sp_bool comparable; sp_int cmp = sp_poly_cmp(a, b, &comparable); if (!comparable) sp_poly_cmp_fail(a, b); return cmp >= 0; }
+/* A typed Bignum compared with a boxed value (codegen's
+   emit_bigint_cmp_inexact), in either order: an Integer at run time
+   compares as a bigint, as the typed Bignum arm does, and any other value
+   -- a Rational, a Float, a program object -- the way sp_poly_eq and
+   sp_poly_lt compare it (sp_poly_as_bigint read a Rational as 0). */
+static SP_INLINE sp_Bigint *sp_poly_int_as_bigint(sp_RbVal v) {
+  return v.tag == SP_TAG_BIGINT ? (sp_Bigint *)v.v.p : sp_bigint_new_int(v.v.i);
+}
+#define SP_BIGINT_POLY_CMP(nm, fn, op) \
+  static SP_NOINLINE SP_COLD sp_bool sp_bigint_poly_##nm##_other(sp_RbVal a, sp_RbVal b) { return fn(a, b); } \
+  static SP_INLINE sp_bool sp_bigint_poly_##nm(sp_Bigint *a, sp_RbVal b) { \
+    if (SP_UNLIKELY(b.tag != SP_TAG_INT && b.tag != SP_TAG_BIGINT)) \
+      return sp_bigint_poly_##nm##_other(sp_box_bigint_or_nil(a), b); \
+    return sp_bigint_cmp(a, sp_poly_int_as_bigint(b)) op 0; } \
+  static SP_INLINE sp_bool sp_poly_bigint_##nm(sp_RbVal a, sp_Bigint *b) { \
+    if (SP_UNLIKELY(a.tag != SP_TAG_INT && a.tag != SP_TAG_BIGINT)) \
+      return sp_bigint_poly_##nm##_other(a, sp_box_bigint_or_nil(b)); \
+    return sp_bigint_cmp(sp_poly_int_as_bigint(a), b) op 0; }
+SP_BIGINT_POLY_CMP(eq, sp_poly_eq, ==)
+SP_BIGINT_POLY_CMP(lt, sp_poly_lt, <)
+SP_BIGINT_POLY_CMP(le, sp_poly_le, <=)
+SP_BIGINT_POLY_CMP(gt, sp_poly_gt, >)
+SP_BIGINT_POLY_CMP(ge, sp_poly_ge, >=)
+#undef SP_BIGINT_POLY_CMP
 /* `a < b` etc. where a user class's operator may answer a non-bool (ruby-vips'
    Image#> builds an image): the user method's own value, else the builtin
    comparison boxed. */
@@ -10522,6 +10555,40 @@ static sp_PolyArray*sp_StrPolyHash_values(sp_StrPolyHash*h){SP_GC_ROOT(h);sp_Pol
 static sp_bool sp_StrPolyHash_has_value(sp_StrPolyHash*h,sp_RbVal v){if (SP_UNLIKELY(!h)) sp_nil_recv("value?");for(sp_int i=0;i<h->len;i++)if(sp_poly_rb_equal(sp_StrPolyHash_get(h,h->order[i]),v))return TRUE;return FALSE;}
 static void sp_StrPolyHash_delete(sp_StrPolyHash*h,const char*k){ sp_gc_wb((void*)h);sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_probe_eq(h->keys[idx],k)){sp_order_drop_str(h->order,h->len,h->keys[idx]);h->keys[idx]=NULL;h->vals[idx]=sp_box_nil();h->len--;sp_int j=(idx+1)&h->mask;while(h->keys[j]){sp_int nj=(sp_int)(sp_str_hash(h->keys[j])&h->mask);if((j>idx&&(nj<=idx||nj>j))||(j<idx&&nj<=idx&&nj>j)){h->keys[idx]=h->keys[j];h->vals[idx]=h->vals[j];h->keys[j]=NULL;h->vals[j]=sp_box_nil();idx=j;}j=(j+1)&h->mask;}return;}idx=(idx+1)&h->mask;}}
 static void sp_StrPolyHash_delete_bytes(sp_StrPolyHash*h,const char*k){ sp_gc_wb((void*)h);sp_int idx=(sp_int)(sp_str_hash(k)&h->mask);while(h->keys[idx]){if(sp_str_probe_eq(h->keys[idx],k)){sp_order_drop_str(h->order,h->len,h->keys[idx]);h->keys[idx]=NULL;h->vals[idx]=sp_box_nil();h->len--;sp_int j=(idx+1)&h->mask;while(h->keys[j]){sp_int nj=(sp_int)(sp_str_hash(h->keys[j])&h->mask);if((j>idx&&(nj<=idx||nj>j))||(j<idx&&nj<=idx&&nj>j)){h->keys[idx]=h->keys[j];h->vals[idx]=h->vals[j];h->keys[j]=NULL;h->vals[j]=sp_box_nil();idx=j;}j=(j+1)&h->mask;}return;}idx=(idx+1)&h->mask;}}
+/* Hash#delete returns the removed value. Keep lookup and removal together:
+   has_key/get/delete would hash and probe the same lookup key three times.
+   The caller retains the frozen-hash guard used by typed deletion paths.
+   No default value/proc is consulted on a miss. */
+static sp_RbVal sp_StrPolyHash_delete_value(sp_StrPolyHash *h, const char *k) {
+  if (SP_UNLIKELY(!h)) sp_nil_recv("delete");
+  sp_gc_wb((void *)h);
+  sp_int idx = (sp_int)(sp_str_hash(k) & h->mask);
+  while (h->keys[idx]) {
+    if (sp_str_probe_eq(h->keys[idx], k)) {
+      sp_RbVal removed = h->vals[idx];
+      sp_order_drop_str(h->order, h->len, h->keys[idx]);
+      h->keys[idx] = NULL;
+      h->vals[idx] = sp_box_nil();
+      h->len--;
+      sp_int j = (idx + 1) & h->mask;
+      while (h->keys[j]) {
+        sp_int nj = (sp_int)(sp_str_hash(h->keys[j]) & h->mask);
+        if ((j > idx && (nj <= idx || nj > j)) ||
+            (j < idx && nj <= idx && nj > j)) {
+          h->keys[idx] = h->keys[j];
+          h->vals[idx] = h->vals[j];
+          h->keys[j] = NULL;
+          h->vals[j] = sp_box_nil();
+          idx = j;
+        }
+        j = (j + 1) & h->mask;
+      }
+      return removed;
+    }
+    idx = (idx + 1) & h->mask;
+  }
+  return sp_box_nil();
+}
 /* Hash#merge for str_poly_hash. Same shape as the
    StrIntHash / SymPolyHash siblings -- copy recv's entries into a
    fresh hash, then overlay other's. */
@@ -16002,6 +16069,13 @@ static sp_PolyArray *sp_poly_keys(sp_RbVal v) {
   sp_raise_nomethod(sp_nomethod_msg("keys", v));   /* nil and the rest named as CRuby does */
   return NULL;  /* unreachable: sp_raise_cls is noreturn */
 }
+/* What a boxed `x.to_h { |k| }` maps over: a Hash's keys, the one value
+   its block of one parameter binds (sp_poly_to_h_subject otherwise). */
+static sp_RbVal sp_poly_to_h_key_subject(sp_RbVal v) {
+  v = sp_poly_to_h_subject(v);
+  if (v.tag == SP_TAG_OBJ && sp_poly_is_hash_kind(v.cls_id)) return sp_box_poly_array(sp_poly_keys(v));
+  return v;
+}
 static int sp_kwargs_name_in(const char *nm, const char *const *names) {
   for (const char *const *a = names; *a; a++) if (!strcmp(nm, *a)) return 1;
   return 0;
@@ -16547,41 +16621,20 @@ static const char *sp_bm_owner_name(sp_BoundMethod *m) {
     memcpy(r, p, n); r[n] = 0;
     return r; }
 }
-/* #parameters from the same rendering: `a`, `b=...`, `*r`, `**k` (#3692). */
+/* #parameters from the list the bind site stamped (sp_BoundMethod.params):
+   [kind] or [kind, name] per entry */
 static sp_PolyArray *sp_bm_parameters(sp_BoundMethod *m) {
   sp_PolyArray *out = sp_PolyArray_new(); SP_GC_ROOT(out);
-  if (!m || !m->desc) return out;
-  const char *o = strchr(m->desc, '(');
-  if (!o) return out;
-  const char *p = o + 1;
-  while (*p && *p != ')') {
-    while (*p == ' ' || *p == ',') p++;
-    if (!*p || *p == ')') break;
-    const char *kind = "req";
-    if (p[0] == '*' && p[1] == '*') { kind = "keyrest"; p += 2; }
-    else if (p[0] == '*') { kind = "rest"; p++; }
-    else if (p[0] == '&') { kind = "block"; p++; }
-    const char *ns = p;
-    while (*p && *p != ',' && *p != ')' && *p != '=' && *p != ':') p++;
-    { size_t n = (size_t)(p - ns);
-      char nm[128]; if (n >= sizeof nm) n = sizeof nm - 1;
-      memcpy(nm, ns, n); nm[n] = 0;
-      if (*p == '=') { kind = "opt"; while (*p && *p != ',' && *p != ')') p++; }
-      /* a keyword, as the description writes it: `k:` required, `k: ...`
-         with a default */
-      else if (*p == ':') {
-        p++;
-        while (*p == ' ') p++;
-        kind = *p == '.' ? "key" : "keyreq";
-        while (*p && *p != ',' && *p != ')') p++;
-      }
-      if (n) {
-        sp_PolyArray *pair = sp_PolyArray_new(); SP_GC_ROOT(pair);
-        sp_PolyArray_push(pair, sp_box_sym(sp_sym_intern(kind)));
-        sp_PolyArray_push(pair, sp_box_sym(sp_sym_intern(nm)));
-        sp_PolyArray_push(out, sp_box_poly_array(pair));
-      }
-    }
+  const char *p = m ? m->params : NULL;
+  while (p && *p) {
+    const char *e = p;
+    while (*e && *e != ' ') e++;
+    const char *colon = memchr(p, ':', (size_t)(e - p));
+    sp_PolyArray *pair = sp_PolyArray_new(); SP_GC_ROOT(pair);
+    sp_PolyArray_push(pair, sp_box_sym(sp_sym_intern_n(p, (size_t)((colon ? colon : e) - p))));
+    if (colon) sp_PolyArray_push(pair, sp_box_sym(sp_sym_intern_n(colon + 1, (size_t)(e - colon - 1))));
+    sp_PolyArray_push(out, sp_box_poly_array(pair));
+    p = *e ? e + 1 : e;
   }
   return out;
 }
@@ -19248,6 +19301,66 @@ static sp_Enumerator *sp_enum_step_labeled(sp_Enumerator *e, sp_RbVal src, const
   e->source = src; e->has_src = TRUE;
   e->meth = m;
   return e;
+}
+/* A blockless Integer#upto / #downto (a Bignum's too) or String#upto on a
+   boxed receiver, where a program class's own method of the name took the
+   dispatch: the Enumerator the no-user-class path makes (#<Enumerator:
+   7:upto(9)>), and NoMethodError for any other value. */
+/* A Bignum's upto / downto walked as far as it is read: a limit far off, or
+   an infinite Float, would lay out without end */
+typedef struct { sp_RbVal recv; sp_RbVal lim; sp_int step; } sp_big_step_cap;
+static void sp_big_step_cap_scan(void *p) {
+  sp_big_step_cap *cap = (sp_big_step_cap *)p;
+  sp_mark_rbval(cap->recv); sp_mark_rbval(cap->lim);
+}
+static void sp_big_step_gen(sp_Fiber *f) {
+  sp_big_step_cap *cap = (sp_big_step_cap *)f->user_data;
+  sp_RbVal v = cap->recv;
+  SP_GC_ROOT_RBVAL(v);
+  while (cap->step > 0 ? sp_poly_cmp_ck(v, cap->lim) <= 0 : sp_poly_cmp_ck(v, cap->lim) >= 0) {
+    sp_Fiber_yield(v);
+    v = sp_poly_add(v, sp_box_int(cap->step));
+  }
+  f->yielded_value = cap->recv;   /* the walk answers the receiver */
+}
+static sp_RbVal sp_poly_upto_enum(sp_RbVal r, sp_RbVal lim, int up) {
+  SP_GC_ROOT_RBVAL(r); SP_GC_ROOT_RBVAL(lim);
+  const char *op = up ? "upto" : "downto";
+  if (up && (r.tag == SP_TAG_STR || sp_poly_is_strbuf(r))) {
+    sp_StrArray *s = sp_StrArray_from_string_range(sp_poly_recv_s(r, "upto"), sp_poly_arg_str_chk(lim), 0);
+    SP_GC_ROOT(s);
+    /* a String's walk has no size of its own: CRuby's `"a".upto("c").size` is nil */
+    return sp_box_nullable_obj((void *)sp_enum_size_nil(sp_enum_step_labeled(sp_Enumerator_new_from(sp_box_nullable_obj((void *)s, SP_BUILTIN_STR_ARRAY)), r, op, &lim, 1)),
+                               SP_BUILTIN_ENUMERATOR);
+  }
+  if (r.tag != SP_TAG_INT && r.tag != SP_TAG_BIGINT) sp_raise_nomethod(sp_nomethod_msg(op, r));
+  if (!(lim.tag == SP_TAG_INT || lim.tag == SP_TAG_BIGINT || lim.tag == SP_TAG_FLT))
+    sp_raise_cls("ArgumentError", sp_sprintf("comparison of Integer with %s failed", sp_poly_cmp_err_repr(lim)));
+  if (r.tag == SP_TAG_INT) {
+    sp_int l = sp_int_step_lim(lim, up);
+    sp_Range rg = up ? (sp_Range){ .first = r.v.i, .last = l, .excl = 0 } : sp_range_new_step(r.v.i, l, 0, -1LL);
+    return sp_box_nullable_obj((void *)sp_int_step_enum(rg, r.v.i, op, lim), SP_BUILTIN_ENUMERATOR);
+  }
+  /* a Bignum counts boxed, as far as the walk is read; its size is the
+     members between, none past the limit, or infinite toward an infinite Float */
+  sp_big_step_cap *cap = (sp_big_step_cap *)sp_gc_alloc(sizeof *cap, NULL, sp_big_step_cap_scan);
+  SP_GC_ROOT(cap);
+  cap->recv = r; cap->lim = lim; cap->step = up ? 1 : -1;
+  sp_RbVal size = sp_box_int(0);
+  SP_GC_ROOT_RBVAL(size);
+  if (lim.tag == SP_TAG_FLT && isinf(lim.v.f)) size = (lim.v.f > 0) == (up != 0) ? sp_box_float(INFINITY) : sp_box_int(0);
+  else {
+    sp_RbVal edge = lim.tag == SP_TAG_FLT ? sp_box_float(up ? floor(lim.v.f) : ceil(lim.v.f)) : lim;
+    SP_GC_ROOT_RBVAL(edge);
+    sp_RbVal span = up ? sp_poly_sub(edge, r) : sp_poly_sub(r, edge);
+    if (sp_poly_cmp_ck(span, sp_box_int(0)) >= 0) size = sp_poly_add(span, sp_box_int(1));
+    /* a Float count (CRuby counts a Float limit in Floats too) as the
+       Integer it is, not narrowed to a word, which a far limit overflows */
+    /* (one past the Floats, `(-2**1023).upto(Float::MAX)`, stays Infinity, as CRuby's) */
+    if (size.tag == SP_TAG_FLT && isfinite(size.v.f)) size = sp_box_bigint(sp_bigint_new_double(size.v.f));
+  }
+  return sp_box_nullable_obj((void *)sp_enum_step_labeled(sp_Enumerator_new_gen(sp_big_step_gen, cap, size), r, op, &lim, 1),
+                             SP_BUILTIN_ENUMERATOR);
 }
 static sp_Enumerator *sp_Enumerator_new_from_rev(sp_RbVal arr) {
   SP_GC_ROOT_RBVAL(arr);   /* published into the enumerator below, after several allocations */

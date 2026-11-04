@@ -1697,9 +1697,6 @@ static void walk_scope_in(Compiler *c, int id, WalkCtx w) {
     int defrecv = nt_ref(c->nt, id, "receiver");
     if (defrecv >= 0) {
       { s->is_cmethod = 1; comp_touch_scope(s->idx); }
-      /* desugar_extend_self's class-side copy of a module's instance method
-         came from the module, as an extend's transplant does */
-      if (class_id >= 0 && nt_int(c->nt, id, "extend_self_copy", 0)) { s->origin_module_ci = class_id + 1; comp_touch_scope(s->idx); }
       defrecv = nt_def_receiver(c->nt, defrecv);
       /* `def Klass.foo` with an explicit constant receiver (typically defined
          outside the class body, where the enclosing class_id is -1) attaches
@@ -2161,8 +2158,9 @@ static void mf_copy_entries(Compiler *c);
 /* Mark a module's module functions as class-level (is_cmethod=1, no self
    param). This lets them be called as bare functions when their module is
    included at the top level. The record's copies name them (mf_copy_entries);
-   what it does not hold is a body that `extend self` makes the module's own,
-   and the arms of a conditional def, which this reads from the tree. */
+   what it does not hold is the arms of a conditional def, which this reads
+   from the tree. (`extend self` is an extend of the module on itself, which
+   the record holds and register_extends copies, not a module function.) */
 void register_module_functions(Compiler *c) {
   const NodeTable *nt = c->nt;
   mf_copy_entries(c);
@@ -2179,41 +2177,15 @@ void register_module_functions(Compiler *c) {
     if (body < 0) continue;
     int bn = 0;
     const int *stmts = nt_arr(nt, body, "body", &bn);
-    int extend_self = 0, arms_mf = 0;
-    /* `extend self` is the other spelling of module_function, and unlike it
-       the placement carries no meaning: it makes EVERY method of the module
-       callable on the module itself, wherever in the body it sits. So scan
-       for it first. (module_function also makes the instance copies
-       private; a module written this way is called as `M.f` -- the same
-       assumption the record's copies already make.) */
-    for (int k = 0; k < bn; k++) {
-      int s = stmts[k];
-      NodeKind sk = nt_kind(nt, s);
-      if (sk != NK_CallNode || nt_ref(nt, s, "receiver") >= 0) continue;
-      const char *nm = nt_str(nt, s, "name");
-      if (!nm || !sp_streq(nm, "extend")) continue;
-      int an = 0;
-      int anode = nt_ref(nt, s, "arguments");
-      const int *aargs = anode >= 0 ? nt_arr(nt, anode, "arguments", &an) : NULL;
-      if (an == 1 && nt_kind(nt, aargs[0]) == NK_SelfNode) { extend_self = 1; break; }
-    }
+    int arms_mf = 0;
     for (int k = 0; k < bn; k++) {
       int s = stmts[k];
       const char *sty = nt_type(nt, s);
-      NodeKind sk = nt_kind(nt, s);
       if (!sty) continue;
       /* arms take only a bare module_function of this body, earlier */
       if (mf_bare_call(nt, s, "module_function")) arms_mf = 1;
       if (mf_call_apply(c, ci, s, stmts, k)) continue;
       if (arms_mf) mf_mark_cond_arms(c, ci, s, NULL);
-      if (sk == NK_DefNode && extend_self) {
-        for (int mi = 0; mi < c->nscopes; mi++) {
-          if (c->scopes[mi].def_node == s) {
-            mf_mark(c, mi);
-            break;
-          }
-        }
-      }
     }
   }
 }
@@ -3717,6 +3689,13 @@ static void stamp_const_write_encl(Compiler *c, int id, int ci) {
   }
 }
 
+/* Is record call VAL the value of a constant path write (`A::B = Struct.new(:a)`)? */
+static int rs_path_write_value(const NodeTable *nt, int val) {
+  for (int p = 0; p < nt->count; p++)
+    if (nt_kind(nt, p) == NK_ConstantPathWriteNode && nt_ref(nt, p, "value") == val) return 1;
+  return 0;
+}
+
 void register_structs(Compiler *c) {
   const NodeTable *nt = c->nt;
   for (int r = 0; r < nt_nroots(nt); r++) stamp_const_write_encl(c, nt_root(nt, r), -1);   /* each file's tree */
@@ -3785,6 +3764,11 @@ void register_structs(Compiler *c) {
       if (is_recv || !is_write_value) {
         char an[48];
         snprintf(an, sizeof an, "StructAnon_%s", comp_node_tag(c, id));
+        /* `Ns::S = Struct.new(:a)`: the path write names the class when it
+           runs (emit_const_target_class_name), as `S = Struct.new(:a)`
+           names it, so the class takes a name once written */
+        if (!is_recv && rs_path_write_value(nt, id))
+          nt_node_set_int((NodeTable *)nt, id, "class_new_anonymous", 2);
         ClassInfo *cls = comp_class_new(c, an, id);
         cls->is_anon_struct = 1;
         c->anon_struct_ids_valid = 0;
@@ -3949,6 +3933,38 @@ static int cmethod_names_ivar(Compiler *c, int ci, const char *ivname) {
           c->scopes[si].class_id == ci && nm && sp_streq(nm, ivname)) return 1;
     }
   return 0;
+}
+
+/* Each class-side accessor version a def after it replaces
+   (elab_replaced_attrs) as the method it is, `def self.x = @x` or
+   `def self.x=(value) = (@x = value)`, walked beside the call that
+   declares it: its scope is the version's (elab_attr_scope), which the
+   plan binds a call to where the accessor is live, and for which the
+   class's slot stands in at that call (cplan_sg_accessor). Its `@x` makes
+   the slot the class-level ivar's (register_attrs), the one the def
+   writes, and goes into the class's ivars now, which declare that slot,
+   whatever the rest of the program names. */
+void register_attr_versions(Compiler *c) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  int n = 0;
+  ElabEntry *a = elab_replaced_attrs(c, &n);
+  for (int i = 0; i < n; i++) {
+    if (a[i].scope) continue;
+    int w = a[i].kind == LR_WRITER, e = c->nscopes;
+    char base[256], ivname[260];
+    if (w ? !setter_base_name(a[i].name, base, sizeof base) : snprintf(base, sizeof base, "%s", a[i].name) >= (int)sizeof base) continue;
+    int def = attr_as_def(nt, a[i].node, base, w);
+    if (def < 0) continue;
+    nt_node_set_ref(nt, def, "receiver", nt_new_node(nt, "SelfNode"));
+    comp_grow_node_arrays(c);
+    walk_scope(c, def, c->nscope[a[i].node], a[i].cls);
+    if (e >= c->nscopes || c->scopes[e].def_node != def) continue;
+    { c->scopes[e].attr_version = 1; comp_touch_scope(c->scopes[e].idx); }
+    snprintf(ivname, sizeof ivname, "@%s", base);
+    comp_ivar_intern(&c->classes[a[i].cls], ivname);
+    elab_attr_scope(c, &a[i], e);
+  }
+  free(a);
 }
 
 /* Each class side's attr readers and writers, from the load record
@@ -4557,7 +4573,7 @@ static void mf_copy_entries(Compiler *c) {
   if (n && !src) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   for (int i = 0; i < n; i++) {
     src[i] = -1;
-    if (!a[i].sg || a[i].cls < 0 || !class_def_is_module(c->nt, c->classes[a[i].cls].def_node)) continue;
+    if (!a[i].sg || a[i].cls < 0 || !comp_class_is_module(c, &c->classes[a[i].cls])) continue;
     if (a[i].node >= 0 && nt_int(c->nt, a[i].node, "cond_arm", 0)) continue;
     src[i] = mf_entry_scope(c, &a[i]);
     int dm = a[i].scope > 0 && nt_kind(c->nt, a[i].node) != NK_DefNode;
@@ -5885,6 +5901,26 @@ static int keep_general_array(TyKind cur, TyKind vt) {
 static TyKind nil_write_type(TyKind cur) {
   return an_ty_holds_nil(cur) ? cur : TY_POLY;
 }
+/* ...for a global's write of nil: a slot no other write has typed yet holds
+   nil (TY_NIL), as a local's does (local_write_ty), so a read of it is nil to
+   whatever it flows into. Left untyped, the read was no evidence: a local
+   that took it and a `false` was typed Boolean, and read the nil as false.
+   A nil-only global boxes after the fixpoint (an_phase_reconcile_check).
+   Not while another write of it brings no type (`untyped`,
+   gvar_has_untyped_write): the global is not written only nil, and TY_NIL
+   settled what read it at nil (`$a = nil; pr = proc { $a }; $a = {}`). */
+static TyKind gvar_nil_write_type(TyKind cur, int untyped) {
+  return cur == TY_UNKNOWN && !untyped ? TY_NIL : nil_write_type(cur);
+}
+/* ...and the join of a global's slot with a write's type vt: on a slot only
+   nil has reached so far, vt as a nil write after it would leave it
+   (nil_write_type), so the order of the writes does not change the slot:
+   `$p = nil; $p = proc { }` is the nullable Proc `$p = proc { }; $p = nil`
+   makes, where the general join would box it */
+static TyKind gvar_join(TyKind cur, TyKind vt) {
+  if (cur == TY_NIL && vt != TY_UNKNOWN && vt != TY_NIL) return nil_write_type(vt);
+  return ty_unify(cur, vt);
+}
 
 /* The first point at which something could read global gname, in the order
    the load phase runs (the load record): a read or update of it (also
@@ -6003,6 +6039,41 @@ static TyKind gvar_write_value_type(Compiler *c, const char *rn, LocalVar *lv, i
   return lit_takes_general_hash(c, lv, vnode, vt, changed);
 }
 
+/* Does a write of the global `lv` other than a nil one (`$g = v`, `$g ||= v`,
+   `$g &&= v`) bring no type yet: gvar_write_value_type answers TY_UNKNOWN,
+   for an empty `{}` no `[]=` of the global types, or a value not inferred
+   yet? The slots with such a write are collected once a round, on the first
+   ask, into *set (*nset of them; *nset < 0 until then; the caller frees it). */
+static int gvar_has_untyped_write(Compiler *c, LocalVar *lv, LocalVar ***set, int *nset, int *changed) {
+  const NodeTable *nt = c->nt;
+  if (*nset < 0) {
+    int cap = 0;
+    *nset = 0;
+    for (int id = 0; id < nt->count; id++) {
+      NodeKind k = nt_kind(nt, id);
+      if (k != NK_GlobalVariableWriteNode && k != NK_GlobalVariableOrWriteNode && k != NK_GlobalVariableAndWriteNode)
+        continue;
+      const char *nm = nt_str(nt, id, "name");
+      const char *rn = nm ? comp_resolve_gvar(c, nm + 1) : NULL;
+      LocalVar *g = rn ? comp_gvar(c, rn) : NULL;
+      if (!g || gvar_write_value_type(c, rn, g, nt_ref(nt, id, "value"), changed) != TY_UNKNOWN) continue;
+      int seen = 0;
+      for (int i = 0; i < *nset && !seen; i++) seen = (*set)[i] == g;
+      if (seen) continue;
+      if (*nset == cap) {
+        cap = cap ? cap * 2 : 8;
+        LocalVar **grown = realloc(*set, (size_t)cap * sizeof **set);
+        if (!grown) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+        *set = grown;
+      }
+      (*set)[(*nset)++] = g;
+    }
+  }
+  for (int i = 0; i < *nset; i++)
+    if ((*set)[i] == lv) return 1;
+  return 0;
+}
+
 /* Set while the store passes below run again after the late nullable marks
    (infer_changed_store_types): they then join only the stores whose input
    has widened since these types, and leave the rest as they settled. */
@@ -6014,20 +6085,26 @@ static int store_unchanged(Compiler *c, int id) {
 int infer_global_const_types(Compiler *c) {
   const NodeTable *nt = c->nt;
   int changed = 0;
+  LocalVar **untyped = NULL;   /* gvar_has_untyped_write's slots */
+  int nuntyped = -1;
   for (int id = 0; id < nt->count; id++) {
     const char *ty = nt_type(nt, id);
     NodeKind ty_k = nt_kind(nt, id);
     if (!ty || store_unchanged(c, id)) continue;
     LocalVar *lv = NULL;
     TyKind vt = TY_UNKNOWN;
+    int gslot = 0;   /* lv is a global's slot (the joins below) */
     if (ty_k == NK_GlobalVariableWriteNode) {
       const char *nm = nt_str(nt, id, "name");
       const char *rn = nm ? comp_resolve_gvar(c, nm + 1) : NULL;
       if (rn) lv = comp_gvar(c, rn);
+      gslot = 1;
       int vnode = nt_ref(nt, id, "value");
       vt = gvar_write_value_type(c, rn, lv, vnode, &changed);
       if (vt == TY_NIL) {
-        if (lv && nil_write_type(lv->type) != lv->type) { lv_set_type(lv, nil_write_type(lv->type)); changed = 1; }
+        TyKind nw = lv ? gvar_nil_write_type(lv->type, lv->type == TY_UNKNOWN &&
+                                                  gvar_has_untyped_write(c, lv, &untyped, &nuntyped, &changed)) : TY_UNKNOWN;
+        if (lv && nw != lv->type) { lv_set_type(lv, nw); changed = 1; }
         continue;
       }
     }
@@ -6035,6 +6112,7 @@ int infer_global_const_types(Compiler *c) {
       const char *nm = nt_str(nt, id, "name");
       const char *rn = nm ? comp_resolve_gvar(c, nm + 1) : NULL;
       if (rn) lv = comp_gvar(c, rn);
+      gslot = 1;
       TyKind cur = lv ? lv->type : TY_UNKNOWN;
       TyKind v = infer_type(c, nt_ref(nt, id, "value"));
       if (cur == TY_STRING) vt = TY_STRING;
@@ -6050,6 +6128,7 @@ int infer_global_const_types(Compiler *c) {
       const char *nm = nt_str(nt, id, "name");
       const char *rn = nm ? comp_resolve_gvar(c, nm + 1) : NULL;
       if (rn) lv = comp_gvar(c, rn);
+      gslot = 1;
       /* `$g ||= []` writes the slot as `$g = []` does: typed only by its
          UNKNOWN value, the global `$stores = nil; $stores ||= []` stayed
          nil-typed, so `($stores || []).each` was typed from the literal
@@ -6058,7 +6137,9 @@ int infer_global_const_types(Compiler *c) {
          slot and the C did not build. */
       vt = gvar_write_value_type(c, rn, lv, nt_ref(nt, id, "value"), &changed);
       if (vt == TY_NIL) {
-        if (lv && nil_write_type(lv->type) != lv->type) { lv_set_type(lv, nil_write_type(lv->type)); changed = 1; }
+        TyKind nw = lv ? gvar_nil_write_type(lv->type, lv->type == TY_UNKNOWN &&
+                                                  gvar_has_untyped_write(c, lv, &untyped, &nuntyped, &changed)) : TY_UNKNOWN;
+        if (lv && nw != lv->type) { lv_set_type(lv, nw); changed = 1; }
         continue;
       }
     }
@@ -6120,7 +6201,7 @@ int infer_global_const_types(Compiler *c) {
         if (!glv) continue;
         TyKind vt2 = (els && i < en) ? infer_type(c, els[i]) : TY_UNKNOWN;
         if (vt2 == TY_NIL || vt2 == TY_UNKNOWN) continue;
-        TyKind merged2 = ty_unify(glv->type, vt2);
+        TyKind merged2 = gvar_join(glv->type, vt2);
         if (merged2 != glv->type) { lv_set_type(glv, merged2); changed = 1; }
       }
       /* handle splat-rest global target (*$rest = ...) */
@@ -6139,7 +6220,7 @@ int infer_global_const_types(Compiler *c) {
               rest_elem = ty_unify(rest_elem, infer_type(c, els[i]));
             TyKind rest_arr_t = (rest_elem != TY_UNKNOWN) ? ty_array_of(rest_elem) : TY_UNKNOWN;
             if (rest_arr_t != TY_UNKNOWN) {
-              TyKind merged3 = ty_unify(glv2->type, rest_arr_t);
+              TyKind merged3 = gvar_join(glv2->type, rest_arr_t);
               if (merged3 != glv2->type) { lv_set_type(glv2, merged3); changed = 1; }
             }
           }
@@ -6189,9 +6270,14 @@ int infer_global_const_types(Compiler *c) {
        Unifying with that type widened the constant every round and the
        narrowing put it back, so the fixpoint never settled. */
     if (ty_is_obj_array(lv->oa_pin) && lv->type == lv->oa_pin && ty_is_array(vt)) continue;
-    TyKind merged = keep_general_array(lv->type, vt) ? lv->type : ty_unify(lv->type, vt);
+    /* (a constant keeps the general join: its nil write, `K = nil`, joins
+       through it too, the same in either order, where a global's takes
+       gvar_nil_write_type) */
+    TyKind merged = keep_general_array(lv->type, vt) ? lv->type
+                  : gslot ? gvar_join(lv->type, vt) : ty_unify(lv->type, vt);
     if (merged != lv->type) { lv_set_type(lv, merged); changed = 1; }
   }
+  free(untyped);
   if (g_store_before) return changed;
   changed |= gvar_implicit_nil_writes(c);
   /* $stdout / $stderr start out holding the standard stream, so a program
@@ -6693,14 +6779,14 @@ static void mark_array_subclasses(Compiler *c) {
   /* the program's reopens of Array and Hash, which a subclass's chain
      reaches above its root */
   int aro = comp_core_class(c, CORE_ARRAY), hro = comp_core_class(c, CORE_HASH);
-  int sro = comp_core_class(c, CORE_STRING);
+  int sro = comp_core_class(c, CORE_STRING), tro = comp_core_class(c, CORE_TIME);
   for (int i = 0; i < c->nclasses; i++) {
     int r = i;
     for (int g = 0; c->classes[r].parent >= 0 && c->classes[r].parent != r &&
                     c->classes[r].parent != hro && c->classes[r].parent != aro &&
-                    c->classes[r].parent != sro && g < 256; g++)
+                    c->classes[r].parent != sro && c->classes[r].parent != tro && g < 256; g++)
       r = c->classes[r].parent;
-    if (r == hro || r == aro || r == sro) continue;
+    if (r == hro || r == aro || r == sro || r == tro) continue;
     if (!class_def_is_class(c->nt, c->classes[r].def_node)) continue;
     const char *par = builtin_value_superclass(c, class_def_super(c->nt, c->classes[r].def_node));
     if (is_embedding_builtin(par)) {
@@ -6708,6 +6794,8 @@ static void mark_array_subclasses(Compiler *c) {
       c->classes[i].ary_hash = sp_streq(par, "Hash");
       c->classes[i].ary_str = sp_streq(par, "String");
       if (c->classes[i].ary_str) { c->classes[r].ary_kind = TY_STRBUF; comp_touch_class(c->classes[r].idx); }
+      c->classes[i].ary_time = sp_streq(par, "Time");
+      if (c->classes[i].ary_time) { c->classes[r].ary_kind = TY_TIME; comp_touch_class(c->classes[r].idx); }
       c->has_arysub = 1;
     }
   }
@@ -7213,6 +7301,137 @@ static int inc_super_behind(Compiler *c, int ci, const char *name, int like) {
   g_inc_did_clone = 1;
   return e;
 }
+
+/* The name in class ci of the copy of src, a hidden copy a module holds:
+   one of ci's own hidden names of the same kind, as the module's spelling
+   may be taken there */
+static void mixin_shadow_name(Compiler *c, int ci, const Scope *src, char *out, size_t size) {
+  if (src->shadow == SHADOW_PREP) comp_shadow_name(c, ci, src->shadow_user, out, size);
+  else snprintf(out, size, "__inc %d %s", c->classes[ci].prep_shadow_count++, src->shadow_user);
+}
+
+/* The copy class ci already holds of src, a hidden copy a module holds,
+   from a mixin of the same kind (LR_INCLUDE, LR_PREPEND, LR_EXTEND) of the
+   snap scopes before this one: a module mixed in before brought the same
+   method, which the ancestors hold once, so the module's chain reaches
+   that copy (include_chain_copy keeps the class's chain then). -1 when
+   there is none. */
+static int mixin_copy_held(Compiler *c, int ci, const Scope *src, int snap, LrMixKind kind) {
+  for (int s = 0; s < snap; s++) {
+    const Scope *k = &c->scopes[s];
+    if (k->class_id != ci || k->def_node != src->def_node) continue;
+    int same = kind == LR_EXTEND ? k->is_extend_copy && k->is_cmethod
+             : kind == LR_PREPEND ? k->is_prepend_copy && !k->is_cmethod
+             : k->is_include_copy && !k->is_prepend_copy && !k->is_cmethod;
+    if (same) return s;
+  }
+  return -1;
+}
+
+/* Does module m bring module mod with it: m is mod, or mod is among the
+   modules m includes, at any depth? seen marks the modules asked already,
+   so a lattice of includes is walked once. */
+static int mixin_brings(Compiler *c, int m, int mod, char *seen) {
+  if (m < 0 || m >= c->nclasses || seen[m]) return 0;
+  if (m == mod) return 1;
+  seen[m] = 1;
+  const ClassInfo *k = &c->classes[m];
+  for (int i = 0; i < k->nincluded_mods; i++)
+    if (mixin_brings(c, k->included_mods[i], mod, seen)) return 1;
+  return 0;
+}
+
+/* Is module mod among the ancestors an include (kind LR_INCLUDE), a
+   prepend (LR_PREPEND) or an extend (LR_EXTEND) of it into class ci would
+   add it to, through the n mixins of that kind mods[] that came before:
+   one of them is mod or brings it? CRuby leaves the ancestors as they are
+   then. An include also looks at the class's prepends and at what its
+   superclasses mix in; a prepend does not look at its includes, as a
+   module included before is listed again behind the class. */
+static int mixin_already_brought(Compiler *c, int ci, int mod, LrMixKind kind, const int *mods, int n) {
+  char *seen = calloc((size_t)(c->nclasses > 0 ? c->nclasses : 1), 1);
+  if (!seen) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  int brought = 0;
+  for (int m = 0; m < n && !brought; m++) brought = mixin_brings(c, mods[m], mod, seen);
+  /* (an include also looks at the class's prepends, and at what its
+     superclasses mix in) */
+  for (int k = ci; kind == LR_INCLUDE && k >= 0 && !brought; k = c->classes[k].parent) {
+    const ClassInfo *cls = &c->classes[k];
+    for (int m = 0; k != ci && m < cls->nincluded_mods && !brought; m++)
+      brought = mixin_brings(c, cls->included_mods[m], mod, seen);
+    for (int m = 0; m < cls->nprepended_mods && !brought; m++)
+      brought = mixin_brings(c, cls->prepended_mods[m], mod, seen);
+  }
+  free(seen);
+  return brought;
+}
+
+/* The module whose own method src copies (a hidden copy's inner module:
+   the one that defines it, however many includes deep); -1 when none.
+   Found once per copy (Scope.def_module_ci). */
+static int mixin_def_module(Compiler *c, Scope *src) {
+  for (int s = 0; s < c->nscopes && !src->def_module_ci; s++) {
+    const Scope *k = &c->scopes[s];
+    if (k->def_node == src->def_node && !k->is_include_copy && !k->shadow && k->class_id >= 0 &&
+        comp_class_is_module(c, &c->classes[k->class_id]))
+      src->def_module_ci = k->class_id + 1;
+  }
+  if (!src->def_module_ci) src->def_module_ci = -1;
+  return src->def_module_ci > 0 ? src->def_module_ci - 1 : -1;
+}
+
+/* The method class ci's chain (cm: of its class methods, keyed
+   "self.<name>") reaches from `name` at its end, or `stop` once it gets
+   there */
+static const char *mixin_chain_end(Compiler *c, int ci, int cm, const char *name, const char *stop) {
+  char key[320];
+  const char *next;
+  for (int hops = 0; hops < c->classes[ci].nprep_chain && !(stop && sp_streq(name, stop)); hops++, name = next) {
+    snprintf(key, sizeof key, "%s%s", cm ? "self." : "", name);
+    if (!(next = comp_prep_chain_target(c, ci, key))) break;
+  }
+  return name;
+}
+
+/* The module's chain (what a super in one of its methods reaches among the
+   module's own copies: a module it includes, one it prepends), carried into
+   class ci by the copies an include, prepend or extend (cm: ci's class
+   methods) made: made[s] is 1 + the copy of the module's scope s, of the
+   snap scopes before it. `super` in the copy of M#m then reaches the copy
+   of what M's m reached, the module M includes, as CRuby's ancestors put it
+   after M. Where ci's chain already sends the copy on (to a module mixed in
+   before, behind M, or the class's own method behind a prepend), the
+   module's chain goes first and the end of it reaches that, unless what M's
+   m reached is behind that already: a module mixed in before brings the
+   same one, which the ancestors hold once, behind it. */
+static void include_chain_copy(Compiler *c, int ci, int mod_id, const int *made, int snap, int cm) {
+  ClassInfo *mod = &c->classes[mod_id];
+  for (int k = 0; k < mod->nprep_chain; k++) {
+    int sf = -1, st = -1;
+    for (int s = 0; s < snap && (sf < 0 || st < 0); s++) {
+      const Scope *sc = &c->scopes[s];
+      if (sc->class_id != mod_id || sc->is_cmethod || !sc->name || !made[s]) continue;
+      if (sp_streq(sc->name, mod->prep_from[k])) sf = s;
+      if (sp_streq(sc->name, mod->prep_to[k])) st = s;
+    }
+    if (sf < 0 || st < 0) continue;
+    char from[320], key[320];
+    const char *to = c->scopes[made[st] - 1].name;
+    snprintf(from, sizeof from, "%s%s", cm ? "self." : "", c->scopes[made[sf] - 1].name);
+    ClassInfo *cls = &c->classes[ci];
+    int q = 0;
+    while (q < cls->nprep_chain && !sp_streq(cls->prep_from[q], from)) q++;
+    if (q == cls->nprep_chain) { comp_prep_chain_add(cls, from, to); continue; }
+    const char *old = cls->prep_to[q];
+    if (sp_streq(mixin_chain_end(c, ci, cm, old, to), to)) continue;
+    const char *end = mixin_chain_end(c, ci, cm, to, NULL);
+    snprintf(key, sizeof key, "%s%s", cm ? "self." : "", end);
+    if (!sp_streq(end, old)) comp_prep_chain_add(cls, key, old);
+    free(cls->prep_to[q]);
+    cls->prep_to[q] = strdup(to);
+  }
+}
+
 /* Copy module mod_id's instance methods into class ci, one clone per
    includer, as `include` does (process_include_body). guard: an include a
    reopening runs after the class's first body; the copy that becomes the
@@ -7244,12 +7463,31 @@ static void include_module_methods(Compiler *c, int ci, int mod_id, int guard, i
     }
     const char *dst_name = src->name;
     char inc_shadow[256];
-    int own = comp_method_in_class(c, ci, src->name), behind = -1;
-    int guarded = guard && !src->is_cmethod;
-    /* a later include of a module whose method the class already has from
-       the same definition (an include repeated, or reached through another
-       module) is Ruby's no-op: the copy stands as it is */
-    if (guarded && own >= 0 && c->scopes[own].is_include_copy && c->scopes[own].def_node == src->def_node) continue;
+    /* a hidden copy the module holds (what its own include or prepend put
+       behind one of its methods, which its chain names) comes over under a
+       hidden name of this class's own, as the class's spelling of the same
+       name may be taken, standing in front of nothing; include_chain_copy
+       carries the chain */
+    int own = src->shadow ? -1 : comp_method_in_class(c, ci, src->name), behind = -1;
+    int guarded = guard && !src->is_cmethod && !src->shadow;
+    if (src->shadow) {
+      /* (one the class has already, from the module mixed in before that
+         brings the method: the module's chain reaches that copy, as the
+         module is in the ancestors once) */
+      int have = mixin_copy_held(c, ci, src, snap, LR_INCLUDE);
+      if (have >= 0) { made[ms] = have + 1; continue; }
+      /* (none where its inner module is among the ancestors already,
+         through the class's prepends or its superclasses' mixins: CRuby's
+         include skips that module, so the module's chain ends there and a
+         super falls through to what the class's own super reaches) */
+      if (mixin_already_brought(c, ci, mixin_def_module(c, src), LR_INCLUDE, NULL, 0)) continue;
+      mixin_shadow_name(c, ci, src, inc_shadow, sizeof inc_shadow);
+      dst_name = inc_shadow;
+    }
+    /* an include of a module whose method the class already has from the
+       same definition (reached through another module included before) is
+       Ruby's no-op: the copy stands as it is */
+    if (own >= 0 && c->scopes[own].is_include_copy && c->scopes[own].def_node == src->def_node) continue;
     if (own >= 0 && c->scopes[own].is_include_copy) {
       /* An earlier include of another module put this name here. Ruby's MRO
          puts the LAST include first, so this module supersedes it: rename
@@ -7335,7 +7573,7 @@ static void include_module_methods(Compiler *c, int ci, int mod_id, int guard, i
     int dst_idx = c->nscopes - 1;
     /* comp_scope_new may realloc c->scopes; re-derive src pointer. */
     src = &c->scopes[ms];
-    if (dst_name == inc_shadow) comp_scope_set_shadow(c, dst_idx, SHADOW_INC, src->name);
+    if (dst_name == inc_shadow) comp_scope_set_shadow(c, dst_idx, src->shadow ? src->shadow : SHADOW_INC, comp_scope_user_name(src));
     else comp_scope_copy_shadow(c, dst_idx, ms, NULL);
     /* Clone the body and re-attribute it to the target when either:
        (a) the target is a built-in class, where `self` has a different
@@ -7425,6 +7663,7 @@ else {
     m->guard_behind = b >= 0 && b < snap && made[b] ? made[b] - 1 : -1;
     if (m->guard_behind < 0) m->mixin_guarded = 0;   /* (nothing to stand in front of: unguarded) */
   }
+  include_chain_copy(c, ci, mod_id, made, snap, 0);
   free(made);
 }
 
@@ -7614,8 +7853,16 @@ void process_include_body(Compiler *c, int ci, int body_node) {
       }
       continue;
     }
+    /* a module the class included or prepended before, or one such a
+       module brings, is among the class's ancestors: CRuby's include of it
+       again changes nothing, so the copies the earlier one made stand
+       (`include M, then include Base` where M includes Base keeps M#g in
+       front; `include M` twice runs M#g once) */
+    int brought = mixin_already_brought(c, ci, mod_id, LR_INCLUDE, c->classes[ci].included_mods,
+                                        c->classes[ci].nincluded_mods);
     /* record membership for `rescue M` matching (dedup across reopenings) */
     class_note_included_mod(c, ci, mod_id);
+    if (brought) continue;
     /* an include a reopening runs after the first body (one that may not
        run keeps the class's methods as they are, as the refusal of a call
        ahead of it does) */
@@ -7710,7 +7957,7 @@ void register_includes(Compiler *c) {
      are copied away with no copy left, as a module's shadowed method is, so
      that neither a definition typed on an undeclared `sp_Struct` nor a
      dispatch arm of a dynamic send reaching it is emitted. */
-  int sbase = comp_class_index(c, "Struct");
+  int sbase = comp_core_class(c, CORE_STRUCT);
   if (sbase >= 0 && !c->classes[sbase].is_struct) {
     int any_record = 0;
     for (int ci = 0; ci < c->nclasses && !any_record; ci++)
@@ -7742,7 +7989,7 @@ static void prepend_copy_name(Compiler *c, int mi) {
   comp_scope_set_shadow(c, mi, SHADOW_PREP, user);
   free(user);
 }
-static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci, int cell, int behind);
+static void specialize_cmethod_for(Compiler *c, int mi, const char *as, int def_cls, int ci, int cell, int behind);
 static int prepend_late_stmt(Compiler *c, int ci, int body);
 static int prepend_cell(Compiler *c, int *cell);
 static void prepend_cell_write(Compiler *c, int late, int list, int after, int cell);
@@ -8034,6 +8281,8 @@ static void extend_alias_refuse_own(Compiler *c, int mod_id, int ci, const char 
 static int extend_class_with(Compiler *c, int ci, int mod_id, int inherited, int prepend, int *cell) {
   int did_clone = 0;
   int snap = c->nscopes;
+  int *made = calloc((size_t)(snap > 0 ? snap : 1), sizeof(int));
+  if (!made) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   for (int ms = 0; ms < snap; ms++) {
     Scope *src = &c->scopes[ms];
     /* Only transplant instance methods; self.* on the module stay on it.
@@ -8044,6 +8293,25 @@ static int extend_class_with(Compiler *c, int ci, int mod_id, int inherited, int
        `include` of the same module had made, with the class object cast
        to an instance pointer (#4648). */
     if (src->class_id != mod_id || (src->is_cmethod && !src->is_module_function) || !src->name) continue;
+    /* an accessor the singleton class declares itself (`class << self;
+       attr_reader :x`) answers before any module the class extends; only a
+       singleton prepend goes in front of it */
+    if (!prepend && comp_sg_accessor_own(c, ci, src->name)) continue;
+    /* a hidden copy the module holds comes over under one of ci's own
+       hidden names, in front of nothing (include_chain_copy), unless a
+       module extended before brought the same one */
+    char hidden[256];
+    if (src->shadow) {
+      int have = mixin_copy_held(c, ci, src, snap, LR_EXTEND);
+      if (have >= 0) { made[ms] = have + 1; continue; }
+      mixin_shadow_name(c, ci, src, hidden, sizeof hidden);
+      specialize_cmethod_for(c, ms, hidden, mod_id, ci, 0, -1);
+      int cp = comp_cmethod_in_class(c, ci, hidden);
+      if (cp >= 0) { c->scopes[cp].is_extend_copy = 1; made[ms] = cp + 1; }
+      c->scopes[ms].is_transplanted_source = 1;
+      did_clone = 1;
+      continue;
+    }
     int own = comp_cmethod_in_class(c, ci, src->name);
     if (own >= 0 && inherited) continue;
     /* The class's own class method comes first, and a module it extends
@@ -8144,15 +8412,15 @@ static int extend_class_with(Compiler *c, int ci, int mod_id, int inherited, int
         NT_FOREACH_KIND(nt2, ow[k], ivid)
           if (c->nscope[ivid] == ms && nt_str(nt2, ivid, "name"))
             comp_ivar_intern(&c->classes[ci], nt_str(nt2, ivid, "name")); }
-    specialize_cmethod_for(c, ms, mod_id, ci, guard, behind_mi);
+    specialize_cmethod_for(c, ms, NULL, mod_id, ci, guard, behind_mi);
     src = &c->scopes[ms];  /* realloc-safe */
     { int cp = comp_cmethod_in_class(c, ci, src->name);
-      if (cp >= 0) c->scopes[cp].is_extend_copy = 1;
+      if (cp >= 0) { c->scopes[cp].is_extend_copy = 1; made[ms] = cp + 1; }
       /* The copy keeps the module's visibility, and a later extend wins. A
          copy behind the class's own method is out of reach of a call. */
       if (cp >= 0 && !own_name)
         comp_cmethod_extend_vis_set(&c->classes[ci], src->name, src->is_module_function && ci != mod_id
-                                    ? SP_VIS_PRIVATE : comp_method_vis(&c->classes[mod_id], src->name));
+                                    ? SP_VIS_PRIVATE : comp_method_vis_in_chain(c, mod_id, src->name));
       if (own_name) {
         if (cp >= 0) { free(c->scopes[cp].name); c->scopes[cp].name = strdup(behind); comp_scope_set_shadow(c, cp, SHADOW_INC, src->name); }
         free(c->scopes[own].name);
@@ -8173,6 +8441,8 @@ static int extend_class_with(Compiler *c, int ci, int mod_id, int inherited, int
     int v = comp_method_vis(m, m->alias_new[i]);
     if (v != SP_VIS_PUBLIC) comp_cmethod_extend_vis_set(&c->classes[ci], m->alias_new[i], v);
   }
+  include_chain_copy(c, ci, mod_id, made, snap, 1);
+  free(made);
   return did_clone;
 }
 
@@ -8344,10 +8614,10 @@ void register_extends(Compiler *c) {
     int cell = 0;
     for (int j = 0; j < n; j++) {
       int s = mx[j].stmt, mod_id = mx[j].mod;
-      /* extending a module the class already extends is a no-op: it stays
-         where it was, and a second copy in front would hide the later one */
-      int again = mod_id < 0;
-      for (int e = 0; e < nseen && !again; e++) again = seen[e] == mod_id;
+      /* extending a module the class already extends, or one such a module
+         brings, is a no-op: it stays where it was, and a second copy in
+         front would hide the later one */
+      int again = mod_id < 0 || mixin_already_brought(c, ci, mod_id, LR_EXTEND, seen, nseen);
       if (!again) {
         if (nseen == capseen) {
           capseen *= 2;
@@ -8629,8 +8899,9 @@ static int body_tail_is_bare_new(const NodeTable *nt, int body) {
   int r = nt_ref(nt, tail, "receiver");
   return nm && sp_streq(nm, "new") && (r < 0 || nt_kind(nt, r) == NK_SelfNode);
 }
-static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci, int cell, int behind) {
-  if (!cell && comp_cmethod_in_class(c, ci, c->scopes[mi].name) >= 0) return;
+static void specialize_cmethod_for(Compiler *c, int mi, const char *as, int def_cls, int ci, int cell, int behind) {
+  if (!as) as = c->scopes[mi].name;
+  if (!cell && comp_cmethod_in_class(c, ci, as) >= 0) return;
   NodeTable *nt = (NodeTable *)c->nt;
   int has_new = 0;
   (void)cmethod_needs_specialization(c, mi, ci, def_cls, &has_new);
@@ -8639,7 +8910,7 @@ static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci, int
   if (src_body >= 0 && new_body < 0) return;  /* clone failed: skip */
   comp_grow_node_arrays(c);
   Scope *src = &c->scopes[mi];
-  Scope *dst = comp_scope_new(c, src->name, src->def_node);
+  Scope *dst = comp_scope_new(c, as, src->def_node);
   src = &c->scopes[mi];  /* realloc-safe */
   int dst_idx = c->nscopes - 1;
   comp_scope_copy_shadow(c, dst_idx, mi, NULL);
@@ -8687,7 +8958,7 @@ static void specialize_cmethod_for(Compiler *c, int mi, int def_cls, int ci, int
     if (sub_def == ci) continue;
     int sub_new = 0;
     if (cmethod_needs_specialization(c, sub_mi, ci, sub_def, &sub_new))
-      specialize_cmethod_for(c, sub_mi, sub_def, ci, 0, -1);
+      specialize_cmethod_for(c, sub_mi, NULL, sub_def, ci, 0, -1);
   }
 }
 
@@ -8824,7 +9095,7 @@ static void specialize_super_cmethod(Compiler *c, int own, int snap) {
     if (pm < 0 || pdef < 0 || !cmethod_reaches_class_ivar(c, pm, pdef, 0)) break;
     char behind[256];
     snprintf(behind, sizeof behind, "__inc %d %s", c->classes[ci].prep_shadow_count++, own_name);
-    specialize_cmethod_for(c, pm, pdef, ci, 0, -1);
+    specialize_cmethod_for(c, pm, NULL, pdef, ci, 0, -1);
     int cp = comp_cmethod_in_class(c, ci, own_name);
     if (cp < 0 || cp == own || cp == cur) break;
     free(c->scopes[cp].name);
@@ -8887,7 +9158,7 @@ void specialize_inherited_cls_new(Compiler *c) {
       Scope *encl = comp_scope_of(c, id);
       if (rn && sp_streq(rn, "class") && rr >= 0 && nt_kind(nt, rr) == NK_SelfNode &&
           mname && !sp_streq(mname, "new") && encl && !encl->is_cmethod && encl->class_id >= 0 &&
-          !class_def_is_module(nt, c->classes[encl->class_id].def_node)) {
+          !comp_class_is_module(c, &c->classes[encl->class_id])) {
         int base = encl->class_id;
         /* the enclosing class too: one that inherits the method holds its
            own class-level ivars as its descendants do */
@@ -8907,7 +9178,7 @@ void specialize_inherited_cls_new(Compiler *c) {
           }
           int has_new = 0;
           if (cmethod_needs_specialization(c, mi, k, def_cls, &has_new))
-            specialize_cmethod_for(c, mi, def_cls, k, 0, -1);
+            specialize_cmethod_for(c, mi, NULL, def_cls, k, 0, -1);
         }
       }
       continue;
@@ -8953,7 +9224,7 @@ void specialize_inherited_cls_new(Compiler *c) {
     if (!cmethod_needs_specialization(c, mi, ci, def_cls, &has_new)) continue;
     /* Clone mi for ci and, transitively, the inherited intermediates it reaches
        (#1451). nscopes growth below stands in for the old did_clone flag. */
-    specialize_cmethod_for(c, mi, def_cls, ci, 0, -1);
+    specialize_cmethod_for(c, mi, NULL, def_cls, ci, 0, -1);
   }
   /* A Class value the analysis cannot pin (`CONTAINERS.fetch(ext).open`)
      runs an inherited class method on whichever class it holds, so its bare
@@ -8980,7 +9251,7 @@ void specialize_inherited_cls_new(Compiler *c) {
       tgt = nt2; tgt[ntgt++] = k;
     }
     if (ntgt > 0 && name_called_on_dynamic_recv(c, mi, tgt, ntgt, node_count, &an))
-      for (int t = 0; t < ntgt; t++) specialize_cmethod_for(c, mi, def_cls, tgt[t], 0, -1);
+      for (int t = 0; t < ntgt; t++) specialize_cmethod_for(c, mi, NULL, def_cls, tgt[t], 0, -1);
     free(tgt);
   }
   /* a class's own class method whose super reaches its parent's */
@@ -9048,8 +9319,11 @@ void specialize_inherited_cls_new(Compiler *c) {
       if (ccres[ii] == s) called_direct = 1;
     }
     /* ... or if a bare call inside some class-method body still resolves to
-       this source (a class with no specialized copy of its own) */
-    for (int id = 0; id < node_count && !called_direct; id++) {
+       this source (a class with no specialized copy of its own). The bodies
+       cloned for the specialized copies (past node_count) count too: a
+       superclass method's copy made for the source's class calls the source
+       by name, and is emitted against it. */
+    for (int id = 0; id < nt->count && !called_direct; id++) {
       if (nt_kind(nt, id) != NK_CallNode) continue;
       int r2 = nt_ref(nt, id, "receiver");
       if (r2 >= 0 && nt_kind(nt, r2) != NK_SelfNode) continue;
@@ -9149,6 +9423,15 @@ static void prepend_cell_write(Compiler *c, int late, int list, int after, int c
   if (n) elab_record_write(c, ver_cell_put(c, name, prog_root_stmts(c, f), st[0], 0, 0));
 }
 
+/* Has module mod been prepended into class ci already: ci holds a copy
+   its prepend made? */
+static int mixin_prepended(Compiler *c, int ci, int mod) {
+  for (int s = 0; s < c->nscopes; s++)
+    if (c->scopes[s].class_id == ci && c->scopes[s].is_prepend_copy && c->scopes[s].origin_module_ci == mod + 1)
+      return 1;
+  return 0;
+}
+
 static void process_prepend_body(Compiler *c, int ci, int body) {
   const NodeTable *nt = c->nt;
   int late = prepend_late_stmt(c, ci, body);
@@ -9163,6 +9446,19 @@ static void process_prepend_body(Compiler *c, int ci, int body) {
     for (int j = 0; j < n; j++) {
       int mod_id = mx[j].mod;
       if (mod_id < 0) continue;
+      /* a module prepended before, or one such a module brings, is among
+         the class's ancestors already: CRuby's prepend of it changes
+         nothing (`prepend M` then `prepend Base`, where M includes Base) */
+      {
+        const ClassInfo *cls = &c->classes[ci];
+        int *done = malloc(sizeof(int) * (size_t)(cls->nprepended_mods > 0 ? cls->nprepended_mods : 1)), nd = 0;
+        if (!done) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+        for (int m = 0; m < cls->nprepended_mods; m++)
+          if (mixin_prepended(c, ci, cls->prepended_mods[m])) done[nd++] = cls->prepended_mods[m];
+        int brought = mixin_already_brought(c, ci, mod_id, LR_PREPEND, done, nd);
+        free(done);
+        if (brought) continue;
+      }
       /* its readers answer in front of the class's own, as its methods do */
       for (int r = 0; r < c->classes[mod_id].nreaders; r++) {
         char ivname[256];
@@ -9171,11 +9467,24 @@ static void process_prepend_body(Compiler *c, int ci, int body) {
         comp_add_own_reader(&c->classes[ci], c->classes[mod_id].readers[r]);
       }
       /* Transplant each instance method of the module into class ci. */
-      for (int ms = 0; ms < c->nscopes; ms++) {
+      int snap = c->nscopes;
+      int *made = calloc((size_t)(snap > 0 ? snap : 1), sizeof(int));
+      if (!made) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      for (int ms = 0; ms < snap; ms++) {
         Scope *sc = &c->scopes[ms];
         if (sc->class_id != mod_id || sc->is_cmethod || !sc->name) continue;
         const char *method_name = sc->name;
-        int active_mi = comp_method_in_class(c, ci, method_name);
+        char hidden[256];
+        /* a hidden copy the module holds comes over under one of ci's own
+           hidden names, in front of nothing (include_chain_copy), unless a
+           module prepended before brought the same one */
+        if (sc->shadow) {
+          int have = mixin_copy_held(c, ci, sc, snap, LR_PREPEND);
+          if (have >= 0) { made[ms] = have + 1; continue; }
+          mixin_shadow_name(c, ci, sc, hidden, sizeof hidden);
+          method_name = hidden;
+        }
+        int active_mi = sc->shadow ? -1 : comp_method_in_class(c, ci, method_name);
         int guard = active_mi >= 0 && late >= 0;
         if (active_mi >= 0) {
           Scope *active = &c->scopes[active_mi];
@@ -9259,9 +9568,14 @@ static void process_prepend_body(Compiler *c, int ci, int body) {
           intern_scope_ivars(c, ms_i, ci);
           sc = &c->scopes[ms_i];
           sc->is_transplanted_source = 1;
+          made[ms_i] = dst_i + 1;
           if (guard) prepend_copy_name(c, dst_i);
         }
       }
+      /* M's own chain, in front of the class's own method: a super in M#m
+         reaches what M includes before the class */
+      include_chain_copy(c, ci, mod_id, made, snap, 0);
+      free(made);
     }
     free(mx);
   }
@@ -10849,6 +11163,21 @@ int poly_cls_value_reaches(Compiler *c, int call, int k) {
              (kl == 6 && !strncmp(kn, "Object", 6)) || (kl == 11 && !strncmp(kn, "BasicObject", 11)) ||
              (kl == 6 && !strncmp(kn, "Kernel", 6))))
     return 1;
+  /* the receiver's class set (cls_fact), where it is bounded: one the
+     analysis narrowed holds no Class object of k or a class under it
+     (`list.pluck(*keys) if list.is_a?(Relation)` on an untyped `list`
+     holds a Relation, not Base, whose `self.pluck(col)` takes no splat,
+     #10939) */
+  int recv = nt_ref(c->nt, call, "receiver");
+  const ClsSet *cs = recv >= 0 ? cls_fact_node(c, recv) : NULL;
+  if (cs && !cs->all) {
+    int any = 0;
+    for (int m = cls_set_next(cs, c->nclasses - 1); m >= 0 && !any; m = cls_set_next(cs, m)) {
+      int v = m - c->nclasses;
+      if (v >= 0 && v < c->nclasses && (v == k || is_descendant(c, v, k))) any = 1;
+    }
+    if (!any) return 0;
+  }
   const char *cvals = poly_recv_class_values(c, call);
   if (!cvals) return 1;
   /* a value of the class or of a class under it (which inherits it) */

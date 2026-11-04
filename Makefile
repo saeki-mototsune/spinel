@@ -2137,6 +2137,12 @@ reject-test: string-minus-reject-test $(SPINEL)
 	  echo "reject-test: FAIL (an ivar written in a block default on a value with no ivars compiled)"; ok=0; \
 	else grep -q "on a value with no instance variable layout" "$$tmp/idw.out" || \
 	  { echo "reject-test: FAIL (an ivar written in a block default rejected without saying why)"; sed -n 1,5p "$$tmp/idw.out"; ok=0; }; fi; \
+	for t in $(shell grep -l '^\# spinel: reject-super-new-block$$' test/reject/*.rb); do \
+	  if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/snb.c" >"$$tmp/snb.out" 2>&1; then \
+	    echo "reject-test: FAIL ($$t, a block that may be nil through a program new's super, compiled)"; ok=0; \
+	  else grep -q "unsupported Array#min" "$$tmp/snb.out" || \
+	    { echo "reject-test: FAIL ($$t, a block that may be nil through a program new's super, rejected without saying why)"; sed -n 1,5p "$$tmp/snb.out"; ok=0; }; fi; \
+	done; \
 	for t in $(shell grep -l '^\# spinel: reject-string-method$$' test/reject/*.rb); do \
 	  if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/smm.c" >"$$tmp/smm.out" 2>&1; then \
 	    echo "reject-test: FAIL ($$t, a Method bound to a String mutator, compiled)"; ok=0; \
@@ -2175,6 +2181,13 @@ reject-test: string-minus-reject-test $(SPINEL)
 	  echo "reject-test: FAIL (the value of super in initialize compiled: $$t)"; ok=0; \
 	else grep -q "unsupported value of \`super\` in initialize" "$$tmp/siv.out" || \
 	  { echo "reject-test: FAIL (the value of super in initialize rejected without saying why: $$t)"; sed -n 1,5p "$$tmp/siv.out"; ok=0; }; fi; \
+	done; \
+	for t in $(shell grep -l '^\# spinel: reject-unsupported: ' test/reject/*.rb); do \
+	  why=$$(sed -n 's/^# spinel: reject-unsupported: //p' "$$t"); \
+	  if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/un.c" >"$$tmp/un.out" 2>&1; then \
+	    echo "reject-test: FAIL ($$t compiled: a construct the compiler refuses)"; ok=0; \
+	  else grep -qF "$$why" "$$tmp/un.out" || \
+	    { echo "reject-test: FAIL ($$t refused without saying why)"; sed -n 1,5p "$$tmp/un.out"; ok=0; }; fi; \
 	done; \
 	for t in $(shell grep -l '^\# spinel: reject-send-super$$' test/reject/*.rb); do \
 	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/ss.c" >"$$tmp/ss.out" 2>&1; then \
@@ -4224,7 +4237,7 @@ endif
 # two weeks are pruned when the test results are cleared.
 GATE_CACHE ?= 1
 export GATE_CACHE
-RESULT_CACHE_HARNESS := 1
+RESULT_CACHE_HARNESS := 2
 RESULT_CACHE_FP = $(if $(filter 0,$(GATE_CACHE)),off,$(eval RESULT_CACHE_FP := $(shell RC_CC="$(CC)" tools/result_cache.sh fp $(SP_RT_LIB) $(SP_RT_MT_LIB) $(BUNDLED_NATIVE_OBJS) $(BUNDLED_NATIVE_MT_OBJS) $(SPINEL_TIMEOUT) -- pch $(PCH_ROOT) $(PCH_FLAGS)))$(RESULT_CACHE_FP))
 # A `<test>.rb.opt` file beside a test names the C optimization flag it is
 # compiled with (`-O0`), for a test whose C is a shape the optimizer does not
@@ -4328,13 +4341,14 @@ elif [ $$built -eq 0 ]; then \
   else \
     : > "$$experr.n"; \
   fi; \
-  if cmp -s "$$exp.n" "$$act.n" && cmp -s "$$experr.n" "$$acterr.n"; then \
+  if cmp -s "$$exp.n" "$$act.n" && cmp -s "$$experr.n" "$$acterr.n" && [ "$$run_rc" -lt 129 ]; then \
     echo PASS > "$@"; \
     if [ -n "$$ckey" ]; then echo PASS | tools/result_cache.sh put "$$ckey"; fi; \
     if [ -t 1 ]; then printf .; fi; \
   else \
     echo FAIL > "$@"; \
     { if [ "$$run_rc" -eq 124 ]; then echo "=== timed out: 10 s of CPU, or the clock backstop of 60 s (the output below is partial) ==="; fi; \
+      if [ "$$run_rc" -ge 129 ]; then echo "=== killed by signal $$((run_rc - 128)) (a program that dies by a signal fails, whatever it printed) ==="; fi; \
       echo "=== stdout diff (expected vs actual) ==="; diff -u "$$exp.n" "$$act.n" || true; \
       echo "=== stderr diff (expected vs actual) ==="; diff -u "$$experr.n" "$$acterr.n" || true; } > "$@.diff" 2>&1; \
     if [ -t 1 ]; then printf F; fi; \
@@ -4733,6 +4747,16 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	  "$$tmp/ibin" >/dev/null 2>&1 || { echo "infer-test: FAIL ($$f: the program does not run)"; ok=0; }; \
 	done; \
 	for flags in '' --share-strings; do \
+	  if [ -f "$(RBS_INC)/rbs/parser.h" ]; then \
+	  $(SPINEL) $$flags test/getter_pending_receiver.rb -c --no-line-map -o "$$tmp/gpr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (getter_pending_receiver: -c)"; ok=0; }; \
+	  for cls in Response Entry; do \
+	    awk "/^struct sp_$${cls}_s \\{/,/^\\}/" "$$tmp/gpr.c" | grep -Fq 'sp_StrStrHash * iv_headers;' || { echo "infer-test: FAIL (a pending getter receiver widened $$cls headers)"; ok=0; }; \
+	  done; \
+	  else echo "infer-test: getter_pending_receiver skipped (no rbs parser)"; fi; \
+	  $(SPINEL) $$flags test/getter_pending_receiver_fallback.rb -c --no-line-map -o "$$tmp/gpf.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (getter_pending_receiver_fallback: -c)"; ok=0; }; \
+	  awk '/^struct sp_Ring_s \{/,/^\}/' "$$tmp/gpf.c" | grep -Fq 'sp_PolyPolyHash * iv_data;' || { echo "infer-test: FAIL (an unknown getter receiver lost its conservative write)"; ok=0; }; \
+	  $(SPINEL) $$flags test/getter_boxed_receiver_owners.rb -c --no-line-map -o "$$tmp/gbo.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (getter_boxed_receiver_owners: -c)"; ok=0; }; \
+	  awk '/^struct sp_Left_s \{/,/^\}/' "$$tmp/gbo.c" | grep -Fq 'sp_PolyPolyHash * iv_letters;' && awk '/^struct sp_Right_s \{/,/^\}/' "$$tmp/gbo.c" | grep -Fq 'sp_PolyPolyHash * iv_numbers;' || { echo "infer-test: FAIL (a boxed getter receiver lost a possible owner)"; ok=0; }; \
 	  $(SPINEL) $$flags test/is_a_user_class_guard_narrows.rb -c --no-line-map -o "$$tmp/iug.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (is_a_user_class_guard_narrows: -c)"; ok=0; }; \
 	  grep -q 'sp_Int_tag((sp_Int \*)(sp_Int \*)sp_poly_unbox_cls(lv_x' "$$tmp/iug.c" || { echo "infer-test: FAIL (is_a?(Int) left a guarded call on a user class in boxed dispatch)"; ok=0; }; \
 	  $(SPINEL) $$flags test/object_method_ivar_receivers.rb -c --no-line-map -o "$$tmp/oir.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (object_method_ivar_receivers: -c)"; ok=0; }; \
@@ -5518,6 +5542,22 @@ signal-default-test: $(SPINEL)
 	$(SPINEL) test/signal/interrupt_recursion.rb -o "$$tmp/ir" >/dev/null 2>&1 || { echo "signal-default-test: FAIL (compile recursion)"; ok=0; }; \
 	if [ $$ok -eq 1 ]; then \
 	  [ "$$(timeout 10 "$$tmp/ir" 2>/dev/null)" = "recursion interrupted" ] || { echo "signal-default-test: FAIL (a SIGINT did not reach a recursion with no loop: the call graph lost its cycle, #9377)"; ok=0; }; \
+	fi; \
+	$(SPINEL) test/signal/interrupt_initialize_recursion.rb -o "$$tmp/iir" >/dev/null 2>&1 || { echo "signal-default-test: FAIL (compile initialize recursion)"; ok=0; }; \
+	if [ $$ok -eq 1 ]; then \
+	  [ "$$(timeout -s KILL 10 "$$tmp/iir" 2>/dev/null)" = "recursion interrupted" ] || { echo "signal-default-test: FAIL (a SIGINT did not reach a recursion through new: the call graph lost the edge from new to initialize)"; ok=0; }; \
+	fi; \
+	$(SPINEL) test/signal/interrupt_class_value_new.rb -o "$$tmp/icv" >/dev/null 2>&1 || { echo "signal-default-test: FAIL (compile class value new)"; ok=0; }; \
+	if [ $$ok -eq 1 ]; then \
+	  [ "$$(timeout -s KILL 10 "$$tmp/icv" 2>/dev/null)" = "recursion interrupted" ] || { echo "signal-default-test: FAIL (a SIGINT did not reach a recursion through new on a class value: the call graph lost the edge to every initialize)"; ok=0; }; \
+	fi; \
+	$(SPINEL) test/signal/interrupt_super_new_recursion.rb -o "$$tmp/isn" >/dev/null 2>&1 || { echo "signal-default-test: FAIL (compile super new recursion)"; ok=0; }; \
+	if [ $$ok -eq 1 ]; then \
+	  [ "$$(timeout -s KILL 10 "$$tmp/isn" 2>/dev/null)" = "recursion interrupted" ] || { echo "signal-default-test: FAIL (a SIGINT did not reach a recursion through a program new's super)"; ok=0; }; \
+	fi; \
+	$(SPINEL) test/signal/interrupt_mixed_new_recursion.rb -o "$$tmp/imn" >/dev/null 2>&1 || { echo "signal-default-test: FAIL (compile mixed new recursion)"; ok=0; }; \
+	if [ $$ok -eq 1 ]; then \
+	  [ "$$(timeout -s KILL 10 "$$tmp/imn" 2>/dev/null)" = "recursion interrupted" ] || { echo "signal-default-test: FAIL (a SIGINT did not reach a recursion through new on a class value that may take the builtin new: the call graph lost the edge to its initialize)"; ok=0; }; \
 	fi; \
 	$(SPINEL) test/signal/interrupt_dynamic_call.rb -o "$$tmp/idc" >/dev/null 2>&1 || { echo "signal-default-test: FAIL (compile dynamic call)"; ok=0; }; \
 	if [ $$ok -eq 1 ]; then \

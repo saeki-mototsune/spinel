@@ -191,9 +191,11 @@ static int share_target_armed_plan(Compiler *c, const CallPlan *p, int call, int
 int share_target_armed(Compiler *c, int call, int mi) {
   return share_target_armed_plan(c, cplan_user_fresh(c, call), call, mi);
 }
-static int sh_targets_in(ShareFacts *F, Compiler *c, int call, int *out, int cap) {
+/* The methods call enters (cplan_entries) when `entries`, else those whose
+   return is its value (cplan_targets), that the share walk follows. */
+static int sh_targets_in(ShareFacts *F, Compiler *c, int call, int *out, int cap, int entries) {
   (void)F;
-  int n = cplan_targets(c, call, out, cap), m = 0;
+  int n = entries ? cplan_entries(c, call, out, cap) : cplan_targets(c, call, out, cap), m = 0;
   if (n == CPT_UNKNOWN) return -1;
   if (n == 0) return sh_copied_self_targets(c, call, out, cap);
   /* the plan once for the call: cplan_user_fresh answers in a buffer the
@@ -203,7 +205,7 @@ static int sh_targets_in(ShareFacts *F, Compiler *c, int call, int *out, int cap
     if (share_target_reachable(c, call, out[i]) && share_target_armed_plan(c, &p, call, out[i])) out[m++] = out[i];
   return m;
 }
-static int sh_targets(Compiler *c, int call, int *out, int cap) { return sh_targets_in(NULL, c, call, out, cap); }
+static int sh_targets(Compiler *c, int call, int *out, int cap) { return sh_targets_in(NULL, c, call, out, cap, 0); }
 /* A module's method an include copied into its includers runs as those
    copies (is_transplanted_source), where self is an includer, so a
    receiverless call in it reaches what each includer's chain answers to
@@ -782,48 +784,35 @@ static void sh_mb_dyn(ShareFacts *F, Compiler *c, int n, const unsigned char *de
 static void sh_mb_build(ShareFacts *F, Compiler *c) {
   const NodeTable *nt = c->nt;
   const unsigned char *dead = sh_dead_nodes(c);
-  int any_new = 0;
   NT_FOREACH_KIND(nt, NK_CallNode, n) {
     if (dead[n]) continue;
     sh_mb_dyn(F, c, n, dead);
     int blk = nt_ref(nt, n, "block");
     if (blk < 0) continue;
-    int tg[64], ntg = sh_targets(c, n, tg, 64);
-    if (ntg < 0) continue;
+    int tg[64], ntg = sh_targets_in(F, c, n, tg, 64, 1);
+    /* methods the plan cannot list: its block may reach each method of the
+       names the plan bounds them by (cplan_entries_bound_names) */
+    if (ntg < 0) {
+      const char *bn[2];
+      int nb = cplan_entries_bound_names(c, n, bn);
+      for (int j = 0; j < nb; j++)
+        for (int m = an_scopes_named_first(c, bn[j]); m >= 1; m = an_scopes_named_next(c, bn[j], m))
+          if (c->scopes[m].def_node >= 0) sh_mb_block(F, c, n, blk, m);
+      continue;
+    }
     int nbind = 0;
     for (int i = 0; i < ntg; i++) nbind += cplan_target_binds(c, n, tg[i]);
-    if (ntg > 0 && nbind > 0) {
+    if (ntg > 0 && nbind > 0)
       for (int i = 0; i < ntg; i++) sh_mb_block(F, c, n, blk, tg[i]);
-      continue;
-    }
-    const char *name = nt_str(nt, n, "name");
-    if (!name || bop_share_named(BOP_ANY_RECV, name) != BSH_NEW || nt_kind(nt, blk) != NK_BlockNode) continue;
-    int recv = nt_ref(nt, n, "receiver");
-    if (recv < 0) {
-      /* a bare `new` in a class method: every initialize it may run */
-      int own[CPT_MAX], nown = cplan_initializers(c, n, own, CPT_MAX);
-      for (int i = 0; i < nown; i++) sh_mb_add(F, c, blk, own[i]);
-      continue;
-    }
-    int mi = cplan_initialize(c, n);
-    if (mi >= 0) { sh_mb_add(F, c, blk, mi); continue; }
-    TyKind rt = c->ntype[recv];
-    /* a class held in a variable: any initialize */
-    if (rt == TY_CLASS || rt == TY_POLY || rt == TY_UNKNOWN) {
-      for (int m = 0; m < c->nscopes; m++)
-        if (c->scopes[m].def_node >= 0 && c->scopes[m].name && sp_streq(c->scopes[m].name, "initialize") &&
-            !c->scopes[m].is_cmethod)
-          sh_mb_add(F, c, blk, m);
-      any_new = 1;
-    }
   }
-  (void)any_new;
   static const NodeKind sup[] = { NK_SuperNode, NK_ForwardingSuperNode };
   for (int k = 0; k < 2; k++)
     NT_FOREACH_KIND(nt, sup[k], n) {
       if (dead[n]) continue;
       int blk = nt_ref(nt, n, "block");
-      int tg[64], ntg = sh_targets(c, n, tg, 64), cur = sh_method_index(c, n);
+      /* (the methods it enters: a program `new`'s super into the builtin
+         Class#new enters the initialize it runs, which answers no value) */
+      int tg[64], ntg = sh_targets_in(F, c, n, tg, 64, 1), cur = sh_method_index(c, n);
       for (int i = 0; i < ntg; i++) {
         if (sup[k] == NK_ForwardingSuperNode && cur >= 0) {
           F->blk_dyn[tg[i]] |= 3;
@@ -1227,6 +1216,72 @@ static int sh_any_reader(Compiler *c, const char *nm) {
   }
   return anh_has(&names, nm);
 }
+/* The scopes of a name share_name_targets lists, ascending: the methods
+   with a def of the name, less the String reopen's instance methods, which
+   make the answer -1 (*n -1). Built per name once per scope-index epoch
+   (the by-name tables'), scanned while the index is not frozen (#10546). */
+static int *sh_ns_mis, sh_ns_cap, sh_ns_n;
+static char **sh_ns_name; static int *sh_ns_off, *sh_ns_cnt, sh_ns_entries, sh_ns_ecap;
+static int sh_ns_stamp_n = -1, sh_ns_stamp_str = -2; static unsigned sh_ns_stamp_gen;
+static ANameHash sh_ns_names;
+static int sh_name_scopes_scan(Compiler *c, const char *nm, int str_cid, int *mis, int *n) {
+  int k = 0;
+  for (int mi = an_scopes_named_first(c, nm); mi >= 1; mi = an_scopes_named_next(c, nm, mi)) {
+    Scope *m = &c->scopes[mi];
+    if (!m->name || m->def_node < 0 || !sp_streq(m->name, nm)) continue;
+    /* a String reopen's method: its self is the receiver */
+    if (str_cid >= 0 && m->class_id == str_cid && !m->is_cmethod) { *n = -1; return 0; }
+    if (mis) mis[k] = mi;
+    k++;
+  }
+  *n = k;
+  return 1;
+}
+static const int *sh_name_scopes(Compiler *c, const char *nm, int str_cid, int *n) {
+  if (!comp_scope_index_is_frozen() || comp_scope_moving()) {
+    /* (the scan, into a buffer of its own: names can still change) */
+    if (sh_ns_cap < c->nscopes + 1) {
+      sh_ns_cap = c->nscopes + 1;
+      sh_ns_mis = realloc(sh_ns_mis, sizeof(int) * (size_t)sh_ns_cap);
+      if (!sh_ns_mis) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      sh_ns_entries = 0; sh_ns_n = 0; anh_free(&sh_ns_names); memset(&sh_ns_names, 0, sizeof sh_ns_names);
+      sh_ns_stamp_n = -1;
+    }
+    sh_name_scopes_scan(c, nm, str_cid, sh_ns_mis, n);
+    sh_ns_stamp_n = -1;   /* (the buffer is the scan's, not the memo's) */
+    return sh_ns_mis;
+  }
+  if (sh_ns_stamp_n != c->nscopes || sh_ns_stamp_gen != comp_scope_index_gen() || sh_ns_stamp_str != str_cid) {
+    anh_free(&sh_ns_names); memset(&sh_ns_names, 0, sizeof sh_ns_names);
+    sh_ns_entries = 0; sh_ns_n = 0;
+    sh_ns_stamp_n = c->nscopes; sh_ns_stamp_gen = comp_scope_index_gen(); sh_ns_stamp_str = str_cid;
+  }
+  int e = anh_find(&sh_ns_names, nm);
+  if (e < 0) {
+    int cnt = 0;
+    (void)sh_name_scopes_scan(c, nm, str_cid, NULL, &cnt);
+    if (sh_ns_entries == sh_ns_ecap) {
+      sh_ns_ecap = sh_ns_ecap ? sh_ns_ecap * 2 : 64;
+      sh_ns_name = realloc(sh_ns_name, sizeof(char *) * (size_t)sh_ns_ecap);
+      sh_ns_off = realloc(sh_ns_off, sizeof(int) * (size_t)sh_ns_ecap);
+      sh_ns_cnt = realloc(sh_ns_cnt, sizeof(int) * (size_t)sh_ns_ecap);
+      if (!sh_ns_name || !sh_ns_off || !sh_ns_cnt) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    int need = cnt > 0 ? cnt : 0;
+    if (sh_ns_n + need > sh_ns_cap) {
+      while (sh_ns_n + need > sh_ns_cap) sh_ns_cap = sh_ns_cap ? sh_ns_cap * 2 : 1024;
+      sh_ns_mis = realloc(sh_ns_mis, sizeof(int) * (size_t)sh_ns_cap);
+      if (!sh_ns_mis) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    e = sh_ns_entries++;
+    /* (the name is the scope's own, which the index keeps while frozen) */
+    sh_ns_name[e] = (char *)nm; sh_ns_off[e] = sh_ns_n; sh_ns_cnt[e] = cnt;
+    if (cnt > 0) { int c2 = 0; (void)sh_name_scopes_scan(c, nm, str_cid, sh_ns_mis + sh_ns_n, &c2); sh_ns_n += cnt; }
+    anh_add(&sh_ns_names, nm);
+  }
+  *n = sh_ns_cnt[e];
+  return sh_ns_mis + sh_ns_off[e];
+}
 /* See share.h. */
 int share_name_targets(Compiler *c, int call, int *out, int cap) {
   const NodeTable *nt = c->nt;
@@ -1243,17 +1298,20 @@ int share_name_targets(Compiler *c, int call, int *out, int cap) {
   /* an attr_reader of the name answers the String its ivar holds, and is
      no method's scope the walk below sees */
   if (sh_any_reader(c, nm)) return -1;
-  int str_cid = comp_core_class(c, CORE_STRING), k = 0;
-  /* the scopes of the name, in ascending order, through the by-name index */
-  for (int mi = an_scopes_named_first(c, nm); mi >= 1; mi = an_scopes_named_next(c, nm, mi)) {
-    Scope *m = &c->scopes[mi];
-    if (!m->name || m->def_node < 0 || !sp_streq(m->name, nm)) continue;
-    /* a String reopen's method: its self is the receiver */
-    if (str_cid >= 0 && m->class_id == str_cid && !m->is_cmethod) return -1;
-    if (k >= cap) return -1;
-    out[k++] = mi;
-  }
-  return k;
+  int str_cid = comp_core_class(c, CORE_STRING);
+  /* the scopes of the name, in ascending order, through the by-name index:
+     kept per name while the index holds (sh_name_scopes), since the walk
+     ran at every call past the plan's list over every method of its name,
+     and the methods it reads are noted for the inference memo as before */
+  int n = 0;
+  const int *mis = sh_name_scopes(c, nm, str_cid, &n);
+  /* (every scope of the name is one the walk read: the inference memo
+     notes them, as the by-name tables' walk did, only when it is recording) */
+  if (imemo_dep_on)
+    for (int mi = an_scopes_named_first(c, nm); mi >= 1; mi = an_scopes_named_next(c, nm, mi)) ;
+  if (n < 0 || n > cap) return -1;
+  for (int i = 0; i < n; i++) out[i] = mis[i];
+  return n;
 }
 /* A call past the plan's list answers a new String where its builtin arms
    do and every method of its name answers one (ret_fresh), answers nothing
@@ -1497,6 +1555,17 @@ int share_frozen_literal(Compiler *c, int n) {
       (bop_share_named(TY_STRING, nt_str(nt, n, "name")) != BSH_FROZEN && !is_freeze_name(nt_str(nt, n, "name")))) return 0;
   return share_frozen_literal(c, nt_ref(nt, n, "receiver"));
 }
+/* Is node n a frozen literal (share_frozen_literal) that runs nothing
+   besides: each parenthesis on the way holds the literal alone,
+   `("lit")` or `("lit").freeze`, never `(f; "lit")`, whose statements run
+   before the literal answers? */
+int share_frozen_literal_alone(Compiler *c, int n) {
+  const NodeTable *nt = c->nt;
+  n = nt_paren_single(nt, n);
+  if (nt_kind(nt, n) == NK_ParenthesesNode || !share_frozen_literal(c, n)) return 0;
+  /* (a freeze of one is one when its receiver is) */
+  return nt_kind(nt, n) != NK_CallNode || share_frozen_literal_alone(c, nt_ref(nt, n, "receiver"));
+}
 /* Is unary `+` of n a new String: n a builtin String constant
    (share_frozen_string), or what the builtin freeze answers, frozen
    whatever its receiver (`+RUBY_ENGINE.freeze`, `+s.freeze`)? */
@@ -1688,7 +1757,7 @@ static int sh_poly_to_s_self(const Compiler *c, int u) {
       call_plain_argc((Compiler *)c, u) != 0 || nt_ref(nt, u, "block") >= 0)
     return 0;
   int recv = nt_ref(nt, u, "receiver");
-  int sci = comp_class_index((Compiler *)c, "String");
+  int sci = comp_core_class(c, CORE_STRING);
   if (recv < 0 || repr_of(c, recv).kind != RK_BOXED ||
       (sci >= 0 && comp_method_in_chain((Compiler *)c, sci, "to_s", NULL) >= 0))
     return 0;

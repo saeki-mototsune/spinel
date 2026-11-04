@@ -147,6 +147,9 @@ int ver_entries_demand(Compiler *c);
    renders the class by the builtin's own table, not by a class method the
    program defines: that method is the one the entry has not reached */
 int cplan_pinned_builtin(const Compiler *c, int id);
+/* Is call id an entry's arm (or else arm) call, pinned to the method it
+   runs or to the builtin (ver_entry_targets lists the methods)? */
+int cplan_pinned(const Compiler *c, int id);
 /* the methods entry scope e's arms call, its else arm's last: at most
    VER_MAX_ARMS + 1; an open history's else arm, which calls none, as its
    last version (the method a Method object of it captured before) */
@@ -160,11 +163,12 @@ void cplan_check_missing(Compiler *c, int id, int mi, int ci, const char *name, 
    lasts until the next call. */
 const CallPlan *cplan_user_fresh(Compiler *c, int id);
 const CallPlan *cplan_const_user(Compiler *c, int id, int recv, int fresh);
-/* A constant receiver's builtin new reaches this initialize, or -1. */
-int cplan_initialize(Compiler *c, int id);
-int cplan_initializers(Compiler *c, int id, int *out, int cap);
-/* Every user method the call node id may reach, into out (at most cap):
-   its plan's method and, for a switch, each member. Answered from the types
+/* The user methods whose return is call node id's value, into out (at
+   most cap): its plan's method and, for a switch, each member. A reader of
+   what the call answers asks this; a reader of what the call enters (the
+   methods its arguments and block reach) asks cplan_entries, which differ
+   for a builtin `new`: it enters initialize but answers the object it
+   builds, which no method returns (0 here). Answered from the types
    as they stand, never kept past cplan_targets_drop.
      n >= 0      the methods, 0 for none (a builtin, a CP_REFUSE plan, a
                  node that is no call): follow nothing
@@ -178,7 +182,14 @@ int cplan_initializers(Compiler *c, int id, int *out, int cap);
    receiver and add members, and nothing here promises a set only grows. */
 enum { CPT_UNKNOWN = -1, CPT_MAX = 64 };
 int cplan_targets(Compiler *c, int id, int *out, int cap);
-/* cplan_targets, for a reader that wants the code the call's emission
+/* The version of cls's `name` the implied call node id makes on operand op
+   (a row of tools/implied_calls.yml: a multiple assignment's to_ary of its
+   value) runs, where the load record proves the one; -1 otherwise */
+int cplan_implied_version(Compiler *c, int id, const char *name, int op, int cls);
+/* The classes whose to_ary that call reaches on a boxed operand, where
+   the record proves it: into out[0..cap), the count */
+int cplan_boxed_to_ary_classes(Compiler *c, int id, int op, int *out, int cap);
+/* cplan_entries, for a reader that wants the code the call's emission
    names (reachability): the same answer, but for a call on a boxed receiver
    the methods of the arms its dispatch has, which the receiver's class
    facts bound, not every class's method of the name; and for a send on one,
@@ -191,6 +202,30 @@ int cplan_emitted_targets(Compiler *c, int id, int *out, int cap);
    builtin's. CPT_WHY_NONE where it lists the members. */
 enum { CPT_WHY_NONE = 0, CPT_WHY_CAP, CPT_WHY_RECV_UNTYPED };
 int cplan_targets_unknown_why(Compiler *c, int id, int cap);
+/* The user methods call node id enters, into out (at most cap): the
+   methods its arguments bind to and its block is handed to, which a call
+   graph, a parameter's or a block's facts follow. For a builtin `new`
+   (no program `new` answers it), the initialize methods it runs: the class
+   it builds and, for a `new` on the class its method runs for, each
+   subclass's; none for a builtin class; CPT_UNKNOWN for a receiver the
+   plan cannot name a class of, which may run any initialize of the
+   program. So for a super, bare or not, in a program `new` that reaches
+   the builtin Class#new: the initialize methods of the method's class and
+   its subclasses, CPT_UNKNOWN for a module's `new`. For any other call,
+   its cplan_targets. Same answers as cplan_targets otherwise (n >= 0,
+   CPT_UNKNOWN). Never what the call answers: that is cplan_targets'. */
+int cplan_entries(Compiler *c, int id, int *out, int cap);
+/* Where cplan_entries cannot list them (CPT_UNKNOWN), the names whose
+   program methods hold every method call node id may enter, into names (at
+   most 2), and how many: the call's own name (a super's, its method's),
+   and for a `new` initialize too (cplan_name_bound_names). A superset, for a reader that must see every body the
+   call may run (a call graph, the blocks or arguments a method may be
+   handed); a reader that needs the exact set takes CPT_UNKNOWN as it is. */
+int cplan_entries_bound_names(Compiler *c, int id, const char *names[2]);
+/* The same bound for a call of method name `name` that no node shows (a
+   Method or an UnboundMethod of it, a send): name, and initialize for
+   `new`. */
+int cplan_name_bound_names(const char *name, const char *names[2]);
 void cplan_targets_drop(void);
 /* Counts the drops (and a new compiler's first ask): an answer held at one
    count is the answer while it stands. */
@@ -352,6 +387,7 @@ typedef enum {
   /* its `default:` arm (emit_poly_defaults_n): the generic one and what it
      answers first, or a name's own */
   PB_ND_GENERIC, PB_ND_REPLACE, PB_ND_ROUND, PB_ND_NUM, PB_ND_STR_INDEX, PB_ND_FIND_INDEX,
+  PB_ND_UPTO,
   PB_ND_FIRSTN, PB_ND_KEYS, PB_ND_MERGE, PB_ND_AREF2, PB_ND_AREF,
   /* the statement-level block dispatch's builtin default
      (emit_poly_recv_block_dispatch): map!/collect! over a builtin array */
@@ -497,11 +533,26 @@ const PolyPlan *cplan_poly_cmeth(Compiler *c, int id);
 PolyPlan *cplan_poly_cls_values(Compiler *c, int id);
 int cplan_visibility_class(Compiler *c, int id, int ci);
 int cplan_has_method_missing(Compiler *c, int id, int ci, int cmethod);
+int cplan_super_needs_method_missing(Compiler *c, int id);
 int cplan_cmethod_visible(Compiler *c, int id, int ci, const char *name);
 TyKind cplan_poly_arg_storage(Compiler *c, int id);
 /* The re-entry of a call on an object whose static class cannot answer the
    name while one of its subclasses can (#4023). Computed afresh. */
 const PolyPlan *cplan_poly_sub(Compiler *c, int id);
+/* How a receiverless call id in a builtin class's reopening hands its
+   block to mi, the reopening's own method it reaches (emit_reopen_own_call):
+   ROB_NONE, it has none; ROB_PASS, as mi's `&blk` argument, as the
+   explicit-receiver reopen call passes it; ROB_DROP, unused by mi, which
+   takes none (a literal block, a forwarded local); ROB_DECLINE, not by that
+   call: a yielding mi is reached through its proc form, and a forwarded
+   expression is evaluated by the general call. */
+enum { ROB_NONE, ROB_PASS, ROB_DROP, ROB_DECLINE };
+int cplan_reopen_own_block(Compiler *c, int id, int mi);
+/* Does the enumerable driver (sp_poly_enum_proc), handed a callable call
+   id forwards on a boxed receiver, answer the call: is no object of a class
+   of the program with an `each` of its own among the values the receiver
+   may hold, and is the callable never nil (an_fwd_block_may_be_nil)? */
+int cplan_driver_walks_recv(Compiler *c, int id);
 /* The re-entry of a call on a poly receiver as an Array call (#2935).
    Computed afresh. */
 const PolyPlan *cplan_poly_redispatch(Compiler *c, int id);
@@ -627,6 +678,29 @@ int cplan_self_builtin(Compiler *c, int id);
    (elab_blocks_run_now: a builtin iterator on a literal); 0 too for a class
    whose chain the record does not know. */
 int cplan_cmethod_later(Compiler *c, int id, int cls, const char *name);
+/* What call id of class method `name` on program class ci runs where ci
+   has a `class << self` accessor of the name: CP_SG_NONE where it has none
+   (the call is an ordinary class method's); CP_SG_SLOT, the slot, named
+   into slot (the writer's base, the reader's name past an alias), where
+   the call binds to no method or to the accessor's own version (one a
+   later def replaces, Scope.attr_version) or where the record tells no
+   version; CP_SG_METHOD where it binds to that def or to the entry that
+   chooses between them at run time, which the call's emitter calls (an
+   accessor no def follows has no method: its calls take the slot). */
+enum { CP_SG_NONE, CP_SG_SLOT, CP_SG_METHOD, CP_SG_UNTOLD };
+int cplan_sg_accessor(Compiler *c, int id, int ci, const char *name, char *slot, size_t cap);
+/* For call node id of `name` on class ci, where a later def replaces ci's
+   class-side accessor of the name (elab_attr_replaced): CP_SG_SLOT where
+   the call binds to the accessor's own version, CP_SG_METHOD where it binds
+   to the def or the entry between them, CP_SG_UNTOLD where the record tells
+   no version (each emitter then keeps its answer without versions).
+   CP_SG_NONE where no def replaces the accessor. */
+int cplan_sg_version(Compiler *c, int id, int ci, const char *name);
+/* Does call node id, written with `name` (not a send or a capture of it),
+   run no method on class ci: the plan's answer for it is the class's
+   accessor slot (cplan_sg_accessor). The reach pass then reaches no scope
+   from it, though the version it binds to is the accessor's own. */
+int cplan_sg_slot_call(Compiler *c, int id, int ci, const char *name);
 /* How a NameError or NoMethodError of call id names self, into buf:
    "class U" or "module M" in a class or module body and "main" at the top
    level (the record's self where the call runs, elab_self_at), else "an

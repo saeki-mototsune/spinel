@@ -97,6 +97,7 @@ int basicobject_own_method(const char *n);
 void emit_poly_cmp_ordered(Compiler *c, const char *fn, int recv, int arg, Buf *b);
 void emit_handle_inspect(Compiler *c, int recv, TyKind rt, Buf *b);
 int bigint_cmp_operand_ok(TyKind t);
+int emit_bigint_cmp_inexact(Compiler *c, int recv, int arg, const char *op, Buf *b);
 Buf emit_cmp_self(Compiler *c, int recv, TyKind rt);
 int emit_float_bigint_cmp(Compiler *c, int recv, int arg, const char *op, Buf *b);
 void emit_int_flt_rel(Buf *b, const char *iv, const char *fv, int int_left, const char *op);
@@ -139,7 +140,7 @@ int root_reopen_defines_own(Compiler *c, int k, const char *qm);   /* a root reo
 int root_reopen_method_vis(Compiler *c, int cid, const char *qm);   /* an Object, Kernel or BasicObject reopening's method qm: its visibility, or -1 */
 int private_answer_overridden(Compiler *c, const char *qm, TyKind rt);
 int refl_md_dynamic_used(Compiler *c);
-void emit_method_parameters_pushes(Compiler *c, int pn4, int tr4, Buf *b);
+void emit_scope_parameters_pushes(Compiler *c, int mi, int tr4, Buf *b);
 int refl_im_params_used(Compiler *c);
 int emit_refl_im_params_call(Compiler *c, int id, Buf *b);
 void emit_refl_im_params(Compiler *c, Buf *b);

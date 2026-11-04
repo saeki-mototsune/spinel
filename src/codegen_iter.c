@@ -5,6 +5,7 @@
 #include "share.h"
 #include "repr.h"
 #include "call_plan.h"
+#include "implied_calls.h"
 #include "value_pos.h"
 #include <errno.h>
 
@@ -2916,6 +2917,10 @@ void emit_block_binds(Compiler *c, int blk, const int *yargs, int yc,
       emit_indent(g_pre, g_indent);
       buf_printf(g_pre, "sp_RbVal _t%d = %s; SP_GC_ROOT_RBVAL(_t%d);\n",
                  poly_splat_tmp, pb2.p ? pb2.p : "sp_box_nil()", poly_splat_tmp);
+      /* a lone value, not a `*x` (to_a's), converts as the parameters'
+         implied to_ary of it (its row) */
+      if (inner == yargs[0])
+        poly_splat_tmp = emit_boxed_to_ary(c, nt_ref(nt, blk, "parameters"), NTI_YIELDED, poly_splat_tmp, g_pre, g_indent);
       emit_indent(g_pre, g_indent);
       buf_printf(g_pre, "int _fs%d = (_t%d.tag == SP_TAG_OBJ && sp_poly_is_array_kind(_t%d.cls_id));\n",
                  poly_splat_tmp, poly_splat_tmp, poly_splat_tmp);
@@ -3663,7 +3668,7 @@ void emit_block_invoke(Compiler *c, int args_node, Buf *b, int indent, int as_ex
       Buf *svp3 = g_pre; int svi3 = g_indent; g_pre = b; g_indent = 0;
       if (want_ty == TY_POLY) {
         buf_puts(&tb, "((void)(");
-        emit_expr(c, bd3[bn3 - 1], &tb);
+        emit_expr_for_effect(c, bd3[bn3 - 1], &tb);
         buf_puts(&tb, "), sp_box_nil())");
       }
       else emit_unresolved_coerced(c, bd3[bn3 - 1], want_ty, &tb);
@@ -5763,8 +5768,11 @@ static void emit_zip_block_param(Compiler *c, TyKind slot, TyKind src_ty,
 static void emit_poly_auto_splat(Compiler *c, int block, int telem, Buf *b, int indent) {
   Scope *bs = comp_scope_of(c, block);
   int npp = 0; while (block_param_name(c, block, npp)) npp++;
+  /* (the parameters' implied to_ary of the value: its row); an Array of
+     any kind splats, as sp_poly_ary_operand answers it */
+  telem = emit_boxed_to_ary(c, nt_ref(c->nt, block, "parameters"), NTI_YIELDED, telem, b, indent + 1);
   emit_indent(b, indent + 1);
-  buf_printf(b, "if (_t%d.tag == SP_TAG_OBJ && SP_IS_BUILTIN_ARRAY(_t%d.cls_id)) {\n", telem, telem);
+  buf_printf(b, "if (_t%d.tag == SP_TAG_OBJ && sp_poly_is_array_kind(_t%d.cls_id)) {\n", telem, telem);
   for (int pj = 0; pj < npp; pj++) {
     const char *pnj = block_param_name(c, block, pj);
     if (!pnj) break;
@@ -7882,6 +7890,19 @@ static int step_bind_recv(Compiler *c, int id, int recv, const char *cty, void (
   return t;
 }
 
+/* Does iteration call `id` hand a callable it forwards (`xs.sum(&h)`) to
+   the enumerable driver, its receiver known only at run time? The driver's
+   answer is the call's, and the statement form below drops it: at a
+   method's tail the value form carries it (emit_stmt_tail_inner). */
+int iter_fwd_proc_to_driver(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  int rfb = resolve_forwarded_block(c, nt_ref(nt, id, "block"));
+  const char *nm = nt_str(nt, id, "name");
+  int recv = nt_ref(nt, id, "receiver");
+  return rfb >= 0 && nt_kind(nt, rfb) == NK_BlockArgumentNode && nm && poly_enum_op_for(nm) &&
+         recv >= 0 && repr_of(c, recv).kind == RK_BOXED;
+}
+
 static int emit_iteration_stmt_body(Compiler *c, int id, Buf *b, int indent) {
   const NodeTable *nt = c->nt;
   int block = nt_ref(nt, id, "block");
@@ -8041,7 +8062,7 @@ static int emit_iteration_stmt_body(Compiler *c, int id, Buf *b, int indent) {
       const char *inm = nt_str(nt, id, "name");
       int irecv = nt_ref(nt, id, "receiver");
       const char *pen = inm ? poly_enum_op_for(inm) : NULL;
-      if (rfb >= 0 && pen && irecv >= 0 && repr_of(c, irecv).kind == RK_BOXED) {
+      if (iter_fwd_proc_to_driver(c, id)) {
         Buf pb0; memset(&pb0, 0, sizeof pb0);
         if (!emit_forwarded_proc_arg(c, rfb, &pb0)) { free(pb0.p); return 0; }
         int tp0 = ++g_tmp;

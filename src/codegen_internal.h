@@ -164,6 +164,7 @@ int civ_class_of(Compiler *c, int node, Scope *s);
 void emit_civ_slot_decl(Compiler *c, int cid, const char *nm, const char *ctype, TyKind t,
                         const char *init, Buf *b);
 int ie_class_of(Compiler *c, int node);
+int ie_own_class_of(Compiler *c, int node);
 /* The shared-mutable shim (codegen_stmt.c) re-runs a value-semantics mutator
    arm against a plain shadow copy, then swaps the handle's bytes for it. A
    LOCAL receiver is redirected into the shadow by the rename table; an ivar
@@ -635,6 +636,8 @@ int builtin_arity_violation(Compiler *c, int id);
 int builtin_object_method_known(const char *m);
 int name_is_enumerable_module_method(const char *m);
 int class_object_answers_builtin(const char *qm, int is_module);
+int emit_poly_object_methods_reflection(Compiler *c, int id, const char *name, int recv, int argc,
+                                        const int *argv, Buf *b);
 int emit_object_methods_reflection(Compiler *c, int recv, int cid, const char *name, int all,
                                    int arg, Buf *b);
 int scope_reads_callee(Compiler *c, int si);
@@ -1206,6 +1209,10 @@ const char *rename_local(const char *nm);
 
 
 void emit_expr(Compiler *c, int id, Buf *b);
+void emit_expr_for_effect(Compiler *c, int node, Buf *b);
+int effect_view_open(Compiler *c, int node);
+void emit_expr_as_value_of(Compiler *c, int node, int owner, Buf *b);
+void effect_view_close(Compiler *c, int v);
 /* Does a read of constant (path) node id raise NameError, the constant
    being defined nowhere the program or the runtime can see? A rescue
    operand is read so when an exception reaches its clause. */
@@ -2071,6 +2078,7 @@ int block_tail_is_unresolved(Compiler *c, int node);
 int emit_iter_value_expr(Compiler *c, int id, Buf *b);
 void set_enum_walk_result(int tmp);
 int iter_value_answers_recv(Compiler *c, int id);
+int iter_fwd_proc_to_driver(Compiler *c, int id);
 int sn_guard_pending(Compiler *c, int id);
 int emit_takewhile_with_index(Compiler *c, int id, Buf *b);
 int emit_transform_hash_expr(Compiler *c, int id, Buf *b);
@@ -2160,6 +2168,7 @@ int default_refs_earlier_param(Compiler *c, Scope *m);
 int opt_before_required(Compiler *c, Scope *m);
 int arg_layout_param_node(Compiler *c, Scope *m, int call, int i, int *spread);
 void emit_pd_param_bind(Compiler *c, Scope *m, int i, int uid, const char *val, char *name, size_t cap);
+void emit_pd_cell_copyback(Compiler *c, Scope *m, int uid, char names[][64]);
 /* `(sp_Parent *)` when an object value flows into an ancestor-typed slot; the
    layouts match by construction, but C needs the cast spelled (#3418). */
 void emit_obj_upcast_prefix(Compiler *c, TyKind slot, TyKind val, Buf *b);
@@ -2396,6 +2405,7 @@ const char *arysub_array_ctype(Compiler *c, int cid);   /* codegen.c: an Array s
 void emit_arysub_alloc(Compiler *c, ClassInfo *ci, Buf *b);
 void arysub_box_id(Compiler *c, TyKind t, Buf *b);   /* the cls_id an object's box carries */
 int program_has_arysub(Compiler *c);
+int program_has_timesub(Compiler *c);   /* codegen.c: some class is a Time subclass (sp_timesub_copy) */
 int program_has_strsub(Compiler *c);   /* a class of the program that subclasses String */
 void emit_obj_switch_key(Compiler *c, int tv, Buf *b);   /* codegen.c: a class switch's key, Array subclasses included */
 void emit_poly_recv_deref(Compiler *c, int recv, const char *name, Buf *b);   /* codegen.c: a dispatch receiver read as its String value, a String subclass with its own method kept */
@@ -2586,7 +2596,7 @@ void view_unbind(int n);
    restored by view_pop (or view_unwind on a refusal) like a type view. */
 int view_const_read_done(Compiler *c, int id);
 int view_push_const_read(Compiler *c, int id);
-enum { VR_STRBUF_BOX, VR_HANDLE_DEMAND, VR_POLY_LIFT, VR_NILNARROW, VR_NIL_TESTED, VR_HEAD_HELD };
+enum { VR_STRBUF_BOX, VR_HANDLE_DEMAND, VR_POLY_LIFT, VR_NILNARROW, VR_NIL_TESTED, VR_HEAD_HELD, VR_DISCARDED };
 int view_push_repr(Compiler *c, int id, int flag, int v);
 /* A splice's alias of a caller's variable that the call's block assigns
    (argument node arg, splice tag, parameter name), and a fence for a C
@@ -2837,6 +2847,7 @@ int frange_index_view(Compiler *c, int id);
 int splice_to_ary_mi(Compiler *c, TyKind rhs_ty);
 TyKind emit_splice_to_ary_src(Compiler *c, int id, int rhs_node, TyKind rhs_ty, int mi, int ta, Buf *b, Buf *out);
 void emit_to_ary_dispatch(Compiler *c, int id, int cid, const char *selfptr, Buf *out);
+int emit_boxed_to_ary(Compiler *c, int id, int op, int src, Buf *b, int indent);
 void emit_index_op_write(Compiler *c, int id, Buf *b, int indent);
 void emit_index_and_or_write(Compiler *c, int id, Buf *b, int indent, int is_or);
 int scope_has_return(Compiler *c, int scope_idx);
@@ -3009,6 +3020,7 @@ void emit_sock_family_arg(Compiler *c, int arg, int is_family, Buf *b);
 int emit_unresolved_coerced(Compiler *c, int node, TyKind target, Buf *b);
 int emit_unresolved_coerced_text(Compiler *c, int node, TyKind target, const char *txt, Buf *b);
 int call_answers_no_value(Compiler *c, int node);
+void emit_reading_no_value(Compiler *c, int id, void (*emit)(Compiler *, int, Buf *), Buf *b);
 void emit_int_divisor(Compiler *c, int node, Buf *b);
 void emit_float_expr(Compiler *c, int node, Buf *b);
 void emit_float_coerce_expr(Compiler *c, int node, Buf *b);
@@ -3076,7 +3088,7 @@ const char *exc_builtin_parent(Compiler *c, int ci);
 void emit_class_struct(Compiler *c, ClassInfo *ci, Buf *b);
 int class_needs_scan(ClassInfo *ci);
 void emit_class_scan(Compiler *c, ClassInfo *ci, Buf *b);
-int comp_class_is_module(Compiler *c, ClassInfo *ci);
+int comp_class_is_module(Compiler *c, const ClassInfo *ci);
 int hv_value_class(Compiler *c, int recv);   /* analyze_infer.c (#4846) */
 void emit_class_new(Compiler *c, ClassInfo *ci, Buf *b);
 int emit_super_inline(Compiler *c, int id, Buf *b, int indent, int as_expr);

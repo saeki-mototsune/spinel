@@ -22,6 +22,8 @@
 #define sp_sym_intern_n sp_poly_cold_sym_intern_n
 #include "spinel_rt.h"
 
+sp_int sp_poly_arg_int(sp_RbVal v) { return sp_poly_arg_int_chk(v); }
+
 #ifdef SP_CEXT
 sp_RbVal sp_cext_object_class(sp_RbVal object) {
   return sp_box_class(sp_poly_class_val(object));
@@ -229,6 +231,17 @@ const char *(*sp_class_name_fn)(sp_Class);
 const char *(*sp_class_display_fn)(sp_Class);
 const char *(*sp_class_user_to_s_fn)(sp_Class);
 const char *(*sp_class_user_inspect_fn)(sp_Class);
+/* A boxed Time's to_s (inspect 0) or inspect (1): a Time subclass
+   instance's goes through its class's own dispatcher, which runs an
+   override of the class's and falls back to Time's. */
+static const char *sp_poly_time_display(sp_RbVal v, int inspect) {
+  int k = sp_bsub_cls_fn ? sp_bsub_cls_fn(v) : -1;
+  if (k >= 0) {
+    if (inspect && sp_obj_inspect_fn) return sp_obj_inspect_fn(k, v.v.p);
+    if (!inspect && sp_obj_to_s_fn) return sp_obj_to_s_fn(k, v.v.p);
+  }
+  return inspect ? sp_Time_inspect((sp_Time *)v.v.p) : sp_Time_to_s((sp_Time *)v.v.p);
+}
 /* the hooks the generated unit installs for this unit (SP_INSTALL_HOOK) */
 sp_user_binop_fn sp_user_binop_hook_lib;
 sp_user_aset_fn sp_user_aset_hook_lib;
@@ -322,7 +335,9 @@ void sp_poly_puts(sp_RbVal v)
         case SP_BUILTIN_RANGE: puts(sp_range_str(*(sp_Range *)v.v.p)); break;
         case SP_BUILTIN_FLOAT_RANGE: puts(sp_frange_inspect(*(sp_FloatRange *)v.v.p)); break;
         case SP_BUILTIN_STR_RANGE: puts(sp_srange_to_s(SP_SRANGE_OF(v.v.p))); break;
-        case SP_BUILTIN_TIME: puts(sp_Time_to_s((sp_Time *)v.v.p)); break;
+        /* a Time subclass instance, boxed as its Time, shows through its
+           class's to_s (an override of its own included) */
+        case SP_BUILTIN_TIME: sp_puts_str_line(sp_poly_time_display(v, 0)); break;
         case SP_BUILTIN_STRBUF: sp_puts_str_line(sp_String_cstr((sp_String *)v.v.p)); break;
         case SP_BUILTIN_COMPLEX: puts(sp_complex_to_s(*(sp_Complex *)v.v.p)); break;
         case SP_BUILTIN_RATIONAL: puts(sp_rational_to_s(*(sp_Rational *)v.v.p)); break;
@@ -381,7 +396,7 @@ const char *sp_poly_to_s(sp_RbVal v)
         case SP_BUILTIN_RANGE: return sp_range_str(*(sp_Range *)v.v.p);
         case SP_BUILTIN_FLOAT_RANGE: return sp_frange_inspect(*(sp_FloatRange *)v.v.p);
         case SP_BUILTIN_STR_RANGE: return sp_srange_to_s(SP_SRANGE_OF(v.v.p));
-        case SP_BUILTIN_TIME: return sp_Time_to_s((sp_Time *)v.v.p);
+        case SP_BUILTIN_TIME: return sp_poly_time_display(v, 0);
         case SP_BUILTIN_STRBUF: return sp_String_cstr((sp_String *)v.v.p);   /* live buffer (#3227) */
         case SP_BUILTIN_METHOD: return sp_method_desc_cstr((sp_BoundMethod *)v.v.p);
         /* Proc#to_s is its inspect; a boxed one (an element of a mixed Array)
@@ -671,7 +686,7 @@ const char *sp_poly_inspect(sp_RbVal v)
         case SP_BUILTIN_RANGE:     return sp_Range_inspect((sp_Range *)v.v.p);
         case SP_BUILTIN_FLOAT_RANGE: return sp_frange_inspect(*(sp_FloatRange *)v.v.p);
         case SP_BUILTIN_STR_RANGE: return sp_srange_inspect(SP_SRANGE_OF(v.v.p));
-        case SP_BUILTIN_TIME:      return sp_Time_inspect((sp_Time *)v.v.p);
+        case SP_BUILTIN_TIME:      return sp_poly_time_display(v, 1);
       case SP_BUILTIN_STRBUF: return sp_str_inspect(sp_String_cstr((sp_String *)v.v.p));   /* (#3227) */
       case SP_BUILTIN_METHOD: return sp_method_desc_cstr((sp_BoundMethod *)v.v.p);
       case SP_BUILTIN_PROC: return sp_proc_inspect((sp_Proc *)v.v.p);
@@ -1875,4 +1890,21 @@ sp_RbVal sp_process_redirect_value(sp_RbVal opts, int slot, sp_bool *found, int 
     }
   }
   return sp_box_nil();
+}
+
+/* What a user #to_int answered, reached through the generated bridge
+   (sp_obj_to_int_sw) when its answer is not statically an Integer. CRuby's
+   rb_to_int takes an Integer -- a Bignum one then does not fit the slot --
+   and names anything else: "can't convert B to Integer (B#to_int gives
+   String)", nil included. cls_id is the receiver's, as CRuby names its class. */
+sp_int sp_obj_to_int_answer(int cls_id, sp_RbVal r) {
+  if (r.tag == SP_TAG_INT) return r.v.i;
+  if (r.tag == SP_TAG_BIGINT && r.v.p) {
+    if (sp_bigint_fits_int((sp_Bigint *)r.v.p)) return (sp_int)sp_bigint_to_int((sp_Bigint *)r.v.p);
+    sp_raise_cls("RangeError", "bignum too big to convert into 'long'");
+  }
+  const char *n = sp_obj_cls_name_fn ? sp_obj_cls_name_fn(cls_id) : "Object";
+  sp_raise_cls("TypeError", sp_sprintf("can't convert %s to Integer (%s#to_int gives %s)",
+                                       n, n, sp_poly_class_name(r)));
+  return 0;
 }

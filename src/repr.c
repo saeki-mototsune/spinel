@@ -1020,7 +1020,7 @@ int repr_boxed_to_s_operand(Compiler *c, int v) {
 static int scope_self_is_string(const Compiler *c, int scope) {
   if (scope < 0) return 0;
   const Scope *s = &c->scopes[scope];
-  return !s->is_cmethod && s->class_id >= 0 && s->class_id == comp_class_index((Compiler *)c, "String");
+  return !s->is_cmethod && s->class_id >= 0 && s->class_id == comp_core_class(c, CORE_STRING);
 }
 
 int repr_self_handle(const Compiler *c, int scope) {
@@ -1289,6 +1289,7 @@ Repr repr_of(const Compiler *c, int node) {
   r.nil_tested = c->nil_tested ? c->nil_tested[node] != 0 : 0;
   r.nil_cold = c->nil_tested ? c->nil_tested[node] == 2 : 0;
   r.head_held = c->head_held ? c->head_held[node] != 0 : 0;
+  r.discarded = c->value_discarded ? c->value_discarded[node] != 0 : 0;
   /* a node is boxed as the type it is stored as; a nil-guard narrowing is
      read where the value is used, not where it is boxed */
   TyKind kt = r.as_ty;

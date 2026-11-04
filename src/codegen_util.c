@@ -3502,7 +3502,7 @@ int emit_empty_container_for_slot(Compiler *c, int v, TyKind slot, Buf *b) {
       buf_puts(b, "(");
       for (int i = 0; i < en; i++) {
         int ev = nt_kind(nt, el[i]) == NK_AssocNode ? nt_ref(nt, el[i], "value") : el[i];
-        buf_puts(b, "(void)("); emit_expr(c, ev, b); buf_puts(b, "), ");
+        buf_puts(b, "(void)("); emit_expr_for_effect(c, ev, b); buf_puts(b, "), ");
       }
       buf_printf(b, "sp_%sHash_new())", hcn);
       return 1;
@@ -5071,7 +5071,7 @@ void emit_expr_slot(Compiler *c, int node, TyKind slot, Buf *b) {
     if (nt_kind(c->nt, node) == NK_NilNode) { buf_puts(b, sent); return; }
     TyKind vt = repr_of(c, node).as_ty;
     if (vt == TY_NIL || vt == TY_VOID) {
-      buf_puts(b, "({ (void)("); emit_expr(c, node, b); buf_printf(b, "); %s; })", sent);
+      buf_puts(b, "({ (void)("); emit_expr_for_effect(c, node, b); buf_printf(b, "); %s; })", sent);
       return;
     }
   }
@@ -6450,7 +6450,7 @@ int emit_catch_tag(Compiler *c, int id, Buf *b) {
   /* nil, true and false are single objects in CRuby, so they match by
      identity: each is the address of its own marker. */
   if (t == TY_NIL) {
-    buf_puts(b, "((void)("); emit_expr(c, id, b); buf_puts(b, "), (const char *)&sp_catch_nil_tag)");
+    buf_puts(b, "((void)("); emit_expr_for_effect(c, id, b); buf_puts(b, "), (const char *)&sp_catch_nil_tag)");
     return 1;
   }
   if (t == TY_BOOL) {
@@ -6504,7 +6504,7 @@ int hash_okey_miss(Compiler *c, int key, TyKind kt) {
 }
 /* that key: evaluated for its effects, then the nil no entry matches */
 void emit_hash_okey(Compiler *c, int key, Buf *b) {
-  buf_puts(b, "({ (void)("); emit_expr(c, key, b); buf_puts(b, "); sp_oint_nil(); })");
+  buf_puts(b, "({ (void)("); emit_expr_for_effect(c, key, b); buf_puts(b, "); sp_oint_nil(); })");
 }
 
 /* ... and a key that may not be an Integer at run time -- a boxed one, or
@@ -6615,7 +6615,7 @@ static void emit_hash_key_value(Compiler *c, int key, TyKind kt, Buf *b) {
     }
     /* evaluate the key for its effects, then answer the value no key equals */
     buf_puts(b, "({ (void)(");
-    emit_expr(c, key, b);
+    emit_expr_for_effect(c, key, b);
     if (kt == TY_STRING)      buf_puts(b, "); (const char *)0; })");
     else                      buf_puts(b, "); (sp_sym)-1; })");
     return;
@@ -7278,7 +7278,7 @@ static void shadow_tab_build(Compiler *c, int raw) {
   if (!g_shadow_tab || !tab) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   for (int k = n - 1; k >= 0; k--) {
     Scope *sc = &c->scopes[k];
-    if (!sc->name || sc->entry == ENTRY_DISPATCH) continue;   /* a hidden entry shadows no method; the public guard does */
+    if (!sc->name || scope_by_name_hidden(sc)) continue;   /* a hidden entry shadows no method; the public guard does */
     /* by the scope's own class, whatever an instance_exec block has moved
        (comp_scope_own_class): the move defines nothing in the class it
        moves to, and the table then reads the same whenever it is built */
@@ -7312,7 +7312,7 @@ static int shadow_tab_extend(Compiler *c) {
   int n = c->nscopes;
   if (g_shadow_n < 0 || g_shadow_n > n) return 0;
   for (int k = g_shadow_n; k < n; k++)
-    if (c->scopes[k].name && c->scopes[k].entry != ENTRY_DISPATCH) return 0;
+    if (c->scopes[k].name && !scope_by_name_hidden(&c->scopes[k])) return 0;
   unsigned char *t = realloc(g_shadow_tab, (size_t)(n > 0 ? n : 1));
   if (!t) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   memset(t + g_shadow_n, 0, (size_t)(n - g_shadow_n));
@@ -7358,7 +7358,7 @@ static int scope_is_shadowed_scan(Compiler *c, int s) {
   for (int k = s + 1; k < c->nscopes; k++) {
     Scope *o = &c->scopes[k];
     if (o->class_id == sc->class_id && o->is_cmethod == sc->is_cmethod &&
-        o->name && o->entry != ENTRY_DISPATCH && sp_streq(o->name, sc->name)) return 1;
+        o->name && !scope_by_name_hidden(o) && sp_streq(o->name, sc->name)) return 1;
   }
   return 0;
 }
@@ -7760,7 +7760,7 @@ void emit_frozen_obj_guard(Compiler *c, int cid, const char *selfexpr, Buf *b) {
   /* an Array subclass instance is frozen as its Array is (#7449); a Hash
      subclass instance, as its Hash is, by the header bit, and a String
      subclass instance as its String handle is, by the same bit */
-  if (c->classes[cid].ary_root > 0 && !c->classes[cid].ary_hash && !c->classes[cid].ary_str) buf_printf(b, "if ((%s)->ary.frozen) ", selfexpr);
+  if (c->classes[cid].ary_root > 0 && !c->classes[cid].ary_hash && !c->classes[cid].ary_str && !c->classes[cid].ary_time) buf_printf(b, "if ((%s)->ary.frozen) ", selfexpr);
   else buf_printf(b, "if (sp_gc_is_frozen((void *)%s)) ", selfexpr);
   buf_printf(b,
       "sp_raise_frozen_obj(sp_box_obj((void *)%s, %d), (&(\"\\xff\" \"can't modify frozen %s\")[1])); ",
@@ -8405,17 +8405,22 @@ static const NilByteMap *class_nilbyte_map(Compiler *c, int cid) {
   int root = class_root(c, cid);
   NilByteMap *m = &memo[root];
   if (m->count >= 0) return m;
+  /* the family's own classes, in class order (class_family), not every
+     class once per family (#10546) */
+  int nmem = 0;
+  const int *mem = class_family(c, root, &nmem);
   int maxn = 0;
-  for (int k = 0; k < c->nclasses; k++)
-    if (class_root(c, k) == root && c->classes[k].nivars > maxn) maxn = c->classes[k].nivars;
+  for (int j = 0; j < nmem; j++)
+    if (c->classes[mem[j]].nivars > maxn) maxn = c->classes[mem[j]].nivars;
   m->n = maxn;
   m->map = (int *)malloc(sizeof(int) * (size_t)(maxn > 0 ? maxn : 1));
   if (!m->map) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   for (int iv = 0; iv < maxn; iv++) m->map[iv] = -1;
   int count = 0;
   for (int iv = 0; iv < maxn; iv++) {
-    for (int k = 0; k < c->nclasses; k++) {
-      if (class_root(c, k) != root || iv >= c->classes[k].nivars) continue;
+    for (int j = 0; j < nmem; j++) {
+      int k = mem[j];
+      if (iv >= c->classes[k].nivars) continue;
       if (ivar_has_nilbit(c, k, iv)) { m->map[iv] = count++; break; }
     }
   }
@@ -8794,7 +8799,7 @@ void emit_oint_expr(Compiler *c, int node, TyKind t, Buf *b) {
      nothing included): evaluated for its effect, then nil */
   if (vt == TY_NIL || vt == TY_VOID ||
       ((vt == TY_UNKNOWN || vt == TY_POLY) && vc >= 0 && nt_kind(nt, vc) == NK_CallNode && call_names_only_void_methods(c, vc))) {
-    buf_puts(b, "((void)("); emit_expr(c, node, b); buf_printf(b, "), %s)", oint_nil(t));
+    buf_puts(b, "((void)("); emit_expr_for_effect(c, node, b); buf_printf(b, "), %s)", oint_nil(t));
     return;
   }
   /* a boxed value, or an untyped one (the gate's raising token): unboxed
@@ -8854,7 +8859,7 @@ void emit_oint_truthy(Compiler *c, int node, TyKind t, Buf *b) {
   if (node_has_oint_form(c, node)) {
     buf_puts(b, "(!("); emit_oint_expr(c, node, t, b); buf_puts(b, ").nil)");
   }
-  else { buf_puts(b, "(("); emit_expr(c, node, b); buf_puts(b, "), 1)"); }
+  else { buf_puts(b, "(("); emit_expr_for_effect(c, node, b); buf_puts(b, "), 1)"); }
 }
 
 /* A typed element read (`a[j]`) whose oint is unwrapped at once: the read

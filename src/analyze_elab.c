@@ -111,8 +111,9 @@ struct LoadRecord {
   LrCheck fam[LR_CHECK_MAX];
   double ms; int builds;
   /* the call plan's frame (elab_plan_enter): the map one build made, swapped
-     in while call_target asks its questions, with the parents it climbed */
-  struct LrPlan { LrStmt *st; int nst, cst, *at; unsigned char *bits; int n, ncap; } plan;
+     in while call_target asks its questions, with the parents it climbed and
+     the run points made of it (lr_run_points) */
+  struct LrPlan { LrStmt *st; int nst, cst, *at; unsigned char *bits; int n, ncap, runs_of, nrun, *rend, *rinst, *urun; } plan;
   int *up;                   /* [n] the parent each node's point was climbed from */
   int *plan_par, plan_depth;
   unsigned char plan_made;
@@ -136,6 +137,7 @@ struct LoadRecord {
   unsigned char evhooks;                /* lr_event_hooks' memo: 1 no, 2 yes */
   char **reopens; int nreopens, creopens;   /* the builtin classes and modules a header of the program reopens, sorted (lr_reopens_take) */
   char **refl; int nrefl, crefl;        /* the names a reflection reader of the source names, sorted (lr_refl_take) */
+  char **refl_table; int nrefl_table, crefl_table;   /* ...those a reader that answers from the table names */
   unsigned char refl_any;               /* ...and one names a name the record cannot read */
   unsigned char names_any;              /* ...and one it defines by a name the record cannot read */
   unsigned char structs;     /* registration has made the class builders' classes (elab_record_builders) */
@@ -344,8 +346,26 @@ static ElabPos elab_body_pos(const NodeTable *nt, int b, ElabPos q) {
    require's (its file), or the parts of `x rescue y` */
 static ElabPos elab_value_pos(const NodeTable *nt, int v, ElabPos q) {
   NodeKind k = nt_kind(nt, v);
-  if (k == NK_CallNode || k == NK_RescueModifierNode || k == NK_LoadNode) q.kind = EP_SPINE;
+  if (k == NK_CallNode || k == NK_RescueModifierNode || k == NK_LoadNode || k == NK_ParenthesesNode) q.kind = EP_SPINE;
   return q;
+}
+
+/* The writes whose value is placed where the write stands: a plain write's,
+   and, with *may set, the value of `||=` and `&&=`, which may not run. */
+int elab_write_value_kind(NodeKind k, int *may) {
+  *may = 0;
+  switch (k) {
+    case NK_ConstantWriteNode: case NK_ConstantPathWriteNode: case NK_LocalVariableWriteNode:
+    case NK_InstanceVariableWriteNode: case NK_GlobalVariableWriteNode: case NK_ClassVariableWriteNode:
+      return 1;
+    case NK_ConstantOrWriteNode: case NK_ConstantPathOrWriteNode: case NK_LocalVariableOrWriteNode:
+    case NK_InstanceVariableOrWriteNode: case NK_GlobalVariableOrWriteNode: case NK_ClassVariableOrWriteNode:
+    case NK_ConstantAndWriteNode: case NK_ConstantPathAndWriteNode: case NK_LocalVariableAndWriteNode:
+    case NK_InstanceVariableAndWriteNode: case NK_GlobalVariableAndWriteNode: case NK_ClassVariableAndWriteNode:
+      *may = 1;
+      return 1;
+    default: return 0;
+  }
 }
 
 /* Where the load phase stands at child ch of node p, which stands at pp.
@@ -419,18 +439,8 @@ ElabPos elab_child(Compiler *c, int p, int ch, const ElabPos *pp) {
       }
       if (spine) q.kind = EP_SPINE;   /* its rescue clauses, else and ensure */
       break;
-    case NK_ConstantWriteNode: case NK_ConstantPathWriteNode: case NK_LocalVariableWriteNode:
-    case NK_InstanceVariableWriteNode: case NK_GlobalVariableWriteNode: case NK_ClassVariableWriteNode:
-      if (spine && ch == nt_ref(nt, p, "value")) return elab_value_pos(nt, ch, q);
-      break;
     case NK_AndNode: case NK_OrNode:   /* the right side runs only if the left decides so: a lone expression, which may not run */
       if (spine && ch == nt_ref(nt, p, "right")) { q.may = q.fmay = 1; return elab_body_pos(nt, ch, q); }
-      break;
-    case NK_ConstantOrWriteNode: case NK_ConstantPathOrWriteNode: case NK_LocalVariableOrWriteNode:
-    case NK_InstanceVariableOrWriteNode: case NK_GlobalVariableOrWriteNode: case NK_ClassVariableOrWriteNode:
-    case NK_ConstantAndWriteNode: case NK_ConstantPathAndWriteNode: case NK_LocalVariableAndWriteNode:
-    case NK_InstanceVariableAndWriteNode: case NK_GlobalVariableAndWriteNode: case NK_ClassVariableAndWriteNode:
-      if (spine && ch == nt_ref(nt, p, "value")) { q.may = q.fmay = 1; return elab_value_pos(nt, ch, q); }
       break;
     case NK_RescueModifierNode:
       if (!spine) break;
@@ -449,7 +459,14 @@ ElabPos elab_child(Compiler *c, int p, int ch, const ElabPos *pp) {
       else { q.partial = q.fpartial = 1; q.rep = pp->e; }   /* an iterator's: zero times, or several */
       break;
     }
-    default: break;
+    default: {
+      int may;
+      if (spine && elab_write_value_kind(k, &may) && ch == nt_ref(nt, p, "value")) {
+        if (may) q.may = q.fmay = 1;
+        return elab_value_pos(nt, ch, q);
+      }
+      break;
+    }
   }
   return q;
 }
@@ -810,11 +827,15 @@ void elab_hold(Compiler *c, int on) {
    program's runtime-name sends make a clone of each call per name, and
    desugar_builtin_method_obj, which appends a wrapper between its asks,
    rebuilt the map hundreds of times a round. SPINEL_ELAB_CHECK asks each
-   call's version of the map as it is too (elab_check_version). */
+   call's version of the map as it is too (elab_check_version). The run
+   points (lr_run_points: each statement's run bits, each region's end, and
+   lr_rta's first statements) are facts of one map's statement numbers, so
+   they swap with it: the frame and the live map each make their own. */
 static void lr_plan_swap(LoadRecord *r) {
-  struct LrPlan live = { r->st, r->nst, r->cst, r->at, r->bits, r->n, r->ncap };
+  struct LrPlan live = { r->st, r->nst, r->cst, r->at, r->bits, r->n, r->ncap, r->runs_of, r->nrun, r->rend, r->rinst, r->urun };
   r->st = r->plan.st; r->nst = r->plan.nst; r->cst = r->plan.cst; r->at = r->plan.at;
   r->bits = r->plan.bits; r->n = r->plan.n; r->ncap = r->plan.ncap;
+  r->runs_of = r->plan.runs_of; r->nrun = r->plan.nrun; r->rend = r->plan.rend; r->rinst = r->plan.rinst; r->urun = r->plan.urun;
   r->plan = live;
 }
 static void *lr_dup(const void *v, size_t sz) {
@@ -857,7 +878,7 @@ int elab_plan_enter(Compiler *c, int id) {
     r->plan.st = lr_dup(r->st, sizeof *r->st * (size_t)r->nst); r->plan.nst = r->plan.cst = r->nst;
     r->plan.at = lr_dup(r->at, sizeof(int) * (size_t)r->ncap);
     r->plan.bits = lr_dup(r->bits, (size_t)r->ncap);
-    r->plan.n = r->n; r->plan.ncap = r->ncap;
+    r->plan.n = r->n; r->plan.ncap = r->ncap; r->plan.runs_of = -1;
     r->plan_par = lr_dup(r->up, sizeof(int) * (size_t)r->n);
     r->plan_par = realloc(r->plan_par, sizeof(int) * (size_t)r->ncap);
     r->plan_made = 1;
@@ -997,8 +1018,9 @@ static int lr_form_answer(Compiler *c, int node, int cls, int sg);
 /* a: class, or -2 - ElabVar; b: singleton; nlink: the next method history
    of the same name (lr_vers_index); open: the history's end-of-load version
    may be a later one than the last the load phase surely applies
-   (elab_history_open) */
-typedef struct LrHist { int a, b; char *name; LrDef *v; int n, cap, next, nlink; unsigned char open; } LrHist;
+   (elab_history_open); late: lr_late_make's late bit of the history, 1
+   no, 2 yes, 3 not asked */
+typedef struct LrHist { int a, b; char *name; LrDef *v; int n, cap, next, nlink; unsigned char open, late; } LrHist;
 /* sup: the superclass the first header naming one names, as resolved
    there (has_sup); LR_UNKNOWN_CLASS when it is not a class the record knows */
 typedef struct LrClass { LrOpen *open; int nopen, copen; LrMixin *mix; int nmix, cmix, sup, sup_ref; unsigned char has_sup; } LrClass;
@@ -1017,10 +1039,19 @@ static int lr_core(const LoadRecord *r, int k) {
    that the record cannot follow, keyed as a constant owner; and whether a
    definition form runs code of the program's, keyed by its node (vis: the
    answer, lr_form_runs); whether a def's body defines or writes anything
-   when it runs, keyed by the def (vis: the answer, lr_body_defines) */
+   when it runs, keyed by the def (vis: the answer, lr_body_defines); and
+   whether the record holds a def in a method body as the version that
+   body makes, keyed by the def (vis: the answer, lr_body_held) */
 enum { LR_KEY_VIS = -5, LR_KEY_OPAQUE = -6, LR_KEY_RUNS = -7, LR_KEY_DEFINES = -8, LR_KEY_AUTO = -9,
        LR_KEY_CONST = -2 - ELAB_CONST,   /* a constant's history, keyed as the variables' (ElabVar) are */
-       LR_KEY_EITHER = -10 };   /* a lookup's only: an owner's constant, else its registration, as CRuby's table holds both */
+       LR_KEY_EITHER = -10,   /* a lookup's only: an owner's constant, else its registration, as CRuby's table holds both */
+       LR_KEY_HELD = -11 };
+/* Is key a the memo of an answer (LR_KEY_RUNS, LR_KEY_DEFINES,
+   LR_KEY_HELD): a history keyed by a node, holding no entry of the
+   program's, which a walk over the histories passes over? */
+static int lr_key_memo(int a) {
+  return a == LR_KEY_RUNS || a == LR_KEY_DEFINES || a == LR_KEY_HELD;
+}
 
 static void *lr_grow(void *v, int *cap, int n, size_t sz) {
   if (n < *cap) return v;
@@ -1130,7 +1161,7 @@ enum { LR_FS_NONE, LR_FS_SCLASS, LR_FS_IEVAL, LR_FS_IEVAL_SCLASS };
 /* elab_program's state: each statement's frame class (fc) and singleton
    flag (fs), each frame's visibility state (vs) and each file's top
    level's (vmain) */
-typedef struct ElabRec { Compiler *c; LoadRecord *r; int *fc; unsigned char *fs, *vs, *vmain; int cap; unsigned char unplaced; int cur, cfc; unsigned char cfs; } ElabRec;   /* cur: the statement being recorded, in the frame cfc / cfs */
+typedef struct ElabRec { Compiler *c; LoadRecord *r; int *fc; unsigned char *fs, *vs, *vmain; int cap; unsigned char unplaced; int cur, cfc; unsigned char cfs; int body; } ElabRec;   /* cur: the statement being recorded, in the frame cfc / cfs; body: the def whose body makes the versions (LrDef.body) */
 
 /* The constant name a class or module header (or a read) names, as the
    program wrote it: a header the qualify passes renamed keeps the Ruby path
@@ -1463,8 +1494,9 @@ static void lr_event(ElabRec *x, int cls, int sg, const char *name, LrKind kind,
 /* ...: a definition of initialize and its kin is private wherever it
    stands, and an alias, or an alias's forwarder (lr_def), takes its
    original's visibility */
+static int lr_chain_open(Compiler *c, int cls);
 static void lr_method(ElabRec *x, int cls, int sg, const char *name, int node, LrKind kind, int bvis, int may, const char *target) {
-  if (cls < LR_MAIN || !name) return;
+  if (cls < LR_MAIN || !name || (x->body && lr_chain_open(x->c, cls))) return;   /* (lr_body_versions) */
   int vis = lr_vis(bvis), ov = target ? lr_vis_at(x->c, cls, target, sg, elab_point_of(x->c, node)) : -1;
   const LrHist *th = x->unplaced && target ? lr_hist(x->r, cls, sg, target, 0) : NULL;
   for (int i = th ? th->n - 1 : -1; i >= 0; i--)   /* an unplaced body's own original, which no query at a point sees */
@@ -1473,7 +1505,7 @@ static void lr_method(ElabRec *x, int cls, int sg, const char *name, int node, L
   if (target && !x->unplaced) lr_settle_add(x->r, SET_ALIAS, node, cls, sg, may, vis, name);
   if (ov >= 0) vis = ov;
   int sc = kind == LR_DEF || kind == LR_DEFINE_METHOD ? lr_def_scope(x->r, node) : 0;
-  lr_version(x->r, cls, sg, name, (LrDef){ node, (unsigned char)kind, (unsigned char)vis, (unsigned char)may, 0, target, .unplaced = x->unplaced, .scope = sc });
+  lr_version(x->r, cls, sg, name, (LrDef){ node, (unsigned char)kind, (unsigned char)vis, (unsigned char)may, 0, target, .unplaced = x->unplaced && !x->body, .scope = sc, .body = x->body });
   lr_event(x, cls, sg, name, kind, node, vis);
   if (!sg && bvis == BVIS_MODULE_FUNCTION && lr_mf_copies(kind, target)) {
     lr_version(x->r, cls, 1, name, (LrDef){ node, LR_COPY, SP_VIS_PUBLIC, (unsigned char)may, 0, name, .unplaced = x->unplaced, .scope = sc });
@@ -1739,11 +1771,17 @@ static void lr_reopens_take(Compiler *c) {
    (whose first argument, when no literal, may name any of them), a call under defined?, and the queries a fold has answered already (def_asked,
    desugar_engine_branches). They answer from the final method tables, so a call
    they guard runs where they say the method is there (lr_late_make). A
-   list of methods or a name the record cannot read may be any (refl_any). */
-static void lr_refl_add(LoadRecord *r, const char *name) {
+   list of methods or a name the record cannot read may be any (refl_any).
+   Every reader but a Method's maker answers from the table (refl_table,
+   elab_method_reflected); a maker binds through the call plan. */
+static void lr_refl_add(LoadRecord *r, const char *name, int table) {
   if (!name) { r->refl_any = 1; return; }
-  r->refl = lr_grow(r->refl, &r->crefl, r->nrefl, sizeof *r->refl);
-  if (!(r->refl[r->nrefl++] = strdup(name))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int t = 0; t <= table; t++) {
+    char ***l = t ? &r->refl_table : &r->refl;
+    int *n = t ? &r->nrefl_table : &r->nrefl;
+    *l = lr_grow(*l, t ? &r->crefl_table : &r->crefl, *n, sizeof **l);
+    if (!((*l)[(*n)++] = strdup(name))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
 }
 static void lr_refl_take(Compiler *c) {
   const NodeTable *nt = c->nt;
@@ -1754,19 +1792,91 @@ static void lr_refl_take(Compiler *c) {
     const int *av = call_args(nt, n, &ac);
     /* (each send's first argument names the method it calls: a send in turn) */
     while (rn && is_send_family(rn)) rn = a < ac ? vis_arg_name(nt, av[a++]) : "";
-    if (!rn) { lr_refl_add(r, NULL); continue; }
-    if ((pq = is_method_presence_query(rn))) lr_refl_add(r, pq == 1 && a < ac ? vis_arg_name(nt, av[a]) : NULL);
+    if (!rn) { lr_refl_add(r, NULL, 1); continue; }
+    if ((pq = is_method_presence_query(rn)))
+      lr_refl_add(r, pq == 1 && a < ac ? vis_arg_name(nt, av[a]) : NULL, !is_method_object_maker(rn));
   }
   NT_FOREACH_KIND(nt, NK_DefinedNode, n) {
     int v = nt_ref(nt, n, "value");
-    if (v >= 0 && nt_kind(nt, v) == NK_CallNode) lr_refl_add(r, nt_str(nt, v, "name"));
+    if (v >= 0 && nt_kind(nt, v) == NK_CallNode) lr_refl_add(r, nt_str(nt, v, "name"), 1);
   }
-  for (int i = 0; i < c->ndef_asked; i++) lr_refl_add(r, c->def_asked[i]);
+  for (int i = 0; i < c->ndef_asked; i++) lr_refl_add(r, c->def_asked[i], 1);
   if (r->nrefl > 1) qsort(r->refl, (size_t)r->nrefl, sizeof *r->refl, lr_name_cmp);
+  if (r->nrefl_table > 1) qsort(r->refl_table, (size_t)r->nrefl_table, sizeof *r->refl_table, lr_name_cmp);
 }
 
 static int lr_body_defines(Compiler *c, int def, int direct, int depth);
 static int lr_callbacks_define(Compiler *c, int depth);
+
+static int lr_body_def(const NodeTable *nt, const int *par, int n, int node);
+static int lr_const_seen(Compiler *c, const char *name);
+static int lr_super(Compiler *c, int cls);
+
+/* Is constant `name` bound once, so that what it names never changes: the
+   record sees every write of it (lr_const_seen), the source writes it with
+   class and module headers alone, which reopen what the first made, or
+   with one write and no header, and no remove_const may take it away? */
+static int lr_const_final(Compiler *c, const char *name) {
+  const LoadRecord *r = c->lrec;
+  const NodeTable *nt = c->nt;
+  int writes = 0, headers = 0;
+  if (!lr_const_seen(c, name)) return 0;
+  for (int i = 0; i < r->nsrcw; i++)
+    if (sp_streq(r->srcw[i].name, name)) {
+      NodeKind wk = nt_kind(nt, r->srcw[i].node);
+      if (wk == NK_ClassNode || wk == NK_ModuleNode) headers++;
+      else writes++;
+    }
+  if (writes > 1 || (writes && headers)) return 0;
+  NT_FOREACH_KIND(nt, NK_CallNode, n) {
+    const char *m = nt_str(nt, n, "name");
+    int ac = 0, a = 0;
+    const int *av = call_args(nt, n, &ac);
+    while (m && is_send_family(m)) m = a < ac ? vis_arg_name(nt, av[a++]) : NULL;
+    if (!m) return 0;   /* (lr_const_seen: no name the record cannot read) */
+    if (is_remove_const_name(m) && (a >= ac || !vis_arg_name(nt, av[a]) || sp_streq(vis_arg_name(nt, av[a]), name))) return 0;
+  }
+  return 1;
+}
+
+/* Does the record hold def node `def` (a `def K.m` in a method body) as
+   the version that body makes (lr_body_versions), on facts that cannot
+   change later: K's constant is bound once (lr_const_final), and K's class
+   and every class on its chain are in the record already, each superclass
+   fixed by the class's first header (CRuby raises on another), so its
+   chain is where it ends (lr_chain_open)? Its version opens where the
+   body first runs, so the def is no definition the record cannot follow
+   (lr_node_defines). Asked first while the walk records, where a class it
+   has not reached yet answers no, and kept (LR_KEY_HELD): a yes is then
+   the answer of the whole record, and a def it does not hold, which
+   lr_body_versions may still record, counts as a definition the record
+   cannot follow, so the calls that run its body stay opaque.
+   SPINEL_ELAB_CHECK asks it again of the finished record (lr_check_held). */
+static int lr_body_holds(Compiler *c, int def) {
+  LoadRecord *r = c->lrec;
+  const NodeTable *nt = c->nt;
+  const int *par = r->plan_depth ? r->plan_par : r->up ? r->up : comp_parent_map(c);   /* (the walk's: the tree's) */
+  int recv = nt_ref(nt, def, "receiver"), k = recv >= 0 ? nt_def_receiver(nt, recv) : -1, held = 0;
+  int body = def < r->n ? lr_body_def(nt, par, r->n, def) : -1;
+  if (body > 0 && k >= 0 && nt_kind(nt, k) == NK_ConstantReadNode && r->at[body] >= 0 && lr_const_final(c, lr_written_name(nt, k))) {
+    lr_place_ref(r, nt, k, r->at[body], LR_LATE | LR_BODY);   /* (where the climb places it: a placed def's receiver, lr_receiver) */
+    int cls = lr_class_ref_at(c, k, NULL);
+    held = cls >= LR_MAIN && !lr_chain_open(c, cls);
+    for (int a = cls, d = 0; held && a >= 0 && a < c->nclasses && d < 64; a = lr_super(c, a), d++) {
+      const LrClass *kc = lr_class(r, a);
+      if (!c->classes[a].is_builtin_const && (!kc || !kc->nopen)) held = 0;
+    }
+  }
+  return held;
+}
+/* ...its first answer, kept */
+static int lr_body_held(Compiler *c, int def) {
+  const LrHist *h = lr_hist(c->lrec, LR_KEY_HELD, def, "", 0);
+  if (h && h->n) return h->v[h->n - 1].vis;
+  int held = lr_body_holds(c, def);
+  lr_version(c->lrec, LR_KEY_HELD, def, "", (LrDef){ def, LR_OPAQUE, (unsigned char)held, 0, 0, NULL });
+  return held;
+}
 
 /* May a call of `name` in a method body run a method of the program's
    that defines or writes something? Each place the program defines the
@@ -1825,6 +1935,7 @@ static int lr_node_defines(Compiler *c, int n, int direct, int depth) {
   NodeKind k = nt_kind(nt, n);
   int nc = 0;
   const NodeKind *ck = elab_const_write_kinds(&nc);
+  if (k == NK_DefNode && lr_body_held(c, n)) return 0;   /* (the record follows it) */
   for (int i = 0; i < (int)(sizeof kinds / sizeof *kinds); i++) if (k == kinds[i]) return 1;
   for (int i = 0; i < nc; i++) if (k == ck[i]) return 1;
   if (k == NK_BlockArgumentNode && nt_kind(nt, nt_ref(nt, n, "expression")) != NK_SymbolNode) return 1;   /* a block passed on */
@@ -1885,20 +1996,37 @@ static int lr_callbacks_define(Compiler *c, int depth) {
   return o;
 }
 
+/* What code the record cannot follow may do, kept in its opaque entry's
+   vis: LR_OPAQUE_WRITES, only write an instance variable, the method it
+   runs being an attr's (LR_READER, LR_WRITER), which defines nothing;
+   LR_OPAQUE_DEFINES, anything (a send, an eval, a mixin a pass made, a
+   program method that may define, one the record cannot pin). Only the
+   defining ones may supply a method (lr_unordered_supply). */
+enum { LR_OPAQUE_WRITES = 1, LR_OPAQUE_DEFINES };
+/* Does owner k's opaque history hold code that may define (LR_OPAQUE_DEFINES)? */
+static int lr_opaque_defines(LoadRecord *r, int k) {
+  const LrHist *op = lr_hist(r, LR_KEY_OPAQUE, lr_const_owner(k), "", 0);
+  for (int j = 0; op && j < op->n; j++)
+    if (op->v[j].vis == LR_OPAQUE_DEFINES) return 1;
+  return 0;
+}
 /* Does a call of `name` on class cls (its singleton when sg) at p run a
    method of the program's that may define or write something: any one
-   it may find but a def whose body does neither (lr_body_defines)? */
+   it may find but a def whose body does neither (lr_body_defines)? 0 when
+   not, else what it may do */
 static int lr_runs_defining(Compiler *c, int cls, int sg, const char *name, LoadPoint p) {
   const LrDef *d = NULL;
   int o = lr_search(c, cls, sg, name, -1, p, 0, 0, &d, 0);
-  return o != ELAB_NO && !(o == ELAB_YES && d && d->kind == LR_DEF && !lr_body_defines(c, d->node, 0, 0));
+  if (o == ELAB_NO || (o == ELAB_YES && d && d->kind == LR_DEF && !lr_body_defines(c, d->node, 0, 0))) return 0;
+  return o == ELAB_YES && d && (d->kind == LR_READER || d->kind == LR_WRITER) ? LR_OPAQUE_WRITES : LR_OPAQUE_DEFINES;
 }
 
 /* Does call `node` on class cls (in its singleton when sg) run code the
    record cannot follow: a send, an eval of a String, or a method of the
    program that may define or write something (lr_runs_defining), called
    on the class (its singleton method, from its body or through its
-   constant) or from its body (a top-level one)? */
+   constant) or from its body (a top-level one)? 0 when not, else what it
+   may do (LR_OPAQUE_*) */
 static int lr_opaque_call(Compiler *c, int node, int cls, int sg) {
   const NodeTable *nt = c->nt;
   if (nt_int(nt, node, "event_hook", 0)) return 0;   /* (the call of a hook the record fires: it asked for it) */
@@ -1906,8 +2034,9 @@ static int lr_opaque_call(Compiler *c, int node, int cls, int sg) {
   int recv = nt_ref(nt, node, "receiver");
   LoadPoint p = elab_point_of(c, node);
   int bare = recv < 0 || nt_kind(nt, recv) == NK_SelfNode;
-  return is_send_family(nm) || (is_eval_exec_family(nm) && nt_ref(nt, node, "block") < 0) ||
-         (!sg && lr_runs_defining(c, cls, 1, nm, p)) || (bare && lr_runs_defining(c, LR_MAIN, 0, nm, p));
+  if (is_send_family(nm) || (is_eval_exec_family(nm) && nt_ref(nt, node, "block") < 0)) return LR_OPAQUE_DEFINES;
+  int on = sg ? 0 : lr_runs_defining(c, cls, 1, nm, p), top = bare ? lr_runs_defining(c, LR_MAIN, 0, nm, p) : 0;
+  return on > top ? on : top;
 }
 /* Is call `node` (named nm) a definition form a statement may hold in its
    parts (`r = attr_reader :a`, `p(private :b)`, `memoize private def c`):
@@ -1987,6 +2116,21 @@ static int lr_remove_shadowed(Compiler *c, int node, const char *nm, int cls, in
    singleton methods. nested: a form the statement holds in its parts
    (lr_nested_part), whose own call the form's answers (lr_form_runs, an opaque
    call) are not asked of. */
+/* Does a mixin call name a class where a module is expected (`include K`,
+   `extend String`): one of the program's, a builtin one the program reopens,
+   or a builtin class by name? CRuby checks every argument before mixing any
+   in, so the statement raises TypeError and brings nothing. */
+static int lr_mix_names_class(Compiler *c, const int *av, int ac) {
+  const NodeTable *nt = c->nt;
+  for (int i = 0; i < ac; i++) {
+    int m = lr_class_ref_at(c, av[i], NULL);
+    if (m >= 0 && m < c->nclasses) { if (!comp_class_is_module(c, &c->classes[m])) return 1; continue; }
+    const char *nm = nt_kind(nt, av[i]) == NK_ConstantReadNode ? nt_str(nt, av[i], "name") : NULL;
+    if (nm && m == LR_UNKNOWN_CLASS && is_builtin_class_name(nm) && !is_builtin_module_name(nm)) return 1;
+  }
+  return 0;
+}
+
 static void lr_call(ElabRec *x, int node, int fc, int fs, unsigned char *vs, int fnode, int may, int nested) {
   const NodeTable *nt = x->c->nt;
   const char *nm = nt_str(nt, node, "name");
@@ -2025,8 +2169,8 @@ static void lr_call(ElabRec *x, int node, int fc, int fs, unsigned char *vs, int
       if (lr_wrapped_vis(x, av[i], cls, sg, node, bvis, may)) continue;
     }
     for (int k = 0; (bvis || cvis) && ak == NK_ArrayNode && k < en; k++)
-      if (!vis_arg_name(nt, ev[k])) opaque = 1;
-    if (!an_ && ak != NK_DefNode && (ak != NK_ArrayNode || !(bvis || cvis)) && naming && (!dm || i == 0)) opaque = 1;   /* a computed name */
+      if (!vis_arg_name(nt, ev[k])) opaque = LR_OPAQUE_DEFINES;
+    if (!an_ && ak != NK_DefNode && (ak != NK_ArrayNode || !(bvis || cvis)) && naming && (!dm || i == 0)) opaque = LR_OPAQUE_DEFINES;   /* a computed name */
     if ((bvis || cvis) && ak == NK_DefNode) {
       /* private def m, private_class_method def self.m */
       lr_def(x, av[i], cls, sg, bvis ? bvis : *vs, may);
@@ -2043,8 +2187,16 @@ static void lr_call(ElabRec *x, int node, int fc, int fs, unsigned char *vs, int
     }
     else if (mix) {
       LrClass *k = lr_class(x->r, cls);
-      int mod = lr_class_ref_at(x->c, av[i], NULL);
-      opaque |= mod < 0 && mod != LR_LATER;
+      /* `extend self` in a module's own body: an extend of the module on
+         itself, at its point (CRuby's model: the module's singleton gets
+         the module as a mixin) */
+      int mod = nt_kind(nt, av[i]) == NK_SelfNode && self && !sg && cls == fc && fs == LR_FS_NONE &&
+                fnode >= 0 && class_def_is_module(nt, fnode) && is_extend_name(nm)
+                ? cls : lr_class_ref_at(x->c, av[i], NULL);
+      /* a class among the arguments: TypeError where the statement runs
+         (codegen reads the mark), and no mixin, not of the modules beside it */
+      if (lr_mix_names_class(x->c, av, ac)) { nt_node_set_int((NodeTable *)nt, node, "mixin_class_arg", 1); continue; }
+      if (mod < 0 && mod != LR_LATER) opaque = LR_OPAQUE_DEFINES;
       if (!k) continue;
       k->mix = lr_grow(k->mix, &k->cmix, k->nmix, sizeof *k->mix);
       x->r->hgen++;
@@ -2056,7 +2208,7 @@ static void lr_call(ElabRec *x, int node, int fc, int fs, unsigned char *vs, int
         lr_mix_event(x, cls, node, av[i], mod, lr_mix_kind(nt, node, nm, sg));
     }
     else if (is_undef_method_name(nm) || is_remove_method_name(nm)) {
-      if (is_remove_method_name(nm) && lr_remove_shadowed(x->c, node, nm, cls, sg)) opaque = 1;   /* (a program method answers: it may do anything) */
+      if (is_remove_method_name(nm) && lr_remove_shadowed(x->c, node, nm, cls, sg)) opaque = LR_OPAQUE_DEFINES;   /* (a program method answers: it may do anything) */
       else lr_method(x, cls, sg, an_, node, is_undef_method_name(nm) ? LR_UNDEF : LR_REMOVE, *vs, may, NULL);
     }
   }
@@ -2071,7 +2223,7 @@ static void lr_call(ElabRec *x, int node, int fc, int fs, unsigned char *vs, int
     lr_settle_add(x->r, SET_OPAQUE, node, cls, sg, may, 0, NULL);
   }
   if (opaque && cls >= 0 && !x->unplaced)
-    lr_version(x->r, LR_KEY_OPAQUE, lr_const_owner(cls), "", (LrDef){ node, LR_OPAQUE, 0, (unsigned char)may, 0, NULL });
+    lr_version(x->r, LR_KEY_OPAQUE, lr_const_owner(cls), "", (LrDef){ node, LR_OPAQUE, (unsigned char)opaque, (unsigned char)may, 0, NULL });
 }
 
 /* The definition forms statement node p (standing at pp, in the frame fc,
@@ -2320,6 +2472,55 @@ static void lr_body_defs(Compiler *c, int ci, int body, int fnode) {
   }
 }
 
+static int lr_body_def(const NodeTable *nt, const int *par, int n, int node);
+/* The versions method bodies make (LrDef.body): a `def K.m` on a constant
+   the record resolves, in the body of a def, with no class body between,
+   is a version of K's singleton history of m wherever the walk stands,
+   recorded after the placed ones. It has no load point but an extent
+   (lr_version_order): from the first statement the def's body may run on,
+   any number of times, as CRuby defines it each time the body runs. Not
+   on a class whose chain the record does not hold (lr_chain_open: a
+   class a builder call makes, `S = Struct.new(:a) { }`): no call on it is
+   ordered against a version, so its calls would meet the version as if
+   it had run from the start. */
+static void lr_body_versions(Compiler *c) {
+  const NodeTable *nt = c->nt;
+  LoadRecord *r = c->lrec;
+  const int *par = r->plan_depth ? r->plan_par : r->up;
+  NT_FOREACH_KIND(nt, NK_DefNode, id) {
+    int recv = nt_ref(nt, id, "receiver"), body = lr_body_def(nt, par, r->n, id);
+    NodeKind rk = recv >= 0 ? nt_kind(nt, nt_def_receiver(nt, recv)) : NK_SelfNode;
+    if (id >= r->n || body <= 0 || (rk != NK_ConstantReadNode && rk != NK_ConstantPathNode)) continue;
+    ElabRec x = { c, r, .unplaced = 1, .body = body };
+    lr_def(&x, id, LR_MAIN, LR_FS_NONE, BVIS_PUBLIC, 1);
+  }
+}
+
+/* Each def the record answered held for (lr_body_held, its first answer
+   kept) against the answer the finished record gives, and recorded as a
+   body version: a held def that is not, or a kept yes the record now
+   answers no to, is an input the first answer read before it was final.
+   A kept no the record now answers yes to is the walk's (a class it had
+   not reached), which lr_body_held keeps on purpose. */
+static void lr_check_held(Compiler *c) {
+  LoadRecord *r = c->lrec;
+  const NodeTable *nt = c->nt;
+  LrCheck *f = lr_family(r, "body held");
+  for (int i = 0; i < r->nhist; i++) {
+    if (r->hist[i].a != LR_KEY_HELD || !r->hist[i].n || !r->hist[i].v[r->hist[i].n - 1].vis) continue;
+    int def = r->hist[i].b, recv = nt_ref(nt, def, "receiver"), found = 0, now;
+    const LrHist *h = recv >= 0 ? lr_hist(r, lr_class_ref_at(c, nt_def_receiver(nt, recv), NULL), 1, nt_str(nt, def, "name"), 0) : NULL;
+    for (int j = 0; h && j < h->n; j++) found |= h->v[j].node == def && h->v[j].body;
+    f->asked++;
+    if ((now = lr_body_holds(c, def)) && found) continue;
+    f->differ++;
+    if (r->shown++ >= LR_CHECK_SHOW) continue;
+    char d[96];
+    lr_node_desc(c, def, d, sizeof d);
+    fprintf(stderr, "spinel-elab-check: body held def=%s recorded=%d now=%d\n", d, found, now);
+  }
+}
+
 /* A class or module body that is no statement of the load phase: one in
    a lambda or in a block kept to run later (`l = -> { class G; private
    :foo; end }`), or in an expression. It runs when the program runs that
@@ -2366,6 +2567,7 @@ static void lr_record_unplaced(Compiler *c) {
       kc->nopen++;
       if (class_def_body(nt, id) >= 0) lr_body_defs(c, ci, class_def_body(nt, id), id);
     }
+  lr_body_versions(c);
 }
 
 /* The record dropped and made again over the walked statements */
@@ -2432,6 +2634,7 @@ void elab_program(Compiler *c, struct HostStep *h) {
   lr_record_unplaced(c);
   r->recorded = 1;
   if (r->check) {   /* the same record made after the walk, as a check */
+    lr_check_held(c);
     char *walked = lr_dump_text(c);
     lr_record_again(&x);
     lr_check_walked(c, walked);
@@ -2584,7 +2787,7 @@ void elab_record_builders(Compiler *c) {
   LoadRecord *r = c->lrec;
   if (!r || !r->recorded) return;
   r->structs = 1;
-  r->runs_of = -1;   /* lr_rta's facts are of the builders' classes from here: computed afresh */
+  r->runs_of = r->plan.runs_of = -1;   /* lr_rta's facts are of the builders' classes from here: computed afresh */
   lr_fit_classes(r, c);
   for (int ci = 0; ci < c->nclasses; ci++) if (lr_builder_body(c, ci) >= 0) r->held[ci + 1] = 1;
   if (r->builders) {
@@ -2638,7 +2841,7 @@ static void lr_settle_regions(Compiler *c) {
       int mod = lr_class_ref_at(c, k->mix[j].ref, NULL), was = k->mix[j].mod;
       k->mix[j].mod = mod;
       if (mod < 0 && mod != LR_LATER && !(was < 0 && was != LR_LATER) && i >= 1)
-        lr_version(r, LR_KEY_OPAQUE, lr_const_owner(i - 1), "", (LrDef){ k->mix[j].node, LR_OPAQUE, 0, (unsigned char)elab_point_may(c, k->mix[j].node), 0, NULL });
+        lr_version(r, LR_KEY_OPAQUE, lr_const_owner(i - 1), "", (LrDef){ k->mix[j].node, LR_OPAQUE, LR_OPAQUE_DEFINES, (unsigned char)elab_point_may(c, k->mix[j].node), 0, NULL });
     }
     if (k->has_sup) k->sup = lr_class_ref_at(c, k->sup_ref, NULL);
   }
@@ -2653,8 +2856,8 @@ static void lr_settle_regions(Compiler *c) {
       h = lr_hist(r, LR_KEY_OPAQUE, lr_const_owner(t->cls), "", 0);
       int seen = 0;
       for (int j = 0; h && j < h->n; j++) seen |= h->v[j].node == t->node;
-      if (!seen && t->cls >= 0 && lr_opaque_call(c, t->node, t->cls, t->sg))
-        lr_version(r, LR_KEY_OPAQUE, lr_const_owner(t->cls), "", (LrDef){ t->node, LR_OPAQUE, 0, (unsigned char)t->may, 0, NULL });
+      int o = !seen && t->cls >= 0 ? lr_opaque_call(c, t->node, t->cls, t->sg) : 0;
+      if (o) lr_version(r, LR_KEY_OPAQUE, lr_const_owner(t->cls), "", (LrDef){ t->node, LR_OPAQUE, (unsigned char)o, (unsigned char)t->may, 0, NULL });
     }
     else {
       h = lr_hist(r, t->cls, t->sg, t->name, 0);
@@ -2676,7 +2879,7 @@ static void lr_settle_regions(Compiler *c) {
    define_method, an attr, an alias, a module_function copy, an undef or
    remove), not a visibility change. lr_vers_index indexes the histories as
    they stand, again once more entries have been recorded. */
-typedef struct LrVers { const char *name; int first, nver, next; unsigned char captured, replaced, late; } LrVers;   /* captured: elab_version_captured's memo, 1 no, 2 yes; replaced: one history holds two versions, or an alias; late: lr_late_make's, 1 no, 2 yes, 3 not asked (two histories) */
+typedef struct LrVers { const char *name; int first, nver, next, pend; unsigned char captured, replaced, late; } LrVers;   /* captured: elab_version_captured's memo, 1 no, 2 yes; replaced: one history holds two versions, or an alias; late: lr_late_make's, 1 no history late, 2 one is, 3 none asked; pend: the histories asked that are not late yet */
 
 static int lr_is_version(const LrDef *v) { return v->kind <= LR_REMOVE && !v->unplaced; }
 
@@ -2695,7 +2898,7 @@ static void lr_vers_index(LoadRecord *r) {
     if (k < 0) {
       r->vers = lr_grow(r->vers, &r->cvers, r->nvers, sizeof *r->vers);
       k = r->nvers++;
-      r->vers[k] = (LrVers){ h->name, -1, 0, r->vers_head[b], 0 };
+      r->vers[k] = (LrVers){ h->name, -1, 0, r->vers_head[b], 0, 0 };
       r->vers_head[b] = k;
     }
     h->nlink = r->vers[k].first;
@@ -2725,46 +2928,72 @@ int elab_method_versions(Compiler *c, const char *name) {
   return x ? x->nver : 0;
 }
 
-/* The late bit of every name whose versions are one history's (LrVers.late),
-   once for all of them, as of the entries recorded: a call of the name
-   may run before the history's first version is made, its statement, or
-   the window of the bodies around it (elab_call_window), opening ahead
-   of that version's point in its region. The first version opens the
-   method; before it the name is absent. Whether a call meets that is
-   the typed receiver's fact (ct_version_at). A name of two histories is
-   not asked, nor one a builtin's method answers (Object's, or any builtin
-   class's): such a call may reach the builtin's, which no entry calls;
-   but a class's (or module's) own class-side history is, of a name the
-   class answers on itself as a reader, with no argument or block
-   (bop_class_answers), whose entry's else arm calls that builtin
-   (VK_BUILTIN). The bit is the name's, not one call's, so it asks the
-   name's shape; each entry asks again at its own arity and keeps the
-   table's answer where the builtin does not take it. Nor one a
-   reflection reader names (lr_refl_take): a call it guards
-   would take the entry where the reader answers the method is there, and
-   raise where the table's answer runs the def. */
+/* the first version of history h, NULL for none */
+static const LrDef *lr_first_version(const LrHist *h) {
+  for (int j = 0; j < h->n; j++) if (lr_is_version(&h->v[j])) return &h->v[j];
+  return NULL;
+}
+/* Is the late bit asked of history h of x's name, one of nh histories
+   that hold a version (lr_late_make)? */
+static int lr_late_asked(const LoadRecord *r, const LrVers *x, const LrHist *h, int nh) {
+  int cside = h->a >= 0 && h->b;
+  if (!lr_first_version(h) || r->refl_any || (r->nrefl && bsearch(&x->name, r->refl, (size_t)r->nrefl, sizeof *r->refl, lr_name_cmp)) ||
+      (nh > 1 && !cside)) return 0;
+  return (cside && bop_class_answers(x->name, 0, 0)) || !(builtin_object_method_known(x->name) || builtin_instance_name_known(x->name));
+}
+/* The late bit of every method history (LrHist.late), once for all of
+   them, as of the entries recorded: a call of the name may run before the
+   history's first version is made, its statement, or the window of the
+   bodies around it (elab_call_window), opening ahead of that version's
+   point in its region; any call, where a method body makes that version
+   (LrDef.body). The first version opens the method; before it the name
+   is absent on that class and side. Whether a call meets that is the
+   typed receiver's fact (ct_version_at), asked of the histories on its
+   chain (elab_versions_late). Not asked of a history of a name a
+   builtin's method answers (Object's, or any builtin class's): such a
+   call may reach the builtin's, which no entry calls; but a class's (or
+   module's) own class-side history is, of a name the class answers on
+   itself as a reader, with no argument or block (bop_class_answers),
+   whose entry's else arm calls that builtin (VK_BUILTIN). The ask is of
+   the name's shape, not one call's; each entry asks again at its own
+   arity and keeps the table's answer where the builtin does not take it.
+   Of a name of two or more histories, only the class-side ones are
+   asked: an instance's chain keeps the table's. Nor one a reflection
+   reader names (lr_refl_take): a call it guards would take the entry
+   where the reader answers the method is there, and raise where the
+   table's answer runs the def. LrVers.late is 2 where some history of the
+   name is late. */
 static void lr_late_make(Compiler *c) {
   LoadRecord *r = c->lrec;
   lr_vers_index(r);
   if (r->lated == r->nentries) return;
   r->lated = r->nentries;
-  for (int k = 0; k < r->nvers; k++) r->vers[k].late = 1;
+  for (int k = 0; k < r->nvers; k++) {
+    LrVers *x = &r->vers[k];
+    int nh = 0;
+    for (int h = x->first; h >= 0; h = r->hist[h].nlink) nh += lr_first_version(&r->hist[h]) != NULL;
+    x->pend = 0;
+    x->late = 3;
+    for (int h = x->first; h >= 0; h = r->hist[h].nlink) {
+      LrHist *y = &r->hist[h];
+      y->late = lr_late_asked(r, x, y, nh) ? 1 : 3;
+      if (y->late == 3) continue;
+      if (lr_first_version(y)->body) y->late = x->late = 2;   /* (a method body's: before its extent opens, lr_version_order) */
+      else { x->pend++; if (x->late == 3) x->late = 1; }
+    }
+  }
   NT_FOREACH_KIND(c->nt, NK_CallNode, id) {
     LrVers *x = lr_vers(r, nt_str(c->nt, id, "name"));
-    const LrDef *v = NULL;
-    int nh = 0, own = 0;
     ElabWindow w;
-    if (!x || !x->nver || x->late != 1) continue;
-    for (int h = x->first; h >= 0 && nh < 2; h = r->hist[h].nlink)
-      for (int j = 0; j < r->hist[h].n; j++)
-        if (lr_is_version(&r->hist[h].v[j])) {
-          if (!nh++) { v = &r->hist[h].v[j]; own = r->hist[h].a >= 0 && r->hist[h].b && bop_class_answers(x->name, 0, 0); }
-          break;
-        }
-    if (nh != 1 || (!own && (builtin_object_method_known(x->name) || builtin_instance_name_known(x->name))) || r->refl_any ||
-        (r->nrefl && bsearch(&x->name, r->refl, (size_t)r->nrefl, sizeof *r->refl, lr_name_cmp))) { x->late = 3; continue; }
-    LoadPoint q = v ? elab_point_of(c, v->node) : (LoadPoint){ -1, -1 };
-    if (q.region >= 0 && elab_call_window(c, id, &w) == ELAB_YES && w.from.region == q.region && w.from.seq < q.seq) x->late = 2;
+    int open = 0;
+    for (int h = x ? x->first : -1; h >= 0 && x->pend; h = r->hist[h].nlink) {
+      LrHist *y = &r->hist[h];
+      if (y->late != 1) continue;
+      LoadPoint q = elab_point_of(c, lr_first_version(y)->node);
+      if (q.region < 0) continue;
+      if (!open++ && elab_call_window(c, id, &w) != ELAB_YES) break;
+      if (w.from.region == q.region && w.from.seq < q.seq) { y->late = x->late = 2; x->pend--; }
+    }
   }
 }
 int elab_method_late(Compiler *c, const char *name) {
@@ -2773,6 +3002,23 @@ int elab_method_late(Compiler *c, const char *name) {
   if (!x || !x->nver) return 0;
   lr_late_make(c);
   return x->late == 2;
+}
+int elab_versions_late(Compiler *c, const char *name, const ElabVersion *vs, int n) {
+  LoadRecord *r = c->lrec;
+  const LrVers *x = r && r->recorded ? lr_vers(r, name) : NULL;
+  int late = 1;
+  if (!x || !x->nver) return 1;
+  lr_late_make(c);
+  if (n < 0) return x->late == 2 ? 2 : 3;
+  for (int i = 0; i < n && late != 2; i++)
+    if (r->hist[vs[i].hist].late != 1) late = r->hist[vs[i].hist].late;
+  return late;
+}
+
+int elab_method_reflected(Compiler *c, const char *name) {
+  LoadRecord *r = c->lrec;
+  if (!r || !r->recorded || !name) return 0;
+  return r->refl_any || (r->nrefl_table && bsearch(&name, r->refl_table, (size_t)r->nrefl_table, sizeof *r->refl_table, lr_name_cmp));
 }
 
 int elab_method_replaced(Compiler *c, const char *name) {
@@ -2821,6 +3067,9 @@ void elab_mark_versions(Compiler *c) {
     const LrVers *x = name && sc->def_node >= 0 ? lr_vers(r, name) : NULL;
     if (!x || (x->nver < 2 && !elab_method_late(c, name))) continue;
     { sc->versioned = 1; comp_touch_scope(sc->idx); }
+    /* an accessor's version (elab_attr_scope) is one the def that ends its
+       history replaces; its scope, made after that def's, takes no key */
+    if (sc->attr_version) { sc->replaced = 1; continue; }
     int def = nt_kind(c->nt, sc->def_node) == NK_DefNode;
     if (!x->replaced || (sc->class_id < 0 && !def)) continue;
     if (!(nk & (nk - 1)) && !(keys = realloc(keys, sizeof *keys * (size_t)(nk ? 2 * nk : 1)))) {
@@ -3220,6 +3469,7 @@ static int lr_run_order(Compiler *c, int d, int n) {
    body's or a block's in it too, runs as lr_run_order orders it against
    that node, under the condition the node runs under; where that order
    is not sure, the statement's answers. */
+static int lr_version_order(Compiler *c, const LrDef *v, LoadPoint p, int late);
 static int lr_last_before(Compiler *c, const LrHist *h, LoadPoint p, int late, int skip_vis, const LrDef **out) {
   int unsure = 0;
   LoadRecord *r = c->lrec;
@@ -3229,10 +3479,9 @@ static int lr_last_before(Compiler *c, const LrHist *h, LoadPoint p, int late, i
     const LrDef *v = &h->v[i];
     if (take && v->unplaced) r->cand_bad = 1;
     if ((skip_vis && v->kind == LR_VIS) || v->unplaced) continue;
-    int in = at && v->node >= 0 && v->node < r->n && r->at[v->node] == p.seq;
+    int in = at && !v->body && v->node >= 0 && v->node < r->n && r->at[v->node] == p.seq;
     int o = in ? lr_run_order(c, v->node, p.node) : PROG_UNKNOWN;
-    if (o == PROG_UNKNOWN)
-      o = late == 1 ? (elab_point_of(c, v->node).region == 0 ? PROG_BEFORE : PROG_UNKNOWN) : elab_cmp(elab_point_of(c, v->node), p);
+    if (o == PROG_UNKNOWN) o = lr_version_order(c, v, p, late);
     if (o == PROG_UNKNOWN || (o == PROG_BEFORE && !in && v->may && (late == 1 || !lr_may_dominates(c->lrec, v, p)))) {
       unsure = 1;
       if (out && (h->a == LR_KEY_CONST || h->a == LR_KEY_AUTO) && !*out) *out = v;
@@ -3281,7 +3530,7 @@ static int lr_super(Compiler *c, int cls) {
   LrClass *k = lr_class(c->lrec, cls);
   if (k && k->has_sup && lr_later(c, &k->sup, k->sup_ref) >= 0) return k->sup;   /* the record's, which it has while it is made */
   if (c->classes[cls].parent >= 0) return c->classes[cls].parent;
-  return class_def_is_module(c->nt, c->classes[cls].def_node) ? LR_UNKNOWN_CLASS : LR_MAIN;
+  return comp_class_is_module(c, &c->classes[cls]) ? LR_UNKNOWN_CLASS : LR_MAIN;
 }
 
 /* Did mixin m of a class happen before p (late: in the load phase)?
@@ -3366,7 +3615,7 @@ static int lr_sg_tail_of(Compiler *c, int cls, int tail[5]) {   /* where in tail
   const LoadRecord *r = c->lrec;
   tail[0] = comp_core_class(c, CORE_CLASS_REOPEN), tail[1] = lr_core(r, CORE_MODULE), tail[2] = lr_core(r, CORE_OBJECT);
   tail[3] = LR_MAIN, tail[4] = lr_core(r, CORE_KERNEL);
-  return cls == LR_MAIN ? 2 : cls >= 0 && class_def_is_module(c->nt, c->classes[cls].def_node) ? 1 : 0;
+  return cls == LR_MAIN ? 2 : cls >= 0 && comp_class_is_module(c, &c->classes[cls]) ? 1 : 0;
 }
 /* ...for a hook the core defines on Class or Module (is_module_hook_name)
    only up to where Object's begin (tail[2]): theirs stand before Object's,
@@ -3568,7 +3817,8 @@ static const int *lr_mixed(Compiler *c, int *n) {
 
 /* Does cls's chain (its singleton's when sg) change for `name` strictly
    between p0 and p1: a module that has or may have the name mixed into a
-   class on it, code the record cannot follow run on one of them? */
+   class on it, code the record cannot follow run on one of them that may
+   define (LR_OPAQUE_DEFINES)? */
 static int lr_chain_moves(Compiler *c, int cls, int sg, const char *name, LoadPoint p0, LoadPoint p1) {
   LoadRecord *r = c->lrec;
   int nk = 0;
@@ -3584,7 +3834,7 @@ static int lr_chain_moves(Compiler *c, int cls, int sg, const char *name, LoadPo
           (lr_mixin_class(c, m) < 0 || lr_search(c, m->mod, 0, name, -1, p1, 1, 0, NULL, 0) != ELAB_NO)) return 1;
     }
     for (int j = 0; op && j < op->n; j++)
-      if (lr_inside(c, op->v[j].node, p0, p1)) return 1;
+      if (op->v[j].vis == LR_OPAQUE_DEFINES && lr_inside(c, op->v[j].node, p0, p1)) return 1;
   }
   return 0;
 }
@@ -3600,9 +3850,8 @@ int elab_chain_settled(Compiler *c, int cls, int sg, const char *name, LoadPoint
   for (int i = 0; i < nk; i++) {
     int k = mk[i];
     const LrClass *kc = lr_class(r, k);
-    const LrHist *op = lr_hist(r, LR_KEY_OPAQUE, lr_const_owner(k), "", 0);
     if (!lr_in_ancestry(c, cls, sg, k, end)) continue;
-    if (op && op->n) return 0;
+    if (lr_opaque_defines(r, k)) return 0;
     for (int j = 0; kc && j < kc->nmix; j++) {
       LrMixin *m = &kc->mix[j];
       if (lr_later(c, &m->mod, m->ref) < 0) return 0;
@@ -3821,6 +4070,22 @@ static int lr_node_runs(Compiler *c, int id) {
    urun[def]: the first statement a recorded def's body may run, 0 for one
    the record did not record. */
 enum { LR_NEVER = INT_MAX, LR_CORE = -4, RQ_INST = 1, RQ_CLASS = 2 };
+/* The order of version v against point p (late == 1: as of the load phase's
+   end): a version at a point, its point's; one a method body makes
+   (LrDef.body), its extent's: after p where p comes before the first
+   statement that body may run on (lr_rta's urun) and that statement does
+   not run again before p (lr_runs_again), not known from there on, since
+   the body may run any number of times, and after every point for a body
+   that never runs */
+static int lr_version_order(Compiler *c, const LrDef *v, LoadPoint p, int late) {
+  if (!v->body)
+    return late == 1 ? (elab_point_of(c, v->node).region == 0 ? PROG_BEFORE : PROG_UNKNOWN) : elab_cmp(elab_point_of(c, v->node), p);
+  LoadRecord *r = c->lrec;
+  lr_run_points(c);
+  int from = r->urun[v->body];
+  if (from == LR_NEVER) return PROG_AFTER;
+  return late != 1 && p.region >= 0 && p.seq < from && !lr_runs_again(c, r->st[from].node, p) ? PROG_AFTER : PROG_UNKNOWN;
+}
 /* The class constant write w holds when a builder made it (`P =
    Struct.new(:x)`): the program's class of it, or LR_CORE when the program
    has none (no block, no header reopens it: only core ancestors);
@@ -3884,14 +4149,18 @@ static void lr_rta_call(LrRta *t, const char *name, int how) {
                                                      ((how & RQ_CLASS) && (h->b || t->ext[h->a + 1])))) lr_rta_reach(t, i);
   }
 }
-/* name called on class k: its singleton chain's, its extended modules' */
-static void lr_rta_call_on(LrRta *t, const char *name, int k) {
+static void lr_rta_reach_by(LrRta *t, int hi);
+/* name called on class k: its singleton chain's, its extended modules'.
+   once: by a call that runs when statement t->s does and at no other time
+   (lr_rta_once), which reaches only the singleton versions made by then */
+static void lr_rta_call_on(LrRta *t, const char *name, int k, int once) {
   LoadRecord *r = t->r;
   lr_rta_call(t, name, RQ_INST);
   for (int a = k, d = 0; a >= LR_MAIN && a < t->c->nclasses && d < 64; a = lr_super(t->c, a), d++) {
     LrClass *kc = lr_class(r, a);
     LrHist *h = lr_hist(r, a, 1, name, 0);
-    if (h) lr_rta_reach(t, (int)(h - r->hist));
+    if (h && once) lr_rta_reach_by(t, (int)(h - r->hist));
+    else if (h) lr_rta_reach(t, (int)(h - r->hist));
     for (int j = 0; kc && j < kc->nmix; j++)
       if (elab_mix_on_singleton(kc->mix[j].kind)) lr_rta_call(t, name, RQ_CLASS);   /* the modules extended (lr_rta_ext) */
   }
@@ -3903,16 +4172,42 @@ static void lr_rta_unit(LrRta *t, int d) {
   t->stack[t->nstack++] = d;
 }
 static void lr_rta_all(LrRta *t, int inst);
+static void lr_rta_version(LrRta *t, const LrHist *h, const LrDef *v) {
+  if (v->kind == LR_DEF) lr_rta_unit(t, v->node);
+  else if ((v->kind == LR_ALIAS || v->kind == LR_COPY) && !v->target) lr_rta_all(t, 0);
+  else if (v->kind == LR_ALIAS || v->kind == LR_COPY) h->b ? lr_rta_call_on(t, v->target, h->a, 0) : lr_rta_call(t, v->target, RQ_INST);
+}
 static void lr_rta_reach(LrRta *t, int hi) {
   const LrHist *h = &t->r->hist[hi];
   if (t->hreach[hi]) return;
   t->hreach[hi] = 1;
+  for (int j = 0; j < h->n; j++) lr_rta_version(t, h, &h->v[j]);
+}
+/* ...its versions made by statement t->s: not one at a later statement of
+   region 0, which a call reaches once it is made. The history counts as
+   reached once none is left. */
+static void lr_rta_reach_by(LrRta *t, int hi) {
+  const LrHist *h = &t->r->hist[hi];
+  int all = 1;
+  if (t->hreach[hi]) return;
   for (int j = 0; j < h->n; j++) {
-    const LrDef *v = &h->v[j];
-    if (v->kind == LR_DEF) lr_rta_unit(t, v->node);
-    else if ((v->kind == LR_ALIAS || v->kind == LR_COPY) && !v->target) lr_rta_all(t, 0);
-    else if (v->kind == LR_ALIAS || v->kind == LR_COPY) h->b ? lr_rta_call_on(t, v->target, h->a) : lr_rta_call(t, v->target, RQ_INST);
+    LoadPoint q = h->v[j].body ? (LoadPoint){ -1, -1 } : elab_point_of(t->c, h->v[j].node);
+    if (q.region == 0 && q.seq > t->s) all = 0;
+    else lr_rta_version(t, h, &h->v[j]);
   }
+  t->hreach[hi] = (unsigned char)all;
+}
+/* Does call id run when statement t->s runs, and at no other time: a node
+   of the statement's own (no def around it), in no lambda and in no block
+   but one that runs at once (elab_blocks_run_now), the statement in no
+   body that runs again (a loop's)? */
+static int lr_rta_once(LrRta *t, int id) {
+  const LrStmt *st = &t->r->st[t->s];
+  NodeKind sk = nt_kind(t->c->nt, st->node);
+  if (t->key[id] != t->s || st->rep >= 0 || sk == NK_WhileNode || sk == NK_UntilNode || !elab_blocks_run_now(t->c, id)) return 0;
+  const int *par = comp_parent_map(t->c);
+  for (int p = par[id]; p >= 0 && p != st->node; p = par[p]) if (nt_kind(t->c->nt, p) == NK_LambdaNode) return 0;
+  return 1;
 }
 /* every name (disp 0: every instance method of E, every singleton
    method), or what the runtime may call back (disp 1: the implicitly
@@ -4041,7 +4336,7 @@ static void lr_rta_node(LrRta *t, int id) {
     if ((m = m >= 0 ? elab_header_class(t->c, m, NULL, NULL) : LR_UNKNOWN_CLASS) >= 0) lr_rta_recv(t, m);
     else lr_rta_any(t);
   }
-  if (rc >= LR_MAIN) lr_rta_call_on(t, by, rc);   /* a method called, sent or made a callable by its name */
+  if (rc >= LR_MAIN) lr_rta_call_on(t, by, rc, by == nm && lr_rta_once(t, id));   /* a method called, sent or made a callable by its name */
   else lr_rta_call(t, by, RQ_INST | RQ_CLASS);
   if (lr_rta_ctor(t, by)) {
     lr_rta_made(t, id, recv);
@@ -4052,7 +4347,7 @@ static void lr_rta_node(LrRta *t, int id) {
   int ka = is_raise_alias(by) ? 0 : rk == NK_ConstantReadNode && is_timeout_call(nt_str(nt, recv, "name"), by) ? 1 : -1;
   ak = ka >= 0 && ka < ac ? nt_kind(nt, av[ka]) : NK_StringNode;
   if (ak == NK_ConstantReadNode || ak == NK_ConstantPathNode) {
-    if ((d = lr_rta_const(t, av[ka])) >= LR_MAIN) lr_rta_call_on(t, "exception", d);
+    if ((d = lr_rta_const(t, av[ka])) >= LR_MAIN) lr_rta_call_on(t, "exception", d, 0);
     lr_rta_made(t, id, av[ka]);
     lr_rta_call(t, "initialize", RQ_INST);
   }
@@ -4286,8 +4581,9 @@ void elab_window_open(Compiler *c, ElabWindow *w) {
 /* The owners whose histories can be in cls's ancestry: its superclass chain
    and the modules mixed into any of those, a module's own mixins too (at any
    time, so a superset of lr_in_ancestry's). -1 when that is not known: a
-   superclass or a mixin the record cannot resolve, code it cannot follow run
-   on one of them, or more owners than fit. A module's (mod) is itself and
+   superclass or a mixin the record cannot resolve, code it cannot follow
+   that may define (not one that only writes) run on one of them, or more
+   owners than fit. A module's (mod) is itself and
    Object, whose constants its lookup reaches, and their mixins. */
 static int lr_ancestry_owners(Compiler *c, int cls, int *out, int cap, int mod) {
   LoadRecord *r = c->lrec;
@@ -4299,7 +4595,7 @@ static int lr_ancestry_owners(Compiler *c, int cls, int *out, int cap, int mod) 
   if (mod && n == 1 && a == LR_UNKNOWN_CLASS && n < cap) out[n++] = LR_MAIN;
   if (a != LR_UNKNOWN_CLASS || out[n - 1] != LR_MAIN) return -1;
   for (int i = 0; i < n; i++) {
-    if (lr_hist(r, LR_KEY_OPAQUE, lr_const_owner(out[i]), "", 0)) return -1;
+    if (lr_opaque_defines(r, out[i])) return -1;
     const LrClass *kc = lr_class(r, out[i]);
     for (int j = 0; kc && j < kc->nmix; j++) {
       int mod = lr_mixin_class(c, &kc->mix[j]), have = 0;
@@ -4351,6 +4647,7 @@ static unsigned lr_unsettled_tables(Compiler *c, int cls, const int *owners, int
   unsigned un = 0;
   for (int i = 0; i < r->nhist; i++) {
     const LrHist *h = &r->hist[i];
+    if (lr_key_memo(h->a)) continue;
     int own = h->a == cls ? 1 : 0, core = h->a == LR_MAIN || lr_core_owner(c, h->a);
     for (int o = 0; o < n && !own && h->a >= LR_MAIN; o++) own = owners[o] == h->a ? 2 : 0;
     int sg = h->a == LR_KEY_CONST && h->b <= 0;   /* (a singleton class body's, or an owner not known) */
@@ -4531,7 +4828,7 @@ static void lr_span_take(Compiler *c, const LrHist *h, int cls, int sg, LoadPoin
   int had = s->m;
   for (int j = 0; j < h->n; j++) {
     const LrDef *v = &h->v[j];
-    if (!lr_is_version(v) || !lr_inside(c, v->node, p0, p1)) continue;
+    if (!lr_is_version(v) || (v->body ? lr_version_order(c, v, p1, 0) == PROG_AFTER : !lr_inside(c, v->node, p0, p1))) continue;
     LoadPoint q = elab_point_of(c, v->node);
     if (v->may || elab_cmp(p0, q) != PROG_BEFORE || elab_cmp(q, p1) != PROG_BEFORE) { s->any = 1; continue; }
     if (!(s->m & (s->m - 1)) && !(s->cp = realloc(s->cp, sizeof(int) * (size_t)(s->m ? 2 * s->m : 1)))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
@@ -4695,7 +4992,8 @@ static int lr_unplaced(Compiler *c, int node) {
 /* May what the record cannot order supply `name` on cls's chain (its
    singleton's when sg) at p: a version of the name a pass made, a mixin a
    pass made into a class on the chain, or code the record cannot follow
-   (a send, an eval of a String) run on one before p? */
+   (a send, an eval of a String) run on one before p, but code that only
+   writes (LR_OPAQUE_WRITES)? */
 static int lr_unordered_supply(Compiler *c, int cls, int sg, const char *name, LoadPoint p) {
   LoadRecord *r = c->lrec;
   const LrVers *x = lr_vers(r, name);
@@ -4710,7 +5008,7 @@ static int lr_unordered_supply(Compiler *c, int cls, int sg, const char *name, L
     for (int j = 0; kc && j < kc->nmix; j++)
       if (lr_unplaced(c, kc->mix[j].node)) return 1;
     for (int j = 0; op && j < op->n; j++)
-      if (elab_cmp(elab_point_of(c, op->v[j].node), p) != PROG_AFTER) return 1;
+      if (op->v[j].vis == LR_OPAQUE_DEFINES && elab_cmp(elab_point_of(c, op->v[j].node), p) != PROG_AFTER) return 1;
   }
   return 0;
 }
@@ -5689,9 +5987,6 @@ int elab_fire_after(Compiler *c, int list, int j) {
     const char *hook = lr_event_hook((LrKind)v->kind, v->sg);
     const LrDef *d = NULL;
     int live = body && v->stmt == e && lr_form_leads(nt, node, v->node) && lr_hook_live(c, v->cls, hook, p, &d);
-    /* a hook the record has only as the copy `extend self` stands for is
-       not one it can place: it runs where the extend does (the mixin form's) */
-    if (live && d && nt_int(nt, d->node, "extend_self", 0)) live = 0;
     /* a visibility word gives the class an entry of its own, and calls the
        hook, only for a method it does not hold itself and whose visibility
        it changes */
@@ -6362,6 +6657,54 @@ ElabEntry *elab_entries(Compiler *c, unsigned mask, int *n) {
   return out;
 }
 
+/* Does a class side's history hold an accessor version and end in a def? */
+static int lr_attr_then_def(const LrHist *h) {
+  int attr = 0, last = -1;
+  for (int j = 0; j < h->n; j++)
+    if (lr_is_version(&h->v[j])) {
+      attr |= h->v[j].kind == LR_READER || h->v[j].kind == LR_WRITER;
+      last = h->v[j].kind;
+    }
+  return attr && last == LR_DEF;
+}
+
+/* See analyze.h. */
+ElabEntry *elab_replaced_attrs(Compiler *c, int *n) {
+  LoadRecord *r = c->lrec;
+  ElabEntry *out = NULL;
+  int k = 0, cap = 0;
+  for (int i = 0; r && r->recorded && i < r->nhist; i++) {
+    const LrHist *h = &r->hist[i];
+    if (h->a < 0 || !h->b || !lr_attr_then_def(h)) continue;
+    for (int j = 0; j < h->n; j++) {
+      const LrDef *d = &h->v[j];
+      if ((d->kind != LR_READER && d->kind != LR_WRITER) || !lr_is_version(d)) continue;
+      out = lr_grow(out, &cap, k, sizeof *out);
+      out[k++] = (ElabEntry){ h->a, h->b, d->kind, d->node, h->name, NULL, d->scope };
+    }
+  }
+  *n = k;
+  return out;
+}
+
+/* See analyze.h. */
+void elab_attr_scope(Compiler *c, const ElabEntry *e, int scope) {
+  LrHist *h = c->lrec ? lr_hist(c->lrec, e->cls, e->sg, e->name, 0) : NULL;
+  for (int j = 0; h && j < h->n; j++)
+    if (h->v[j].node == e->node && h->v[j].kind == e->kind) h->v[j].scope = scope;
+}
+
+/* See analyze.h. */
+int elab_attr_replaced(Compiler *c, int cls, const char *name) {
+  LoadRecord *r = c->lrec;
+  const LrHist *h = r && r->recorded && cls >= 0 ? lr_hist(r, cls, 1, name, 0) : NULL;
+  for (int j = 0; h && j < h->n; j++)
+    if ((h->v[j].kind == LR_READER || h->v[j].kind == LR_WRITER) && h->v[j].scope) return 1;
+  return 0;
+}
+
+/* (every entry, one that only writes too: the macro splice in analyze_ct.c
+   runs code at compile time that may read the instance variable it wrote) */
 int elab_opaque_before(Compiler *c, int cls, LoadPoint p) {
   if (!lr_ready(c, p)) return ELAB_UNKNOWN;
   return lr_last_before(c, lr_hist(c->lrec, LR_KEY_OPAQUE, lr_const_owner(cls), "", 0), p, p.region < 0, 0, NULL);
@@ -6621,14 +6964,14 @@ void elab_dump(Compiler *c, FILE *out) {
   if (r->nhist) lr_run_points(c);
   for (int i = 0; i < r->nhist; i++) {
     const LrHist *h = &r->hist[i];
-    if (h->a == LR_KEY_DEFINES) continue;
-    if (h->a == LR_KEY_VIS) fprintf(out, "visibility in #%d:", elab_point_of(c, h->b).seq);
-    else if (h->a == LR_KEY_OPAQUE) fprintf(out, "opaque %s:", h->b >= 2 ? c->classes[h->b - 2].name : "main");
-    else if (h->a == LR_KEY_RUNS) {   /* only the forms that run the program's code */
+    if (h->a == LR_KEY_RUNS) {   /* only the forms that run the program's code */
       if (h->n && h->v[h->n - 1].vis != ELAB_NO)
         fprintf(out, "form #%d runs code%s\n", elab_point_of(c, h->b).seq, h->v[h->n - 1].vis == ELAB_YES && !h->v[h->n - 1].may ? "" : " (maybe)");
       continue;
     }
+    if (lr_key_memo(h->a)) continue;
+    if (h->a == LR_KEY_VIS) fprintf(out, "visibility in #%d:", elab_point_of(c, h->b).seq);
+    else if (h->a == LR_KEY_OPAQUE) fprintf(out, "opaque %s:", h->b >= 2 ? c->classes[h->b - 2].name : "main");
     else if ((h->a == LR_KEY_CONST || h->a == LR_KEY_AUTO) && h->b < 0)
       fprintf(out, "%s #<Class:%s>::%s:", h->a == LR_KEY_AUTO ? "autoload" : "const", lr_class_name(c, -h->b - 2), h->name);
     else if (h->a == LR_KEY_AUTO)   /* a registration, keyed by its owner as a constant is */
@@ -6640,7 +6983,13 @@ void elab_dump(Compiler *c, FILE *out) {
       const LrDef *v = &h->v[j];
       fprintf(out, " %s#%d%s%s%s", kinds[v->kind], elab_point_of(c, v->node).seq, v->may ? " may" : "", v->nil ? " nil" : "",
               v->unplaced ? " unplaced" : "");
-      if (v->kind == LR_DEF && h->a >= LR_MAIN && r->nregion == 1 && v->node < r->n && elab_method_versions(c, h->name) > 1)   /* lr_rta */
+      if (v->body) {   /* a method body's (LrDef.body): its extent, from that body's first statement on */
+        lr_run_points(c);
+        fprintf(out, " in def#%d", elab_point_of(c, v->body).seq);
+        int from = r->urun[v->body];   /* (0: a body lr_rta did not record, whose extent opens anywhere) */
+        from == LR_NEVER ? fputs(" from=never", out) : from ? fprintf(out, " from=#%d", from) : fputs(" from=?", out);
+      }
+      if (v->kind == LR_DEF && !v->body && h->a >= LR_MAIN && r->nregion == 1 && v->node < r->n && elab_method_versions(c, h->name) > 1)   /* lr_rta */
         r->urun[v->node] == LR_NEVER ? fputs(" runs=never", out) : fprintf(out, " runs=#%d", r->urun[v->node]);
       if (v->kind == LR_ALIAS && v->target) {   /* the version the alias takes, as the query answers it */
         const LrDef *d = NULL;
@@ -6838,9 +7187,12 @@ void elab_free(Compiler *c) {
     fprintf(stderr, "spinel-elab-check: family=\"%s\" asked=%ld differ=%ld\n", r->fam[i].reader, r->fam[i].asked, r->fam[i].differ);
   lr_record_drop(r);
   free(r->plan.st); free(r->plan.at); free(r->plan.bits); free(r->plan_par); free(r->up);
+  free(r->plan.rend); free(r->plan.rinst); free(r->plan.urun);
   for (int i = 0; i < r->nnames; i++) free(r->names[i]);
   for (int i = 0; i < r->nreopens; i++) free(r->reopens[i]);
   for (int i = 0; i < r->nrefl; i++) free(r->refl[i]);
+  for (int i = 0; i < r->nrefl_table; i++) free(r->refl_table[i]);
+  free(r->refl_table);
   free(r->names); free(r->defs); free(r->reopens); free(r->refl);
   for (int i = 0; i < r->nsrcw; i++) free(r->srcw[i].name);
   free(r->srcw);
@@ -6878,8 +7230,7 @@ static int host_id_cmp(const void *a, const void *b) {
    query of the walk has taken over (the precondition rule, H3-PLAN 2.4), or
    -1: an ffi declaration (desugar_ffi_library_functions,
    desugar_native_func_defs), a mixin (desugar_included_hooks,
-   desugar_explicit_receiver_mixin, desugar_extend_self,
-   desugar_extend_enumerable), a class builder (desugar_class_new_blocks,
+   desugar_explicit_receiver_mixin, desugar_extend_enumerable), a class builder (desugar_class_new_blocks,
    desugar_inline_struct_blocks), const_get (desugar_literal_const_get,
    desugar_self_const_get, desugar_dynamic_const_get), a write through a
    constant path (desugar_constant_path_self_alias, qualify_colliding_consts),

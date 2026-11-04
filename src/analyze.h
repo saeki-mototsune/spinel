@@ -239,10 +239,17 @@ typedef struct {
   unsigned char unplaced; /* in a body the walk does not place (a builder's
                              block, lr_body_defs): no version, and no query
                              at a point sees it */
+  int body;             /* a version a method body makes (lr_body_versions):
+                           the def whose body holds it; such a version has
+                           no load point but an extent, from the first
+                           statement that body may run on, any number of
+                           times (lr_version_order); 0 for one at a point */
   int scope;            /* a def's or a define_method's: the method scope
                            the scope walk made of it (its Scope index; 0,
                            the program's top level, for none); a
-                           module_function copy's of one, that one's */
+                           module_function copy's of one, that one's; a
+                           class-side accessor's that a def replaces, the
+                           method made of it (elab_attr_scope) */
 } LrDef;
 typedef struct { int node, body; } LrOpen;
 typedef enum { LR_INCLUDE, LR_EXTEND, LR_PREPEND, LR_SG_PREPEND } LrMixKind;   /* LR_SG_PREPEND: a prepend of the singleton class, ahead of its own methods */
@@ -351,10 +358,14 @@ int elab_method_versions(Compiler *c, const char *name);
    main's) history of it hold more than one version, or an alias, which
    names the version it captured? */
 int elab_method_replaced(Compiler *c, const char *name);
-/* does a call of `name`, whose versions the record holds in one history,
-   run, or open the window of the bodies around it, ahead of the first
-   version, where the name is absent? */
+/* does a call of `name` run, or open the window of the bodies around it,
+   ahead of the first version of one of its histories, where the name is
+   absent on that class and side? */
 int elab_method_late(Compiler *c, const char *name);
+/* Does a reflection reader that answers from the method table (respond_to?,
+   method_defined?, defined?, a list of methods: not a Method's maker) name
+   `name`, or one name any (lr_refl_take)? */
+int elab_method_reflected(Compiler *c, const char *name);
 /* The record's histories of method `name`, one class and side at a time:
    the first with i -1, then the one after i; -1 past the last. *cls the
    class (-1 main's), *sg 1 for its singleton side. */
@@ -426,13 +437,15 @@ void elab_window_open(Compiler *c, ElabWindow *w);
    elsewhere or the record cannot order, the changes of more than one
    history in a body that runs again, a stretch whose version the record
    cannot tell); -1 when cls's chain moves inside w (a mixin of a module
-   that has or may have the name, code the record cannot follow). */
+   that has or may have the name, code the record cannot follow that may
+   define). */
 enum { ELAB_SPAN_ANY = -2 };
 int elab_method_span(Compiler *c, int cls, const char *name, int sg, const ElabWindow *w, const LrDef **out, int cap);
 /* does cls's chain (its singleton's when sg) hold still for `name` from p
    to the load's end: each mixin of a module that has or may have the name
    into a class on it ran before p for certain, and no code the record
-   cannot follow runs on one of them? Then the chain the record holds at
+   cannot follow that may define (not one that only writes) runs on one of
+   them? Then the chain the record holds at
    the load's end (elab_chain_versions) is the one a call after p meets. */
 int elab_chain_settled(Compiler *c, int cls, int sg, const char *name, LoadPoint p);
 /* the versions of cls's method `name` (singleton when sg) in the histories
@@ -446,6 +459,13 @@ int elab_chain_settled(Compiler *c, int cls, int sg, const char *name, LoadPoint
    not hold, a mixin's module is not known, or past cap. */
 typedef struct { const LrDef *v; int hist, n; } ElabVersion;
 int elab_chain_versions(Compiler *c, int cls, int sg, const char *name, ElabVersion *out, int cap);
+/* the late bit of the histories of `name` that versions vs[0..n) are in
+   (elab_chain_versions): 2 where a call may run ahead of the first version
+   of one of them, 3 where none is but one was not asked (a name a
+   builtin's method answers, an instance-side history of a name of two or
+   more, one a reflection reader names), else 1; for n -1, the name's: 2
+   where one of its histories is, else 3 */
+int elab_versions_late(Compiler *c, const char *name, const ElabVersion *vs, int n);
 /* ...and the versions of cls's own history of `name` alone, numbered as
    there */
 int elab_history_versions(Compiler *c, int cls, int sg, const char *name, ElabVersion *out, int cap);
@@ -638,6 +658,16 @@ typedef struct { int cls, sg, kind, node; const char *name, *target; int scope; 
    time (lr_stmt_applied: 2) */
 enum { ELAB_ENTRY_MAY = 1 << 30 };
 ElabEntry *elab_entries(Compiler *c, unsigned mask, int *n);
+/* The class-side accessor versions of each history that ends in a def
+   (`class << self; attr_writer :cfg; end`, then `def self.cfg=`): a call
+   that runs while one is live runs the accessor, any other the def, so
+   each is a version of its own, a method register_attr_versions makes and
+   elab_attr_scope links to it (LrDef.scope); *n of them, the caller frees
+   the array. An accessor no def follows stays its class's slot alone. */
+ElabEntry *elab_replaced_attrs(Compiler *c, int *n);
+void elab_attr_scope(Compiler *c, const ElabEntry *e, int scope);
+/* does class cls's own side hold such an accessor version of name? */
+int elab_attr_replaced(Compiler *c, int cls, const char *name);
 /* did code the record cannot follow (a send, an eval of a String, a mixin
    of a module it does not know, a computed method name, a method of the
    program its body calls) run on cls before p? */
@@ -724,6 +754,10 @@ int fresh_array_builtin_name(const char *nm);
 /* the value of node n is dropped where it is: a statement's, a loop
    body's, an ensure clause's (an_value_dropped, analyze_infer.c) */
 int an_node_dropped(Compiler *c, int n);
+/* the outermost node whose value node n's value is, through conditionals'
+   arms and the right of `&&` or `||`; -1 past the tested left of `||`
+   (an_value_top, analyze_infer.c) */
+int an_value_top(Compiler *c, int n);
 /* True if a regex source contains a capturing group: an unescaped '(' that
    isn't the start of a non-capturing/extension group '(?...'. scan returns
    nested arrays for capturing patterns, which the str_array path can't model. */
@@ -1020,6 +1054,16 @@ int block_keyword_default(Compiler *c, int block, int idx);
    block from a nested proc/lambda literal. */
 int is_proc_constant(const NodeTable *nt, int n);
 int is_proc_literal(Compiler *c, int id);
+/* Can the callable call id forwards (`a.m(&b)`) be nil at run time? The
+   enclosing method's own block is where some call enters the method
+   without a block or with a callable that may be nil, read from every
+   call that reaches it (its name or an alias's, a `super`, a send; a
+   Method of it or a computed name may enter it either way); a Symbol, a
+   proc or lambda literal, a method(:x) and a local every write of which
+   is one, written as a statement of its method's or file's body, are not;
+   any other value (a parameter, an ivar, a call's answer, a local set
+   under a branch) may be. */
+int an_fwd_block_may_be_nil(Compiler *c, int id);
 /* A `Hash.new { }` default block lowered to a real proc (analyze_util.c);
    codegen emits it that way. */
 int hash_new_block_is_proc(Compiler *c, int id);
@@ -1045,6 +1089,7 @@ int an_object_methods_listable(Compiler *c, int cid, const char *name);
 int an_module_methods_listable(Compiler *c, int m, const char *name);
 int an_module_defines(Compiler *c, int m, const char *nm, int *vis);
 int an_object_methods_all_arg(Compiler *c, int cid, int argc, const int *argv);
+int an_poly_object_methods_listable(Compiler *c, int id, const char *name, int argc, const int *argv);   /* a boxed receiver's list, per class it can hold */
 /* obj.methods / public_methods on a builtin value: the core class it lists as */
 const char *an_value_methods_class(Compiler *c, int recv, TyKind rt, const char *name, int argc,
                                    const int *argv);
@@ -1064,6 +1109,11 @@ void ie_body_restore(Compiler *c, int *snap);
 int ie_call_kwhash(Compiler *c, int id);
 size_t block_param_written_len(const Compiler *c, const char *name);
 size_t reassigned_param_written_len(const Compiler *c, const char *name);
+size_t param_written_len(const Compiler *c, const char *n);
+/* What a parameter node the desugar made or named stands for, as its
+   "desugared_param" mark says (desugared_param_name) */
+enum { DPN_OWN, DPN_WRITTEN, DPN_NAMELESS, DPN_NONE };
+int desugared_param_name(const NodeTable *nt, int p, const char **written);
 int block_param_is_renamed(const Compiler *c, const char *name);
 int block_param_made_for(const Compiler *c, const char *name, int blk);   /* an invented name of that block */
 char *block_param_invent_name(Compiler *c, const char *written, int blk);

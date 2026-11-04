@@ -106,6 +106,7 @@ static void pa_arm_text(Compiler *c, const PolyArm *a, char *out, size_t n) {
                                      "strftime", "aref-str", "aref-sym", "aref-poly", "predicate(arg)",
                                      "default generic", "default replace", "default round(n)",
                                      "default numeric(n)", "default str-index", "default find_index",
+                                     "default upto/downto",
                                      "default first/last(n)", "default delete/dig/values_at",
                                      "default merge", "default aref2", "default aref/fetch",
                                      "block map!", "subclass re-entry", "array re-entry",
@@ -1829,20 +1830,43 @@ int emit_poly_obj_default0(Compiler *c, int id, const char *name, int argc, TyKi
       else if (obj_mi >= 0 && obj_def == obj_cls && c->scopes[obj_mi].nrequired == 0 &&
           scope_has_callable_symbol(c, obj_mi)) {
         /* an optional parameter takes its default, spelled with the
-           boxed receiver as self */
+           boxed receiver as self. What a default puts ahead of the call (a
+           temp of its own, an earlier parameter it reads) is this arm's
+           alone, in a block of the arm: in the statement's prelude it ran
+           for a value of every class, or named a temp the prelude never
+           declared. A default that reads an earlier parameter reads it
+           from that parameter's temp (emit_pd_param_bind), as a direct
+           call's does. */
+        Scope *om = &c->scopes[obj_mi];
         Buf ob; memset(&ob, 0, sizeof ob);
-        buf_printf(&ob, "%s(_t%d", mc_method(c, &c->scopes[obj_mi]), tv);
+        Buf apre; memset(&apre, 0, sizeof apre);
+        buf_printf(&ob, "%s(_t%d", mc_method(c, om), tv);
         { const char *saved_self = g_self;
           char oselfbuf[32]; snprintf(oselfbuf, sizeof oselfbuf, "_t%d", tv);
           g_self = oselfbuf;
-          for (int a = 0; a < c->scopes[obj_mi].nparams; a++) {
-            buf_puts(&ob, ", "); emit_arg_or_default(c, &c->scopes[obj_mi], a, -1, &ob);
+          Buf *sv_pre = g_pre; g_pre = &apre;
+          int sibling = om->nparams <= 64 && default_refs_earlier_param(c, om);
+          int uid = sibling ? ++g_tmp : 0, ren_base = g_nren;
+          char tn[64][64];
+          for (int a = 0; a < om->nparams; a++) {
+            if (!sibling) { buf_puts(&ob, ", "); emit_arg_or_default(c, om, a, -1, &ob); continue; }
+            Buf vb; memset(&vb, 0, sizeof vb);
+            emit_arg_or_default(c, om, a, -1, &vb);
+            emit_pd_param_bind(c, om, a, uid, vb.p, tn[a], sizeof tn[a]);
+            free(vb.p);
           }
+          if (sibling) {
+            emit_pd_cell_copyback(c, om, uid, tn);
+            for (int a = 0; a < om->nparams; a++) { buf_puts(&ob, ", "); buf_puts(&ob, tn[a]); }
+          }
+          g_nren = ren_base;
+          g_pre = sv_pre;
           g_self = saved_self; }
-        emit_trailing_blk_arg(c, &c->scopes[obj_mi], id, (*blk_tmp0), &ob);
+        emit_trailing_blk_arg(c, om, id, (*blk_tmp0), &ob);
         buf_puts(&ob, ")");
         const char *ocall = ob.p;
         buf_puts(b, " default: ");
+        if (apre.p && apre.p[0]) { buf_puts(b, "{ "); buf_puts(b, apre.p); }
         int pconv = PC_SAME;
         if (method_is_void(&c->scopes[obj_mi])) { buf_puts(b, ocall); pconv = PC_VOID; }
         else {
@@ -1861,7 +1885,9 @@ int emit_poly_obj_default0(Compiler *c, int id, const char *name, int argc, TyKi
           else if (method_ret_is_oint(&c->scopes[obj_mi])) buf_printf(b, "%s(%s)", oint_arg(c->scopes[obj_mi].ret), ocall);
           else plan_put_plain(so, ret, ocall, b);
         }
+        if (apre.p && apre.p[0]) buf_puts(b, "; }");
         buf_puts(b, "; break;");
+        free(apre.p);
         free(ob.p);
         done = 1;
         if (g_plan_check) pa_observe(PA_USER, PA_KEY_DEFAULT, obj_mi, c->scopes[obj_mi].ret, pconv);
@@ -1915,12 +1941,16 @@ int poly_key_cls0(Compiler *c, int call, const char *name, int argc, int kwh, in
    dispatch of call `call`? The key then maps a runtime tag to its class
    (#4219). */
 int poly_key_prim(Compiler *c, int call, const char *name, int argc, int kwh, int pos_argc, int splat_a) {
-  /* a reopening without the method takes no arm: the name's candidates */
-  int npc = 0;
-  const PolyCand *pcs = comp_poly_candidates(c, name, &npc);
-  for (int ki = 0; ki < npc; ki++) {
-    int k = pcs[ki].cls;
-    if (!class_is_prim_reopen(c, k)) continue;
+  /* a reopening without the method takes no arm: only one of the name's
+     candidates (a class whose chain has the method or a reader,
+     comp_poly_candidates), asked of the primitive reopenings alone, which
+     are few, where every candidate of the name was asked (#10546) */
+  IMEMO_DEP_GLOBAL();   /* (the candidates are read over every class) */
+  int npk = 0;
+  const int *pks = comp_prim_reopen_classes(c, &npk);
+  for (int ki = 0; ki < npk; ki++) {
+    int k = pks[ki];
+    if (comp_method_in_chain(c, k, name, NULL) < 0 && !comp_reader_in_chain(c, k, name, NULL)) continue;
     int pmi = call_target(c, call, k, name, 0, NULL);
     char pexp[600];
     if (pmi < 0) continue;
@@ -4809,6 +4839,21 @@ void emit_poly_defaults_n(Compiler *c, int id, int recv, const char *name, const
                  tr, tv, rb9.p ? rb9.p : "sp_box_nil()");
       free(rb9.p);
     }
+    /* blockless upto / downto: a class defining the name took the
+       dispatch, and the Integer (a promote-mode sum is boxed) or String in
+       the same slot fell to the raise below (tzinfo's `(year + 1).upto(n)`
+       beside the date package's Date#upto) */
+    else if ((sp_streq(name, "upto") || sp_streq(name, "downto")) && argc == 1 && pos_argc == 1 &&
+             splat_a < 0 && blk_tmp2 < 0 && nt_ref(nt, id, "block") < 0 && ret == TY_POLY) {
+      Buf ub; memset(&ub, 0, sizeof ub);
+      { char tn[32]; snprintf(tn, sizeof tn, "_t%d", atmp[0]);
+        if (atmp_ty[0] == TY_POLY) buf_puts(&ub, tn);
+        else emit_boxed_text(c, atmp_ty[0], tn, &ub); }
+      buf_printf(b, " _t%d = sp_poly_upto_enum(_t%d, %s, %d); break;",
+                 tr, tv, ub.p ? ub.p : "sp_box_nil()", sp_streq(name, "upto"));
+      free(ub.p);
+      if (g_plan_check) pa_observe(PA_BUILTIN, PA_KEY_BUILTIN + PB_ND_UPTO, -1, TY_UNKNOWN, PC_SAME);
+    }
     /* round(n) / ceil(n) / floor(n) / truncate(n): a class defining
        `round(digits)` took over the name, and the Integer or Float in
        the same slot fell to the raise below (#4532). The zero-arg forms
@@ -5201,6 +5246,15 @@ void emit_poly_last_default(Compiler *c, int id, int recv, const char *name, int
    each_cons, the repeated pair), 0 for any other. */
 int poly_redispatch_kind(Compiler *c, int id, const char *name, int argc) {
   const NodeTable *nt = c->nt;
+  /* A callable forwarded to a name the enumerable driver serves
+     (`xs.sort_by(&f)`) has no block body for the array emitters to splice:
+     re-entered as an Array call, it found no emitter and raised
+     NoMethodError naming Array. The driver takes it, where it answers for
+     every value the receiver holds (cplan_driver_walks_recv). A literal
+     block the forward resolves to (a spliced caller's) is spliced. */
+  int blk = nt_ref(nt, id, "block"), rfb = resolve_forwarded_block(c, blk);
+  if (blk >= 0 && nt_kind(nt, blk) == NK_BlockArgumentNode && (rfb < 0 || nt_kind(nt, rfb) == NK_BlockArgumentNode) &&
+      argc == 0 && poly_enum_op_for(name) && cplan_driver_walks_recv(c, id)) return 0;
   int takes = (nt_ref(nt, id, "block") >= 0 && sp_streq(name, "sort_by")) ||
        /* and the COMPARATOR-block forms. `sort` blockless has an arm of its
           own above; with a block it had none, so a method whose parameter

@@ -45,105 +45,136 @@ static void emit_bm_legacy_casts_boxed(Compiler *c, int tr, int eargc, const int
   buf_puts(b, ")");
 }
 
-/* Push [kind, name] pairs for the parameters node pn4 onto the PolyArray
-   _t<tr4>, in CRuby's order: req, opt, rest, post-req, key(req), keyrest,
-   block. Shared by Method#parameters and the reflection table
-   (sp_refl_instance_method_parameters). */
-void emit_method_parameters_pushes(Compiler *c, int pn4, int tr4, Buf *b) {
-  const NodeTable *nt = c->nt;
-  if (pn4 >= 0) {
-    int ca = nt_int(nt, pn4, "cext_arity", -99);
-    if (ca != -99) {
-      int count = ca < 0 ? 1 : ca;
-      for (int i = 0; i < count; i++) {
-        int tp = ++g_tmp;
-        buf_printf(b, " { sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d); sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", tp, tp, tp);
-        emit_str_literal(b, ca < 0 ? "rest" : "req");
-        buf_printf(b, "))); sp_PolyArray_push(_t%d, sp_box_poly_array(_t%d)); }", tr4, tp);
-      }
-      return;
-    }
-    /* CRuby order: req, opt, rest, post-req, key(req), keyrest, block */
-    static const struct { const char *arr; const char *kind; const char *optkind; } PKINDS[] = {
-      { "requireds", "req", NULL }, { "optionals", "opt", NULL },
-      { "rest", NULL, NULL },   /* placeholder: rest emitted in this slot */
-      { "posts", "req", NULL }, { "keywords", "keyreq", "key" },
-    };
-    for (size_t pk = 0; pk < sizeof PKINDS / sizeof PKINDS[0]; pk++) {
-      if (!PKINDS[pk].kind) {   /* the rest param, in CRuby's slot */
-        int rest4 = nt_ref(nt, pn4, "rest");
-        if (rest4 >= 0 && nt_str(nt, rest4, "name")) {
-          int tp4 = ++g_tmp;
-          buf_printf(b, " { sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
-                        " sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", tp4, tp4, tp4);
-          emit_str_literal(b, "rest");
-          buf_printf(b, ")));"
-                        " sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", tp4);
-          emit_str_literal(b, sp_streq(nt_str(nt, rest4, "name"), "__anon_rest") ? "*" : nt_str(nt, rest4, "name"));
-          buf_printf(b, ")));"
-                        " sp_PolyArray_push(_t%d, sp_box_poly_array(_t%d)); }", tr4, tp4);
-        }
-        continue;
-      }
-      int an4 = 0; const int *av4 = nt_arr(nt, pn4, PKINDS[pk].arr, &an4);
-      for (int e4 = 0; e4 < an4; e4++) {
-        const char *pnm4 = nt_str(nt, av4[e4], "name");
-        if (!pnm4) continue;
-        const char *kind4 = PKINDS[pk].kind;
-        if (PKINDS[pk].optkind) {
-          NodeKind ety4_k = nt_kind(nt, av4[e4]);
-          if (ety4_k == NK_OptionalKeywordParameterNode) kind4 = PKINDS[pk].optkind;
-        }
-        int tp4 = ++g_tmp;
-        buf_printf(b, " { sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
-                      " sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", tp4, tp4, tp4);
-        emit_str_literal(b, kind4);
-        buf_printf(b, ")));"
-                      " sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", tp4);
-        emit_str_literal(b, pnm4);
-        buf_printf(b, ")));"
-                      " sp_PolyArray_push(_t%d, sp_box_poly_array(_t%d)); }", tr4, tp4);
-      }
-    }
-    int kwr4 = nt_ref(nt, pn4, "keyword_rest");
-    if (kwr4 >= 0 && nt_str(nt, kwr4, "name")) {
-      int tp4 = ++g_tmp;
-      buf_printf(b, " { sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
-                    " sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", tp4, tp4, tp4);
-      emit_str_literal(b, "keyrest");
-      buf_printf(b, ")));"
-                    " sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", tp4);
-      emit_str_literal(b, sp_streq(nt_str(nt, kwr4, "name"), "__anon_kwrest") ? "**" : nt_str(nt, kwr4, "name"));
-      buf_printf(b, ")));"
-                    " sp_PolyArray_push(_t%d, sp_box_poly_array(_t%d)); }", tr4, tp4);
-    }
-    int blk4 = nt_ref(nt, pn4, "block");
-    if (blk4 >= 0 && nt_str(nt, blk4, "name")) {
-      int tp4 = ++g_tmp;
-      buf_printf(b, " { sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
-                    " sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", tp4, tp4, tp4);
-      emit_str_literal(b, "block");
-      buf_printf(b, ")));"
-                    " sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", tp4);
-      /* an anonymous `&` carries a synthetic name (desugar_anon_block_param);
-         CRuby reports it as :& */
-      const char *bnm4 = nt_str(nt, blk4, "name");
-      emit_str_literal(b, sp_streq(bnm4, "__anon_block") ? "&" : bnm4);
-      buf_printf(b, ")));"
-                    " sp_PolyArray_push(_t%d, sp_box_poly_array(_t%d)); }", tr4, tp4);
-    }
+/* One entry of Method#parameters: its kind and its name, len bytes at name
+   (NULL: none) */
+typedef struct { const char *kind, *name; size_t len; } MethodParam;
+static void method_param_add_n(MethodParam **v, int *n, int *cap, const char *kind, const char *name, size_t len) {
+  if (*n == *cap) {
+    *cap = *cap ? *cap * 2 : 8;
+    *v = realloc(*v, sizeof(MethodParam) * (size_t)*cap);
+    if (!*v) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  (*v)[(*n)++] = (MethodParam){ kind, name, len };
+}
+/* Add the entry of parameter node p: the name the program wrote for it
+   (desugared_param_name, param_written_len), none for a destructuring
+   group's, no entry for a parameter the desugar made that is none */
+static void method_param_add(Compiler *c, MethodParam **v, int *n, int *cap, const char *kind, int p) {
+  const char *w = NULL, *slot = nt_str(c->nt, p, "name");
+  switch (slot ? desugared_param_name(c->nt, p, &w) : DPN_NAMELESS) {
+  case DPN_NONE: return;
+  case DPN_NAMELESS: method_param_add_n(v, n, cap, kind, NULL, 0); return;
+  case DPN_WRITTEN: method_param_add_n(v, n, cap, kind, w, strlen(w)); return;
+  default: method_param_add_n(v, n, cap, kind, slot, param_written_len(c, slot)); return;
   }
 }
 
+/* The #parameters entries of the parameters node pn4 (-1: none), in CRuby's
+   order: req, opt, rest, post-req, key(req), keyrest, block, each by the
+   name the program wrote (method_param_add); a destructuring group has
+   none, and neither has a C extension's method. Returns the count; *out is
+   malloc'd. */
+static int method_params_of(Compiler *c, int pn4, MethodParam **out) {
+  const NodeTable *nt = c->nt;
+  MethodParam *v = NULL;
+  int n = 0, cap = 0;
+  *out = NULL;
+  if (pn4 < 0) return 0;
+  int ca = nt_int(nt, pn4, "cext_arity", -99);
+  if (ca != -99) {
+    int count = ca < 0 ? 1 : ca;
+    for (int i = 0; i < count; i++) method_param_add_n(&v, &n, &cap, ca < 0 ? "rest" : "req", NULL, 0);
+    *out = v;
+    return n;
+  }
+  static const struct { const char *arr; const char *kind; const char *optkind; } PKINDS[] = {
+    { "requireds", "req", NULL }, { "optionals", "opt", NULL },
+    { "rest", NULL, NULL },   /* placeholder: rest emitted in this slot */
+    { "posts", "req", NULL }, { "keywords", "keyreq", "key" },
+  };
+  for (size_t pk = 0; pk < sizeof PKINDS / sizeof PKINDS[0]; pk++) {
+    if (!PKINDS[pk].kind) {   /* the rest param, in CRuby's slot */
+      int rest4 = nt_ref(nt, pn4, "rest");
+      if (rest4 >= 0 && nt_str(nt, rest4, "name")) method_param_add(c, &v, &n, &cap, "rest", rest4);
+      continue;
+    }
+    int an4 = 0; const int *av4 = nt_arr(nt, pn4, PKINDS[pk].arr, &an4);
+    for (int e4 = 0; e4 < an4; e4++) {
+      const char *pnm4 = nt_str(nt, av4[e4], "name");
+      /* a destructuring group (`def d((x, y), z)`) has no name of its own */
+      if (!pnm4 && nt_kind(nt, av4[e4]) != NK_MultiTargetNode) continue;
+      const char *kind4 = PKINDS[pk].kind;
+      if (PKINDS[pk].optkind && nt_kind(nt, av4[e4]) == NK_OptionalKeywordParameterNode) kind4 = PKINDS[pk].optkind;
+      method_param_add(c, &v, &n, &cap, kind4, av4[e4]);
+    }
+  }
+  int kwr4 = nt_ref(nt, pn4, "keyword_rest");
+  if (kwr4 >= 0 && nt_str(nt, kwr4, "name")) method_param_add(c, &v, &n, &cap, "keyrest", kwr4);
+  int blk4 = nt_ref(nt, pn4, "block");
+  if (blk4 >= 0 && nt_str(nt, blk4, "name")) method_param_add(c, &v, &n, &cap, "block", blk4);
+  *out = v;
+  return n;
+}
+
+/* The parameters node of method mi: its def's, or a define_method's
+   block's (inside its BlockParametersNode); -1 for none */
+static int scope_params_node(Compiler *c, int mi) {
+  const NodeTable *nt = c->nt;
+  int dn = mi >= 0 ? c->scopes[mi].def_node : -1;
+  if (dn >= 0 && nt_kind(nt, dn) == NK_CallNode) dn = nt_ref(nt, dn, "block");
+  int pn = dn >= 0 ? nt_ref(nt, dn, "parameters") : -1;
+  return pn >= 0 && nt_kind(nt, pn) == NK_BlockParametersNode ? nt_ref(nt, pn, "parameters") : pn;
+}
+
+/* The #parameters entries of method mi. A method made of an accessor
+   (Scope.attr_version) answers CRuby's accessor list, not its synthesized
+   def's: a writer's one parameter has no name ([[:req]]), a reader has
+   none ([]). */
+static int scope_method_params(Compiler *c, int mi, MethodParam **out) {
+  if (mi >= 0 && c->scopes[mi].attr_version) {
+    MethodParam *v = NULL;
+    int n = 0, cap = 0;
+    for (int i = 0; i < c->scopes[mi].nparams; i++) method_param_add_n(&v, &n, &cap, "req", NULL, 0);
+    *out = v;
+    return n;
+  }
+  return method_params_of(c, scope_params_node(c, mi), out);
+}
+
+/* Push the entries v[0..n) onto the PolyArray _t<tr4>, as [kind, name], or
+   [kind] for one with no name */
+static void emit_method_params_pushes(const MethodParam *v, int n, int tr4, Buf *b) {
+  for (int i = 0; i < n; i++) {
+    int tp = ++g_tmp;
+    buf_printf(b, " { sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
+                  " sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", tp, tp, tp);
+    emit_str_literal(b, v[i].kind);
+    buf_puts(b, ")));");
+    if (v[i].name) {
+      buf_printf(b, " sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", tp);
+      emit_str_literal_n(b, v[i].name, v[i].len, 0);
+      buf_puts(b, ")));");
+    }
+    buf_printf(b, " sp_PolyArray_push(_t%d, sp_box_poly_array(_t%d)); }", tr4, tp);
+  }
+}
+
+/* Push the #parameters entries of method mi onto the PolyArray _t<tr4>.
+   Shared by Method#parameters and the reflection table
+   (sp_refl_instance_method_parameters). */
+void emit_scope_parameters_pushes(Compiler *c, int mi, int tr4, Buf *b) {
+  MethodParam *v;
+  int n = scope_method_params(c, mi, &v);
+  emit_method_params_pushes(v, n, tr4, b);
+  free(v);
+}
 
 /* "#<Method: Owner#name(a, b=..., *r, k:, o: ..., **kw, &blk)>" -- CRuby's
    Method#inspect rendering, built at compile time from the target scope and
    emitted as a C string literal; " file:line" is appended when positions
-   were stamped (--line-map). sp_bm_parameters reads Method#parameters back
-   from it, so a keyword is written as CRuby writes it (`k:`, `o: ...`), not
-   as a positional. The text grows with the parameter names, so it is built
-   in a Buf: a fixed array cut it off, and wrote past its end once the names
-   filled it. */
+   were stamped (--line-map). The text grows with the parameter names, so it
+   is built in a Buf: a fixed array cut it off, and wrote past its end once
+   the names filled it. */
 static void emit_method_desc_literal(Compiler *c, int mi, const char *sym, int unbound, Buf *b) {
   Scope *m = &c->scopes[mi];
   const char *ow = "Object"; char sep = '#';
@@ -159,7 +190,9 @@ static void emit_method_desc_literal(Compiler *c, int mi, const char *sym, int u
   for (int i = 0; i < m->nparams; i++) {
     if (!m->pnames[i]) continue;
     if (i) buf_puts(&d, ", ");
-    if (i == m->rest_idx) buf_printf(&d, "*%s", m->pnames[i]);
+    /* a method made of an accessor: its parameter has no name (`x=(_)`) */
+    if (m->attr_version) buf_puts(&d, "_");
+    else if (i == m->rest_idx) buf_printf(&d, "*%s", m->pnames[i]);
     else if (i == m->kwrest_idx) buf_printf(&d, "**%s", m->pnames[i]);
     else if (callee_param_is_declared_kwarg(c, m, m->pnames[i]))
       buf_printf(&d, m->pdefault[i] >= 0 ? "%s: ..." : "%s:", m->pnames[i]);
@@ -175,6 +208,29 @@ static void emit_method_desc_literal(Compiler *c, int mi, const char *sym, int u
   buf_puts(&d, ">");
   emit_str_literal(b, d.p);
   free(d.p);
+}
+
+/* Method#parameters of method mi as sp_BoundMethod.params carries it: a C
+   string literal of "kind[:name]" entries separated by spaces */
+static void emit_method_params_literal(Compiler *c, int mi, Buf *b) {
+  MethodParam *v;
+  int n = scope_method_params(c, mi, &v);
+  Buf d; memset(&d, 0, sizeof d);
+  for (int i = 0; i < n; i++) {
+    buf_printf(&d, "%s%s", i ? " " : "", v[i].kind);
+    if (v[i].name) buf_printf(&d, ":%.*s", (int)v[i].len, v[i].name);
+  }
+  emit_str_literal(b, d.p ? d.p : "");
+  free(d.p);
+  free(v);
+}
+
+/* The descriptor arguments of sp_bound_method_new_d for method mi: its
+   rendering, then its parameter list */
+static void emit_method_desc_args(Compiler *c, int mi, const char *sym, int unbound, Buf *b) {
+  emit_method_desc_literal(c, mi, sym, unbound, b);
+  buf_puts(b, ", ");
+  emit_method_params_literal(c, mi, b);
 }
 
 /* Proc#parameters. parameters() follows the receiver's own nature; an explicit
@@ -245,7 +301,7 @@ int emit_op_proc_source_location(Compiler *c, const BopCtx *x, Buf *b) {
     if (!fn) fn = nt->source_file;
     if (!fn) fn = "?";
     int ta = ++g_tmp;
-    buf_printf(b, "({ (void)("); emit_expr(c, recv, b);
+    buf_printf(b, "({ (void)("); emit_expr_for_effect(c, recv, b);
     buf_printf(b, "); sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);", ta, ta);
     buf_printf(b, " sp_PolyArray_push(_t%d, sp_box_str(", ta); emit_str_literal(b, fn); buf_puts(b, "));");
     buf_printf(b, " sp_PolyArray_push(_t%d, sp_box_int(%d));", ta, nl);
@@ -265,10 +321,8 @@ int emit_op_method_unbind(Compiler *c, const BopCtx *x, Buf *b) {
   buf_printf(b, "({ sp_BoundMethod *_t%d = ", tvu);
   emit_expr(c, recv, b);
   buf_printf(b, "; sp_bm_set_unbound(sp_bm_set_abi(sp_bound_method_new_d(NULL, SP_BM_SELF_NONE, _t%d->fn, _t%d->name, _t%d->arity, ", tvu, tvu, tvu);
-  if (tmu >= 0) {
-    emit_method_desc_literal(c, tmu, method_sym_arg(c, mnu), 1, b);
-  }
-  else buf_puts(b, "NULL");
+  if (tmu >= 0) emit_method_desc_args(c, tmu, method_sym_arg(c, mnu), 1, b);
+  else buf_printf(b, "NULL, _t%d->params", tvu);
   buf_printf(b, "), 0, _t%d->legacy_int_abi, _t%d->legacy_sig, _t%d->legacy_fixed, _t%d->legacy_rest, _t%d->legacy_ret, _t%d->poly_abi, _t%d->poly_fixed)); })", tvu, tvu, tvu, tvu, tvu, tvu, tvu);
   return 1;
   return 0;
@@ -302,7 +356,7 @@ int emit_op_method_super_method(Compiler *c, const BopCtx *x, Buf *b) {
     emit_str_literal(b, c->scopes[pmip].name ? c->scopes[pmip].name : "?");
     { int ar; if (method_scope_arity(c, pmip, &ar)) buf_printf(b, ", (sp_int)%d", ar); else buf_puts(b, ", (sp_int)-1"); }
     buf_puts(b, ", ");
-    emit_method_desc_literal(c, pmip, c->scopes[pmip].name, sup_unb, b);
+    emit_method_desc_args(c, pmip, c->scopes[pmip].name, sup_unb, b);
     buf_puts(b, ")");
     { char _s[8 * 64 + 1]; int _fx = 0, _rs = 0, _rt = 0, _pf = 0, _prt = 0;
       int _ab = method_legacy_int_abi(c, pmip, !sup_unb, _s, sizeof _s, &_fx, &_rs, &_rt);
@@ -319,7 +373,7 @@ int emit_op_method_super_method(Compiler *c, const BopCtx *x, Buf *b) {
   }
   else {
     buf_puts(b, "((void)(");
-    emit_expr(c, recv, b);
+    emit_expr_for_effect(c, recv, b);
     buf_puts(b, "), (sp_BoundMethod *)NULL)");
   }
   return 1;
@@ -338,7 +392,7 @@ static int emit_method_bind_target(Compiler *c, const BopCtx *x, Buf *b, int t2)
     /* obj of another class: CRuby's TypeError, at bind time, whether or
        not the Method is ever called. It was bound and called as one. */
     buf_puts(b, "({ (void)(");
-    emit_expr(c, argv[0], b);
+    emit_expr_for_effect(c, argv[0], b);
     buf_printf(b, "); sp_raise_cls(\"TypeError\", \"bind argument must be an instance of %s\"); (sp_BoundMethod *)NULL; })",
                c->classes[c->scopes[t2].class_id].name);
     return 1;
@@ -356,7 +410,7 @@ static int emit_method_bind_target(Compiler *c, const BopCtx *x, Buf *b, int t2)
     emit_str_literal(b, method_sym_arg(c, mn2));
     { int ar; if (method_scope_arity(c, t2, &ar)) buf_printf(b, ", (sp_int)%d", ar); else buf_puts(b, ", (sp_int)-1"); }
     buf_puts(b, ", ");
-    emit_method_desc_literal(c, t2, method_sym_arg(c, mn2), 0, b);
+    emit_method_desc_args(c, t2, method_sym_arg(c, mn2), 0, b);
     buf_puts(b, ")");
     { char _s[8 * 64 + 1]; int _fx = 0, _rs = 0, _rt = 0, _pf = 0, _prt = 0;
       int _ab = method_legacy_int_abi(c, t2, 1, _s, sizeof _s, &_fx, &_rs, &_rt);
@@ -457,7 +511,7 @@ int emit_op_method_original_name(Compiler *c, const BopCtx *x, Buf *b) {
   int mn4 = method_recv_node(c, recv);
   int tg4 = mn4 >= 0 ? method_obj_target_mi(c, mn4) : -1;
   if (tg4 >= 0 && c->scopes[tg4].name) {
-    buf_puts(b, "((void)("); emit_expr(c, recv, b);
+    buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b);
     buf_puts(b, "), sp_sym_intern(");
     emit_str_literal(b, comp_scope_user_name(&c->scopes[tg4]));
     buf_puts(b, "))");
@@ -477,7 +531,7 @@ static int emit_method_source_target(Compiler *c, const BopCtx *x, Buf *b, int t
   int dn4 = tg4 >= 0 ? c->scopes[tg4].def_node : -1;
   int ln4 = dn4 >= 0 ? (int)nt_int(nt, dn4, "node_line", 0) : 0;
   if (dn4 >= 0 && nt_int(nt, dn4, "cext_extension", 0)) {
-    buf_puts(b, "((void)("); emit_expr(c, recv, b); buf_puts(b, "), 0)"); return 1;
+    buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), 0)"); return 1;
   }
   /* a boxed receiver's wrapper (bam_poly) has no position of its own: the
      method is the one the receiver's run-time class answers by the name,
@@ -534,7 +588,7 @@ static int emit_method_source_target(Compiler *c, const BopCtx *x, Buf *b, int t
     const char *file4 = nt_file_path(nt, (int)nt_int(nt, dn4, "node_file", 0));
     if (!file4 || !*file4) file4 = nt->source_file;
     int tr4 = ++g_tmp;
-    buf_printf(b, "({ (void)("); emit_expr(c, recv, b);
+    buf_printf(b, "({ (void)("); emit_expr_for_effect(c, recv, b);
     buf_printf(b, "); sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
                   " sp_PolyArray_push(_t%d, sp_box_str(", tr4, tr4, tr4);
     emit_str_literal(b, file4 ? file4 : "");
@@ -570,7 +624,6 @@ int emit_op_method_source_location(Compiler *c, const BopCtx *x, Buf *b) {
 /* Method/UnboundMethod#parameters: [[:req, :a], [:opt, :b], ...] built
    statically from the target's parameter list (#3247). */
 int emit_op_method_parameters(Compiler *c, const BopCtx *x, Buf *b) {
-  const NodeTable *nt = c->nt;
   int recv = x->recv;
   CallPlan plan = cplan_method_call(c, x->id);
   int mn4 = plan.method_node, tg4 = plan.mi;
@@ -580,10 +633,8 @@ int emit_op_method_parameters(Compiler *c, const BopCtx *x, Buf *b) {
     buf_printf(b, "; SP_GC_ROOT(_t%d); sp_bm_parameters(_t%d); })", tr, tr);
     return 1;
   }
-  int dn4 = tg4 >= 0 ? c->scopes[tg4].def_node : -1;
-  int pn4 = dn4 >= 0 ? nt_ref(nt, dn4, "parameters") : -1;
-  /* A Method no one node names: the list its rendering carries, as a
-     poly one reads it (#3692) */
+  /* A Method no one node names: the list it carries, as a poly one reads
+     it (#3692) */
   if (mn4 < 0) {
     buf_puts(b, "sp_bm_parameters(");
     emit_expr(c, recv, b);
@@ -592,9 +643,9 @@ int emit_op_method_parameters(Compiler *c, const BopCtx *x, Buf *b) {
   }
   if (tg4 >= 0) {
     int tr4 = ++g_tmp;
-    buf_printf(b, "({ (void)("); emit_expr(c, recv, b);
+    buf_printf(b, "({ (void)("); emit_expr_for_effect(c, recv, b);
     buf_printf(b, "); sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);", tr4, tr4);
-    emit_method_parameters_pushes(c, pn4, tr4, b);
+    emit_scope_parameters_pushes(c, tg4, tr4, b);
     buf_printf(b, " _t%d; })", tr4);
     return 1;
   }
@@ -649,7 +700,7 @@ int emit_op_method_owner(Compiler *c, const BopCtx *x, Buf *b) {
                  : c->scopes[target].class_id;
     const char *ocn = ocid >= 0 ? (class_ruby_name(c, ocid) ? class_ruby_name(c, ocid)
                                                             : c->classes[ocid].name) : "Object";
-    buf_printf(b, "((void)("); emit_expr(c, recv, b);
+    buf_printf(b, "((void)("); emit_expr_for_effect(c, recv, b);
     buf_puts(b, "), ");
     if (method_owner_singleton(c, target, unbound)) emit_method_owner_class(c, target, unbound, b);
     else buf_printf(b, "((sp_Class){(sp_int)-1, SPL(\"%s\")})", ocn);
@@ -671,7 +722,7 @@ int emit_op_method_owner(Compiler *c, const BopCtx *x, Buf *b) {
       /* and Numeric's that Integer and Float inherit: Integer#abs2 */
       else if (osym && builtin_numeric_owns(mcls, osym) && !builtin_method_known(mcls, osym))
         mcls = "Numeric";
-      buf_printf(b, "((void)("); emit_expr(c, recv, b);
+      buf_printf(b, "((void)("); emit_expr_for_effect(c, recv, b);
       buf_printf(b, "), ((sp_Class){(sp_int)-1, SPL(\"%s\")}))", mcls);
       return 1;
     }
@@ -702,7 +753,7 @@ int emit_op_method_receiver(Compiler *c, const BopCtx *x, Buf *b) {
                       mrk == NK_ArrayNode || mrk == NK_SelfNode ||
                       mrk == NK_InstanceVariableReadNode);
   if (pure) {
-    buf_puts(b, "((void)("); emit_expr(c, recv, b); buf_puts(b, "), ");
+    buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), ");
     emit_expr(c, mrecv, b); buf_puts(b, ")");
     return 1;
   }
@@ -782,8 +833,8 @@ int emit_op_method_arity(Compiler *c, const BopCtx *x, Buf *b) {
          inline (creating the bound method emits a non-void-castable
          expression), or the local read when the method object is var-held */
       buf_printf(b, "((void)(");
-      if (mn == recv) { if (mrecv >= 0) emit_expr(c, mrecv, b); else buf_puts(b, "0"); }
-      else emit_expr(c, recv, b);
+      if (mn == recv) { if (mrecv >= 0) emit_expr_for_effect(c, mrecv, b); else buf_puts(b, "0"); }
+      else emit_expr_for_effect(c, recv, b);
       buf_printf(b, "), (sp_int)%d)", ba);
       return 1;
     }
@@ -1589,7 +1640,7 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
       argc == 1 && (is_shift_op(name)) &&
       ty_never_callable(comp_ntype(c, argv[0])) &&
       !user_defines_or_reads(c, "call")) {
-    buf_puts(b, "({ (void)("); emit_expr(c, recv, b);
+    buf_puts(b, "({ (void)("); emit_expr_for_effect(c, recv, b);
     buf_puts(b, "); (void)("); emit_boxed(c, argv[0], b);
     buf_puts(b, "); sp_raise_cls(\"TypeError\", \"callable object is expected\");"
                 " (sp_Proc *)NULL; })");
@@ -1618,7 +1669,7 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
       emit_str_literal(b, method_sym_arg(c, id));
       { int ar; if (method_scope_arity(c, umi, &ar)) buf_printf(b, ", (sp_int)%d", ar); else buf_puts(b, ", (sp_int)-1"); }
       buf_puts(b, ", ");
-      emit_method_desc_literal(c, umi, method_sym_arg(c, id), 1, b);
+      emit_method_desc_args(c, umi, method_sym_arg(c, id), 1, b);
       buf_puts(b, ")");
       { char _s[8 * 64 + 1]; int _fx = 0, _rs = 0, _rt = 0, _pf = 0, _prt = 0;
         int _ab = method_legacy_int_abi(c, umi, 0, _s, sizeof _s, &_fx, &_rs, &_rt);
@@ -1644,7 +1695,7 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
       is_call_alias(name) &&
       method_expr_is_unbound(c, recv)) {
     if (g_plan_check) ucall_refused(id);
-    buf_puts(b, "({ (void)("); emit_expr(c, recv, b);
+    buf_puts(b, "({ (void)("); emit_expr_for_effect(c, recv, b);
     buf_printf(b, "); sp_raise_cls(\"NoMethodError\", (&(\"\\xff\" \"undefined method '%s' for an instance of UnboundMethod\")[1])); %s; })",
                name, default_value_from_compiler(c, repr_of(c, id).as_ty));
     return 1;
@@ -1697,7 +1748,8 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
     }
   }
   /* method(:sym) / <recv>.method(:sym) -> a bound Method object. */
-  if (sp_streq(name, "method") && method_sym_arg(c, id) != NULL) {
+  if (sp_streq(name, "method") && method_sym_arg(c, id) != NULL &&
+      (nt_int(nt, id, "builtin_only", 0) || !method_user_override_recv(c, id))) {
     const char *sym = method_sym_arg(c, id);
     int mi = capture;
     if ((mi < 0 || method_obj_of_native_func(c, recv, sym)) &&
@@ -1805,6 +1857,11 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
         buf_printf(b, "({ void *_t%d = (void *)(", self_tmp);
         emit_expr(c, recv, b);
         buf_printf(b, "); SP_GC_ROOT%s(_t%d); ", self_is_str ? "_STR" : "", self_tmp);
+        /* a receiver that may be nil (a NULL pointer here) has no method of
+           the name: CRuby's NameError at the lookup, where a Method bound
+           to NULL would call the method on it (#10719, e4) */
+        if (nil_fact_node(c, recv))
+          buf_printf(b, "if (!_t%d) sp_raise_cls(\"NameError\", \"undefined method '%s' for class 'NilClass'\"); ", self_tmp, sym);
       }
     }
     buf_puts(b, mi >= 0 ? "sp_bm_set_thunk(sp_bm_set_abi(sp_bound_method_new_d(" : "sp_bm_set_thunk(sp_bm_set_abi(sp_bound_method_new(");
@@ -2008,7 +2065,7 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
       else buf_puts(b, ", (sp_int)-1"); }
     if (mi >= 0) {
       buf_puts(b, ", ");
-      emit_method_desc_literal(c, mi, disp, 0, b);
+      emit_method_desc_args(c, mi, disp, 0, b);
     }
     buf_puts(b, ")");
     { char _rbb[16]; snprintf(_rbb, sizeof _rbb, "%d", recv_bound);
@@ -2045,7 +2102,7 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
          self; an instance-method context binds self too, same answer */
       if (tg3 >= 0 && bare3) {
         buf_puts(b, "((void)(");
-        emit_expr(c, mrecv2, b);
+        emit_expr_for_effect(c, mrecv2, b);
         buf_puts(b, "), (sp_bool)1)");
         return 1;
       }

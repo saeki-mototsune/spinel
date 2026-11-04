@@ -469,9 +469,13 @@ def argument_shapes(n, elems, fills = [1, "a"], plain = [1])
 end
 
 # Every call of `mname` on the receiver `build_recv.(mk)` makes
-def probe_calls(label, mname, counts, build_recv, own: nil, elems: false, own_role: :self, fills: [1, "a"], plain: [1])
+def probe_calls(label, mname, counts, build_recv, own: nil, elems: false, own_role: :self, fills: [1, "a"], plain: [1], like: nil)
   counts.each do |n|
-    argument_shapes(n, elems, fills, plain).each do |args, blk|
+    shapes = argument_shapes(n, elems, fills, plain)
+    # a container of the receiver's own shape as the one argument: two
+    # containers compare element by element (Hash#== asks a value's ==)
+    shapes << [->(mk) { [like.(mk)] }, nil] if like && n == 1 && %w[== != eql? ===].include?(mname.to_s)
+    shapes.each do |args, blk|
       probe(label, mname.to_s, own: own, self_omit: own ? [own] : [], own_role: own_role) do |mk|
         recv = build_recv.(mk)
         a = args.(mk)
@@ -555,6 +559,8 @@ PSTATUS = (system("true"); $?)
 # elements, so that their equal hashes collide and `eql?` is asked.
 CONTAINERS = {
   "Array" => ->(mk) { [mk.(:elem), mk.(:elem)] },
+  # pairs, which assoc and rassoc compare by their first or second element
+  "Array pairs" => ->(mk) { [[mk.(:elem), mk.(:elem)], [mk.(:elem), mk.(:elem)]] },
   "Hash" => ->(mk) { { mk.(:elem) => 1, mk.(:elem) => 2 } },
   "Hash values" => ->(mk) { { 1 => mk.(:elem), 2 => mk.(:elem) } },
   "Set" => ->(mk) { Set[mk.(:elem), mk.(:elem)] },
@@ -590,7 +596,7 @@ def probe_instances
     mkc.(probe_one).public_methods.sort.each do |mname|
       next if SKIP_ANYWHERE.include?(mname)
       m = (mkc.(probe_one).method(mname) rescue next)
-      probe_calls(cname.split.first, mname, arity_counts(m), mkc, elems: true)
+      probe_calls(cname.split.first, mname, arity_counts(m), mkc, elems: true, like: mkc)
     end
   end
 end
@@ -726,7 +732,20 @@ def probe_kernel
   probe("Kernel", "open") { |mk| o = mk.(:arg); -> { open(o) { |f| f } } }
   probe("Kernel", "format") { |mk| o = mk.(:arg); -> { format("%s %d %f", o, o, o) } }
   probe("Kernel", "sprintf") { |mk| o = mk.(:arg); -> { sprintf("%s %d %f", o, o, o) } }
+  # a Hash argument holds the values a named reference (%{a}, %<b>s) reads:
+  # they are its elements, not the argument
+  %i[format sprintf printf].each do |mname|
+    probe("Kernel", mname.to_s) { |mk| h = { a: mk.(:elem), b: mk.(:elem) }; -> { Kernel.__send__(mname, "%{a} %<b>s", h) } }
+  end
+  probe("File", "printf") { |mk| h = { a: mk.(:elem), b: mk.(:elem) }; f = File.new(File::NULL, "w"); -> { f.printf("%{a} %<b>s", h) } }
+  probe("StringIO", "printf") { |mk| h = { a: mk.(:elem), b: mk.(:elem) }; io = StringIO.new(+""); -> { io.printf("%{a} %<b>s", h) } }
   probe("String", "%") { |mk| o = mk.(:arg); -> { +"%s %d %f" % [o, o, o] } }
+  # the Array or Hash a program writes as the argument holds the values the
+  # format reads: they are its elements, not the argument
+  probe("String", "%") { |mk| a = [mk.(:elem), mk.(:elem)]; -> { +"%s %d" % a } }
+  probe("String", "%") { |mk| h = { a: mk.(:elem), b: mk.(:elem) }; -> { +"%{a} %<b>s" % h } }
+  # a String argument joins the elements: to_str, to_ary, then to_s
+  probe("Array", "*") { |mk| a = [mk.(:elem), mk.(:elem)]; -> { a * "," } }
   probe("Array", "pack") { |mk| a = [mk.(:elem), mk.(:elem)]; -> { a.pack("aw") } }
   probe("IO.", "select") { |mk| o = mk.(:elem); -> { IO.select([o], nil, nil, 0) } }
   probe("Kernel", "select") { |mk| o = mk.(:elem); -> { select([o], nil, nil, 0) } }

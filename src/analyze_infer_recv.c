@@ -1231,7 +1231,8 @@ int infer_arysub_call(Compiler *c, int id, TyKind *out) {
   int hash = comp_arysub_emb(c, ty_object_class(rt));
   /* a Hash method answering a copy of its receiver answers one of its class */
   int self = comp_arysub_self_result(c, id, hash) ||
-             (hash == 1 && (comp_arysub_answer(c, id, hash) & BOPF_COPY_CLASS));
+             (hash == 1 && (comp_arysub_answer(c, id, hash) & BOPF_COPY_CLASS)) ||
+             (hash == 3 && comp_timesub_copy_name(c, nt_str(c->nt, id, "name")));
   TyKind r = TY_UNKNOWN;
   if (k != TY_UNKNOWN) {
     an_face_push(recv, k);
@@ -1412,8 +1413,13 @@ int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       /* a def in a subclass overrides the reader for that subclass, as on
          self (infer_call): the call answers what either may */
       int base_mi = call_target(c, id, cid, name, 0, NULL);
-      for (int k = 0; k < c->nclasses; k++) {
-        if (k == cid || !is_descendant(c, k, cid)) continue;
+      /* (the descendants in class order, less those no reached code names,
+         as is_descendant answers: #10546) */
+      int nd = 0;
+      const int *ds = comp_descendants(c, cid, &nd);
+      for (int di = 0; di < nd; di++) {
+        int k = ds[di];
+        if (c->classes[k].unreferenced) continue;
         int kmi = call_target(c, id, k, name, 0, NULL);
         if (kmi < 0 || kmi == base_mi) continue;
         if (g_plan_check) an_user_call_record(c, id, kmi, UC_POLY, k);
@@ -1509,7 +1515,7 @@ int lines_sep_ty(Compiler *c, int a) {
 
 int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
   { const char *nm0 = nt_str(c->nt, id, "name");
-    if (nm0 && sp_streq(nm0, "__to_h_subject")) { *out = TY_POLY; return 1; } }
+    if (nm0 && (sp_streq(nm0, "__to_h_subject") || sp_streq(nm0, "__to_h_key_subject"))) { *out = TY_POLY; return 1; } }
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
   int recv = nt_ref(nt, id, "receiver");
