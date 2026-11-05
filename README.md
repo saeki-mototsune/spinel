@@ -513,8 +513,8 @@ docker run --rm -v "$PWD:/work" ghcr.io/saeki-mototsune/spinel spinel app.rb
 docker run --rm -it -v "$PWD:/work" ghcr.io/saeki-mototsune/spinel   # a shell in the tree
 ```
 
-The tags are `latest`; the version, `YYYY.MM.DD-N` (the commit's date and
-its position on `master`, e.g. `2026.09.26-10234`); `sha-<rev>` (the
+The tags are `latest`; the version, `YYYY.MM.DD.N` (the commit's date and
+its position on `master`, e.g. `2026.09.26.10234`); `sha-<rev>` (the
 commit); and the release name when the commit is a release tag.
 `spinel --version` inside the image names the same release and revision a
 `make` of that commit prints.

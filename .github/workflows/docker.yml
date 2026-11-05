@@ -7,13 +7,14 @@ name: Docker image
 # ghcr.io/<owner>/spinel. It is tagged
 #
 #   latest          the newest master build
-#   YYYY.MM.DD-N    the version: the commit's date (UTC) and N, the number of
+#   YYYY.MM.DD.N    the version: the commit's date (UTC) and N, the number of
 #                   commits on master's first-parent line up to it, so a later
 #                   build sorts later and one commit always gets the same name.
-#                   Deliberately not the shape of a release tag (YYYY.MM.DD or
-#                   YYYY.MM.DD.N): a master build is not a release.
+#                   The shape of a release tag, but every master build has one:
+#                   only the release list says which of them are releases.
 #   sha-<rev>       the commit, for pinning
 #   YYYY.MM.DD[.N]  the release name too, when the commit is exactly a release tag
+#                   of another name than the version
 #
 # `spinel --version` inside the image says what a `make` of the same commit
 # says: the release and revision come from the Makefile's own stamp rule here
@@ -79,10 +80,10 @@ jobs:
             echo "image=$image"
             echo "release=$release"
             echo "rev=$rev"
-            echo "version=$date-$count"
+            echo "version=$date.$count"
             echo "release_tag=$release_tag"
           } >> "$GITHUB_OUTPUT"
-          echo "spinel $release ($rev): $image version $date-$count${release_tag:+, release $release_tag}"
+          echo "spinel $release ($rev): $image version $date.$count${release_tag:+, release $release_tag}"
 
   build:
     name: build (${{ matrix.platform }})
@@ -189,11 +190,12 @@ jobs:
         with:
           images: ${{ needs.version.outputs.image }}
           # Priorities order the list; the first entry is what the version
-          # annotation names. The release line is disabled off a release tag;
-          # its placeholder value is there only because a raw tag needs one.
+          # annotation names. The release line is disabled off a release tag
+          # and when the release is named as the version already is; its
+          # placeholder value is there only because a raw tag needs one.
           tags: |
             type=raw,value=${{ needs.version.outputs.version }},priority=1000
-            type=raw,value=${{ needs.version.outputs.release_tag || 'unreleased' }},enable=${{ needs.version.outputs.release_tag != '' }},priority=900
+            type=raw,value=${{ needs.version.outputs.release_tag || 'unreleased' }},enable=${{ needs.version.outputs.release_tag != '' && needs.version.outputs.release_tag != needs.version.outputs.version }},priority=900
             type=sha,priority=800
             type=raw,value=latest,enable={{is_default_branch}},priority=700
 
