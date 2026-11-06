@@ -16057,6 +16057,20 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         if (ct >= 0 && nt_kind(nt, ct) == NK_NilNode) ct = -1;
       }
       if ((kwh >= 0 ? argc - 1 : argc) < 2) unsupported(c, id, "TCPSocket.new without a host and a port");
+      Repr ctr = ct >= 0 ? repr_of(c, ct) : (Repr){0};
+      if (ct >= 0 && (ctr.may_nil || ctr.as_ty == TY_POLY || ctr.as_ty == TY_NIL ||
+                      yield_site_type(c, ct) == TY_POLY)) {
+        /* A value that can be nil at run time decides the connect there, in
+           argument order, the box holding it once. */
+        int th = ++g_tmp, tp = ++g_tmp, to = ++g_tmp;
+        buf_printf(b, "({ const char *_t%d = ", th); emit_str_expr(c, argv[0], b);
+        buf_printf(b, "; SP_GC_ROOT_STR(_t%d); sp_int _t%d = ", th, tp); emit_int_expr(c, argv[1], b);
+        buf_printf(b, "; sp_RbVal _t%d = ", to); emit_boxed(c, ct, b);
+        buf_printf(b, "; sp_io_fdopen_sock(_t%d.tag == SP_TAG_NIL ? sp_net_connect(_t%d, _t%d) : "
+                      "sp_io_connect_timeout(_t%d, _t%d, sp_poly_to_f_with_rational(_t%d)), "
+                      "(&(\"\\xff\" \"tcp\")[1])); })", to, th, tp, th, tp, to);
+        { *out = 1; return 1; }
+      }
       if (ct >= 0) {
         buf_puts(b, "sp_io_fdopen_sock(sp_io_connect_timeout(");
         emit_str_expr(c, argv[0], b); buf_puts(b, ", ");
