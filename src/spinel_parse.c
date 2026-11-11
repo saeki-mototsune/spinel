@@ -448,6 +448,77 @@ static pm_node_t *flat_superclass(pm_node_t *sup) {
   return sup;
 }
 
+/* `in [Integer => a, (Integer => b)]`: parentheses around a sub-pattern
+   group it and mean nothing more, but each pass that reads a pattern (the
+   matcher, the bindings, their types) asks for its node kind. The pattern
+   is rewritten in place without them: each ParenthesesNode that holds one
+   pattern gives way to that pattern, at the root (also under an arm's
+   guard) and at every sub-pattern slot. A pinned expression `^(expr)`
+   keeps its own parentheses. */
+static pm_node_t *flat_pattern(pm_node_t *pat);
+static void flat_pattern_list(pm_node_list_t *list) {
+  for (size_t i = 0; i < list->size; i++) list->nodes[i] = flat_pattern(list->nodes[i]);
+}
+static pm_node_t *flat_pattern(pm_node_t *pat) {
+  while (pat && PM_NODE_TYPE(pat) == PM_PARENTHESES_NODE) {
+    pm_parentheses_node_t *pn = (pm_parentheses_node_t *)pat;
+    pm_node_t *pb = pn->body;
+    if (!pb) break;
+    if (PM_NODE_TYPE(pb) == PM_STATEMENTS_NODE) {
+      pm_statements_node_t *st = (pm_statements_node_t *)pb;
+      if (st->body.size != 1) break;
+      pb = st->body.nodes[0];
+      st->body.size = 0;   /* the shell goes, the pattern stays */
+    }
+    else pn->body = NULL;
+    pm_node_destroy((pm_parser_t *)g_parser, pat);
+    pat = pb;
+  }
+  if (!pat) return pat;
+  switch (PM_NODE_TYPE(pat)) {
+  case PM_ALTERNATION_PATTERN_NODE: {
+    pm_alternation_pattern_node_t *n = (pm_alternation_pattern_node_t *)pat;
+    n->left = flat_pattern(n->left);
+    n->right = flat_pattern(n->right);
+    break;
+  }
+  case PM_ARRAY_PATTERN_NODE: {
+    pm_array_pattern_node_t *n = (pm_array_pattern_node_t *)pat;
+    flat_pattern_list(&n->requireds);
+    flat_pattern_list(&n->posts);
+    break;
+  }
+  case PM_FIND_PATTERN_NODE:
+    flat_pattern_list(&((pm_find_pattern_node_t *)pat)->requireds);
+    break;
+  case PM_HASH_PATTERN_NODE: {
+    pm_hash_pattern_node_t *n = (pm_hash_pattern_node_t *)pat;
+    for (size_t i = 0; i < n->elements.size; i++) {
+      pm_node_t *e = n->elements.nodes[i];
+      if (e && PM_NODE_TYPE(e) == PM_ASSOC_NODE) {
+        pm_assoc_node_t *a = (pm_assoc_node_t *)e;
+        a->value = flat_pattern(a->value);
+      }
+    }
+    break;
+  }
+  case PM_CAPTURE_PATTERN_NODE: {
+    pm_capture_pattern_node_t *n = (pm_capture_pattern_node_t *)pat;
+    n->value = flat_pattern(n->value);
+    break;
+  }
+  case PM_IF_NODE: case PM_UNLESS_NODE: {
+    /* `in pat if guard`: the arm's pattern is the guard's one statement */
+    pm_statements_node_t *st = PM_NODE_TYPE(pat) == PM_IF_NODE ? ((pm_if_node_t *)pat)->statements
+                                                                : ((pm_unless_node_t *)pat)->statements;
+    if (st && st->body.size == 1) st->body.nodes[0] = flat_pattern(st->body.nodes[0]);
+    break;
+  }
+  default: break;
+  }
+  return pat;
+}
+
 /* A scope's own locals, joined with commas. A block's or lambda's (params +
    first-assigned-inside): Ruby scoping makes the non-param ones FRESH on
    every call, and a name the enclosing scope assigns only after the block's
@@ -1876,6 +1947,7 @@ static int flatten_node(pm_node_t *node) {
   case PM_IN_NODE: {
     pm_in_node_t *n = (pm_in_node_t *)node;
     N("InNode");
+    n->pattern = flat_pattern(n->pattern);
     R("pattern", n->pattern);
     R("statements", n->statements);
     break;
@@ -2221,6 +2293,7 @@ else if (PM_NODE_TYPE(n->parameters) != PM_NUMBERED_PARAMETERS_NODE) {
        matching (array / hash patterns, pinned vars) is out of scope
        and falls through to the unknown-node passthrough. */
     pm_match_required_node_t *n = (pm_match_required_node_t *)node;
+    n->pattern = flat_pattern(n->pattern);
     if (n->pattern && PM_NODE_TYPE_P(n->pattern, PM_LOCAL_VARIABLE_TARGET_NODE)) {
       pm_local_variable_target_node_t *t = (pm_local_variable_target_node_t *)n->pattern;
       N("LocalVariableWriteNode");
@@ -2239,6 +2312,7 @@ else {
     pm_match_predicate_node_t *n = (pm_match_predicate_node_t *)node;
     N("MatchPredicateNode");
     R("value", n->value);
+    n->pattern = flat_pattern(n->pattern);
     R("pattern", n->pattern);
     break;
   }
@@ -2352,9 +2426,9 @@ else {
   case PM_IT_LOCAL_VARIABLE_READ_NODE:
     /* `it` inside the block body. Lowered to a regular
        LocalVariableReadNode named "_1" so it pairs with the
-       lowered NumberedParametersNode { maximum: 1 } above. */
-    N("LocalVariableReadNode");
-    S("name", "_1");
+       lowered NumberedParametersNode { maximum: 1 } above; implicit_it keeps it
+       apart from a written `_1` (blockarg_plain_read). */
+    N("LocalVariableReadNode"); S("name", "_1"); I("implicit_it", 1);
     break;
   case PM_INTERPOLATED_SYMBOL_NODE: {
     /* `:"foo_#{x}"`. Carries `parts` like InterpolatedStringNode;
@@ -2671,6 +2745,19 @@ static int source_references_io_buffer(const char *src) {
   return sp_src_code_any(src, sp_iob_hit);
 }
 
+/* Whether `src` calls String#unicode_normalize, #unicode_normalize! or
+   #unicode_normalized? in CODE, or names one as a Symbol (`send`,
+   `method`); `unicode_normalize` starts all three (the skipping of
+   sp_src_code_any). Drives the unicode_normalize splice below: CRuby
+   answers them without a require, loading its tables on first use. */
+static int sp_unorm_hit(const char *src, const char *p) {
+  (void)src;
+  return (p[0] == '.' || p[0] == ':') && strncmp(p + 1, "unicode_normalize", 17) == 0;
+}
+static int source_calls_unicode_normalize(const char *src) {
+  return sp_src_code_any(src, sp_unorm_hit);
+}
+
 /* Whether `src` calls Time.parse or Time.strptime in CODE (the skipping of
    sp_src_code_any). `Time` starts a word that no `.` or `::` qualifies, so
    DateTime.parse and Foo::Time.parse do not count, though a top-level
@@ -2708,11 +2795,6 @@ static int source_calls_time_parser(const char *src) {
    sp_feature_enabled(). Definitions here (spinel_parse.c includes no project
    headers); declared extern in compiler.h. */
 int g_strict_require = 0;
-/* A String is shared by reference, as CRuby shares it (#6765): the one
-   mode, with no switch to copy. The compiler's flag and the parser's read
-   of a package's share declarations ask this one test; `--share-strings`
-   is still accepted and changes nothing. */
-int sp_share_strings_env(void) { return 1; }
 int g_strict_require_cli = 0;   /* --strict-require */
 int g_dump_load_graph = 0;    /* --dump-load-graph */
 int sp_parse_reported = 0;    /* the parse failed and said why (the driver adds nothing) */
@@ -3774,6 +3856,8 @@ int g_require_unread = 0;
    other (sp_require_computed). */
 const char **g_required_features = NULL;
 int g_nrequired_features = 0;
+static const char **sp_boot_features = NULL;
+static int sp_nboot_features = 0;
 static void sp_note_required_feature(const char *name) {
   if (!name || !*name) return;
   for (int i = 0; i < g_nrequired_features; i++)
@@ -3784,6 +3868,18 @@ static void sp_note_required_feature(const char *name) {
   g_required_features[g_nrequired_features++] = strdup(name);
 }
 static int sp_req_written = 0, sp_req_resolved = 0;
+/* Does the program require a feature that is not a core library its start
+   loads? A core library is read like the program, so its defs are in the
+   node table; another feature can be native and define methods none sees. */
+int sp_requires_non_boot_feature(void) {
+  for (int i = 0; i < g_nrequired_features; i++) {
+    /* (builtins/: the core methods written in Ruby, read like the program) */
+    int boot = strncmp(g_required_features[i], "builtins/", 9) == 0;
+    for (int k = 0; k < sp_nboot_features && !boot; k++) boot = strcmp(sp_boot_features[k], g_required_features[i]) == 0;
+    if (!boot) return 1;
+  }
+  return 0;
+}
 
 /* The names of one file's tree that bear on g_require_unread: a call named
    load or autoload, a variable that is the load path or the loaded features
@@ -5292,14 +5388,13 @@ static int sp_lib_lookup(const char *lib_dir, const char *lib_name, char *out, s
    `path` is the file as found. First, what a native Windows build
    answers differently for it, lib/win32/overlay/<the same path>
    (sp_win32_driver.c). Then a package's share declarations
-   (`native_share`), in <name>.share.rb beside the file; kept apart so
-   that a build without the flag parses no node of them. */
+   (`native_share`), in <name>.share.rb beside the file. */
 static char *sp_lib_text_appended(char *content, const char *path, int tier) {
   if (!content || tier < SP_LIB_BUILTIN) return content;
 #if defined(_WIN32)
   content = sp_w32_overlay(content, path);
 #endif
-  if (sp_share_strings_env() && strlen(path) > 3) {
+  if (strlen(path) > 3) {
     char sp[1100];
     snprintf(sp, sizeof sp, "%.*s.share.rb", (int)(strlen(path) - 3), path);
     char *side = read_file(sp);
@@ -5981,29 +6076,79 @@ static int sp_src_defines_module(const char *source, const char *cname) {
   return 0;
 }
 
-static char *sp_prepend_require(char *source, const char *exe_path, const char *head,
-                                unsigned char **fsl, size_t *fsl_n) {
+/* Where boot package `rank` (boot_package_rank) goes among the boot packages
+   `text` already has spliced: the packages' files are the blocks of lines
+   from a PUSH or INSERT marker to the POP that closes it, which stand in a
+   row at the text's start (a package's file carries the package tier in its
+   marker; a program's own file of the same name does not), and the
+   packages' load order is the facts' order (as sp_graph_boot loads them).
+   The offset of the first block of a package that loads after it, else the
+   end of the last block of one that loads before it, else 0. */
+static size_t sp_boot_insert_at(const char *text, int rank) {
+  size_t pos = 0, after = 0;
+  for (;;) {
+    const char *line = text + pos, *eol = strchr(line, '\n');
+    size_t pl = !strncmp(line, SP_PUSH_PREFIX, strlen(SP_PUSH_PREFIX)) ? strlen(SP_PUSH_PREFIX)
+              : !strncmp(line, SP_INSERT_PREFIX, strlen(SP_INSERT_PREFIX)) ? strlen(SP_INSERT_PREFIX) : 0;
+    if (!pl || !eol) return after;
+    size_t fl = (size_t)(eol - line) - pl;
+    int tier;
+    const char *fp = sp_marker_file(line + pl, &fl, &tier);
+    int depth = 0;
+    const char *q = line;
+    do {
+      if (!strncmp(q, SP_PUSH_PREFIX, strlen(SP_PUSH_PREFIX)) || !strncmp(q, SP_INSERT_PREFIX, strlen(SP_INSERT_PREFIX))) depth++;
+      else if (!strncmp(q, SP_POP_PREFIX, strlen(SP_POP_PREFIX))) depth--;
+      const char *nl = strchr(q, '\n');
+      if (!nl) return after;   /* (a block with no end: not one) */
+      q = nl + 1;
+    } while (depth > 0);
+    int r = (tier & ~SP_FILE_DEFERRED) == SP_LIB_PACKAGE ? boot_package_rank_of_path(fp, fl) : -1;
+    if (r > rank) return pos;
+    if (r >= 0) after = (size_t)(q - text);
+    pos = (size_t)(q - text);
+  }
+}
+
+/* `head` (a require line) written into `source` at offset `at`, which is the
+   start of a line, and resolved there. The file it splices is marked as
+   inserted, so the program's own line numbers stay where they are. */
+static char *sp_splice_require_at(char *source, const char *exe_path, const char *head, size_t at,
+                                  unsigned char **fsl, size_t *fsl_n) {
   size_t sl = strlen(source), hl = strlen(head);
   char *ns = (char *)malloc(sl + hl + 1);
   if (!ns) return source;
-  memcpy(ns, head, hl); memcpy(ns + hl, source, sl + 1);
+  memcpy(ns, source, at); memcpy(ns + at, head, hl); memcpy(ns + at + hl, source + at, sl - at + 1);
+  {   /* (the line is one of the buffer's, and has no flag yet) */
+    unsigned char z = 0;
+    sp_fsl_splice(fsl, fsl_n, sp_fsl_line_at(source, at), 0, &z, 1);
+  }
   sp_req_written++;   /* (the head is one require) */
   sp_src_lex_drop();
   free(source);
   ns = resolve_plain_requires(NULL, ns, exe_path, fsl, fsl_n);
   size_t pl = strlen(SP_PUSH_PREFIX), il = strlen(SP_INSERT_PREFIX), nl = strlen(ns);
-  char *w = strncmp(ns, SP_PUSH_PREFIX, pl) == 0 ? (char *)malloc(nl - pl + il + 1) : NULL;
+  char *w = strncmp(ns + at, SP_PUSH_PREFIX, pl) == 0 ? (char *)malloc(nl - pl + il + 1) : NULL;
   if (!w) return ns;
-  memcpy(w, SP_INSERT_PREFIX, il); memcpy(w + il, ns + pl, nl - pl + 1);
+  memcpy(w, ns, at); memcpy(w + at, SP_INSERT_PREFIX, il); memcpy(w + at + il, ns + at + pl, nl - at - pl + 1);
   free(ns);
   return w;
+}
+
+/* Boot package `feature`, which the program names without requiring it
+   (CRuby has it loaded at boot): spliced among the boot packages by their
+   load order. */
+static char *sp_splice_boot_package(char *source, const char *exe_path, const char *feature,
+                                    unsigned char **fsl, size_t *fsl_n) {
+  char head[96]; snprintf(head, sizeof head, "require \"%s\"\n", feature);
+  return sp_splice_require_at(source, exe_path, head, sp_boot_insert_at(source, boot_package_rank(feature)), fsl, fsl_n);
 }
 
 static char *sp_splice_named_builtin(char *source, const char *exe_path, const char *cname,
                                      const char *file, unsigned char **fsl, size_t *fsl_n) {
   if (!sp_src_names_const(source, cname) || sp_src_defines_module(source, cname)) return source;
   char head[96]; snprintf(head, sizeof head, "require \"%s\"\n", file);
-  return sp_prepend_require(source, exe_path, head, fsl, fsl_n);
+  return sp_splice_require_at(source, exe_path, head, 0, fsl, fsl_n);
 }
 
 /* builtins/monitor_mixin.rb: MonitorMixin, for a program that names it in
@@ -6024,7 +6169,7 @@ static char *sp_splice_monitor_mixin(char *source, const char *exe_path,
     if (*bol != '#') named = 1;
   }
   if (!named || sp_src_defines_module(source, w)) return source;
-  return sp_prepend_require(source, exe_path, "require \"builtins/monitor_mixin\"\n", fsl, fsl_n);
+  return sp_splice_require_at(source, exe_path, "require \"builtins/monitor_mixin\"\n", 0, fsl, fsl_n);
 }
 
 /* builtins/object_space.rb: the finalizer API. Only for a program that names
@@ -6037,7 +6182,7 @@ static char *sp_splice_object_space(char *source, const char *exe_path,
   if (!strstr(source, "define_finalizer")) return source;
   { SpSrcLex *lx = sp_src_lex_of(source); if (!lx->fin && !lx->evals) return source; }
   if (sp_src_defines_module(source, "ObjectSpace")) return source;
-  return sp_prepend_require(source, exe_path, "require \"builtins/object_space\"\n", fsl, fsl_n);
+  return sp_splice_require_at(source, exe_path, "require \"builtins/object_space\"\n", 0, fsl, fsl_n);
 }
 
 /* builtins/process_detach.rb: Process.detach, for a program that calls it
@@ -6045,7 +6190,7 @@ static char *sp_splice_object_space(char *source, const char *exe_path,
 static char *sp_splice_process_detach(char *source, const char *exe_path,
                                       unsigned char **fsl, size_t *fsl_n) {
   if (!strstr(source, "Process.detach") || sp_src_defines_module(source, "Process")) return source;
-  return sp_prepend_require(source, exe_path, "require \"builtins/process_detach\"\n", fsl, fsl_n);
+  return sp_splice_require_at(source, exe_path, "require \"builtins/process_detach\"\n", 0, fsl, fsl_n);
 }
 
 /* builtins/system_spawn.rb: Kernel#system with an options or environment
@@ -6076,7 +6221,7 @@ static int sp_src_system_call_has_keyword(const char *source) {
 static char *sp_splice_system_spawn(char *source, const char *exe_path,
                                     unsigned char **fsl, size_t *fsl_n) {
   if (!sp_src_system_call_has_keyword(source)) return source;
-  return sp_prepend_require(source, exe_path, "require \"builtins/system_spawn\"\n", fsl, fsl_n);
+  return sp_splice_require_at(source, exe_path, "require \"builtins/system_spawn\"\n", 0, fsl, fsl_n);
 }
 
 /* builtins/file_foreach_first.rb: File.foreach(path).first(n), for a program
@@ -6084,7 +6229,7 @@ static char *sp_splice_system_spawn(char *source, const char *exe_path,
 static char *sp_splice_foreach_first(char *source, const char *exe_path,
                                      unsigned char **fsl, size_t *fsl_n) {
   if (!strstr(source, "foreach(") || !strstr(source, ".first(")) return source;
-  return sp_prepend_require(source, exe_path, "require \"builtins/file_foreach_first\"\n", fsl, fsl_n);
+  return sp_splice_require_at(source, exe_path, "require \"builtins/file_foreach_first\"\n", 0, fsl, fsl_n);
 }
 
 /* builtins/io_popen.rb: IO.popen with a block, for a program that calls
@@ -6093,7 +6238,7 @@ static char *sp_splice_io_popen(char *source, const char *exe_path,
                                 unsigned char **fsl, size_t *fsl_n) {
   if (!strstr(source, "IO.popen")) return source;
   { SpSrcLex *lx = sp_src_lex_of(source); if (!lx->popen && !(lx->evals && lx->popen_str)) return source; }
-  return sp_prepend_require(source, exe_path, "require \"builtins/io_popen\"\n", fsl, fsl_n);
+  return sp_splice_require_at(source, exe_path, "require \"builtins/io_popen\"\n", 0, fsl, fsl_n);
 }
 
 static char *sp_splice_builtins(char *source, const char *exe_path,
@@ -6142,7 +6287,7 @@ static char *sp_splice_builtins(char *source, const char *exe_path,
     if (known && sp_source_mentions_method(source, aliases[k][0])) any = 1;
   }
   if (!any) return source;
-  return sp_prepend_require(source, exe_path, "require \"builtins/enumerable\"\n", fsl, fsl_n);
+  return sp_splice_require_at(source, exe_path, "require \"builtins/enumerable\"\n", 0, fsl, fsl_n);
 }
 
 /* builtins/enumerator.rb: the Enumerator walks desugar_enum_walk_calls
@@ -6178,7 +6323,7 @@ static char *sp_splice_builtin_enumerator(char *source, const char *exe_path,
   if (!fp) { snprintf(gp, sizeof gp, "%.*s/../builtins/enumerator.rb", base_len, lib_dir); fp = fopen(gp, "r"); }
   if (!fp) return source;
   fclose(fp);
-  return sp_prepend_require(source, exe_path, "require \"builtins/enumerator\"\n", fsl, fsl_n);
+  return sp_splice_require_at(source, exe_path, "require \"builtins/enumerator\"\n", 0, fsl, fsl_n);
 }
 
 /* ---- builtins/: the other containers (Integer, Float, Comparable, Monitor) ----
@@ -6230,7 +6375,7 @@ static char *sp_splice_builtin_extra(char *source, const char *exe_path, SpBuilt
     if (sp_source_mentions_method(source, bf->names[i])) any = 1;
   if (!any) return source;
   char head[160]; snprintf(head, sizeof head, "require \"%s\"\n", bf->req);
-  return sp_prepend_require(source, exe_path, head, fsl, fsl_n);
+  return sp_splice_require_at(source, exe_path, head, 0, fsl, fsl_n);
 }
 
 static char *sp_splice_builtin_extras(char *source, const char *exe_path,
@@ -6447,8 +6592,6 @@ else {
         sp_req_resolved++;
       }
     }
-    if (g) sp_load_edge(&g->spl, &g->nspl, &g->splcap, -1, 0, 1, lib_name, spl_how,
-                        spl_how == SP_LOAD_FILE ? sp_load_file(g, spl_to) : -1);
     /* Stub arms above leave cfsl NULL: their content is a one-line comment. */
     if (!cfsl) cfsl = sp_fsl_make(content, 0, &cfsl_n);
     if (sp_require_preloaded(lib_name)) req_val = "false";
@@ -6458,6 +6601,29 @@ else {
        line map's accounting for code after the require. No-op without --debug. */
     content = sp_wrap_included(content, lib_path, lib_tier);
     sp_fsl_pad_wrap(&cfsl, &cfsl_n);
+
+    /* A library CRuby has loaded at boot is loaded before the program's first
+       statement, as --load-model=graph loads it (sp_graph_boot), and the
+       boot packages in the order the facts list them: its text goes among
+       theirs at the start (sp_boot_insert_at), and the call stays where it
+       is, to find the file already included and answer so (the next round of
+       this scan). A call that stands at that place is there already. */
+    int boot_rank = lib_tier == SP_LIB_PACKAGE ? boot_package_rank(lib_name) : -1;
+    size_t boot_at = boot_rank >= 0 ? sp_boot_insert_at(result, boot_rank) : 0;
+    if (boot_rank >= 0 && (size_t)(hit.kw - result) != boot_at) {
+      char *call = strndup(hit.kw, (size_t)(hit.expr_end - hit.kw));
+      if (!call) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
+      sp_req_hoist_splice(&result, fsl, fsl_n, &hit, boot_at, content, cfsl, cfsl_n, call);
+      free(call);
+      free(cfsl);
+      free(content);
+      free(canon_keep);
+      continue;
+    }
+
+    /* (a boot library's call is recorded by the round that finds it again) */
+    if (g) sp_load_edge(&g->spl, &g->nspl, &g->splcap, -1, 0, 1, lib_name, spl_how,
+                        spl_how == SP_LOAD_FILE ? sp_load_file(g, spl_to) : -1);
 
     /* The call's value is live: the require sits in a condition, an
        assignment, a receiver chain, or carries a trailing modifier
@@ -6927,6 +7093,7 @@ typedef struct {
   const pm_parser_t *p;
   int nested;                 /* inside a class or module body */
   pm_constant_id_t def;       /* the def the walk is in, 0 outside one */
+  const pm_node_t *defined;   /* the operand of the defined? the walk is at: it does not run */
 } SpNamesWalk;
 
 static void sp_names_const(SpNamesWalk *w, const char *tag, pm_constant_id_t id) {
@@ -6978,9 +7145,9 @@ static int sp_pm_block_breaks(const pm_node_t *body) {
 /* Whether call `c` passes lo..hi arguments of the kinds `flags` allows and
    has the block and the receiver they ask for (lower_row_nt's test, of a
    parsed call) */
-static int sp_pm_args_fit(const pm_call_node_t *c, int lo, int hi, unsigned flags) {
+static int sp_pm_args_fit(const pm_call_node_t *c, int lo, int hi, unsigned flags, int drop) {
   const pm_node_list_t *args = c->arguments ? &c->arguments->arguments : NULL;
-  int an = args ? (int)args->size : 0;
+  int an = (args ? (int)args->size : 0) - drop;
   if (an < lo || (hi >= 0 && an > hi)) return 0;
   const pm_node_t *blk = c->block;
   if ((flags & LR_NO_BLOCK) && blk) return 0;
@@ -6991,7 +7158,7 @@ static int sp_pm_args_fit(const pm_call_node_t *c, int lo, int hi, unsigned flag
   if ((flags & LR_BLOCK_LITERAL) && !made && (!blk || PM_NODE_TYPE(blk) != PM_BLOCK_NODE)) return 0;
   if ((flags & LR_BREAKS) && (!blk || PM_NODE_TYPE(blk) != PM_BLOCK_NODE)) return 0;
   if ((flags & LR_HAS_RECV) && !c->receiver) return 0;
-  if ((flags & LR_NO_ARGS) && c->arguments) return 0;
+  if ((flags & LR_NO_ARGS) && an > 0) return 0;
   int kwh = 0;
   for (int i = 0; i < an; i++) {
     pm_node_type_t k = PM_NODE_TYPE(args->nodes[i]);
@@ -7014,7 +7181,7 @@ static int sp_pm_const_is(const pm_parser_t *p, const pm_node_t *n, const char *
    `r`? lower_row_nt's question, of a parsed call: the graph decides its
    libraries before flattening. SPINEL_LOWER_ROWS_CHECK holds the two to
    one answer (sp_lower_rows_note, lower_rows_check). */
-static int sp_pm_row_fits(const pm_parser_t *p, const pm_call_node_t *c, const char *name, const LowerRow *r) {
+static int sp_pm_row_fits(const pm_parser_t *p, const pm_call_node_t *c, const char *name, const LowerRow *r, int drop) {
   if (strcmp(name, r->name) != 0) return 0;
   const pm_node_t *recv = c->receiver;
   if (r->recv == LR_RECV_NONE && recv) return 0;
@@ -7025,29 +7192,68 @@ static int sp_pm_row_fits(const pm_parser_t *p, const pm_call_node_t *c, const c
     const pm_call_node_t *rc = (const pm_call_node_t *)recv;
     if (!sp_pm_name_is(p, rc->name, r->recv_name)) return 0;
     if (r->recv_const && !sp_pm_const_is(p, rc->receiver, r->recv_const)) return 0;
-    if (!sp_pm_args_fit(rc, r->rargc_min, r->rargc_max, r->rflags)) return 0;
+    if (!sp_pm_args_fit(rc, r->rargc_min, r->rargc_max, r->rflags, 0)) return 0;
   }
   if (r->recv_calls && recv && PM_NODE_TYPE(recv) == PM_CALL_NODE && !((const pm_call_node_t *)recv)->block) {
     int k = 0;
     while (r->recv_calls[k] && !sp_pm_name_is(p, ((const pm_call_node_t *)recv)->name, r->recv_calls[k])) k++;
     if (!r->recv_calls[k]) return 0;
   }
-  return sp_pm_args_fit(c, r->argc_min, r->argc_max, r->flags);
+  return sp_pm_args_fit(c, r->argc_min, r->argc_max, r->flags, drop);
+}
+
+/* Does call `c` end in `**` operands that may all pass nothing (an empty
+   operand)? Then the analysis splits it into the call with them and the call
+   without (split_kwsplat_calls in analyze.c, whose rule this one repeats:
+   not the operand of `defined?` (`defined`, the node the walk is at, or
+   NULL where it is not known: that call is never split, so the shape this
+   notes for it is never looked for), no splat beside the `**`, no pair-only
+   hash literal among the operands, which is never empty); the one without
+   takes the rows of its own shape. */
+static int sp_pm_kwsplat_may_drop(const pm_call_node_t *c, const pm_node_t *defined) {
+  const pm_node_list_t *args = c->arguments ? &c->arguments->arguments : NULL;
+  if (!args || !args->size || PM_NODE_TYPE(args->nodes[args->size - 1]) != PM_KEYWORD_HASH_NODE ||
+      (const pm_node_t *)c == defined)
+    return 0;
+  const pm_node_list_t *el = &((const pm_keyword_hash_node_t *)args->nodes[args->size - 1])->elements;
+  int drop = 1;
+  for (size_t k = 0; k < args->size - 1; k++) {
+    pm_node_type_t t = PM_NODE_TYPE(args->nodes[k]);
+    if (t == PM_SPLAT_NODE || t == PM_FORWARDING_ARGUMENTS_NODE) drop = 0;
+  }
+  for (size_t k = 0; k < el->size; k++) {
+    if (PM_NODE_TYPE(el->nodes[k]) != PM_ASSOC_SPLAT_NODE) { drop = 0; continue; }
+    const pm_node_t *v = ((const pm_assoc_splat_node_t *)el->nodes[k])->value;
+    if (!v) { drop = 0; continue; }
+    if (PM_NODE_TYPE(v) != PM_HASH_NODE) continue;
+    const pm_node_list_t *he = &((const pm_hash_node_t *)v)->elements;
+    int has_splat = 0;
+    for (size_t q = 0; q < he->size; q++) if (PM_NODE_TYPE(he->nodes[q]) == PM_ASSOC_SPLAT_NODE) has_splat = 1;
+    if (he->size && !has_splat) drop = 0;
+  }
+  return drop;
 }
 
 /* The lowerings call `c` has the shape of (builtin_names.c's rows): each
    names the method or constant it lowers to */
 static void sp_names_lowerings(SpNamesWalk *w, const pm_call_node_t *c, const char *name) {
   const LowerRow *r;
+  int drop = sp_pm_kwsplat_may_drop(c, w->defined);
   for (int i = 0; (r = lower_row_at(i)) != NULL; i++)
-    if (sp_pm_row_fits(w->p, c, name, r))
+    if (sp_pm_row_fits(w->p, c, name, r, 0) || (drop && sp_pm_row_fits(w->p, c, name, r, 1)))
       sp_names_add(w->s, sp_names_target_tag(r->target), r->target, strlen(r->target));
 }
 
 /* SPINEL_LOWER_ROWS_CHECK: each call flattened in graph mode notes the
    lowering rows its parse has the shape of (sp_pm_row_fits), a mask of
    row indices (`lr_rows`); the analysis's lower_rows_check compares it
-   with the rows the node it became matches (lower_row_nt) */
+   with the rows the node it became matches (lower_row_nt). A call that may
+   be split on its `**` operands (sp_pm_kwsplat_may_drop) notes the rows of
+   the call without them too (`lr_rows_drop`), which split_kwsplat_calls
+   hands to the call it builds, so both shapes are checked. Only the first
+   row of a family is compared: the names the graph loads for a call are a
+   superset of the rows' targets by construction (sp_names_add), and extra
+   names are not this check's business. */
 static int g_lower_rows_check = -1;
 static void sp_lower_rows_note(const pm_node_t *node, int id) {
   if (g_lower_rows_check < 0) g_lower_rows_check = getenv("SPINEL_LOWER_ROWS_CHECK") != NULL;
@@ -7056,11 +7262,15 @@ static void sp_lower_rows_note(const pm_node_t *node, int id) {
   const pm_constant_t *nm = pm_constant_pool_id_to_constant(&g_parser->constant_pool, c->name);
   char name[64];
   snprintf(name, sizeof name, "%.*s", (int)nm->length, (const char *)nm->start);
-  long long mask = 0;
+  long long mask = 0, dmask = 0;
   const LowerRow *r;
-  for (int i = 0; i < LOWER_ROWS_MASK_BITS && (r = lower_row_at(i)) != NULL; i++)
-    if (sp_pm_row_fits(g_parser, c, name, r)) mask |= 1LL << i;
+  int drop = sp_pm_kwsplat_may_drop(c, NULL);
+  for (int i = 0; i < LOWER_ROWS_MASK_BITS && (r = lower_row_at(i)) != NULL; i++) {
+    if (sp_pm_row_fits(g_parser, c, name, r, 0)) mask |= 1LL << i;
+    if (drop && sp_pm_row_fits(g_parser, c, name, r, 1)) dmask |= 1LL << i;
+  }
   emit_int(id, "lr_rows", mask);
+  if (drop) emit_int(id, "lr_rows_drop", dmask);
 }
 
 /* Method name `b` given as a value (a Symbol, a String a reflection is
@@ -7150,6 +7360,7 @@ static bool sp_names_visit(const pm_node_t *n, void *data) {
   SpNamesWalk *w = data;
   switch (PM_NODE_TYPE(n)) {
     case PM_CALL_NODE: sp_names_call(w, (const pm_call_node_t *)n); break;
+    case PM_DEFINED_NODE: w->defined = ((const pm_defined_node_t *)n)->value; break;
     case PM_SYMBOL_NODE: {
       /* `:name` or a `%i[]` word (a hash key's `name:` names no method) */
       const pm_symbol_node_t *sy = (const pm_symbol_node_t *)n;
@@ -8047,9 +8258,23 @@ static int sp_graph_flatten(SpLoadGraph *g, int f, const char *source_file) {
     sp_inline_rbs_free();
     return 0;
   }
+  /* a `#<SPINEL_SOURCE>file:line` marker in the file pins the positions
+     after it, as the inline model's map of the spliced buffer does: the
+     file's own map for its parse, the file's own lines elsewhere */
+  int saved_map_n = sp_line_map_n;
+  int *saved_lf = sp_line_file, *saved_lo = sp_line_orig, *saved_lp = sp_line_pop;
+  int *saved_df = sp_disp_file, *saved_dl = sp_disp_line;
+  int own_map = r->text && strstr(r->text, SP_SOURCE_PREFIX) != NULL;
+  if (own_map) sp_build_line_map(r->text, sp_file_table[g_flat_file]);
   g_flat_sites = (SpGraphFlat){ g, r, 0 };
   int start = node_counter, root = flatten(r->src.root);
   g_flat_sites = (SpGraphFlat){ NULL, NULL, 0 };
+  if (own_map) {
+    free(sp_line_file); free(sp_line_orig); free(sp_line_pop); free(sp_disp_file); free(sp_disp_line);
+    sp_line_map_n = saved_map_n;
+    sp_line_file = saved_lf; sp_line_orig = saved_lo; sp_line_pop = saved_lp;
+    sp_disp_file = saved_df; sp_disp_line = saved_dl;
+  }
   sp_inline_rbs_done();
   sp_inline_rbs_free();
   if (!f) out_nt->root_id = root;
@@ -8100,6 +8325,8 @@ static int sp_graph_flatten(SpLoadGraph *g, int f, const char *source_file) {
 static int sp_graph_boot_load(SpLoadGraph *g, const SpBootLib *b) {
   sp_feature_mark(b->lib);
   sp_note_required_feature(b->lib);
+  const char **bf = realloc(sp_boot_features, sizeof(char *) * (size_t)(sp_nboot_features + 1));
+  if (bf) { sp_boot_features = bf; sp_boot_features[sp_nboot_features++] = strdup(b->lib); }
   int to = sp_load_file(g, b->path);
   if (b->tier == SP_LIB_BUILTIN) *sp_load_flags(g, to) |= SP_FILE_BUILTIN;
   sp_load_set_tier(g, to, b->tier);
@@ -8284,6 +8511,17 @@ static void sp_load_enter(SpLoadGraph *g, int e) {
   const SpGraphFile *r = g->gf[x->to];
   for (int i = 0; i < r->nsite; i++) sp_load_enter(g, r->site[i].edge);
 }
+/* Does a boot library's load run file `f`'s top level (an edge of g->boot,
+   or the top-level requires of a file one runs)? It runs before the entry's
+   first statement, so no other require runs it first. */
+static int sp_load_by_boot(const SpLoadGraph *g, int f) {
+  while (g->entered[f] >= 0) {
+    int e = g->entered[f];
+    for (int b = 0; b < g->nboot; b++) if (g->boot[b] == e) return 1;
+    f = g->edge[e].from;
+  }
+  return 0;
+}
 static void sp_load_order_build(SpLoadGraph *g) {
   g->entered = malloc(sizeof(int) * (size_t)(g->nfile + 1));
   if (!g->entered) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
@@ -8292,12 +8530,12 @@ static void sp_load_order_build(SpLoadGraph *g) {
   for (int b = 0; b < g->nboot; b++) sp_load_enter(g, g->boot[b]);
   for (int i = 0; i < g->gf[0]->nsite; i++) sp_load_enter(g, g->gf[0]->site[i].edge);
   /* a file another require may run first is not placed, nor is any file
-     only such a file places */
+     only such a file places (not a boot library's: nothing runs before it) */
   for (int changed = 1; changed; ) {
     changed = 0;
     for (int e = 0; e < g->nedge; e++) {
       const SpLoadEdge *x = &g->edge[e];
-      if (x->how != SP_LOAD_FILE || x->to <= 0 || g->entered[x->to] == -1) continue;
+      if (x->how != SP_LOAD_FILE || x->to <= 0 || g->entered[x->to] == -1 || sp_load_by_boot(g, x->to)) continue;
       int by = g->entered[x->to];
       if (!x->top || g->entered[x->from] == -1 || (by >= 0 && g->entered[g->edge[by].from] == -1)) {
         g->entered[x->to] = -1;
@@ -8536,25 +8774,27 @@ static NodeTable *sp_parse_emit(const char *source_file, const char *argv0) {
   source = sp_splice_system_spawn(source, argv0, &fsl, &fsl_n);
   source = sp_splice_io_popen(source, argv0, &fsl, &fsl_n);
   source = sp_splice_foreach_first(source, argv0, &fsl, &fsl_n);
-  /* CRuby provides Set (3.2+) and IO::Buffer without a require wherever
+  /* CRuby provides Set (3.2+), IO::Buffer and String#unicode_normalize without a require wherever
      they are used, in a required file as well (activesupport's
      notifications/fanout.rb; #6740 for IO::Buffer). Ask over the resolved
      program, the way the builtins splice below does, and splice the binding
-     ahead of everything when it is named and was not required.
-     sp_prepend_require marks the splice as inserted, so the program's own
-     line numbers stay where they are; a require written into the entry
-     file's text instead took a line of its own and pushed every later line
-     down by one. */
+     among the boot packages at the start (sp_boot_insert_at) when it is
+     named and was not required. sp_splice_require_at marks the splice as
+     inserted, so the program's own line numbers stay where they are; a
+     require written into the entry file's text instead took a line of its
+     own and pushed every later line down by one. */
   if (!sp_feature_required("set") && !sp_src_opens(source, "class Set") &&
       source_references_set(source))
-    source = sp_prepend_require(source, argv0, "require \"set\"\n", &fsl, &fsl_n);
+    source = sp_splice_boot_package(source, argv0, "set", &fsl, &fsl_n);
   if (!sp_feature_required("io/buffer") && source_references_io_buffer(source))
-    source = sp_prepend_require(source, argv0, "require \"io/buffer\"\n", &fsl, &fsl_n);
+    source = sp_splice_boot_package(source, argv0, "io/buffer", &fsl, &fsl_n);
+  if (!sp_feature_required("unicode_normalize") && source_calls_unicode_normalize(source))
+    source = sp_splice_boot_package(source, argv0, "unicode_normalize", &fsl, &fsl_n);
   /* CRuby's time.rb (packages/time) for a program that requires "time" and
      calls Time.parse or Time.strptime; any other program keeps the
      runtime's C (#9946). */
   if (sp_feature_required("time") && source_calls_time_parser(source))
-    source = sp_prepend_require(source, argv0, "require \"" SP_TIME_PARSERS_FEATURE "\"\n", &fsl, &fsl_n);
+    source = sp_splice_require_at(source, argv0, "require \"" SP_TIME_PARSERS_FEATURE "\"\n", 0, &fsl, &fsl_n);
   source = sp_splice_builtins(source, argv0, &fsl, &fsl_n);
   source = sp_splice_builtin_extras(source, argv0, &fsl, &fsl_n);
   source = sp_splice_builtin_enumerator(source, argv0, &fsl, &fsl_n);

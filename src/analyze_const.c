@@ -10,10 +10,14 @@
 
      - nothing that runs before it, in program order and entering the bodies,
        can run code of the program's: only definitions (def, class, module,
-       alias, attr_*, include, extend, prepend, a visibility call) and the
+       alias, attr_*, include, extend, prepend, a visibility call, a native
+       binding's declarations: native_lib, native_method ..., unless the
+       program defines a method by such a name or method_missing) and the
        settled assignments of other constants, whose values are built of
        literals, settled constants, class constructors and the builtin
-       operators on those; or
+       operators on those, Math's functions (unless the program defines on
+       Math) and a native binding's functions (`IOBufferPackage.__page_size`,
+       C handed no proc) called with those; or
      - no read of the constant (a bare name or a path, defined?, const_get,
        const_defined?) and no `constants` call comes earlier in program order
        than the assignment: a method that reads it and is written before the
@@ -43,7 +47,14 @@
    method_added ...) has its definitions counted as code of the program's
    too, and one that reopens a builtin class has the builtin operators
    counted so. The pass also names, for each flagged bare read, the class or
-   module it is written in (`const_cref`), as the error shows it. */
+   module it is written in (`const_cref`), as the error shows it.
+
+   A constant bound once to an Integer or Float literal (its only write, no
+   remove_const: elab_const_write_final) reads as that literal
+   (LocalVar.const_lit): a read in a loop that stores through a pointer
+   loads the slot again on every pass otherwise, since the C compiler cannot
+   tell the store from one to the slot. Its presence flag, if any, is still
+   tested. */
 
 #include "analyze_internal.h"
 #include "builtin_names.h"
@@ -61,6 +72,8 @@ typedef struct {
   int hooks;         /* a definition can run a hook of the program's */
   int cmissing;      /* the program defines const_missing, which spinel does not call */
   int reopened;      /* a builtin class is reopened: its operators may be the program's */
+  int math_own;      /* the program defines on Math or reaches its singleton: its functions may be the program's */
+  int native_own;    /* the program defines a method named as a native declaration, or method_missing: such a call may run it */
 } ConstWalk;
 
 static int cw_index(const ConstWalk *w, const LocalVar *lv) { return (int)(lv - w->c->consts); }
@@ -123,7 +136,7 @@ static int cw_value_walk(ConstWalk *w, int id, int depth) {
       /* a class or a builtin constant is there; a value constant must have been assigned */
       int par = nt_kind(nt, id) == NK_ConstantPathNode ? nt_ref(nt, id, "parent") : -1;
       if (par >= 0 && !cw_value(w, par, depth + 1)) return 0;
-      const char *nm = nt_str(nt, id, "name");
+      const char *nm = const_key_at(w->c, id);
       LocalVar *lv = nm ? comp_const(w->c, nm) : NULL;
       if (!lv) return 1;
       int i = cw_index(w, lv);
@@ -142,11 +155,13 @@ static int cw_value_walk(ConstWalk *w, int id, int depth) {
         /* the declarations of a body; a mixin runs the module's hook, if any */
         if (is_attr_reader_family(nm) || is_attr_writer_family(nm) || visibility_of_name(nm))
           return 1;
+        /* a native binding's declarations, which make methods */
+        if (is_native_decl_name(nm) && !w->native_own) return w->hooks ? 0 : 1;
         return is_mixin_call(nm) && !w->hooks ? 1 : 0;
       }
       int rv = cw_value(w, r, depth + 1);
       if (rv == 0) return 0;
-      const char *rn = nt_kind(nt, r) == NK_ConstantReadNode ? nt_str(nt, r, "name") : NULL;
+      const char *rn = nt_kind(nt, r) == NK_ConstantReadNode ? nt_key_name(nt, r) : NULL;
       /* Struct.new, Data.define, Class.new, Module.new run the body they take */
       if (rn && is_class_builder(rn, nm) && !w->hooks && !w->reopened) {
         if (blk < 0) return 1;
@@ -156,6 +171,10 @@ static int cw_value_walk(ConstWalk *w, int id, int depth) {
       }
       if (blk >= 0) return 0;
       if (rn && is_value_constructor(rn, nm) && ar == 2 && !w->reopened) return 1;
+      /* Math.sqrt(2.0) */
+      if (rn && is_math_module_name(rn) && is_math_fn_name(nm) && ar == 2 && !w->math_own) return 2;
+      /* a module's native_func (`Mod.f`) runs C, handed no proc to call */
+      if (rn && ar == 2 && comp_native_find(w->c, rn, nm) >= 0) return 1;
       if (is_freeze_family(nm) && an == 0) return rv;
       if (rv == 2 && ar == 2 && !w->reopened &&
           (is_arith_op(nm) || is_cmp_op(nm) || is_eq_op(nm) || is_bit_op(nm) || is_shift_op(nm)))
@@ -193,7 +212,7 @@ static void cw_stmt_walk(ConstWalk *w, int id, int depth) {
       int was = w->clean || bi;
       int r = cw_value(w, nt_ref(nt, id, "value"), depth + 1);
       if (!r) w->clean = 0;
-      const char *nm = nt_str(nt, id, "name");
+      const char *nm = const_key_at(w->c, id);
       LocalVar *lv = nm ? comp_const(w->c, nm) : NULL;
       if (was && (r || bi) && lv) {
         int i = cw_index(w, lv);
@@ -214,7 +233,7 @@ static void cw_stmt_walk(ConstWalk *w, int id, int depth) {
         int n = 0; const int *ts = nt_arr(nt, id, sides[k], &n);
         for (int i = 0; i < n; i++) {
           if (nt_kind(nt, ts[i]) != NK_ConstantTargetNode) continue;
-          const char *nm = nt_str(nt, ts[i], "name");
+          const char *nm = const_key_at(w->c, ts[i]);
           LocalVar *lv = nm ? comp_const(w->c, nm) : NULL;
           if (was && (r || bi) && lv) { w->settled[ts[i]] = 1; w->seen[cw_index(w, lv)] = 1; }
         }
@@ -227,7 +246,7 @@ static void cw_stmt_walk(ConstWalk *w, int id, int depth) {
       int was = w->clean || bi;
       int r = cw_value(w, nt_ref(nt, id, "value"), depth + 1);
       int tgt = nt_ref(nt, id, "target");
-      const char *nm = tgt >= 0 ? nt_str(nt, tgt, "name") : NULL;
+      const char *nm = tgt >= 0 ? const_key_at(w->c, tgt) : NULL;
       LocalVar *lv = nm ? comp_const(w->c, nm) : NULL;
       if (was && (r || bi) && lv) { w->settled[id] = 1; w->seen[cw_index(w, lv)] = 1; }
       return;
@@ -255,7 +274,7 @@ static void cw_top_stmt(void *w, int id) { cw_stmt(w, id, 0); }
 static const char *cw_read_name(const NodeTable *nt, int id) {
   switch (nt_kind(nt, id)) {
     case NK_ConstantReadNode: case NK_ConstantPathNode:
-      return nt_str(nt, id, "name");
+      return nt_const_key_or_name(nt, id);   /* (const_key_at) */
     case NK_CallNode: {
       const char *cn = nt_str(nt, id, "name");
       int a = nt_ref(nt, id, "arguments"), an = 0;
@@ -330,6 +349,16 @@ int an_const_read_finds(Compiler *c, int id, const char *name) {
 
 static int const_class_presence(Compiler *c, int id, int program);
 
+/* 1 + the Integer or Float literal write node `first` assigns when it is
+   its constant's only write (LocalVar.const_lit), else 0 */
+static int const_literal_write(Compiler *c, int first) {
+  const NodeTable *nt = c->nt;
+  if (first < 0 || nt_kind(nt, first) != NK_ConstantWriteNode) return 0;
+  int v = nt_ref(nt, first, "value");
+  NodeKind vk = v >= 0 ? nt_kind(nt, v) : NK_NONE;
+  return (vk == NK_IntegerNode || vk == NK_FloatNode) && elab_const_write_final(c, first) ? v + 1 : 0;
+}
+
 /* Mark the constants some assignment can follow a read of: LocalVar.const_early
    (see the header comment). */
 void an_const_presence(Compiler *c) {
@@ -350,10 +379,19 @@ void an_const_presence(Compiler *c) {
       const char *dn = nt_str(nt, id, "name");
       if (dn && is_definition_hook_name(dn)) w.hooks = 1;
       if (dn && is_const_missing_name(dn)) w.cmissing = 1;
+      if (dn && (is_native_decl_name(dn) || is_method_missing_name(dn))) w.native_own = 1;
     }
     else if (k == NK_ClassNode || k == NK_ModuleNode) {
       const char *cn = class_def_name(nt, id);
       if (cn && (is_builtin_class_name(cn) || is_builtin_reopen_name(cn))) w.reopened = 1;
+      if (is_math_module_name(cn)) w.math_own = 1;
+    }
+    /* def Math.f, class << Math, Math.define_singleton_method ... */
+    if (k == NK_DefNode || k == NK_SingletonClassNode || k == NK_CallNode) {
+      int r = nt_ref(nt, id, k == NK_SingletonClassNode ? "expression" : "receiver");
+      if (r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode && is_math_module_name(nt_key_name(nt, r)) &&
+          !(k == NK_CallNode && is_math_fn_name(nt_str(nt, id, "name"))))
+        w.math_own = 1;
     }
   }
   prog_top_stmts(c, cw_top_stmt, &w);   /* the files' top levels, in load order */
@@ -363,6 +401,7 @@ void an_const_presence(Compiler *c) {
     int early, first = elab_const_first_write(c, c->consts[i].name, &early);
     first_settled[i] = first >= 0 && w.settled[first];
     if (early) c->consts[i].const_early = 1;
+    c->consts[i].const_lit = const_literal_write(c, first);
   }
   /* Every read and listing asks at its statement's point, including the
      defining statement of a body that may run later. */
@@ -370,10 +409,27 @@ void an_const_presence(Compiler *c) {
     const char *rn = cw_read_name(nt, id), *cn = nt_kind(nt, id) == NK_CallNode ? nt_str(nt, id, "name") : NULL;
     LocalVar *lv = rn && !cw_path_target(&w, id) ? comp_const(c, rn) : NULL;
     int listed = cn && is_constants_list_name(cn), computed = cn && !rn && is_const_query_name(cn) && nt_ref(nt, id, "arguments") >= 0;
-    if ((!lv && !listed && !computed) || !cw_placed(&w, id)) continue;
-    for (int i = lv ? cw_index(&w, lv) : 0, end = lv ? i + 1 : c->nconsts; i < end; i++)
+    /* `A.const_defined?(:X)` with X keyed by owner only (A__X, B__X: two
+       modules own an X) asks the slot A's chain finds; a receiver known
+       only at run time asks each constant of that leaf */
+    int leaf_q = !lv && rn && cn && is_const_query_name(cn) && !strstr(rn, "::");
+    if (leaf_q) {
+      int r = nt_ref(nt, id, "receiver");
+      NodeKind rk = r >= 0 ? nt_kind(nt, r) : NK_NONE;
+      if (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) {
+        lv = const_defined_slot(c, const_get_recv_class(c, id, r), rn);
+        if (lv) leaf_q = 0;
+      }
+    }
+    if ((!lv && !listed && !computed && !leaf_q) || !cw_placed(&w, id)) continue;
+    for (int i = lv ? cw_index(&w, lv) : 0, end = lv ? i + 1 : c->nconsts; i < end; i++) {
+      if (leaf_q) {
+        const char *kn = c->consts[i].name, *lf = const_key_leaf(kn);
+        if (lf == kn || !sp_streq(lf, rn)) continue;
+      }
       if (!first_settled[i] && !an_const_read_finds(c, id, c->consts[i].name))
         early_reads[i] |= listed ? 2 : computed ? 4 : 1;
+    }
   }
   for (int i = 0; i < c->nconsts; i++) {
     if (c->consts[i].const_early || !early_reads[i]) continue;
@@ -402,7 +458,7 @@ void an_const_presence(Compiler *c) {
   char *own = calloc(nn, 1);             /* per node: a read that asks its own class's flag */
   if (!cref || !own) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   for (int id = 0; id < nt->count; id++) {
-    LocalVar *lv = nt_kind(nt, id) == NK_ConstantReadNode ? comp_const(c, nt_str(nt, id, "name")) : NULL;
+    LocalVar *lv = nt_kind(nt, id) == NK_ConstantReadNode ? comp_const_at(c, id) : NULL;
     if (lv && lv->const_early && cw_placed(&w, id)) cref[id] = 1 + cw_cref_at(&w, id);
   }
   /* Compute consumption once, while the constant pass visits reads. A
@@ -424,8 +480,31 @@ void an_const_presence(Compiler *c) {
     c->classes[ci - 1].presence_read = 1;
     if (nt_kind(nt, c->classes[ci - 1].def_node) == NK_ConstantPathWriteNode && id < (int)nn) own[id] = 1;
   }
+  /* Class#subclasses lists the subclasses whose header has run, as CRuby's
+     does while classes load (a library walking a class's descendants from
+     class bodies sees only those loaded so far): the call asks each
+     candidate's flag, a constant receiver's direct subclasses (by the
+     superclass their headers name: the class graph's parents are linked
+     later), any class value's every subclass, and their headers store it. */
+  NT_FOREACH_KIND(nt, NK_CallNode, id) {
+    const char *nm = nt_str(nt, id, "name");
+    int argc = 0;
+    if (!nm || !sp_streq(nm, "subclasses") || (call_args(nt, id, &argc), argc)) continue;
+    int r = nt_ref(nt, id, "receiver");
+    const char *rn = r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode ? nt_str(nt, r, "name") : NULL;
+    for (int k = 0; k < c->nclasses; k++) {
+      ClassInfo *ci = &c->classes[k];
+      if (ci->def_node < 0 || ci->is_singleton_of || is_builtin_reopen(ci->name)) continue;
+      int sn = nt_kind(nt, ci->def_node) == NK_ClassNode ? class_def_super(nt, ci->def_node) : -1;
+      if (sn < 0) continue;
+      const char *pn = nt_str(nt, sn, "name");
+      if (rn && !(pn && sp_streq(pn, rn))) continue;
+      ci->presence_read = 1;
+    }
+  }
   for (int id = 0; id < (int)nn && id < nt->count; id++) {
-    if (cref[id]) nt_node_set_str((NodeTable *)nt, id, "const_cref", cref[id] > 1 ? w.crefs[cref[id] - 2] : "");
+    /* (a read a desugar made with its holder's name keeps it) */
+    if (cref[id] && !nt_str(nt, id, "const_cref")) nt_node_set_str((NodeTable *)nt, id, "const_cref", cref[id] > 1 ? w.crefs[cref[id] - 2] : "");
     if (own[id]) nt_node_set_str((NodeTable *)nt, id, "own_presence", "1");
   }
   free(cref); free(own);
@@ -469,8 +548,9 @@ int an_class_needs_presence(Compiler *c, int ci) {
    each, and marks those that ask `own_presence`), not a reference to the
    class the passes made of self later. */
 static int const_class_presence(Compiler *c, int id, int program) {
-  const char *nm = nt_str(c->nt, id, "name");
-  int ci = nm ? comp_class_index(c, nm) : -1;
+  const char *nm = nt_key_name(c->nt, id);
+  NodeKind ik = nt_kind(c->nt, id);
+  int ci = !nm ? -1 : ik == NK_ConstantReadNode || ik == NK_ConstantPathNode ? const_node_class_index(c, id) : comp_class_index(c, nm);
   if (!an_class_needs_presence(c, ci)) return 0;
   int def = c->classes[ci].def_node, in_own = 0;
   Scope *scope = comp_scope_of(c, id);
@@ -501,7 +581,7 @@ int an_class_presence_write(Compiler *c, int id) {
   if (k == NK_ClassNode || k == NK_ModuleNode) ci = elab_header_class(c, id, NULL, NULL);
   else if (k == NK_ConstantWriteNode || k == NK_ConstantPathWriteNode) {
     int target = k == NK_ConstantWriteNode ? id : nt_ref(c->nt, id, "target");
-    const char *nm = nt_str(c->nt, target, "name");
+    const char *nm = const_key_at(c, target);
     ci = nm ? comp_class_index(c, nm) : -1;
     if (ci >= 0 && c->classes[ci].def_node != id) ci = -1;
   }
@@ -513,9 +593,8 @@ int an_class_presence_write(Compiler *c, int id) {
 ConstReadEffect an_const_read_effect(Compiler *c, int id) {
   NodeKind k = nt_kind(c->nt, id);
   if (!nt_kind_is_constant(k)) return (ConstReadEffect){0};
-  const char *nm = nt_str(c->nt, id, "name");
-  LocalVar *lv = nm ? comp_const(c, nm) : NULL;
-  return (ConstReadEffect){ const_has_flag(lv) && (k != NK_ConstantPathNode || (!const_path_in_closed_builtin(c, id) && !const_path_misses_toplevel(c, id))) ? lv : NULL,
+  LocalVar *lv = comp_const_at(c, id);
+  return (ConstReadEffect){ const_has_flag(lv) && (k != NK_ConstantPathNode || const_path_reaches_leaf_const(c, id)) ? lv : NULL,
                            elab_autoload_read(c, id), const_class_presence(c, id, 0) };
 }
 
@@ -533,7 +612,7 @@ int an_const_read_keeps_class(Compiler *c, int id) {
 
 int an_const_read_is_value(Compiler *c, int id) {
   NodeKind k = nt_kind(c->nt, id);
-  const char *nm = nt_str(c->nt, id, "name");
+  const char *nm = const_key_at(c, id);
   return (nt_kind_is_constant(k)) && nm &&
          comp_class_index(c, nm) < 0 && !is_builtin_class_name(nm) && comp_const(c, nm);
 }

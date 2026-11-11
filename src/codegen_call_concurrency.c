@@ -268,23 +268,36 @@ int emit_op_queue_pop(Compiler *c, const BopCtx *x, Buf *b) {
   return 0;
 }
 
+/* fn(recv, values, count) for Fiber#resume / #transfer on a typed fiber.
+   A receiver that may be a fresh one (`Fiber.new { }.resume(1, 2)`,
+   operand_may_allocate) is rooted in a temp first, as the poly arm roots
+   its own: the values are packed after it is made, which allocates, and a
+   collection there freed the fiber the call then resumed. A local's or an
+   ivar's fiber is held already. */
+static void emit_fiber_pass_rooted(Compiler *c, const char *fn, int recv, int argc, const int *argv, Buf *b) {
+  Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
+  if (!operand_may_allocate(c, recv)) emit_fiber_pass_call(c, fn, rb.p ? rb.p : "NULL", argc, argv, b);
+  else {
+    int tf = ++g_tmp;
+    char ft[32]; snprintf(ft, sizeof ft, "_t%d", tf);
+    buf_printf(b, "({ sp_Fiber *_t%d = %s; SP_GC_ROOT(_t%d); ", tf, rb.p ? rb.p : "NULL", tf);
+    emit_fiber_pass_call(c, fn, ft, argc, argv, b);
+    buf_puts(b, "; })");
+  }
+  free(rb.p);
+}
+
 int emit_op_fiber_resume(Compiler *c, const BopCtx *x, Buf *b) {
-  int recv = x->recv;
   int argc;
   const int *argv = call_args(c->nt, x->id, &argc);
-  Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
-  emit_fiber_pass_call(c, "sp_Fiber_resume_n", rb.p ? rb.p : "NULL", argc, argv, b);
-  free(rb.p);
+  emit_fiber_pass_rooted(c, "sp_Fiber_resume_n", x->recv, argc, argv, b);
   return 1;
 }
 
 int emit_op_fiber_transfer(Compiler *c, const BopCtx *x, Buf *b) {
-  int recv = x->recv;
   int argc;
   const int *argv = call_args(c->nt, x->id, &argc);
-  Buf rb; memset(&rb, 0, sizeof rb); emit_expr(c, recv, &rb);
-  emit_fiber_pass_call(c, "sp_Fiber_transfer_n", rb.p ? rb.p : "NULL", argc, argv, b);
-  free(rb.p);
+  emit_fiber_pass_rooted(c, "sp_Fiber_transfer_n", x->recv, argc, argv, b);
   return 1;
 }
 
@@ -486,6 +499,9 @@ int emit_call_synchronize_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
           buf_printf(b, "if (_retf%d) { %s = _retv%d; return 0; } ", eid, proc_ret_slot(), eid);
         /* a fiber body is `static void`: see g_c_ret_void */
         else if (has_retval && g_c_ret_void) buf_printf(b, "if (_retf%d) return; ", eid);
+        /* (a handle slot's answer is published as it returns, as
+           emit_retf_return's is) */
+        else if (has_retval && g_ret_type == TY_STRBUF) buf_printf(b, "if (_retf%d) return sp_strface_pub_h(_retv%d); ", eid, eid);
         else if (has_retval) buf_printf(b, "if (_retf%d) return _retv%d; ", eid, eid);
         else if (g_in_proc_body && g_result_var && g_result_poly)
           buf_printf(b, "if (_retf%d) { %s = sp_box_nil(); return 0; } ", eid, g_result_var);

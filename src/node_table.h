@@ -121,6 +121,11 @@ typedef struct {
   int *kind_moved, nkind_moved, ckind_moved;
   int kind_live;
   int **kind_retired, nkind_retired, ckind_retired;
+  /* the strings an edit replaced (a string field's value or key, a type, a
+     content), kept until nt_free: a caller may hold the pointer nt_str or
+     nt_type answered across a call that renames the node */
+  char **str_retired;
+  int nstr_retired, cstr_retired;
   /* the class or module body that holds each node (fwd_lex_parent), made as
      far as its questions need; NULL until the first */
   struct NtHolders *holders;
@@ -300,6 +305,11 @@ int *nt_subtree_ids(NodeTable *nt, const int *roots, int n, int *out);
    yet. comp_node_tag names an appended node from this, so the name is the
    same whenever it is asked and whichever passes ran before. */
 int nt_origin(const NodeTable *nt, int id, char *how, int *a, unsigned *pass, int *k);
+/* The node `id` is a copy of (nt_origin's 'c' link: nt_clone_subtree made
+   it), or -1 for any other node: one parsed, one first linked under a
+   parent, one linked nowhere yet. A clone's own source may be a clone, so
+   a caller that follows the chain bounds its steps. */
+int nt_clone_source(const NodeTable *nt, int id);
 void nt_track_origins(NodeTable *nt);   /* from the nodes appended next on */
 const char *nt_set_pass(NodeTable *nt, const char *pass);   /* the one before */
 void nt_subtree_blank(NodeTable *nt, int id);   /* every node of the subtree a NilNode */
@@ -324,9 +334,10 @@ void nt_node_reset(NodeTable *nt, int id, const char *type);
 void nt_node_set_str(NodeTable *nt, int id, const char *key, const char *val);
 /* A temporary rename (an emitter re-entering under another spelling): the
    swap sets key to a copy of val and answers the string it held, NULL when
-   the node had none, which the restore puts back. Unlike nt_node_set_str it
-   frees nothing a caller may still hold: a name read before the rename stays
-   valid through it and after. */
+   the node had none, which the restore puts back. Neither, nor any other
+   edit, frees a string a caller may still hold: the replaced one is kept
+   until the table is freed (NodeTable.str_retired), so a name read before a
+   rename stays valid through it and after. */
 char *nt_node_swap_str(NodeTable *nt, int id, const char *key, const char *val);
 void nt_node_restore_str(NodeTable *nt, int id, const char *key, char *held);
 void nt_node_set_int(NodeTable *nt, int id, const char *key, long long val);
@@ -645,6 +656,25 @@ static inline int nt_paren_single(const NodeTable *nt, int n) {
   }
   return n;
 }
+/* The arm that continues the ladder `n` (an IfNode or UnlessNode) is an arm
+   of, or -1: its `subsequent` when that is an `elsif`, or an `else` whose
+   statements are exactly one IfNode or UnlessNode (a hand-written `else`
+   holding an `if ... end`, and a nested ternary's else arm). It answers the
+   syntactic question "is the else arm one more conditional?", so a ladder
+   of any length is walked by a loop instead of by recursion. Parentheses
+   around the inner conditional are the program's own nesting and are left
+   alone. It says nothing of a value or a type. */
+static inline int nt_ladder_next(const NodeTable *nt, int n) {
+  int sub = nt_ref(nt, n, nt_kind(nt, n) == NK_UnlessNode ? "else_clause" : "subsequent");
+  if (sub < 0) return -1;
+  if (nt_kind(nt, sub) == NK_IfNode) return sub;
+  if (nt_kind(nt, sub) != NK_ElseNode) return -1;
+  int st = nt_ref(nt, sub, "statements"), cnt = 0;
+  const int *body = st >= 0 ? nt_arr(nt, st, "body", &cnt) : NULL;
+  if (cnt != 1) return -1;
+  NodeKind k = nt_kind(nt, body[0]);
+  return k == NK_IfNode || k == NK_UnlessNode ? body[0] : -1;
+}
 /* nt_paren_single's answer for n, with the parentheses it peels taken out
    of the table: each one and its statements become NilNodes that hold
    nothing, so no walk by id and no parent map (an_parent_map) still finds
@@ -697,4 +727,13 @@ extern int g_opt_debug, g_opt_line_map, g_opt_positions, g_opt_warn_widen, g_opt
 extern const char *g_opt_emit_types, *g_opt_emit_rbs, *g_opt_emit_symbol_map, *g_opt_profile_symbol_map,
                   *g_opt_rbs_seed;
 
+
+/* The name a class or module header's constant path is keyed by: the one
+   qualify_colliding_classes gave a colliding header ("qc_name"), else the
+   one the program wrote. (Interim, #10793: the readers move to the class
+   the node opens.) */
+static inline const char *nt_key_name(const NodeTable *nt, int n) {
+  const char *q = nt_str(nt, n, "qc_name");
+  return q ? q : nt_str(nt, n, "name");
+}
 #endif

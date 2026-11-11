@@ -4,6 +4,10 @@ spinel: 1 refusal, nothing written
 == test/collect/gap_inside_capturing_proc.rb [promote] rc=1
 spinel: test/collect/gap_inside_capturing_proc.rb:19: unsupported class variable read (no class scope): node N (ClassVariableReadNode)
 spinel: 1 refusal, nothing written
+== test/reject/alias_of_extended_super_behind_redef_two_modules.rb [default] rc=1
+spinel: test/reject/alias_of_extended_super_behind_redef_two_modules.rb:16: B.n: alias of an inherited class method whose `super` reaches a module the class extends, behind a later definition of the name, is not supported; see docs/limitations.md
+== test/reject/alias_of_extended_super_behind_redef_two_modules.rb [promote] rc=1
+spinel: test/reject/alias_of_extended_super_behind_redef_two_modules.rb:16: B.n: alias of an inherited class method whose `super` reaches a module the class extends, behind a later definition of the name, is not supported; see docs/limitations.md
 == test/reject/alias_rebinds_after_class_body_call.rb [default] rc=1
 spinel: test/reject/alias_rebinds_after_class_body_call.rb:8: `a` is called in the class body before an alias rebinds it: an alias binds for the whole program here, so the call would run the aliased body, not the `def a` Ruby runs at that point. Call it after the alias, or give the alias another name
 == test/reject/alias_rebinds_after_class_body_call.rb [promote] rc=1
@@ -66,17 +70,35 @@ spinel: 1 refusal, nothing written
 == test/reject/bool_reopen_block_return_in_lambda.rb [promote] rc=1
 spinel: test/reject/bool_reopen_block_return_in_lambda.rb:8: a `return` in a block given to a TrueClass's or FalseClass's yielding method, inside a lambda, is not supported by AOT compilation
 spinel: 1 refusal, nothing written
+== test/reject/builder_after_header.rb [default] rc=1
+spinel: test/reject/builder_after_header.rb:7: a `class Foo` or `module Foo` ahead of a Foo = Class.new or Module.new in the same body is not supported: the write replaces the header's class with the built one, and spinel would merge the two; rename one of them
+== test/reject/builder_after_header.rb [promote] rc=1
+spinel: test/reject/builder_after_header.rb:7: a `class Foo` or `module Foo` ahead of a Foo = Class.new or Module.new in the same body is not supported: the write replaces the header's class with the built one, and spinel would merge the two; rename one of them
+== test/reject/builder_after_header_under_rescue.rb [default] rc=1
+spinel: test/reject/builder_after_header_under_rescue.rb:7: a `class Foo` or `module Foo` ahead of a Foo = Class.new or Module.new in the same body is not supported: the write replaces the header's class with the built one, and spinel would merge the two; rename one of them
+== test/reject/builder_after_header_under_rescue.rb [promote] rc=1
+spinel: test/reject/builder_after_header_under_rescue.rb:7: a `class Foo` or `module Foo` ahead of a Foo = Class.new or Module.new in the same body is not supported: the write replaces the header's class with the built one, and spinel would merge the two; rename one of them
+== test/reject/builder_beside_conditional_header.rb [default] rc=1
+spinel: test/reject/builder_beside_conditional_header.rb:5: a Foo = Class.new or Module.new that may run without a `class Foo` or `module Foo` in the same body, or the header without it, is not supported: spinel cannot tell whether the header reopens the built class; write the two together or rename one of them
+== test/reject/builder_beside_conditional_header.rb [promote] rc=1
+spinel: test/reject/builder_beside_conditional_header.rb:5: a Foo = Class.new or Module.new that may run without a `class Foo` or `module Foo` in the same body, or the header without it, is not supported: spinel cannot tell whether the header reopens the built class; write the two together or rename one of them
+== test/reject/builder_beside_header_in_rescued_begin.rb [default] rc=1
+spinel: test/reject/builder_beside_header_in_rescued_begin.rb:6: a Foo = Class.new or Module.new that may run without a `class Foo` or `module Foo` in the same body, or the header without it, is not supported: spinel cannot tell whether the header reopens the built class; write the two together or rename one of them
+== test/reject/builder_beside_header_in_rescued_begin.rb [promote] rc=1
+spinel: test/reject/builder_beside_header_in_rescued_begin.rb:6: a Foo = Class.new or Module.new that may run without a `class Foo` or `module Foo` in the same body, or the header without it, is not supported: spinel cannot tell whether the header reopens the built class; write the two together or rename one of them
+== test/reject/builder_conditional_beside_header.rb [default] rc=1
+spinel: test/reject/builder_conditional_beside_header.rb:7: a Bar = Class.new or Module.new that may run without a `class Bar` or `module Bar` in the same body, or the header without it, is not supported: spinel cannot tell whether the header reopens the built class; write the two together or rename one of them
+== test/reject/builder_conditional_beside_header.rb [promote] rc=1
+spinel: test/reject/builder_conditional_beside_header.rb:7: a Bar = Class.new or Module.new that may run without a `class Bar` or `module Bar` in the same body, or the header without it, is not supported: spinel cannot tell whether the header reopens the built class; write the two together or rename one of them
+== test/reject/builder_header_apart_under_rescue.rb [default] rc=1
+spinel: test/reject/builder_header_apart_under_rescue.rb:6: a Foo = Class.new or Module.new that may run without a `class Foo` or `module Foo` in the same body, or the header without it, is not supported: spinel cannot tell whether the header reopens the built class; write the two together or rename one of them
+== test/reject/builder_header_apart_under_rescue.rb [promote] rc=1
+spinel: test/reject/builder_header_apart_under_rescue.rb:6: a Foo = Class.new or Module.new that may run without a `class Foo` or `module Foo` in the same body, or the header without it, is not supported: spinel cannot tell whether the header reopens the built class; write the two together or rename one of them
 == test/reject/builtin_include_in_method.rb [default] rc=1
 spinel: test/reject/builtin_include_in_method.rb:7: String.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class String ... end` (see docs/limitations.md)
 spinel: 1 refusal, nothing written
 == test/reject/builtin_include_in_method.rb [promote] rc=1
 spinel: test/reject/builtin_include_in_method.rb:7: String.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class String ... end` (see docs/limitations.md)
-spinel: 1 refusal, nothing written
-== test/reject/builtin_reopen_bare_instance_method.rb [default] rc=1
-spinel: test/reject/builtin_reopen_bare_instance_method.rb:6: unsupported call: node N (CallNode `instance_method`) recv=-/ty-1 argc=1 arg0ty8
-spinel: 1 refusal, nothing written
-== test/reject/builtin_reopen_bare_instance_method.rb [promote] rc=1
-spinel: test/reject/builtin_reopen_bare_instance_method.rb:6: unsupported call: node N (CallNode `instance_method`) recv=-/ty-1 argc=1 arg0ty8
 spinel: 1 refusal, nothing written
 == test/reject/builtin_singleton_alias_call_unordered_block.rb [default] rc=1
 spinel: test/reject/builtin_singleton_alias_call_unordered_block.rb:3: Time.stamp: a call that may run before the singleton alias of a builtin's class method is made (written in a block, on the alias's line, or beside an alias that is not plain class-body code) is not supported; see docs/limitations.md
@@ -508,6 +530,50 @@ spinel: test/reject/compact_path_struct_parent_in_module.rb:9: a class or module
 spinel: test/reject/compact_path_struct_parent_reopened_later.rb:8: a class or module under Point, a constant that holds a Struct or Data class, is not supported here; write it in the body that writes Point, after any `class Point` body
 == test/reject/compact_path_struct_parent_reopened_later.rb [promote] rc=1
 spinel: test/reject/compact_path_struct_parent_reopened_later.rb:8: a class or module under Point, a constant that holds a Struct or Data class, is not supported here; write it in the body that writes Point, after any `class Point` body
+== test/reject/comparable_copy_alias_kernel_name.rb [default] rc=1
+spinel: test/reject/comparable_copy_alias_kernel_name.rb:15: unsupported puts argument: node N (CallNode `qa`) recv=StringNode/ty6 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_alias_kernel_name.rb [promote] rc=1
+spinel: test/reject/comparable_copy_alias_kernel_name.rb:15: unsupported puts argument: node N (CallNode `qa`) recv=StringNode/ty6 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_alias_kernel_name_rational.rb [default] rc=1
+spinel: test/reject/comparable_copy_alias_kernel_name_rational.rb:11: unsupported puts argument: node N (CallNode `qa`) recv=CallNode/ty15 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_alias_kernel_name_rational.rb [promote] rc=0
+== test/reject/comparable_copy_alias_method_kernel_name_rational.rb [default] rc=1
+spinel: test/reject/comparable_copy_alias_method_kernel_name_rational.rb:11: unsupported puts argument: node N (CallNode `qa`) recv=CallNode/ty15 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_alias_method_kernel_name_rational.rb [promote] rc=0
+== test/reject/comparable_copy_const_class_alias_kernel_name.rb [default] rc=1
+spinel: test/reject/comparable_copy_const_class_alias_kernel_name.rb:13: unsupported puts argument: node N (CallNode `qa`) recv=StringNode/ty6 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_const_class_alias_kernel_name.rb [promote] rc=1
+spinel: test/reject/comparable_copy_const_class_alias_kernel_name.rb:13: unsupported puts argument: node N (CallNode `qa`) recv=StringNode/ty6 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_own_kernel_name.rb [default] rc=1
+spinel: test/reject/comparable_copy_own_kernel_name.rb:12: unsupported puts argument: node N (CallNode `qa`) recv=StringNode/ty6 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_own_kernel_name.rb [promote] rc=1
+spinel: test/reject/comparable_copy_own_kernel_name.rb:12: unsupported puts argument: node N (CallNode `qa`) recv=StringNode/ty6 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_prepended_alias_kernel_name.rb [default] rc=1
+spinel: test/reject/comparable_copy_prepended_alias_kernel_name.rb:15: unsupported puts argument: node N (CallNode `qa`) recv=StringNode/ty6 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_prepended_alias_kernel_name.rb [promote] rc=1
+spinel: test/reject/comparable_copy_prepended_alias_kernel_name.rb:15: unsupported puts argument: node N (CallNode `qa`) recv=StringNode/ty6 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_toplevel_include_kernel_name.rb [default] rc=1
+spinel: test/reject/comparable_copy_toplevel_include_kernel_name.rb:10: unsupported puts argument: node N (CallNode `qa`) recv=StringNode/ty6 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_toplevel_include_kernel_name.rb [promote] rc=1
+spinel: test/reject/comparable_copy_toplevel_include_kernel_name.rb:10: unsupported puts argument: node N (CallNode `qa`) recv=StringNode/ty6 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_unplain_mixin_kernel_name.rb [default] rc=1
+spinel: test/reject/comparable_copy_unplain_mixin_kernel_name.rb:18: unsupported puts argument: node N (CallNode `qa`) recv=StringNode/ty6 argc=0
+spinel: 1 refusal, nothing written
+== test/reject/comparable_copy_unplain_mixin_kernel_name.rb [promote] rc=1
+spinel: test/reject/comparable_copy_unplain_mixin_kernel_name.rb:18: unsupported puts argument: node N (CallNode `qa`) recv=StringNode/ty6 argc=0
+spinel: 1 refusal, nothing written
 == test/reject/compare_by_identity_chained.rb [default] rc=1
 spinel: test/reject/compare_by_identity_chained.rb:8: unsupported Hash#compare_by_identity (identity-keyed hashing): its answer is used as another name for the hash: node N (CallNode `compare_by_identity`) recv=LocalVariableReadNode/ty28 argc=0
 spinel: 1 refusal, nothing written
@@ -525,12 +591,6 @@ spinel: test/reject/compare_by_identity_chained_boxed.rb:4: unsupported Hash#com
 spinel: 1 refusal, nothing written
 == test/reject/compare_by_identity_chained_boxed.rb [promote] rc=1
 spinel: test/reject/compare_by_identity_chained_boxed.rb:4: unsupported Hash#compare_by_identity (identity-keyed hashing): node N (CallNode `compare_by_identity`) recv=CallNode/ty50 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/compare_by_identity_string_key.rb [default] rc=1
-spinel: test/reject/compare_by_identity_string_key.rb:5: unsupported Hash#compare_by_identity (identity-keyed hashing): a key may be a String, an Integer, a Float or a boxed value: node N (CallNode `compare_by_identity`) recv=CallNode/ty30 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/compare_by_identity_string_key.rb [promote] rc=1
-spinel: test/reject/compare_by_identity_string_key.rb:5: unsupported Hash#compare_by_identity (identity-keyed hashing): a key may be a String, an Integer, a Float or a boxed value: node N (CallNode `compare_by_identity`) recv=CallNode/ty30 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/complex_bignum_component.rb [default] rc=1
 spinel: test/reject/complex_bignum_component.rb:7: a Complex component given an Integer past 64 bits, which no conversion keeps in its sp_float slot
@@ -566,6 +626,14 @@ spinel: 1 refusal, nothing written
 spinel: test/reject/const_get_runtime_name.rb:7: unsupported const_get with a name known only at run time and no class or module receiver (an instance has no const_get; constants are resolved at compile time): node N (CallNode `const_get`) recv=-/ty-1 argc=1 arg0ty6
 == test/reject/const_get_runtime_name.rb [promote] rc=1
 spinel: test/reject/const_get_runtime_name.rb:7: unsupported const_get with a name known only at run time and no class or module receiver (an instance has no const_get; constants are resolved at compile time): node N (CallNode `const_get`) recv=-/ty-1 argc=1 arg0ty6
+== test/reject/const_path_value_parent_middle_collides.rb [default] rc=1
+spinel: test/reject/const_path_value_parent_middle_collides.rb:9: a constant path through a run-time value (`<value>::...::Foo`) is not supported when a middle name of the path and Foo each name classes or modules in more than one scope (see docs/limitations.md)
+== test/reject/const_path_value_parent_middle_collides.rb [promote] rc=1
+spinel: test/reject/const_path_value_parent_middle_collides.rb:9: a constant path through a run-time value (`<value>::...::Foo`) is not supported when a middle name of the path and Foo each name classes or modules in more than one scope (see docs/limitations.md)
+== test/reject/const_path_value_parent_rescue.rb [default] rc=1
+spinel: test/reject/const_path_value_parent_rescue.rb:10: a constant path through a run-time value (`<value>::Err`) in a class or module definition, a rescue list or through a value other than a local, self or its class is not supported when classes or modules in more than one scope are named Err (see docs/limitations.md)
+== test/reject/const_path_value_parent_rescue.rb [promote] rc=1
+spinel: test/reject/const_path_value_parent_rescue.rb:10: a constant path through a run-time value (`<value>::Err`) in a class or module definition, a rescue list or through a value other than a local, self or its class is not supported when classes or modules in more than one scope are named Err (see docs/limitations.md)
 == test/reject/const_set_ambiguous_receiver.rb [default] rc=1
 spinel: test/reject/const_set_ambiguous_receiver.rb:11: const_set(:X, ...) on a receiver whose class or module is known only at run time is not supported when more than one module holds a constant X: constants are compile-time globals, and which module's X this sets is not known at compile time. Write `Mod.const_set(:X, v)` or `Mod::X = v` (see docs/limitations.md)
 spinel: 1 refusal, nothing written
@@ -727,10 +795,10 @@ spinel: 1 refusal, nothing written
 spinel: test/reject/defined_super_builtin_singleton.rb:6: unsupported defined?(super) where the method super reaches is not known at compile time: node N (DefinedNode)
 spinel: 1 refusal, nothing written
 == test/reject/dynamic_send_then_refusal.rb [default] rc=1
-spinel: test/reject/dynamic_send_then_refusal.rb:15: String#unicode_normalize is not supported: Unicode normalization requires shipping the Unicode decomposition/composition tables, which spinel deliberately does not carry -- the same limit as String#grapheme_clusters (see docs/limitations.md)
+spinel: test/reject/dynamic_send_then_refusal.rb:15: Proc#ruby2_keywords is not supported: it is a shim for the Ruby 2.x-to-3.0 keyword-argument transition, and spinel targets modern keyword semantics, so it has nothing to toggle (see docs/limitations.md)
 spinel: 1 refusal, nothing written
 == test/reject/dynamic_send_then_refusal.rb [promote] rc=1
-spinel: test/reject/dynamic_send_then_refusal.rb:15: String#unicode_normalize is not supported: Unicode normalization requires shipping the Unicode decomposition/composition tables, which spinel deliberately does not carry -- the same limit as String#grapheme_clusters (see docs/limitations.md)
+spinel: test/reject/dynamic_send_then_refusal.rb:15: Proc#ruby2_keywords is not supported: it is a shim for the Ruby 2.x-to-3.0 keyword-argument transition, and spinel targets modern keyword semantics, so it has nothing to toggle (see docs/limitations.md)
 spinel: 1 refusal, nothing written
 == test/reject/enumerator_own_with_object.rb [default] rc=1
 spinel: test/reject/enumerator_own_with_object.rb:17: Enumerator#with_object of the program's own (an Enumerator reopening, or a module it prepends or includes) is not supported
@@ -792,54 +860,6 @@ spinel: 1 refusal, nothing written
 == test/reject/forwarding_super_yielding_optional.rb [promote] rc=1
 spinel: test/reject/forwarding_super_yielding_optional.rb:5: `super(...)` into a method that yields and takes an optional or *rest parameter: the forwarded arguments cannot leave one out
 spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_args.rb [default] rc=1
-spinel: test/reject/fwd_block_super_new_args.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_args.rb [promote] rc=1
-spinel: test/reject/fwd_block_super_new_args.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_bind_call.rb [default] rc=1
-spinel: test/reject/fwd_block_super_new_bind_call.rb:8: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_bind_call.rb [promote] rc=1
-spinel: test/reject/fwd_block_super_new_bind_call.rb:8: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_nil.rb [default] rc=1
-spinel: test/reject/fwd_block_super_new_nil.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_nil.rb [promote] rc=1
-spinel: test/reject/fwd_block_super_new_nil.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_poly_class_each.rb [default] rc=1
-spinel: test/reject/fwd_block_super_new_poly_class_each.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_poly_class_each.rb [promote] rc=1
-spinel: test/reject/fwd_block_super_new_poly_class_each.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_poly_class_value.rb [default] rc=1
-spinel: test/reject/fwd_block_super_new_poly_class_value.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_poly_class_value.rb [promote] rc=1
-spinel: test/reject/fwd_block_super_new_poly_class_value.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_prepend.rb [default] rc=1
-spinel: test/reject/fwd_block_super_new_prepend.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_prepend.rb [promote] rc=1
-spinel: test/reject/fwd_block_super_new_prepend.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_sclass.rb [default] rc=1
-spinel: test/reject/fwd_block_super_new_sclass.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_sclass.rb [promote] rc=1
-spinel: test/reject/fwd_block_super_new_sclass.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_superclass_new.rb [default] rc=1
-spinel: test/reject/fwd_block_super_new_superclass_new.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/fwd_block_super_new_superclass_new.rb [promote] rc=1
-spinel: test/reject/fwd_block_super_new_superclass_new.rb:6: unsupported Array#min on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `min`) recv=LocalVariableReadNode/ty22 argc=0
-spinel: 1 refusal, nothing written
 == test/reject/include_module_from_expression.rb [default] rc=1
 spinel: test/reject/include_module_from_expression.rb:9: `include` of a module named by an expression, not a constant, is not supported (the mixin is resolved at compile time)
 == test/reject/include_module_from_expression.rb [promote] rc=1
@@ -848,14 +868,14 @@ spinel: test/reject/include_module_from_expression.rb:9: `include` of a module n
 spinel: test/reject/included_hook_return_in_define_method_args.rb:9: Module#define_method in a method body is supported only for a method the class does not answer yet: it is defined from the start, not when that method runs (see docs/limitations.md)
 == test/reject/included_hook_return_in_define_method_args.rb [promote] rc=1
 spinel: test/reject/included_hook_return_in_define_method_args.rb:9: Module#define_method in a method body is supported only for a method the class does not answer yet: it is defined from the start, not when that method runs (see docs/limitations.md)
-== test/reject/inherited_alias_later_redefined.rb [default] rc=1
-spinel: test/reject/inherited_alias_later_redefined.rb:9: D#o: alias of an inherited method that P defines again after it is not supported; see docs/limitations.md
-== test/reject/inherited_alias_later_redefined.rb [promote] rc=1
-spinel: test/reject/inherited_alias_later_redefined.rb:9: D#o: alias of an inherited method that P defines again after it is not supported; see docs/limitations.md
-== test/reject/inherited_singleton_alias_later_redefined.rb [default] rc=1
-spinel: test/reject/inherited_singleton_alias_later_redefined.rb:10: D.o: alias of an inherited method that P defines again after it is not supported; see docs/limitations.md
-== test/reject/inherited_singleton_alias_later_redefined.rb [promote] rc=1
-spinel: test/reject/inherited_singleton_alias_later_redefined.rb:10: D.o: alias of an inherited method that P defines again after it is not supported; see docs/limitations.md
+== test/reject/inherited_alias_computed_define_method_redefined.rb [default] rc=1
+spinel: test/reject/inherited_alias_computed_define_method_redefined.rb:7: B#n: alias of an inherited method that A defines again after it is not supported; see docs/limitations.md
+== test/reject/inherited_alias_computed_define_method_redefined.rb [promote] rc=1
+spinel: test/reject/inherited_alias_computed_define_method_redefined.rb:7: B#n: alias of an inherited method that A defines again after it is not supported; see docs/limitations.md
+== test/reject/inherited_singleton_alias_super_into_extend.rb [default] rc=1
+spinel: test/reject/inherited_singleton_alias_super_into_extend.rb:13: B.n: alias of an inherited class method whose `super` reaches a module the class extends, behind a later definition of the name, is not supported; see docs/limitations.md
+== test/reject/inherited_singleton_alias_super_into_extend.rb [promote] rc=1
+spinel: test/reject/inherited_singleton_alias_super_into_extend.rb:13: B.n: alias of an inherited class method whose `super` reaches a module the class extends, behind a later definition of the name, is not supported; see docs/limitations.md
 == test/reject/instance_eval_def_beside_statements.rb [default] rc=1
 spinel: test/reject/instance_eval_def_beside_statements.rb:6: a method defined in an instance_eval block, other than one of defs only on a class or module the program defines and without arguments, is not supported: name the receiver (`def Klass.m`) instead
 == test/reject/instance_eval_def_beside_statements.rb [promote] rc=1
@@ -1257,10 +1277,10 @@ spinel: test/reject/method_called_reaches_its_target.rb:5: Class.new with a non-
 spinel: test/reject/method_called_reaches_its_target.rb:5: Class.new with a non-constant superclass is not supported; use a constant superclass (see docs/limitations.md)
 spinel: 2 refusals, nothing written
 == test/reject/method_defined_polyfill_unimplemented_builtin.rb [default] rc=1
-spinel: test/reject/method_defined_polyfill_unimplemented_builtin.rb:10: String#unicode_normalize is not supported: Unicode normalization requires shipping the Unicode decomposition/composition tables, which spinel deliberately does not carry -- the same limit as String#grapheme_clusters (see docs/limitations.md)
+spinel: test/reject/method_defined_polyfill_unimplemented_builtin.rb:10: Proc#ruby2_keywords is not supported: it is a shim for the Ruby 2.x-to-3.0 keyword-argument transition, and spinel targets modern keyword semantics, so it has nothing to toggle (see docs/limitations.md)
 spinel: 1 refusal, nothing written
 == test/reject/method_defined_polyfill_unimplemented_builtin.rb [promote] rc=1
-spinel: test/reject/method_defined_polyfill_unimplemented_builtin.rb:10: String#unicode_normalize is not supported: Unicode normalization requires shipping the Unicode decomposition/composition tables, which spinel deliberately does not carry -- the same limit as String#grapheme_clusters (see docs/limitations.md)
+spinel: test/reject/method_defined_polyfill_unimplemented_builtin.rb:10: Proc#ruby2_keywords is not supported: it is a shim for the Ruby 2.x-to-3.0 keyword-argument transition, and spinel targets modern keyword semantics, so it has nothing to toggle (see docs/limitations.md)
 spinel: 1 refusal, nothing written
 == test/reject/method_defined_unlisted_builtin_superclass.rb [default] rc=1
 spinel: test/reject/method_defined_unlisted_builtin_superclass.rb:6: unsupported method_defined? (needs a compile-time-known class and literal method name): node N (CallNode `method_defined?`) recv=ConstantReadNode/ty49 argc=1 arg0ty8
@@ -1285,6 +1305,12 @@ spinel: test/reject/method_string_handed_to_appender.rb:15: a String is passed t
 spinel: 1 refusal, nothing written
 == test/reject/method_string_handed_to_appender.rb [promote] rc=1
 spinel: test/reject/method_string_handed_to_appender.rb:15: a String is passed through `g.call`, and a proc or Method it can reach appends to the String it is handed: this call hands it a copy, so the append would not reach the caller's String (a String is not yet shared by reference from an instance variable). Return the String from the proc or Method and assign it, or append to it in the caller.
+spinel: 1 refusal, nothing written
+== test/reject/module_method_capture_singleton_untold.rb [default] rc=1
+spinel: test/reject/module_method_capture_singleton_untold.rb:12: a Method of a module's class method it does not have, made where the program does not tell whether the module's singleton class is made yet (a form that makes it may run before): CRuby's NameError names the class `#<Class:V>` once it is, `Module` before
+spinel: 1 refusal, nothing written
+== test/reject/module_method_capture_singleton_untold.rb [promote] rc=1
+spinel: test/reject/module_method_capture_singleton_untold.rb:12: a Method of a module's class method it does not have, made where the program does not tell whether the module's singleton class is made yet (a form that makes it may run before): CRuby's NameError names the class `#<Class:V>` once it is, `Module` before
 spinel: 1 refusal, nothing written
 == test/reject/module_named_like_monitor.rb [default] rc=1
 spinel: test/reject/module_named_like_monitor.rb:3: Monitor is not a module (TypeError)
@@ -1346,15 +1372,17 @@ spinel: 1 refusal, nothing written
 == test/reject/object_method_ivar_struct_slot.rb [promote] rc=1
 spinel: test/reject/object_method_ivar_struct_slot.rb:3: unsupported instance_variable_set to an ivar absent from the fixed object layout: node N (CallNode `instance_variable_set`) recv=SelfNode/ty50 argc=2 arg0ty8
 spinel: 1 refusal, nothing written
-== test/reject/object_override_default_class_const.rb [default] rc=1
-spinel: test/reject/object_override_default_class_const.rb:12: a parameter default of a builtin class's override of an Object method that reads a constant the class defines is not supported by AOT compilation
-== test/reject/object_override_default_class_const.rb [promote] rc=1
-spinel: test/reject/object_override_default_class_const.rb:12: a parameter default of a builtin class's override of an Object method that reads a constant the class defines is not supported by AOT compilation
 == test/reject/object_receiver_include_alias.rb [default] rc=1
 spinel: test/reject/object_receiver_include_alias.rb:8: Object.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class Object ... end` (see docs/limitations.md)
 spinel: 1 refusal, nothing written
 == test/reject/object_receiver_include_alias.rb [promote] rc=1
 spinel: test/reject/object_receiver_include_alias.rb:8: Object.include(...) is not supported by AOT compilation: the class graph, ancestor chain, and method/ivar layout are baked at compile time, so a class cannot be restructured through an explicit receiver. Move the `include` inside `class Object ... end` (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/own_include_class_method_super.rb [default] rc=1
+spinel: test/reject/own_include_class_method_super.rb:15: a class method `include` of the program that may call super or a builtin mixin is not supported by AOT compilation: the builtin mixin would add a module as the program runs, and a class's ancestors are fixed at compile time. Mix the module in with the builtin form, or define the method without it (see docs/limitations.md)
+spinel: 1 refusal, nothing written
+== test/reject/own_include_class_method_super.rb [promote] rc=1
+spinel: test/reject/own_include_class_method_super.rb:15: a class method `include` of the program that may call super or a builtin mixin is not supported by AOT compilation: the builtin mixin would add a module as the program runs, and a class's ancestors are fixed at compile time. Mix the module in with the builtin form, or define the method without it (see docs/limitations.md)
 spinel: 1 refusal, nothing written
 == test/reject/pattern_value_const_range.rb [default] rc=1
 spinel: test/reject/pattern_value_const_range.rb:7: unsupported value constant pattern other than an Integer, Float, String or Symbol: node N (ConstantPathNode)
@@ -1388,6 +1416,10 @@ spinel: test/reject/range_rational_walk_own_map.rb:8: a Range with a Rational or
 spinel: test/reject/range_reopen_float_range.rb:8: a method the program defines in Range, called on a Range of Floats: only an Integer Range runs it
 == test/reject/range_reopen_float_range.rb [promote] rc=1
 spinel: test/reject/range_reopen_float_range.rb:8: a method the program defines in Range, called on a Range of Floats: only an Integer Range runs it
+== test/reject/range_reopen_obj_range.rb [default] rc=1
+spinel: test/reject/range_reopen_obj_range.rb:16: a method the program defines in Range, called on a Range of objects: only an Integer Range runs it
+== test/reject/range_reopen_obj_range.rb [promote] rc=1
+spinel: test/reject/range_reopen_obj_range.rb:16: a method the program defines in Range, called on a Range of objects: only an Integer Range runs it
 == test/reject/range_reopen_string_range.rb [default] rc=1
 spinel: test/reject/range_reopen_string_range.rb:12: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
 == test/reject/range_reopen_string_range.rb [promote] rc=1
@@ -1406,12 +1438,10 @@ spinel: test/reject/range_reopened_endpoint_write.rb:11: a method the program de
 spinel: test/reject/range_reopened_member_answer.rb:9: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
 == test/reject/range_reopened_member_answer.rb [promote] rc=1
 spinel: test/reject/range_reopened_member_answer.rb:9: a method the program defines in Range, called on a Range of Strings: only an Integer Range runs it
-== test/reject/range_time_bound.rb [default] rc=1
-spinel: test/reject/range_time_bound.rb:4: a Range of Time objects cannot be built: a Range is an unboxed value with sp_int bounds, so it has nowhere to hold them. Comparing against the bounds directly (`t >= lo && t < hi`) needs no Range and does work (see docs/limitations.md)
-spinel: 1 refusal, nothing written
-== test/reject/range_time_bound.rb [promote] rc=1
-spinel: test/reject/range_time_bound.rb:4: a Range of Time objects cannot be built: a Range is an unboxed value with sp_int bounds, so it has nowhere to hold them. Comparing against the bounds directly (`t >= lo && t < hi`) needs no Range and does work (see docs/limitations.md)
-spinel: 1 refusal, nothing written
+== test/reject/range_reopened_time_range.rb [default] rc=1
+spinel: test/reject/range_reopened_time_range.rb:9: a method the program defines in Range, called on a Range of Times: only an Integer Range runs it
+== test/reject/range_reopened_time_range.rb [promote] rc=1
+spinel: test/reject/range_reopened_time_range.rb:9: a method the program defines in Range, called on a Range of Times: only an Integer Range runs it
 == test/reject/rational_include_method.rb [default] rc=1
 spinel: test/reject/rational_include_method.rb:9: unsupported a method of a module included or prepended into Rational or Complex (define it in the class body instead): node N (CallNode `desc`) recv=RationalNode/ty15 argc=0
 spinel: 1 refusal, nothing written
@@ -1420,6 +1450,20 @@ spinel: 1 refusal, nothing written
 spinel: test/reject/rational_pow_bignum.rb:7: the receiver of a Float `**` given a Rational, which no conversion keeps in its sp_float slot
 spinel: 1 refusal, nothing written
 == test/reject/rational_pow_bignum.rb [promote] rc=0
+== test/reject/record_capture_in_lambda_before_def.rb [default] rc=1
+spinel: test/reject/record_capture_in_lambda_before_def.rb:5: a Method of a Struct or Data class's class method, made where the method's def may not have run yet: CRuby raises NameError before the def runs
+spinel: 1 refusal, nothing written
+== test/reject/record_capture_in_lambda_before_def.rb [promote] rc=1
+spinel: test/reject/record_capture_in_lambda_before_def.rb:5: a Method of a Struct or Data class's class method, made where the method's def may not have run yet: CRuby raises NameError before the def runs
+spinel: 1 refusal, nothing written
+== test/reject/record_sclass_in_method_body.rb [default] rc=1
+spinel: test/reject/record_sclass_in_method_body.rb:6: `class << K` in a method body, on a class Struct.new or Data.define makes, is not supported: its methods are defined from the start, not when that method runs (see docs/limitations.md)
+== test/reject/record_sclass_in_method_body.rb [promote] rc=1
+spinel: test/reject/record_sclass_in_method_body.rb:6: `class << K` in a method body, on a class Struct.new or Data.define makes, is not supported: its methods are defined from the start, not when that method runs (see docs/limitations.md)
+== test/reject/record_sclass_self_in_class_method.rb [default] rc=1
+spinel: test/reject/record_sclass_self_in_class_method.rb:5: `class << K` in a method body, on a class Struct.new or Data.define makes, is not supported: its methods are defined from the start, not when that method runs (see docs/limitations.md)
+== test/reject/record_sclass_self_in_class_method.rb [promote] rc=1
+spinel: test/reject/record_sclass_self_in_class_method.rb:5: `class << K` in a method body, on a class Struct.new or Data.define makes, is not supported: its methods are defined from the start, not when that method runs (see docs/limitations.md)
 == test/reject/recursive_default_reads_block.rb [default] rc=1
 spinel: test/reject/recursive_default_reads_block.rb:5: unsupported default of `m`'s parameter `y` that calls `m` again with that argument omitted (one reading the caller's block or `super` cannot be moved into a method of its own): node N (ParenthesesNode)
 spinel: 1 refusal, nothing written
@@ -1491,10 +1535,10 @@ spinel: 1 refusal, nothing written
 spinel: test/reject/runtime_condition_def_list_two_arms.rb:10: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
 spinel: 1 refusal, nothing written
 == test/reject/runtime_condition_def_module_includers.rb [default] rc=1
-spinel: test/reject/runtime_condition_def_module_includers.rb:11: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
+spinel: test/reject/runtime_condition_def_module_includers.rb:8: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
 spinel: 1 refusal, nothing written
 == test/reject/runtime_condition_def_module_includers.rb [promote] rc=1
-spinel: test/reject/runtime_condition_def_module_includers.rb:11: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
+spinel: test/reject/runtime_condition_def_module_includers.rb:8: a def under a condition only the run time decides, of a name another method answers (a builtin's, another def's or an accessor's), is not supported: which one answers when the branch did not run is not known at compile time; see docs/limitations.md
 spinel: 1 refusal, nothing written
 == test/reject/runtime_condition_def_private_instance_methods.rb [default] rc=1
 spinel: test/reject/runtime_condition_def_private_instance_methods.rb:7: a method defined under a condition only the run time decides is not answered for by respond_to?, method_defined?, instance_methods and their kin (it would answer as if the branch had run); see docs/limitations.md
@@ -1566,162 +1610,6 @@ spinel: 1 refusal, nothing written
 == test/reject/send_override_super_does_more.rb [promote] rc=1
 spinel: test/reject/send_override_super_does_more.rb:10: unsupported `super` in a program-defined `send`: it reaches Object#send, which a program method cannot call yet (only a `send` whose whole body is `super` is supported, in a program with no other `send` of its own)
 spinel: 1 refusal, nothing written
-== test/reject/set_identity_attr_reader.rb [default] rc=1
-spinel: test/reject/set_identity_attr_reader.rb:15: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_attr_reader.rb [promote] rc=1
-spinel: test/reject/set_identity_attr_reader.rb:15: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_boxed_bignum.rb [default] rc=1
-spinel: test/reject/set_identity_boxed_bignum.rb:14: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_boxed_bignum.rb [promote] rc=1
-spinel: test/reject/set_identity_boxed_bignum.rb:14: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_boxed_float.rb [default] rc=1
-spinel: test/reject/set_identity_boxed_float.rb:11: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_boxed_float.rb [promote] rc=1
-spinel: test/reject/set_identity_boxed_float.rb:11: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_deep_reader.rb [default] rc=1
-spinel: test/reject/set_identity_deep_reader.rb:22: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_deep_reader.rb [promote] rc=1
-spinel: test/reject/set_identity_deep_reader.rb:22: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_define_method_capture.rb [default] rc=1
-spinel: test/reject/set_identity_define_method_capture.rb:9: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_define_method_capture.rb [promote] rc=1
-spinel: test/reject/set_identity_define_method_capture.rb:9: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_delegator_splat.rb [default] rc=1
-spinel: test/reject/set_identity_delegator_splat.rb:10: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_delegator_splat.rb [promote] rc=1
-spinel: test/reject/set_identity_delegator_splat.rb:10: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_dup_lookup.rb [default] rc=1
-spinel: test/reject/set_identity_dup_lookup.rb:9: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_dup_lookup.rb [promote] rc=1
-spinel: test/reject/set_identity_dup_lookup.rb:9: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_each_over_enumerator_call.rb [default] rc=1
-spinel: test/reject/set_identity_each_over_enumerator_call.rb:38: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_each_over_enumerator_call.rb [promote] rc=1
-spinel: test/reject/set_identity_each_over_enumerator_call.rb:38: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_enumerator_each_value.rb [default] rc=1
-spinel: test/reject/set_identity_enumerator_each_value.rb:17: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_enumerator_each_value.rb [promote] rc=1
-spinel: test/reject/set_identity_enumerator_each_value.rb:17: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_escape_arg.rb [default] rc=1
-spinel: test/reject/set_identity_escape_arg.rb:16: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_escape_arg.rb [promote] rc=1
-spinel: test/reject/set_identity_escape_arg.rb:16: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_float_lookup.rb [default] rc=1
-spinel: test/reject/set_identity_float_lookup.rb:8: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_float_lookup.rb [promote] rc=1
-spinel: test/reject/set_identity_float_lookup.rb:8: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_forwarded_block_kept.rb [default] rc=1
-spinel: test/reject/set_identity_forwarded_block_kept.rb:25: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_forwarded_block_kept.rb [promote] rc=1
-spinel: test/reject/set_identity_forwarded_block_kept.rb:25: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_hook_name_sent.rb [default] rc=1
-spinel: test/reject/set_identity_hook_name_sent.rb:20: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_hook_name_sent.rb [promote] rc=1
-spinel: test/reject/set_identity_hook_name_sent.rb:20: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_integer_member.rb [default] rc=1
-spinel: test/reject/set_identity_integer_member.rb:9: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_integer_member.rb [promote] rc=1
-spinel: test/reject/set_identity_integer_member.rb:9: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_ivar_set_reader_member.rb [default] rc=1
-spinel: test/reject/set_identity_ivar_set_reader_member.rb:17: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_ivar_set_reader_member.rb [promote] rc=1
-spinel: test/reject/set_identity_ivar_set_reader_member.rb:17: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_kept_block_value.rb [default] rc=1
-spinel: test/reject/set_identity_kept_block_value.rb:29: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_kept_block_value.rb [promote] rc=1
-spinel: test/reject/set_identity_kept_block_value.rb:29: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_lambda_yield_kept.rb [default] rc=1
-spinel: test/reject/set_identity_lambda_yield_kept.rb:22: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_lambda_yield_kept.rb [promote] rc=1
-spinel: test/reject/set_identity_lambda_yield_kept.rb:22: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_list_concat_strings_to_set.rb [default] rc=1
-spinel: test/reject/set_identity_list_concat_strings_to_set.rb:14: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_list_concat_strings_to_set.rb [promote] rc=1
-spinel: test/reject/set_identity_list_concat_strings_to_set.rb:14: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_list_to_set_own_to_a.rb [default] rc=1
-spinel: test/reject/set_identity_list_to_set_own_to_a.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_list_to_set_own_to_a.rb [promote] rc=1
-spinel: test/reject/set_identity_list_to_set_own_to_a.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_member_list_read.rb [default] rc=1
-spinel: test/reject/set_identity_member_list_read.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_member_list_read.rb [promote] rc=1
-spinel: test/reject/set_identity_member_list_read.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_own_alias_method.rb [default] rc=1
-spinel: test/reject/set_identity_own_alias_method.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_own_alias_method.rb [promote] rc=1
-spinel: test/reject/set_identity_own_alias_method.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_own_name_list_to_set.rb [default] rc=1
-spinel: test/reject/set_identity_own_name_list_to_set.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_own_name_list_to_set.rb [promote] rc=1
-spinel: test/reject/set_identity_own_name_list_to_set.rb:19: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_pairs_to_h.rb [default] rc=1
-spinel: test/reject/set_identity_pairs_to_h.rb:10: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_pairs_to_h.rb [promote] rc=1
-spinel: test/reject/set_identity_pairs_to_h.rb:10: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_predicate_computed.rb [default] rc=1
-spinel: test/reject/set_identity_predicate_computed.rb:26: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_predicate_computed.rb [promote] rc=1
-spinel: test/reject/set_identity_predicate_computed.rb:26: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reader_alias.rb [default] rc=1
-spinel: test/reject/set_identity_reader_alias.rb:17: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reader_alias.rb [promote] rc=1
-spinel: test/reject/set_identity_reader_alias.rb:17: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reader_block.rb [default] rc=1
-spinel: test/reject/set_identity_reader_block.rb:9: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reader_block.rb [promote] rc=1
-spinel: test/reject/set_identity_reader_block.rb:9: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reader_by_send.rb [default] rc=1
-spinel: test/reject/set_identity_reader_by_send.rb:13: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reader_by_send.rb [promote] rc=1
-spinel: test/reject/set_identity_reader_by_send.rb:13: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reader_method_object.rb [default] rc=1
-spinel: test/reject/set_identity_reader_method_object.rb:15: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reader_method_object.rb [promote] rc=1
-spinel: test/reject/set_identity_reader_method_object.rb:15: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reader_name_table_key_sent.rb [default] rc=1
-spinel: test/reject/set_identity_reader_name_table_key_sent.rb:11: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reader_name_table_key_sent.rb [promote] rc=1
-spinel: test/reject/set_identity_reader_name_table_key_sent.rb:11: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reflective_fresh_members.rb [default] rc=1
-spinel: test/reject/set_identity_reflective_fresh_members.rb:11: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reflective_fresh_members.rb [promote] rc=1
-spinel: test/reject/set_identity_reflective_fresh_members.rb:11: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reflective_read_used.rb [default] rc=1
-spinel: test/reject/set_identity_reflective_read_used.rb:9: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reflective_read_used.rb [promote] rc=1
-spinel: test/reject/set_identity_reflective_read_used.rb:9: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reflective_write_set.rb [default] rc=1
-spinel: test/reject/set_identity_reflective_write_set.rb:10: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reflective_write_set.rb [promote] rc=1
-spinel: test/reject/set_identity_reflective_write_set.rb:10: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reopened_array_each.rb [default] rc=1
-spinel: test/reject/set_identity_reopened_array_each.rb:23: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_reopened_array_each.rb [promote] rc=1
-spinel: test/reject/set_identity_reopened_array_each.rb:23: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_send_name_made.rb [default] rc=1
-spinel: test/reject/set_identity_send_name_made.rb:13: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_send_name_made.rb [promote] rc=1
-spinel: test/reject/set_identity_send_name_made.rb:13: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_send_name_writer.rb [default] rc=1
-spinel: test/reject/set_identity_send_name_writer.rb:14: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_send_name_writer.rb [promote] rc=1
-spinel: test/reject/set_identity_send_name_writer.rb:14: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_singleton_attr_reader.rb [default] rc=1
-spinel: test/reject/set_identity_singleton_attr_reader.rb:16: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_singleton_attr_reader.rb [promote] rc=1
-spinel: test/reject/set_identity_singleton_attr_reader.rb:16: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_string_list_to_set.rb [default] rc=1
-spinel: test/reject/set_identity_string_list_to_set.rb:14: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_string_list_to_set.rb [promote] rc=1
-spinel: test/reject/set_identity_string_list_to_set.rb:14: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_string_member.rb [default] rc=1
-spinel: test/reject/set_identity_string_member.rb:8: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_string_member.rb [promote] rc=1
-spinel: test/reject/set_identity_string_member.rb:8: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_tap_block.rb [default] rc=1
-spinel: test/reject/set_identity_tap_block.rb:9: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
-== test/reject/set_identity_tap_block.rb [promote] rc=1
-spinel: test/reject/set_identity_tap_block.rb:9: a value whose identity is not CRuby's (a String, an Integer, a Float, a Rational, a Complex, a Range, or one of no static kind) enters or is looked up in a Set, in a program that calls Set#compare_by_identity: an identity Set would find it otherwise than CRuby's
 == test/reject/setter_symbol_block_builtin.rb [default] rc=1
 spinel: test/reject/setter_symbol_block_builtin.rb:6: a setter Symbol (`&:name=`) as the block of a builtin method is not supported
 spinel: 1 refusal, nothing written
@@ -1748,6 +1636,22 @@ spinel: 2 refusals, nothing written
 spinel: test/reject/singleton_class_declaration_in_method.rb:5: Object#singleton_class is not supported by AOT compilation: it is the gateway to a per-object method table, which direct C calls have no room for -- the same limit as define_singleton_method. Define methods in the class body instead (see docs/limitations.md)
 spinel: test/reject/singleton_class_declaration_in_method.rb:8: undefined method 'x=' for a Class: no class in the program defines a class method 'x=' (NoMethodError)
 spinel: 2 refusals, nothing written
+== test/reject/singleton_class_self_in_instance_method.rb [default] rc=1
+spinel: test/reject/singleton_class_self_in_instance_method.rb:19: singleton method on self inside an instance method: self is whichever instance runs it, and a compiled class cannot give one object a method of its own
+== test/reject/singleton_class_self_in_instance_method.rb [promote] rc=1
+spinel: test/reject/singleton_class_self_in_instance_method.rb:19: singleton method on self inside an instance method: self is whichever instance runs it, and a compiled class cannot give one object a method of its own
+== test/reject/singleton_def_self_in_instance_method.rb [default] rc=1
+spinel: test/reject/singleton_def_self_in_instance_method.rb:18: singleton method on self inside an instance method: self is whichever instance runs it, and a compiled class cannot give one object a method of its own
+== test/reject/singleton_def_self_in_instance_method.rb [promote] rc=1
+spinel: test/reject/singleton_def_self_in_instance_method.rb:18: singleton method on self inside an instance method: self is whichever instance runs it, and a compiled class cannot give one object a method of its own
+== test/reject/singleton_def_self_in_subclass_bare_call.rb [default] rc=1
+spinel: test/reject/singleton_def_self_in_subclass_bare_call.rb:7: singleton method on self inside an instance method: self is whichever instance runs it, and a compiled class cannot give one object a method of its own
+== test/reject/singleton_def_self_in_subclass_bare_call.rb [promote] rc=1
+spinel: test/reject/singleton_def_self_in_subclass_bare_call.rb:7: singleton method on self inside an instance method: self is whichever instance runs it, and a compiled class cannot give one object a method of its own
+== test/reject/singleton_def_self_shadows_instance_method.rb [default] rc=1
+spinel: test/reject/singleton_def_self_shadows_instance_method.rb:14: singleton method on self inside an instance method: self is whichever instance runs it, and a compiled class cannot give one object a method of its own
+== test/reject/singleton_def_self_shadows_instance_method.rb [promote] rc=1
+spinel: test/reject/singleton_def_self_shadows_instance_method.rb:14: singleton method on self inside an instance method: self is whichever instance runs it, and a compiled class cannot give one object a method of its own
 == test/reject/singleton_extend_extended_hook.rb [default] rc=1
 spinel: test/reject/singleton_extend_extended_hook.rb:8: Object#extend is not supported by AOT compilation: mixing a module into a live object needs a per-object method table. Use `include`/`prepend` in the class body instead (see docs/limitations.md)
 spinel: 1 refusal, nothing written
@@ -1918,6 +1822,14 @@ spinel: 1 refusal, nothing written
 spinel: test/reject/stringio_subclass_initialize_no_super.rb:7: NoSuper#initialize does not call super: the StringIO it is would be left unset, where CRuby raises IOError (uninitialized stream) on its first use; call super in initialize
 == test/reject/stringio_subclass_initialize_no_super.rb [promote] rc=1
 spinel: test/reject/stringio_subclass_initialize_no_super.rb:7: NoSuper#initialize does not call super: the StringIO it is would be left unset, where CRuby raises IOError (uninitialized stream) on its first use; call super in initialize
+== test/reject/struct_new_member_names_own_to_sym.rb [default] rc=1
+spinel: test/reject/struct_new_member_names_own_to_sym.rb:8: Struct.new with member names known only at run time (a splat of a list the compiler cannot read): write the names, or a constant of literal symbols
+== test/reject/struct_new_member_names_own_to_sym.rb [promote] rc=1
+spinel: test/reject/struct_new_member_names_own_to_sym.rb:8: Struct.new with member names known only at run time (a splat of a list the compiler cannot read): write the names, or a constant of literal symbols
+== test/reject/struct_new_runtime_member_names.rb [default] rc=1
+spinel: test/reject/struct_new_runtime_member_names.rb:6: Struct.new with member names known only at run time (a splat of a list the compiler cannot read): write the names, or a constant of literal symbols
+== test/reject/struct_new_runtime_member_names.rb [promote] rc=1
+spinel: test/reject/struct_new_runtime_member_names.rb:6: Struct.new with member names known only at run time (a splat of a list the compiler cannot read): write the names, or a constant of literal symbols
 == test/reject/struct_subclass_own_new_superclass.rb [default] rc=1
 spinel: test/reject/struct_subclass_own_new_superclass.rb:7: unsupported superclass expression (a call other than Struct.new, Data.define, a Struct subclass's new or a blockless Class.new(Constant)): write the superclass as a constant
 == test/reject/struct_subclass_own_new_superclass.rb [promote] rc=1
@@ -2129,24 +2041,6 @@ spinel: test/reject/typed_array_kept_by_struct_into_boxed_param_store.rb:11: an 
 spinel: 1 refusal, nothing written
 == test/reject/typed_array_kept_by_struct_into_boxed_param_store.rb [promote] rc=1
 spinel: test/reject/typed_array_kept_by_struct_into_boxed_param_store.rb:11: an Array[Integer] is passed to `m`'s parameter `arr`, which the method stores elements of other kinds into: the caller's array cannot hold them, and the store would go to a copy it never sees. Build the argument where the call can follow it (an array literal or a new array, through locals and method values), so it is widened with the parameter.
-spinel: 1 refusal, nothing written
-== test/reject/typed_array_kept_by_struct_into_mutated_param.rb [default] rc=1
-spinel: test/reject/typed_array_kept_by_struct_into_mutated_param.rb:10: an Array[Integer] is passed to `add`'s parameter `out`, which the method mutates: the parameter is a general Array and the argument would be copied into it, so the mutation would not reach the caller's array. Give the parameter the argument's kind (an rbs seed, or callers that all pass Array[Integer]), or build the argument as a general Array.
-spinel: 1 refusal, nothing written
-== test/reject/typed_array_kept_by_struct_into_mutated_param.rb [promote] rc=1
-spinel: test/reject/typed_array_kept_by_struct_into_mutated_param.rb:10: an Array[Integer] is passed to `add`'s parameter `out`, which the method mutates: the parameter is a general Array and the argument would be copied into it, so the mutation would not reach the caller's array. Give the parameter the argument's kind (an rbs seed, or callers that all pass Array[Integer]), or build the argument as a general Array.
-spinel: 1 refusal, nothing written
-== test/reject/unresolved_builtin_method.rb [default] rc=1
-spinel: test/reject/unresolved_builtin_method.rb:7: unsupported Hash#transform_values on a value typed as Hash, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `transform_values`) recv=LocalVariableReadNode/ty28 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/unresolved_builtin_method.rb [promote] rc=1
-spinel: test/reject/unresolved_builtin_method.rb:7: unsupported Hash#transform_values on a value typed as Hash, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `transform_values`) recv=LocalVariableReadNode/ty28 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/unresolved_builtin_method_sym_block.rb [default] rc=1
-spinel: test/reject/unresolved_builtin_method_sym_block.rb:17: unsupported Array#drop_while on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `drop_while`) recv=CallNode/ty22 argc=0
-spinel: 1 refusal, nothing written
-== test/reject/unresolved_builtin_method_sym_block.rb [promote] rc=1
-spinel: test/reject/unresolved_builtin_method_sym_block.rb:17: unsupported Array#drop_while on a value typed as Array, a call no route of the compiler took (CRuby calls the method; this would raise NoMethodError): node N (CallNode `drop_while`) recv=CallNode/ty22 argc=0
 spinel: 1 refusal, nothing written
 == test/reject/unsupported_node_kind.rb [default] rc=1
 spinel: test/reject/unsupported_node_kind.rb:5: unsupported condition (non-bool): FlipFlopNode at test/reject/unsupported_node_kind.rb:5:8

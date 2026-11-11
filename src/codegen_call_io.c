@@ -88,7 +88,7 @@ static void emit_line_param_decl(Compiler *c, int id, const char *pn, int lt, Bu
     lv = bs && raw ? scope_local(bs, raw) : NULL;
   }
   /* a buffer, or a parameter held as the shared handle (--share-strings) */
-  if (repr_of_slot(c, lv).kind == RK_STRBUF || repr_of_slot(c, lv).handle)
+  if (repr_of_slot(c, lv).kind == RK_STRBUF)
     buf_printf(b, " sp_String *lv_%s = sp_String_new_shared(_t%d); SP_GC_ROOT(lv_%s);", pn, lt, pn);
   else buf_printf(b, " const char *lv_%s = _t%d; SP_GC_ROOT_STR(lv_%s);", pn, lt, pn);
 }
@@ -144,8 +144,15 @@ static void emit_io_read_buffer(Compiler *c, const char *name, const char *fn, c
   if (boxed)
     buf_printf(b, "if (_t%d && sp_poly_is_strbuf(_t%d) && sp_String_is_frozen((sp_String *)_t%d.v.p))"
                   " sp_raise_frozen_str(_t%d); ", ts, ta + nint, ta + nint, ts);
+  /* readpartial into a buffer that is a shared handle reads straight into
+     it (sp_File_readpartial_into), with no String between to copy from */
+  int into = boxed && !handle && !rest && sp_streq(fn, "sp_File_readpartial_or_nil");
+  int tq = into ? ++g_tmp : 0;
+  if (into) buf_printf(b, "sp_bool _t%d = sp_poly_is_strbuf(_t%d); ", tq, ta + nint);
   buf_printf(b, "if (_t%d) sp_str_check_mutable(_t%d); const char *_t%d = ", ts, ts, tr);
   if (rest) buf_printf(b, "sp_poly_nil_p(_t%d) ? sp_File_read(_t%d) : ", ta, tf);
+  if (into)
+    buf_printf(b, "_t%d ? sp_File_readpartial_into(_t%d, _t%d, (sp_String *)_t%d.v.p) : ", tq, tf, ti, ta + nint);
   buf_printf(b, "%s(_t%d", fn, tf);
   for (int k = 0; k < nint; k++) buf_printf(b, ", _t%d", ti + k);
   buf_puts(b, "); ");
@@ -155,8 +162,10 @@ static void emit_io_read_buffer(Compiler *c, const char *name, const char *fn, c
                ts, ta + nint, tr, tr);
   else if (boxed) {
     int tn = ++g_tmp;
-    buf_printf(b, "if (_t%d) { sp_RbVal _t%d = sp_poly_str_become(_t%d, _t%d ? _t%d : sp_str_empty); ",
-               ts, tn, ta + nint, tr, tr);
+    buf_printf(b, "if (_t%d", ts);
+    if (into) buf_printf(b, " && !_t%d", tq);   /* the read already filled it */
+    buf_printf(b, ") { sp_RbVal _t%d = sp_poly_str_become(_t%d, _t%d ? _t%d : sp_str_empty); ",
+               tn, ta + nint, tr, tr);
     if (nt_kind(c->nt, ob) == NK_LocalVariableReadNode) { emit_expr(c, ob, b); buf_printf(b, " = _t%d; } ", tn); }
     else buf_printf(b, "(void)_t%d; } ", tn);
   }
@@ -856,7 +865,7 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
        ((sp_streq(name, "__sp_tty_mode") || sp_streq(name, "__sp_tty_restore")) && argc == 1) ||
        sp_streq(name, "readlines") || sp_streq(name, "rewind") ||
        poly_io_codepoint_enum(c, id) ||
-       sp_streq(name, "readpartial") ||
+       sp_streq(name, "readpartial") || sp_streq(name, "sysread") ||
        /* a socket read back out of a container: its non-blocking connect and
           its options, as the typed socket arms answer them */
        (boxed_socket_opt(name, argc) && sp_feature_required("socket")) ||
@@ -884,9 +893,9 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           one of these reached the unresolved-call gate (#4611) */
        /* File::Stat's mode and numeric fields: a stat read out of a
           container is the same boxed handle. Not where a class method may
-          own the name, or an OpenStruct may carry it as a field. */
-       (argc == 0 && boxed_stat_name(name) && !class_method_named(c, name) &&
-        !sp_feature_required("ostruct")) ||
+          own the name (an OpenStruct's member read takes the poly dispatch
+          ahead of here, poly_ostruct_member_call). */
+       (argc == 0 && boxed_stat_name(name) && !class_method_named(c, name)) ||
        sp_streq(name, "stat") || sp_streq(name, "seek") || sp_streq(name, "tell") ||
        sp_streq(name, "pos") || sp_streq(name, "pread") || sp_streq(name, "pwrite") ||
        sp_streq(name, "fsync") || sp_streq(name, "fdatasync") ||
@@ -1203,6 +1212,10 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       int qname = argc == 0 && (sp_streq(name, "close") || sp_streq(name, "closed?"));
       /* and a boxed Mutex answers owned? itself, where a stat answers its own */
       int mname = argc == 0 && sp_streq(name, "owned?");
+      /* A path read into a boxed slot (beside a class's reader of the name,
+         whose answer the slot holds too) goes in boxed, as rewind's 0 does
+         below: bare, the String stored into the sp_RbVal did not build. */
+      int boxed_path = argc == 0 && is_path_reader(name) && repr_of(c, id).kind == RK_BOXED;
       int tdr = 0;
       if (dirfn || qname || mname) {
         tdr = ++g_tmp;
@@ -1218,6 +1231,12 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
         if (dirfn) {
           buf_printf(b, "_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_DIR ? ", tdr, tdr);
           if (sp_streq(name, "close")) buf_printf(b, "((void)sp_Dir_close((sp_Dir *)_t%d.v.p), sp_box_nil()) : ", tdr);
+          else if (boxed_path) {
+            char dp[64];
+            snprintf(dp, sizeof dp, "%s((sp_Dir *)_t%d.v.p)", dirfn, tdr);
+            emit_boxed_text(c, TY_STRING, dp, b);
+            buf_puts(b, " : ");
+          }
           else buf_printf(b, "%s((sp_Dir *)_t%d.v.p) : ", dirfn, tdr);
         }
       }
@@ -1257,7 +1276,10 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           Buf ab2; memset(&ab2, 0, sizeof ab2);
           int arr2 = 0;
           if (is_puts2 && (ty_is_array(akt2) || arg_repr.kind == RK_BOXED)) { arr2 = 1; emit_boxed(c, argv[k2], &ab2); }
-          else if (akt2 == TY_STRING) emit_expr(c, argv[k2], &ab2);
+          /* a String the dispatch holds as its handle (a user `puts(*args)`
+             beside this arm takes it so) is read as its bytes, as the write
+             arm reads its payload (emit_to_s_expr) */
+          else if (akt2 == TY_STRING) emit_to_s_expr(c, argv[k2], &ab2);
           else if (arg_repr.kind == RK_BOXED) { arr2 = 1; emit_boxed(c, argv[k2], &ab2); }
           else { buf_puts(&ab2, "sp_poly_to_s("); emit_boxed(c, argv[k2], &ab2); buf_puts(&ab2, ")"); }
           const char *at2 = ab2.p ? ab2.p : "\"\"";
@@ -1277,7 +1299,7 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           free(ab2.p);
         }
         if (is_puts2 && argc == 0) buf_printf(b, "sp_File_write(_t%d, \"\\n\"); ", tio2);
-        buf_puts(b, "((sp_int)0); })");
+        buf_puts(b, repr_of(c, id).kind == RK_BOXED ? "sp_box_nil(); })" : "((sp_int)0); })");   /* (a boxed answer is nil, not the int a nil statement stands for) */
       }
       else if (sp_streq(name, "putc") && argc == 1) {
         buf_printf(b, "sp_File_putc(_t%d, ", tio2); emit_boxed(c, argv[0], b); buf_puts(b, "); })");
@@ -1361,6 +1383,12 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
         /* the field's nil (a failed stat) beside it, in the call's form */
         if (node_is_oint(c, id)) buf_printf(b, "sp_stat_field(_t%d, %d); })", tio2, k);
         else buf_printf(b, "sp_oint_arg(sp_stat_field(_t%d, %d)); })", tio2, k);
+      }
+      else if (boxed_path) {
+        char fp[48];
+        snprintf(fp, sizeof fp, "sp_File_path(_t%d)", tio2);
+        emit_boxed_text(c, TY_STRING, fp, b);
+        buf_puts(b, "; })");
       }
       else if (is_path_reader(name))
         buf_printf(b, "sp_File_path(_t%d); })", tio2);
@@ -1533,14 +1561,31 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
          count-less, the arm below was skipped and the fallback answered
          fileno; over-long, the extras were read and dropped. CRuby refuses
          both with ArgumentError before touching the stream. */
-      else if (sp_streq(name, "readpartial") && (argc == 0 || argc > 2)) {
+      else if ((sp_streq(name, "readpartial") || sp_streq(name, "sysread")) && (argc == 0 || argc > 2)) {
         buf_printf(b, "sp_raise_cls(\"ArgumentError\", \"wrong number of arguments "
                       "(given %d, expected 1..2)\"); (const char *)0; })", argc);
       }
       /* the same (len, outbuf) rebind the typed arm makes (#3336) */
-      else if (sp_streq(name, "readpartial") && argc >= 1) {
+      else if ((sp_streq(name, "readpartial") || sp_streq(name, "sysread")) && argc >= 1) {
+        Buf sh; memset(&sh, 0, sizeof sh);
         if (argc == 2 && emit_io_read_outbuf(c, id, name, "sp_File_readpartial_or_nil", tio, argv, 1, argv[1], 0, b))
           buf_puts(b, "; })");
+        /* a buffer held in a String handle slot -- a local or an instance
+           variable -- is checked for a freeze and read into in place: the
+           handle took sp_str_check_mutable's const char * and the C did not
+           build, and only a local was rebound to the bytes */
+        else if (argc == 2 && strbuf_slot_text(c, argv[1], &sh)) {
+          int tn = ++g_tmp, th = ++g_tmp, tsp = ++g_tmp;
+          buf_printf(b, "sp_int _t%d = ", tn);
+          emit_int_expr(c, argv[0], b);
+          buf_printf(b, "; sp_String *_t%d = %s; SP_GC_ROOT(_t%d); ", th, sh.p, th);
+          /* a frozen literal's handle carries the freeze in its bytes */
+          buf_printf(b, "if (_t%d) { if (sp_String_is_frozen(_t%d)) sp_raise_frozen_str(_t%d->data); "
+                        "sp_str_check_mutable(_t%d->data); } ", th, th, th, th);
+          buf_printf(b, "const char *_t%d = _t%d ? sp_File_readpartial_into(_t%d, _t%d, _t%d)"
+                        " : sp_File_readpartial_or_nil(_t%d, _t%d); ", tsp, th, tio2, tn, th, tio2, tn);
+          buf_printf(b, "if (!_t%d) sp_raise_cls(\"EOFError\", \"end of file reached\"); _t%d; })", tsp, tsp);
+        }
         else {
           const char *sbp = NULL;
           if (argc >= 2 &&
@@ -1555,17 +1600,12 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           emit_int_expr(c, argv[0], b);
           buf_puts(b, ")");
           if (argc >= 2) {
-            { Buf hr; memset(&hr, 0, sizeof hr);
-            /* a buffer that is also appended to is a mutable String handle:
-               replace its contents, where assigning the bytes to the handle
-               did not compile (#7314) */
-            if (sbp && strbuf_slot_text(c, argv[1], &hr)) buf_printf(b, "; sp_String_set_read_bytes(%s, _t%d ? _t%d : sp_str_empty)", hr.p, tsp, tsp);
-            else if (sbp) { buf_puts(b, "; "); emit_local_ref(c, argv[1], sbp, b); buf_printf(b, " = _t%d ? _t%d : sp_str_empty", tsp, tsp); }
-            free(hr.p); }
+            if (sbp) { buf_puts(b, "; "); emit_local_ref(c, argv[1], sbp, b); buf_printf(b, " = _t%d ? _t%d : sp_str_empty", tsp, tsp); }
             buf_printf(b, "; if (!_t%d) sp_raise_cls(\"EOFError\", \"end of file reached\"); _t%d", tsp, tsp);
           }
           buf_puts(b, "; })");
         }
+        free(sh.p);
       }
       else if (is_io_wait(name)) {
         char tr[32]; snprintf(tr, sizeof tr, "_t%d", tio2);
@@ -2410,7 +2450,7 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
       free(abs);
       free(aarr);
       free(abin);
-      buf_puts(b, "((sp_int)0)");
+      buf_puts(b, repr_of(c, id).kind == RK_BOXED ? "sp_box_nil()" : "((sp_int)0)");
       free(rb.p); return 1;
     }
     if (sp_streq(name, "sync=") && argc >= 1) {

@@ -31,6 +31,12 @@ static inline unsigned sp_strhash(const char *s) {
   for (; *s; s++) { h ^= (unsigned char)*s; h *= 16777619u; }
   return h;
 }
+/* sp_strhash of the first n bytes of s (a name without its suffix, with no copy) */
+static inline unsigned sp_strnhash(const char *s, unsigned n) {
+  unsigned h = 2166136261u;
+  for (unsigned i = 0; i < n; i++) { h ^= (unsigned char)s[i]; h *= 16777619u; }
+  return h;
+}
 
 /* ---- The boxed-receiver face table ----
 
@@ -68,15 +74,17 @@ enum {
   PF_FRANGE = 1 << 7,  /* TY_FLOAT_RANGE */
   PF_SRANGE = 1 << 8,  /* TY_STR_RANGE */
   PF_RANDOM = 1 << 9,  /* TY_RANDOM */
-  PF_OWNERS = 0x3ff,
-  PF_MUT      = 1 << 10,  /* mutates the receiver: the result is written back through the box */
-  PF_STR_BANG = 1 << 11, /* String value-form bang: re-enter the plain name, nil when unchanged */
-  PF_STR_SELF = 1 << 12, /* ... but a bang that answers self (succ!/next!): never nil */
-  PF_ARGS_OWN = 1 << 13, /* the arguments must be of the owner's own kind (concat) */
-  PF_VAL_SELF = 1 << 14, /* a mutator whose value is the receiver: the box itself, or for a String the box its variable holds after the write */
-  PF_SAME_OK  = 1 << 16, /* ... and contents that are the receiver's own mean no write, so no frozen check (scrub!) */
-  PF_ENC      = 1 << 17, /* ... and the new contents carry the result's encoding, which a shared handle takes, binary or text (bytesplice) */
-  PF_LAST     = 1 << 15  /* answers only once no poly-receiver emitter of its own has claimed the name */
+  PF_TRANGE = 1 << 10, /* TY_TIME_RANGE: a Range of Times (step with a block) */
+  PF_OWNERS = 0x7ff,
+  PF_MUT      = 1 << 11,  /* mutates the receiver: the result is written back through the box */
+  PF_STR_BANG = 1 << 12, /* String value-form bang: re-enter the plain name, nil when unchanged */
+  PF_STR_SELF = 1 << 13, /* ... but a bang that answers self (succ!/next!): never nil */
+  PF_ARGS_OWN = 1 << 14, /* the arguments must be of the owner's own kind (concat) */
+  PF_VAL_SELF = 1 << 15, /* a mutator whose value is the receiver: the box itself, or for a String the box its variable holds after the write */
+  PF_SAME_OK  = 1 << 17, /* ... and contents that are the receiver's own mean no write, so no frozen check (scrub!) */
+  PF_ENC      = 1 << 18, /* ... and the new contents carry the result's encoding, which a shared handle takes, binary or text (bytesplice) */
+  PF_STR_TYPED = 1 << 19, /* a String bang for a receiver known to be a String (ty_str_typed_bang_flags), whose row is the mutator kind's for a boxed receiver (reverse!, scrub!); PF_STR_SELF on it says it answers self, PF_SAME_OK that an unchanged String is no write */
+  PF_LAST     = 1 << 16  /* answers only once no poly-receiver emitter of its own has claimed the name */
 };
 typedef struct {
   const char *name;
@@ -103,8 +111,9 @@ int ty_poly_hash_face_name(const char *nm);
    list of them: its PF_STR_BANG and PF_STR_SELF flags, or 0 for any other
    name. Its plain name is the bang without the '!' (str_bang_plain). */
 unsigned ty_str_bang_flags(const char *name);
-/* ty_str_bang_flags for a receiver known to be a String, which reverse!
-   joins */
+/* ty_str_bang_flags for a receiver known to be a String, which the
+   PF_STR_TYPED rows (reverse!, scrub!) join: PF_STR_BANG, with their
+   PF_STR_SELF and PF_SAME_OK */
 unsigned ty_str_typed_bang_flags(const char *name);
 void str_bang_plain(const char *bang, char *out, int n);
 
@@ -175,7 +184,11 @@ typedef enum {
      only the element cast on index differs. Kept last, not beside its sibling:
      abi_sig_token encodes a kind as 100000 + (int)TyKind, so inserting mid-enum
      renumbers every kind after it. */
-  TY_FLOAT_ARRAY_ARRAY
+  TY_FLOAT_ARRAY_ARRAY,
+  TY_TIME_RANGE,   /* (t1..t2): a Range of Times (sp_TimeRange *), after the
+                      last for the same reason */
+  TY_OBJ_RANGE     /* (d1..d2): a Range of the program's objects whose class
+                      defines <=> (sp_ObjRange *, its ends boxed) */
 } TyKind;
 
 /* The receiver type an owner bit re-enters the typed emitter with. */
@@ -191,6 +204,7 @@ static inline TyKind ty_poly_face_kind(unsigned owner) {
     case PF_FRANGE: return TY_FLOAT_RANGE;
     case PF_SRANGE: return TY_STR_RANGE;
     case PF_RANDOM: return TY_RANDOM;
+    case PF_TRANGE: return TY_TIME_RANGE;
   }
   return TY_UNKNOWN;
 }
@@ -226,14 +240,6 @@ int array_new_copies(TyKind t);
 /* Set while the type fixpoint iterates; defined in analyze.c. Declared here
    because ty_array_of consults it -- see the TY_UNKNOWN case. */
 extern int g_infer_optimistic;
-/* One String representation, the only one: every String slot is the
-   handle. A constant while the branches that test it are folded away
-   (stage 2 of string-one-repr-design.md); ty_array_of and ty_hash_of take
-   a String handle as a String. */
-#define g_one_string 1
-/* ...and so is the share rule it implies (every String slot the handle):
-   what c->share_strings and repr_share_rule() said, folded the same way */
-#define SHARE_ON 1
 /* Set while infer_write_types is re-deriving local types. That pass resets
    every non-param local to UNKNOWN at the top of each round and re-derives in
    node order, so a read reached BEFORE its own write answers UNKNOWN -- and
@@ -430,8 +436,10 @@ typedef struct {
   unsigned char scalar_ret;   /* is_scalar_ret */
   unsigned char store_class;  /* repr_store_class (SC_*) */
   unsigned char box_form;     /* the form --repr-check records for box_text (RF_*) */
+  const char *elem_sfx;       /* typed_elem_sfx: a typed Array's element-store entries */
+  unsigned char elem_held;    /* typed_elem_held: the kind its element is held as */
 } TyTraits;
-#define TY_TRAITS_N ((int)TY_FLOAT_ARRAY_ARRAY + 1)
+#define TY_TRAITS_N ((int)TY_OBJ_RANGE + 1)
 extern const TyTraits ty_traits[TY_TRAITS_N];
 /* the row of builtin kind t, or NULL (a user object's kind) */
 extern int g_traits_promote;   /* --int-overflow=promote (main.c) */
@@ -439,6 +447,16 @@ extern const TyTraits ty_traits_promote_rational;
 static inline const TyTraits *ty_traits_of(TyKind t) {
   if (t == TY_RATIONAL && g_traits_promote) return &ty_traits_promote_rational;
   return (int)t >= 0 && (int)t < TY_TRAITS_N ? &ty_traits[t] : (const TyTraits *)0;
+}
+
+/* A kind a value of which can be boxed into a poly value (emit_boxed_text):
+   a builtin kind whose row has a box, a String of either face, a user
+   object or an object array. An unsettled kind (TY_UNKNOWN) cannot. */
+static inline int ty_boxable(TyKind t) {
+  if (t == TY_STRING || t == TY_STRBUF) return 1;
+  const TyTraits *tr = ty_traits_of(t);
+  if (tr) return tr->box_text != 0;
+  return ty_is_object(t) || ty_is_obj_array(t);
 }
 
 /* A builtin kind held by a C pointer (a String handle, a Proc, a Regexp, an

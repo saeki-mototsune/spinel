@@ -25,6 +25,12 @@ is a user guarantee.
   every thread until it returns; I/O, sleeps and Queue / Mutex waits park in
   the scheduler and do not. A fixed N above 1 caps parallelism. Absent the env var, Spinel autodetects the
   number of online cores and runs a helper per core beside main.
+  Main runs no thread it did not start on itself: the threads go to the
+  helpers. So a program whose main thread only starts threads and joins
+  them (a server's main, typically) has N-1 OS threads of work under
+  `SPINEL_WORKERS=N`, and `SPINEL_WORKERS=2` runs every thread on one
+  helper. Give such a program `SPINEL_WORKERS=N+1` for N threads of work,
+  or leave the variable unset.
 - **Real parallelism, no GVL.** Two threads run Ruby code on two cores
   simultaneously. There is no implicit per-object lock, so unsynchronized
   shared mutation is a data race (see [By design](#by-design) below).
@@ -84,7 +90,9 @@ on whichever of an fd or the deadline comes first. An
 `syswrite`, and the buffered reads and writes over them) wait the same way,
 on the descriptor between non-blocking record-layer steps. A backtick,
 `system` and `Process.waitpid2` in a green thread wait for the child without
-holding the worker either.
+holding the worker either, and so do the waits with flags (`Process.wait2(pid,
+Process::WUNTRACED)`); `Process::WNOHANG` asks once and answers nil for a child
+still running, with no wait at all.
 
 Why this matters beyond fairness: a collection stops the world at
 safepoints, and a worker sitting in a syscall never reaches one, so a thread

@@ -454,6 +454,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       (sp_streq(name, "message") || sp_streq(name, "result") ||
        sp_streq(name, "errno") || sp_streq(name, "error_code") ||
        sp_streq(name, "key") || sp_streq(name, "receiver") ||
+       sp_streq(name, "args") || sp_streq(name, "private_call?") ||
        sp_streq(name, "backtrace") || sp_streq(name, "cause") ||
        is_exception_full_message(name)) &&
       repr_of(c, recv).as_ty == TY_POLY) {
@@ -567,19 +568,25 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
   }
   if (recv >= 0 && !sp_streq(name, "message") && !sp_streq(name, "to_s")) {
     TyKind xrt = comp_ntype(c, recv);
-    int xdef = -1, xob = ty_is_object(xrt) ? ty_object_class(xrt) : -1;
+    MethodLookup ml = { .def_class = -1 };
+    int xob = ty_is_object(xrt) ? ty_object_class(xrt) : -1;
     int xhit = xob >= 0 && class_is_exc_subclass(c, xob)
-                 ? call_target(c, id, xob, name, 0, &xdef) : -1;
+                 ? call_target(c, id, xob, name, 0, &ml) : -1;
     if (xrt == TY_EXCEPTION ||
         (xob >= 0 && class_is_exc_subclass(c, xob) &&
-         (xhit < 0 || (xdef >= 0 && is_builtin_reopen(c->classes[xdef].name))))) {
+         (xhit < 0 || (ml.def_class >= 0 && is_builtin_reopen(c->classes[ml.def_class].name))))) {
       int xr[8];
       int xn = exc_reopen_definers(c, name, xr, 8);
       if (xn > 0) {
         int xt = ++g_tmp;
         buf_printf(b, "({ sp_Exception *_t%d = (sp_Exception *)(", xt);
         emit_expr(c, recv, b);
+        /* rooted for the call where the receiver may be a fresh one
+           (`RuntimeError.new("x").tag`, operand_may_allocate): nothing else
+           holds it, and the definer it reaches may allocate before it reads
+           self (`"RT:" + super`) */
         buf_puts(b, "); ");
+        if (operand_may_allocate(c, recv)) buf_printf(b, "SP_GC_ROOT(_t%d); ", xt);
         char xcls[48]; snprintf(xcls, sizeof xcls, "_t%d->cls_name", xt);
         int pk = emit_exc_reopen_pick_head(c, xr, xn, xcls, b);
         /* a runtime class none of them is above has no such method */
@@ -694,11 +701,6 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       buf_puts(b, "sp_exc_cause("); emit_expr(c, recv, b); buf_puts(b, ")");
       return 1;
     }
-    if (sp_streq(name, "result") && argc == 0) {
-      /* StopIteration#result: the finished iteration's return value. */
-      buf_puts(b, "sp_exc_result("); emit_expr(c, recv, b); buf_puts(b, ")");
-      return 1;
-    }
     if (sp_streq(name, "errno") && argc == 0) {
       /* SystemCallError#errno: the number of the Errno:: class, by name (#4560) */
       buf_puts(b, "sp_exc_errno_acc("); emit_expr(c, recv, b); buf_puts(b, ")");
@@ -727,10 +729,14 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       int t = hoist_exc_recv(c, recv);
       /* a class of the program carries its own id (sp_user_exc_class), so
          #superclass and #ancestors walk past a user parent */
-      if (g_needs_class_machinery)
-        buf_printf(b, "(_t%d ? sp_user_exc_class(sp_exc_class_name(_t%d)) : ((sp_Class){0, SPL(\"NilClass\")}))", t, t);
-      else
-        buf_printf(b, "((sp_Class){0, _t%d ? sp_exc_class_name(_t%d) : SPL(\"NilClass\")})", t, t);
+      if (g_needs_class_machinery) {
+        buf_printf(b, "(_t%d ? sp_user_exc_class(sp_exc_class_name(_t%d)) : ", t, t);
+        emit_builtin_class_value(c, "NilClass", b); buf_puts(b, ")");
+      }
+      else {
+        buf_printf(b, "(_t%d ? ((sp_Class){(sp_int)-1, sp_exc_class_name(_t%d)}) : ", t, t);
+        emit_builtin_class_value(c, "NilClass", b); buf_puts(b, ")");
+      }
       return 1;
     }
     /* object identity: the same raised object compares equal to $! / a `=> e`
@@ -799,6 +805,23 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
 }
 
 /* raise / fail as an expression */
+/* The name `raise K, ...` raises a constant K by: the class it names
+   (const_node_match_class_name), so an alias raises the class it holds;
+   else the name written */
+/* Is `raise K`'s constant one a read can reach before its assignment
+   (LocalVar.const_early)? It is no class's name there: the operand is
+   evaluated as a value is, and that read raises CRuby's NameError where K
+   is not yet assigned. */
+static int raise_const_read_early(Compiler *c, int node) {
+  NodeKind k = nt_kind(c->nt, node);
+  if (k != NK_ConstantReadNode && k != NK_ConstantPathNode) return 0;
+  LocalVar *lv = comp_const_at(c, node);
+  return lv && lv->const_early;
+}
+static const char *exc_const_class_name(Compiler *c, int node) {
+  const char *n = const_node_match_class_name(c, node);
+  return n ? n : nt_str(c->nt, node, "name");
+}
 int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv) {
   /* raise */
   /* `fail` is an exact alias of `Kernel#raise`. */
@@ -866,8 +889,9 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
                       repr_of(c, cause_node).exc));
       int first_const = ac > 0 && nt_type(nt, av[0]) &&
                         comp_ntype(c, av[0]) != TY_STRING && comp_ntype(c, av[0]) != TY_STRBUF &&
-                        (nt_kind(nt, av[0]) == NK_ConstantReadNode || nt_kind(nt, av[0]) == NK_ConstantPathNode);
-      const char *first_cn = first_const ? nt_str(nt, av[0], "name") : NULL;
+                        (nt_kind(nt, av[0]) == NK_ConstantReadNode || nt_kind(nt, av[0]) == NK_ConstantPathNode) &&
+                        !raise_const_read_early(c, av[0]);
+      const char *first_cn = first_const ? exc_const_class_name(c, av[0]) : NULL;
       int first_xc = first_cn ? comp_class_index(c, first_cn) : -1;
       TyKind first_ty = ac > 0 && !first_const ? comp_ntype(c, av[0]) : TY_UNKNOWN;
       /* a class of the program with its own initialize is built before the
@@ -933,6 +957,7 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
     }
     else if (ac == 1 && nt_type(nt, av[0]) &&
              (nt_kind(nt, av[0]) == NK_ConstantReadNode || nt_kind(nt, av[0]) == NK_ConstantPathNode) &&
+             !raise_const_read_early(c, av[0]) &&
              /* A String constant is the message, as a String variable is. */
              comp_ntype(c, av[0]) != TY_STRING && comp_ntype(c, av[0]) != TY_STRBUF &&
              /* a constant holding an exception INSTANCE (`ERR = RuntimeError.new(..)`;
@@ -944,7 +969,7 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
          the object (filling initialize's defaults) so its custom initialize and
          any `super`/message run. Without a custom initialize the message
          defaults to the class name, so the (cls, "") fast path is correct. */
-      const char *cn = nt_str(nt, av[0], "name");
+      const char *cn = exc_const_class_name(c, av[0]);
       int xc = cn ? comp_class_index(c, cn) : -1;
       /* a reopened builtin exception is still the builtin: raised by name,
          through the reopening's own initialize when it has one */
@@ -999,12 +1024,13 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
     }
     else if (ac >= 2 && nt_type(nt, av[0]) &&
              comp_ntype(c, av[0]) != TY_STRING && comp_ntype(c, av[0]) != TY_STRBUF &&
-             (nt_kind(nt, av[0]) == NK_ConstantReadNode || nt_kind(nt, av[0]) == NK_ConstantPathNode)) {
+             (nt_kind(nt, av[0]) == NK_ConstantReadNode || nt_kind(nt, av[0]) == NK_ConstantPathNode) &&
+             !raise_const_read_early(c, av[0])) {
       /* `raise Cls, arg` on a user exception subclass with an initialize is
          `raise Cls.new(arg)`: construct the object so its ivars are set and
          the message comes from the class's initialize/super, then carry it.
          A bare-string/builtin exception keeps the (cls, msg) fast path. */
-      const char *cn = nt_str(nt, av[0], "name");
+      const char *cn = exc_const_class_name(c, av[0]);
       int xc = cn ? comp_class_index(c, cn) : -1;
       /* a reopened builtin exception is still the builtin: raised by name,
          through the reopening's own initialize when it has one */
@@ -1062,6 +1088,12 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
           buf_puts(b, "sp_raise_exc(sp_signal_exc_new(");
           emit_boxed(c, av[1], b);
           buf_puts(b, "))");
+        }
+        /* `raise SystemExit, 3` is SystemExit.new(3): a number is the status */
+        else if (xc >= 0 ? class_is_sysexit(c, xc) : (effn && sp_streq(effn, "SystemExit"))) {
+          buf_puts(b, "sp_raise_exc((sp_Exception *)");
+          emit_sysexit_new(c, id, xc, 1, &av[1], b);
+          buf_puts(b, ")");
         }
         /* `raise Errno::ENOENT, "x"` is Errno::ENOENT.new("x"): the errno
            text, " - x" (SystemCallError.new("x") an unknown error) */

@@ -436,7 +436,7 @@ int emit_call_identity_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
   /* nil? on a pointer-backed concrete type: nil is the NULL pointer. */
   if (recv >= 0 && argc == 0 && sp_streq(name, "nil?") &&
       (rt == TY_FIBER || rt == TY_PROC || rt == TY_CURRY || rt == TY_RANDOM ||
-       rt == TY_METHOD || rt == TY_IO ||
+       rt == TY_METHOD || rt == TY_IO || rt == TY_TIME ||   /* an sp_Time pointer, NULL for nil (#11343) */
        rt == TY_MATCHDATA || rt == TY_REGEX || rt == TY_EXCEPTION || rt == TY_BIGINT)) {
     buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, ") == NULL)");
     return 1;
@@ -451,7 +451,7 @@ int emit_call_identity_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
   }
   /* nil? on a value-typed concrete receiver is always false. */
   if (recv >= 0 && argc == 0 && sp_streq(name, "nil?") &&
-      (rt == TY_RANGE || rt == TY_TIME || rt == TY_COMPLEX || rt == TY_RATIONAL ||
+      (rt == TY_RANGE || rt == TY_COMPLEX || rt == TY_RATIONAL ||
        rt == TY_BOOL || rt == TY_CLASS)) {
     buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), 0)");
     return 1;
@@ -686,12 +686,6 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       int sv_nil_ie = g_ie_nil_ivars; g_ie_nil_ivars = 0;
       if (nexec) emit_args_off_self(c, niav, niac, g_pre);
       g_ie_nil_ivars = id + 1;
-      /* a String variable the block appends to is aliased, as a yield's is
-         (#6179); the alias's brace closes after the body, which then leaves
-         its value in a temp */
-      BlockAliases nal = { .n = 0 };
-      int nal_tr = -1;
-      TyKind nal_vt = TY_UNKNOWN;
       /* --share-strings: the call read as the handle (strbuf_route_ie)
          answers the tail's handle */
       TyKind ntt = nbn > 0 ? repr_of(c, nbb[nbn - 1]).as_ty : TY_NIL;
@@ -699,21 +693,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       if (nexec) {
         /* into a side buffer: a value's own prelude drains into g_pre first */
         Buf bb; memset(&bb, 0, sizeof bb);
-        emit_block_binds(c, nblk, niav, niac, &bb, g_indent, 0, NULL, &nal);
-        if (nal.open && nbn > 0) {
-          Repr lr = repr_of(c, nbb[nbn - 1]);
-          TyKind lt = lr.as_ty;
-          nal_vt = repr_of(c, id).kind == RK_BOXED && lr.kind != RK_BOXED ? TY_POLY : lt;
-          if (nhandle) nal_vt = TY_STRBUF;
-          if (nal_vt != TY_VOID && nal_vt != TY_NIL && nal_vt != TY_UNKNOWN &&
-              (ty_is_object(nal_vt) || c_type_name(nal_vt))) {
-            nal_tr = ++g_tmp;
-            emit_indent(g_pre, g_indent); emit_ctype(c, nal_vt, g_pre);
-            buf_printf(g_pre, " _t%d = %s; ", nal_tr, comp_ty_value_obj(c, nal_vt) ? "{0}" : default_value_from_compiler(c, nal_vt));
-            emit_gc_root_tmp(c, nal_vt, nal_tr, g_pre);
-            buf_puts(g_pre, "\n");
-          }
-        }
+        emit_block_binds(c, nblk, niav, niac, &bb, g_indent, 0, NULL);
         if (bb.p) buf_puts(g_pre, bb.p);
         free(bb.p);
       }
@@ -727,7 +707,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         else { buf_printf(g_pre, "lv_%s = ", rename_local(pn)); emit_ie_param_default(c, plv->type, g_pre); buf_puts(g_pre, ";\n"); }
       }
       if (!nexec && (block_keyword_name(c, nblk, 0) || block_kwrest_name(c, nblk)))
-        emit_block_kw_binds(c, nblk, -1, comp_scope_of(c, id), g_pre, g_indent, 0, NULL, NULL);
+        emit_block_kw_binds(c, nblk, -1, comp_scope_of(c, id), g_pre, g_indent, 0, NULL);
       view_unbind(sv_nargov);
       Repr nbtr = repr_of(c, nbn > 0 ? nbb[nbn - 1] : -1);
       TyKind nbt = nbn > 0 ? nbtr.as_ty : TY_NIL;
@@ -738,30 +718,11 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       for (int j = 0; j < nbn - 1; j++) emit_stmt(c, nbb[j], g_pre, g_indent);
       if (nbn == 0) {
         ie_body_restore(c, nsnap); g_self = sv_self; g_self_deref = sv_deref;
-        if (nal.open) { emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n"); }
         g_ie_nil_ivars = sv_nil_ie;
         buf_puts(b, "sp_box_nil()"); return 1;
       }
       int nscalar = is_scalar_ret(nbt) && nbt != TY_VOID && nbt != TY_NIL && nbt != TY_UNKNOWN;
       int nbox = repr_of(c, id).kind == RK_BOXED && nbtr.kind != RK_BOXED;
-      if (nal.open) {
-        Buf vb; memset(&vb, 0, sizeof vb);
-        if (nal_vt == TY_POLY && nbtr.kind != RK_BOXED) emit_boxed(c, nbb[nbn - 1], &vb);
-        else if (nhandle) emit_strbuf_handle_of(c, nbb[nbn - 1], &vb);
-        else emit_expr(c, nbb[nbn - 1], &vb);
-        emit_indent(g_pre, g_indent);
-        if (nal_tr >= 0) buf_printf(g_pre, "_t%d = %s;\n", nal_tr, vb.p ? vb.p : "0");
-        else buf_printf(g_pre, "%s;\n", vb.p ? vb.p : "0");
-        free(vb.p);
-        ie_body_restore(c, nsnap);
-        g_self = sv_self; g_self_deref = sv_deref;
-        block_aliases_release(&nal);
-        emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
-        if (nal_tr >= 0) buf_printf(b, "_t%d", nal_tr);
-        else buf_puts(b, nbox ? "sp_box_nil()" : default_value_from_compiler(c, nbt));
-        g_ie_nil_ivars = sv_nil_ie;
-        return 1;
-      }
       if (nhandle) {
         int tr = ++g_tmp;
         Buf vb; memset(&vb, 0, sizeof vb);
@@ -946,7 +907,6 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       /* Bind the block params (interned in the enclosing scope, declared
          there): instance_exec assigns the call-site args; instance_eval
          yields the receiver to each param. */
-      BlockAliases ie_al = { .n = 0 };
       {
         int is_exec = ie_tramp ? (ie_tramp == 2) : sp_streq(name, "instance_exec");
         int bp_node = nt_ref(nt, blk, "parameters");
@@ -964,9 +924,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
              `instance_exec(1) { |*r, a| }` bound r = [1]. */
           int sv_nargov = g_n_argov;
           Buf bb; memset(&bb, 0, sizeof bb);   /* see the non-object receiver's */
-          /* a String variable the block appends to is aliased, as a yield's
-             is: the block writes through the caller's slot (#6179) */
-          emit_block_binds(c, blk, iav, iac + (ie_kwhash >= 0), &bb, g_indent, 0, NULL, &ie_al);
+          emit_block_binds(c, blk, iav, iac + (ie_kwhash >= 0), &bb, g_indent, 0, NULL);
           if (bb.p) buf_puts(g_pre, bb.p);
           free(bb.p);
           view_unbind(sv_nargov);
@@ -1053,7 +1011,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
           buf_puts(g_pre, pdecl ? ";\n" : ");\n");
         }
         if (block_keyword_name(c, blk, 0) || block_kwrest_name(c, blk))
-          emit_block_kw_binds(c, blk, ie_kwhash, comp_scope_of(c, id), g_pre, g_indent, 0, NULL, NULL);
+          emit_block_kw_binds(c, blk, ie_kwhash, comp_scope_of(c, id), g_pre, g_indent, 0, NULL);
         }
       }
       view_unbind(ie_sv_argov);   /* the binds were the arguments' last readers */
@@ -1065,6 +1023,12 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         /* In statement position the value is discarded, so emit the whole body
            as statements -- the last node may not be expressible (e.g. puts). */
         int last_as_stmt = g_ie_discard_value && !scalar_res;
+        /* a `next` or `break` tail is a statement too: its own lowering stores
+           the slot (g_ie_next_var / g_loop_break_var) and leaves the wrapper
+           (not a passed-on block's `break`, which leaves the method it was
+           given to: the method's value does not hold it) */
+        NodeKind ie_tk = ie_bn > 0 ? nt_kind(nt, ie_bb[ie_bn - 1]) : NK_NilNode;
+        if (ie_tk == NK_NextNode || (ie_tk == NK_BreakNode && !nt_call_has_block_arg(nt, id))) last_as_stmt = 1;
         int upto = last_as_stmt ? ie_bn : ie_bn - 1;
         int saved_discard = g_ie_discard_value; g_ie_discard_value = 0;
         /* A break/next that binds to the splice (not a nested loop) needs a C
@@ -1077,8 +1041,12 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
            enclosing valued-break scope */
         const char *sv_bser = g_brk_ser_var; g_brk_ser_var = NULL;
         int sv_iep = g_ie_res_poly, sv_ieo = g_ie_next_oint;
+        TyKind sv_iet = g_ie_next_ty;
         g_ie_res_poly = (scalar_res && body_ty == TY_POLY);
         g_ie_next_oint = res_oint;   /* a `next v` stores the slot's form */
+        /* (`next nil` too, which it reads to spell its nil; a splice nested
+           in one whose slot is an oint does not take that slot's type) */
+        g_ie_next_ty = res_oint ? body_ty : TY_UNKNOWN;
         char bvbuf[32];
         int sv_lexc2 = g_loop_exc_base, sv_lexc2_rb = g_loop_rescue_base, sv_lens2 = g_loop_ensure_base;
         if (ie_bn_wrap) {
@@ -1113,14 +1081,11 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
           g_indent--; emit_indent(g_pre, g_indent); buf_puts(g_pre, "} while (0);\n");
         }
         g_loop_exc_base = sv_lexc2; g_loop_rescue_base = sv_lexc2_rb; g_loop_ensure_base = sv_lens2;
-        g_ie_res_poly = sv_iep; g_ie_next_oint = sv_ieo;
+        g_ie_res_poly = sv_iep; g_ie_next_oint = sv_ieo; g_ie_next_ty = sv_iet;
         g_brk_ser_var = sv_bser;
         g_ie_discard_value = saved_discard;
         g_one_held = sv_oh;
       }
-      /* the aliases end with the body, which the result temps outlive */
-      block_aliases_release(&ie_al);
-      if (ie_al.open) { emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n"); }
       g_ie_class_id = saved_ie;
       if (ie_flip) { { ie_sc->is_cmethod = ie_sv_cm; comp_touch_scope(ie_sc->idx); } { ie_sc->class_id = ie_sv_cls; comp_touch_scope(ie_sc->idx); } comp_scope_move_end(); }
       g_self = saved_self2;
@@ -1175,7 +1140,7 @@ static int emit_freeze_recv_handle(Compiler *c, int recv, Buf *b) {
   /* (or a boxed receiver's call whose arms each answer a String's handle,
      read as the box's handle, as a mutator's receiver is:
      emit_recv_route_handle) */
-  else if (c->share_plan && share_plan_producer(c, recv, NULL) == SPK_POLY_ARMS) {
+  else if (share_plan_producer(c, recv, NULL) == SPK_POLY_ARMS) {
     th = ++g_tmp;
     buf_printf(b, "({ sp_String *_t%d = ", th);
     emit_str_form_handle(c, recv, b);
@@ -2353,7 +2318,7 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
            that answers nil, where the bytes it read were a copy */
         int sn_self = rrt == TY_STRING && !sn_obj && !sn_scalar && !sn_cont &&
                       strbuf_self_route(c, recv);
-        int sn_poly = !sn_self && c->share_plan && rrt == TY_STRING && !sn_obj && !sn_scalar &&
+        int sn_poly = !sn_self && rrt == TY_STRING && !sn_obj && !sn_scalar &&
                       !sn_cont && share_plan_producer(c, recv, NULL) == SPK_POLY_ARMS;
         int sn_hold = sn_self || sn_poly;
         /* arguments that run code, which a String receiver's change in
@@ -2668,8 +2633,9 @@ int emit_call_object_override_arms(Compiler *c, int id, Buf *b, const NodeTable 
     int nc2 = 0; const int *nv2 = na2 >= 0 ? nt_arr(nt, na2, "arguments", &nc2) : NULL;
     if (nr2 >= 0 && nn2 && (sp_streq(nn2, "!") || sp_streq(nn2, "!=")) &&
         ty_is_object(comp_ntype(c, nr2))) {
-      int nd = ty_object_class(comp_ntype(c, nr2)), ndef = nd;
-      int nmi2 = call_target(c, id, nd, nn2, 0, &ndef);
+      int nd = ty_object_class(comp_ntype(c, nr2));
+      MethodLookup ml = { .def_class = nd };
+      int nmi2 = call_target(c, id, nd, nn2, 0, &ml);
       /* The arguments go straight into the parameters only when there is
          one plain parameter per argument; any other layout (a rest, an
          optional, a keyword) or count binds them as every call does
@@ -2688,12 +2654,12 @@ int emit_call_object_override_arms(Compiler *c, int id, Buf *b, const NodeTable 
            root it first */
         int nht = !plain && !nval && !expr_is_held_ref(c, nr2) ? ++g_tmp : 0;
         if (nht) {
-          buf_printf(b, "({ sp_%s *_t%d = (sp_%s *)(", c->classes[ndef].c_name, nht, c->classes[ndef].c_name);
+          buf_printf(b, "({ sp_%s *_t%d = (sp_%s *)(", c->classes[ml.def_class].c_name, nht, c->classes[ml.def_class].c_name);
           emit_expr(c, nr2, b);
           buf_printf(b, "); SP_GC_ROOT(_t%d); ", nht);
         }
         buf_printf(b, "%s(", mc_method(c, nm2));
-        if (!nval) buf_printf(b, "(sp_%s *)", c->classes[ndef].c_name);
+        if (!nval) buf_printf(b, "(sp_%s *)", c->classes[ml.def_class].c_name);
         buf_puts(b, "(");
         if (nht) buf_printf(b, "_t%d", nht); else emit_expr(c, nr2, b);
         buf_puts(b, ")");
@@ -2936,7 +2902,7 @@ int emit_call_object_override_arms(Compiler *c, int id, Buf *b, const NodeTable 
     }
     /* TrueClass.new / FalseClass.new / NilClass.new: no allocator */
     if (nm0 && sp_streq(nm0, "new") && rv0 >= 0 && nt_kind(nt, rv0) == NK_ConstantReadNode) {
-      const char *cn0 = nt_str(nt, rv0, "name");
+      const char *cn0 = nt_key_name(nt, rv0);
       if (cn0 && (is_immediate_class_name(cn0))) {
         buf_printf(b, "(sp_raise_cls(\"NoMethodError\","
                       " (&(\"\\xff\" \"undefined method 'new' for class %s\")[1])), 0)", cn0);
@@ -3671,7 +3637,7 @@ int emit_object_ivar_call(Compiler *c, int id, const char *name, int recv, TyKin
           if (strbuf_slot_text(c, argv[1], &srefIS)) { buf_puts(b, srefIS.p); free(srefIS.p); }
           /* (--share-strings: the handle the String plan gives, rendered by
              the handle face: a boxed receiver's call whose arms answer one) */
-          else if (c->share_plan && share_plan_producer(c, argv[1], NULL) == SPK_POLY_ARMS &&
+          else if (share_plan_producer(c, argv[1], NULL) == SPK_POLY_ARMS &&
                    share_plan_of(c, argv[1], SPR_STORE, NULL).form == SPF_HANDLE)
             emit_str_form_handle(c, argv[1], b);
           else {

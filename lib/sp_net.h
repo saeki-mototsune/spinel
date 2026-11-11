@@ -61,6 +61,8 @@ int sp_net_sock_name(int fd, int peer, void *out, int cap);
 int sp_net_accept(int sfd);
 int sp_net_accept_unless(int sfd, const unsigned char *cancel);
 int sp_net_accept_nb(int sfd);
+/* The peer IP of a connected fd as text, "" when it has none. */
+const char *sp_net_peer_ip(int fd);
 int sp_net_connect(const char *host, int port);
 /* connect an existing fd to a packed sockaddr, waiting as connect does */
 int sp_net_connect_sa(int fd, const void *sa, int len);
@@ -72,9 +74,13 @@ int sp_net_connect_sa(int fd, const void *sa, int len);
  * (sp_sched_wait_io_timeout), and the returned fd is non-blocking as
  * connect's is there. take_connect_timeout tells a timeout apart from a
  * refusal or a failed lookup: 1 when the calling worker's last
- * connect_timeout gave up on the deadline, else 0. Reading it clears it. */
+ * connect_timeout gave up on the deadline, else 0. Reading it clears it.
+ * connect_timeout_ip then names the address that connect was waiting on,
+ * as sock_ip names a socket's: its IP as text into ipbuf, and the port
+ * returned (-1 when there is none). */
 int sp_net_connect_timeout(const char *host, int port, double timeout_s);
 int sp_net_take_connect_timeout(void);
+int sp_net_connect_timeout_ip(char *ipbuf, int cap);
 
 /* ---- UDP ----
  * udp_open: an unbound SOCK_DGRAM fd. bind/connect attach it to a local /

@@ -886,6 +886,33 @@ void sp_native_leave(void) {
   sp_out_leave_locked(sp_worker_id);
   SCHED_UNLOCK();
 }
+/* An ffi_callback from inside a blocking call runs Ruby, so it comes back into
+   the world for the method and goes out again when the method has returned:
+   by then its frames are off the shadow stack, and what the way out publishes
+   is what stands below the call. Only the trampoline can do this: a Ruby method
+   that went out itself would publish its own frame and return. The depth drops
+   to 0 meanwhile, as this worker is in the world like any other, so a raise
+   that unwinds out of the blocking call lands in that state, and a blocking
+   call the method makes starts over. Answers what the way out restores. */
+int sp_native_callback_enter(void) {
+  int depth = g_native_depth;
+  if (depth == 0) return 0;   /* a plain call: this worker never left */
+  g_native_depth = 0;
+  if (g_native_noop) g_native_noop = 0;   /* entered before the pool existed: it never left either */
+  else {
+    SCHED_LOCK();
+    sp_out_leave_locked(sp_worker_id);
+    SCHED_UNLOCK();
+  }
+  return depth;
+}
+/* A real way out even if the call began with no pool: the method may have
+   started the first thread, and its collections do not wait for this call. */
+void sp_native_callback_leave(int depth) {
+  if (depth == 0) return;
+  sp_native_enter();
+  g_native_depth = depth;
+}
 /* What a parking worker publishes for the collector: the shadow-stack roots
    plus this worker's live match registers (TLS, so the collector's globals
    hook does not reach them) into the green thread's saved snapshot, then
@@ -1399,6 +1426,31 @@ static int         g_ev_fd  = -1;
 static unsigned long long g_ev_arms = 0, g_ev_adds = 0, g_ev_lost = 0, g_ev_timeouts = 0, g_ev_backstop = 0;
 #endif
 
+/* The handler-stack snapshot a green thread takes around each park (save,
+   switch out, load). Parks are the hot path of a server -- one per wait for
+   a socket -- and each one made a context with calloc, grew each of its
+   handler arrays with realloc and freed them all on resume. A small pool per
+   OS thread keeps them instead: a park takes one and its resume gives it
+   back, on the same OS thread, since a started green thread runs only on
+   its home worker (home_wid); past SP_SNAP_POOL a context is freed. What a
+   pooled context held is never read again: save rewrites every count and
+   the live prefix of every array, and load and the mark go by the counts.
+   A build with C extensions keeps the extension arena in the context,
+   which its free disposes of, so it takes a new context each time as
+   before. */
+#ifdef SP_CEXT
+static void *sp_snap_take(void) { return sp_exc_ctx_new(); }
+static void sp_snap_give(void *p) { sp_exc_ctx_free(p); }
+#else
+#define SP_SNAP_POOL 64
+static SP_TLS void *g_snap_pool[SP_SNAP_POOL];
+static SP_TLS int g_snap_n;
+static void *sp_snap_take(void) { return g_snap_n ? g_snap_pool[--g_snap_n] : sp_exc_ctx_new(); }
+static void sp_snap_give(void *p) {
+  if (g_snap_n < SP_SNAP_POOL) g_snap_pool[g_snap_n++] = p;
+  else sp_exc_ctx_free(p);
+}
+#endif
 static sp_thread *g_all = NULL;          /* registry of live threads, for GC rooting */
 
 #ifdef SP_EV_BACKEND
@@ -1678,13 +1730,33 @@ static int sp_ev_handle(int w, sp_ev_ready *evs, int en) {
    is ready is readied now. The worker's fast path takes it between threads
    it runs, which is what lets a busy worker deliver I/O without the scheduler
    lock. */
+/* When this worker last looked at its set, and how many threads it has run
+   since; read by sp_ev_drain_due. */
+static SP_TLS unsigned g_ev_runs_since;
+static SP_TLS double g_ev_drained_at;
 static int sp_ev_drain(int wid) {
   if (g_wslot[wid].evfd <= 0) return 0;
+  g_ev_runs_since = 0;
+  g_ev_drained_at = sp_monotonic_now();
   sp_ev_ready evs[64];
   int en = sp_ev_backend_wait(g_wslot[wid].evfd, evs, 64, 0);
   if (en <= 0) return 0;
   SP_STAT_ADD(g_mon_polls, 1); SP_STAT_ADD(g_mon_pollfds, en);
   return sp_ev_handle(wid, evs, en);
+}
+
+/* Whether a worker that is about to run another thread looks at its set
+   first. With its own queue empty it always does, as before. With threads
+   queued, it does every SP_EV_DRAIN_RUNS threads, or once SP_EV_DRAIN_GAP
+   seconds have passed since the last look, so a parked thread whose
+   descriptor is ready waits a bounded time instead of a look being paid
+   on every thread switch. */
+#define SP_EV_DRAIN_RUNS 16u
+#define SP_EV_DRAIN_GAP  0.001
+static int sp_ev_drain_due(int wid) {
+  if (!SP_ATOMIC_LOAD(&g_lrq[wid].head, __ATOMIC_ACQUIRE)) return 1;
+  if (++g_ev_runs_since >= SP_EV_DRAIN_RUNS) return 1;
+  return sp_monotonic_now() - g_ev_drained_at >= SP_EV_DRAIN_GAP;
 }
 
 /* Wait on this worker's own readiness set for up to `tmo_ms`, then ready what
@@ -1785,6 +1857,7 @@ void sp_sched_ev_forget(int fd) { (void)fd; }
 #endif
 
 static unsigned   g_next_id = 1;
+static void sp_thread_raise_main_locked(const char *cls, const char *msg, void *obj);
 static unsigned char g_report_default = 1;  /* Thread.report_on_exception default */
 
 #ifdef SP_THREADS
@@ -1894,6 +1967,11 @@ static void runq_requeue(sp_thread *t) {
    worker that keeps refilling its own queue (e.g. a thread spawning in a loop)
    cannot starve globally-requeued (preempted / woken) work. */
 static SP_TLS unsigned g_pick_tick = 0;
+/* Set when the thread this worker just ran was switched out at the end of
+   its quantum (sp_safepoint_preempt). Such a run took a whole quantum, so
+   picking from the local queue again would leave the global queue's
+   unstarted threads a 61-pick wait of one quantum each. */
+static SP_TLS int g_run_preempted = 0;
 #ifdef SP_THREADS
 /* An unstarted thread popped from the global queue is about to be pinned to
    whichever worker runs it first, for life. Under a helper pool that grows on
@@ -2138,15 +2216,19 @@ int sp_sched_other_threads_live(void) {
    exact wake-up. sp_Thread_pass runs a runnable sibling immediately; the sleep
    only keeps a busy loop from burning the core while the child works, and it
    caps at 5ms, which is nothing against a wait long enough to matter. */
-int sp_sched_wait_child(int pid, int *status) {
+int sp_sched_wait_child(int pid, int *status) { return sp_sched_wait_child_flags(pid, status, 0); }
+/* The same with the flags of waitpid(2): WNOHANG asks once and answers 0 for
+   a child still running, with no wait and no poll; WUNTRACED takes a stopped
+   child too. The poll keeps the caller's flags beside its own WNOHANG. */
+int sp_sched_wait_child_flags(int pid, int *status, int flags) {
   int r;
-  if (!sp_sched_other_threads_live()) {
-    do { r = (int)waitpid((pid_t)pid, status, 0); } while (r < 0 && errno == EINTR);
+  if ((flags & WNOHANG) || !sp_sched_other_threads_live()) {
+    do { r = (int)waitpid((pid_t)pid, status, flags); } while (r < 0 && errno == EINTR);
     return r;
   }
   { double back = 0.0002;
     for (;;) {
-      do { r = (int)waitpid((pid_t)pid, status, WNOHANG); } while (r < 0 && errno == EINTR);
+      do { r = (int)waitpid((pid_t)pid, status, WNOHANG | flags); } while (r < 0 && errno == EINTR);
       if (r != 0) return r;   /* reaped, or an error for the caller to report */
       sp_Thread_pass();
 #ifdef SP_THREADS
@@ -2976,8 +3058,16 @@ static void run_thread_once(sp_thread *t) { sp_gc_wb((void*)t);   /* PRE/POST: s
          for this one, then lets the exception surface at join and terminate
          with its status. Reporting it printed a scary line for an ordinary
          `exit` inside a thread. */
-      do_report = t->report_on_exception &&
-                  !(ec && strcmp(ec, "SystemExit") == 0);
+      int is_exit = ec && sp_exc_cls_matches(ec, "SystemExit");
+      do_report = t->report_on_exception && !is_exit;
+      /* ... and it ends the program from any wait main is in, ensures and
+         at_exit hooks included, as CRuby raises it in the main thread. Ahead
+         of the joiners' wake, so a main joining t raises it once. */
+      if (is_exit) {
+        if (!locked) SCHED_LOCK();
+        sp_thread_raise_main_locked(ec, em, eo);
+        if (!locked) SCHED_UNLOCK();
+      }
     }
     /* DEAD goes up after retval and the exception fields, with release:
        #status and #inspect read has_exc once they see it, without the lock. */
@@ -3028,8 +3118,9 @@ static void run_thread_once(sp_thread *t) { sp_gc_wb((void*)t);   /* PRE/POST: s
   else {
     /* Thread.pass / preempt: requeue. A started thread is pinned to its home
        worker (TLS affinity), so it lands on our own local queue TAIL -- other
-       queued work still runs first, and the 61-tick global check keeps the
-       global queue from starving. */
+       queued work still runs first, and the 61-tick global check, with the
+       turn a preempted run takes (g_run_preempted), keeps the global queue
+       from starving. */
     runq_requeue(t);
     sched_wake_home(t->home_wid);   /* pinned to us: our own loop re-picks it */
   }
@@ -3074,6 +3165,7 @@ static void sp_safepoint_preempt(void) {
      would park that fiber, and the thread is resumed at its own. Skip this
      slice; the monitor asks again on the next one. */
   if (sp_fiber_current != self->fiber) return;
+  g_run_preempted = 1;
   SCHED_UNLOCK();
   sp_sched_switch_out();
   sp_fiber_fire_inject_if_pending();   /* a #kill/#raise delivered while we were off-cpu */
@@ -3115,7 +3207,7 @@ static void sp_sched_pump(sp_thread *target, int may_wait) {
        roots a stale snapshot a collector could later mark. Main instead waits
        and lets a helper run the work. At N=1 there are no helpers, so it must
        pump. EXCEPTION: a thread pinned to main's worker (home_wid 0 -- it first
-       ran here via a Thread.pass sweep, sp_sched_pass) can run NOWHERE else:
+       ran here before main had a helper) can run NOWHERE else:
        helpers must not resume it (TLS affinity) and stealing skips it. If one
        is requeued while main pumps (a #kill/#raise or Queue wake unblocked it),
        main is the only worker that can finish it, so run it here -- otherwise
@@ -3173,6 +3265,41 @@ static void sp_sched_pump(sp_thread *target, int may_wait) {
   }
 }
 
+#ifdef SP_THREADS
+/* The first thread on worker 0's queue that is pinned there, off the queue. An
+   unstarted one stays for a helper to steal: after a helper that failed to
+   start, a thread running here can have spawned one onto this queue. PRE: the
+   queue's lock held. */
+static sp_thread *runq_pop_pinned(sp_runq *q) {
+  if (!q->head || q->head->home_wid >= 0) return runq_pop(q);
+  sp_thread *prev = q->head;
+  while (prev->rq_next && prev->rq_next->home_wid < 0) prev = prev->rq_next;
+  sp_thread *t = prev->rq_next;
+  if (!t) return NULL;
+  prev->rq_next = t->rq_next;
+  if (q->tail == t) q->tail = prev;
+  if (q->woke == t) q->woke = NULL;
+  t->rq_next = NULL;
+  RUNNABLE_DEC();
+  return t;
+}
+
+/* What main's sweep runs when nothing is pinned to its worker. A thread a helper
+   spawned waits on that helper's queue for a worker to come round to it, and a
+   helper in a blocking call does not. A new helper takes it, when the pool can
+   grow. When it cannot and every helper is in such a call, main does, the one
+   worker left, and the thread is pinned here. */
+static sp_thread *sched_pass_stranded(void) {
+  if (!SP_ATOMIC_LOAD(&g_lrq_unstarted, __ATOMIC_SEQ_CST)) return NULL;
+  int before = g_helpers_spawned;
+  sp_sched_maybe_grow();
+  if (g_helpers_spawned > before) return NULL;
+  for (int i = 1; i < sp_active_workers; i++)
+    if (SP_ATOMIC_LOAD(&g_native_out[i], __ATOMIC_RELAXED) != SP_OUT_NATIVE) return NULL;
+  return sched_pick(sp_worker_id);
+}
+#endif
+
 /* One round-robin sweep for Thread.pass from the main thread: give each thread
    that is runnable *right now* exactly one timeslice, then return to main.
    Threads that re-queue themselves (their own Thread.pass) during the sweep land
@@ -3188,7 +3315,7 @@ static void sp_sched_pass(void) {
   (void)nrun;
 #ifdef SP_EV_BACKEND
   /* Main's own readiness set holds the I/O of the threads pinned to main's
-     worker (a thread that first ran in one of these sweeps is), and only a
+     worker (one that first ran in a sweep with no helper is), and only a
      drain of it readies them. The pump drains it; a Thread.pass loop did not,
      so main spinning on Thread.pass until such a thread got a connection
      spun for good. A drain is a few syscalls (about 12 us on Darwin), and a
@@ -3202,7 +3329,20 @@ static void sp_sched_pass(void) {
   }
 #endif
   while (n-- > 0) {
-    sp_thread *t = sched_pick(sp_worker_id);
+    sp_thread *t;
+#ifdef SP_THREADS
+    /* With helpers main starts no thread, as in its pump: a thread that first
+       runs here is pinned to main's worker, and stands still whenever main is
+       in a blocking C call, for as long as that call lasts. A thread spawned
+       just before the Thread.pass found the new helper not up yet, so it took
+       that road every time. */
+    if (sp_active_workers > 1) {
+      RQ_LOCK(0); t = runq_pop_pinned(&g_lrq[0]); RQ_UNLOCK(0);
+      if (!t) t = sched_pass_stranded();
+    }
+    else
+#endif
+    t = sched_pick(sp_worker_id);
     if (!t) return;
     run_thread_once(t);
   }
@@ -3343,7 +3483,12 @@ static void sp_thread_await(sp_thread *t) {
 /* CRuby: #join and #value re-raise the thread's unhandled exception in the
    joining thread. */
 static void sp_thread_reraise_if_exc(sp_thread *t) {
-  if (t->has_exc) sp_fiber_reraise(t->exc_cls, t->exc_msg, t->exc_obj);
+  if (!t->has_exc) return;
+  /* An exit this thread forwarded to main and main has not met yet is this
+     same exception: raised from the slot it goes once, and a later wait does
+     not raise it again. A later join finds the slot empty and re-raises. */
+  sp_fiber_fire_inject_if_pending();
+  sp_fiber_reraise(t->exc_cls, t->exc_msg, t->exc_obj);
 }
 
 sp_thread *sp_Thread_join(sp_thread *t) {
@@ -3994,11 +4139,11 @@ static int sp_sched_sleep_park(double seconds) {
   else {
     /* Same exception-context snapshot as sp_sched_block: the symmetric transfer
        clobbers our handler stack on resume. */
-    void *exc_snap = sp_exc_ctx_new();
+    void *exc_snap = sp_snap_take();
     sp_exc_ctx_save(exc_snap);
     sp_sched_switch_out();
     sp_exc_ctx_load(exc_snap);
-    sp_exc_ctx_free(exc_snap);
+    sp_snap_give(exc_snap);
     SP_ATOMIC_STORE(&self->wait_timer, 0, __ATOMIC_RELEASE);
     NTIMED_DEC();   /* running again */
     woken = self->woken;
@@ -4189,11 +4334,11 @@ static int sp_sched_wait_io_impl(int fd, short events, struct pollfd *set, int n
     else {
       /* Same exception-context snapshot as sp_sched_block/sleep: the symmetric
          transfer clobbers our handler stack on resume. */
-      void *exc_snap = sp_exc_ctx_new();
+      void *exc_snap = sp_snap_take();
       sp_exc_ctx_save(exc_snap);
       sp_sched_switch_out();
       sp_exc_ctx_load(exc_snap);
-      sp_exc_ctx_free(exc_snap);
+      sp_snap_give(exc_snap);
     }
     SP_ATOMIC_STORE(&self->wait_timer, 0, __ATOMIC_RELEASE);
     int rev = self->io_revents; self->io_revents = 0; self->io_fd = -1;
@@ -4260,12 +4405,12 @@ static int sp_sched_wait_io_impl(int fd, short events, struct pollfd *set, int n
   }
   /* Same exception-context snapshot as sp_sched_block/sleep: the symmetric
      transfer clobbers our handler stack on resume. */
-  void *exc_snap = sp_exc_ctx_new();
+  void *exc_snap = sp_snap_take();
   sp_exc_ctx_save(exc_snap);
   SCHED_UNLOCK();
   sp_sched_switch_out();
   sp_exc_ctx_load(exc_snap);
-  sp_exc_ctx_free(exc_snap);
+  sp_snap_give(exc_snap);
   SP_ATOMIC_STORE(&self->wait_timer, 0, __ATOMIC_RELEASE);
     int rev = self->io_revents; self->io_revents = 0; self->io_fd = -1;
   /* the set entries are off every list (whoever unparked us dropped them);
@@ -4295,26 +4440,29 @@ int sp_sched_wait_io_set(struct pollfd *set, int n, double timeout_s) {
    lock, for as long as there is some (PRE/POST: the scheduler lock NOT held).
    A thread taken off the queue stays counted runnable until run_thread_once
    counts it running, in one change (runq_take): main's pump reads both to
-   decide that nothing can wake it. Every 61st pick, and when a
-   descriptor of a thread pinned here is ready, it returns for one turn of the
-   locked loop, which drains this worker's readiness set and gives the global
-   queue its turn. Answers SP_LOCAL_TURN then, and otherwise whether it ran
-   anything. */
+   decide that nothing can wake it. Every 61st pick, after a thread that
+   ran out its quantum, and when a descriptor of a thread pinned here is
+   ready, it returns for one turn of the locked loop, which drains this
+   worker's readiness set and gives the global queue its turn. Answers
+   SP_LOCAL_TURN then, and otherwise whether it ran anything. */
 #define SP_LOCAL_TURN 2
 static int sp_worker_run_local(int wid) {
   RQ_LOCK(wid); sp_thread *ft = runq_take(&g_lrq[wid]); RQ_UNLOCK(wid);
   int ran = ft != NULL;
   while (ft) {
     g_run_taken = 1;
+    g_run_preempted = 0;
     run_thread_once(ft);
     ft = NULL;
     if (SP_ATOMIC_LOAD(&g_stw_active, __ATOMIC_SEQ_CST) || SP_ATOMIC_LOAD(&g_shutdown, __ATOMIC_RELAXED)) break;
     if ((++g_pick_tick % 61u) == 0) { ran = SP_LOCAL_TURN; break; }
+    if (g_run_preempted) { ran = SP_LOCAL_TURN; break; }
 #ifdef SP_EV_BACKEND
     /* the I/O of threads pinned here waits in this worker's own set; readying
        it takes only the worker's own lock (sp_ev_drain), so it is done here,
-       between threads, and what it readies lands on this worker's queue */
-    if (g_wslot[wid].evfd > 0) (void)sp_ev_drain(wid);
+       between threads, when it is due (sp_ev_drain_due), and what it readies
+       lands on this worker's queue */
+    if (g_wslot[wid].evfd > 0 && sp_ev_drain_due(wid)) (void)sp_ev_drain(wid);
 #endif
     RQ_LOCK(wid); ft = runq_take(&g_lrq[wid]); RQ_UNLOCK(wid);
   }
@@ -4493,14 +4641,14 @@ static void *sp_worker_main(void *arg) {
     }
     locked_turn = 0;
 #ifdef SP_EV_BACKEND
-    /* Drain what is ready before picking, every turn. A worker with runnable
-       work never reaches the blocking wait below, and its OWN set is the only
-       place its parked threads are delivered from -- so without this a busy
-       worker starves them until it happens to idle. That showed as a
-       ping-pong that ran at full speed on one worker and fell to a fifth of it
-       on four, run to run. One zero-timeout wait per scheduling turn is what
-       every netpoll scheduler pays for the same reason. */
-    if (g_wslot[wid].evfd > 0) sp_ev_worker_wait(wid, 0);
+    /* Drain what is ready before picking, when it is due (sp_ev_drain_due:
+       with nothing queued here, and otherwise every few threads or a
+       millisecond). A worker with runnable work never reaches the blocking
+       wait below, and its OWN set is the only place its parked threads are
+       delivered from -- so without this a busy worker starves them until it
+       happens to idle. That showed as a ping-pong that ran at full speed on
+       one worker and fell to a fifth of it on four, run to run. */
+    if (g_wslot[wid].evfd > 0 && sp_ev_drain_due(wid)) sp_ev_worker_wait(wid, 0);
 #endif
     sp_thread *t = sched_pick(wid);   /* own queue, then global, then steal */
     if (t) { run_thread_once(t); continue; }  /* run_thread_once signals quiescence on the last one */
@@ -4719,6 +4867,17 @@ static void sp_sched_report_stats(void) {
 #endif
 }
 
+/* main() is finishing and has at_exit hooks to run: the same turn for the
+   remaining runnable threads, with the helpers left up. A hook runs as CRuby's
+   does, while the program's threads are alive, and a thread it starts needs a
+   worker; sp_sched_drain ends them once the hooks are done. */
+void sp_sched_drain_runnable(void) {
+  if (g_current != &g_main_thread) return;
+  SCHED_LOCK();
+  sp_sched_pump(NULL, 2);
+  SCHED_UNLOCK();
+}
+
 void sp_sched_drain(void) {
   /* main() is finishing: run remaining runnable threads so fire-and-forget side
      effects happen, then shut the helper workers down. Only the main thread
@@ -4802,13 +4961,13 @@ static void sp_sched_block(sp_thread **waitlist, int defer_inject) {   /* PRE/PO
        handler stack when root resumes from the block, so snapshot it here and
        restore it on wake -- otherwise a #raise/#kill delivered while blocked
        would find an empty handler stack and escape unhandled. */
-    void *exc_snap = sp_exc_ctx_new();
+    void *exc_snap = sp_snap_take();
     sp_exc_ctx_save(exc_snap);
     if (defer_inject) sp_fiber_defer_inject();
     SCHED_UNLOCK();   /* drop the lock across the transfer (we run no metadata while parked) */
     sp_sched_switch_out();
     sp_exc_ctx_load(exc_snap);
-    sp_exc_ctx_free(exc_snap);
+    sp_snap_give(exc_snap);
     /* resumed: a pending #kill/#raise fires here, in this thread's context (lock
        not held), so its ensure/rescue blocks unwind on its own stack. On the
        normal resume we re-take the lock so the caller continues holding it. */
@@ -4871,12 +5030,12 @@ static void sp_sched_block_wl(sp_thread **waitlist, sp_wlock *wl, int defer_inje
     sp_fiber_fire_inject_if_pending();   /* a #raise that woke main */
   }
   else {
-    void *exc_snap = sp_exc_ctx_new();
+    void *exc_snap = sp_snap_take();
     sp_exc_ctx_save(exc_snap);
     if (defer_inject) sp_fiber_defer_inject();
     sp_sched_switch_out();
     sp_exc_ctx_load(exc_snap);
-    sp_exc_ctx_free(exc_snap);
+    sp_snap_give(exc_snap);
     sp_fiber_fire_inject_if_pending();
   }
   wl_lock(wl);
@@ -4973,12 +5132,12 @@ static int sp_sched_block_timeout(sp_thread **waitlist, double deadline, sp_mute
     else sp_fiber_fire_inject_if_pending();
   }
   else {
-    void *exc_snap = sp_exc_ctx_new();
+    void *exc_snap = sp_snap_take();
     sp_exc_ctx_save(exc_snap);
     if (mutex) sp_fiber_defer_inject();
     sp_sched_switch_out();
     sp_exc_ctx_load(exc_snap);
-    sp_exc_ctx_free(exc_snap);
+    sp_snap_give(exc_snap);
     SP_ATOMIC_STORE(&self->wait_timer, 0, __ATOMIC_RELEASE);
     NTIMED_DEC();   /* running again */
     if (!mutex) sp_fiber_fire_inject_if_pending();
@@ -5090,6 +5249,21 @@ static void sp_sched_timer_expire(const sp_tm_ent *timer, double now) {
 }
 #endif
 
+/* Queue a raise on the root fiber main runs on and wake a main parked in a
+   wait; the scheduler lock is held. The slot holds one, and an exit keeps it:
+   a raise taking its place could be rescued, and main would go on as if nothing
+   had ended it. */
+static void sp_thread_raise_main_locked(const char *cls, const char *msg, void *obj) {
+  sp_thread *t = &g_main_thread;
+  if (!g_main_root) return;
+  sp_fiber_set_raise_inject_behind_exit(g_main_root, cls, msg, obj);
+  if (SP_TH_STATE(t) == SP_TH_BLOCKED) {
+    sp_sched_unpark(t);
+    SP_TH_SET_STATE(t, SP_TH_RUNNABLE);
+  }
+  SCHED_WAKE_MAIN();   /* a joining main pumps without being BLOCKED */
+}
+
 /* #kill / #raise: deliver an inject to the target so it terminates (running its
    ensures) or raises. The current thread acts on itself immediately; another
    thread gets the inject queued on its fiber and is made runnable, so the inject
@@ -5111,14 +5285,7 @@ static void sp_thread_deliver(sp_thread *t, int is_kill,
      to fill then deadlocked. #kill of main is still a no-op: CRuby ends the
      process for it (see the Thread row in docs/limitations.md). */
   if (t == &g_main_thread) {
-    if (!is_kill && g_main_root) {
-      sp_fiber_set_raise_inject(g_main_root, cls, msg, obj);
-      if (SP_TH_STATE(t) == SP_TH_BLOCKED) {
-        sp_sched_unpark(t);
-        SP_TH_SET_STATE(t, SP_TH_RUNNABLE);
-      }
-      SCHED_WAKE_MAIN();   /* a joining main pumps without being BLOCKED */
-    }
+    if (!is_kill) sp_thread_raise_main_locked(cls, msg, obj);
     SCHED_UNLOCK();
     return;
   }

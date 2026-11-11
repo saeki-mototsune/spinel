@@ -1,0 +1,24 @@
+Time
+Stamp
+0
+0
+[Stamp, Time]
+[5, 5]
+[Time, Stamp]
+2
+4
+1
+nil
+9
+NoMethodError
+1
+arg
+"undefined method 'at' for class Integer"
+arg2
+"undefined method 'at' for class Integer"
+a1
+kw
+dsplat
+"undefined method 'at' for class Integer"
+abcdefghijklmnopq
+"undefined method 'at' for class Integer"

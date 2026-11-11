@@ -55,7 +55,7 @@ static const PolyFace ty_poly_face_tbl[] = {
      An Array owns bsearch too: a row for the name decides every receiver
      kind, so leaving it out made a boxed Array's bsearch a NoMethodError.
      A String Range's bsearch is its TypeError, raised by its own row. */
-  {"step", PF_RANGE | PF_FRANGE | PF_SRANGE, 0, 1, 1},
+  {"step", PF_RANGE | PF_FRANGE | PF_SRANGE | PF_TRANGE, 0, 1, 1},
   {"bsearch", PF_ARRAY | PF_RANGE | PF_FRANGE | PF_SRANGE, 0, 0, 1},
   /* bsearch_index with a block is Array's alone (a Range has none) */
   {"bsearch_index", PF_ARRAY, 0, 0, 1},
@@ -80,7 +80,7 @@ static const PolyFace ty_poly_face_tbl[] = {
   /* and the Enumerable names that had no arm at all */
   {"grep", PF_ENUM, 1, 1, -1}, {"minmax_by", PF_ENUM, 0, 0, 1},
   /* The String mutators String alone owns. */
-  {"setbyte", PF_STRING | PF_MUT, 2, 2, 0}, {"scrub!", PF_STRING | PF_MUT | PF_VAL_SELF | PF_SAME_OK, 0, 1, -1},
+  {"setbyte", PF_STRING | PF_MUT, 2, 2, 0}, {"scrub!", PF_STRING | PF_MUT | PF_VAL_SELF | PF_SAME_OK | PF_STR_TYPED | PF_STR_SELF, 0, 1, -1},
   {"bytesplice", PF_STRING | PF_MUT | PF_VAL_SELF | PF_ENC, 2, 5, 0}, {"append_as_bytes", PF_STRING | PF_MUT | PF_VAL_SELF, 0, -1, 0},
   /* The names String and Array share: the receiver's run-time kind picks
      the arm. concat's arguments are of the receiver's own kind in CRuby
@@ -88,7 +88,7 @@ static const PolyFace ty_poly_face_tbl[] = {
      inference has typed as the other kind rules that arm out. */
   {"concat", PF_STRING | PF_MUT | PF_ARGS_OWN | PF_VAL_SELF, 0, -1, 0}, {"concat", PF_ARRAY | PF_MUT | PF_VAL_SELF | PF_ARGS_OWN, 0, -1, 0},
   {"prepend", PF_STRING | PF_MUT | PF_ARGS_OWN | PF_VAL_SELF, 0, -1, 0}, {"prepend", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, -1, 0},
-  {"reverse!", PF_STRING | PF_MUT | PF_VAL_SELF, 0, 0, 0}, {"reverse!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, 0},
+  {"reverse!", PF_STRING | PF_MUT | PF_VAL_SELF | PF_STR_TYPED | PF_STR_SELF, 0, 0, 0}, {"reverse!", PF_ARRAY | PF_MUT | PF_VAL_SELF, 0, 0, 0},
   {"slice!", PF_STRING | PF_MUT, 1, 2, 0}, {"slice!", PF_ARRAY | PF_MUT, 1, 2, 0},
   /* The Hash mutators, on a Hash at run time; a typed variant takes the
      result back from the general copy it was normalized to, and the value is
@@ -140,6 +140,21 @@ static const PolyFace ty_poly_face_tbl[] = {
   {"collect_concat", PF_HASH | PF_LAST, 0, -1, -1}, {"none?", PF_HASH | PF_LAST, 0, -1, -1}, {"one?", PF_HASH | PF_LAST, 0, -1, -1},
   /* the readers of a hash's default, and deconstruct_keys */
   {"deconstruct_keys", PF_HASH | PF_LAST, 0, -1, -1}, {"default", PF_HASH | PF_LAST, 0, -1, -1}, {"default_proc", PF_HASH | PF_LAST, 0, -1, -1},
+  /* The zero-argument forms of names whose boxed arms were written for one
+     argument or more: the typed emitter of each owner answers them, so a
+     row sends the box there (a Hash's merge, an Array's values_at / union /
+     difference / intersection / zip, the blockless index family and
+     sort_by, slice, the String's start_with? / end_with? / dedup / encode!). */
+  {"merge", PF_HASH, 0, 0, -1},
+  {"values_at", PF_ARRAY, 0, 0, 0}, {"values_at", PF_HASH, 0, 0, 0},
+  {"union", PF_ARRAY, 0, 0, 0}, {"difference", PF_ARRAY, 0, 0, 0}, {"intersection", PF_ARRAY, 0, 0, 0},
+  {"zip", PF_ARRAY | PF_HASH | PF_RANGE, 0, 0, 0},
+  {"index", PF_ARRAY | PF_STRING, 0, 0, 0}, {"rindex", PF_ARRAY | PF_STRING, 0, 0, 0},
+  {"find_index", PF_ARRAY | PF_HASH, 0, 0, 0}, {"bsearch", PF_ARRAY, 0, 0, 0},
+  {"sort_by", PF_ARRAY | PF_HASH | PF_RANGE, 0, 0, 0},
+  {"slice", PF_ARRAY | PF_STRING | PF_HASH, 0, 0, 0},
+  {"start_with?", PF_STRING, 0, 0, 0}, {"end_with?", PF_STRING, 0, 0, 0},
+  {"dedup", PF_STRING, 0, 0, 0}, {"encode!", PF_STRING | PF_MUT | PF_VAL_SELF, 0, 0, 0},
   {0, 0, 0, 0, 0}
 };
 static int face_row_matches(const PolyFace *r, int argc, int has_blk, int plain) {
@@ -177,12 +192,14 @@ unsigned ty_str_bang_flags(const char *name) {
   return 0;
 }
 unsigned ty_str_typed_bang_flags(const char *name) {
-  unsigned fl = ty_str_bang_flags(name);
-  /* reverse! is a String bang too, answering self, but its face rows are
-     the mutator kind's (PF_MUT | PF_VAL_SELF): Array has it as well, so a
-     boxed receiver's reverse! is either, and answers poly */
-  if (!fl && name && sp_streq(name, "reverse!")) fl = PF_STR_BANG | PF_STR_SELF;
-  return fl;
+  if (!name) return 0;
+  /* reverse! and scrub! are String bangs too, answering self, but their
+     face rows are the mutator kind's (PF_MUT | PF_VAL_SELF): Array has
+     reverse! as well, so a boxed receiver's is either, and answers poly */
+  for (const PolyFace *r = ty_poly_face_tbl; r->name; r++)
+    if ((r->flags & (PF_STR_BANG | PF_STR_TYPED)) && sp_streq(name, r->name))
+      return PF_STR_BANG | (r->flags & (PF_STR_SELF | PF_SAME_OK));
+  return 0;
 }
 void str_bang_plain(const char *bang, char *out, int n) {
   size_t len = bang ? strlen(bang) : 0;
@@ -244,6 +261,8 @@ const char *ty_name(TyKind t) {
     case TY_ADDRINFO: return "addrinfo";
     case TY_SOCKOPT: return "sockopt";
     case TY_STR_RANGE: return "str_range";
+    case TY_TIME_RANGE: return "time_range";
+    case TY_OBJ_RANGE: return "obj_range";
     case TY_TMS:     return "tms";
     case TY_PROCESS_STATUS: return "process_status";
     case TY_OPENSTRUCT: return "openstruct";
@@ -308,7 +327,7 @@ int ty_never_callable(TyKind t) {
          t == TY_COMPLEX || t == TY_STRING || t == TY_STRBUF ||
          t == TY_SYMBOL || t == TY_BOOL ||
          t == TY_NIL || t == TY_RANGE || t == TY_FLOAT_RANGE ||
-         t == TY_STR_RANGE || t == TY_REGEX || t == TY_TIME ||
+         t == TY_STR_RANGE || t == TY_TIME_RANGE || t == TY_OBJ_RANGE || t == TY_REGEX || t == TY_TIME ||
          t == TY_MATCHDATA || t == TY_EXCEPTION || t == TY_IO ||
          t == TY_ENUMERATOR || ty_is_array(t) || ty_is_obj_array(t) ||
          ty_is_hash(t);
@@ -466,7 +485,14 @@ static int bop_result_fallback_allowed(const char *name) {
             alongside it. A String site mixed with Array ones compiles now,
             but on a literal still hits #2332's frozen-literal limitation at
             runtime, same as every other mutator this family has fixed. */
-         !strcmp(name, "slice!");
+         !strcmp(name, "slice!") ||
+         /* K-036: rotate!(n) -- its own row is BOPR_SELF for a plain Array
+            at every argc (0..127, same row as the 0-arg form yield_site_
+            listed now answers), but the 0-arg form's success does not
+            reach this argc>=1 allowlist on its own; verified with its own
+            RED (differing-kind sites, raw C pointer-type error) then
+            GREEN test, same as every other name here. */
+         !strcmp(name, "rotate!");
 }
 /* Whether a yield site answers `name` on a receiver of kind recv from the
    builtin-op rows rather than from a rule of its own: 1 for a listed pair,
@@ -514,6 +540,18 @@ static int yield_site_listed(const char *name, TyKind recv) {
       !strcmp(name, "last") || !strcmp(name, "min") || !strcmp(name, "max") ||
       !strcmp(name, "pop"))
     return ty_recv_is_plain_array(recv);
+  /* rotate!: its own row is already BOPR_SELF for a plain Array (every
+     argc, unlike push/append/unshift below) -- never gated here before
+     (kilau K-036), so a bare `yield.rotate!` across differing Array-kind
+     sites failed to compile with a raw C pointer-type error, the same
+     shape minmax had in K-033. push/append/unshift are NOT listed here:
+     their row is TY_UNKNOWN on purpose (a direct, non-yield multi-arg
+     push of a mismatched-kind element, e.g. an IntArray's push("s"),
+     relies on that placeholder to answer poly rather than the receiver's
+     narrow kind -- confirmed by a real regression, test/
+     array_push_lift_splat.rb, when this fix first tried widening their
+     row to BOPR_SELF instead of adding a dedicated 0-arg arm below). */
+  if (!strcmp(name, "rotate!")) return ty_recv_is_plain_array(recv);
   /* first/shift's own row states a Hash kind too (the [key, value] pair --
      K-033/kilau), unlike min/max/uniq/minmax above, whose Hash row is a
      placeholder TY_UNKNOWN (bop_result below declines it, so listing Hash
@@ -610,6 +648,21 @@ int ty_recv_builtin_result(const char *name, int argc, TyKind arg0, TyKind arg1,
       TyKind r = op ? bop_result(op, recv) : TY_UNKNOWN;
       if (r == TY_UNKNOWN) return 0;
       *out = r; if (row) *row = op;
+      return 1;
+    }
+    /* 0-arg push/append/unshift: each answers self (CRuby's own no-op
+       push/append/unshift of nothing). Answered here by name, bypassing
+       the row entirely -- their shared bop_rows row states TY_UNKNOWN on
+       purpose, read by a direct (non-yield) multi-arg call of a
+       mismatched-kind element (an IntArray's push("s")) to fall through
+       to a poly answer there; widening that row to BOPR_SELF for this
+       fix instead regressed test/array_push_lift_splat.rb, a real,
+       unrelated direct call, so this arm leaves the row untouched and
+       only ever answers the plain-Array 0-arg yield-receiver case
+       (kilau K-036). */
+    if (ty_recv_is_plain_array(recv) &&
+        (!strcmp(name, "push") || !strcmp(name, "append") || !strcmp(name, "unshift"))) {
+      *out = recv;
       return 1;
     }
     /* succ: a String or Symbol site always answers its own kind (String's
@@ -1019,7 +1072,7 @@ int ty_object_protocol_family(TyKind t) {
   if (t == TY_STRING || t == TY_STRBUF) return 2;
   if (ty_is_array(t) || ty_is_obj_array(t)) return 3;
   if (ty_is_hash(t)) return 4;
-  if (t == TY_RANGE || t == TY_FLOAT_RANGE || t == TY_STR_RANGE) return 5;
+  if (t == TY_RANGE || t == TY_FLOAT_RANGE || t == TY_STR_RANGE || t == TY_TIME_RANGE || t == TY_OBJ_RANGE) return 5;
   return 100 + (int)t;
 }
 
@@ -1080,7 +1133,7 @@ int g_traits_promote = 0;
 const TyTraits ty_traits_promote_rational = {
   "sp_Rational", "(sp_Rational){0}", "(sp_Rational){0}", NULL, "sp_promote_rat_box", NULL,
   "sp_promote_rat_box($e)", NULL, NULL, "(*(sp_Rational *)($e).v.p)", "(*(sp_Rational *)($e).v.p)",
-  NULL, NULL, NULL, NULL, 0, 0, 1, 1, 3, 10 };
+  NULL, NULL, NULL, NULL, 0, 0, 1, 1, 3, 10, NULL, 0 };
 
 /* A builtin value's type, which lays out no instance variables: a String,
    a number, true, false, nil, a Symbol, a Range (of any endpoints), a Random,
@@ -1088,7 +1141,7 @@ const TyTraits ty_traits_promote_rational = {
 int ty_builtin_ivar_less(TyKind t) {
   return t == TY_STRING || t == TY_STRBUF || t == TY_INT || t == TY_FLOAT || t == TY_BOOL || t == TY_NIL ||
          t == TY_SYMBOL || t == TY_BIGINT || t == TY_RANGE || t == TY_FLOAT_RANGE || t == TY_STR_RANGE ||
-         t == TY_RANDOM || ty_is_array(t) || ty_is_hash(t);
+         t == TY_TIME_RANGE || t == TY_OBJ_RANGE || t == TY_RANDOM || ty_is_array(t) || ty_is_hash(t);
 }
 
 /* Of those, the values whose identity Spinel keeps, so the runtime's map can

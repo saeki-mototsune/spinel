@@ -190,20 +190,19 @@ int sp_str_stress_checked = 0;
 const char sp_str_empty_data[] = "\xff";
 /* nil.to_s, true.to_s and false.to_s answer FROZEN Strings in CRuby: a
    header-carrying static object marked 0xf1, as a frozen literal is */
-#ifdef SP_ONE_STRING
-/* ...with the handle slot a generated literal has (sp_StringLiteral: the
-   handle, then the next slot; the header links it, tagged), so each of them
-   is one String object wherever it is boxed or held, as CRuby's is */
-static struct { void *value, *next; } sp_fz_empty_l, sp_fz_true_l, sp_fz_false_l;
-#define SP_FZ_LINK(l) ((sp_str_hdr *)((char *)&(l) + 1))
-#else
-#define SP_FZ_LINK(l) NULL
-#endif
+/* ...each one String object, as a generated literal is (sp_StringLiteral:
+   the header links to the static handle, tagged), so each of them is one
+   object wherever it is boxed or held, as CRuby's is */
+static sp_StringLiteral sp_fz_empty_l, sp_fz_true_l, sp_fz_false_l;
+#define SP_FZ_LINK(l) ((sp_str_hdr *)((char *)&(l).s + 1))
 /* the link Symbol#to_s's String carries in its header (sp_str_is_sym_name) */
 const sp_str_hdr sp_sym_str_tag = { NULL, 0, 0, 0 };
 static struct { sp_str_hdr h; unsigned char m; char d[1]; } sp_fz_empty_s = { { SP_FZ_LINK(sp_fz_empty_l), 1 | SP_STR_SIZE_ASCII7, 0, 0 }, 0xf1, "" };
 static struct { sp_str_hdr h; unsigned char m; char d[5]; } sp_fz_true_s = { { SP_FZ_LINK(sp_fz_true_l), 5 | SP_STR_SIZE_ASCII7, 4, 0 }, 0xf1, "true" };
 static struct { sp_str_hdr h; unsigned char m; char d[6]; } sp_fz_false_s = { { SP_FZ_LINK(sp_fz_false_l), 6 | SP_STR_SIZE_ASCII7, 5, 0 }, 0xf1, "false" };
+static sp_StringLiteral sp_fz_empty_l = SP_STRING_LITERAL_INIT(sp_fz_empty_l, sp_fz_empty_s.d, 0);
+static sp_StringLiteral sp_fz_true_l = SP_STRING_LITERAL_INIT(sp_fz_true_l, sp_fz_true_s.d, 4);
+static sp_StringLiteral sp_fz_false_l = SP_STRING_LITERAL_INIT(sp_fz_false_l, sp_fz_false_s.d, 5);
 const char *const sp_str_frozen_empty = sp_fz_empty_s.d;
 const char *const sp_str_frozen_true = sp_fz_true_s.d;
 const char *const sp_str_frozen_false = sp_fz_false_s.d;
@@ -725,6 +724,17 @@ static void sp_str_retune(size_t before, size_t promoted) {
    variants, -DSP_GC_NONE) names the collector nowhere: this definition
    agrees with the program's, which is the strong one. */
 SP_WEAK void (*sp_gc_collect_fn)(void) = NULL;
+#elif defined(_WIN32)
+/* Not weak on Windows. A COFF weak definition is a weak external whose
+   default lives in its own section, and MinGW ld's --gc-sections drops that
+   section (the references name the weak external, not the section): the
+   pointer was left undefined, its 0 relocated by the ASLR delta into a
+   non-NULL garbage address, and the first collection faulted on it -- under
+   the runtime's SIGSEGV emulation, the same fault over and over, a hang.
+   Nothing needs it weak here: a --gc=none program links the _nogc archive
+   (the branch above), and the C extension archives that a --gc=none
+   program would share are not built for Windows. */
+void (*sp_gc_collect_fn)(void) = sp_gc_collect;
 #else
 SP_WEAK void (*sp_gc_collect_fn)(void) = sp_gc_collect;
 #endif
@@ -739,11 +749,6 @@ void sp_gc_collect_retune(void) {
   if (!sp_gc_collect_installed()) return;
   sp_gc_collect_fn();
   sp_gc_enforce_mem_limit();
-}
-void sp_str_collect_retune(void) {
-  /* the gated sweep hook inside sp_gc_collect retunes the string threshold */
-  if (!sp_gc_collect_installed()) return;
-  sp_gc_collect_fn();
 }
 void sp_gc_collect_retune_all(void) {
   if (!sp_gc_collect_installed()) return;
@@ -779,6 +784,13 @@ int sp_gc_collection_wanted(void) {
 /* sp_gc_alloc lives in lib/sp_slab.c: the allocation fast path is one
    function there, the slab's claim and the collector's bookkeeping in one
    frame. */
+/* The safe points' flag (a loop's back-edge, a method's entry: the signals'
+   sp_sig_pending_flag, read by lib/sp_cold.c's polls) and the collection
+   asked of them. Defined here, which every runtime links, so asking needs
+   nothing of sp_cold.o: a weak reference to a function there pulled
+   sp_cold.o, and what it needs, into a C extension's link on macOS. */
+volatile int sp_sig_pending_flag;
+volatile int sp_gc_poll_due;
 void *sp_gc_alloc_nogc(size_t sz, void (*fin)(void *), void (*scn)(void *)) {
   size_t need = sizeof(sp_gc_hdr) + sz;
   sp_gc_hdr *h = (sp_gc_hdr *)sp_slab_alloc(need);
@@ -788,7 +800,29 @@ void *sp_gc_alloc_nogc(size_t sz, void (*fin)(void *), void (*scn)(void *)) {
   SP_HEAP_LOCK();
   SP_GC_HEAP_PUSH(h); sp_gc_bytes_add(need);
   SP_HEAP_UNLOCK();
+#ifndef SP_GC_NONE
+  /* A collection this allocation may not run (a Bignum operation's
+     operands are temporaries nothing roots) is asked of the next safe point
+     the program has, a loop's back-edge or a method's entry: a loop whose
+     only allocations come this way (`s = (s * 75 + 74) % m`) otherwise never
+     collected, and its memory grew with its round count (#11106). */
+  if (SP_GC_CTR_GET(sp_gc_bytes) > SP_GC_CTR_GET(sp_gc_threshold) && !sp_gc_poll_due) {
+    sp_gc_poll_due = 1;
+    SP_ATOMIC_STORE(&sp_sig_pending_flag, 1, __ATOMIC_RELEASE);
+  }
+#endif
   return (char *)h + sizeof(sp_gc_hdr);
+}
+/* The collection a safe point runs for sp_gc_alloc_nogc (sp_gc_poll_due):
+   the one an allocation would have run, if it is still due */
+void sp_gc_poll_collect(void) {
+#ifndef SP_GC_NONE
+#ifdef SP_THREADS
+  if (SP_GC_CTR_GET(sp_gc_bytes) > SP_GC_CTR_GET(sp_gc_threshold)) sp_stw_collect();
+#else
+  if (SP_GC_CTR_GET(sp_gc_bytes) > SP_GC_CTR_GET(sp_gc_threshold)) sp_gc_collect_retune();
+#endif
+#endif
 }
 
 SP_TLS struct sp_str_lcache_entry sp_str_lcache[SP_STR_LCACHE_SIZE];
@@ -1273,6 +1307,7 @@ const char *sp_float_to_s(sp_float f) {
   out[o]=0;sp_str_set_len(out,(size_t)o);return out;
 }
 
+#ifndef SP_NO_ALLOC_REPORT
 /* ---- SPINEL_ALLOC_REPORT: deterministic allocation counters (#1336) ----
    Env-var gated (set to 1 or an output path); zero work when off beyond one
    predictable branch at each allocation entry point. Counters key on the
@@ -1822,3 +1857,4 @@ SP_CONSTRUCTOR static void sp_alloc_report_boot(void) {
     atexit(sp_alloc_report_dump);
   }
 }
+#endif /* !SP_NO_ALLOC_REPORT */

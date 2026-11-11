@@ -221,9 +221,9 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
      these; only the dispatch was missing). FileTest shares File's predicate
      surface (#2819). */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_str(nt, recv, "name") &&
-      (sp_streq(nt_str(nt, recv, "name"), "File") ||
-       sp_streq(nt_str(nt, recv, "name"), "FileTest"))) {
+      nt_key_name(nt, recv) &&
+      (sp_streq(nt_key_name(nt, recv), "File") ||
+       sp_streq(nt_key_name(nt, recv), "FileTest"))) {
     if ((sp_streq(name, "basename") || sp_streq(name, "dirname") || sp_streq(name, "extname")) && argc == 1) {
       /* the path argument must reach sp_file_* as a const char*; emit_path_expr
          coerces a poly / nullable-string path so it does not pass an sp_RbVal
@@ -378,31 +378,62 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       buf_puts(b, "sp_file_truncate("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
       emit_int_expr(c, argv[1], b); buf_puts(b, ")"); return 1;
     }
-    /* File.write(path, str, offset) / File.write(path, str, mode: "a", perm: 0o600) (#2782) */
-    if ((sp_streq(name, "write") || sp_streq(name, "binwrite")) && argc == 3) {
-      NodeKind k3_k = nt_kind(nt, argv[2]);
-      if (k3_k == NK_KeywordHashNode) {
-        int mv = struct_kwarg_value(c, argv[2], "mode");
-        int pv = struct_kwarg_value(c, argv[2], "perm");
-        if (pv >= 0) {
-          buf_puts(b, "sp_file_write_perm("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
-          emit_to_s_expr(c, argv[1], b); buf_puts(b, ", ");
-          if (mv >= 0) emit_str_expr(c, mv, b); else buf_puts(b, "\"w\"");
-          buf_puts(b, ", ");
-          if (comp_ntype(c, pv) == TY_NIL) { buf_puts(b, "({ (void)("); emit_expr_for_effect(c, pv, b); buf_puts(b, "); sp_oint_nil(); })"); }
-          else if (yield_site_type(c, pv) == TY_POLY) { buf_puts(b, "sp_poly_arg_perm("); emit_expr(c, pv, b); buf_puts(b, ")"); }
-          else emit_oint_expr(c, pv, TY_INT, b);
-          buf_puts(b, ")");
-          return 1;
-        }
-        if (mv >= 0) {
-          buf_puts(b, "sp_file_write_mode("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
-          emit_to_s_expr(c, argv[1], b); buf_puts(b, ", ");
-          emit_str_expr(c, mv, b); buf_puts(b, ")");
-          return 1;
+    /* File.write(path, str, [offset,] mode: "a", perm: 0o600, encoding: "UTF-8")
+       (#2782). An encoding the text already has (UTF-8, or BINARY, which
+       writes the same bytes) changes nothing, so the options hash is only
+       mode and perm. */
+    if ((sp_streq(name, "write") || sp_streq(name, "binwrite")) && (argc == 3 || argc == 4) &&
+        nt_kind(nt, argv[argc - 1]) == NK_KeywordHashNode) {
+      int kwh = argv[argc - 1];
+      int en = 0; const int *els = nt_arr(nt, kwh, "elements", &en);
+      int mv = -1, pv = -1;
+      for (int i = 0; i < en; i++) {
+        int k = nt_kind(nt, els[i]) == NK_AssocNode ? nt_ref(nt, els[i], "key") : -1;
+        int v = k >= 0 ? nt_ref(nt, els[i], "value") : -1;
+        const char *kn = k >= 0 && nt_kind(nt, k) == NK_SymbolNode ? nt_str(nt, k, "value") : NULL;
+        if (kn && sp_streq(kn, "mode")) mv = v;
+        else if (kn && sp_streq(kn, "perm")) pv = v;
+        else if (!kn || !(sp_streq(kn, "encoding") || sp_streq(kn, "external_encoding") ||
+                          sp_streq(kn, "internal_encoding")) ||
+                 kwh_enc_value(nt, v) == KWH_ENC_NONE) {
+          unsupported_feature(c, id, "File.write with options other than mode:, perm: "
+                              "and an encoding (UTF-8 or BINARY) is not supported");
         }
       }
-      else if (comp_ntype(c, argv[2]) == TY_NIL) {
+      /* a nil OFFSET is "no offset", as in the three-argument form: the
+         options then apply to a plain write */
+      int nil_off = argc == 4 && comp_ntype(c, argv[2]) == TY_NIL;
+      if (argc == 4 && !nil_off) {
+        if (mv >= 0 || pv >= 0)
+          unsupported_feature(c, id, "File.write with an offset and mode: or perm: is not supported");
+        buf_puts(b, "sp_file_write_at("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
+        emit_to_s_expr(c, argv[1], b); buf_puts(b, ", ");
+        emit_int_expr(c, argv[2], b); buf_puts(b, ")");
+        return 1;
+      }
+      if (nil_off) { buf_puts(b, "({ (void)("); emit_expr_for_effect(c, argv[2], b); buf_puts(b, "); "); }
+      if (pv >= 0) {
+        buf_puts(b, "sp_file_write_perm("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
+        emit_to_s_expr(c, argv[1], b); buf_puts(b, ", ");
+        if (mv >= 0) emit_str_expr(c, mv, b); else buf_puts(b, "\"w\"");
+        buf_puts(b, ", ");
+        if (comp_ntype(c, pv) == TY_NIL) { buf_puts(b, "({ (void)("); emit_expr_for_effect(c, pv, b); buf_puts(b, "); sp_oint_nil(); })"); }
+        else if (yield_site_type(c, pv) == TY_POLY) { buf_puts(b, "sp_poly_arg_perm("); emit_expr(c, pv, b); buf_puts(b, ")"); }
+        else emit_oint_expr(c, pv, TY_INT, b);
+        buf_puts(b, ")");
+      } else if (mv >= 0) {
+        buf_puts(b, "sp_file_write_mode("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
+        emit_to_s_expr(c, argv[1], b); buf_puts(b, ", ");
+        emit_str_expr(c, mv, b); buf_puts(b, ")");
+      } else {
+        buf_puts(b, "sp_file_write("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
+        emit_to_s_expr(c, argv[1], b); buf_puts(b, ")");
+      }
+      if (nil_off) buf_puts(b, "; })");
+      return 1;
+    }
+    if ((sp_streq(name, "write") || sp_streq(name, "binwrite")) && argc == 3) {
+      if (comp_ntype(c, argv[2]) == TY_NIL) {
         /* a nil OFFSET is "no offset" -- a plain truncating write, not a
            write at position 0 (which would keep the file's tail) */
         buf_puts(b, "({ (void)("); emit_expr_for_effect(c, argv[2], b);
@@ -775,7 +806,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
      for a value already typed String, so it costs nothing where inference
      succeeded. */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Dir")) {
+      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Dir")) {
     if (sp_streq(name, "for_fd") && argc == 1) {
       buf_puts(b, "sp_Dir_for_fd("); emit_int_expr(c, argv[0], b); buf_puts(b, ")");
       return 1;
@@ -948,7 +979,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
 
   /* Time class constructors */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Time")) {
+      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Time")) {
     if ((sp_streq(name, "now") || sp_streq(name, "new")) && argc == 0) { buf_puts(b, "sp_time_now()"); return 1; }
     /* Time.now(in: zone): the current instant in the zone the keyword names,
        read as Time.at's `in:` is. With no arm here the call fell through to
@@ -1252,7 +1283,7 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
 
   /* GC module methods */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "GC")) {
+      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "GC")) {
     if (sp_streq(name, "start") && argc == 0) { buf_puts(b, "(sp_gc_collect_request(), (sp_int)0)"); return 1; }
     /* GC.start(full_mark:, immediate_mark:, immediate_sweep:): one collector,
        one kind of collection -- the options are hints, their values
@@ -1322,7 +1353,7 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
 
   /* Process module methods */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Process")) {
+      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Process")) {
     if (sp_streq(name, "pid") && argc == 0) { buf_puts(b, "((sp_int)getpid())"); return 1; }
     if (sp_streq(name, "times") && argc == 0) { buf_puts(b, "sp_process_times()"); return 1; }
     if (sp_streq(name, "ppid") && argc == 0) { buf_puts(b, "sp_process_ppid()"); return 1; }
@@ -1399,7 +1430,7 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
 
   /* Integer.sqrt(n) -> integer square root (exact, Newton's method) */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Integer") &&
+      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Integer") &&
       sp_streq(name, "sqrt") && argc == 1) {
     if (repr_of(c, argv[0]).big) {
       buf_puts(b, "sp_bigint_isqrt("); emit_expr(c, argv[0], b); buf_puts(b, ")");  /* (#2420) */
@@ -1419,7 +1450,7 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
 
   /* Marshal (Phase 1): dump a value to a binary String, load one back as poly */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Marshal")) {
+      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Marshal")) {
     if (sp_streq(name, "dump") && argc == 1) {
       buf_puts(b, "sp_marshal_dump("); emit_boxed(c, argv[0], b); buf_puts(b, ")");
       return 1;
@@ -1457,7 +1488,7 @@ else {
      program can silence or re-enable a category at run time and Kernel#warn's
      `category:` gate reads the same flags. */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Warning")) {
+      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Warning")) {
     /* the category argument as a C string: a literal symbol becomes a string
        literal; a symbol-typed expression resolves through the symbol table */
     int cat_ok = argc >= 1 && nt_type(nt, argv[0]) &&
@@ -1492,7 +1523,7 @@ else {
 
   /* Math module functions -> C math.h equivalents */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Math")) {
+      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Math")) {
     /* 1-arg functions */
     /* Domain-restricted functions route through sp_math_* wrappers that
        raise Math::DomainError on out-of-domain input (CRuby parity); the
@@ -1635,7 +1666,7 @@ else {
 
   /* Dir.exist? -> directory test; Dir.exists? was removed in Ruby 4.0 (#2780) */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Dir") &&
+      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Dir") &&
       (is_exist_alias(name)) && argc == 1) {
     if (sp_streq(name, "exists?")) {
       buf_puts(b, "({ (void)("); emit_expr_for_effect(c, argv[0], b);
@@ -1676,11 +1707,50 @@ void emit_sock_family_arg(Compiler *c, int arg, int is_family, Buf *b) {
   buf_printf(b, ", %d)", is_family);
 }
 
+/* [end0, end1] of a socket pair: Socket.pair(domain, type[, protocol]), or
+   UNIXSocket.pair([type[, protocol]]) with AF_UNIX and SOCK_STREAM for an
+   argument it leaves out (`dom` / `type` -1). The two descriptors stay in
+   the call's own array until both handles exist. */
+static void emit_sock_pair(Compiler *c, int dom, int type, int proto, int is_unix, Buf *b) {
+  int tf = ++g_tmp, ta = ++g_tmp, tb = ++g_tmp, tp = ++g_tmp;
+  buf_printf(b, "({ int _t%d[2]; sp_sock_socketpair(", tf);
+  if (dom >= 0) emit_sock_family_arg(c, dom, 1, b); else buf_puts(b, "sp_sock_const(\"AF_UNIX\")");
+  buf_puts(b, ", ");
+  if (type >= 0) emit_sock_family_arg(c, type, 0, b); else buf_puts(b, "sp_sock_const(\"SOCK_STREAM\")");
+  buf_puts(b, ", ");
+  if (proto >= 0) emit_int_expr(c, proto, b); else buf_puts(b, "0");
+  buf_printf(b, ", _t%d); sp_File *_t%d = sp_sock_pair_handle(_t%d[0], %d); SP_GC_ROOT(_t%d);"
+                " sp_File *_t%d = sp_sock_pair_handle(_t%d[1], %d); SP_GC_ROOT(_t%d);"
+                " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
+                " sp_PolyArray_push(_t%d, sp_box_obj(_t%d, SP_BUILTIN_IO));"
+                " sp_PolyArray_push(_t%d, sp_box_obj(_t%d, SP_BUILTIN_IO)); _t%d; })",
+             tf, ta, tf, is_unix, ta, tb, tf, is_unix, tb, tp, tp, tp, ta, tp, tb, tp);
+}
+
+/* TCPSocket.new(host, port, connect_timeout: t): the connect that gives up
+   after t seconds. Host, port and t are evaluated once each, in the order
+   CRuby evaluates the arguments. t goes through its box: nil is no limit,
+   and anything else converts as a time interval does (a negative number,
+   or a value that is not a number, raises as CRuby's does). Returns 0 for
+   a call without the keyword, which emits nothing. */
+int emit_tcp_connect_timeout(Compiler *c, int argc, const int *argv, Buf *b) {
+  int kwh = argc >= 3 ? nt_argv_kwh(c->nt, argv, argc) : -1;
+  int tv = kwh >= 0 ? struct_kwarg_value(c, kwh, "connect_timeout") : -1;
+  if (tv < 0) return 0;
+  int th = ++g_tmp, tp = ++g_tmp, tt = ++g_tmp;
+  buf_printf(b, "({ const char *_t%d = ", th); emit_str_expr(c, argv[0], b);
+  buf_printf(b, "; SP_GC_ROOT_STR(_t%d); sp_int _t%d = ", th, tp); emit_int_expr(c, argv[1], b);
+  buf_printf(b, "; sp_RbVal _t%d = ", tt); emit_boxed(c, tv, b);
+  buf_printf(b, "; sp_sock_tcp_connect_timeout(_t%d, _t%d, _t%d.tag == SP_TAG_NIL ? -1.0 : sp_io_wait_interval(_t%d)); })",
+             th, tp, tt, tt);
+  return 1;
+}
+
 int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
   /* Thread class methods: Thread.current / Thread.pass (recv is the Thread
      constant). Handled before the Class.new dispatch since they are not `new`. */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode) {
-    const char *tcn = nt_str(nt, recv, "name");
+    const char *tcn = nt_key_name(nt, recv);
     /* IO.popen is not implemented: refused at compile time, as an
        unsupported API is, rather than a NoMethodError the first time the
        line runs (#7199). A program's own IO.popen is its own. */
@@ -1732,17 +1802,9 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
         return 1;
       }
     }
-    /* Exception class-level: Cls.exception(msg) is Cls.new (#2740);
-       Exception.to_tty? reports whether stderr is a terminal (#2757). */
-    if (tcn && is_exc_name(tcn)) {
-      if (sp_streq(name, "exception")) {
-        if (emit_syserr_family_new(c, id, tcn, argc, argv, b)) return 1;
-        emit_exc_new_msg(c, tcn, argc >= 1 ? argv[0] : -1, b);
-        return 1;
-      }
-      if (sp_streq(name, "to_tty?") && argc == 0) {
-        buf_puts(b, "(isatty(2) != 0)"); return 1;
-      }
+    /* Exception.to_tty? reports whether stderr is a terminal (#2757). */
+    if (tcn && is_exc_name(tcn) && sp_streq(name, "to_tty?") && argc == 0) {
+      buf_puts(b, "(isatty(2) != 0)"); return 1;
     }
     /* Addrinfo.tcp(host, port) / .udp(host, port) / .ip(host) / .unix(path) */
     if (tcn && sp_streq(tcn, "Addrinfo") && sp_feature_required("socket")) {
@@ -1808,6 +1870,16 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
         return 1;
       }
     }
+    /* UNIXSocket.pair / .socketpair([type[, protocol]]) -> two connected
+       UNIXSockets, as Socket.pair makes them with AF_UNIX */
+    if (tcn && sp_streq(tcn, "UNIXSocket") && sp_feature_required("socket") &&
+        is_socket_pair_alias(name) && argc <= 2 && nt_ref(nt, id, "block") < 0) {
+      int skc = comp_core_class(c, builtin_core_class_slot(tcn));
+      if (skc < 0 || call_target(c, id, skc, name, CT_CMETHOD, NULL) < 0) {
+        emit_sock_pair(c, -1, argc >= 1 ? argv[0] : -1, argc >= 2 ? argv[1] : -1, 1, b);
+        return 1;
+      }
+    }
     /* Socket class methods (#2922) */
     if (tcn && sp_streq(tcn, "Socket") && sp_feature_required("socket")) {
       if (sp_streq(name, "gethostname") && argc == 0) {
@@ -1831,19 +1903,9 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
         buf_puts(b, ")");
         return 1;
       }
-      /* Socket.pair / .socketpair -> [end0, end1]; the runtime creates both on
-         the first call and hands back the second on the next. */
+      /* Socket.pair / .socketpair -> [end0, end1] */
       if ((is_socket_pair_alias(name)) && argc >= 2) {
-        int tp0 = ++g_tmp, tp1 = ++g_tmp, tpa = ++g_tmp;
-        buf_printf(b, "({ sp_File *_t%d = sp_sock_pair_end(", tp0);
-        emit_sock_family_arg(c, argv[0], 1, b); buf_puts(b, ", ");
-        emit_sock_family_arg(c, argv[1], 0, b); buf_puts(b, ", ");
-        if (argc >= 3) emit_int_expr(c, argv[2], b); else buf_puts(b, "0");
-        buf_printf(b, ", 0); SP_GC_ROOT(_t%d); sp_File *_t%d = sp_sock_pair_end(0, 0, 0, 1);"
-                      " SP_GC_ROOT(_t%d); sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
-                      " sp_PolyArray_push(_t%d, sp_box_obj(_t%d, SP_BUILTIN_IO));"
-                      " sp_PolyArray_push(_t%d, sp_box_obj(_t%d, SP_BUILTIN_IO)); _t%d; })",
-                   tp0, tp1, tp1, tpa, tpa, tpa, tp0, tpa, tp1, tpa);
+        emit_sock_pair(c, argv[0], argv[1], argc >= 3 ? argv[2] : -1, 0, b);
         return 1;
       }
       /* Socket.getaddrinfo(host, port) ->
@@ -1970,11 +2032,11 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
               buf_printf(b, "_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == %d"
                             " ? sp_StringIO_read((sp_StringIO *)_t%d.v.p) : ", ts, ts, sio_cid, ts);
             buf_printf(b, "_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_IO"
-                          " ? sp_File_read((sp_File *)_t%d.v.p)"
+                          " ? sp_io_copy_stream_read((sp_File *)_t%d.v.p)"
                           " : (sp_raise_nomethod(sp_nomethod_msg(\"read\", _t%d)), (const char *)0); })", ts, ts, ts, ts);
           }
           else if (a0_sio) { buf_puts(b, "sp_StringIO_read("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
-          else if (a0_io) { buf_puts(b, "sp_File_read("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+          else if (a0_io) { buf_puts(b, "sp_io_copy_stream_read("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
           else { buf_puts(b, "sp_file_read("); emit_path_expr(c, argv[0], b); buf_puts(b, ")"); }
           buf_printf(b, "; SP_GC_ROOT(_t%d); ", td);
           if (a1_poly) {
@@ -1997,7 +2059,7 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
         if ((a0_sio || a0_io) && (a1_sio || a1_io)) {
           buf_puts(b, a1_sio ? "sp_StringIO_write(" : "sp_File_write_bin(");
           emit_expr(c, argv[1], b);
-          buf_puts(b, a0_sio ? ", sp_StringIO_read(" : ", sp_File_read(");
+          buf_puts(b, a0_sio ? ", sp_StringIO_read(" : ", sp_io_copy_stream_read(");
           emit_expr(c, argv[0], b);
           buf_puts(b, "))"); return 1;
         }
@@ -2108,16 +2170,19 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
           }
         }
         buf_printf(b, " if (_t%d->len == 0) sp_raise_cls(\"ArgumentError\", \"wrong number of arguments (given 0, expected 1+)\");", tall);
-        buf_printf(b, " sp_RbVal _t%d = _t%d->data[0];", tcmd, tall);
+        buf_printf(b, " sp_RbVal _t%d = _t%d->data[0]; SP_GC_ROOT_RBVAL(_t%d);", tcmd, tall, tcmd);
         buf_printf(b, " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);", targs, targs);
         buf_printf(b, " for (sp_int _i = 1; _i < _t%d->len; _i++) sp_PolyArray_push(_t%d, _t%d->data[_i]);",
                    tall, targs, tall);
       }
       else {
         /* cmd = argv[0] (boxed, so it can be String or Array) */
+        /* (held: a String made for it, `"cmd #{x}"`, is freed by the
+           arguments' Array made next, and the env shift below takes the
+           command out of the Array that held it) */
         buf_printf(b, "({ sp_RbVal _t%d = ", tcmd);
         emit_boxed(c, argv[0], b);
-        buf_puts(b, ";");
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d);", tcmd);
         /* args: collect argv[1..argc-2] (or empty if argc==1) into a
            PolyArray. Skip the last arg if it's a Hash (the opts). */
         buf_printf(b, " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);", targs, targs);
@@ -2262,6 +2327,18 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
       buf_puts(b, ")");
       return 1;
     }
+    /* The four with the flags of waitpid(2): the answer is boxed, as WNOHANG
+       answers nil for a child still running */
+    if (tcn && sp_streq(tcn, "Process") && argc == 2 &&
+        (sp_streq(name, "wait") || sp_streq(name, "waitpid") || sp_streq(name, "wait2") || sp_streq(name, "waitpid2"))) {
+      int pair = sp_streq(name, "wait2") || sp_streq(name, "waitpid2");
+      buf_puts(b, "sp_process_wait_flags(");
+      emit_int_expr(c, argv[0], b);
+      buf_puts(b, ", ");
+      emit_int_expr(c, argv[1], b);
+      buf_printf(b, ", %d)", pair);
+      return 1;
+    }
     /* Process::Status.new(status_int) is handled earlier in
        emit_call_body (the ConstantPathNode arm above); the
        ConstantReadNode-scoped block here does not see it. */
@@ -2356,7 +2433,7 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
   /* Random class methods: Random.rand(n) / Random.rand / Random.bytes(n)
      share a lazily-seeded default instance. */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Random")) {
+      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Random")) {
     if (sp_streq(name, "rand")) {
       if (argc >= 1 && repr_of(c, argv[0]).as_ty == TY_FLOAT) {
         buf_puts(b, "sp_Random_rand_float_bound(sp_random_default_get(), ");
@@ -2419,7 +2496,7 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
      (sp_enum_product_kw_check), so a `**h` and a String key are named as
      CRuby names them. */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Enumerator") &&
+      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Enumerator") &&
       sp_streq(name, "product")) {
     int tf = ++g_tmp;
     buf_printf(b, "({ sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);", tf, tf);
@@ -2518,13 +2595,14 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     /* a Random instance is an opaque object: #class, and identity #==/#equal? (#2524) */
     if (sp_streq(name, "class") && argc == 0) {
       if (!node_may_be_null_nil(c, recv)) {
-        buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), ((sp_Class){0, SPL(\"Random\")}))");
+        buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), "); emit_builtin_class_value(c, "Random", b); buf_puts(b, ")");
         return 1;
       }
       /* a NULL slot is nil, whose class is NilClass */
       int tr = ++g_tmp;
       buf_printf(b, "({ sp_Random *_t%d = ", tr); emit_expr(c, recv, b);
-      buf_printf(b, "; _t%d ? ((sp_Class){0, SPL(\"Random\")}) : ((sp_Class){(sp_int)-1, SPL(\"NilClass\")}); })", tr);
+      buf_printf(b, "; _t%d ? ", tr); emit_builtin_class_value(c, "Random", b);
+      buf_puts(b, " : "); emit_builtin_class_value(c, "NilClass", b); buf_puts(b, "; })");
       return 1;
     }
     /* equal? and eql? are identity; == compares by internal PRNG state

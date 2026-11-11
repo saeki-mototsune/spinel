@@ -231,6 +231,11 @@ const char *(*sp_class_name_fn)(sp_Class);
 const char *(*sp_class_display_fn)(sp_Class);
 const char *(*sp_class_user_to_s_fn)(sp_Class);
 const char *(*sp_class_user_inspect_fn)(sp_Class);
+const char *(*sp_array_user_inspect_fn)(sp_RbVal);
+/* set while pp prints: CRuby's pp lays out an Array by its own
+   pretty_print, never by the program's Array#inspect. One flag for each
+   thread, as each thread can print at the same time. */
+SP_TLS int sp_pp_printing;
 /* A boxed Time's to_s (inspect 0) or inspect (1): a Time subclass
    instance's goes through its class's own dispatcher, which runs an
    override of the class's and falls back to Time's. */
@@ -245,6 +250,7 @@ static const char *sp_poly_time_display(sp_RbVal v, int inspect) {
 /* the hooks the generated unit installs for this unit (SP_INSTALL_HOOK) */
 sp_user_binop_fn sp_user_binop_hook_lib;
 sp_user_aset_fn sp_user_aset_hook_lib;
+sp_orange_walk_fn sp_orange_walk_lib;   /* the generated unit's Range walk (SP_ORANGE_WALK) */
 sp_obj_eq_fn sp_obj_eq_hook_lib;
 sp_obj_hash_fn sp_obj_hash_hook_lib;
 sp_obj_eql_fn sp_obj_eql_hook_lib;
@@ -297,17 +303,26 @@ void sp_poly_puts(sp_RbVal v)
       /* MRI's `puts arr` iterates an Array, printing one element per
          line (using to_s on each); a non-Array OBJ falls back to
          inspect / class-name. */
+      /* rooted for the walk: a fresh Array that only this call holds (a
+         method's answer of more than one class) is freed partway by a
+         collection an element's render runs, as sp_File_puts_val roots it */
+      SP_GC_ROOT_RBVAL(v);
       switch (v.cls_id) {
+        /* an element that is nil (a gap a write past the end left, its nil
+           bit) prints puts nil's empty line, as the typed puts does */
         case SP_BUILTIN_INT_ARRAY: {
           sp_IntArray *_a = (sp_IntArray *)v.v.p;
-          for (sp_int _i = 0; _i < _a->len; _i++)
-            printf("%lld\n", (long long)_a->data[_a->start + _i]);
+          for (sp_int _i = 0; _i < _a->len; _i++) {
+            sp_oint _e = sp_IntArray_oget(_a, _i);
+            if (_e.nil) putchar('\n');
+            else printf("%lld\n", (long long)_e.v);
+          }
           break;
         }
         case SP_BUILTIN_FLT_ARRAY: {
           sp_FloatArray *_a = (sp_FloatArray *)v.v.p;
           for (sp_int _i = 0; _i < _a->len; _i++) {
-            fputs(sp_float_to_s(_a->data[_i]), stdout); putchar('\n');
+            fputs(sp_float_opt_to_s(sp_FloatArray_oget(_a, _i)), stdout); putchar('\n');
           }
           break;
         }
@@ -371,6 +386,24 @@ void sp_poly_puts(sp_RbVal v)
   }
 }
 
+/* Symbol#to_s and #id2name as a program calls them: a new String at each
+   call, as CRuby answers one, and frozen, as Spinel answers it (CRuby's is
+   chilled; docs/limitations.md). sp_sym_to_s_frozen is the one frozen copy
+   the runtime renders a Symbol with (puts, interpolation, inspect); two
+   calls answered that one object, so `s.to_s.equal?(s.to_s)` was true. */
+const char *sp_sym_to_s_new(sp_sym id)
+{
+  const char *nm = sp_sym_to_s_frozen(id);
+  return sp_str_freeze_val(sp_str_from_bytes(nm, sp_str_byte_len(nm)));
+}
+/* a boxed receiver's to_s as a program calls it: a Symbol's is a new
+   String (sp_sym_to_s_new), every other value's is sp_poly_to_s's */
+const char *sp_poly_to_s_call(sp_RbVal v)
+{
+  if (v.tag == SP_TAG_SYM) return sp_sym_to_s_new((sp_sym)v.v.i);
+  return sp_poly_to_s(v);
+}
+
 const char *sp_poly_to_s(sp_RbVal v)
 {
   switch (v.tag) {
@@ -414,10 +447,17 @@ const char *sp_poly_to_s(sp_RbVal v)
            renders it: a boxed one fell through to "" (`puts [f, d]`) */
         case SP_BUILTIN_IO: return sp_io_to_s((sp_File *)v.v.p);
         case SP_BUILTIN_DIR: return sp_Dir_to_s((sp_Dir *)v.v.p);
+        case SP_BUILTIN_TIME_RANGE: return sp_trange_to_s((sp_TimeRange *)v.v.p);
+        case SP_BUILTIN_OBJ_RANGE: return sp_orange_to_s((sp_ObjRange *)v.v.p);
         case SP_BUILTIN_FIBER: return sp_Fiber_inspect((sp_Fiber *)v.v.p);
         case SP_BUILTIN_THREAD: return sp_Thread_inspect((sp_thread *)v.v.p);
         /* OpenStruct#to_s is its inspect, as sp_poly_inspect renders it */
         case SP_BUILTIN_OPENSTRUCT: return sp_OpenStruct_inspect((struct sp_OpenStruct_s *)v.v.p);
+        /* as the typed to_s renders each: an Enumerator and a Random by
+           their inspect, ARGF by its name; a boxed one fell through to "" */
+        case SP_BUILTIN_ENUMERATOR: return sp_enum_inspect_boxed(v);
+        case SP_BUILTIN_RANDOM: if (v.v.p) return sp_Random_inspect((sp_Random *)v.v.p); return SPL("#<Object>");
+        case SP_BUILTIN_ARGF: return SPL("ARGF");
         default:
           if ((v.cls_id >= 0 || v.cls_id == SP_BUILTIN_OBJECT) && v.v.p) {
             /* a class with a user #to_s renders through the generated
@@ -447,24 +487,28 @@ const char *sp_poly_to_s(sp_RbVal v)
   }
 }
 
-const char *sp_poly_class_name(sp_RbVal v)
+/* The class name of a boxed value, and in *id the builtin class id of that name
+   (the table's, sp_Class.cls_id of the class value) where the arm names it by
+   a literal; -1 for a name the arm computes or the table has no id for. */
+static const char *sp_poly_class_name_arm(sp_RbVal v, int *id)
 {
+  *id = -1;
   switch (v.tag) {
-    case SP_TAG_INT: return SPL("Integer");
-    case SP_TAG_STR: return SPL("String");
-    case SP_TAG_FLT: return SPL("Float");
-    case SP_TAG_BOOL: return v.v.b ? SPL("TrueClass") : SPL("FalseClass");
-    case SP_TAG_NIL: return SPL("NilClass");
-    case SP_TAG_SYM: return SPL("Symbol");
+    case SP_TAG_INT: return (*id = SP_BCLS_INTEGER, SPL("Integer"));
+    case SP_TAG_STR: return (*id = SP_BCLS_STRING, SPL("String"));
+    case SP_TAG_FLT: return (*id = SP_BCLS_FLOAT, SPL("Float"));
+    case SP_TAG_BOOL: return v.v.b ? (*id = SP_BCLS_TRUECLASS, SPL("TrueClass")) : (*id = SP_BCLS_FALSECLASS, SPL("FalseClass"));
+    case SP_TAG_NIL: return (*id = SP_BCLS_NILCLASS, SPL("NilClass"));
+    case SP_TAG_SYM: return (*id = SP_BCLS_SYMBOL, SPL("Symbol"));
     case SP_TAG_ENCODING: return SPL("Encoding");
     case SP_TAG_CLASS: {
       sp_Class c = sp_unbox_class(v);
       int m = sp_class_is_module_fn ? sp_class_is_module_fn(c)
             : (c.cls_id == -114 || c.cls_id == -115 || c.cls_id == -119 || c.cls_id == -130 ||
                c.cls_id == -162);
-      return m ? SPL("Module") : SPL("Class");
+      return m ? (*id = SP_BCLS_MODULE, SPL("Module")) : (*id = SP_BCLS_CLASS, SPL("Class"));
     }
-    case SP_TAG_BIGINT: return SPL("Integer");
+    case SP_TAG_BIGINT: return (*id = SP_BCLS_INTEGER, SPL("Integer"));
     case SP_TAG_OBJ:
       /* an Array subclass instance boxed as its Array (#7449) */
       if (sp_bsub_cls_fn && sp_obj_cls_name_fn) {
@@ -474,26 +518,26 @@ const char *sp_poly_class_name(sp_RbVal v)
       switch (v.cls_id) {
         case SP_BUILTIN_INT_ARRAY: case SP_BUILTIN_FLT_ARRAY:
         case SP_BUILTIN_STR_ARRAY: case SP_BUILTIN_SYM_ARRAY:
-        case SP_BUILTIN_PTR_ARRAY: case SP_BUILTIN_POLY_ARRAY: return SPL("Array");
+        case SP_BUILTIN_PTR_ARRAY: case SP_BUILTIN_POLY_ARRAY: return (*id = SP_BCLS_ARRAY, SPL("Array"));
         case SP_BUILTIN_STR_INT_HASH: case SP_BUILTIN_STR_STR_HASH:
         case SP_BUILTIN_INT_STR_HASH: case SP_BUILTIN_SYM_INT_HASH:
          case SP_BUILTIN_INT_INT_HASH:
         case SP_BUILTIN_SYM_STR_HASH: case SP_BUILTIN_STR_POLY_HASH:
-        case SP_BUILTIN_SYM_POLY_HASH: case SP_BUILTIN_POLY_POLY_HASH: return SPL("Hash");
-        case SP_BUILTIN_RANGE: return SPL("Range");
-        case SP_BUILTIN_FLOAT_RANGE: case SP_BUILTIN_STR_RANGE: return SPL("Range");
-        case SP_BUILTIN_TIME: return SPL("Time");
-    case SP_BUILTIN_STRBUF: return SPL("String");   /* (#3227) */
-        case SP_BUILTIN_COMPLEX: return SPL("Complex");
-        case SP_BUILTIN_RATIONAL: return SPL("Rational");
-        case SP_BUILTIN_BIG_RATIONAL: return SPL("Rational");
-        case SP_BUILTIN_REGEX: return SPL("Regexp");
-        case SP_BUILTIN_MATCHDATA: return SPL("MatchData");   /* (#3641) */
-        case SP_BUILTIN_OBJECT: return SPL("Object");   /* a bare Object.new instance */
-        case SP_BUILTIN_BASIC_OBJECT: return SPL("BasicObject");
-        case SP_BUILTIN_PROC: return SPL("Proc");
+        case SP_BUILTIN_SYM_POLY_HASH: case SP_BUILTIN_POLY_POLY_HASH: return (*id = SP_BCLS_HASH, SPL("Hash"));
+        case SP_BUILTIN_RANGE: return (*id = SP_BCLS_RANGE, SPL("Range"));
+        case SP_BUILTIN_FLOAT_RANGE: case SP_BUILTIN_STR_RANGE: return (*id = SP_BCLS_RANGE, SPL("Range"));
+        case SP_BUILTIN_TIME: return (*id = SP_BCLS_TIME, SPL("Time"));
+    case SP_BUILTIN_STRBUF: return (*id = SP_BCLS_STRING, SPL("String"));   /* (#3227) */
+        case SP_BUILTIN_COMPLEX: return (*id = SP_BCLS_COMPLEX, SPL("Complex"));
+        case SP_BUILTIN_RATIONAL: return (*id = SP_BCLS_RATIONAL, SPL("Rational"));
+        case SP_BUILTIN_BIG_RATIONAL: return (*id = SP_BCLS_RATIONAL, SPL("Rational"));
+        case SP_BUILTIN_REGEX: return (*id = SP_BCLS_REGEXP, SPL("Regexp"));
+        case SP_BUILTIN_MATCHDATA: return (*id = SP_BCLS_MATCHDATA, SPL("MatchData"));   /* (#3641) */
+        case SP_BUILTIN_OBJECT: return (*id = SP_BCLS_OBJECT, SPL("Object"));   /* a bare Object.new instance */
+        case SP_BUILTIN_BASIC_OBJECT: return (*id = SP_BCLS_BASIC_OBJECT, SPL("BasicObject"));
+        case SP_BUILTIN_PROC: return (*id = SP_BCLS_PROC, SPL("Proc"));
         /* a curried proc IS a Proc to Ruby (#3885) */
-        case SP_BUILTIN_CURRY: return SPL("Proc");
+        case SP_BUILTIN_CURRY: return (*id = SP_BCLS_PROC, SPL("Proc"));
         case SP_BUILTIN_METHOD:
           return ((sp_BoundMethod *)v.v.p)->unbound ? SPL("UnboundMethod") : SPL("Method");   /* (#3692) */
         /* a chain and a product report their own class, as the typed
@@ -515,26 +559,40 @@ const char *sp_poly_class_name(sp_RbVal v)
            `.class` emit uses, so a Monitor and a SizedQueue stay distinct. */
         case SP_BUILTIN_MUTEX: return sp_Mutex_class_name((sp_mutex *)v.v.p);
         case SP_BUILTIN_QUEUE: return sp_Queue_class_name((sp_queue *)v.v.p);
-        case SP_BUILTIN_CONDVAR: return SPL("Thread::ConditionVariable");
-        case SP_BUILTIN_FIBER: return SPL("Fiber");
-        case SP_BUILTIN_THREAD: return SPL("Thread");
-        case SP_BUILTIN_DIR: return SPL("Dir");
-        case SP_BUILTIN_TMS: return SPL("Process::Tms");
+        case SP_BUILTIN_CONDVAR: return (*id = SP_BCLS_THREAD_CONDITIONVARIABLE, SPL("Thread::ConditionVariable"));
+        case SP_BUILTIN_FIBER: return (*id = SP_BCLS_FIBER, SPL("Fiber"));
+        case SP_BUILTIN_THREAD: return (*id = SP_BCLS_THREAD, SPL("Thread"));
+        case SP_BUILTIN_DIR: return (*id = SP_BCLS_DIR, SPL("Dir"));
+        case SP_BUILTIN_TIME_RANGE: case SP_BUILTIN_OBJ_RANGE: return (*id = SP_BCLS_RANGE, SPL("Range"));
+        case SP_BUILTIN_TMS: return (*id = SP_BCLS_PROCESS_TMS, SPL("Process::Tms"));
         case SP_BUILTIN_OPENSTRUCT: return SPL("OpenStruct");
         /* These two had no arm of their own. They went unnoticed because their
            cls_ids collided with STRBUF and OPENSTRUCT, so a boxed one answered
            String / OpenStruct rather than nothing (#4158). */
         case SP_BUILTIN_ADDRINFO: return SPL("Addrinfo");
         case SP_BUILTIN_SOCKOPT: return SPL("Socket::Option");
-        case SP_BUILTIN_PROCESS_STATUS: return SPL("Process::Status");
+        case SP_BUILTIN_PROCESS_STATUS: return (*id = SP_BCLS_PROCESS_STATUS, SPL("Process::Status"));
         case SP_BUILTIN_YIELDER: return SPL("Enumerator::Yielder");
         case SP_BUILTIN_RANDOM: return SPL("Random");
         case SP_BUILTIN_ARGF: return SPL("ARGF.class");
         case SP_BUILTIN_EXCEPTION: return sp_exc_class_name((volatile struct sp_Exception_s *)v.v.p);
         default: { sp_Class c = {v.cls_id}; return sp_class_to_s(c); }
       }
-    default: return SPL("Object");
+    default: return (*id = SP_BCLS_OBJECT, SPL("Object"));
   }
+}
+/* ...and for a name the arm computes (an Enumerator's, an IO's), the id the
+   table has for it */
+const char *sp_poly_class_name_id(sp_RbVal v, int *id)
+{
+  const char *n = sp_poly_class_name_arm(v, id);
+  if (*id == -1 && n) *id = sp_builtin_class_id_of(n);
+  return n;
+}
+const char *sp_poly_class_name(sp_RbVal v)
+{
+  int id;
+  return sp_poly_class_name_id(v, &id);
 }
 
 sp_RbVal sp_poly_slice(sp_RbVal a, sp_int start, sp_int len)
@@ -655,6 +713,15 @@ sp_RbVal sp_poly_slice(sp_RbVal a, sp_int start, sp_int len)
   }
 }
 
+/* the inspect pp prints: sp_poly_inspect with the program's own
+   Array#inspect left out, for v and what it holds */
+const char *sp_pp_inspect(sp_RbVal v) {
+  int was = sp_pp_printing;
+  sp_pp_printing = 1;
+  const char *r = sp_poly_inspect(v);
+  sp_pp_printing = was;
+  return r;
+}
 const char *sp_poly_inspect(sp_RbVal v)
 {
   switch (v.tag) {
@@ -666,9 +733,15 @@ const char *sp_poly_inspect(sp_RbVal v)
     case SP_TAG_NIL:  return SPL("nil");
     case SP_TAG_SYM:  return sp_sym_inspect((sp_sym)v.v.i);
     case SP_TAG_ENCODING: return sp_encoding_inspect_name(v.v.s ? v.v.s : "");
-    case SP_TAG_CLASS: return sp_class_val_user(v, sp_class_user_inspect_fn);
+    /* (the class's own self.inspect runs as outside a pp: SP_PP_USER) */
+    case SP_TAG_CLASS: return SP_PP_USER(sp_class_val_user(v, sp_class_user_inspect_fn));
     case SP_TAG_BIGINT: return sp_bigint_to_s((sp_Bigint *)v.v.p);
     case SP_TAG_OBJ:
+      /* an Array of any kind, where the program reopens Array#inspect */
+      if (sp_array_user_inspect_fn && !sp_pp_printing && sp_poly_is_array_kind(v.cls_id)) {
+        const char *r = sp_array_user_inspect_fn(v);
+        if (r) return r;
+      }
  /* Built-in container / value-type tags get their typed inspect
     helper. Matches the dispatch shape in sp_poly_to_s above and the
     `puts` poly arm earlier in this file; without it, a Range / Time
@@ -707,6 +780,8 @@ const char *sp_poly_inspect(sp_RbVal v)
         case SP_BUILTIN_POLY_POLY_HASH: return sp_PolyPolyHash_inspect((sp_PolyPolyHash *)v.v.p);
         case SP_BUILTIN_OPENSTRUCT: return sp_OpenStruct_inspect((struct sp_OpenStruct_s *)v.v.p);
         case SP_BUILTIN_ENUMERATOR: return sp_enum_inspect_boxed(v);
+        case SP_BUILTIN_TIME_RANGE: return sp_trange_inspect((sp_TimeRange *)v.v.p);
+        case SP_BUILTIN_OBJ_RANGE: return sp_orange_inspect((sp_ObjRange *)v.v.p);
         /* #<Dir:PATH>, as the typed Dir's inspect renders it (#3250) */
         case SP_BUILTIN_DIR: {
           const char *_dp = v.v.p ? ((sp_Dir *)v.v.p)->path : NULL;
@@ -760,10 +835,10 @@ sp_StrStrHash *sp_StrPolyHash_to_s_values(sp_StrPolyHash *h)
   SP_GC_ROOT(h);
   sp_StrStrHash *r = sp_StrStrHash_new(); SP_GC_ROOT(r);
   /* a missing match reads the default, as its to_s (nil's "" is no default) */
-  if (h && h->default_v.tag != SP_TAG_NIL) r->default_v = SP_SEF(sp_poly_to_s(h->default_v));
+  if (h && h->default_v.tag != SP_TAG_NIL) r->default_v = sp_String_new_shared(sp_poly_to_s(h->default_v));
   if (h) for (sp_int i = 0; i < h->len; i++) {
     const char *k = h->order[i];
-    sp_StrStrHash_set_e(r, k, SP_SEF(sp_poly_to_s(sp_StrPolyHash_get(h, k))));
+    sp_StrStrHash_set_e(r, k, sp_String_new_shared(sp_poly_to_s(sp_StrPolyHash_get(h, k))));
   }
   return r;
 }
@@ -877,6 +952,7 @@ sp_RbVal sp_poly_slice_or_call(sp_RbVal v, sp_RbVal a, sp_RbVal b)
       b.tag == SP_TAG_INT) {
     sp_int n = b.v.i;
     if (sp_re_match((mrb_regexp_pattern *)a.v.p, v.v.s ? v.v.s : "") < 0) return sp_box_nil();
+    n = sp_re_group_nth(n);   /* a negative n counts back from the last group */
     if (n == 0) return sp_box_nullable_str(sp_re_match_str);
     if (n >= 1 && n <= 9) return sp_box_nullable_str(sp_re_captures[n]);
     return sp_box_nil();
@@ -1135,6 +1211,20 @@ sp_RbVal sp_kw_splat_check(sp_RbVal h, const char *const *mem, int n, const unsi
   return named ? sp_box_obj(named, SP_BUILTIN_POLY_POLY_HASH) : h;
 }
 
+/* a checked [k, v] pair, copied: to_h keeps the pair as it was read.  A
+   String key is copied and frozen here, as the Hash does on insert, so a
+   later to_ary that changes it does not change the key either */
+static sp_RbVal sp_poly_pair_copy(sp_RbVal e) {
+  SP_GC_ROOT_RBVAL(e);
+  sp_PolyArray *p = sp_PolyArray_new(); SP_GC_ROOT(p);
+  sp_RbVal k = sp_poly_arr_get(e, 0); SP_GC_ROOT_RBVAL(k);
+  if (k.tag == SP_TAG_STR && k.v.s) k.v.s = sp_hash_key_str(k.v.s);
+  else if (sp_poly_is_strbuf(k)) k = sp_box_str(sp_hash_key_str(sp_String_cstr((sp_String *)k.v.p)));
+  sp_PolyArray_push(p, k);
+  sp_PolyArray_push(p, sp_poly_arr_get(e, 1));
+  return sp_box_poly_array(p);
+}
+
 sp_RbVal sp_poly_to_h_m(sp_RbVal v)
 {
   if (v.tag == SP_TAG_NIL) return sp_box_obj(sp_SymPolyHash_new(), SP_BUILTIN_SYM_POLY_HASH);
@@ -1155,6 +1245,30 @@ sp_RbVal sp_poly_to_h_m(sp_RbVal v)
      boxed hash otherwise -- reading an Integer key as a symbol id built a
      hash whose keys were other programs' symbols (#3972) */
   if (v.tag == SP_TAG_OBJ && sp_poly_is_array_kind(v.cls_id)) {
+    /* every element is checked in order, and a program object's to_ary
+       (any visibility) gives its pair just before its check, as in CRuby:
+       from the first such object on, the pairs are kept in their own
+       array, each one copied as it is checked, so a later to_ary that
+       changes an earlier pair does not change the result (CRuby inserts
+       each pair before it converts the next element) */
+    SP_GC_ROOT_RBVAL(v);
+    sp_PolyArray *conv = NULL; SP_GC_ROOT(conv);
+    for (sp_int i = 0; i < sp_poly_length(v); i++) {
+      sp_RbVal e = sp_poly_arr_get(v, i);
+      if (sp_poly_is_user_obj(e) && e.v.p && !conv) {
+        conv = sp_PolyArray_new();
+        for (sp_int j = 0; j < i; j++) sp_PolyArray_push(conv, sp_poly_pair_copy(sp_poly_arr_get(v, j)));
+      }
+      if (conv) e = sp_poly_pair_to_ary(e);
+      if (!(e.tag == SP_TAG_OBJ && sp_poly_is_array_kind(e.cls_id)))
+        sp_raise_cls("TypeError", sp_sprintf("wrong element type %s at %lld (expected array)",
+                                          sp_poly_class_name(e), (long long)i));
+      if (sp_poly_length(e) != 2)
+        sp_raise_cls("ArgumentError", sp_sprintf("wrong array length at %lld (expected 2, was %lld)",
+                                              (long long)i, (long long)sp_poly_length(e)));
+      if (conv) sp_PolyArray_push(conv, sp_poly_pair_copy(e));
+    }
+    if (conv) v = sp_box_poly_array(conv);
     sp_int n = sp_poly_length(v);
     int all_sym = 1;
     for (sp_int i = 0; i < n && all_sym; i++) {
@@ -1288,8 +1402,8 @@ sp_PolyPolyHash *sp_poly_hash_merge(sp_RbVal a, sp_RbVal b)
   if (a.tag == SP_TAG_OBJ && a.v.p) {
     switch (a.cls_id) {
       case SP_BUILTIN_STR_INT_HASH: { sp_StrIntHash *h = (sp_StrIntHash *)a.v.p; r->default_v = h->default_nil ? sp_box_nil() : sp_box_int(h->default_v); break; }
-      case SP_BUILTIN_STR_STR_HASH: r->default_v = SP_SEBOXN(((sp_StrStrHash *)a.v.p)->default_v); break;
-      case SP_BUILTIN_INT_STR_HASH: r->default_v = SP_SEBOXN(((sp_IntStrHash *)a.v.p)->default_v); break;
+      case SP_BUILTIN_STR_STR_HASH: r->default_v = SP_SEBOX(((sp_StrStrHash *)a.v.p)->default_v); break;
+      case SP_BUILTIN_INT_STR_HASH: r->default_v = SP_SEBOX(((sp_IntStrHash *)a.v.p)->default_v); break;
       case SP_BUILTIN_INT_INT_HASH: { sp_IntIntHash *h = (sp_IntIntHash *)a.v.p; r->default_v = h->default_nil ? sp_box_nil() : sp_box_int(h->default_v); break; }
       case SP_BUILTIN_STR_POLY_HASH: r->default_v = ((sp_StrPolyHash *)a.v.p)->default_v; break;
       case SP_BUILTIN_SYM_POLY_HASH: r->default_v = ((sp_SymPolyHash *)a.v.p)->default_v; break;
@@ -1393,20 +1507,20 @@ void sp_poly_hash_writeback_ex(sp_RbVal orig, sp_PolyPolyHash *work, int with_de
     case SP_BUILTIN_STR_STR_HASH: {
       sp_StrStrHash *h = (sp_StrStrHash *)orig.v.p;
       sp_StrStrHash_clear(h);
-      if (with_default) h->default_v = SP_SEF(sp_poly_to_s_or_nil(work->default_v));
+      if (with_default) h->default_v = sp_String_new_shared(sp_poly_to_s_or_nil(work->default_v));
       for (sp_int i = 0; i < work->len; i++) {
         sp_int j = work->order[i];
-        sp_StrStrHash_set_e(h, sp_poly_to_s(work->keys[j]), SP_SEF(sp_poly_to_s_or_nil(work->vals[j])));
+        sp_StrStrHash_set_e(h, sp_poly_to_s(work->keys[j]), sp_String_new_shared(sp_poly_to_s_or_nil(work->vals[j])));
       }
       return;
     }
     case SP_BUILTIN_INT_STR_HASH: {
       sp_IntStrHash *h = (sp_IntStrHash *)orig.v.p;
       sp_IntStrHash_clear(h);
-      if (with_default) h->default_v = SP_SEF(sp_poly_to_s_or_nil(work->default_v));
+      if (with_default) h->default_v = sp_String_new_shared(sp_poly_to_s_or_nil(work->default_v));
       for (sp_int i = 0; i < work->len; i++) {
         sp_int j = work->order[i];
-        sp_IntStrHash_set_e(h, sp_poly_to_i(work->keys[j]), SP_SEF(sp_poly_to_s_or_nil(work->vals[j])));
+        sp_IntStrHash_set_e(h, sp_poly_to_i(work->keys[j]), sp_String_new_shared(sp_poly_to_s_or_nil(work->vals[j])));
       }
       return;
     }
@@ -1524,6 +1638,9 @@ const char *sp_pm_len_msg(sp_RbVal arr, sp_int want, int at_least) {
 
 /* format(*args) with boxed arguments (spinel_rt.h) */
 const char *sp_str_format_polyarr(const char *fmt, sp_PolyArray *a) {
+  /* a %p or %s formats by inspect / to_s, which allocate: a list the call
+     made for this (an Array of Floats boxed for it) was freed partway */
+  SP_GC_ROOT_STR(fmt); SP_GC_ROOT(a);
   size_t cap = strlen(fmt) + 64;
   char *buf = (char *)malloc(cap);
   if (!buf) { perror("malloc"); exit(1); }

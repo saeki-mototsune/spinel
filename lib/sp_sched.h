@@ -144,6 +144,7 @@ int        sp_sched_other_threads_live(void);
 int        sp_sched_fork(void);   /* fork(2) that leaves the child a sound scheduler (#10516) */
 int        sp_sched_threads_started(void);   /* the worker pool is up: Process.daemon refuses to fork */
 int        sp_sched_wait_child(int pid, int *status);
+int        sp_sched_wait_child_flags(int pid, int *status, int flags);   /* the same with waitpid(2) flags (WNOHANG: no wait, 0 for a running child) */
 void       sp_sleep(sp_float s);   /* Kernel#sleep; relocated from spinel_rt.h to lib/sp_cold.c */
 void       sp_sleep_forever(void);  /* a bare Kernel#sleep, until Thread#wakeup */
 /* Scheduler-aware blocking I/O: park the calling green thread until `fd` is ready
@@ -202,6 +203,7 @@ sp_bool   sp_Thread_tls_key(sp_thread *t, sp_sym k);             /* Thread#key? 
 
 /* Run any remaining runnable threads to completion. Emitted at the end of
    main() so a fire-and-forget Thread still runs its body. */
+void       sp_sched_drain_runnable(void);
 void       sp_sched_drain(void);
 
 /* Safepoint (design 5.1). codegen emits, at loop back-edges of a threaded
@@ -242,9 +244,15 @@ int sp_cext_native_register(void (*)(void *), void *, int);
 void sp_cext_native_unregister(void);
 #endif
 void sp_native_leave(void);
+/* An ffi_callback's trampoline around the method: back in the world for it, if
+   the callback came from inside a blocking call, and out again after it. */
+int sp_native_callback_enter(void);
+void sp_native_callback_leave(int depth);
 #else
 static inline void sp_native_enter(void) {}
 static inline void sp_native_leave(void) {}
+static inline int sp_native_callback_enter(void) { return 0; }
+static inline void sp_native_callback_leave(int depth) { (void)depth; }
 #endif
 
 /* Optional hook the generated TU installs so a worker parking at a safepoint

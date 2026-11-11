@@ -167,18 +167,22 @@ int sp_net_listen_host(const char *host, int port, int backlog) {
     char portbuf[16];
     snprintf(portbuf, sizeof(portbuf), "%d", port);
     if (sp_net_resolve((host && *host) ? host : NULL, portbuf, &hints, &res) != 0) return -1;
-    int fd = -1;
+    int fd = -1, err = 0;
     for (struct addrinfo *ai = res; ai; ai = ai->ai_next) {
         fd = sp_net_socket_cloexec(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
-        if (fd < 0) continue;
+        if (fd < 0) { err = errno; continue; }
         int one = 1;
         setsockopt(fd, SOL_SOCKET, SO_REUSEADDR, &one, sizeof(one));
         if (bind(fd, ai->ai_addr, ai->ai_addrlen) == 0 &&
             listen(fd, backlog > 0 ? backlog : 1024) == 0) break;
+        err = errno;
         close(fd);
         fd = -1;
     }
     freeaddrinfo(res);
+    /* errno is what the last bind or listen failed with (EADDRINUSE for a
+       port in use), which the caller raises (#11351) */
+    if (fd < 0 && err) errno = err;
     return fd;
 }
 
@@ -259,6 +263,16 @@ int sp_net_sock_ip(int fd, int peer, char *ipbuf, int cap) {
         return (int)ntohs(a->sin6_port);
     }
     return -1;
+}
+
+/* The peer's IP of a connected socket fd as text ("" when it has none: a
+   UNIX socket, or a closed one), for an FFI caller that reads a string back
+   (a server's `REMOTE_ADDR`). Per thread, as sp_net_recv_some's buffer. */
+static SP_TLS char sp_net_peer_ip_buf[64];
+const char *sp_net_peer_ip(int fd) {
+    if (sp_net_sock_ip(fd, 1, sp_net_peer_ip_buf, (int)sizeof sp_net_peer_ip_buf) < 0)
+        sp_net_peer_ip_buf[0] = '\0';
+    return sp_net_peer_ip_buf;
 }
 
 /* The local/peer address of a socket fd as the packed sockaddr bytes, into
@@ -515,6 +529,9 @@ int sp_net_unix_connect(const char *path) {SP_GC_ROOT_STR(path);
     int fd = sp_net_socket_cloexec(AF_UNIX, SOCK_STREAM, 0);
     if (fd < 0) return -1;
     if (SP_SIG_BLOCKING(connect(fd, (struct sockaddr *)&sa, sizeof sa)) != 0) { close(fd); return -1; }
+#ifdef SP_THREADS
+    sp_net_set_nonblock(fd);
+#endif
     return fd;
 }
 /* The bound path of a UNIX socket (empty for an unnamed peer). */
@@ -737,6 +754,16 @@ static int sp_net_connect_until(int fd, const struct sockaddr *sa, socklen_t len
 
 /* Per-worker, like sp_net_recv_timed_out. */
 static SP_TLS int sp_net_connect_timed_out;
+/* The address the connect that gave up was for, which the caller's error
+   names (sp_net_connect_timeout_ip). */
+static SP_TLS struct sockaddr_storage sp_net_connect_timed_out_sa;
+
+static void sp_net_connect_gave_up(const struct addrinfo *ai) {
+    sp_net_connect_timed_out = 1;
+    memset(&sp_net_connect_timed_out_sa, 0, sizeof sp_net_connect_timed_out_sa);
+    if (ai->ai_addrlen <= sizeof sp_net_connect_timed_out_sa)
+        memcpy(&sp_net_connect_timed_out_sa, ai->ai_addr, ai->ai_addrlen);
+}
 
 /* sp_net_connect with a deadline of timeout_s seconds (see sp_net.h). */
 int sp_net_connect_timeout(const char *host, int port, double timeout_s) {
@@ -761,14 +788,14 @@ int sp_net_connect_timeout(const char *host, int port, double timeout_s) {
     int fd = -1;
     for (struct addrinfo *ai = res; ai != NULL; ai = ai->ai_next) {
         if (sp_fiber_current && sp_fiber_inject_pending(sp_fiber_current)) break;
-        if (sp_net_now() >= deadline) { sp_net_connect_timed_out = 1; break; }
+        if (sp_net_now() >= deadline) { sp_net_connect_gave_up(ai); break; }
         fd = sp_net_socket_cloexec(ai->ai_family, ai->ai_socktype, ai->ai_protocol);
         if (fd < 0) continue;
         int rc = sp_net_connect_until(fd, ai->ai_addr, ai->ai_addrlen, deadline);
         if (rc == 0) break;
         close(fd);
         fd = -1;
-        if (rc == -2) { sp_net_connect_timed_out = 1; break; }
+        if (rc == -2) { sp_net_connect_gave_up(ai); break; }
     }
     freeaddrinfo(res);
     sp_fiber_undefer_inject();
@@ -789,6 +816,23 @@ int sp_net_take_connect_timeout(void) {
     int t = sp_net_connect_timed_out;
     sp_net_connect_timed_out = 0;
     return t;
+}
+
+/* The address that connect gave up on, as sp_net_sock_ip answers a socket's:
+   its IP as text into ipbuf; returns the port, or -1. */
+int sp_net_connect_timeout_ip(char *ipbuf, int cap) {
+    struct sockaddr_storage *ss = &sp_net_connect_timed_out_sa;
+    if (ss->ss_family == AF_INET) {
+        struct sockaddr_in *a = (struct sockaddr_in *)ss;
+        if (!inet_ntop(AF_INET, &a->sin_addr, ipbuf, (socklen_t)cap)) return -1;
+        return (int)ntohs(a->sin_port);
+    }
+    if (ss->ss_family == AF_INET6) {
+        struct sockaddr_in6 *a = (struct sockaddr_in6 *)ss;
+        if (!inet_ntop(AF_INET6, &a->sin6_addr, ipbuf, (socklen_t)cap)) return -1;
+        return (int)ntohs(a->sin6_port);
+    }
+    return -1;
 }
 
 int sp_net_close(int fd) {

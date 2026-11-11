@@ -2,7 +2,10 @@
 #include "sp_proc.h"
 #include "sp_exc.h"   /* sp_arity_check */
 
-void sp_Proc_scan(void *p) { sp_Proc *pr = (sp_Proc *)p; if (pr->cap && pr->cap_scan) pr->cap_scan(pr->cap); }
+/* A dup or clone keeps its lineage root (origin) for Proc#== and the hash,
+   which compare roots by address: the root must live as long as any copy of
+   it, or a new Proc allocated at the freed address would equal the copy. */
+void sp_Proc_scan(void *p) { sp_Proc *pr = (sp_Proc *)p; if (pr->cap && pr->cap_scan) pr->cap_scan(pr->cap); if (pr->origin) sp_gc_mark(pr->origin); }
 sp_Proc *sp_proc_new_meta(void *fn, void *cap, void (*cap_scan)(void *), sp_int arity, sp_bool lambda_p, sp_int param_count, const sp_sym *param_kinds, const sp_sym *param_names) { sp_Proc *p = (sp_Proc *)sp_gc_alloc(sizeof(sp_Proc), NULL, sp_Proc_scan); p->fn = fn; p->cap = cap; p->cap_scan = cap_scan; p->arity = arity; p->lambda_p = lambda_p; p->param_count = param_count; p->param_kinds = param_kinds; p->param_names = param_names; return p; }
 /* Proc#dup / #clone: a fresh shallow copy (distinct identity; the capture
    environment is shared, like CRuby). dup drops the frozen flag, clone keeps
@@ -106,6 +109,9 @@ sp_Curry *sp_curry_apply(sp_Curry *c, sp_RbVal arg) {SP_GC_ROOT_RBVAL(arg);
 /* Method#to_proc: wrap the bound method in a Proc whose trampoline forwards
    through the (void *self, sp_int...) ABI (the arity dispatches the cast). */
 void sp_bm_cap_scan(void *p) { sp_gc_mark(p); }
+/* A Method's proc's capture is its Method, which answers the proc's
+   #parameters too (sp_proc_parameters_of) */
+void sp_method_proc_scan(void *p) { sp_gc_mark(p); }
 /* Whether every fixed position of the stamped signature is a scalar-kind
    token (the TY_UNKNOWN wildcard 0 through TY_NIL 4; see abi_sig_token in
    codegen_call.c). A pointer token is 100000 + TyKind. The generic
@@ -402,7 +408,7 @@ sp_int sp_method_proc_tramp(void *cap, sp_int argc, sp_int *args) {
 }
 sp_Proc *sp_method_to_proc(sp_BoundMethod *m) {
   SP_GC_ROOT(m);   /* `&method(:m)` hands over a Method nothing else holds */
-  return sp_proc_new_meta((void *)sp_method_proc_tramp, m, sp_bm_cap_scan, 1, TRUE, 0, NULL, NULL);
+  return sp_proc_new_meta((void *)sp_method_proc_tramp, m, sp_method_proc_scan, 1, TRUE, 0, NULL, NULL);
 }
 /* Bound Method object: `obj.method(:foo)` / `method(:foo)`. `self` is the
    bound receiver (NULL for a top-level method), `fn` the function address

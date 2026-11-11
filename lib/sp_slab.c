@@ -904,30 +904,6 @@ void *sp_slab_alloc(size_t need) {
   if (SP_EXPECT(sp_slab_verify_on, 0)) sp_slab_note(p, 1);
   return p;
 }
-/* A heap string: the bump of sp_slab_alloc_in with the str bit set in the
-   word cached beside the run, the way an object's fin bit is. Locating the
-   slot from its address instead (chunk, bitmap, word, bit) was two thirds of
-   the cost of allocating a short string. */
-void *sp_slab_alloc_str(size_t need) {
-  if (SP_EXPECT(sp_slab_on > 0 && need <= SP_SLAB_MAX && !sp_slab_verify_on, 1)) {
-    int cls = sp_slab_cls_of[(need + 15) >> 4];
-    sp_slab_worker *wk = &sp_slab_wk[SP_SLAB_WID()];
-    char *q = wk->rnext[0][cls];
-    if (SP_EXPECT(q != wk->rend[0][cls], 1)) {
-      wk->rnext[0][cls] = q + sp_slab_csize[cls];
-      unsigned i = (unsigned)(((uint64_t)(size_t)(q - wk->rbase[0][cls]) * sp_slab_recip[cls]) >> 32);
-      bm_or(wk->rstr[0][cls], (uint64_t)1 << i);
-      return q;
-    }
-  }
-  void *p = sp_slab_alloc_in(need, 0, 0, 0);
-  if (sp_slab_on > 0 && sp_slab_owns(p)) {
-    sp_slab_loc l; sp_slab_locate(p, &l);
-    bm_or(&l.bm->str[l.w], l.bit);
-    if (sp_slab_verify_on) sp_slab_note(p, 2);
-  }
-  return p;
-}
 /* A block no sweep frees: a container's payload, dying by an explicit free */
 void *sp_slab_alloc_raw(size_t need) {
   void *p = sp_slab_alloc_in(need, 1, 0, 0);
@@ -941,9 +917,41 @@ void sp_slab_set_fin(void *h) {
   bm_or(&l.bm->fin[l.w], l.bit);
   if (sp_slab_verify_on) sp_slab_note(h, 4);
 }
+/* sp_slab_pin's promise (below) for a frozen heap String in a block the
+   slab does not own: one past the largest class, or any with the slab off
+   (SPINEL_GC_SLAB=0, a reservation that failed). No bitmap pins such a
+   block. The String is the GC object it was born in (sp_str_alloc_born), on
+   the collector's lists, whose sweep frees what the mark did not reach, and
+   the holders that count on the promise are no roots: the intern table of
+   String#-@ and #dedup, and Module#name's cache through it, answered a
+   freed String, or the mutable one allocated in its place. So the object
+   is recorded here and marked with the roots of every collection
+   (sp_slab_mark_pinned), which keeps it as the pin bit keeps a slot. It is
+   recorded under the heap lock, as the intern table is, and read by the
+   collector under the barrier, where no mutator is inside that lock. */
+static void **sp_slab_pinned = NULL;
+static size_t sp_slab_npinned = 0, sp_slab_pinned_cap = 0;
+static void sp_slab_pin_outside(const void *p) {
+  sp_str_hdr *h = ((sp_str_hdr *)(void *)((char *)p - 1)) - 1;
+  char *o = (char *)SP_STR_BORN_LINK(h);
+  /* not born in a handle: on the string lists, whose sweep keeps a frozen one */
+  if (!o || o + sizeof(struct sp_String_s) != (char *)h) return;
+  SP_HEAP_LOCK();
+  if (sp_slab_npinned == sp_slab_pinned_cap) {
+    size_t nc = sp_slab_pinned_cap ? sp_slab_pinned_cap * 2 : 64;
+    void **nt = (void **)realloc(sp_slab_pinned, nc * sizeof(void *));
+    if (!nt) sp_oom_die();
+    sp_slab_pinned = nt; sp_slab_pinned_cap = nc;
+  }
+  sp_slab_pinned[sp_slab_npinned++] = o;
+  SP_HEAP_UNLOCK();
+}
+void sp_slab_mark_pinned(void) {
+  for (size_t i = 0; i < sp_slab_npinned; i++) sp_gc_mark(sp_slab_pinned[i]);
+}
 /* a frozen heap string: kept until the program ends, as a static literal is */
 void sp_slab_pin(const void *p) {
-  if (sp_slab_on <= 0 || !sp_slab_owns(p)) return;
+  if (sp_slab_on <= 0 || !sp_slab_owns(p)) { sp_slab_pin_outside(p); return; }
   sp_slab_loc l; sp_slab_locate(p, &l);
   bm_or(&l.bm->pin[l.w], l.bit);
   if (sp_slab_verify_on) sp_slab_note(p, 9);
@@ -975,13 +983,13 @@ void sp_slab_relive(void *h) {
    and the program answers right by luck. Here a freed slot is filled with
    0xdb and kept out of reuse: pinned, so no sweep and no allocation touches
    it, and named in a bitmap of its own, which is what tells it from a
-   payload. An object keeps its header, and a string its header, marker byte
-   and length, so a report can say what the slot was; the bytes after are
-   poison. sp_slab_is_live answers no for such a slot, so the verifier's
+   payload. An object keeps its header, so a report can say what the slot
+   was; the bytes after are poison. sp_slab_is_live answers no for such a slot, so the verifier's
    membership test (sp_gc_mark) stops a mark that reaches one and names the
    root or the holder, and a read by the program gets 0xdb: an Integer field
-   is -2604246222170760229, a pointer field faults, a string is its own
-   length of \xDB.
+   is -2604246222170760229, a pointer field faults, a String (an object slot
+   whole: its length and terminator are poison too) reads as \xDB up to the
+   slot's end.
    The quarantine holds SP_SLAB_QUAR_MAX bytes and is then let go whole, at
    the next barrier: every chunk with a slot in it is one more for each
    sweep to walk, and with a collection at every allocation that walk is the

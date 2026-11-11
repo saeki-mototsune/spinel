@@ -92,26 +92,153 @@ module Net
   class HTTPResponse
     attr_reader :http_version, :code, :message
 
-    def initialize(http_version, code, message, headers, body, fields = nil)
+    def self.read_new(sock)
+      version, code, message = read_status_line(sock)
+      response = response_class(code).new(version, code, message)
+      each_response_header(sock) { |key, value| response.add_field(key, value) }
+      response
+    end
+
+    def self.read_status_line(sock)
+      line = sock.readline
+      match = /\AHTTP(?:\/(\d+\.\d+))?\s+(\d\d\d)(?:\s+(.*))?\z/in.match(line)
+      raise HTTPBadResponse, "wrong status line: #{line.dump}" if match.nil?
+      [match[1], match[2], match[3]]
+    end
+
+    def self.each_response_header(sock)
+      key = value = nil
+      loop do
+        line = sock.readuntil("\n", true).sub(/\s+\z/, '')
+        break if line.empty?
+        if (line[0] == " " || line[0] == "\t") && value
+          value << " " unless value.empty?
+          value << line.strip
+        else
+          yield key, value if key
+          key, value = line.strip.split(/\s*:\s*/, 2)
+          raise HTTPBadResponse, "wrong header line format" if value.nil?
+        end
+      end
+      yield key, value if key
+    end
+
+    def self.response_class(code)
+      case code
+      when "100" then return HTTPContinue
+      when "101" then return HTTPSwitchProtocol
+      when "102" then return HTTPProcessing
+      when "103" then return HTTPEarlyHints
+      when "200" then return HTTPOK
+      when "201" then return HTTPCreated
+      when "202" then return HTTPAccepted
+      when "203" then return HTTPNonAuthoritativeInformation
+      when "204" then return HTTPNoContent
+      when "205" then return HTTPResetContent
+      when "206" then return HTTPPartialContent
+      when "207" then return HTTPMultiStatus
+      when "208" then return HTTPAlreadyReported
+      when "226" then return HTTPIMUsed
+      when "300" then return HTTPMultipleChoices
+      when "301" then return HTTPMovedPermanently
+      when "302" then return HTTPFound
+      when "303" then return HTTPSeeOther
+      when "304" then return HTTPNotModified
+      when "305" then return HTTPUseProxy
+      when "307" then return HTTPTemporaryRedirect
+      when "308" then return HTTPPermanentRedirect
+      when "400" then return HTTPBadRequest
+      when "401" then return HTTPUnauthorized
+      when "402" then return HTTPPaymentRequired
+      when "403" then return HTTPForbidden
+      when "404" then return HTTPNotFound
+      when "405" then return HTTPMethodNotAllowed
+      when "406" then return HTTPNotAcceptable
+      when "407" then return HTTPProxyAuthenticationRequired
+      when "408" then return HTTPRequestTimeout
+      when "409" then return HTTPConflict
+      when "410" then return HTTPGone
+      when "411" then return HTTPLengthRequired
+      when "412" then return HTTPPreconditionFailed
+      when "413" then return HTTPPayloadTooLarge
+      when "414" then return HTTPURITooLong
+      when "415" then return HTTPUnsupportedMediaType
+      when "416" then return HTTPRangeNotSatisfiable
+      when "417" then return HTTPExpectationFailed
+      when "421" then return HTTPMisdirectedRequest
+      when "422" then return HTTPUnprocessableEntity
+      when "423" then return HTTPLocked
+      when "424" then return HTTPFailedDependency
+      when "426" then return HTTPUpgradeRequired
+      when "428" then return HTTPPreconditionRequired
+      when "429" then return HTTPTooManyRequests
+      when "431" then return HTTPRequestHeaderFieldsTooLarge
+      when "451" then return HTTPUnavailableForLegalReasons
+      when "500" then return HTTPInternalServerError
+      when "501" then return HTTPNotImplemented
+      when "502" then return HTTPBadGateway
+      when "503" then return HTTPServiceUnavailable
+      when "504" then return HTTPGatewayTimeout
+      when "505" then return HTTPVersionNotSupported
+      when "506" then return HTTPVariantAlsoNegotiates
+      when "507" then return HTTPInsufficientStorage
+      when "508" then return HTTPLoopDetected
+      when "510" then return HTTPNotExtended
+      when "511" then return HTTPNetworkAuthenticationRequired
+      end
+      case code[0, 1]
+      when "1" then HTTPInformation
+      when "2" then HTTPSuccess
+      when "3" then HTTPRedirection
+      when "4" then HTTPClientError
+      when "5" then HTTPServerError
+      else HTTPUnknownResponse
+      end
+    end
+
+    def initialize(http_version, code, message, headers = nil, body = nil, fields = nil)
       @http_version = http_version
       @code = code
       @message = message
-      @headers = headers          # downcased name => value
+      @headers = headers || {}    # downcased name => value
       @body = body
       @body_reader = nil
       @decode_content = false
       @read = false
+      @body_unavailable = headers.nil?
       @fields = {}
       if fields.nil?
-        headers.each { |k, v| @fields[k] = [v] }
+        @headers.each { |k, v| @fields[k] = [v] }
       else
         fields.each { |k, v| @fields[k] = v }
+      end
+    end
+
+    def add_field(key, value)
+      name = key.downcase.to_s
+      values = @fields[name] || []
+      begin
+        append_response_field(values, value)
+        @fields[name] = values
+      ensure
+        @headers[name] = values.join(", ") if @fields.key?(name)
+      end
+    end
+
+    def append_response_field(values, value)
+      if Enumerable === value
+        value.each { |part| append_response_field(values, part) }
+      else
+        text = value.to_s
+        raise ArgumentError, "header field value cannot include CR/LF" if /[\r\n]/n.match?(text.b)
+        values << text
       end
     end
 
     def reading_body(reader, decode_content)
       @body_reader = reader
       @decode_content = decode_content
+      @body_unavailable = reader.nil?
     end
 
     def body
@@ -124,6 +251,7 @@ module Net
         return @body
       end
       raise ArgumentError, "both arg and block given for HTTP method" if dest && block
+      raise IOError, "attempt to read body out of block" if @body_unavailable
       if !@body_reader.nil? || (!@body.nil? && (dest || block))
         out = block.nil? ? (dest || String.new) : ReadAdapter.new(block)
         if @body_reader.nil?
@@ -139,7 +267,8 @@ module Net
     end
 
     def [](name)
-      @headers[name.to_s.downcase]
+      values = @fields[name.to_s.downcase]
+      values.nil? ? nil : values.join(", ")
     end
 
     # Each value of the header, in the order they came, or nil when it is
@@ -154,7 +283,7 @@ module Net
     end
 
     def each_header
-      @headers.each { |k, v| yield k, v }
+      @fields.each { |k, values| yield k, values.join(", ") }
       nil
     end
 
@@ -165,7 +294,7 @@ module Net
     # so is CRuby's main_type/sub_type split: a third `/` part is dropped and
     # an empty subtype leaves the main type alone (`text/` reads `text`).
     def content_type
-      v = @headers["content-type"]
+      v = self["content-type"]
       return nil if v.nil?
       parts = v.split(";", 2)[0].to_s.split("/")
       main = parts[0].to_s.strip
@@ -194,12 +323,10 @@ module Net
   end
 
   # The response family. CRuby's success test is `res.is_a?(Net::HTTPSuccess)`
-  # rather than a predicate on the code, so the classes have to exist for that
-  # line to compile. The families are all here; of the per-code classes only
-  # the ones a client actually names are, which is the usual subset rule:
-  # the common ones, and those an API client branches on (202, 304, the
-  # 307/308 redirects, 405, 409, 410, 422, 429, 502, 503, 504).
+  # rather than a predicate on the code. Each status named by CRuby has its
+  # own class; unlisted codes use their family or HTTPUnknownResponse.
   class HTTPInformation < HTTPResponse; end
+  class HTTPUnknownResponse < HTTPResponse; end
   class HTTPSuccess < HTTPResponse; end
 
   class HTTPRedirection < HTTPResponse
@@ -214,41 +341,90 @@ module Net
     def error_type = HTTPFatalError
   end
 
+  class HTTPContinue < HTTPInformation; end
+  class HTTPSwitchProtocol < HTTPInformation; end
+  class HTTPProcessing < HTTPInformation; end
+  class HTTPEarlyHints < HTTPInformation; end
   class HTTPOK < HTTPSuccess; end
   class HTTPCreated < HTTPSuccess; end
   class HTTPAccepted < HTTPSuccess; end
+  class HTTPNonAuthoritativeInformation < HTTPSuccess; end
   class HTTPNoContent < HTTPSuccess; end
+  class HTTPResetContent < HTTPSuccess; end
+  class HTTPPartialContent < HTTPSuccess; end
+  class HTTPMultiStatus < HTTPSuccess; end
+  class HTTPAlreadyReported < HTTPSuccess; end
+  class HTTPIMUsed < HTTPSuccess; end
+  class HTTPMultipleChoices < HTTPRedirection; end
   class HTTPMovedPermanently < HTTPRedirection; end
   class HTTPFound < HTTPRedirection; end
+  class HTTPSeeOther < HTTPRedirection; end
   class HTTPNotModified < HTTPRedirection; end
+  class HTTPUseProxy < HTTPRedirection; end
   class HTTPTemporaryRedirect < HTTPRedirection; end
   class HTTPPermanentRedirect < HTTPRedirection; end
   class HTTPBadRequest < HTTPClientError; end
   class HTTPUnauthorized < HTTPClientError; end
+  class HTTPPaymentRequired < HTTPClientError; end
   class HTTPForbidden < HTTPClientError; end
   class HTTPNotFound < HTTPClientError; end
   class HTTPMethodNotAllowed < HTTPClientError; end
+  class HTTPNotAcceptable < HTTPClientError; end
+  class HTTPProxyAuthenticationRequired < HTTPClientError; end
+  class HTTPRequestTimeout < HTTPClientError; end
   class HTTPConflict < HTTPClientError; end
   class HTTPGone < HTTPClientError; end
+  class HTTPLengthRequired < HTTPClientError; end
+  class HTTPPreconditionFailed < HTTPClientError; end
+  class HTTPPayloadTooLarge < HTTPClientError; end
+  class HTTPURITooLong < HTTPClientError; end
+  class HTTPUnsupportedMediaType < HTTPClientError; end
+  class HTTPRangeNotSatisfiable < HTTPClientError; end
+  class HTTPExpectationFailed < HTTPClientError; end
+  class HTTPMisdirectedRequest < HTTPClientError; end
   class HTTPUnprocessableEntity < HTTPClientError; end
+  class HTTPLocked < HTTPClientError; end
+  class HTTPFailedDependency < HTTPClientError; end
+  class HTTPUpgradeRequired < HTTPClientError; end
+  class HTTPPreconditionRequired < HTTPClientError; end
   class HTTPTooManyRequests < HTTPClientError; end
+  class HTTPRequestHeaderFieldsTooLarge < HTTPClientError; end
+  class HTTPUnavailableForLegalReasons < HTTPClientError; end
   class HTTPInternalServerError < HTTPServerError; end
+  class HTTPNotImplemented < HTTPServerError; end
   class HTTPBadGateway < HTTPServerError; end
   class HTTPServiceUnavailable < HTTPServerError; end
   class HTTPGatewayTimeout < HTTPServerError; end
+  class HTTPVersionNotSupported < HTTPServerError; end
+  class HTTPVariantAlsoNegotiates < HTTPServerError; end
+  class HTTPInsufficientStorage < HTTPServerError; end
+  class HTTPLoopDetected < HTTPServerError; end
+  class HTTPNotExtended < HTTPServerError; end
+  class HTTPNetworkAuthenticationRequired < HTTPServerError; end
 
-  # A request. CRuby builds these as Net::HTTP::Get.new(path) and friends;
-  # the same shape is here so the same code compiles.
-  class HTTPRequest
+  # A request of any method: CRuby's Net::HTTPGenericRequest, the base of
+  # HTTPRequest and so of Net::HTTP::Get and the rest, which code that
+  # forwards a request of any method builds directly (#11347). The two flags
+  # say whether the method's request and response carry a body.
+  class HTTPGenericRequest
     attr_reader :method, :path, :decode_content
     attr_accessor :body
+
+    def initialize(method, request_has_body, response_has_body, path, initheader = nil)
+      @request_has_body = request_has_body
+      @response_has_body = response_has_body
+      __init_request(method, path, initheader)
+    end
+
+    def request_body_permitted? = @request_has_body
+    def response_body_permitted? = @response_has_body
 
     # `path` is a request path, or a URI -- CRuby takes either, and
     # `Net::HTTP::Post.new(uri, "Content-Type" => "application/json")` is the
     # spelling a caller reaches for when it already parsed the URL. A URI
     # contributes its `request_uri` (the path with the query), not its `to_s`,
     # which is the whole URL and would go out as an absolute request line.
-    def initialize(method, path, initheader = nil)
+    def __init_request(method, path, initheader)
       @method = method
       @path = if path.is_a?(URI::Generic)
         path.request_uri
@@ -385,6 +561,15 @@ module Net
     end
   end
 
+  # A request. CRuby builds these as Net::HTTP::Get.new(path) and friends;
+  # the same shape is here so the same code compiles. (Here it also takes
+  # the method name first, the form post_form and the helpers build.)
+  class HTTPRequest < HTTPGenericRequest
+    def initialize(method, path, initheader = nil)
+      super(method, method == "POST" || method == "PUT" || method == "PATCH", method != "HEAD", path, initheader)
+    end
+  end
+
   class HTTP
     # CRuby builds requests as Net::HTTP::Get.new(path) and friends. Same
     # spelling here, so the same code compiles.
@@ -429,7 +614,7 @@ module Net
 
     # CRuby's, handed to the TLS context the connection is made with. nil,
     # the default, leaves the context's own, VERIFY_PEER.
-    attr_accessor :verify_mode
+    attr_accessor :verify_mode, :verify_hostname, :cert_store
 
     # CRuby's `ssl_timeout` is the TLS SESSION timeout (it becomes
     # `SSLContext#timeout`), how long a cached session may be resumed -- not
@@ -490,6 +675,10 @@ module Net
       @reusable = false
       @last_communicated = 0.0
       @verify_mode = nil
+      @verify_hostname = nil
+      @cert_store = nil
+      @wire_buffer = String.new
+      @wire_socket = nil
       @debug_output = nil
       @socket = nil
       @tls = nil
@@ -596,16 +785,31 @@ module Net
         begin
           context = OpenSSL::SSL::SSLContext.new
           context.verify_mode = @verify_mode unless @verify_mode.nil?
+          context.verify_hostname = @verify_hostname unless @verify_hostname.nil?
+          context.cert_store = @cert_store
           tls = OpenSSL::SSL::SSLSocket.new(@socket, context)
         rescue NameError
           raise "net/http: an https request needs the openssl package (require \"openssl\")"
         end
         tls.hostname = @address
-        tls.connect
         @tls = tls
+        # TCP and TLS each get open_timeout, rather than sharing a deadline.
+        deadline = @open_timeout && Process.clock_gettime(Process::CLOCK_MONOTONIC) + @open_timeout
+        loop do
+          raise OpenTimeout if deadline && deadline <= Process.clock_gettime(Process::CLOCK_MONOTONIC)
+          step = tls.connect_nonblock(exception: false)
+          break unless step == :wait_readable || step == :wait_writable
+          remaining = deadline ? deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC) : nil
+          raise OpenTimeout if remaining && remaining <= 0
+          ready = step == :wait_readable ? IO.select([@socket], nil, nil, remaining) : IO.select(nil, [@socket], nil, remaining)
+          raise OpenTimeout if ready.nil?
+        end
       end
       @fresh = true
       nil
+    rescue StandardError
+      close_socket
+      raise
     end
 
     # Closes the session, and raises IOError when none is open, as CRuby's
@@ -624,6 +828,8 @@ module Net
     end
 
     def close_socket
+      @wire_buffer = String.new
+      @wire_socket = nil
       @tls.sysclose unless @tls.nil?
       @socket.close unless @socket.nil?
       @tls = nil
@@ -675,23 +881,6 @@ module Net
     end
     private :debug
 
-    # Wait for the peer to START answering, or give up. Without this a server
-    # that accepts the connection and never replies held the caller forever,
-    # whatever read_timeout was set to (#4133).
-    #
-    # Once. Not before every read, and the reason is worth stating: after the
-    # first byte arrives the rest of the response is normally already in a
-    # buffer this cannot see -- stdio's on the plain path, the TLS record
-    # layer's on the other -- so waiting again would time out on data the
-    # caller is holding. What this covers is the failure that hangs: a peer
-    # that accepts and then says nothing. A stall PART WAY through a response
-    # is not covered, and CRuby's per-read timeout does cover it.
-    def wait_for_response
-      limit = @read_timeout.nil? ? 0 : @read_timeout
-      return if limit <= 0
-      raise ReadTimeout if IO.select([@socket], nil, nil, limit).nil?
-    end
-
     def get(path, headers = nil)
       req = HTTPRequest.new("GET", path, headers)
       request(req)
@@ -738,6 +927,11 @@ module Net
       res.body
       end_transport(req, res)
       res
+    rescue StandardError
+      socket = @socket
+      close_socket
+      @socket = socket # The next transport hook sees a closed socket, as on CRuby.
+      raise
     ensure
       do_finish unless started
     end
@@ -823,17 +1017,44 @@ module Net
     end
 
     def wire_gets
-      @tls.nil? ? @socket.gets : @tls.gets
+      while (index = @wire_buffer.index("\n")).nil?
+        chunk = wire_receive(16384)
+        break if chunk.nil?
+        @wire_buffer << chunk
+      end
+      return nil if @wire_buffer.empty?
+      n = index.nil? ? @wire_buffer.bytesize : index + 1
+      line = @wire_buffer.byteslice(0, n)
+      @wire_buffer = @wire_buffer.byteslice(n, @wire_buffer.bytesize).to_s
+      line
     end
 
     def wire_read(n)
-      @tls.nil? ? @socket.readpartial(n) : @tls.readpartial(n)
-    rescue EOFError
-      nil
+      return wire_receive(n) if @wire_buffer.empty?
+      chunk = @wire_buffer.byteslice(0, n)
+      @wire_buffer = @wire_buffer.byteslice(chunk.bytesize, @wire_buffer.bytesize).to_s
+      chunk
+    end
+
+    # Try buffered TLS data before waiting; each read has its own deadline.
+    def wire_receive(n)
+      loop do
+        deadline = @read_timeout && Process.clock_gettime(Process::CLOCK_MONOTONIC) + @read_timeout
+        chunk = @tls.nil? ? @socket.read_nonblock(n, exception: false) : @tls.sysread_nonblock(n, exception: false)
+        return chunk unless chunk == :wait_readable || chunk == :wait_writable
+        remaining = deadline ? deadline - Process.clock_gettime(Process::CLOCK_MONOTONIC) : nil
+        raise ReadTimeout if remaining && remaining <= 0
+        ready = chunk == :wait_readable ? IO.select([@socket], nil, nil, remaining) : IO.select(nil, [@socket], nil, remaining)
+        raise ReadTimeout if ready.nil?
+      end
     end
 
     def wire_read_all
-      @tls.nil? ? @socket.read : @tls.read
+      body = String.new
+      while (chunk = wire_read(16384))
+        body << chunk
+      end
+      body
     end
 
     def write_request(req)
@@ -864,7 +1085,11 @@ module Net
     end
 
     def read_response(method, decode_content)
-      wait_for_response
+      # Connection hooks may be overridden; the buffer belongs to its socket.
+      unless @wire_socket.equal?(@socket)
+        @wire_buffer = String.new
+        @wire_socket = @socket
+      end
       version = ""
       code = ""
       message = ""
@@ -989,38 +1214,7 @@ module Net
     # leading digit, so an unlisted 2xx is still a Net::HTTPSuccess and
     # `res.is_a?(Net::HTTPSuccess)` answers what it should.
     def build_response(version, code, message, headers, body, fields = nil)
-      case code
-      when "200" then return HTTPOK.new(version, code, message, headers, body, fields)
-      when "201" then return HTTPCreated.new(version, code, message, headers, body, fields)
-      when "202" then return HTTPAccepted.new(version, code, message, headers, body, fields)
-      when "204" then return HTTPNoContent.new(version, code, message, headers, body, fields)
-      when "301" then return HTTPMovedPermanently.new(version, code, message, headers, body, fields)
-      when "302" then return HTTPFound.new(version, code, message, headers, body, fields)
-      when "304" then return HTTPNotModified.new(version, code, message, headers, body, fields)
-      when "307" then return HTTPTemporaryRedirect.new(version, code, message, headers, body, fields)
-      when "308" then return HTTPPermanentRedirect.new(version, code, message, headers, body, fields)
-      when "400" then return HTTPBadRequest.new(version, code, message, headers, body, fields)
-      when "401" then return HTTPUnauthorized.new(version, code, message, headers, body, fields)
-      when "403" then return HTTPForbidden.new(version, code, message, headers, body, fields)
-      when "404" then return HTTPNotFound.new(version, code, message, headers, body, fields)
-      when "405" then return HTTPMethodNotAllowed.new(version, code, message, headers, body, fields)
-      when "409" then return HTTPConflict.new(version, code, message, headers, body, fields)
-      when "410" then return HTTPGone.new(version, code, message, headers, body, fields)
-      when "422" then return HTTPUnprocessableEntity.new(version, code, message, headers, body, fields)
-      when "429" then return HTTPTooManyRequests.new(version, code, message, headers, body, fields)
-      when "500" then return HTTPInternalServerError.new(version, code, message, headers, body, fields)
-      when "502" then return HTTPBadGateway.new(version, code, message, headers, body, fields)
-      when "503" then return HTTPServiceUnavailable.new(version, code, message, headers, body, fields)
-      when "504" then return HTTPGatewayTimeout.new(version, code, message, headers, body, fields)
-      end
-      case code[0, 1]
-      when "1" then HTTPInformation.new(version, code, message, headers, body, fields)
-      when "2" then HTTPSuccess.new(version, code, message, headers, body, fields)
-      when "3" then HTTPRedirection.new(version, code, message, headers, body, fields)
-      when "4" then HTTPClientError.new(version, code, message, headers, body, fields)
-      when "5" then HTTPServerError.new(version, code, message, headers, body, fields)
-      else HTTPResponse.new(version, code, message, headers, body, fields)
-      end
+      HTTPResponse.response_class(code).new(version, code, message, headers, body, fields)
     end
 
     # Chunked transfer: each chunk is a hex length line, the bytes, then CRLF.

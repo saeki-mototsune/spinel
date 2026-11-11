@@ -41,6 +41,17 @@ module SQL
 end
 ```
 
+The name may also be a library file name, a path, or an Array of
+candidates, as the ffi gem takes them:
+
+- a file name (`"libturbojpeg.so.0"`, `"libz.1.dylib"`) links that file:
+  `-l:<file>` for GNU ld and lld, which reaches a library installed
+  without its development link; on macOS, whose system libraries link from
+  the SDK's stubs, the `-l` of its base name (`-lz`);
+- a path (`"/opt/x/lib/libfoo.so"`) goes to the linker as it is;
+- an Array (`["libz.1.dylib", "z"]`) links the first candidate this machine
+  has a library file for, or the first one when it has none.
+
 ### `ffi_cflags "..."`
 
 Declares cflags (include dirs, defines, link-search paths) needed for
@@ -184,8 +195,17 @@ the call runs does not wait for it to return (otherwise every other worker
 waits at the barrier until it does), and a collection in progress is
 waited out on the way back. The arguments are evaluated before the call
 leaves. The bracket costs a scheduler lock round trip, so it is for calls
-that block, not for every call; a callback-taking or variadic function
-keeps the plain call. The single-threaded runtime ignores the keyword.
+that block, not for every call; a variadic function keeps the plain call.
+The single-threaded runtime ignores the keyword.
+
+An `ffi_callback` from inside such a call comes back into the world for the
+method and goes out again when it has returned. That holds for one handed to
+the call and for one handed to C earlier, as an event loop calls back what was
+registered with it, so `[NSApp run]` can be declared blocking while its timers
+run Ruby. The method runs like any other: it allocates, starts threads and
+raises, and a raise unwinds out of the call as it does from a plain one. A
+String the method returns to C is the program's to keep alive: once the worker
+is out again, a collection can take it.
 
 ### Passing an `IO::Buffer`
 
