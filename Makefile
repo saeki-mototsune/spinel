@@ -1354,8 +1354,10 @@ TESTS := $(filter-out test/io_winsize_set.rb,$(TESTS))
 endif
 # A test whose subject only Linux gives (`# spinel: linux`): a connect to a
 # listener whose accept queue is full hangs there, as one to a dead host
-# does, where macOS refuses it at once. Such a test runs on Linux alone;
-# master's Linux jobs and the ryzen9 lanes are its check.
+# does, where macOS refuses it at once; and only Linux holds a process to
+# chosen CPUs, for a test of what one that may use a single CPU does. Such
+# a test runs on Linux alone; master's Linux jobs and the ryzen9 lanes are
+# its check.
 ifneq ($(shell uname -s),Linux)
 TESTS := $(filter-out $(shell grep -l '^\# spinel: linux' test/*.rb),$(TESTS))
 endif
@@ -1794,6 +1796,18 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SPINEL_TIMEOUT)
 	    cmp -s "$$tmp/out" test/ext/expected_methods_sub && [ $$rc -eq 0 ] || { echo "ext-test: FAIL (--ext-class subclass host output mismatch, or status $$rc)"; diff -u test/ext/expected_methods_sub "$$tmp/out" || true; ok=0; }; \
 	  else echo "ext-test: FAIL (--ext-class subclass host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
 	fi; \
+	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/dup_leaf.rb -c --no-line-map --ext-init Init_ext_dup \
+	      --ext-entry ExtDup.go --ext-class ExtDupB::Base -o "$$tmp/d.c" >/dev/null 2>&1; then \
+	    echo "ext-test: FAIL (--ext-class path emission with two classes of one leaf name)"; ok=0; \
+	  elif ! grep -Fq '"b")[1]), 0,' "$$tmp/d.c" || grep -Fq '"a")[1]), 0,' "$$tmp/d.c" || grep -Fq '"c")[1]), 0,' "$$tmp/d.c"; then \
+	    echo "ext-test: FAIL (--ext-class ExtDupB::Base exports a class other than ExtDupB::Base)"; ok=0; \
+	  fi; \
+	  if $(SPINEL) test/ext/dup_leaf.rb -c --no-line-map --ext-init Init_ext_dup \
+	      --ext-entry ExtDup.go --ext-class Base -o "$$tmp/d.c" >"$$tmp/d.out" 2>&1; then \
+	    echo "ext-test: FAIL (--ext-class Base named two classes and compiled)"; ok=0; \
+	  else grep -q "names 2 classes" "$$tmp/d.out" || { echo "ext-test: FAIL (--ext-class Base refused without naming both classes)"; sed -n 1,3p "$$tmp/d.out"; ok=0; }; fi; \
+	fi; \
 	rm -rf "$$tmp"; \
 	if [ $$ok -eq 1 ]; then echo "ext-test: pass"; else exit 1; fi
 
@@ -1944,7 +1958,7 @@ decisions-test: $(SPINEL) $(SPINEL_TIMEOUT)
 	  [ "$$(SPINEL_GC_STRESS=2 $(TIMEOUT10) "$$tmp/fa" 2>&1)" = "$$(printf 'true\ntrue')" ] || \
 	  { echo "decisions-test: FAIL (the program whose receiver temp is a slot of the frame does not answer true, true under SPINEL_GC_STRESS=2)"; ok=0; }; \
 	$(SPINEL) test/fixtures/decisions/builtin_split_narrowed.rb -c -o "$$tmp/bs.c" >/dev/null 2>&1 && \
-	  [ "$$(grep -c 'sp_str_in_list(sp_poly_class_name' "$$tmp/bs.c")" = 1 ] && grep 'sp_str_in_list(sp_poly_class_name' "$$tmp/bs.c" | grep -q '"IO"' && grep -q 'sp_message()' "$$tmp/bs.c" || \
+	  [ "$$(grep -c 'sp_poly_class_name_id(' "$$tmp/bs.c")" = 1 ] && grep 'sp_poly_class_name_id(' "$$tmp/bs.c" | grep -qE '== -120[^0-9]' && grep -q 'sp_message()' "$$tmp/bs.c" || \
 	  { echo "decisions-test: FAIL (a boxed send tested builtin classes its receiver cannot be, or dropped the one it may be)"; ok=0; }; \
 	n=$$(printf 'm%0700d' 0); \
 	printf 'class Sprites\n  def initialize; @s = [[1, 2], [3]]; end\n  def %sa(i) = @s[i].size\n  def %sb(i) = @s[i].first\nend\ns = Sprites.new\np s.%sa(0), s.%sb(1)\n' $$n $$n $$n $$n > "$$tmp/long.rb"; \
@@ -5570,7 +5584,10 @@ gate-test:
 # under the gate's job server (they took 181 s one after another, the
 # longest of the gate's legs; spin-check alone is 72 s).
 gate-props:
-	+@$(MAKE) --no-print-directory alloc-report-test infer-test collect-errors-test spin-check diff-test scale-test traits-check-test ty-setter-check imemo-shadow-test bop-arity-check-test bop-callbacks-test bop-share-check-test poly-cold-test share-strings-test wrap-test
+	+@$(MAKE) --no-print-directory alloc-report-test infer-test collect-errors-test spin-check diff-test scale-test traits-check-test ty-setter-check imemo-shadow-test bop-arity-check-test bop-callbacks-test bop-share-check-test poly-cold-test share-strings-test wrap-test process-clock-test
+.PHONY: process-clock-test
+process-clock-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB)
+	@CC="$(CC)" REF_RUBY="$(REF_RUBY)" ruby tools/process_clock_test.rb $(SPINEL)
 
 # infer_type's answers kept across queries against fresh ones (#8852): a
 # write the setters do not count shows as a differing answer. The whole
@@ -5609,10 +5626,13 @@ imemo-shadow-corpus: $(SPINEL)
 # each change for its memo (#8852). Under SP_TY_GUARD their fields are const,
 # so a direct write anywhere in the compiler does not compile. The nine
 # viewed node arrays also hide their field names outside compiler.h and
-# their storage/view owners (compiler.c and codegen_view.c).
+# their storage/view owners (compiler.c and codegen_view.c). A pointer that
+# drops the const is gcc's -Wdiscarded-qualifiers; clang takes that for an
+# unknown option and has the warning under a name of its own.
+TY_GUARD_QUAL := -Werror=discarded-qualifiers $(if $(filter clang,$(CC_KIND)),-Werror=incompatible-pointer-types-discards-qualifiers)
 ty-setter-check: $(SPINEL)
 	@printf '%s\n' $(patsubst build/csrc/%.o,src/%.c,$(SPINEL_OBJ)) | \
-	 xargs -P $(NPROC) -I{} $(CC) $(CFLAGS) -fsyntax-only -DSP_TY_GUARD -Werror=discarded-qualifiers -Isrc -Ibuild/csrc {} && \
+	 xargs -P $(NPROC) -I{} $(CC) $(CFLAGS) -fsyntax-only -DSP_TY_GUARD $(TY_GUARD_QUAL) -Isrc -Ibuild/csrc {} && \
 	 echo "ty-setter-check: pass"
 
 # The ty_traits table (types.c) against the functions each column names,

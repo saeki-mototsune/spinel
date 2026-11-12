@@ -564,12 +564,10 @@ static inline double sp_process_clock_gettime(void) {
 #endif
 }
 
-/* Nanoseconds from the given clock id, for Process.clock_gettime with an
-   integer unit (the caller scales to us/ms/s or a float). */
-static inline int64_t sp_process_clock_ns(sp_int clock_id) {
+static inline int64_t sp_process_clock_units(sp_int clock_id, int64_t ns_per_unit) {
   struct timespec ts;
   if (clock_gettime((clockid_t)clock_id, &ts) != 0) ts.tv_sec = ts.tv_nsec = 0;
-  return (int64_t)ts.tv_sec * 1000000000LL + (int64_t)ts.tv_nsec;
+  return (int64_t)ts.tv_sec * (1000000000LL / ns_per_unit) + (int64_t)ts.tv_nsec / ns_per_unit;
 }
 
 /* Clock resolution in nanoseconds, for Process.clock_getres (#3045). */
@@ -1336,6 +1334,7 @@ const char *sp_File_readpartial_into(sp_File *f, sp_int n, sp_String *buf);
 /* IO#pread(len, offset): read without moving the file position. Inline
    because it allocates from this TU's string heap (#3038). */
 static inline const char *sp_File_pread(sp_File *f, sp_int len, sp_int off) {
+  SP_GC_ROOT(f);   /* `File.new(path).pread(n, off)` holds the handle nowhere else */
   sp_pread_check(f, len, 0);
   if (len < 0) len = 0;
   char *buf = (char *)sp_str_alloc((size_t)len);
@@ -1357,6 +1356,7 @@ static inline const char *sp_File_pread_checked(sp_File *f, sp_int len, sp_int o
 /* IO#pread answering NULL at EOF instead of raising, for the same reason as
    sp_File_readpartial_or_nil. */
 static inline const char *sp_File_pread_or_nil(sp_File *f, sp_int len, sp_int off) {
+  SP_GC_ROOT(f);   /* `File.new(path).pread(n, off, buf)` holds the handle nowhere else */
   sp_pread_check(f, len, 1);
   if (len < 0) len = 0;
   char *buf = (char *)sp_str_alloc((size_t)len);
@@ -1382,6 +1382,7 @@ const char *sp_slurp_stream(FILE *fp);
 const char *sp_slurp_stream_err(FILE *fp, int *err);
 sp_File *sp_File_set_encoding(sp_File *f, sp_RbVal ext, sp_RbVal in);
 static inline const char *sp_File_read(sp_File *f) {
+  SP_GC_ROOT(f);   /* `IO.for_fd(fd).read` holds the handle nowhere else */
   sp_io_check_readable(f);
   if (SP_ATOMIC_LOAD(&f->timeout, __ATOMIC_ACQUIRE)) return sp_File_read_timed(f, -1);
   sp_io_wait_readable(f);
@@ -1411,6 +1412,7 @@ static inline const char *sp_File_read(sp_File *f) {
    naming "ODES" with a nonsense size, and the renderer then drew 1496 pixels
    out of 76800. */
 static inline const char *sp_File_read_n(sp_File *f, sp_int n) {
+  SP_GC_ROOT(f);   /* `File.new(path).read(n)` holds the handle nowhere else */
   /* a negative length is CRuby's ArgumentError, checked before the stream */
   if (n < 0) sp_raise_cls("ArgumentError", sp_sprintf("negative length %lld given", (long long)n));
   sp_io_check_readable(f);
@@ -2314,14 +2316,15 @@ static sp_bool sp_poly_responds_builtin(sp_RbVal v, const char *m) {
     "__id__", "define_singleton_method", "instance_eval", "instance_exec",
     "private_methods", "protected_methods", "public_method", "public_methods",
     "remove_instance_variable", "singleton_method", "singleton_methods", NULL };
-  /* empty? is Array's and Hash's, not Enumerable's: a Range does not answer
-     it in CRuby, and activesupport's Object#blank? asks exactly that --
-     deliberately absent from this array, even though both Array and Hash
-     get it from their own generated sp_gen_responds_*[] instead. */
+  /* empty? and length are Array's and Hash's, not Enumerable's: a Range or
+     an Enumerator does not answer them in CRuby, and activesupport's
+     Object#blank? asks exactly that -- deliberately absent from this array,
+     even though both Array and Hash get them from their own generated
+     sp_gen_responds_*[] instead. */
   static const char *const enumm[] = {
     "each", "each_with_index", "each_with_object", "map", "collect", "select",
     "filter", "reject", "find", "detect", "reduce", "inject", "to_a", "size",
-    "length", "count", "include?", "first", "min", "max", "sort", "sort_by",
+    "count", "include?", "first", "min", "max", "sort", "sort_by",
     "sum", "any?", "all?", "none?", "one?", "group_by", "partition", "zip",
     "flat_map", "each_slice", "each_cons", "take", "drop", NULL };
   static const char *const numm[] = {
@@ -3557,14 +3560,20 @@ static inline int sp_poly_is_user_obj(sp_RbVal v) {
    as CRuby's to_ary: a program object answering #to_ary becomes that
    Array, and one whose #to_ary answers a non-Array is CRuby's TypeError.
    Anything else comes back as it was, for the caller's own error. */
-static sp_RbVal sp_poly_ary_operand(sp_RbVal v) {
-  if (!(sp_poly_is_user_obj(v) && v.v.p && sp_obj_to_ary_fn)) return v;
-  sp_RbVal a = sp_obj_to_ary_fn(v);
+/* What the to_ary answer a of program object v makes of it, as CRuby's
+   rb_check_array_type: an Array is the value, nil keeps the object, and
+   any other answer is CRuby's TypeError. A call site that calls its own
+   version of to_ary hands that version's answer here. */
+static sp_RbVal sp_poly_ary_answer(sp_RbVal v, sp_RbVal a) {
   if (a.tag == SP_TAG_NIL) return v;
   if (a.tag == SP_TAG_OBJ && a.v.p && sp_poly_is_array_kind(a.cls_id)) return a;
   const char *cn = sp_poly_class_name(v);
   sp_raise_cls("TypeError", sp_sprintf("can't convert %s to Array (%s#to_ary gives %s)", cn, cn, sp_poly_class_name(a)));
   return v;
+}
+static sp_RbVal sp_poly_ary_operand(sp_RbVal v) {
+  if (!(sp_poly_is_user_obj(v) && v.v.p && sp_obj_to_ary_fn)) return v;
+  return sp_poly_ary_answer(v, sp_obj_to_ary_fn(v));
 }
 
 /* One element of Array#to_h, converted as CRuby's rb_check_array_type: a
@@ -4477,6 +4486,116 @@ static SP_UNUSED sp_RbVal sp_poly_nil_no_method(const char *m, sp_RbVal v) { sp_
 static SP_UNUSED sp_int sp_poly_range_bound(sp_RbVal v, sp_int none) { return v.tag == SP_TAG_NIL ? none : sp_poly_to_i(v); }
 /* Enumerating a beginless Range: CRuby's TypeError. */
 static SP_NOINLINE SP_COLD SP_UNUSED void sp_range_nil_begin_raise(void) { sp_raise_cls("TypeError", "can't iterate from NilClass"); }
+/* The sum of an Integer Range's elements plus an Integer seed, by the
+   closed form instead of a walk: n elements from first by step s add to
+   n * (first + last) / 2. The Array a walk builds holds at most 2**30
+   elements, so `(1..2**31).sum` answered the sum of the first 2**30 of them.
+   It is computed in an integer twice the word's width (SP_RSUM_W), where it
+   is exact for every Range: n is at most 2**w and first + last below 2**w in
+   size, and one of them is halved first (n when it is even; else first +
+   last, which is then even, as the n - 1 steps between them are an even
+   count). The seed is added in the same width, so a sum the seed brings
+   back into the word is no overflow. Only the total that leaves the word
+   follows the overflow mode: a Bignum under promote, RangeError under
+   raise, wrapped under wrap. */
+#if SP_HAVE_INT128 && INTPTR_MAX > INT32_MAX
+#  define SP_RSUM_W sp_int128
+#elif INTPTR_MAX == INT32_MAX
+#  define SP_RSUM_W int64_t
+#endif
+#ifdef SP_RSUM_W
+static SP_UNUSED SP_RSUM_W sp_range_sum_w(sp_Range r, sp_int seed) {
+  if (r.nobeg) sp_range_nil_begin_raise();
+  if (r.noend) sp_raise_cls("RangeError", "cannot convert endless range to an array");
+  sp_int s = sp_range_step(r);
+  if (sp_range_none(r, s)) return (SP_RSUM_W)seed;
+  /* the count less one, exact in unsigned (sp_range_count caps the count) */
+  uintptr_t q = sp_range_span(r, s) / sp_range_ustep(s);
+  SP_RSUM_W n = (SP_RSUM_W)q + 1;
+  SP_RSUM_W ends = (SP_RSUM_W)r.first + (SP_RSUM_W)sp_range_last_elem(r);
+  SP_RSUM_W total = (n & 1) ? n * (ends / 2) : (n / 2) * ends;
+  return total + (SP_RSUM_W)seed;
+}
+/* does a wide sum fit the word? */
+static SP_UNUSED sp_bool sp_range_sum_fits(SP_RSUM_W v) {
+  return v >= (SP_RSUM_W)INTPTR_MIN && v <= (SP_RSUM_W)INTPTR_MAX;
+}
+#endif
+static SP_UNUSED sp_RbVal sp_range_sum_box(sp_Range r, sp_int seed) {
+#ifdef SP_RSUM_W
+  SP_RSUM_W v = sp_range_sum_w(r, seed);
+  if (sp_range_sum_fits(v)) return sp_box_int((sp_int)v);
+#  ifdef SP_INT_OVERFLOW_MODE_PROMOTE
+  /* past the word: hi * 2**w + lo, with lo in two half-word pieces so each
+     piece fits in a box */
+  const int hw = (int)(sizeof(sp_int) * 4);
+  sp_int hi = (sp_int)(v >> (2 * hw));
+  uintptr_t lo = (uintptr_t)v;
+  uintptr_t half = ((uintptr_t)1 << hw);
+  sp_RbVal acc = sp_poly_mul(sp_box_int(hi), sp_box_int((sp_int)half));
+  SP_GC_ROOT_RBVAL(acc);
+  acc = sp_poly_add(acc, sp_box_int((sp_int)(lo >> hw)));
+  acc = sp_poly_mul(acc, sp_box_int((sp_int)half));
+  return sp_poly_add(acc, sp_box_int((sp_int)(lo & (half - 1))));
+#  elif defined(SP_INT_OVERFLOW_MODE_WRAP)
+  return sp_box_int((sp_int)(uintptr_t)v);
+#  else
+  sp_raise_cls("RangeError", "integer overflow in +");
+  return sp_box_int(0);
+#  endif
+#else
+  /* no double-width integer (a portable build of a 64-bit word): the
+     halved product through the mode's own arithmetic */
+  if (r.nobeg) sp_range_nil_begin_raise();
+  if (r.noend) sp_raise_cls("RangeError", "cannot convert endless range to an array");
+  sp_int n = sp_range_count(r);
+  if (n <= 0) return sp_box_int(seed);
+  sp_int mid = (sp_int)((uintptr_t)r.first + (uintptr_t)((n - 1) / 2) * (uintptr_t)sp_range_step(r));
+  sp_RbVal total;
+  if (n & 1) total = SP_POLY_INT_OP(mul, n, mid);
+  else {
+    sp_RbVal ends = SP_POLY_INT_OP(add, r.first, sp_range_last_elem(r));
+    SP_GC_ROOT_RBVAL(ends);
+    total = sp_poly_mul(sp_box_int(n / 2), ends);
+  }
+  SP_GC_ROOT_RBVAL(total);
+  return sp_poly_add(total, sp_box_int(seed));
+#endif
+}
+/* the same sum as a Float, for a Float (or any non-Integer) seed: CRuby
+   adds the exact total to the seed's Float, so the total never passes
+   through the word, where it raised under raise and wrapped under wrap */
+static SP_UNUSED sp_float sp_range_sum_f(sp_Range r) {
+#ifdef SP_RSUM_W
+  return (sp_float)sp_range_sum_w(r, 0);
+#else
+  if (r.nobeg) sp_range_nil_begin_raise();
+  if (r.noend) sp_raise_cls("RangeError", "cannot convert endless range to an array");
+  sp_int n = sp_range_count(r);
+  if (n <= 0) return 0.0;
+  if (n & 1) {
+    sp_int mid = (sp_int)((uintptr_t)r.first + (uintptr_t)((n - 1) / 2) * (uintptr_t)sp_range_step(r));
+    return (sp_float)n * (sp_float)mid;
+  }
+  return (sp_float)(n / 2) * ((sp_float)r.first + (sp_float)sp_range_last_elem(r));
+#endif
+}
+/* the same sum in the word, for the typed sum */
+static SP_UNUSED sp_int sp_range_sum_i(sp_Range r, sp_int seed) {
+#ifdef SP_RSUM_W
+  SP_RSUM_W v = sp_range_sum_w(r, seed);
+  if (sp_range_sum_fits(v)) return (sp_int)v;
+#  ifdef SP_INT_OVERFLOW_MODE_WRAP
+  return (sp_int)(uintptr_t)v;
+#  else
+  sp_raise_cls("RangeError", "integer overflow in +");
+  return 0;
+#  endif
+#else
+  sp_RbVal v = sp_range_sum_box(r, seed);
+  return v.v.i;
+#endif
+}
 /* A Float Range bound read out of a box: nil leaves that side open (the
    -/+HUGE_VAL sentinel), anything else converts as a Float bound does; the
    bits record an open side (nil_bit) or an Integer one (int_bit) for
@@ -4873,6 +4992,25 @@ static SP_UNUSED sp_bool sp_srange_cover_poly(sp_RbVal recv, sp_RbVal x) {
   if (!o.last) return 0;
   int d = strcmp(o.last, r.last);
   return r.excl ? (d < 0 || (d == 0 && o.excl)) : d <= 0;
+}
+/* Range#cover?(range) for an Integer Range a and a String Range b (a boxed
+   Range of Symbols too), as CRuby's r_cover_range_p: an Integer end never compares
+   with a String one, so only a's missing ends can take b in. b is not empty,
+   a has no begin or end where b has one, and an excluded open end of a takes
+   an endless b only when b excludes its end too. */
+static SP_UNUSED sp_bool sp_range_cover_srange(sp_Range a, sp_StrRange b) {
+  /* (an end held as a String handle reads as its current text) */
+  b = sp_srange_live(b);
+  int a_end = a.fe || !a.noend;
+  if (a_end && !b.last) return 0;
+  if (!a.nobeg && !b.first) return 0;
+  if (b.first && b.last && (b.excl ? sp_str_cmp_bytes(b.first, b.last) >= 0 : sp_str_cmp_bytes(b.first, b.last) > 0)) return 0;
+  /* b's begin against a's ends: an Integer never compares with it */
+  if (b.first && (!a.nobeg || a_end)) return 0;
+  if (b.last && a_end) return 0;
+  /* a has no end: b's end is below it, or both are open (equal) */
+  if (a.excl == b.excl) return 1;
+  return a.excl ? b.last != NULL : 1;
 }
 /* A Range whose begin is decided at run time (`a[0]..a[1]` over a mixed
    Array, `x..3`), or whose end is beside an absent begin: the ends pick the
@@ -6674,6 +6812,13 @@ static inline int sp_poly_is_hash_kind(int cls_id) {
   return cls_id == SP_BUILTIN_STR_INT_HASH || cls_id == SP_BUILTIN_STR_STR_HASH ||
          cls_id == SP_BUILTIN_INT_STR_HASH || cls_id == SP_BUILTIN_INT_INT_HASH || cls_id == SP_BUILTIN_STR_POLY_HASH ||
          cls_id == SP_BUILTIN_SYM_POLY_HASH || cls_id == SP_BUILTIN_POLY_POLY_HASH;
+}
+/* A boxed Range carries the class id of its representation, which its ends
+   choose (Integers, Floats, Strings, Times, the program's objects); its
+   class is Range under every one of them */
+static inline int sp_poly_is_range_kind(int cls_id) {
+  return cls_id == SP_BUILTIN_RANGE || cls_id == SP_BUILTIN_FLOAT_RANGE || cls_id == SP_BUILTIN_STR_RANGE ||
+         cls_id == SP_BUILTIN_TIME_RANGE || cls_id == SP_BUILTIN_OBJ_RANGE;
 }
 /* `try_convert` on a class known only at run time: the argument when it
    already is one of that class, nil otherwise, which is what the typed
@@ -14415,9 +14560,7 @@ static sp_bool sp_poly_kind_of_builtin(sp_RbVal v, const char *cn) {
   int is_rat = (v.tag == SP_TAG_OBJ && (v.cls_id == SP_BUILTIN_RATIONAL || v.cls_id == SP_BUILTIN_BIG_RATIONAL));
   int is_cpx = (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_COMPLEX);
   int is_arr = (v.tag == SP_TAG_OBJ && sp_poly_is_array_kind(v.cls_id));
-  int is_range = (v.tag == SP_TAG_OBJ && (v.cls_id == SP_BUILTIN_RANGE ||
-                                          v.cls_id == SP_BUILTIN_FLOAT_RANGE ||
-                                          v.cls_id == SP_BUILTIN_STR_RANGE));
+  int is_range = (v.tag == SP_TAG_OBJ && sp_poly_is_range_kind(v.cls_id));
   int is_hash = (v.tag == SP_TAG_OBJ &&
                  (v.cls_id == SP_BUILTIN_POLY_POLY_HASH || v.cls_id == SP_BUILTIN_SYM_POLY_HASH ||
                   v.cls_id == SP_BUILTIN_STR_POLY_HASH || v.cls_id == SP_BUILTIN_STR_STR_HASH ||
@@ -15779,15 +15922,7 @@ static sp_RbVal sp_poly_sum(sp_RbVal v) {
     case SP_BUILTIN_POLY_ARRAY: return sp_PolyArray_sum_poly((sp_PolyArray *)v.v.p);
     case SP_BUILTIN_PTR_ARRAY:  return sp_PolyArray_sum_poly(sp_PtrArray_to_poly((sp_PtrArray *)v.v.p));
     /* a container-read int Range sums like the typed path (#3234) */
-    case SP_BUILTIN_RANGE: {
-      sp_IntArray *ia = sp_range_to_ia(*(sp_Range *)v.v.p);
-      SP_GC_ROOT(ia);
-#ifdef SP_INT_OVERFLOW_MODE_PROMOTE
-      return sp_IntArray_sum_promote(ia, 0);
-#else
-      return sp_box_int(sp_IntArray_sum(ia, 0));
-#endif
-    }
+    case SP_BUILTIN_RANGE: return sp_range_sum_box(*(sp_Range *)v.v.p, 0);
     /* an Enumerator's seedless sum is its sum(0), as in CRuby: from the
        first Float on, compensated */
     case SP_BUILTIN_ENUMERATOR: return sp_poly_sum_seed(v, sp_box_int(0));
@@ -15825,22 +15960,16 @@ static sp_RbVal sp_range_sum_seed(sp_Range r, sp_RbVal seed) {
   if (r.noend) sp_raise_cls("RangeError", "cannot convert endless range to an array");
   if (sp_range_count(r) <= 0) return seed;
   SP_GC_ROOT_RBVAL(seed);
-  sp_IntArray *ia = sp_range_to_ia(r);
-  SP_GC_ROOT(ia);
-#ifdef SP_INT_OVERFLOW_MODE_PROMOTE
-  sp_RbVal promoted = sp_IntArray_sum_promote(ia, 0);
-  SP_GC_ROOT_RBVAL(promoted);
-  if (seed.tag == SP_TAG_INT || seed.tag == SP_TAG_BIGINT)
-    return sp_poly_add(promoted, seed);
-  return sp_box_float(sp_poly_Float(seed) + sp_poly_Float(promoted));
-#else
-  sp_int total = sp_IntArray_sum(ia, 0);
+  /* an Integer seed goes into the sum itself, so a seed that brings the
+     total back into the word is no overflow */
+  if (seed.tag == SP_TAG_INT) return sp_range_sum_box(r, seed.v.i);
+  /* any other seed is Kernel#Float's, added to the total as a Float */
+  if (seed.tag != SP_TAG_BIGINT) return sp_box_float(sp_poly_Float(seed) + sp_range_sum_f(r));
   /* through sp_poly_add so a Bignum seed keeps its digits instead of wrapping
      into the sp_int the typed emitter used to hand this path */
-  if (seed.tag == SP_TAG_INT || seed.tag == SP_TAG_BIGINT)
-    return sp_poly_add(sp_box_int(total), seed);
-  return sp_box_float(sp_poly_Float(seed) + (sp_float)total);
-#endif
+  sp_RbVal total = sp_range_sum_box(r, 0);
+  SP_GC_ROOT_RBVAL(total);
+  return sp_poly_add(total, seed);
 }
 /* Is this a value CRuby's Array#sum keeps in its EXACT accumulation phase --
    the Integer/Rational family, which adds without dropping a digit? A Float is
@@ -20529,6 +20658,8 @@ static sp_Enumerator *sp_enum_chain_of(sp_RbVal sources) {
     if (!sp_poly_kind_of_builtin(src, "Enumerable"))
       sp_raise_cls("NoMethodError", sp_sprintf("undefined method 'each' for an instance of %s",
                                                sp_poly_class_name(src)));
+    /* a Range of Times is Enumerable and has an #each, which raises */
+    if (src.tag == SP_TAG_OBJ && src.cls_id == SP_BUILTIN_TIME_RANGE && src.v.p) sp_trange_iterate_raise();
     sp_PolyArray *part = sp_enum_items_from(src); SP_GC_ROOT(part);
     for (sp_int j = 0; j < part->len; j++) sp_PolyArray_push(items, part->data[j]);
   }
@@ -20880,11 +21011,12 @@ static sp_bool sp_range_cover_poly(sp_Range *r, sp_RbVal x) {
   return 0;
 }
 /* Range#cover? of an Integer Range: a boxed Range argument is covered by its
-   ends (r_cover_range_p), an Integer or a Float Range alike; any other value
+   ends (r_cover_range_p), an Integer, a Float or a String Range alike; any other value
    as sp_range_cover_poly says. */
 static SP_UNUSED sp_bool sp_range_cover_val(sp_Range *r, sp_RbVal x) {
   if (x.tag == SP_TAG_OBJ && x.v.p && x.cls_id == SP_BUILTIN_RANGE) return sp_range_cover_rng(*r, *(sp_Range *)x.v.p);
   if (x.tag == SP_TAG_OBJ && x.v.p && x.cls_id == SP_BUILTIN_FLOAT_RANGE) return sp_range_cover_frange(*r, *(sp_FloatRange *)x.v.p);
+  if (x.tag == SP_TAG_OBJ && x.v.p && x.cls_id == SP_BUILTIN_STR_RANGE) return sp_range_cover_srange(*r, SP_SRANGE_OF(x.v.p));
   return sp_range_cover_poly(r, x);
 }
 /* slice_before/slice_after with a pattern VALUE: start a new group before

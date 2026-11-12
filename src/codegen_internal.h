@@ -557,11 +557,9 @@ void emit_str_form_handle(Compiler *c, int v, Buf *b);
    a variable's slot (a local's Array at a literal or local index) */
 void strh_elem_handle_text(Compiler *c, int v, Buf *b);
 int strh_elem_slot(Compiler *c, int v);
-int strh_handle_call(Compiler *c, int v);
 int one_str_elem_call(Compiler *c, int v, TyKind rt);
 /* one representation: a block parameter bound to a typed String Array's element is the handle (codegen_fold.c) */
 TyKind one_elem_decl_type(const char *k, TyKind et);
-const char *one_elem_get_sfx(const char *k);
 /* a walk's String Array element `_sa->data[_si]` as the bytes the push or the box takes
    (the element is the handle under the mode; the text is unchanged otherwise) */
 #define ONE_SA_ELEM ("SP_SEB(_sa->data[_si])")
@@ -618,6 +616,14 @@ int builtin_super_cmethod_known(const char *cls, const char *name);
 int builtin_instance_name_known(const char *m);
 int builtin_instance_method_known(const char *cls, const char *m);
 int builtin_arity_violation(Compiler *c, int id, int non_nil);   /* non_nil: a `&.` call's non-nil arm */
+/* Does every builtin class a boxed receiver of call id can be refuse its
+   count, a method_missing of the program aside (which may answer it)? */
+int builtin_count_refused_boxed(Compiler *c, int id);
+/* Does CRuby refuse the arguments call id gives the method of op, a
+   library's IO row (io/console's winsize given one), a keyword hash
+   counted as the call plan says? A boxed handle's dispatch raises its
+   ArgumentError, and inference types the call by the row's answer. */
+int io_library_count_refused(Compiler *c, int id, const BuiltinOp *op, const char *name);
 int builtin_object_method_known(const char *m);
 int name_is_enumerable_module_method(const char *m);
 int class_object_answers_builtin(const char *qm, int is_module);
@@ -641,7 +647,16 @@ extern int  *g_argov_node;
    the C did not build (#7604). view_bind checks the length now. */
 #define ARGOV_TEXT_LEN 160
 extern char (*g_argov_text)[ARGOV_TEXT_LEN];
-extern unsigned char *g_argov_oint;   /* the bound text is an oint (view_bind_o) */
+/* Per slot: ARGOV_OINT, the bound text is an oint (view_bind_o); ARGOV_RAN,
+   it is a temp the binder assigned before the binding is read
+   (view_bind_temp; view_ran_first asks it); ARGOV_HELD, that temp is rooted
+   for the binding's life (view_hold); ARGOV_HANDLE, it is a String handle
+   (view_hold_handle). */
+#define ARGOV_OINT 1u
+#define ARGOV_RAN  2u
+#define ARGOV_HELD 4u
+#define ARGOV_HANDLE 8u
+extern unsigned char *g_argov_flag;
 int view_bind_o(int node, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
 extern int  g_n_argov;
 /* Room for one more override whatever the fill, for a site that must run
@@ -681,6 +696,10 @@ void emit_scan_rtcheck_open(Compiler *c, int id, int recv, Buf *pre, int indent,
    -- variable and literal reads, scalar arithmetic, typed-array reads and
    plain field reads, all the way down (codegen_call.c)? */
 int subtree_is_pure_read(Compiler *c, int id);
+/* The same question about the node's own code, whether or not it already ran
+   into a temp: for a question about what the whole statement runs, not what
+   reading the node here runs. */
+int subtree_code_is_pure_read(Compiler *c, int id);
 /* A pure read, or one of the forms beside that list which run no call of the
    program's and make nothing either: a global's read; a unary minus, `abs`
    or an operator on numbers; `!` on a boolean; `size` or `length` of a
@@ -1256,6 +1275,12 @@ void effect_view_close(Compiler *c, int v);
    value is. A rescue operand is read so when an exception reaches its
    clause. */
 int const_read_raises(Compiler *c, int id);
+/* The NameError of constant (path) node id, whose lookup the caller knows
+   to fail there: its read where that raises, else (a path whose read
+   answers by its last name, though the class or module before it holds no
+   such constant) the raise itself, naming that class or module as CRuby
+   does, with the build-time warning a read gives. */
+void emit_const_lookup_failure(Compiler *c, int id, Buf *b);
 /* The constant path as the program wrote it, for a NameError (codegen_expr.c) */
 void const_path_written(const NodeTable *nt, int id, char *out, size_t cap);
 void emit_constant_slot(Compiler *c, int id, Buf *b);
@@ -1526,6 +1551,9 @@ int emit_unknown_kwarg_raise(Compiler *c, Scope *m, const int *argv, int argc);
    because the rule was written twice and the second copy only had the typed half
    (#4425). */
 void emit_str_append_arg(Compiler *c, int arg, const char *rtext, Buf *b);
+/* ...for a consumer that takes every argument before it appends any: a
+   String argument is read as a copy (emit_str_expr_own). */
+void emit_str_append_arg_own(Compiler *c, int arg, const char *rtext, Buf *b);
 void emit_str_force_encoding(Compiler *c, const char *name, const char *r, const int *argv, int argc, Buf *b);
 int rest_shortfall_required(Compiler *c, Scope *m);
 /* Emit a hash key, unboxing a poly value to the typed-hash's key type. */
@@ -1733,11 +1761,14 @@ int strbuf_marked_yields_handle(Compiler *c, int v);
 void emit_scope_local_ref(Compiler *c, Scope *s, const char *name, Buf *b);
 void emit_typed_elem_value(Compiler *c, int node, TyKind rt, Buf *b);
 void emit_typed_elem_hold(Compiler *c, int node, TyKind rt, const char *text, Buf *b);
-void emit_typed_elem_coerce(Compiler *c, int node, TyKind rt, const char *what, Buf *b);
+int emit_typed_elem_coerce(Compiler *c, int node, TyKind rt, const char *what, Buf *b);
 const char *typed_elem_sfx(TyKind rt);
 const char *typed_elem_store_sfx(TyKind rt);
 TyKind typed_elem_held(TyKind rt);
 int typed_elem_hold_may_make(Compiler *c, int node, TyKind rt);
+int typed_elem_read_raw(TyKind rt, int id);
+int typed_elem_read_open(TyKind rt, int id, Buf *b);
+void typed_elem_getf(char *out, size_t n, TyKind rt, const char *k, const char *argfmt, ...) __attribute__((format(printf, 5, 6)));
 void emit_block_locals_reset(Compiler *c, int blk, Buf *b, int indent);
 const char *resolve_class_alias(Compiler *c, const char *cname);
 const char *resolve_class_alias_chain(Compiler *c, const char *cname);
@@ -1794,6 +1825,7 @@ void ucall_emitted(int id);
 void ucall_refused(int id);
 /* how deep emit_inline_call_x is in spliced bodies (codegen_iter.c) */
 int inline_splice_depth(void);
+void inline_splice_depth_reset(int d);
 /* One refusal: where and what. Recorded in order for --emit-types. */
 typedef struct { const char *file; int line; const char *msg; } SpDiag;
 extern SpDiag *g_diags;
@@ -1870,7 +1902,7 @@ int const_path_in_closed_builtin(Compiler *c, int id);
 int const_path_misses_toplevel(Compiler *c, int id);
 int builtin_module_at(int i, const char **name, int *id);
 int is_builtin_exception_name(const char *n);
-const char *superclass_builtin_exc_name(const NodeTable *nt, int sc);   /* analyze_util.c */
+const char *superclass_builtin_exc_name(const Compiler *c, const NodeTable *nt, int sc);   /* analyze_util.c */
 const char *errno_canonical_name(const char *n);   /* analyze_util.c */
 int is_syserr_family_name(const char *n);           /* analyze_util.c */
 int class_is_syserr(Compiler *c, int ci);          /* codegen_call.c */
@@ -2374,11 +2406,17 @@ int emit_args_before_binding(Compiler *c, Scope *m, const int *argv, int argc, B
    (LocalVar.proc_rebinds), by anything that may call that proc
    (subtree_may_run_proc); an
    instance, global or class variable by any effect. A value built of reads
-   (`[x, 2]`) asks it of each; a block reads when it runs. */
+   (`[x, 2]`) asks it of each; a block reads when it runs. A node bound to a
+   temp the binder marked as run first (view_ran_first) reads that temp: no. */
 int read_rebound_by(Compiler *c, int x, int after);
+/* ...of the variables x's own code reads, whatever x is bound to: whether
+   `after` can give the variable itself another value. A write back to the
+   variable asks it (aset_recv_rebinds_only): a receiver read first into a
+   temp still has its variable rebound by the key or value. */
+int read_code_rebound_by(Compiler *c, int x, int after);
 void strbuf_hold_slot(Compiler *c, int v, int r, Buf *sb);
 /* Whether the key or value of `x[key] = val` may give the local or instance
-   variable `x` reads another value (read_rebound_by) and cannot mutate it,
+   variable `x` reads another value (read_code_rebound_by) and cannot mutate it,
    so a store reads the receiver first and leaves the new binding; 0 for
    any other receiver (codegen_call_recv.c). */
 int aset_recv_rebinds_only(Compiler *c, int recv, int key, int val);
@@ -2587,7 +2625,7 @@ int emit_reader_override_handle(Compiler *c, int id, int cid, const char *name, 
                                 const char *reader, int boxed, Buf *b);
 TyKind reader_override_ty(Compiler *c, int id, int cid, const char *name);
 int emit_tap_then_expr(Compiler *c, int id, Buf *b);
-int recv_is_const(const NodeTable *nt, int recv, const char *name);
+int recv_is_const(const Compiler *c, const NodeTable *nt, int recv, const char *name);
 int sp_is_fiber_storage_recv(const NodeTable *nt, int recv);
 int emit_ctor_yield_inline(Compiler *c, int id, int ci, Buf *b);
 int emit_env_args_before(Compiler *c, int id);
@@ -2641,6 +2679,14 @@ int emit_builtin_op_tmp(Compiler *c, int id, int recv, TyKind rt, const char *na
    there; every other lookup reads stage 0 */
 int emit_builtin_op_stage(Compiler *c, int id, int recv, TyKind rt, const char *name,
                           int stage, Buf *b);
+/* The row emit_builtin_op finds for call id, named name, on a receiver
+   read as kind rt (stage 0, the arguments' kinds as codegen has them), or
+   NULL: what an arm that renders the call itself switches on */
+const struct BuiltinOp *emit_builtin_op_row(Compiler *c, int id, TyKind rt, const char *name);
+/* Call id, named name, on builtin class cls (a constant receiver's name),
+   emitted through its class-side row (cplan_builtin_class_row): 0 when no
+   row of the class's singleton chain emits it */
+int emit_builtin_class_op(Compiler *c, int id, const char *cls, const char *name, Buf *b);
 
 /* #7483: a block's body typed again under one arm's type for its parameter
    (the caller set the parameter's slot to `kind`): each statement's
@@ -2670,6 +2716,7 @@ unsigned view_class_is_read(int tok);
 /* A call re-entered after its enclosing emitter tested the receiver. */
 int view_push_call_nil_tested(Compiler *c, int id);
 int view_call_nil_tested(Compiler *c, int id);
+void view_nil_test_written(Compiler *c, int recv);   /* the guard of emit_nil_target_own's arm wrote its test */
 int emit_delegated_equality(Compiler *c, int id, int negate, Buf *b);
 int view_type_top(int node, TyKind *kind);   /* the open type view on node, if any */
 void view_pop(Compiler *c, int tok);
@@ -2689,8 +2736,12 @@ int view_mark(void);
    see whether a builtin answers it, and the gap of that call
    (emit_unrouted_gap) sets *gap_hit: the builtin declined it. A gap of
    another call in the arm's text (in a block the arm splices, an operand)
-   is that call's own raise, which the arm runs. */
-typedef struct { int pd_skip, prbd_skip, builtin_arm, send_split, each_inline, each_dispatch, gap_watch; int *gap_hit; } ArmCtx;
+   is that call's own raise, which the arm runs. arm_cls names the builtin
+   class every value of a builtin arm is (String's pre-arm), NULL where the
+   arm takes any builtin's value: the class whose lookup decides whether
+   the arm's call reaches the program's Object method
+   (cplan_arm_object_target). */
+typedef struct { int pd_skip, prbd_skip, builtin_arm, send_split, each_inline, each_dispatch, gap_watch; int *gap_hit; const char *arm_cls; } ArmCtx;
 extern ArmCtx g_arm;
 #define g_pd_skip (g_arm.pd_skip)
 #define g_prbd_skip (g_arm.prbd_skip)
@@ -2715,7 +2766,47 @@ int stmt_may_rebind_local(Compiler *c, int stmt, int read, const char *name);
    view_bind answers the binding's slot; view_unbind(n) drops every binding
    from slot n up. */
 int view_bind(int node, const char *fmt, ...) __attribute__((format(printf, 2, 3)));
+/* As view_bind, to the temp _t<t> that the binder assigned the node's value
+   (or a conversion of it) before any read of the binding: the slot records
+   ARGOV_RAN. view_bind_temp_o is view_bind_o's form, and
+   view_bind_temp_read binds `reader(_t<t>)` for a reader that only reads the
+   temp (SP_STR_B, sp_unbox_class). */
+int view_bind_temp(int node, int t);
+int view_bind_temp_o(int node, int t);
+int view_bind_temp_read(int node, const char *reader, int t);
 void view_unbind(int n);
+/* The bindings of method m's own nodes, out of sight while the copy of m's
+   body that `call` splices is emitted: they are an enclosing copy's. A
+   yielding method is spliced at each call, and a block given to one call
+   may call the method again (`M.f { M.f { 1 } }`), so the second copy is
+   emitted inside the first, at the first's `yield`, with the same node
+   ids. An argument the first ran ahead into a temp (emit_arg_temp) is still
+   bound there, and the second read that temp for its own argument and
+   never ran it. The call's own operands are the caller's and stay bound.
+   Answers how many it parked, for view_bind_unpark; a refusal's
+   view_unwind puts them back with the views. */
+int view_bind_park(Compiler *c, const Scope *m, int call);
+void view_bind_unpark(Compiler *c, int n);
+/* Is node `node`'s latest binding to a temp the binder marked as run first
+   (view_bind_temp)? Its read is then that plain temp: it runs nothing,
+   allocates nothing and reads no variable a sibling can rebind, whatever the
+   node's own shape. */
+int view_ran_first(int node);
+/* ...and the binder rooted that temp for as long as the binding lives
+   (view_hold): emit_args_filled_argv's handle temps and the boxed temps
+   hoist_dispatch_args roots. */
+int view_held(int node);
+/* ...and the temp's text, or NULL when the node's latest binding is not held:
+   an argument that renders as it is passed on as that temp. */
+const char *view_held_text(int node);
+/* The temp the binding at `slot` names is rooted for as long as the binding
+   lives. Called by the binder that rooted it, right after view_bind_temp.
+   Only a ran-first slot takes it. */
+void view_hold(int slot);
+/* ...and the temp is a String handle (an sp_String *), not the bytes. */
+void view_hold_handle(int slot);
+/* The node's latest binding is held, and its temp is a String handle. */
+int view_held_handle(int node);
 /* A constant receiver's read effect already ran for the enclosing emission. */
 int view_const_read_done(Compiler *c, int id);
 int view_push_const_read(Compiler *c, int id);
@@ -2732,6 +2823,10 @@ int view_push_repr(Compiler *c, int id, int flag, int v);
 unsigned view_epoch(void);
 void view_unwind(int mark);   /* back to a view_mark(): views, arm contexts and bindings */
 int emit_op_ivar_reflection(Compiler *c, const BopCtx *x, Buf *b);
+/* CRuby's NameError for `sym`, a literal name that is no instance variable
+   name (ivar_name_ok): `sp_raise_cls(...)`, a statement-free expression */
+void emit_ivar_name_error(Compiler *c, Buf *b, const char *sym, int arg);
+const char *ivar_raise_tail(Compiler *c, int id);   /* that raise's dead value, in the call's C form */
 int emit_exc_ivar_call(Compiler *c, int id, const char *name, int recv, Buf *b);
 /* The concurrency handles' row emitters (codegen_call_concurrency.c) */
 int emit_op_thread_set_report(Compiler *c, const BopCtx *x, Buf *b);
@@ -2850,6 +2945,12 @@ int emit_op_array_cycle_endless(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_array_slice_groups(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_array_join_str(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_array_pred_class(Compiler *c, const BopCtx *x, Buf *b);
+/* IO's class-side rows and io/console's writer (codegen_call_io.c) */
+int emit_op_io_for_fd(Compiler *c, const BopCtx *x, Buf *b);
+int emit_op_io_select(Compiler *c, const BopCtx *x, Buf *b);
+int emit_op_io_copy_stream(Compiler *c, const BopCtx *x, Buf *b);
+int emit_op_io_sysopen(Compiler *c, const BopCtx *x, Buf *b);
+int emit_op_io_set_winsize(Compiler *c, const BopCtx *x, Buf *b);
 /* A typed array receiver of a compare (`ck` "cmp") or a blockless sum (`ck`
    "sum"), wrapped in the runtime's nil check where the array can hold nil
    (codegen_call_recv.c) */
@@ -2959,6 +3060,9 @@ int order_operand_inert(Compiler *c, int call, int op, int is_recv);   /* codege
 /* ...and the count it expects when it does not (NULL when it admits it) */
 const char *builtin_arity_expected(const char *cls, const char *name, int with_block, int argc,
                                    char *exp, size_t n);
+/* The arity table's class for a row's receiver kind, or NULL: the kinds the
+   table probes a receiver of (a stream's are File's). */
+const char *bop_spec_class(TyKind k);
 void emit_complex_coerce(Compiler *c, int node, Buf *b);
 int emit_complex_real_args(Compiler *c, const int *argv, int argc, int polar, Buf *b);
 void emit_brk_wrapped_call(Compiler *c, int id, Buf *b);
@@ -2977,6 +3081,15 @@ int splice_to_ary_mi(Compiler *c, TyKind rhs_ty);
 TyKind emit_splice_to_ary_src(Compiler *c, int id, int rhs_node, TyKind rhs_ty, int mi, int ta, Buf *b, Buf *out);
 void emit_to_ary_dispatch(Compiler *c, int id, int cid, const char *selfptr, Buf *out);
 int emit_boxed_to_ary(Compiler *c, int id, int op, int src, Buf *b, int indent);
+struct CplanToAry;   /* (call_plan.h) */
+/* The conversions of the boxed value v (an lvalue) to the Array the
+   classes ks[0..n) answer, each as vs[i] says (cplan_boxed_to_ary_classes),
+   every test led by the C condition text guard (empty, or ending in
+   " && "); an unrooted v holds the answer through a rooted temp */
+void emit_boxed_to_ary_arms(Compiler *c, const int *ks, const struct CplanToAry *vs, int n, const char *guard, const char *v, int rooted, Buf *b, int indent);
+/* The boxed answer of to_ary method mi, of class defc's, called on the
+   program object the sp_RbVal v holds (sp_obj_to_ary's arm): into b. */
+void emit_obj_to_ary_call(Compiler *c, int mi, int defc, const char *v, Buf *b);
 void emit_index_op_write(Compiler *c, int id, Buf *b, int indent);
 void emit_index_and_or_write(Compiler *c, int id, Buf *b, int indent, int is_or);
 int scope_has_return(Compiler *c, int scope_idx);
@@ -3104,6 +3217,7 @@ void emit_int_expr(Compiler *c, int node, Buf *b);
    an `x + c` whose check waited (codegen.c) */
 void emit_int_index_late(Compiler *c, int node, int tk, char *redo, size_t n, Buf *b);
 void emit_str_expr(Compiler *c, int node, Buf *b);
+void emit_str_expr_own(Compiler *c, int node, Buf *b);
 void emit_path_expr(Compiler *c, int node, Buf *b);
 void emit_to_s_expr(Compiler *c, int node, Buf *b);
 /* Converted String operands held across the call they enter (codegen.c).
@@ -3167,6 +3281,13 @@ int emit_rooted_arg_list(Compiler *c, const int *argv, int argc,
                          const char *ctype, const char *root,
                          void (*emit)(Compiler *, int, Buf *), int *tmps, Buf *b);
 void emit_split_pre(Compiler *c, int node, void (*emit)(Compiler *, int, Buf *), Buf *pre, Buf *val);
+/* The run-time test that boxed value _t<tv>, the receiver recv of a call of
+   name, is of a class whose own lookup answers name ahead of Object (the
+   classes cplan_send_split_owners gives: a builtin one by its class id, a
+   program's by its name), written to b (NULL: counted only); with
+   no_class_values, without Module's and Class's, which answer class
+   values. The number of classes it tests, 0 for none. */
+int emit_owner_class_test(Compiler *c, int recv, const char *name, int tv, int no_class_values, Buf *b);
 /* A braced conditional arm whose hoisted setup stays inside that arm. */
 void emit_cond_arm(Compiler *c, int node, Buf *b, void (*emit)(Compiler *, int, Buf *, void *), void *ctx);
 void declare_local(Compiler *c, Buf *b, LocalVar *lv, int vol);

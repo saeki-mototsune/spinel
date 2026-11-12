@@ -100,28 +100,28 @@ static void const_pair_add(ANameHash *out, const char *pn, const char *nm) {
 }
 /* The constants subtree n (not entering a nested class, module or method)
    writes, as pn's */
-static void body_const_writes(const NodeTable *nt, int n, const char *pn, ANameHash *out) {
+static void body_const_writes(const Compiler *c, const NodeTable *nt, int n, const char *pn, ANameHash *out) {
   if (n < 0) return;
   NodeKind k = nt_kind(nt, n);
   if (k == NK_ClassNode || k == NK_ModuleNode || k == NK_SingletonClassNode || k == NK_DefNode) return;
   /* (a multiple assignment's target too: `P, Q = ...`) */
   if (k == NK_ConstantWriteNode || k == NK_ConstantOrWriteNode || k == NK_ConstantAndWriteNode ||
       k == NK_ConstantOperatorWriteNode || k == NK_ConstantTargetNode)
-    const_pair_add(out, pn, nt_key_name(nt, n));
+    const_pair_add(out, pn, key_name(c, n));
   int nr = nt_num_refs(nt, n);
-  for (int i = 0; i < nr; i++) body_const_writes(nt, nt_ref_at(nt, n, i), pn, out);
+  for (int i = 0; i < nr; i++) body_const_writes(c, nt, nt_ref_at(nt, n, i), pn, out);
   int na = nt_num_arrs(nt, n);
   for (int i = 0; i < na; i++) {
     int m = 0;
     const int *ids = nt_arr_at(nt, n, i, &m);
-    for (int j = 0; j < m; j++) body_const_writes(nt, ids[j], pn, out);
+    for (int j = 0; j < m; j++) body_const_writes(c, nt, ids[j], pn, out);
   }
 }
 /* the path `pn::nm` (or `::pn::nm`) that node is; none for `self::nm` */
-static void path_const_write(const NodeTable *nt, int node, ANameHash *out) {
+static void path_const_write(const Compiler *c, const NodeTable *nt, int node, ANameHash *out) {
   if (node < 0) return;
   int par = nt_ref(nt, node, "parent");
-  const_pair_add(out, par >= 0 ? nt_key_name(nt, par) : NULL, nt_key_name(nt, node));
+  const_pair_add(out, par >= 0 ? key_name(c, par) : NULL, key_name(c, node));
 }
 static const ANameHash *const_pairs_of(Compiler *c) {
   const NodeTable *nt = c->nt;
@@ -132,16 +132,16 @@ static const ANameHash *const_pairs_of(Compiler *c) {
   int ndk = 0; const NodeKind *dk = class_def_kinds(&ndk);
   for (int dh = 0; dh < ndk; dh++)
     NT_FOREACH_KIND(nt, dk[dh], d) {
-      const char *dn = class_def_opens_cref(nt, d) ? class_def_name(nt, d) : NULL;
-      if (dn) body_const_writes(nt, class_def_body(nt, d), dn, &p->keys);
+      const char *dn = class_def_opens_cref(nt, d) ? class_def_key(c, d) : NULL;
+      if (dn) body_const_writes(c, nt, class_def_body(nt, d), dn, &p->keys);
     }
   static const NodeKind writes[] = { NK_ConstantPathWriteNode, NK_ConstantPathOrWriteNode,
                                      NK_ConstantPathAndWriteNode, NK_ConstantPathOperatorWriteNode };
   for (int i = 0; i < 4; i++)
-    NT_FOREACH_KIND(nt, writes[i], w) path_const_write(nt, nt_ref(nt, w, "target"), &p->keys);
-  NT_FOREACH_KIND(nt, NK_ConstantPathTargetNode, t) path_const_write(nt, t, &p->keys);
+    NT_FOREACH_KIND(nt, writes[i], w) path_const_write(c, nt, nt_ref(nt, w, "target"), &p->keys);
+  NT_FOREACH_KIND(nt, NK_ConstantPathTargetNode, t) path_const_write(c, nt, t, &p->keys);
   /* a self-alias write the desugaring dropped (desugar_constant_path_self_alias) */
-  NT_FOREACH_KIND(nt, NK_NilNode, d) path_const_write(nt, (int)nt_int(nt, d, "dropped_target", -1), &p->keys);
+  NT_FOREACH_KIND(nt, NK_NilNode, d) path_const_write(c, nt, (int)nt_int(nt, d, "dropped_target", -1), &p->keys);
   p->nt = nt; p->ver = nt->version; p->edits = nt->edits; p->count = nt->count;
   return &p->keys;
 }
@@ -190,9 +190,15 @@ static const char *class_leaf_name(const char *n) {
    or module the program nests in k, a constant it writes in a body of k or
    through `k::NAME = v`, or one a write the analysis cannot place may
    define (a path written through a dynamic parent, const_set). *sub is the
-   class or module the member is, -1 when it is a value or unknown. */
-static int class_may_have_const(Compiler *c, int k, const char *nm, int *sub, int depth) {
+   class or module the member is, -1 when it is a value or unknown. `seen`
+   holds, per class, one more than the least depth the search entered it at
+   (0: not yet): a class met again no nearer is not searched again, since
+   modules that each include several of the ones before them are reached by
+   a number of routes that grows with every link. */
+static int class_may_have_const_from(Compiler *c, int k, const char *nm, int *sub, int depth, int *seen) {
   if (k < 0 || k >= c->nclasses || depth > 32) return 0;
+  if (seen[k] && seen[k] <= depth + 1) return 0;
+  seen[k] = depth + 1;
   ClassInfo *ki = &c->classes[k];
   if (!ki->name) return 1;
   for (int j = 0; j < c->nclasses; j++)
@@ -215,11 +221,11 @@ static int class_may_have_const(Compiler *c, int k, const char *nm, int *sub, in
     *sub = comp_class_index(c, nm);
     return 1;
   }
-  if (class_may_have_const(c, ki->parent, nm, sub, depth + 1)) return 1;
+  if (class_may_have_const_from(c, ki->parent, nm, sub, depth + 1, seen)) return 1;
   for (int i = 0; i < ki->nincluded_mods; i++)
-    if (class_may_have_const(c, ki->included_mods[i], nm, sub, depth + 1)) return 1;
+    if (class_may_have_const_from(c, ki->included_mods[i], nm, sub, depth + 1, seen)) return 1;
   for (int i = 0; i < ki->nprepended_mods; i++)
-    if (class_may_have_const(c, ki->prepended_mods[i], nm, sub, depth + 1)) return 1;
+    if (class_may_have_const_from(c, ki->prepended_mods[i], nm, sub, depth + 1, seen)) return 1;
   /* a class's chain ends at Object, whose modules (a top-level include,
      Kernel) a scoped read reaches, though not Object's own constants: not a
      module's, nor a class's below BasicObject (`K::C`, with C in a module
@@ -230,21 +236,28 @@ static int class_may_have_const(Compiler *c, int k, const char *nm, int *sub, in
       int o = roots[r];
       if (r == 0 && o < 0) {
         for (int i = 0; i < c->ntoplevel_includes; i++)
-          if (class_may_have_const(c, c->toplevel_includes[i], nm, sub, depth + 1)) return 1;
+          if (class_may_have_const_from(c, c->toplevel_includes[i], nm, sub, depth + 1, seen)) return 1;
         continue;
       }
       if (o < 0 || o == k) continue;
       ClassInfo *oi = &c->classes[o];
-      if (r == 1 && class_may_have_const(c, o, nm, sub, depth + 1)) return 1;
+      if (r == 1 && class_may_have_const_from(c, o, nm, sub, depth + 1, seen)) return 1;
       for (int i = 0; r == 0 && i < oi->nincluded_mods; i++)
-        if (class_may_have_const(c, oi->included_mods[i], nm, sub, depth + 1)) return 1;
+        if (class_may_have_const_from(c, oi->included_mods[i], nm, sub, depth + 1, seen)) return 1;
       for (int i = 0; r == 0 && i < c->ntoplevel_includes; i++)
-        if (class_may_have_const(c, c->toplevel_includes[i], nm, sub, depth + 1)) return 1;
+        if (class_may_have_const_from(c, c->toplevel_includes[i], nm, sub, depth + 1, seen)) return 1;
       for (int i = 0; r == 0 && i < oi->nprepended_mods; i++)
-        if (class_may_have_const(c, oi->prepended_mods[i], nm, sub, depth + 1)) return 1;
+        if (class_may_have_const_from(c, oi->prepended_mods[i], nm, sub, depth + 1, seen)) return 1;
     }
   }
   return 0;
+}
+static int class_may_have_const(Compiler *c, int k, const char *nm, int *sub, int depth) {
+  int *seen = calloc((size_t)(c->nclasses > 0 ? c->nclasses : 1), sizeof *seen);
+  if (!seen) return 1;   /* unknown: it may */
+  int r = class_may_have_const_from(c, k, nm, sub, depth, seen);
+  free(seen);
+  return r;
 }
 /* Can the program define constant `nm` where no class body or `P::NAME = v`
    path shows it: through a path whose parent is not a constant
@@ -301,7 +314,7 @@ static int builtin_scope_lacks_member(Compiler *c, int seg);
 static int const_path_scope(Compiler *c, int seg, int *missing) {
   const NodeTable *nt = c->nt;
   NodeKind sk = nt_kind(nt, seg);
-  const char *nm = nt_key_name(nt, seg);
+  const char *nm = key_name(c, seg);
   if (!nm) return -1;
   if (sk == NK_ConstantReadNode) {
     int k = comp_class_index(c, nm);
@@ -393,7 +406,7 @@ int class_lacks_own_const(Compiler *c, int k, const char *nm) {
                                      NK_ConstantOperatorWriteNode, NK_ConstantTargetNode };
   for (int i = 0; i < 5; i++)
     NT_FOREACH_KIND(nt, writes[i], w) {
-      const char *wn = nt_key_name(nt, w);
+      const char *wn = key_name(c, w);
       size_t wl = wn ? strlen(wn) : 0;
       if (wn && sp_streq(wn, nm)) return 0;
       if (wl > nl + 2 && sp_streq(wn + wl - nl, nm) && !strncmp(wn + wl - nl - 2, "__", 2)) return 0;
@@ -507,8 +520,8 @@ int const_node_class_index(Compiler *c, int id) {
   /* the record resolves the name to the builtin (Object holds no constant of
      the program's by it): only a top-level class of that name can be the
      program's reopening of it, not a nested one that shares its leaf
-     (Foo::Process is not Process) */
-  return core != -1 && k >= 0 && c->classes[k].enclosing_class >= 0 ? -1 : k;
+     (Foo::Process is not Process; Object's body is the top level's) */
+  return core != -1 && k >= 0 && comp_class_in_namespace(c, k) ? -1 : k;
 }
 /* The class a constant node names where a raise or a rescue arm matches
    by the class (`raise K`, `rescue K => e`): the one it names, a class
@@ -681,7 +694,7 @@ int const_path_in_closed_builtin(Compiler *c, int id) {
   /* `Encoding::X` or `::Encoding::X` */
   if (!(pk == NK_ConstantReadNode || (pk == NK_ConstantPathNode && nt_ref(nt, par, "parent") < 0)))
     return 0;
-  const char *pn = nt_key_name(nt, par), *nm = nt_key_name(nt, id);
+  const char *pn = key_name(c, par), *nm = key_name(c, id);
   if (!pn || !nm || sp_streq(pn, "Object")) return 0;
   if (!is_builtin_class_name(pn) && !is_builtin_module_name(pn) && !is_builtin_exception_name(pn)) return 0;
   if (comp_const(c, pn)) return 0;
@@ -1021,13 +1034,13 @@ int builtin_class_val_id(const char *name) {
    and `raise E` failed. A path whose whole name is no builtin keeps the
    leaf reading it always had (`::StandardError`, `Mod::RuntimeError`). The
    result is a stable string: the qualified forms are interned here. */
-const char *superclass_builtin_exc_name(const NodeTable *nt, int sc) {
+const char *superclass_builtin_exc_name(const Compiler *c, const NodeTable *nt, int sc) {
   const char *sty = sc >= 0 ? nt_type(nt, sc) : NULL;
   NodeKind sk = nt_kind(nt, sc);
   if (!sty) return NULL;
   int is_read = sk == NK_ConstantReadNode, is_path = sk == NK_ConstantPathNode;
   if (!is_read && !is_path) return NULL;
-  const char *leaf = nt_key_name(nt, sc);
+  const char *leaf = key_name(c, sc);
   if (!leaf) return NULL;
   if (is_path) {
     char q[256]; size_t o = strlen(leaf);
@@ -1061,7 +1074,7 @@ const char *superclass_builtin_exc_name(const NodeTable *nt, int sc) {
 }
 int class_inherits_builtin_exception(Compiler *c, int ci) {
   for (int k = ci; k >= 0; k = c->classes[k].parent)
-    if (superclass_builtin_exc_name(c->nt, class_def_super(c->nt, c->classes[k].def_node)))
+    if (superclass_builtin_exc_name(c, c->nt, class_def_super(c->nt, c->classes[k].def_node)))
       return 1;
   return 0;
 }
@@ -1376,11 +1389,11 @@ int node_is_empty_container(Compiler *c, int node) {
   if (!nm || !sp_streq(nm, "new")) return 0;
   int r = nt_ref(nt, node, "receiver");
   if (r < 0 || nt_kind(nt, r) != NK_ConstantReadNode) return 0;
-  const char *rn = nt_key_name(nt, r);
+  const char *rn = key_name(c, r);
   if (!rn || (!sp_streq(rn, "Array") && !sp_streq(rn, "Hash"))) return 0;
   int ca = nt_ref(nt, node, "arguments");
   int argc = 0; if (ca >= 0) nt_arr(nt, ca, "arguments", &argc);
-  return argc == 0 && !cplan_const_user(c, node, r, 1);
+  return argc == 0 && cplan_const_user(c, node, r, 1).mi < 0;
 }
 
 int is_arith_op(const char *op) {
@@ -1536,10 +1549,82 @@ int class_recv_static_ci(Compiler *c, int node) {
   const NodeTable *nt = c->nt;
   NodeKind k = nt_kind(nt, node);
   if ((k == NK_ConstantReadNode || k == NK_ConstantPathNode) &&
-      nt_key_name(nt, node))
+      key_name(c, node))
     return const_node_class_index(c, node);
   if (k == NK_SelfNode) return class_body_self_ci(c, node);
   return class_var_static_ci(c, node);
+}
+/* Is class a class b or one above or below it, by the parent chain as
+   written (an ivar of one is an ivar of the other's instances)? */
+static int civ_related(Compiler *c, int a, int b) {
+  for (int x = a; x >= 0; x = c->classes[x].parent) if (x == b) return 1;
+  for (int x = b; x >= 0; x = c->classes[x].parent) if (x == a) return 1;
+  return 0;
+}
+/* The program class an ivar read in an instance method holds, as
+   class_var_static_ci reads a local: every store to the ivar in an
+   instance method of its class, or of a class above or below it, is a
+   plain write (or `||=`, `&&=`) of the same class constant, and no
+   attribute writer, top-level or module method, or literal-named
+   instance_variable_set stores it. -1 otherwise. A slot no write has
+   reached yet is nil, and a store these do not see (a computed name, an
+   instance_eval block) may put another class there: only the run time
+   tells, and the Method's maker tests it (emit_method_obj_target). */
+static int class_ivar_static_ci_raw(Compiler *c, int node);
+int class_ivar_static_ci(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  if (node < 0 || node >= nt->count || nt_kind(nt, node) != NK_InstanceVariableReadNode) return -1;
+  /* the scan reads the whole program: once per read while the tree and
+     the class table stay as they are (the answer + 2; 0 not asked) */
+  static int *memo; static int memo_cap, memo_ncls; static unsigned memo_ver;
+  if (nt->version != memo_ver || c->nclasses != memo_ncls || nt->count > memo_cap) {
+    if (nt->count > memo_cap) {
+      memo_cap = nt->count * 2;
+      free(memo);
+      memo = malloc(sizeof *memo * (size_t)memo_cap);
+      if (!memo) { fprintf(stderr, "out of memory\n"); exit(1); }
+    }
+    memset(memo, 0, sizeof *memo * (size_t)memo_cap);
+    memo_ver = nt->version; memo_ncls = c->nclasses;
+  }
+  if (!memo[node]) memo[node] = class_ivar_static_ci_raw(c, node) + 2;
+  return memo[node] - 2;
+}
+static int class_ivar_static_ci_raw(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  const char *vn = nt_str(nt, node, "name");
+  Scope *sc = vn ? comp_scope_of(c, node) : NULL;
+  int own = sc && !sc->is_cmethod ? sc->class_id : -1;
+  if (own < 0 || own == c->toplevel_class || comp_class_is_module(c, &c->classes[own])) return -1;
+  for (int k = 0; k < c->nclasses; k++)
+    if (comp_is_writer(&c->classes[k], vn + 1) && civ_related(c, k, own)) return -1;
+  static const NodeKind stores[] = { NK_InstanceVariableWriteNode, NK_InstanceVariableOrWriteNode,
+                                     NK_InstanceVariableAndWriteNode, NK_InstanceVariableOperatorWriteNode,
+                                     NK_InstanceVariableTargetNode };
+  int found = -1;
+  for (size_t s = 0; s < sizeof stores / sizeof stores[0]; s++)
+    for (int w = comp_kind_first(c, stores[s]); w >= 0; w = comp_kind_next(c, w)) {
+      const char *wn = nt_str(nt, w, "name");
+      Scope *ws = wn && sp_streq(wn, vn) ? comp_scope_of(c, w) : NULL;
+      /* (a class body's or a class method's store is the class's own ivar,
+         and the top level's main's) */
+      if (!ws || !ws->name || ws->is_cmethod) continue;
+      int k = ws->class_id;
+      if (k < 0 || k == c->toplevel_class || comp_class_is_module(c, &c->classes[k])) return -1;
+      if (!civ_related(c, k, own)) continue;
+      int val = nt_ref(nt, w, "value");
+      NodeKind vk = val >= 0 ? nt_kind(nt, val) : NK_NONE;
+      int ci = stores[s] != NK_InstanceVariableOperatorWriteNode && stores[s] != NK_InstanceVariableTargetNode &&
+               (vk == NK_ConstantReadNode || vk == NK_ConstantPathNode) ? const_node_class_index(c, val) : -1;
+      if (ci < 0 || is_builtin_reopen(c->classes[ci].name) || (found >= 0 && found != ci)) return -1;
+      found = ci;
+    }
+  if (found < 0) return -1;
+  NT_FOREACH_KIND(nt, NK_SymbolNode, y)
+    if (nt_str(nt, y, "value") && sp_streq(nt_str(nt, y, "value"), vn)) return -1;
+  NT_FOREACH_KIND(nt, NK_StringNode, y)
+    if (nt_str(nt, y, "content") && sp_streq(nt_str(nt, y, "content"), vn)) return -1;
+  return found;
 }
 /* The class or module `self` is at node: the one whose body holds it,
    outside a method (self_class_body), as `self.m` there reaches it; -1 in a
@@ -1557,6 +1642,10 @@ int record_recv_class(Compiler *c, int node) {
   int ci = -1;
   if (nt_kind(c->nt, node) == NK_SelfNode) {
     const Scope *s = comp_scope_of(c, node);
+    /* a self instance_eval or instance_exec rebinds is the receiver it is
+       handed, not the class of the method around it: that receiver's own
+       dispatch answers, at run time for a proc (ie_rself) */
+    if (nt_int(c->nt, node, "ie_rself", 0) || ie_class_of(c, node) != -1) return -1;
     if (s && s->is_cmethod) ci = s->class_id;
     else ci = class_body_self_ci(c, node);   /* a class body's self, a Struct.new block's among them */
   }
@@ -1705,9 +1794,9 @@ int str_self_call(const NodeTable *nt, int id) {
     return 1;
   return ac == 2 && sp_streq(nm, "insert");
 }
-int fiber_storage_recv(const NodeTable *nt, int recv) {
+int fiber_storage_recv(const Compiler *c, const NodeTable *nt, int recv) {
   NodeKind rk = nt_kind(nt, recv);
-  const char *rn = nt_key_name(nt, recv);
+  const char *rn = key_name(c, recv);
   if (rk == NK_ConstantReadNode) return rn && sp_streq(rn, "Fiber");
   if (rk != NK_CallNode) return 0;
   int rr = nt_ref(nt, recv, "receiver");
@@ -2193,7 +2282,7 @@ int const_get_recv_class(Compiler *c, int call, int recv) {
   const NodeTable *nt = c->nt;
   NodeKind rk = nt_kind(nt, recv);
   if (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) {
-    const char *nm = nt_key_name(nt, recv);
+    const char *nm = key_name(c, recv);
     if (!nm) return CG_NONE;
     int k = const_node_class_index(c, recv);
     if (k >= 0) return k;
@@ -3349,8 +3438,8 @@ static int yvt_callee_index_scan(Compiler *c, int cid) {
        owner of infer_type's memo follows, and a block value kept while it
        was direct stood after it was not */
     else if (cn) {
-      const CallPlan *p = cplan_user_fresh(c, cid);
-      if (p->mi >= 0 && p->via == UC_REOPEN && c->scopes[p->mi].yields) rmi = p->mi;
+      const CallPlan p = cplan_user_fresh(c, cid);
+      if (p.mi >= 0 && p.via == UC_REOPEN && c->scopes[p.mi].yields) rmi = p.mi;
     }
   }
   return rmi;
@@ -4768,7 +4857,7 @@ int is_handler_proc_block(Compiler *c, int id) {
     nt_str(nt, recv, "name") && sp_streq(nt_str(nt, recv, "name"), "Signal");
   }
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "ENV") &&
+      key_name(c, recv) && sp_streq(key_name(c, recv), "ENV") &&
       is_select_bang(name))
     return 1;
   return 0;
@@ -5154,7 +5243,7 @@ int is_method_obj_call(Compiler *c, int node) {
   /* a receiver whose class has a `method` of the program's own calls that
      (#10719); its super is the builtin, marked builtin_only
      (desugar_method_override_super) */
-  if (sp_streq(nm, "method") && !nt_int(nt, node, "builtin_only", 0) && method_user_override_recv(c, node))
+  if (is_method_ref_name(nm) && !cplan_builtin_call(c, node) && method_user_override_recv(c, node))
     return 0;
   return 1;
 }
@@ -5221,7 +5310,7 @@ static int method_obj_lookup(Compiler *c, int node, int *cls, int *sg) {
                          nt_kind(nt, recv) == NK_ConstantPathNode)) {
     /* `Outer::Mod.method(:m)` names the class by its last segment, as every
        other constant receiver resolves */
-    const char *rn2 = nt_key_name(nt, recv);
+    const char *rn2 = key_name(c, recv);
     k = class_recv_static_ci(c, recv), side = 1;
     if (k < 0) k = rn2 ? comp_class_index(c, rn2) : -1;
     if (k >= 0) goto found;
@@ -5231,6 +5320,14 @@ static int method_obj_lookup(Compiler *c, int node, int *cls, int *sg) {
   if (rt == TY_CLASS) {
     k = self_class_static_ci(c, recv), side = 1;
     if (k >= 0) goto found;
+  }
+  /* `@k.method(:cmeth)` on an ivar holding one class: that class's
+     class-side method, as a local's resolves through its constant; the
+     Method's maker tests the slot's class at run time
+     (emit_method_obj_target), since an unwritten slot is nil */
+  if (rt == TY_CLASS && nt_kind(nt, recv) == NK_InstanceVariableReadNode) {
+    k = class_ivar_static_ci(c, recv), side = 1;
+    if (k >= 0 && call_target(c, node, k, sym, CT_CAPTURE | CT_CMETHOD, NULL) >= 0) goto found;
   }
   return -1;
 found:
@@ -5522,6 +5619,15 @@ int bam_owner(Compiler *c, int mi, const char **name) {
   return dn >= 0 ? (int)nt_int(c->nt, dn, "bam_owner_ci", 0) - 1 : -1;
 }
 
+/* Does wrapper mi stand for one of main's own singleton methods: was its
+   bind site a capture the plan answered on main's singleton
+   (cplan_main_singleton_call, recorded on the def as bam_main_sg)? Its
+   owner is main's singleton class, which is not modeled. */
+int bam_main_singleton(Compiler *c, int mi) {
+  int dn = mi >= 0 && mi < c->nscopes ? c->scopes[mi].def_node : -1;
+  return dn >= 0 && nt_int(c->nt, dn, "bam_main_sg", 0) != 0;
+}
+
 /* Is method mi a Struct member's accessor wrapper: an accessor's wrapper
    (bam_accessor) that no attr_* call declares (bam_src), named for one of
    the members of the class it stands for? An attr_* accessor in a
@@ -5582,9 +5688,23 @@ static int bam_owner_unknown(Compiler *c, int mi) {
   return dn >= 0 && nt_str(c->nt, dn, "bam_sym") && bam_owner(c, mi, &bn) < 0 && !bn;
 }
 
-/* Does the program make a Method of such a wrapper anywhere? */
+/* Is the Method wrapper mi makes read by the call it is the receiver of and
+   nothing else (`object.method(:to_hash).arity`, hashie's)? That call keeps
+   no Method an owner read elsewhere could reach. */
+static int bam_site_consumed(Compiler *c, int mi) {
+  static const char *const reads[] = { "arity", "call", "name", "parameters", "source_location",
+    "receiver", "owner", "inspect", "to_s", "to_proc", NULL };
+  int dn = c->scopes[mi].def_node;
+  int site = dn >= 0 ? (int)nt_int(c->nt, dn, "bam_site", 0) - 1 : -1;
+  int up = site >= 0 ? comp_recv_parent(c, site) : -1;
+  const char *nm = up >= 0 ? nt_str(c->nt, up, "name") : NULL;
+  for (int i = 0; nm && reads[i]; i++) if (sp_streq(nm, reads[i])) return 1;
+  return 0;
+}
+
+/* Does the program make a Method of such a wrapper anywhere it can be held? */
 static int program_has_bam_owner_unknown(Compiler *c) {
-  for (int i = 0; i < c->nscopes; i++) if (bam_owner_unknown(c, i)) return 1;
+  for (int i = 0; i < c->nscopes; i++) if (bam_owner_unknown(c, i) && !bam_site_consumed(c, i)) return 1;
   return 0;
 }
 
@@ -5686,7 +5806,7 @@ int call_user_yield_mi(Compiler *c, int id) {
        the key classes are indexed under */
     const char *cname = ((rk == NK_ConstantReadNode ||
                                  rk == NK_ConstantPathNode))
-                        ? nt_key_name(nt, recv) : NULL;
+                        ? key_name(c, recv) : NULL;
     /* ... and `self.class.run { }` by the class self.class names, as the
        inliner does (self_class_static_ci) */
     int ci = cname ? const_node_class_index(c, recv) : self_class_static_ci(c, recv);
@@ -6147,8 +6267,15 @@ int strh_call_op(Compiler *c, int call, TyKind rt) {
   const int *av = ca >= 0 ? nt_arr(nt, ca, "arguments", &argc) : NULL;
   if (nt_argv_has(nt, av, argc, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_BLOCK)) return STRH_NONE;
   int op = strh_op(nm, argc, blk < 0 ? 0 : nt_kind(nt, blk) == NK_BlockNode ? 1 : 2);
-  if (op == STRH_ELEM && argc == 1 && comp_ntype(c, av[0]) != TY_INT) return STRH_NONE;
-  if (op != STRH_NONE && share_builtin_overridden(c, "Array", nm)) return STRH_NONE;
+  if (op == STRH_NONE || share_builtin_overridden(c, "Array", nm)) return STRH_NONE;
+  if (argc == 1) {
+    /* (`[]` at an index known only at run time, where the call is typed a
+       String: its emitter reads the element) */
+    TyKind at = comp_ntype(c, av[0]);
+    if (op == STRH_DELETE ? at != TY_STRING
+                          : at != TY_INT && !(at == TY_POLY && is_aref_name(nm) && comp_ntype(c, call) == TY_STRING))
+      return STRH_NONE;
+  }
   return op;
 }
 /* Is node n a read of a variable (a local, an instance variable, a global, a
@@ -6166,7 +6293,7 @@ int an_kernel_const_recv(Compiler *c, int id, int recv, int fresh) {
   const NodeTable *nt = c->nt;
   if (recv < 0 || nt_kind(nt, recv) != NK_ConstantReadNode) return 0;
   const char *rn = nt_str(nt, recv, "name");
-  return rn && sp_streq(rn, "Kernel") && !cplan_const_user(c, id, recv, fresh);
+  return rn && sp_streq(rn, "Kernel") && cplan_const_user(c, id, recv, fresh).mi < 0;
 }
 
 /* Is `recv` a receiver Kernel#` answers call `id` for: the Kernel module
@@ -6377,7 +6504,7 @@ static const char *const si_protocol_names[] = {
 
 /* May a `raise` of the class constant ref raise a StopIteration? */
 static int si_class_may_stop(Compiler *c, int ref, int depth) {
-  const char *nm = nt_key_name(c->nt, ref);
+  const char *nm = key_name(c, ref);
   if (!nm || depth > 64) return 1;
   if (sp_streq(nm, "StopIteration") || sp_streq(nm, "ClosedQueueError")) return 1;
   /* (a read or a path asks the node: a nested class's leaf, `raise SSLError`
@@ -6593,7 +6720,7 @@ static void si_facts(Compiler *c) {
     if (c->classes[k].name && c->classes[k].def_node >= 0 && is_builtin_class_name(c->classes[k].name)) f->reopen[f->nreopen++] = k;
   for (int id = 0; id < nt->count; id++) {
     NodeKind k = nt_kind(nt, id);
-    const char *nm = (k == NK_ConstantReadNode || k == NK_ConstantPathNode) ? nt_key_name(nt, id) : NULL;
+    const char *nm = (k == NK_ConstantReadNode || k == NK_ConstantPathNode) ? key_name(c, id) : NULL;
     if (nm && (sp_streq(nm, "Queue") || sp_streq(nm, "SizedQueue") || sp_streq(nm, "ClosedQueueError"))) f->queues = 1;
     if (k == NK_CallNode && nt_str(nt, id, "name") && sp_streq(nt_str(nt, id, "name"), "lazy")) f->lazy = 1;
   }
@@ -6731,11 +6858,11 @@ static int ext_param_ty_checked(TyKind t) {
   }
 }
 
-/* Whether the list names class_id: a class or module of the program (not
-   a reopened builtin, not a package's native class). A module exports its
-   singleton methods only. */
-/* Whether the list names a class of that name: as written (`Sub`), or as
-   the last name of a path (`ExtSub::Sub`); `all` names every class. */
+/* Whether the list names a definition of that leaf name: as written
+   (`Sub`), or as the last name of a path (`ExtSub::Sub`); `all` names
+   every one. The loose test, for a definition the class table does not
+   hold yet (ext_listed_descendant); a class of the table is asked by
+   ext_class_listed. */
 static int ext_name_listed(const char *name) {
   if (!g_ext_classes || !*g_ext_classes || !name) return 0;
   if (sp_streq(g_ext_classes, "all")) return 1;
@@ -6751,11 +6878,80 @@ static int ext_name_listed(const char *name) {
   return 0;
 }
 
-int ext_class_exported(Compiler *c, int class_id) {
-  if (!g_ext_classes || !*g_ext_classes || class_id < 0 || class_id >= c->nclasses) return 0;
+/* Whether path (`A::B`, or `::A::B`) is the Ruby path of class k: the
+   Ruby leaves of k and of the classes that enclose it, read against the
+   segments of path from its end. By the names, not by the table's keys: a
+   top-level class named `A__Base` has the key of A::Base. A reopened
+   Object's constants are top-level ones. */
+static int ext_class_path_is(Compiler *c, int k, const char *path) {
+  int obj = comp_core_class(c, CORE_OBJECT);
+  if (path[0] == ':' && path[1] == ':') path += 2;
+  const char *end = path + strlen(path);
+  for (int e = k; ; ) {
+    const char *leaf = e >= 0 && e < c->nclasses ? comp_class_ruby_leaf(c, e) : NULL;
+    size_t n = leaf ? strlen(leaf) : 0;
+    if (!n || (size_t)(end - path) < n || strncmp(end - n, leaf, n) != 0) return 0;
+    end -= n;
+    e = c->classes[e].enclosing_class;
+    if (end == path) return e < 0 || e == obj;
+    if (end - path < 2 || end[-1] != ':' || end[-2] != ':' || e < 0 || e == obj) return 0;
+    end -= 2;
+  }
+}
+
+/* Whether one name of the list, item (len bytes), names class k: a path
+   (`A::B`) names the class whose Ruby path it is; a name alone names each
+   class whose Ruby leaf it is, whatever encloses it (`Sub` for
+   ExtSub::Sub). Two classes of one leaf (A::Base and B::Base) are keyed
+   by their paths in the table, so a name alone names both: the check of
+   the list (analyze.c) refuses it. */
+static int ext_item_names(Compiler *c, const char *item, size_t len, int k) {
+  char buf[512];
+  if (len == 0 || len >= sizeof buf) return 0;
+  memcpy(buf, item, len);
+  buf[len] = 0;
+  if (strstr(buf, "::")) return ext_class_path_is(c, k, buf);
+  const char *leaf = comp_class_ruby_leaf(c, k);
+  return leaf && sp_streq(leaf, buf);
+}
+
+/* Whether the list names class k; `all` names every class. */
+static int ext_class_listed(Compiler *c, int k) {
+  if (sp_streq(g_ext_classes, "all")) return 1;
+  for (const char *p = g_ext_classes; *p; ) {
+    const char *e = strchr(p, ',');
+    size_t len = e ? (size_t)(e - p) : strlen(p);
+    if (ext_item_names(c, p, len, k)) return 1;
+    if (!e) break;
+    p = e + 1;
+  }
+  return 0;
+}
+
+/* Whether class_id is one the list can export: a class or module of the
+   program (not a reopened builtin, not a package's native class). A module
+   exports its singleton methods only. */
+static int ext_class_exportable(Compiler *c, int class_id) {
+  if (class_id < 0 || class_id >= c->nclasses) return 0;
   ClassInfo *ci = &c->classes[class_id];
-  if (!ci->name || is_builtin_reopen(ci->name) || ci->is_native_class) return 0;
-  return ext_name_listed(ci->name);
+  return ci->name && !is_builtin_reopen(ci->name) && !ci->is_native_class;
+}
+
+int ext_item_classes(Compiler *c, const char *item, int *a, int *b) {
+  int n = 0;
+  *a = *b = -1;
+  for (int k = 0; k < c->nclasses; k++) {
+    if (!ext_class_exportable(c, k) || !ext_item_names(c, item, strlen(item), k)) continue;
+    if (n == 0) *a = k;
+    else if (n == 1) *b = k;
+    n++;
+  }
+  return n;
+}
+
+int ext_class_exported(Compiler *c, int class_id) {
+  if (!g_ext_classes || !*g_ext_classes) return 0;
+  return ext_class_exportable(c, class_id) && ext_class_listed(c, class_id);
 }
 
 /* Whether scope si is the method the chain of class_id answers for its
@@ -6833,7 +7029,7 @@ static int ext_listed_descendant(Compiler *c, const char *name) {
   const NodeTable *nt = c->nt;
   int found = 0;
   NT_FOREACH_KIND(nt, NK_ClassNode, d) {
-    const char *cn = found ? NULL : class_def_name(nt, d);
+    const char *cn = found ? NULL : class_def_key(c, d);
     if (!cn || sp_streq(cn, name) || !ext_name_listed(cn)) continue;
     const char *sup = ext_const_leaf(nt, class_def_super(nt, d));
     for (int h = 0; sup && !found && h < 64; h++) {

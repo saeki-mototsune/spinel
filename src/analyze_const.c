@@ -161,7 +161,7 @@ static int cw_value_walk(ConstWalk *w, int id, int depth) {
       }
       int rv = cw_value(w, r, depth + 1);
       if (rv == 0) return 0;
-      const char *rn = nt_kind(nt, r) == NK_ConstantReadNode ? nt_key_name(nt, r) : NULL;
+      const char *rn = nt_kind(nt, r) == NK_ConstantReadNode ? key_name(w->c, r) : NULL;
       /* Struct.new, Data.define, Class.new, Module.new run the body they take */
       if (rn && is_class_builder(rn, nm) && !w->hooks && !w->reopened) {
         if (blk < 0) return 1;
@@ -382,14 +382,14 @@ void an_const_presence(Compiler *c) {
       if (dn && (is_native_decl_name(dn) || is_method_missing_name(dn))) w.native_own = 1;
     }
     else if (k == NK_ClassNode || k == NK_ModuleNode) {
-      const char *cn = class_def_name(nt, id);
+      const char *cn = class_def_key(c, id);
       if (cn && (is_builtin_class_name(cn) || is_builtin_reopen_name(cn))) w.reopened = 1;
       if (is_math_module_name(cn)) w.math_own = 1;
     }
     /* def Math.f, class << Math, Math.define_singleton_method ... */
     if (k == NK_DefNode || k == NK_SingletonClassNode || k == NK_CallNode) {
       int r = nt_ref(nt, id, k == NK_SingletonClassNode ? "expression" : "receiver");
-      if (r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode && is_math_module_name(nt_key_name(nt, r)) &&
+      if (r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode && is_math_module_name(key_name(c, r)) &&
           !(k == NK_CallNode && is_math_fn_name(nt_str(nt, id, "name"))))
         w.math_own = 1;
     }
@@ -548,7 +548,7 @@ int an_class_needs_presence(Compiler *c, int ci) {
    each, and marks those that ask `own_presence`), not a reference to the
    class the passes made of self later. */
 static int const_class_presence(Compiler *c, int id, int program) {
-  const char *nm = nt_key_name(c->nt, id);
+  const char *nm = key_name(c, id);
   NodeKind ik = nt_kind(c->nt, id);
   int ci = !nm ? -1 : ik == NK_ConstantReadNode || ik == NK_ConstantPathNode ? const_node_class_index(c, id) : comp_class_index(c, nm);
   if (!an_class_needs_presence(c, ci)) return 0;

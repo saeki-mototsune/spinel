@@ -147,7 +147,7 @@ static int cmp_elem_read(Compiler *c, int node, TyKind t, int *arr, int *idx) {
   if (r < 0 || ac != 1 || repr_of(c, av[0]).as_ty != TY_INT) return 0;
   Repr rr = repr_of(c, r);
   if (rr.elem != (t == TY_FLOAT ? TY_FLOAT : TY_INT)) return 0;
-  if (rr.kind == RK_BOXED || cplan_user(c, node)->dispatch != CP_NONE) return 0;
+  if (rr.kind == RK_BOXED || cplan_user(c, node).dispatch != CP_NONE) return 0;
   *arr = r; *idx = av[0];
   return 1;
 }
@@ -285,7 +285,7 @@ static int emit_cmp_reopen_arm(Compiler *c, int id, int recv, const int *argv, B
   snprintf(rv, sizeof rv, "_t%d", rt0);
   if (g_cmp_reopen_id == id || g_n_argov >= MAX_ARG_OVERRIDE || !poly_cmp_reopen_test(c, rv, rtest, sizeof rtest))
     return 0;
-  int mk = view_bind(recv, "%s", rv);
+  int mk = view_bind_temp(recv, rt0);
   int sv = g_cmp_reopen_id; g_cmp_reopen_id = id;
   Buf db; memset(&db, 0, sizeof db);
   Buf *svp = g_pre; Buf dpre; memset(&dpre, 0, sizeof dpre); g_pre = &dpre;
@@ -370,7 +370,7 @@ static int emit_isa_runtime_flag_class(Compiler *c, const NodeTable *nt, const c
   /* Queue and SizedQueue are one runtime object told apart by its bound, so
      these two cannot be answered statically from TY_QUEUE alone -- a
      SizedQueue reported false for its own class (#3466). */
-  { const char *qcn = nt_key_name(nt, argv[0]);
+  { const char *qcn = key_name(c, argv[0]);
     if (eff_rt == TY_QUEUE && qcn &&
         (is_queue_class_name(qcn))) {
       int tq3 = ++g_tmp;
@@ -1214,7 +1214,7 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
     if (ty_is_object(rt)) {
       int cid5 = ty_object_class(rt);
       if (call_target(c, id, cid5, name, 0, NULL) >= 0) {
-        Buf selfb = emit_cmp_self(c, recv, rt);
+        Buf selfb = emit_cmp_self(c, recv, rt, NULL);
         emit_dispatch(c, cid5, name, selfb.p, nt_ref(nt, id, "arguments"), -1, b);
         free(selfb.p);
         return 1;
@@ -1240,7 +1240,7 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           buf_printf(b, "(sp_poly_cmp_ck(_t%d, _t%d) %s 0)", ta, tb2, name);
           return 1;
         }
-        Buf selfb = emit_cmp_self(c, recv, rt);
+        Buf selfb = emit_cmp_self(c, recv, rt, NULL);
         buf_puts(b, "(");
         emit_dispatch(c, cid4, "<=>", selfb.p, nt_ref(nt, id, "arguments"), -1, b);
         buf_printf(b, " %s 0)", name);
@@ -1303,7 +1303,7 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
     /* a bool receiver's class depends on its VALUE: true is a TrueClass,
        false a FalseClass (ty_matches_class carries only the type) */
     {
-      const char *bcn = nt_key_name(nt, argv[0]);
+      const char *bcn = key_name(c, argv[0]);
       if (rt == TY_BOOL && bcn &&
           (is_boolean_class_name(bcn))) {
         buf_puts(b, "(("); emit_expr(c, recv, b);
@@ -1517,7 +1517,7 @@ int emit_call_compare_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
   if (recv >= 0 && ty_is_object(rt) && argc == 1 &&
       (sp_streq(name, "is_a?") || sp_streq(name, "kind_of?"))) {
     const char *acn = nt_kind(nt, argv[0]) == NK_ConstantReadNode
-                        ? nt_key_name(nt, argv[0]) : NULL;
+                        ? key_name(c, argv[0]) : NULL;
     if (acn && is_object_root(acn)) {
       buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), 1)");
       return 1;

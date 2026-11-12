@@ -581,6 +581,10 @@ int is_lambda_constructor(const char *n) {
   return sp_streq(n, "lambda");
 }
 
+/* to_a / force: the calls ending a lazy chain that code generation lowers
+   whole, as its terminal (it tests `first` itself beside them). Which call
+   forces a Lazy at all, for the record's reading of where a chain runs, is
+   is_lazy_forcing_name's question; these are a subset of its names. */
 int is_lazy_force(const char *n) {
   return sp_streq(n, "to_a") || sp_streq(n, "force");
 }
@@ -1858,6 +1862,21 @@ int is_lazy_chain_name(const char *n) {
     "slice_before", "slice_when", "take", "take_while", "uniq", "with_index", NULL };
   return n && builtin_name_in(n, LAZY);
 }
+/* A call on a lazy enumerator that runs its chain before it answers, with a
+   value that is not the chain: always (first, to_a, sum, ...), or given a
+   block (each, find, group_by, ...: with none, each answers the chain on as
+   an enumerator). each_slice, each_cons, each_entry and reverse_each are
+   not among them (given a block they force the chain and answer it again),
+   nor are next and peek (they run it a step at a time). The calls code
+   generation lowers a chain into as its terminal (is_lazy_force: to_a,
+   force; `first`) are a subset of these. */
+int is_lazy_forcing_name(const char *n, int block) {
+  static const char *const ALWAYS[] = { "all?", "any?", "count", "entries", "first", "force", "include?", "inject", "max",
+    "member?", "min", "minmax", "none?", "one?", "reduce", "sort", "sum", "tally", "to_a", "to_h", "to_set", NULL };
+  static const char *const BLOCK[] = { "cycle", "detect", "each", "each_with_index", "each_with_object", "find",
+    "find_index", "group_by", "max_by", "min_by", "minmax_by", "partition", "sort_by", "with_object", "zip", NULL };
+  return n && (builtin_name_in(n, ALWAYS) || (block && builtin_name_in(n, BLOCK)));
+}
 int is_concat_name(const char *n) { return sp_streq(n, "concat"); }
 
 /* `Array.new(...)`, by its receiver's constant name and the method */
@@ -2136,6 +2155,45 @@ const char *builtin_method_alias_group(const char *cls, const char *canonical) {
       o += (size_t)snprintf(out + o, cap - o, "%s ", BMT_ALIASES[i].name);
   return out;
 }
+/* The method a held Method's written name calls, for each builtin class a
+   boxed receiver's run time may name, as " Class=Owner#canonical ..." with a
+   space each side: Owner is the first of Class's ancestors that has the
+   name, and canonical is the name's first spelling in Owner's alias group.
+   Only classes where the name is in an alias group are listed. A class
+   that skip(ud, Class) refuses (the program's reopening may answer the
+   name first) is left out. Two held Methods of one receiver call one
+   method when both list the receiver's class with the same Owner#canonical.
+   NULL when no class lists the name. */
+char *builtin_method_class_canon_map(const char *name, int (*skip)(void *, const char *), void *ud) {
+  if (!name) return NULL;
+  size_t cap = 0, o = 0;
+  char *out = NULL;
+  const BuiltinClass *r;
+  for (int i = 0; (r = builtin_class_at(i)) != NULL; i++) {
+    const char *cls = r->name, *own = NULL, *a;
+    int dup = 0;
+    for (int j = 0; j < i && !dup; j++) dup = sp_streq(builtin_class_at(j)->name, cls);
+    if (dup) continue;
+    for (int k = 0; (a = builtin_ancestor_at(cls, k)) && !own; k++)
+      if (builtin_owns_instance_method(a, name)) own = a;
+    if (!own) continue;
+    const char *canon = builtin_method_canonical(own, name);
+    const char *grp = builtin_method_alias_group(own, canon);
+    if (!grp) continue;
+    free((void *)grp);
+    if (skip && skip(ud, cls)) continue;
+    size_t need = strlen(cls) + strlen(own) + strlen(canon) + 4;
+    if (o + need + 2 > cap) {
+      cap = (o + need + 2) * 2;
+      char *nb = realloc(out, cap);
+      if (!nb) { free(out); return NULL; }
+      out = nb;
+    }
+    if (!o) out[o++] = ' ';
+    o += (size_t)snprintf(out + o, cap - o, "%s=%s#%s ", cls, own, canon);
+  }
+  return out;
+}
 /* A number every spelling of one method shares, whichever class a Method's
    receiver is: the names that are aliases of each other in some class are
    one group (a union over every class, looser than any one class's own
@@ -2298,6 +2356,118 @@ int builtin_core_is_a(int k, int anc) {
   return 0;
 }
 
+/* The builtins whose keyword hash is one more positional, from CRuby's own
+   facts (builtin_arity.inc): BAK the instance methods, BALK a library's,
+   with the library (io/console's IO#winsize), which hold where
+   builtin_library_fact_holds says; BACK the class methods (fixed arity, no keywords) */
+#define BAI(...)
+#define BAM(...)
+#define BAS(...)
+#define BAC(...)
+#define BAK(c,m) {c,m,NULL},
+#define BACK(...)
+#define BAKT(...)
+#define BAP(...)
+#define BAL(...)
+#define BALC(...)
+#define BALK(f,c,m) {c,m,f},
+static const struct { const char *cls, *m, *feature; } sp_builtin_kwpos_tbl[] = {
+#include "builtin_arity.inc"
+  {NULL, NULL, NULL}
+};
+#undef BAK
+#undef BACK
+#undef BALK
+#define BAK(...)
+#define BALK(...)
+#define BACK(c,m) {c,m},
+static const struct { const char *cls; const char *m; } sp_builtin_cmeth_kwpos_tbl[] = {
+#include "builtin_arity.inc"
+  {NULL, NULL}
+};
+#undef BACK
+#undef BAKT
+#define BACK(...)
+#define BAKT(c,m,k,cside,max) {c,m,k,cside,max},
+/* BAKT: the methods that take one keyword and pass a hash with any other
+   key on as one more positional (Kernel.raise, Kernel.fail and Fiber#raise,
+   cause:), with their most positionals */
+static const struct { const char *cls, *m, *key; int cside, max; } sp_builtin_kw_taken_tbl[] = {
+#include "builtin_arity.inc"
+  {NULL, NULL, NULL, 0, 0}
+};
+#undef BAKT
+#undef BAI
+#undef BAM
+#undef BAS
+#undef BAC
+#undef BAK
+#undef BACK
+#undef BAL
+#undef BALC
+#undef BALK
+#undef BAP
+/* See builtin_names.h. */
+int builtin_library_fact_holds(const char *feature) {
+  return !feature || sp_feature_required(feature);
+}
+/* See builtin_names.h. */
+const char *builtin_kw_taken(const char *cls, const char *name, int cside) {
+  for (int i = 0; cls && name && sp_builtin_kw_taken_tbl[i].cls; i++)
+    if (sp_builtin_kw_taken_tbl[i].cside == cside && sp_streq(sp_builtin_kw_taken_tbl[i].cls, cls) &&
+        sp_streq(sp_builtin_kw_taken_tbl[i].m, name))
+      return sp_builtin_kw_taken_tbl[i].key;
+  return NULL;
+}
+/* See builtin_names.h. */
+const char *builtin_name_kw_taken(const char *name, int npos) {
+  const char *key = NULL;
+  int at_max = 0;
+  for (int i = 0; name && sp_builtin_kw_taken_tbl[i].cls; i++) {
+    if (!sp_streq(sp_builtin_kw_taken_tbl[i].m, name)) continue;
+    if (key && !sp_streq(key, sp_builtin_kw_taken_tbl[i].key)) return NULL;
+    key = sp_builtin_kw_taken_tbl[i].key;
+    if (npos >= sp_builtin_kw_taken_tbl[i].max) at_max = 1;
+  }
+  return at_max ? key : NULL;
+}
+/* See builtin_names.h. The facts' BAKT first; then the instance side: a
+   fixed Method#arity, or a fixed accepted count where the class has no
+   Method#arity row and some class has a fixed one, or the facts' BAK; the
+   class side: cls's own class-side rows (bop_class_keywords), else the
+   facts' BACK (BasicSocket.for_fd). */
+int builtin_kw_positional(const char *cls, const char *name, int cside) {
+  if (!cls || !name) return -1;
+  if (builtin_kw_taken(cls, name, cside)) return 2;
+  if (cside) {
+    int kw = bop_class_keywords(cls, name);
+    if (kw >= 0) return !kw;
+    for (int i = 0; sp_builtin_cmeth_kwpos_tbl[i].cls; i++)
+      if (sp_streq(sp_builtin_cmeth_kwpos_tbl[i].cls, cls) && sp_streq(sp_builtin_cmeth_kwpos_tbl[i].m, name)) return 1;
+    return -1;
+  }
+  int fa, min, max;
+  const char *lo, *hi;
+  if (builtin_method_arity(cls, name, &fa)) { if (fa >= 0) return 1; }
+  else if (builtin_method_fixed_any(name) && builtin_class_arity_spec(cls, name, &min, &max, &lo, &hi) && min == max)
+    return 1;
+  for (int i = 0; sp_builtin_kwpos_tbl[i].cls; i++)
+    if (sp_streq(sp_builtin_kwpos_tbl[i].cls, cls) && sp_streq(sp_builtin_kwpos_tbl[i].m, name) &&
+        builtin_library_fact_holds(sp_builtin_kwpos_tbl[i].feature))
+      return 1;
+  return -1;
+}
+/* See builtin_names.h. */
+int builtin_name_kwless(const char *name) {
+  if (!name) return 0;
+  if (bop_name_kwless(name) || bop_class_name_kwless(name) || builtin_method_fixed_any(name)) return 1;
+  for (int i = 0; sp_builtin_kwpos_tbl[i].cls; i++)
+    if (sp_streq(sp_builtin_kwpos_tbl[i].m, name) && builtin_library_fact_holds(sp_builtin_kwpos_tbl[i].feature)) return 1;
+  for (int i = 0; sp_builtin_cmeth_kwpos_tbl[i].cls; i++)
+    if (sp_streq(sp_builtin_cmeth_kwpos_tbl[i].m, name)) return 1;
+  return 0;
+}
+
 /* The names CRuby's own facts give Object, BasicObject, Kernel, Module and
    Class (builtin_arity.inc), sorted once per self kind for
    builtin_self_method_known */
@@ -2306,7 +2476,12 @@ int builtin_core_is_a(int k, int anc) {
 #define BAS(c,m,...) {c,m},
 #define BAC(...)
 #define BAK(...)
+#define BACK(...)
+#define BAKT(...)
 #define BAP(...)
+#define BAL(...)
+#define BALC(...)
+#define BALK(...)
 static const struct { const char *cls, *m; } self_fact_rows[] = {
 #include "builtin_arity.inc"
 };
@@ -2315,6 +2490,11 @@ static const struct { const char *cls, *m; } self_fact_rows[] = {
 #undef BAS
 #undef BAC
 #undef BAK
+#undef BACK
+#undef BAKT
+#undef BAL
+#undef BALC
+#undef BALK
 #undef BAP
 /* Does Spinel have values of table class k: a builtin class row, a synthetic slot, or a class the arity facts
    list (StringScanner, Set, StringIO)? */
@@ -2337,13 +2517,18 @@ const char *builtin_next_class_answering(int *i, const char *m) {
   return NULL;
 }
 static int self_fact_cmp(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }
-/* main's own methods, beside Object's: its singleton's (`to_s`, `inspect`
-   answer "main") and the private ones a top-level body calls as a class
-   body would (`include`, `private`, `define_method`, ...) */
+/* main's singleton methods the core gives it: `to_s` and `inspect`, which
+   answer "main" */
+int main_singleton_method(const char *m) {
+  static const char *const MAINS[] = { "to_s", "inspect", NULL };
+  return builtin_name_in(m, MAINS);
+}
+/* main's own methods, beside Object's: its singleton's (main_singleton_method)
+   and the private ones a top-level body calls as a class body would
+   (`include`, `private`, `define_method`, ...) */
 int main_self_method(const char *m) {
-  static const char *const MAINM[] = { "to_s", "inspect", "include", "public", "private", "define_method",
-                                       "using", "ruby2_keywords", NULL };
-  return builtin_name_in(m, MAINM);
+  static const char *const MAINM[] = { "include", "public", "private", "define_method", "using", "ruby2_keywords", NULL };
+  return main_singleton_method(m) || builtin_name_in(m, MAINM);
 }
 /* See builtin_names.h. Kernel's module functions and Object's surface
    answer on every self; the facts' Object, BasicObject and Kernel methods
@@ -2453,9 +2638,11 @@ const char *encoding_const_name(const char *nm) {
 
 int strh_op(const char *n, int argc, int block) {
   if (!n || block) return STRH_NONE;
-  if (argc == 1 && is_element_at_alias(n)) return STRH_ELEM;
-  if (argc == 0 && is_endpoint_query(n)) return STRH_ELEM;
+  if (argc == 1 && (is_element_at_alias(n) || sp_streq(n, "fetch") || sp_streq(n, "dig"))) return STRH_ELEM;
+  if (argc == 0 && (is_endpoint_query(n) || is_minmax_query(n) || sp_streq(n, "sample"))) return STRH_ELEM;
   if (argc == 0 && (sp_streq(n, "pop") || sp_streq(n, "shift"))) return STRH_TAKE;
+  if (argc == 1 && sp_streq(n, "delete_at")) return STRH_TAKE;
+  if (argc == 1 && sp_streq(n, "delete")) return STRH_DELETE;
   return STRH_NONE;
 }
 

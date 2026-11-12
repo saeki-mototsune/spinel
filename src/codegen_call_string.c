@@ -864,12 +864,11 @@ no_gsub_enum:
       if (!fend) { buf_puts(b, "sp_str_format_polyarr("); emit_expr(c, recv, b); }
       /* the one-element list is held by `_fa` alone while an argument that
          allocates is built (`"%5s|" % ("q" + i.to_s)`); one that already
-         ran into a temp was built before the list */
-      int an = arg_ran_first(argv[0], 0) ? argv[0] : nt_paren_single(c->nt, argv[0]);
-      /* not asked of a statement left alone, and the walk of the argument
-         (subtree_is_pure_read) last */
+         ran into a temp was built before the list, which the walk of the
+         argument (subtree_is_pure_read) answers. Not asked of a statement
+         left alone, and that walk last */
       int runs = !(!fend && str_format_left_alone(c, recv, argv[0])) &&
-                 operand_may_allocate(c, argv[0]) && !arg_ran_first(an, 0) && !subtree_is_pure_read(c, argv[0]);
+                 operand_may_allocate(c, argv[0]) && !subtree_is_pure_read(c, argv[0]);
       /* a number needs no holding: its value is taken ahead of the list
          (`"%5d|" % sq(i)`) and boxed there by the call emit_boxed wrote */
       if (runs && (at == TY_INT || at == TY_FLOAT)) {
@@ -1293,8 +1292,8 @@ int emit_call_symbol_bool_string_arms(Compiler *c, int id, Buf *b, const NodeTab
                  ti, ti, tl, ti);
       if (p0) {
         if (p0_box_poly_ech) buf_printf(b, "lv_%s = %ssp_StrArray_get%s(_t%d, _t%d)); ", p0, ONE_SA_BOXO, ONE_SA_GE, tl, ti);
-        else if (p0_handle_ech) buf_printf(b, "lv_%s = sp_String_new_shared(sp_StrArray_get(_t%d, _t%d)); ", p0, tl, ti);
-        else buf_printf(b, "lv_%s = SP_STR_B(sp_StrArray_get(_t%d, _t%d)); ", p0, tl, ti);   /* (one representation: the line is a handle, the parameter's slot bytes) */
+        else if (p0_handle_ech) buf_printf(b, "lv_%s = sp_StrArray_get_e(_t%d, _t%d); ", p0, tl, ti);
+        else buf_printf(b, "lv_%s = SP_STR_B(sp_StrArray_get_e(_t%d, _t%d)); ", p0, tl, ti);   /* (the line is a handle, the parameter's slot bytes) */
       }
     }
     /* codepoints yields each character's codepoint, not each byte: the String
@@ -1560,7 +1559,7 @@ int emit_string_handle_append(Compiler *c, int id, Buf *b, const char *name, int
         if (!is_append_concat(name)) {
           int ordered = 0;
           for (int j = 0; j < argc && argc > 1; j++)
-            if (!arg_ran_first(argv[j], 0) && !subtree_is_pure_read(c, argv[j])) ordered = 1;
+            if (!subtree_is_pure_read(c, argv[j])) ordered = 1;
           if (ordered) emit_string_prepend_ordered(c, tb2, argc, argv, b);
           else {
             int tp3 = ++g_tmp;
@@ -1684,7 +1683,7 @@ static int emit_string_slice_poly(Compiler *c, const BopCtx *x, int arg, int two
       int bx = r1.kind == RK_BOXED || r1.as_ty != TY_INT || r1.nil_scalar || r1.may_nil;
       b2 = g_n_argov;
       int t2 = hold_operand(c, argv[1], bx ? TY_POLY : TY_INT, bx, ++g_tmp, 1, " ", b);
-      view_bind(argv[1], "_t%d", t2);
+      view_bind_temp(argv[1], t2);
     }
   }
   /* a nil receiver raises once the arguments ran, before the form is picked */
@@ -1715,7 +1714,7 @@ static int emit_string_slice_poly(Compiler *c, const BopCtx *x, int arg, int two
   }
   /* the Integer form takes the box, converted after its frozen check */
   buf_printf(b, "; }\nelse { _t%d = ", tr);
-  bind = view_bind(arg, "_t%d", ta);
+  bind = view_bind_temp(arg, ta);
   emit_op_string_slice(c, &arm, b);
   view_unbind(bind);
   buf_printf(b, "; } _t%d; }); })", tr);
@@ -1887,7 +1886,7 @@ static void str_mut_hold(Compiler *c, const int *argv, int argc, int i, int as_i
   if (str_mut_inert(c, n, later)) return;
   buf_puts(b, " ");
   o->t = hold_operand(c, n, boxed ? TY_POLY : ty, boxed, ++g_tmp, 1, "", b);
-  if (!boxed) view_bind(n, "_t%d", o->t);
+  if (!boxed) view_bind_temp(n, o->t);
 }
 
 /* The sp_int index operand o reads as: an Integer as it is; any other

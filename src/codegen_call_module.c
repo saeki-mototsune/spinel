@@ -221,9 +221,9 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
      these; only the dispatch was missing). FileTest shares File's predicate
      surface (#2819). */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) &&
-      (sp_streq(nt_key_name(nt, recv), "File") ||
-       sp_streq(nt_key_name(nt, recv), "FileTest"))) {
+      key_name(c, recv) &&
+      (sp_streq(key_name(c, recv), "File") ||
+       sp_streq(key_name(c, recv), "FileTest"))) {
     if ((sp_streq(name, "basename") || sp_streq(name, "dirname") || sp_streq(name, "extname")) && argc == 1) {
       /* the path argument must reach sp_file_* as a const char*; emit_path_expr
          coerces a poly / nullable-string path so it does not pass an sp_RbVal
@@ -806,7 +806,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
      for a value already typed String, so it costs nothing where inference
      succeeded. */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Dir")) {
+      key_name(c, recv) && sp_streq(key_name(c, recv), "Dir")) {
     if (sp_streq(name, "for_fd") && argc == 1) {
       buf_puts(b, "sp_Dir_for_fd("); emit_int_expr(c, argv[0], b); buf_puts(b, ")");
       return 1;
@@ -979,7 +979,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
 
   /* Time class constructors */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Time")) {
+      key_name(c, recv) && sp_streq(key_name(c, recv), "Time")) {
     if ((sp_streq(name, "now") || sp_streq(name, "new")) && argc == 0) { buf_puts(b, "sp_time_now()"); return 1; }
     /* Time.now(in: zone): the current instant in the zone the keyword names,
        read as Time.at's `in:` is. With no arm here the call fell through to
@@ -1283,7 +1283,7 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
 
   /* GC module methods */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "GC")) {
+      key_name(c, recv) && sp_streq(key_name(c, recv), "GC")) {
     if (sp_streq(name, "start") && argc == 0) { buf_puts(b, "(sp_gc_collect_request(), (sp_int)0)"); return 1; }
     /* GC.start(full_mark:, immediate_mark:, immediate_sweep:): one collector,
        one kind of collection -- the options are hints, their values
@@ -1322,7 +1322,7 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
   }
 
   /* Fiber class methods: Fiber.yield(val) and Fiber.current */
-  if (recv_is_const(nt, recv, "Fiber")) {
+  if (recv_is_const(c, nt, recv, "Fiber")) {
     if (sp_streq(name, "yield")) {
       /* Fiber.yield(a, b) hands the resumer [a, b] */
       emit_fiber_pass_call(c, "sp_Fiber_yield", NULL, argc, argv, b);
@@ -1353,7 +1353,7 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
 
   /* Process module methods */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Process")) {
+      key_name(c, recv) && sp_streq(key_name(c, recv), "Process")) {
     if (sp_streq(name, "pid") && argc == 0) { buf_puts(b, "((sp_int)getpid())"); return 1; }
     if (sp_streq(name, "times") && argc == 0) { buf_puts(b, "sp_process_times()"); return 1; }
     if (sp_streq(name, "ppid") && argc == 0) { buf_puts(b, "sp_process_ppid()"); return 1; }
@@ -1384,13 +1384,15 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
         buf_printf(b, "({ sp_raise_cls(\"ArgumentError\", (&(\"\\xff\" \"unexpected unit: %s\")[1])); 0.0; })", unit);
         return 1;
       }
-      buf_puts(b, sp_streq(name, "clock_getres") ? "(sp_process_clock_res_ns(" : "(sp_process_clock_ns(");
+      int div = !unit ? 0 : sp_streq(unit, "microsecond") ? 1000 : sp_streq(unit, "millisecond") ? 1000000 : sp_streq(unit, "second") ? 1000000000 : 0;
+      int ns_per_unit = sp_streq(name, "clock_gettime") && div && div < 1000000000 ? div : 1;
+      buf_puts(b, div ? "({ int64_t _clock_ticks = " : "(");
+      buf_puts(b, sp_streq(name, "clock_getres") ? "sp_process_clock_res_ns(" : "sp_process_clock_units(");
       if (!emit_clock_id(c, argv[0], b)) emit_int_expr(c, argv[0], b);
+      if (sp_streq(name, "clock_gettime")) buf_printf(b, ", %d", ns_per_unit);
       buf_puts(b, ")");
-      if (unit && sp_streq(unit, "nanosecond")) buf_puts(b, ")");
-      else if (unit && sp_streq(unit, "microsecond")) buf_puts(b, " / 1000)");
-      else if (unit && sp_streq(unit, "millisecond")) buf_puts(b, " / 1000000)");
-      else if (unit && sp_streq(unit, "second")) buf_puts(b, " / 1000000000)");
+      if (div) buf_printf(b, "; _clock_ticks / %d - (_clock_ticks %% %d < 0); })", div / ns_per_unit, div / ns_per_unit);
+      else if (unit && sp_streq(unit, "nanosecond")) buf_puts(b, ")");
       else if (unit && sp_streq(unit, "float_microsecond")) buf_puts(b, " / 1e3)");
       else if (unit && sp_streq(unit, "float_millisecond")) buf_puts(b, " / 1e6)");
       else buf_puts(b, " / 1e9)");  /* float_second (default) */
@@ -1430,7 +1432,7 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
 
   /* Integer.sqrt(n) -> integer square root (exact, Newton's method) */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Integer") &&
+      key_name(c, recv) && sp_streq(key_name(c, recv), "Integer") &&
       sp_streq(name, "sqrt") && argc == 1) {
     if (repr_of(c, argv[0]).big) {
       buf_puts(b, "sp_bigint_isqrt("); emit_expr(c, argv[0], b); buf_puts(b, ")");  /* (#2420) */
@@ -1450,7 +1452,7 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
 
   /* Marshal (Phase 1): dump a value to a binary String, load one back as poly */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Marshal")) {
+      key_name(c, recv) && sp_streq(key_name(c, recv), "Marshal")) {
     if (sp_streq(name, "dump") && argc == 1) {
       buf_puts(b, "sp_marshal_dump("); emit_boxed(c, argv[0], b); buf_puts(b, ")");
       return 1;
@@ -1488,7 +1490,7 @@ else {
      program can silence or re-enable a category at run time and Kernel#warn's
      `category:` gate reads the same flags. */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Warning")) {
+      key_name(c, recv) && sp_streq(key_name(c, recv), "Warning")) {
     /* the category argument as a C string: a literal symbol becomes a string
        literal; a symbol-typed expression resolves through the symbol table */
     int cat_ok = argc >= 1 && nt_type(nt, argv[0]) &&
@@ -1523,7 +1525,7 @@ else {
 
   /* Math module functions -> C math.h equivalents */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Math")) {
+      key_name(c, recv) && sp_streq(key_name(c, recv), "Math")) {
     /* 1-arg functions */
     /* Domain-restricted functions route through sp_math_* wrappers that
        raise Math::DomainError on out-of-domain input (CRuby parity); the
@@ -1666,7 +1668,7 @@ else {
 
   /* Dir.exist? -> directory test; Dir.exists? was removed in Ruby 4.0 (#2780) */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Dir") &&
+      key_name(c, recv) && sp_streq(key_name(c, recv), "Dir") &&
       (is_exist_alias(name)) && argc == 1) {
     if (sp_streq(name, "exists?")) {
       buf_puts(b, "({ (void)("); emit_expr_for_effect(c, argv[0], b);
@@ -1750,7 +1752,7 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
   /* Thread class methods: Thread.current / Thread.pass (recv is the Thread
      constant). Handled before the Class.new dispatch since they are not `new`. */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode) {
-    const char *tcn = nt_key_name(nt, recv);
+    const char *tcn = key_name(c, recv);
     /* IO.popen is not implemented: refused at compile time, as an
        unsupported API is, rather than a NoMethodError the first time the
        line runs (#7199). A program's own IO.popen is its own. */
@@ -1974,107 +1976,9 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
         return 1;
       }
     }
-    /* IO.pipe / IO.copy_stream / IO.sysopen (#2815) */
-    if (tcn && sp_streq(tcn, "IO")) {
-      if (sp_streq(name, "pipe") && argc == 0) { buf_puts(b, "sp_io_pipe()"); return 1; }
-      /* IO.for_fd(fd [, mode] [, autoclose: bool]). IO.new takes the same
-         descriptor form -- it is how CRuby spells "wrap this fd", and the way
-         to reach a File::Stat from one. */
-      if ((sp_streq(name, "for_fd") || sp_streq(name, "new")) && argc >= 1) {
-        int kwh = nt_argv_kwh(nt, argv, argc);
-        int ac = kwh >= 0 ? kwh_lookup(nt, kwh, "autoclose") : -1;
-        buf_puts(b, "sp_io_for_fd(");
-        emit_int_expr(c, argv[0], b);
-        buf_puts(b, ", ");
-        /* the positional mode rides through whatever its inferred type: a
-           STRING as-is, a widened (poly) one unboxed -- the TY_STRING-only
-           guard dropped a mode variable that widened in a larger program
-           (PR #4209's observation). argv[1] may also BE the keyword hash. */
-        if (argc >= 2 && argv[1] != kwh && comp_ntype(c, argv[1]) == TY_STRING)
-          emit_expr(c, argv[1], b);
-        else if (argc >= 2 && argv[1] != kwh && repr_of(c, argv[1]).kind == RK_BOXED) {
-          buf_puts(b, "sp_poly_to_s("); emit_expr(c, argv[1], b); buf_puts(b, ")");
-        }
-        /* no mode: the runtime derives it from the fd's own access mode
-           (a fixed "r" made fdopen fail on a write-only fd, #4208) */
-        else buf_puts(b, "\"\"");
-        buf_puts(b, ", ");
-        if (ac >= 0) { buf_puts(b, "("); emit_expr(c, ac, b); buf_puts(b, ")"); }
-        else buf_puts(b, "1");
-        buf_puts(b, ")");
-        return 1;
-      }
-      /* IO.select(read, write, error, timeout): a nil array watches nothing */
-      if (sp_streq(name, "select") && argc >= 1 && argc <= 4) return emit_io_select(c, argc, argv, b);
-      if (sp_streq(name, "copy_stream") && argc == 2) {
-        /* IO.copy_stream(src, dst): read the whole source, write it to the dest,
-           returning the byte count. sp_io_copy_stream takes two path strings, so
-           a StringIO (#3216) or an IO/socket (#3217, an sp_File*) endpoint passed
-           straight in was an incompatible-pointer error. When both endpoints are
-           stream objects (StringIO or IO), read/write them by kind; two path
-           strings keep the filename copy. */
-        int a0_sio = node_is_stringio(c, argv[0]), a0_io = comp_ntype(c, argv[0]) == TY_IO;
-        int a1_sio = node_is_stringio(c, argv[1]), a1_io = comp_ntype(c, argv[1]) == TY_IO;
-        int a0_poly = repr_of(c, argv[0]).kind == RK_BOXED;
-        int a1_poly = repr_of(c, argv[1]).kind == RK_BOXED;
-        /* A boxed endpoint may hold a path, including a shared String handle,
-           or a stream. Check its kind before reading the payload as sp_File. */
-        if (a0_poly || a1_poly) {
-          int sio_cid = comp_core_class(c, CORE_STRINGIO);
-          int td = ++g_tmp;
-          buf_printf(b, "({ const char *_t%d = ", td);
-          if (a0_poly) {
-            int ts = ++g_tmp;
-            buf_puts(b, "({ "); ts = hold_operand(c, argv[0], TY_POLY, 0, ts, 1, " ", b);
-            buf_printf(b, "(_t%d.tag == SP_TAG_STR || sp_poly_is_strbuf(_t%d))"
-                          " ? sp_file_read(sp_poly_unbox_s(_t%d)) : ", ts, ts, ts);
-            if (sio_cid >= 0)
-              buf_printf(b, "_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == %d"
-                            " ? sp_StringIO_read((sp_StringIO *)_t%d.v.p) : ", ts, ts, sio_cid, ts);
-            buf_printf(b, "_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_IO"
-                          " ? sp_io_copy_stream_read((sp_File *)_t%d.v.p)"
-                          " : (sp_raise_nomethod(sp_nomethod_msg(\"read\", _t%d)), (const char *)0); })", ts, ts, ts, ts);
-          }
-          else if (a0_sio) { buf_puts(b, "sp_StringIO_read("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
-          else if (a0_io) { buf_puts(b, "sp_io_copy_stream_read("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
-          else { buf_puts(b, "sp_file_read("); emit_path_expr(c, argv[0], b); buf_puts(b, ")"); }
-          buf_printf(b, "; SP_GC_ROOT(_t%d); ", td);
-          if (a1_poly) {
-            int tdd = ++g_tmp;
-            tdd = hold_operand(c, argv[1], TY_POLY, 0, tdd, 1, " ", b);
-            buf_printf(b, "(_t%d.tag == SP_TAG_STR || sp_poly_is_strbuf(_t%d))"
-                          " ? sp_file_write(sp_poly_unbox_s(_t%d), _t%d) : ", tdd, tdd, tdd, td);
-            if (sio_cid >= 0)
-              buf_printf(b, "_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == %d"
-                            " ? sp_StringIO_write((sp_StringIO *)_t%d.v.p, _t%d) : ", tdd, tdd, sio_cid, tdd, td);
-            buf_printf(b, "_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_IO"
-                          " ? sp_File_write_bin((sp_File *)_t%d.v.p, _t%d)"
-                          " : (sp_raise_nomethod(sp_nomethod_msg(\"write\", _t%d)), (sp_int)0); })", tdd, tdd, tdd, td, tdd);
-          }
-          else if (a1_sio) { buf_puts(b, "sp_StringIO_write("); emit_expr(c, argv[1], b); buf_printf(b, ", _t%d); })", td); }
-          else if (a1_io) { buf_puts(b, "sp_File_write_bin("); emit_expr(c, argv[1], b); buf_printf(b, ", _t%d); })", td); }
-          else { buf_puts(b, "sp_file_write("); emit_path_expr(c, argv[1], b); buf_printf(b, ", _t%d); })", td); }
-          return 1;
-        }
-        if ((a0_sio || a0_io) && (a1_sio || a1_io)) {
-          buf_puts(b, a1_sio ? "sp_StringIO_write(" : "sp_File_write_bin(");
-          emit_expr(c, argv[1], b);
-          buf_puts(b, a0_sio ? ", sp_StringIO_read(" : ", sp_io_copy_stream_read(");
-          emit_expr(c, argv[0], b);
-          buf_puts(b, "))"); return 1;
-        }
-        buf_puts(b, "sp_io_copy_stream("); emit_path_expr(c, argv[0], b); buf_puts(b, ", ");
-        emit_path_expr(c, argv[1], b); buf_puts(b, ")"); return 1;
-      }
-      if (sp_streq(name, "sysopen") && argc >= 1) {
-        buf_puts(b, "sp_io_sysopen("); emit_path_expr(c, argv[0], b);
-        buf_puts(b, ", ");
-        if (argc >= 2) emit_int_expr(c, argv[1], b); else buf_puts(b, "0");
-        buf_puts(b, ", ");
-        if (argc >= 3) emit_int_expr(c, argv[2], b); else buf_puts(b, "0");
-        buf_puts(b, ")"); return 1;
-      }
-    }
+    /* a builtin class's own methods (IO.pipe, IO.select, #2815): its
+       class-side rows */
+    if (emit_builtin_class_op(c, id, tcn, name, b)) return 1;
     /* Signal module queries (#2735) */
     if (tcn && sp_streq(tcn, "Signal") && sp_streq(name, "list") && argc == 0) {
       buf_puts(b, "sp_signal_list()"); return 1;
@@ -2433,7 +2337,7 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
   /* Random class methods: Random.rand(n) / Random.rand / Random.bytes(n)
      share a lazily-seeded default instance. */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Random")) {
+      key_name(c, recv) && sp_streq(key_name(c, recv), "Random")) {
     if (sp_streq(name, "rand")) {
       if (argc >= 1 && repr_of(c, argv[0]).as_ty == TY_FLOAT) {
         buf_puts(b, "sp_Random_rand_float_bound(sp_random_default_get(), ");
@@ -2496,7 +2400,7 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
      (sp_enum_product_kw_check), so a `**h` and a String key are named as
      CRuby names them. */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      nt_key_name(nt, recv) && sp_streq(nt_key_name(nt, recv), "Enumerator") &&
+      key_name(c, recv) && sp_streq(key_name(c, recv), "Enumerator") &&
       sp_streq(name, "product")) {
     int tf = ++g_tmp;
     buf_printf(b, "({ sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);", tf, tf);

@@ -2508,13 +2508,19 @@ else {
     break;
   }
   case PM_POST_EXECUTION_NODE: {
-    /* `END { ... }`. CRuby runs END blocks in REVERSE registration
-       order at program exit. Spinel emits each as a static C
-       function and registers them via atexit() at main() startup --
-       atexit naturally invokes handlers LIFO, matching CRuby. */
+    /* `END { ... }`. CRuby puts the block on the same stack as at_exit's
+       hooks, when the statement runs and only the first time, and runs that
+       stack last in first out at exit. So it is read as `at_exit { ... }`,
+       marked end_once for codegen to register it on the first run only. */
     pm_post_execution_node_t *n = (pm_post_execution_node_t *)node;
-    N("PostExecutionNode");
-    R("statements", n->statements);
+    N("CallNode");
+    emit_str(id, "name", "at_exit");
+    I("end_once", 1);
+    int bid = node_counter++;
+    nt_put_type(out_nt, bid, "BlockNode");
+    if (in_bi) emit_int(bid, "node_bi", g_bi_base + 1);
+    emit_ref(bid, "body", (pm_node_t *)n->statements);
+    nt_put_ref(out_nt, id, "block", bid);
     break;
   }
   case PM_PRE_EXECUTION_NODE: {
@@ -7224,8 +7230,7 @@ static int sp_pm_kwsplat_may_drop(const pm_call_node_t *c, const pm_node_t *defi
   for (size_t k = 0; k < el->size; k++) {
     if (PM_NODE_TYPE(el->nodes[k]) != PM_ASSOC_SPLAT_NODE) { drop = 0; continue; }
     const pm_node_t *v = ((const pm_assoc_splat_node_t *)el->nodes[k])->value;
-    if (!v) { drop = 0; continue; }
-    if (PM_NODE_TYPE(v) != PM_HASH_NODE) continue;
+    if (!v || PM_NODE_TYPE(v) != PM_HASH_NODE) continue;
     const pm_node_list_t *he = &((const pm_hash_node_t *)v)->elements;
     int has_splat = 0;
     for (size_t q = 0; q < he->size; q++) if (PM_NODE_TYPE(he->nodes[q]) == PM_ASSOC_SPLAT_NODE) has_splat = 1;

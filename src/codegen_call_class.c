@@ -633,7 +633,7 @@ static int refl_builtin_vis_walk(Compiler *c, int ci, const char *m, int inherit
   if (ri->is_struct) sup = ri->is_data ? "Data" : "Struct";
   else {
     int sc = class_def_super(c->nt, ri->def_node);
-    const char *exc = sc >= 0 ? superclass_builtin_exc_name(c->nt, sc) : NULL;
+    const char *exc = sc >= 0 ? superclass_builtin_exc_name(c, c->nt, sc) : NULL;
     NodeKind sk = sc >= 0 ? nt_kind(c->nt, sc) : NK_NilNode;
     if (exc) sup = exc;
     else if (sk == NK_ConstantReadNode || sk == NK_ConstantPathNode) sup = nt_str(c->nt, sc, "name");
@@ -1993,9 +1993,9 @@ int user_assign_handle(Compiler *c, int id) {
     return 1;
   }
   if (!ty_is_object(rty)) return 0;
-  const CallPlan *p = cplan_user(c, id);
-  if (p->dispatch != CP_DIRECT || p->mi < 0) return 0;
-  const Scope *m = &c->scopes[p->mi];
+  const CallPlan p = cplan_user(c, id);
+  if (p.dispatch != CP_DIRECT || p.mi < 0) return 0;
+  const Scope *m = &c->scopes[p.mi];
   return m->nparams == 1 && m->rest_idx < 0 && m->kwrest_idx < 0 && !m->blk_param;
 }
 
@@ -2269,8 +2269,8 @@ int emit_cmethod_setter_assign(Compiler *c, int id, Buf *b) {
       nt_kind(nt, argv[0]) == NK_SplatNode || !call_is_setter_assign(nt, id) ||
       !(name[0] == '_' || (name[0] >= 'a' && name[0] <= 'z') || (name[0] >= 'A' && name[0] <= 'Z')))
     return 0;
-  const CallPlan *pl = cplan_user(c, id);
-  if (!pl || pl->mi < 0 || pl->via != UC_CMETH || !c->scopes[pl->mi].is_cmethod) return 0;
+  const CallPlan pl = cplan_user(c, id);
+  if (pl.mi < 0 || pl.via != UC_CMETH || !c->scopes[pl.mi].is_cmethod) return 0;
   return emit_setter_assign_value(c, id, argv, b);
 }
 
@@ -2309,7 +2309,7 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
     NodeKind rty_nv_k = nt_kind(nt, recv);
     const char *nvmod = NULL;
     if (rty_nv_k == NK_ConstantReadNode || rty_nv_k == NK_ConstantPathNode)
-      nvmod = nt_key_name(nt, recv);
+      nvmod = key_name(c, recv);
     int nvi = nvmod ? comp_native_find(c, nvmod, name) : -1;
     if (nvi >= 0) {
       const char *feat = c->native_funcs[nvi].feat;
@@ -2382,9 +2382,9 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
     NodeKind rty_ffi_k = nt_kind(nt, recv);
     const char *rcmod = NULL;
     if (rty_ffi_k == NK_ConstantReadNode)
-      rcmod = nt_key_name(nt, recv);
+      rcmod = key_name(c, recv);
     else if (rty_ffi_k == NK_ConstantPathNode)
-      rcmod = nt_key_name(nt, recv);
+      rcmod = key_name(c, recv);
     if (rcmod) {
       int fi = -1;
       for (int ffi_i = 0; ffi_i < c->n_ffi_funcs; ffi_i++)
@@ -3116,19 +3116,19 @@ int emit_call_const_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     NodeKind rk = nt_kind(nt, recv);
     /* (a class body's self is its class, as the constant would be) */
     int bci = rk == NK_SelfNode ? class_body_self_ci(c, recv) : -1;
-    const char *rname = bci >= 0 ? c->classes[bci].name : nt_key_name(nt, recv);
+    const char *rname = bci >= 0 ? c->classes[bci].name : key_name(c, recv);
     if (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode || bci >= 0) {
       int ci = bci >= 0 ? bci : const_node_class_index(c, recv);
       int defcls = -1, mi = -1;
       /* the target is the call's plan (call_plan.c): the constant's class
          method, or a method the program adds to Class (its owner, not the
          constant's class, is then the plan's) */
-      const CallPlan *pl = cplan_user(c, id);
-      if (pl->mi >= 0 && pl->via == UC_CMETH) {
-        mi = pl->mi;
+      const CallPlan pl = cplan_user(c, id);
+      if (pl.mi >= 0 && pl.via == UC_CMETH) {
+        mi = pl.mi;
         defcls = c->scopes[mi].class_id;
         if (g_plan_check) cplan_served("cmethod-on-constant");
-        if (pl->owner_ci != ci) ci = builtin_class_id(rname);
+        if (pl.owner_ci != ci) ci = builtin_class_id(rname);
       }
       /* --plan-check keeps the arm's own lookup as the assertion; without a
          plan it is the arm's answer */
@@ -3834,7 +3834,7 @@ int emit_call_new_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const c
      then fall back to sp_<Sub>_new(args) */
   if (recv >= 0 && sp_streq(name, "new") &&
       nt_kind(nt, recv) == NK_ConstantPathNode) {
-    const char *cn = nt_key_name(nt, recv);
+    const char *cn = key_name(c, recv);
     int ci = const_node_class_index(c, recv);
     /* native (C-backed) class reached as ::Name (root-qualified) */
     if (emit_native_ctor(c, id, ci, argc, argv, b)) return 1;
@@ -3915,7 +3915,7 @@ int emit_call_new_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const c
       }
     }
     if (ci < 0) {
-      const char *qn = superclass_builtin_exc_name(nt, recv);
+      const char *qn = superclass_builtin_exc_name(c, nt, recv);
       if (qn) cn = qn;
     }
     /* (`::NoMethodError.new(msg, name, args, receiver: r)`, a root-anchored
@@ -4889,7 +4889,7 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     if (nt_type(nt, recv) &&
         (nt_kind(nt, recv) == NK_ConstantReadNode ||
          nt_kind(nt, recv) == NK_ConstantPathNode) &&   /* `Outer::Nested.name(x)`: the leaf keys the class (#4526) */
-        nt_key_name(nt, recv)) {
+        key_name(c, recv)) {
       int sci = const_node_class_index(c, recv);
       if (sci >= 0 && call_target(c, id, sci, name, CT_CMETHOD, NULL) >= 0) cls_shadowed = 1;
     }
@@ -5104,7 +5104,7 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
       const char *rcn = nt_type(nt, recv) &&
                         (nt_kind(nt, recv) == NK_ConstantReadNode ||
                          nt_kind(nt, recv) == NK_ConstantPathNode)
-                        ? nt_key_name(nt, recv) : NULL;
+                        ? key_name(c, recv) : NULL;
       int rci = rcn ? const_node_class_index(c, recv) : -1;
       /* `self.constants` (a bare `constants` is given self by desugar): in a
          class body self is that class; in a class method it is the class or
@@ -5262,14 +5262,18 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
        names, answers instead: emit_call_cmethod_arms calls it) */
     NodeKind rvt2_k = nt_kind(nt, recv);
     const char *rcn2 = ((rvt2_k == NK_ConstantReadNode ||
-                                 rvt2_k == NK_ConstantPathNode)) ? nt_key_name(nt, recv) : NULL;
+                                 rvt2_k == NK_ConstantPathNode)) ? key_name(c, recv) : NULL;
     /* an alias of a class (`E = Mod::ParseError`) is no longer renamed to
        the class it names: ask the node which class it is */
     int rci2 = rcn2 ? const_node_class_index(c, recv) : -1;
     if (rci2 >= 0) rcn2 = c->classes[rci2].name;
-    const CallPlan *eqp = rcn2 && sp_streq(name, "===") && argc == 1 ? cplan_user(c, id) : NULL;
+    int eqmi = -1;
+    if (rcn2 && sp_streq(name, "===") && argc == 1) {
+      const CallPlan eqp = cplan_user(c, id);
+      if (eqp.via == UC_CMETH) eqmi = eqp.mi;
+    }
     if (sp_streq(name, "===") && argc == 1 &&
-        !(eqp && eqp->mi >= 0 && eqp->via == UC_CMETH && !scope_calls_super(c, eqp->mi))) {
+        !(eqmi >= 0 && !scope_calls_super(c, eqmi))) {
       if (rcn2 && (rci2 >= 0 ||
                    is_boolean_class_name(rcn2) ||
                    /* the roots: every object is one, and `Object === x` used to
@@ -5437,7 +5441,7 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
           if (any_pf9) {
             int tsd = ++g_tmp;
             tsd = hold_operand_pre(c, recv, TY_POLY, 1, tsd, 1);
-            view_bind(recv, "_t%d", tsd);
+            view_bind_temp(recv, tsd);
             int vw = view_push(c, recv, TY_POLY);
             int svcv = g_cls_value_recv; g_cls_value_recv = recv;
             int done9 = emit_unresolved_call(c, id, b);
@@ -6266,12 +6270,12 @@ int emit_root_reopen_call(Compiler *c, int id, Buf *b, const NodeTable *nt, int 
 int emit_call_reopen_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, TyKind rt) {
   /* dispatch user-defined methods on reopened built-in types -- not for an
      alias that captured the builtin (builtin_only) */
-  if (recv >= 0 && !nt_int(nt, id, "builtin_only", 0)) {
+  if (recv >= 0 && !cplan_builtin_call(c, id)) {
     if (rt == TY_RANDOM) {
-      const CallPlan *pl = cplan_user(c, id);
-      if (pl->mi >= 0 && pl->via == UC_REOPEN && pl->dispatch == CP_DIRECT &&
-          pl->owner_ci == comp_core_class(c, CORE_RANDOM)) {
-        int mi = pl->mi, ci = pl->owner_ci;
+      const CallPlan pl = cplan_user(c, id);
+      if (pl.mi >= 0 && pl.via == UC_REOPEN && pl.dispatch == CP_DIRECT &&
+          pl.owner_ci == comp_core_class(c, CORE_RANDOM)) {
+        int mi = pl.mi, ci = pl.owner_ci;
         if (emit_reopen_block_call(c, id, recv, mi, NULL, b)) return 1;
         if (g_plan_check) ucall_observe(c, id, mi, ci, 0);
         size_t at = b->len;
@@ -6358,9 +6362,9 @@ int emit_call_reopen_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     {
       int oc_ci3 = comp_core_class(c, CORE_OBJECT);
       if (oc_ci3 >= 0) {
-        const CallPlan *pl = cplan_user(c, id);
-        int planned = pl->via == UC_REOPEN && pl->owner_ci == oc_ci3 && pl->dispatch == CP_DIRECT;
-        int oc_mi3 = planned ? pl->mi : call_target(c, id, oc_ci3, name, 0, NULL);
+        const CallPlan pl = cplan_user(c, id);
+        int planned = pl.via == UC_REOPEN && pl.owner_ci == oc_ci3 && pl.dispatch == CP_DIRECT;
+        int oc_mi3 = planned ? pl.mi : call_target(c, id, oc_ci3, name, 0, NULL);
         if (g_plan_check && planned) {
           cplan_served("object-fallback");
           int own = call_target(c, id, oc_ci3, name, 0, NULL);
@@ -6493,15 +6497,15 @@ int emit_call_implicit_self_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     if (dispatch_cid >= 0) {
       if (emit_or_take_back(c, id, b, emit_implicit_self_member)) return 1;
       /* The contextual plan supplies both the target and dispatch form. */
-      const CallPlan *pl = implicit_self_plan(c, id, dispatch_cid);
-      int mi = pl->chain && pl->via == UC_INST && pl->owner_ci == dispatch_cid ? pl->mi : -1;
+      const CallPlan pl = implicit_self_plan(c, id, dispatch_cid);
+      int mi = pl.chain && pl.via == UC_INST && pl.owner_ci == dispatch_cid ? pl.mi : -1;
       if (g_plan_check) cplan_served("implicit-self-late");
       cplan_check_missing(c, id, mi, dispatch_cid, name, 0, "implicit-self-late");
       /* Template-method pattern: a base-class method calls an abstract method
          that is implemented only in subclasses. Not found up the chain, but if a
          descendant defines it, emit_dispatch can still resolve it virtually on
          self's runtime class. */
-      int dispatch = mi >= 0 || (!self->is_cmethod && pl->dispatch >= CP_SWITCH);
+      int dispatch = mi >= 0 || (!self->is_cmethod && pl.dispatch >= CP_SWITCH);
       if (dispatch && emit_reopen_own_call(c, id, dispatch_cid, b)) return 1;
       if (dispatch) {
         emit_dispatch(c, dispatch_cid, name, g_self, nt_ref(nt, id, "arguments"), nt_ref(nt, id, "block"), b);

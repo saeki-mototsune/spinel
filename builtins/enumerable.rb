@@ -420,18 +420,47 @@ module Enumerable
     end
   end
 
-  def find
+  def find(ifnone = nil)
     if block_given?
       found = nil
+      hit = false
       each do |x|
         if yield(x)
           found = x
+          hit = true
           break
         end
+      end
+      if !hit && !nil.equal?(ifnone)
+        found = ifnone.call
       end
       found
     else
       each
+    end
+  end
+
+  def rfind
+    if block_given?
+      # Only an Array reaches this walk, and it reads the array live at each
+      # step, as the typed path's loop does: an element the block writes
+      # before the walk gets to it is the element the walk sees, and an
+      # array the block shrinks is walked from its new end (CRuby's
+      # rb_ary_rfind clamps the index the same way)
+      found = nil
+      i = size
+      while i > 0
+        i -= 1
+        x = self[i]
+        if yield(x)
+          found = x
+          break
+        end
+        i = size if i > size
+      end
+      found
+    else
+      to_a.reverse.each
     end
   end
 

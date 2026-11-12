@@ -12,6 +12,10 @@
 #include "call_plan.h"
 
 int array_fill_boxes_handle(Compiler *c, int id, int fill);
+/* main's own `to_s` or `inspect` (cplan_main_text_call): main's text, the
+   String sp_poly_to_s answers for main, with no dispatch and no box for its
+   receiver, which is main. emit_call_inner asks it ahead of the arms. */
+int emit_main_text_call(Compiler *c, int id, Buf *b);
 
 /* ---- the arms ---- */
 int emit_call_synchronize_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv);
@@ -106,7 +110,7 @@ void emit_poly_cmp_ordered(Compiler *c, const char *fn, int recv, int arg, Buf *
 void emit_handle_inspect(Compiler *c, int recv, TyKind rt, Buf *b);
 int bigint_cmp_operand_ok(TyKind t);
 int emit_bigint_cmp_inexact(Compiler *c, int recv, int arg, const char *op, Buf *b);
-Buf emit_cmp_self(Compiler *c, int recv, TyKind rt);
+Buf emit_cmp_self(Compiler *c, int recv, TyKind rt, int *tmp);
 int emit_float_bigint_cmp(Compiler *c, int recv, int arg, const char *op, Buf *b);
 void emit_int_flt_rel(Buf *b, const char *iv, const char *fv, int int_left, const char *op);
 int emit_int_float_cmp(Compiler *c, int recv, int arg, const char *op, Buf *b);
@@ -370,7 +374,7 @@ int emit_reopen_recv_args(Compiler *c, int id, int mi, int recv, int boxed, cons
 int emit_reopen_recv_in_order(Compiler *c, int id, int mi, int recv, int boxed, const char *box_fn, size_t at, Buf *b);
 void emit_reopen_self_arg(Compiler *c, int id, int mi, Buf *b);
 int str_fresh_value(Compiler *c, int n);
-const CallPlan *implicit_self_plan(Compiler *c, int id, int dispatch_cid);
+CallPlan implicit_self_plan(Compiler *c, int id, int dispatch_cid);
 
 int emit_send_blind(Compiler *c, int id, Buf *b);
 

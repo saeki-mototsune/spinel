@@ -23,6 +23,11 @@
    stack beside the views, popped by view_unbind, and a refusal's
    view_unwind drops the ones bound since its mark with the rest.
 
+   view_bind_park takes the bindings of one method's own nodes out of sight
+   for a copy of its body spliced inside another copy (the same nodes, the
+   enclosing copy's temps). Each parked binding is an entry on the view
+   stack, so view_bind_unpark or a refusal's view_unwind puts it back.
+
    view_push_target gives a call its effective method name for one emission.
    The node stays intact; cache depth, epochs and refusal unwinding include it.
 
@@ -58,7 +63,7 @@
 /* what an entry overrides: the node's type, one representation flag, or
    the arm context */
 enum { VK_TYPE = -1, VK_ARM = -2, VK_FACE = -3, VK_STMT = -4, VK_TARGET = -7, VK_CONVERSION = -8,
-       VK_CONST_READ = -9, VK_CLASS_IS = -10, VK_CALL_NIL_TESTED = -11 };
+       VK_CONST_READ = -9, VK_CLASS_IS = -10, VK_CALL_NIL_TESTED = -11, VK_BIND_PARKED = -12 };
 static struct { Compiler *c; int id; int kind; int saved; int val; ArmCtx arm_saved; const void *pre; } view_stack[VIEW_MAX];
 static int view_face = -1;   /* the innermost face entry, or -1 */
 static int view_stmt = -1;   /* the innermost statement entry, or -1 */
@@ -66,7 +71,7 @@ static int view_sp;
 static int view_nodes;   /* the entries that view a node (all but VK_ARM) */
 static unsigned view_epoch_n;
 
-ArmCtx g_arm = { -1, -1, 0, -1, -1, -1, -1, NULL };
+ArmCtx g_arm = { -1, -1, 0, -1, -1, -1, -1, NULL, NULL };
 
 /* Argument-hoist overrides: emit_args_filled pre-evaluates GC-hazardous
    call arguments into rooted temps; emit_expr then substitutes the temp
@@ -74,10 +79,10 @@ ArmCtx g_arm = { -1, -1, 0, -1, -1, -1, -1, NULL };
    with, so only a call of more arguments than that grows it. */
 static int  argov_node0[2 * MAX_ARG_OVERRIDE];
 static char argov_text0[2 * MAX_ARG_OVERRIDE][ARGOV_TEXT_LEN];
-static unsigned char argov_oint0[2 * MAX_ARG_OVERRIDE];
+static unsigned char argov_flag0[2 * MAX_ARG_OVERRIDE];
 int  *g_argov_node = argov_node0;
 char (*g_argov_text)[ARGOV_TEXT_LEN] = argov_text0;
-unsigned char *g_argov_oint = argov_oint0;   /* the bound text is an sp_oint / sp_ofloat (view_bind_o) */
+unsigned char *g_argov_flag = argov_flag0;   /* per slot flags (ARGOV_OINT: the bound text is an sp_oint / sp_ofloat, view_bind_o) */
 static int g_argov_cap = 2 * MAX_ARG_OVERRIDE;
 int  g_n_argov = 0;
 /* See codegen_internal.h. */
@@ -89,11 +94,11 @@ void argov_reserve(void) {
   if (!nodes || !texts) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   memcpy(nodes, g_argov_node, sizeof *nodes * (size_t)g_n_argov);
   memcpy(texts, g_argov_text, sizeof *texts * (size_t)g_n_argov);
-  unsigned char *oints = calloc((size_t)cap, 1);
-  if (!oints) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  memcpy(oints, g_argov_oint, (size_t)g_n_argov);
-  if (g_argov_node != argov_node0) { free(g_argov_node); free(g_argov_text); free(g_argov_oint); }
-  g_argov_node = nodes; g_argov_text = texts; g_argov_oint = oints; g_argov_cap = cap;
+  unsigned char *flags = calloc((size_t)cap, 1);
+  if (!flags) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  memcpy(flags, g_argov_flag, (size_t)g_n_argov);
+  if (g_argov_node != argov_node0) { free(g_argov_node); free(g_argov_text); free(g_argov_flag); }
+  g_argov_node = nodes; g_argov_text = texts; g_argov_flag = flags; g_argov_cap = cap;
 }
 
 /* A bound text is what the emitters compare and print: --share-check's
@@ -103,7 +108,7 @@ static int view_bind_v(int node, int oint, const char *fmt, va_list ap) {
   if (g_n_argov + 1 > g_argov_cap) argov_reserve();
   int slot = g_n_argov++;
   g_argov_node[slot] = node;
-  g_argov_oint[slot] = (unsigned char)oint;
+  g_argov_flag[slot] = (unsigned char)(oint ? ARGOV_OINT : 0);
   int n;
   n = vsnprintf(g_argov_text[slot], sizeof g_argov_text[0], fmt, ap);
   /* (one representation: a node bound to a temp held by face reads it as bytes) */
@@ -136,7 +141,67 @@ int view_bind_o(int node, const char *fmt, ...) {
   return slot;
 }
 
+/* See codegen_internal.h. */
+static int view_ran(int slot) {
+  g_argov_flag[slot] |= ARGOV_RAN;
+  return slot;
+}
+int view_bind_temp(int node, int t) { return view_ran(view_bind(node, "_t%d", t)); }
+int view_bind_temp_o(int node, int t) { return view_ran(view_bind_o(node, "_t%d", t)); }
+int view_bind_temp_read(int node, const char *reader, int t) {
+  return view_ran(view_bind(node, "%s(_t%d)", reader, t));
+}
+
 void view_unbind(int n) { g_n_argov = n; }
+
+/* See codegen_internal.h. A parked binding keeps its slot and its text; its
+   node reads as none any lookup asks for (-1 is one they do ask for: a call
+   with no receiver), until the entry that parked it is closed. */
+#define BIND_PARKED(node) (-2 - (node))
+static int view_open_mark(int kind, int node, int v, const void *p);
+int view_bind_park(Compiler *c, const Scope *m, int call) {
+  int n = 0;
+  for (int i = 0; i < g_n_argov; i++) {
+    int node = g_argov_node[i], in = 0;
+    const int *par = node >= 0 ? codegen_node_parents(c, node) : NULL;
+    for (int p = node; par && p >= 0 && p < c->cg_parent_n && p != call && !in; p = par[p])
+      in = p == m->def_node || p == m->body;
+    if (!in) continue;
+    view_open_mark(VK_BIND_PARKED, i, node, NULL);
+    g_argov_node[i] = BIND_PARKED(node);
+    n++;
+  }
+  return n;
+}
+void view_bind_unpark(Compiler *c, int n) {
+  while (n-- > 0) view_pop(c, view_sp - 1);
+}
+
+/* Does node's latest binding, the one emit_expr writes, carry flag `bit`?
+   No binding carries none. */
+static int view_latest_has(int node, unsigned char bit) {
+  if (node < 0) return 0;
+  for (int i = g_n_argov - 1; i >= 0; i--)
+    if (g_argov_node[i] == node) return (g_argov_flag[i] & bit) != 0;
+  return 0;
+}
+/* See codegen_internal.h. */
+int view_ran_first(int node) { return view_latest_has(node, ARGOV_RAN); }
+const char *view_held_text(int node) {
+  if (node < 0) return NULL;
+  for (int i = g_n_argov - 1; i >= 0; i--)
+    if (g_argov_node[i] == node) return (g_argov_flag[i] & ARGOV_HELD) ? g_argov_text[i] : NULL;
+  return NULL;
+}
+int view_held(int node) { return view_held_text(node) != NULL; }
+void view_hold(int slot) {
+  if (slot >= 0 && slot < g_n_argov && (g_argov_flag[slot] & ARGOV_RAN)) g_argov_flag[slot] |= ARGOV_HELD;
+}
+void view_hold_handle(int slot) {
+  view_hold(slot);
+  if (slot >= 0 && slot < g_n_argov && (g_argov_flag[slot] & ARGOV_HELD)) g_argov_flag[slot] |= ARGOV_HANDLE;
+}
+int view_held_handle(int node) { return view_held(node) && view_latest_has(node, ARGOV_HANDLE); }
 
 unsigned view_epoch(void) { return view_epoch_n; }
 
@@ -158,12 +223,12 @@ static void view_write(Compiler *c, int kind, int id, int v) {
   switch (kind) {
   case VK_TYPE:          comp_set_ntype(c, id, (TyKind)v); break;
   case VR_STRBUF_BOX:    comp_set_strbuf_box(c, id, (unsigned char)v); break;
-  case VR_HANDLE_DEMAND: c->strbuf_handle_demand[id] = (unsigned char)v; break;
-  case VR_POLY_LIFT:     c->poly_strbuf_lift[id] = (unsigned char)v; break;
-  case VR_NIL_TESTED:    c->nil_tested[id] = (unsigned char)v; break;
-  case VR_HEAD_HELD:     c->head_held[id] = (unsigned char)v; break;
-  case VR_DISCARDED:     c->value_discarded[id] = (unsigned char)v; break;
-  case VR_STR_SHADOW:    c->str_shadow[id] = (unsigned char)v; break;
+  case VR_HANDLE_DEMAND: ((unsigned char *)c->strbuf_handle_demand)[id] = (unsigned char)v; break;
+  case VR_POLY_LIFT:     ((unsigned char *)c->poly_strbuf_lift)[id] = (unsigned char)v; break;
+  case VR_NIL_TESTED:    ((unsigned char *)c->nil_tested)[id] = (unsigned char)v; break;
+  case VR_HEAD_HELD:     ((unsigned char *)c->head_held)[id] = (unsigned char)v; break;
+  case VR_DISCARDED:     ((unsigned char *)c->value_discarded)[id] = (unsigned char)v; break;
+  case VR_STR_SHADOW:    ((unsigned char *)c->str_shadow)[id] = (unsigned char)v; break;
   default:               comp_set_nilnarrow(c, id, (TyKind)v); break;
   }
 }
@@ -215,6 +280,7 @@ int view_push_arm(int pd_skip, int prbd_skip, int builtin_arm) {
   g_arm.pd_skip = pd_skip;
   g_arm.prbd_skip = prbd_skip;
   g_arm.builtin_arm = builtin_arm;
+  g_arm.arm_cls = NULL;
   return tok;
 }
 
@@ -364,11 +430,24 @@ int view_call_nil_tested(Compiler *c, int id) {
   return 0;
 }
 
+/* A nil arm that leaves the receiver's test to the call's own guard opens
+   VR_NIL_TESTED at 3 (emit_nil_target_own); the guard that writes the test
+   says so here, and the arm reads the 4 before it pops. A signal on the
+   open view: it counts no edit, like the push and the pop around it. */
+void view_nil_test_written(Compiler *c, int recv) {
+  if (comp_nil_tested_stored(c, recv) == 3) ((unsigned char *)c->nil_tested)[recv] = 4;
+}
+
 /* the entry on top, put back */
 static void view_close(int tok) {
   if (view_stack[tok].kind == VK_ARM) { g_arm = view_stack[tok].arm_saved; return; }
   if (view_stack[tok].kind == VK_FACE) { view_face = view_stack[tok].arm_saved.pd_skip; return; }
   if (view_stack[tok].kind == VK_STMT) { view_stmt = view_stack[tok].saved; return; }
+  if (view_stack[tok].kind == VK_BIND_PARKED) {
+    /* (a refusal may have dropped the binding itself: its slot is then free, or another's) */
+    if (g_argov_node[view_stack[tok].id] == BIND_PARKED(view_stack[tok].saved)) g_argov_node[view_stack[tok].id] = view_stack[tok].saved;
+    return;
+  }
   if (view_stack[tok].kind != VK_TARGET && view_stack[tok].kind != VK_CONVERSION && view_stack[tok].kind != VK_CONST_READ &&
       view_stack[tok].kind != VK_CLASS_IS && view_stack[tok].kind != VK_CALL_NIL_TESTED)
     view_write(view_stack[tok].c, view_stack[tok].kind, view_stack[tok].id, view_stack[tok].saved);

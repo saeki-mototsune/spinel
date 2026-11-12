@@ -142,10 +142,11 @@ int const_path_in_closed_builtin(Compiler *c, int id);
 int const_path_misses_toplevel(Compiler *c, int id);
 int builtin_module_at(int i, const char **name, int *id);
 int is_builtin_exception_name(const char *n);
-const char *superclass_builtin_exc_name(const NodeTable *nt, int sc);   /* analyze_util.c */
+const char *superclass_builtin_exc_name(const Compiler *c, const NodeTable *nt, int sc);   /* analyze_util.c */
 int is_syserr_family_name(const char *n);           /* analyze_util.c */
 int builtin_method_known(const char *cls, const char *m);
 int builtin_method_known_any(const char *m);   /* codegen_call.c */
+int builtin_method_fixed_any(const char *m);   /* ...of a fixed Method#arity (codegen_call.c) */
 int builtin_instance_name_known(const char *m);   /* codegen_call.c */
 int builtin_name_below_object(const char *m);   /* codegen_call.c */
 int builtin_object_method_known(const char *m);   /* builtin_names.c */
@@ -166,6 +167,8 @@ int poly_splat_keyed(const char *name);
 int an_bi_generic_splat(Compiler *c, int id);
 int builtin_kernel_fn_span(const char *name, int with_block, int *lo, int *hi);
 int builtin_arity_violation(Compiler *c, int id, int non_nil);
+int builtin_count_refused_boxed(Compiler *c, int id);
+int io_library_count_refused(Compiler *c, int id, const struct BuiltinOp *op, const char *name);
 int is_handler_proc_block(Compiler *c, int id);
 int builtin_class_id(const char *name);
 int class_is_prim_reopen(Compiler *c, int k);
@@ -449,8 +452,9 @@ void elab_walk_leave(Compiler *c, int e);
 void elab_walk_rest(Compiler *c, int id, ElabPos pos);
 void elab_walk_site(Compiler *c, int id, const ElabPos *pos);
 int elab_header_entity(Compiler *c, int node, const ElabPos *pos);
+void elab_builder_entity(Compiler *c, int node, const ElabPos *pos);
 void elab_header_opened(Compiler *c, int node, int cls, int made);
-int elab_rec_open(Compiler *c, int node, int cp, const char *cname, int encl);
+int elab_rec_open(Compiler *c, int node, int cp, const char *cname, const char *rname, int encl);
 void header_parent_encloses(Compiler *c, int par, int child, const char *leaf, int named);
 void elab_load_sites(Compiler *c, int stmt, void (*fn)(void *ud, int load, int in_place), void *ud);
 void walk_scope_stmt(Compiler *c, int stmt, int k, int scope_idx, ElabPos pos);
@@ -754,6 +758,7 @@ int desugar_class_body_bare_new(Compiler *c);
 int desugar_bare_spawn(Compiler *c);
 int desugar_bare_class_self_calls(Compiler *c);
 int desugar_ie_bare_object_calls(Compiler *c);
+int desugar_main_singleton_calls(Compiler *c);
 int desugar_bare_object_reopen_calls(Compiler *c);
 int desugar_descendant_reader_calls(Compiler *c);
 int desugar_masgn_store_evidence(Compiler *c);
@@ -1038,6 +1043,7 @@ int desugar_toplevel_instance_exec(Compiler *c);
 int desugar_binding_lvget(Compiler *c);
 int desugar_step_kwargs(Compiler *c);
 int desugar_defined_method_call(Compiler *c);
+int desugar_respond_to_missing(Compiler *c);
 int desugar_respond_to_probe(Compiler *c);
 int desugar_symbol_to_proc_call(Compiler *c);
 int desugar_call_op_write(Compiler *c);
@@ -1096,7 +1102,7 @@ typedef struct {
   const char *param, *cls;
   int mod, hook_mod, cls_node;
 } InclSubst;
-void incl_subst(NodeTable *nt, int node, const InclSubst *is, int self_mod);
+void incl_subst(const Compiler *c, NodeTable *nt, int node, const InclSubst *is, int self_mod);
 void incl_emit_stmt(const NodeTable *nt, int s, int **out, int *no, int *cap, char **frame);
 char *incl_frame_add(char *fr, const char *locals);
 int incl_hook_returns(const NodeTable *nt, int node);   /* a `return` that leaves the hook */
@@ -1208,6 +1214,9 @@ void refuse_readonly_global_write(Compiler *c);
 /* Defined in codegen.c; the analyzer uses it to specialize/type a
    `rescue <UserExc> => e` binding (#1415). */
 int class_is_exc_subclass(Compiler *c, int ci);
+/* (and a builtin exception's reopening, whose text methods the uncaught
+   exception printer asks, cr_collect_program_end) */
+int class_is_exc_reopen(Compiler *c, int ci);
 /* the native-binding registries' growth and `;`-merge (analyze_scope.c),
    shared with a bundled extension's __cext_link (analyze_cext.c) */
 void ffi_semi_append(char **slot, const char *add);

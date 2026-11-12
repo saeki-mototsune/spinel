@@ -327,6 +327,13 @@ LocalVar *comp_const_at(Compiler *c, int node);
 int const_writes_head(Compiler *c, const char *key);
 int const_writes_next(Compiler *c, int node);
 void const_writes_free(Compiler *c);
+/* What main's own singleton answers for `name` at p, ahead of Object's
+   table: ELAB_YES with *out a program's `def self.m` (or alias) there, or
+   with *out NULL the core's own singleton method (main_singleton_method:
+   `to_s`, `inspect`) that main has from the start; ELAB_NO when the
+   singleton holds no method of the name, ELAB_UNKNOWN when the record
+   cannot say. */
+int elab_main_singleton_at(Compiler *c, const char *name, LoadPoint p, const LrDef **out);
 /* the version of cls's method `name` (singleton when sg) live at p, through
    its ancestors as they stood at p; *out (when asked) the version found. A
    hook (`inherited`, `included`, `method_added`, ...) is asked as the
@@ -334,6 +341,8 @@ void const_writes_free(Compiler *c);
 int elab_method_at(Compiler *c, int cls, const char *name, int sg, LoadPoint p, const LrDef **out);
 /* ...and whether the program gives cls's instance side a method `name` of its own at p, or through a prepend: what shadows the class's own core method (an ancestor's, a Numeric's or Object's, does not, nor an include's); ELAB_YES also for one removed, ELAB_UNKNOWN for one that may not have run (under a condition) */
 int elab_own_method_at(Compiler *c, int cls, const char *name, LoadPoint p);
+/* ...and whether cls's instance side reaches a method `name` at p from its own part of the lookup: its prepends, its own entries (a visibility change of the name too) and its includes, not its superclass; ELAB_YES also for one removed */
+int elab_reached_method_at(Compiler *c, int cls, const char *name, LoadPoint p);
 /* may a call at p run on cls: on its class object (sg) once a header has
    opened it, on an instance once one may exist? 1 where the record cannot
    tell */
@@ -397,6 +406,16 @@ int elab_self_at(Compiler *c, int node);
    itself (a block of another call may run under another self, as
    class_exec's does); -2 otherwise, and for main's top level */
 int elab_self_value_at(Compiler *c, int node);
+/* Does the load phase never run the block of `call`, a call on self in the
+   body of class cls, where self is the class (the scope walk's direct
+   class: under a condition or in an expression of the body, not in a
+   block or a method): the record finds a def of the program's among the
+   class's class methods for it there, its own, its extends' or a
+   superclass's, and no method the program defines by that name uses the
+   block it is given, whichever of them is live when the call runs? 0 where
+   that is not sure: a name the walk reads by itself (elab_block_when), one
+   the program takes away somewhere, a statement that may run again. */
+int elab_block_never_runs(Compiler *c, int call, int cls);
 /* Has module cls's singleton class been made at p, which CRuby makes on
    the first of its makers (is_singleton_class_maker, a def on the
    singleton, `class << m`, an instance or class variable write), or at
@@ -465,6 +484,7 @@ int elab_method_reflected(Compiler *c, const char *name, int sg);
    one answering from the table, a respond_to? or defined? the cells
    answer, a Method's maker; or one name any? */
 int elab_method_asked(Compiler *c, const char *name);
+int elab_reopen_answers(Compiler *c, const char *cls, const char *name);
 /* The record's histories of method `name`, one class and side at a time:
    the first with i -1, then the one after i; -1 past the last. *cls the
    class (-1 main's), *sg 1 for its singleton side. */
@@ -534,10 +554,26 @@ int elab_call_window(Compiler *c, int id, ElabWindow *w);
    cap. Where its value, or a read of that local, goes anywhere else it may
    run at any time, which no site places. */
 int elab_closure_runs(Compiler *c, int id, int *sites, int cap);
-/* ...and whether node id is in a block the record takes to run at once
-   (ELAB_BLK_ASSUMED) whose typed call target keeps it (Call node
-   `blk_kept`), with no def or lambda between: node id may then run any
-   time after its point, and elab_window_open widens w to its region's end. */
+/* ...and the calls that force the lazy chain whose block node id is in
+   (elab_block_runs answers it later: lr_lazy_later), with only blocks run
+   at once between: the chain's value written whole to a local, each call
+   on a read of it in the same body that forces it (is_lazy_forcing_name),
+   followed through the calls that chain it on into another such local.
+   How many; -1 for no such chain, past cap, and where the chain, or a read
+   of such a local, goes anywhere else (handed on as it is, to a method,
+   returned), so that every site is where the block may run. */
+int elab_lazy_runs(Compiler *c, int id, int *sites, int cap);
+/* does the body of def node `def` keep the block it is given for later,
+   for certain, by the record's reading of its uses of the block (a store,
+   a closure that escapes, a hand-on to a call that keeps it), with none
+   that runs it now or is unsure? */
+int elab_def_keeps_block(Compiler *c, int def);
+/* ...and whether node id is in a block whose typed call target keeps it
+   (Call node `blk_kept`, an_mark_kept_blocks: one the record takes to run
+   at once, ELAB_BLK_ASSUMED, or one given to a method of the program's,
+   ELAB_BLK_UNKNOWN), with no def or lambda between: node id may then run
+   any time after its point, and elab_window_open widens w to its region's
+   end. */
 int elab_in_kept_block(Compiler *c, int id);
 /* ...and whether node id is in a block the record answers later
    (elab_block_runs: a lazy chain's) or in an END body: it may run any time
@@ -729,6 +765,10 @@ int elab_class_candidates(Compiler *c, int node, int **out);   /* the classes a 
    Object's; below -1 not known) and the name (NULL outside the load
    phase's walk) */
 int elab_header_class(const Compiler *c, int node, int *owner, const char **leaf);
+/* The name a class or module header's constant path (or a read) is keyed by,
+   asked of the compiler: nt_key_name, where the readers move from the name
+   the header was stamped with to the class it opened (#10793). */
+const char *key_name(const Compiler *c, int n);
 /* ...and the class a class builder's write opens (`X = Struct.new(:a) do`,
    `k = Data.define(:a) do`), -1 for a write no builder made a class at */
 int elab_builder_class(Compiler *c, int node);
@@ -744,6 +784,10 @@ int class_def_path(const NodeTable *nt, int def_node);   /* the constant node it
 int mixin_stmt_args(const NodeTable *nt, int st, int *prepend, const int **av);   /* a body's receiverless include/prepend: its argument count, -1 for another node */
 const char *class_def_name(const NodeTable *nt, int def_node);   /* the constant name it writes, NULL for none */
 const char *class_def_bare_name(const NodeTable *nt, int def_node);   /* ...written as a plain constant, NULL under a path */
+/* ...asked of the compiler: where the readers move from the name the header
+   was stamped with to the class it opened (#10793) */
+const char *class_def_key(const Compiler *c, int def_node);
+const char *class_def_bare_key(const Compiler *c, int def_node);
 void class_def_set_body(NodeTable *nt, int def_node, int body);   /* its body statements, as a pass rebuilds them */
 int class_def_body(const NodeTable *nt, int def_node);   /* its body statements, -1 for none */
 int class_def_super(const NodeTable *nt, int def_node);   /* its superclass reference, -1 for none */
@@ -770,6 +814,13 @@ void elab_swap_nodes(Compiler *c, int a, int b);
    be, *miss then the name that names nothing (ref's or a parent's) and
    *owner the class it was looked up in (-1: Object's, the top level) */
 int elab_const_ref_at(Compiler *c, int ref, int site, const char **miss, int *owner);
+/* the segment of constant read node (`Missing`, `Known::Thing`) its lookup
+   fails on where the read stands, or -1 for none the record is sure of: a
+   first name the program defines nowhere, or a name a class or module of
+   the program the path reaches does not hold, nor its ancestors, in a
+   program with no const_missing and no const_set or autoload of a computed
+   name */
+int elab_const_path_fails(Compiler *c, int node);
 /* the superclass the first header of cls naming one names, as the record
    resolved it there; -1 when it names none or one the record does not know */
 int elab_class_super(Compiler *c, int cls);
@@ -786,6 +837,11 @@ int elab_method_vis_at(Compiler *c, int cls, const char *name, int sg, LoadPoint
    Object's own; 0 where main has none there; -1 where the record cannot
    tell (node in a method body, a def under a condition, an undef) */
 int elab_main_method_vis_at(Compiler *c, int node, const char *name);
+/* Is main's def of `name` (a top-level def or alias) the live entry of
+   Object's method table where node runs, rather than Object's own def?
+   The later of the two answers: 1 main's, 0 Object's, -1 where the record
+   cannot tell. */
+int elab_main_def_live_at(Compiler *c, int node, const char *name);
 /* ... when no change of it follows: elab_method_vis_at's answer at p, or -1
    where an entry of the name's histories along cls's superclass chain at or
    after p (one in another region too, whose order is not known, and an
@@ -1341,6 +1397,7 @@ int method_recv_nodes(Compiler *c, int recv, int **out); /* every one a re-writt
 int method_recv_stamped(Compiler *c, int recv);           /* ...each from a bind site that stamps its position */
 int method_recv_owner_unknown(Compiler *c, int recv);     /* may a Method expr hold a builtin's whose owner no fact names */
 int bam_owner(Compiler *c, int mi, const char **name);     /* the owner a builtin's or accessor's wrapper stands for */
+int bam_main_singleton(Compiler *c, int mi);   /* does the wrapper stand for a method of main's singleton? */
 int bam_struct_member(Compiler *c, int mi);                 /* is it a Struct member's accessor wrapper */
 int method_expr_is_unbound(Compiler *c, int recv);    /* instance_method with no #bind crossed */
 int proc_to_proc_method_nodes(Compiler *c, int recv, int **out); /* the method(:sym) nodes behind <method>.to_proc */
@@ -1448,9 +1505,10 @@ int std_stream_foreign_writer(Compiler *c, const char *nm);   /* an object outpu
 int std_stream_bare_call_own(Compiler *c, int id, const char *nm);   /* bare nm reaches the program's own */
 /* The operation (StrhOp, builtin_names.h) call node `call` is on a String
    Array, whose elements are handles, given the receiver's type rt:
-   STRH_NONE unless rt is TY_STR_ARRAY, the call's index
-   arguments are Integers, no argument is a splat, a keyword Hash or a block
-   argument, and no method of the program's own stands in for Array's. */
+   STRH_NONE unless rt is TY_STR_ARRAY, the call's index is an Integer
+   (delete's needle a String), no argument is a splat, a keyword Hash or a
+   block argument, and no method of the program's own stands in for
+   Array's. */
 int strh_call_op(Compiler *c, int call, TyKind rt);
 int strh_var_read(const NodeTable *nt, int n);   /* a variable's read, whatever its kind of variable */
 

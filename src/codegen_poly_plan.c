@@ -138,7 +138,7 @@ static int pa_key_cmp(const void *x, const void *y) {
   return ((const PolyArm *)x)->key - ((const PolyArm *)y)->key;
 }
 
-void pa_end(Compiler *c, int frame, const PolyPlan *p) {
+void pa_end(Compiler *c, int frame, PolyPlan p) {
   if (frame < 0 || frame >= g_pa_n) return;
   PaFrame *f = &g_pa[frame];
   const char *nm = nt_str(c->nt, f->id, "name");
@@ -159,20 +159,20 @@ void pa_end(Compiler *c, int frame, const PolyPlan *p) {
   char pt[400], ct[400];
   g_pa_compared++;
   g_pa_arms += f->n;
-  if ((f->flags & PPF_SEEN) && (f->flags & ~PPF_SEEN) != (p->flags & ~PPF_SEEN)) {
+  if ((f->flags & PPF_SEEN) && (f->flags & ~PPF_SEEN) != (p.flags & ~PPF_SEEN)) {
     fprintf(stderr, "plan-check: poly-conflict: node %d %s: flags: plan %#x, codegen %#x\n", f->id,
-            nm ? nm : "?", p->flags & ~PPF_SEEN, f->flags & ~PPF_SEEN);
+            nm ? nm : "?", p.flags & ~PPF_SEEN, f->flags & ~PPF_SEEN);
     g_pa_conflict++;
   }
   /* both lists by key: the switch writes its tag pre-arms and builtin cases
      around the class arms */
-  PolyArm *pl = p->n ? malloc((size_t)p->n * sizeof *pl) : NULL;
-  if (p->n) memcpy(pl, p->arm, (size_t)p->n * sizeof *pl);
-  qsort(pl, (size_t)p->n, sizeof *pl, pa_key_cmp);
+  PolyArm *pl = p.n ? malloc((size_t)p.n * sizeof *pl) : NULL;
+  if (p.n) memcpy(pl, p.arm, (size_t)p.n * sizeof *pl);
+  qsort(pl, (size_t)p.n, sizeof *pl, pa_key_cmp);
   qsort(f->arm, (size_t)f->n, sizeof *f->arm, pa_key_cmp);
   int i = 0, j = 0;
-  while (i < p->n || j < f->n) {
-    const PolyArm *pa = i < p->n ? &pl[i] : NULL, *ca = j < f->n ? &f->arm[j] : NULL;
+  while (i < p.n || j < f->n) {
+    const PolyArm *pa = i < p.n ? &pl[i] : NULL, *ca = j < f->n ? &f->arm[j] : NULL;
     if (pa && (!ca || pa->key < ca->key)) {
       pa_arm_text(c, pa, pt, sizeof pt);
       fprintf(stderr, "plan-check: poly-missing: node %d %s: plan %s\n", f->id, nm ? nm : "?", pt);
@@ -909,7 +909,7 @@ static void emit_poly_struct_set(Compiler *c, int id, const PolyUserArgs *U, int
   int av[2];
   for (int i = 0; i < 2; i++) {
     av[i] = view_push(c, U->argv[i], U->atmp_ty[i]);
-    view_bind(U->argv[i], "_t%d", U->atmp[i]);
+    view_bind_temp(U->argv[i], U->atmp[i]);
   }
   buf_printf(b, " case %d: _t%d = ", k, U->tr);
   emit_object_call(c, id, b);
@@ -2689,7 +2689,7 @@ void emit_poly_cases0(Compiler *c, int id, int recv, const char *name, const Pol
   if (argc == 0 && ret == TY_POLY && nt_ref(nt, id, "block") < 0 &&
       poly_container_read_p(name) && g_pd_skip != id &&
       g_n_argov < MAX_ARG_OVERRIDE) {
-    int slot9 = view_bind(recv, "_t%d", tv);
+    int slot9 = view_bind_temp(recv, tv);
     int va = view_push_arm(id, g_prbd_skip, 1);
     /* The builtin surface reads the node's own type to pick its shape, and
        this node was widened to poly to hold both answers. Restore the
@@ -3979,7 +3979,8 @@ int emit_poly_prearms_n_blk(Compiler *c, int id, const char *name, const PolySpe
     snprintf(crt, sizeof crt, "sp_unbox_class(_t%d)", tv);
     int slot[4];
     for (int i = 0; i < pos_argc; i++)
-      slot[i] = view_bind(argv[i], atmp_ty[i] == TY_POLY ? "sp_unbox_class(_t%d)" : "_t%d", atmp[i]);
+      slot[i] = atmp_ty[i] == TY_POLY ? view_bind_temp_read(argv[i], "sp_unbox_class", atmp[i])
+                                      : view_bind_temp(argv[i], atmp[i]);
     Buf cb; memset(&cb, 0, sizeof cb);
     if (emit_builtin_op_arm_text(c, id, nt_ref(nt, id, "receiver"), TY_CLASS, name, crt, tv, &cb))
       buf_printf(b, "if (_t%d.tag == SP_TAG_CLASS) _t%d = %s%s%s;\nelse ", tv, tr,
@@ -5006,9 +5007,9 @@ int poly_num_arm(const char *name, int argc) {
    written; the builtin surface's trial is the tail otherwise. */
 static int emit_poly_plan_default_n(Compiler *c, int id, const char *name, int kwh, int pos_argc, int splat_a,
                                     int tv, Buf *b) {
-  const PolyPlan *p = cplan_poly(c, id);
-  for (int i = 0; i < p->n; i++) {
-    const PolyArm *a = &p->arm[i];
+  const PolyPlan p = cplan_poly(c, id);
+  for (int i = 0; i < p.n; i++) {
+    const PolyArm *a = &p.arm[i];
     if (a->key != PA_KEY_DEFAULT || (a->kind != PA_ARITY && a->kind != PA_VIS)) continue;
     if (a->kind == PA_VIS) {
       buf_puts(b, " ");
@@ -5049,7 +5050,7 @@ void emit_poly_defaults_n(Compiler *c, int id, int recv, const char *name, const
   if (bop_share_named(BOP_ANY_ARRAY, name) == BSH_PACK) {
     for (int e = 0; e < kw->kwn; e++) {
       int v = nt_ref(nt, kw->kwels[e], "value");
-      if (v >= 0) view_bind(v, "_t%d", kw->kwtmp[e]);
+      if (v >= 0) view_bind_temp(v, kw->kwtmp[e]);
     }
   }
   /* Same fallthrough rule as the zero-arg dispatch, but only when the
@@ -5281,7 +5282,7 @@ void emit_poly_defaults_n(Compiler *c, int id, int recv, const char *name, const
     if (kw->kwtmp && bop_share_named(BOP_ANY_ARRAY, name) != BSH_PACK) {
       for (int e = 0; e < kw->kwn; e++) {
         int v = nt_ref(nt, kw->kwels[e], "value");
-        if (v >= 0) view_bind(v, "_t%d", kw->kwtmp[e]);
+        if (v >= 0) view_bind_temp(v, kw->kwtmp[e]);
       }
     }
     if (!obj_arity && !sum_done && (!dl_open ||

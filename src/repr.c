@@ -225,9 +225,14 @@ static int node_is_oint_asked(Compiler *c, int node) {
     TyKind rt = r >= 0 ? comp_ntype(c, r) : TY_UNKNOWN;
     int a2 = nt_ref(nt, node, "arguments"), an2 = 0;
     if (a2 >= 0) nt_arr(nt, a2, "arguments", &an2);
+    /* Kernel's then and tap, where the plan binds the call to no method of
+       the program's (an Object or a class method of the name answers in
+       its own form, below) */
+    CallPlan kp = cplan_user(c, node);
+    int kernel = kp.mi < 0 && kp.dispatch == CP_NONE;
     /* `x.then { ... }` answers its block: a nil tail or a `next` that can
        hand nil makes it nil */
-    if ((sp_streq(nm, "then") || sp_streq(nm, "yield_self")) && blk >= 0 && nt_kind(nt, blk) == NK_BlockNode) {
+    if (kernel && is_then_alias(nm) && blk >= 0 && nt_kind(nt, blk) == NK_BlockNode) {
       int bb = nt_ref(nt, blk, "body");
       int bn = 0; const int *bs = bb >= 0 ? nt_arr(nt, bb, "body", &bn) : NULL;
       if (bn > 0 && (node_has_oint_form(c, bs[bn - 1]) || nt_kind(nt, bs[bn - 1]) == NK_NilNode)) return 1;
@@ -245,7 +250,7 @@ static int node_is_oint_asked(Compiler *c, int node) {
       return nt_kind(nt, lv) == NK_NilNode || repr_of(c, lv).kind == RK_BOXED || node_has_oint_form(c, lv);
     }
     /* `x.tap { ... }` answers its receiver, in the receiver's form */
-    if (sp_streq(nm, "tap") && blk >= 0 && nt_kind(nt, blk) == NK_BlockNode && r >= 0 && oint_kind(rt)) return node_is_oint(c, r);
+    if (kernel && is_tap_name(nm) && blk >= 0 && nt_kind(nt, blk) == NK_BlockNode && r >= 0 && oint_kind(rt)) return node_is_oint(c, r);
     /* unary `+` hands an Integer / Float its operand: the operand's form */
     if (sp_streq(nm, "+@") && an2 == 0 && r >= 0 && oint_kind(rt)) return node_is_oint(c, r);
     /* a proc's result comes back boxed and is unboxed with its nil */
@@ -449,11 +454,11 @@ static int node_is_oint_asked(Compiler *c, int node) {
       int nn = nullable_int_value(c, node);
       g_nn_builtin_call = sv_bc;
       if (nn) return 1;
-      /* ... unless the name is one the program's Object method owns, which
-         is the arm's answer in its own form */
+      /* ... unless the arm's call reaches the program's Object method,
+         which answers in its own form (in a String's arm, a name String
+         answers is String's own: cplan_arm_object_target) */
       if (g_poly_builtin_arm && g_pd_skip == node) {
-        int oc = comp_core_class(c, CORE_OBJECT);
-        int omi = oc >= 0 ? call_target(c, node, oc, nm, 0, NULL) : -1;
+        int omi = cplan_arm_object_target(c, node, g_arm.arm_cls);
         if (omi >= 0 && method_ret_is_oint(&c->scopes[omi])) return 1;
       }
     }
@@ -807,14 +812,14 @@ static int repr_boxed_native_handle(Compiler *c, int v) {
   int recv = nt_ref(c->nt, v, "receiver");
   const char *nm = nt_str(c->nt, v, "name");
   if (recv < 0 || !nm || !repr_recv_boxed(c, recv)) return 0;
-  const PolyPlan *p = cplan_poly_arms(c, v);
+  const PolyPlan p = cplan_poly_arms(c, v);
   int nk = 0, any = 0;
   const int *ks = poly_recv_classes(c, v, &nk);
-  if (p->n <= 0 || !ks || nk <= 0) return 0;
+  if (p.n <= 0 || !ks || nk <= 0) return 0;
   for (int j = 0; j < nk; j++) {
     int arm = -1;
-    for (int i = 0; i < p->n && arm < 0; i++)
-      if (p->arm[i].key == ks[j]) arm = i;
+    for (int i = 0; i < p.n && arm < 0; i++)
+      if (p.arm[i].key == ks[j]) arm = i;
     /* (a class with no arm and no method_missing raises NoMethodError,
        which answers no String: strbuf_poly_user_boxes) */
     if (arm < 0) {
@@ -823,7 +828,7 @@ static int repr_boxed_native_handle(Compiler *c, int v) {
         return 0;
       continue;
     }
-    if (p->arm[arm].kind != PA_NATIVE || !repr_native_arm_handle(c, v, ks[j])) return 0;
+    if (p.arm[arm].kind != PA_NATIVE || !repr_native_arm_handle(c, v, ks[j])) return 0;
     any = 1;
   }
   return any;
@@ -904,12 +909,12 @@ int repr_call_returns_handle(Compiler *c, int v) {
   v = nt_paren_single(c->nt, v);
   if (repr_super_native_keeps(c, v)) return 1;
   if (v >= 0 && (nt_kind(nt, v) == NK_SuperNode || nt_kind(nt, v) == NK_ForwardingSuperNode)) {
-    const CallPlan *p = cplan_user(c, v);
-    return p->dispatch == CP_DIRECT && repr_self_handle(c, p->mi) && scope_ret_handle(c, p->mi);
+    const CallPlan p = cplan_user(c, v);
+    return p.dispatch == CP_DIRECT && repr_self_handle(c, p.mi) && scope_ret_handle(c, p.mi);
   }
   if (v < 0 || nt_kind(nt, v) != NK_CallNode) return 0;
   /* a String's value, or one the pickup marks to be stored as the handle */
-  TyKind t = comp_ntype_stored(c, v);
+  TyKind t = comp_ntype_settled(c, v);
   if (t != TY_STRING && !(t == TY_STRBUF && (comp_strbuf_box_stored(c, v) || c->n_cext_extensions))) return 0;
   if (strbuf_io_outbuf(c, v) >= 0) return 1;
   /* a Method's call: the method `method(:m)` names */
@@ -919,7 +924,7 @@ int repr_call_returns_handle(Compiler *c, int v) {
      the return channel before making its own String. delete's
      missing-key block answers its value the same way. */
   if (recv >= 0 && nt_kind(nt, recv) == NK_ConstantReadNode &&
-      is_env_const(nt_key_name(nt, recv)) && !comp_const(c, "ENV") &&
+      is_env_const(key_name(c, recv)) && !comp_const(c, "ENV") &&
       bop_share_named(BOP_ENV, nm) == BSH_FETCH) {
     int argc = 0; const int *argv = call_args(nt, v, &argc);
     int tail = env_delete_block_value(c, v);
@@ -995,16 +1000,16 @@ int repr_call_returns_handle(Compiler *c, int v) {
 int repr_boxed_reader_handle(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
   if (v < 0 || nt_kind(nt, v) != NK_CallNode ||
-      (comp_ntype_stored(c, v) != TY_STRING && !(comp_ntype_stored(c, v) == TY_STRBUF && comp_strbuf_box_stored(c, v))) ||
+      (comp_ntype_settled(c, v) != TY_STRING && !(comp_ntype_settled(c, v) == TY_STRBUF && comp_strbuf_box_stored(c, v))) ||
       nt_ref(nt, v, "block") >= 0 ||
       nt_ref(nt, v, "arguments") >= 0) return 0;
   int recv = nt_ref(nt, v, "receiver");
   if (recv < 0 || !repr_recv_boxed(c, recv) ||
       ty_poly_face_owners(nt_str(nt, v, "name"), 0, 0, 1, 1)) return 0;
-  const PolyPlan *p = cplan_poly_arms(c, v);
-  if (p->n == 0) return 0;
-  for (int i = 0; i < p->n; i++)
-    if (p->arm[i].kind != PA_READER || p->arm[i].vty != TY_STRBUF) return 0;
+  const PolyPlan p = cplan_poly_arms(c, v);
+  if (p.n == 0) return 0;
+  for (int i = 0; i < p.n; i++)
+    if (p.arm[i].kind != PA_READER || p.arm[i].vty != TY_STRBUF) return 0;
   /* (an exception in the box answers #message through the exception's
      route, whose fallback takes these readers' boxes: exc_message_boxed_call) */
   return !exc_message_boxed_call(c, v);
@@ -1018,15 +1023,16 @@ int repr_boxed_reader_handle(Compiler *c, int v) {
    are not among those targets, nor is the method the call is in (`def
    to_s = @v.to_s`, whose box may hold another of its objects): that arm
    answers what the method's other tails answer, which its own return
-   decides. */
+   decides. main's own `to_s` (cplan_main_text_call) answers main's text,
+   not a box's String. */
 int repr_boxed_to_s_operand(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
   if (v < 0 || nt_kind(nt, v) != NK_CallNode) return -1;
   const char *nm = nt_str(nt, v, "name");
   int recv = nt_ref(nt, v, "receiver");
-  if (!is_to_s_name(nm) || recv < 0 || call_plain_argc(c, v) != 0 ||
+  if (!is_to_s_name(nm) || recv < 0 || call_plain_argc(c, v) != 0 || cplan_main_text_call(c, v) ||
       nt_ref(nt, v, "block") >= 0 || repr_of(c, recv).kind != RK_BOXED ||
-      (comp_ntype_stored(c, v) != TY_STRING && comp_ntype_stored(c, v) != TY_STRBUF)) return -1;
+      (comp_ntype_settled(c, v) != TY_STRING && comp_ntype_settled(c, v) != TY_STRBUF)) return -1;
   int targets[CPT_MAX], n = cplan_targets(c, v, targets, CPT_MAX);
   if (n < 0) return -1;
   for (int i = 0; i < n; i++) {
@@ -1098,7 +1104,7 @@ int repr_string_conversion_operand(Compiler *c, int v) {
   return r >= 0 && is_receiver_conversion(nt_str(c->nt, v, "name")) &&
          call_plain_argc(c, v) == 0 && (nt_ref(c->nt, v, "block") < 0 || nt_int(c->nt, v, "dyn_arm", 0)) &&
          comp_recv_type(c, r) == TY_STRING &&
-         (cplan_user(c, v)->dispatch == CP_NONE || repr_user_answers_self(c, v)) ? r : -1;
+         (cplan_user(c, v).dispatch == CP_NONE || repr_user_answers_self(c, v)) ? r : -1;
 }
 /* ENV copies its stored bytes, but a store answers its value operand.
    A boxed operand can still hold plain bytes: an observable alias stays
@@ -1109,7 +1115,7 @@ int repr_env_store_operand(Compiler *c, int v) {
   if (v < 0 || nt_kind(nt, v) != NK_CallNode) return -1;
   int r = nt_ref(nt, v, "receiver"), argc = 0;
   const int *argv = call_args(nt, v, &argc);
-  return r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode && is_env_const(nt_key_name(nt, r)) &&
+  return r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode && is_env_const(key_name(c, r)) &&
          !comp_const(c, "ENV") && argc == 2 && bop_share_named(BOP_ENV, nt_str(nt, v, "name")) == BSH_LAST &&
          (repr_of(c, argv[1]).kind != RK_BOXED || share_value_unobserved(c, argv[1])) &&
          (repr_of(c, argv[0]).handle || share_value_fresh(c, argv[0], 0) || !subtree_has_side_effect(c, argv[1]))
@@ -1133,8 +1139,12 @@ static int repr_strbuf_src(const Compiler *c, int node, TyKind t) {
   NodeKind k = nt_kind(nt, node);
   if (repr_self_shared(c, node)) return RS_HANDLE;
   /* an element a String Array of handles reads or removes is the handle
-     the Array keeps, as a String Range's endpoint is (#8328 step 5) */
-  if ((t == TY_STRING || t == TY_STRBUF) && strh_handle_call(mc, node)) return RS_HANDLE;
+     the Array keeps, as a String Range's endpoint is (#8328 step 5): the
+     call as written. A sequence in parentheses that ends in one is stored
+     as any String of either face is: an argument held ahead of its call
+     as its handle is bound as that handle, and a consumer of bytes without
+     a face of its own (eql?, casecmp?) reads the bound text as it is */
+  if ((t == TY_STRING || t == TY_STRBUF) && k == NK_CallNode && one_str_elem_call(mc, node, TY_UNKNOWN)) return RS_HANDLE;
   if (t == TY_STRING) {
     /* a global holding the handle (--share-strings): its read boxes it */
     if (repr_static_read_kind(k)) return repr_static_share(c, node) ? RS_HANDLE : RS_NONE;
@@ -1310,24 +1320,24 @@ Repr repr_of(const Compiler *c, int node) {
   r.ty = r.as_ty = r.narrowed = r.elem = r.key = r.val = r.range = TY_UNKNOWN;
   r.kind = RK_NONE;
   r.untyped = 1;
-  if (node < 0 || node >= c->nt->count) return r;
-  r.ty = comp_ntype_stored(c, node);
+  if (!comp_node_in(c, node)) return r;
+  r.ty = comp_ntype_settled(c, node);
   r.as_ty = comp_ntype(c, node);
   /* the layout first, from the type it is stored as, then the flags:
      GCC 13's store merging at -O2 drops the nil_cold store when
      repr_layout's bitfield stores come after it; setting the layout first
      avoids it */
   repr_layout(&r, r.as_ty);
-  r.narrowed = comp_nilnarrow_present(c) ? comp_nilnarrow_stored(c, node) : TY_UNKNOWN;
+  r.narrowed = comp_nilnarrow_stored(c, node);
   r.handle = comp_strbuf_box_stored(c, node) != 0;
   r.demand = comp_strbuf_handle_demand_stored(c, node) != 0;
   r.read_raw = c->strbuf_read_raw ? c->strbuf_read_raw[node] != 0 : 0;
-  r.poly_lift = comp_poly_strbuf_lift_present(c) ? comp_poly_strbuf_lift_stored(c, node) != 0 : 0;
-  r.nil_tested = comp_nil_tested_present(c) ? comp_nil_tested_stored(c, node) != 0 : 0;
-  r.nil_cold = comp_nil_tested_present(c) ? comp_nil_tested_stored(c, node) == 2 : 0;
-  r.head_held = comp_head_held_present(c) ? comp_head_held_stored(c, node) != 0 : 0;
-  r.discarded = comp_value_discarded_present(c) ? comp_value_discarded_stored(c, node) != 0 : 0;
-  r.str_shadow = comp_str_shadow_present(c) ? comp_str_shadow_stored(c, node) & 3 : 0;
+  r.poly_lift = comp_poly_strbuf_lift_stored(c, node) != 0;
+  r.nil_tested = comp_nil_tested_stored(c, node) != 0;
+  r.nil_cold = comp_nil_tested_stored(c, node) == 2;
+  r.head_held = comp_head_held_stored(c, node) != 0;
+  r.discarded = comp_value_discarded_stored(c, node) != 0;
+  r.str_shadow = comp_str_shadow_stored(c, node) & 3;
   /* a node is boxed as the type it is stored as; a nil-guard narrowing is
      read where the value is used, not where it is boxed */
   TyKind kt = r.as_ty;
@@ -1398,6 +1408,54 @@ ReprForm repr_box_form(const Compiler *c, Repr r) {
   if (ty_is_object(r.elem) || ty_is_array(r.elem)) return RF_PTR_ARRAY;
   if (ty_is_object(t)) return r.dyn_cls ? RF_NULLABLE_DYN : RF_NULLABLE;
   return RF_NULLABLE;
+}
+
+/* See repr.h. Every box can, unless its form proves an immediate: an
+   Integer, a Float (each with its nil or not), true, false, a Symbol, nil
+   and a void value's nil; or a Class, boxed by its id or by its name
+   (sp_box_class), whose name the collector marks but every producer
+   passes as a literal, so it holds nothing collectable. A by-value
+   struct's box is a heap copy of it (a Range, a Rational, Process::Tms),
+   whatever the slot that holds the struct needs, and a Time's is its
+   object; a builtin pointer the collector does not own (a Regexp's
+   compiled pattern: its row roots no slot) is not one. An untyped value
+   is boxed by its shape where it has one (an empty `[]` or `{}`, a bare
+   Array.new or Hash.new): a new container. A frozen String literal's box
+   is its static handle (share_frozen_literal). */
+int repr_box_holds_heap(Compiler *c, int node) {
+  Repr r = repr_of(c, node);
+  if (share_frozen_literal(c, node)) return 0;
+  switch (repr_box_form(c, r)) {
+  case RF_INT: case RF_INT_NIL: case RF_FLT: case RF_FLT_NIL: case RF_BOOL: case RF_SYM:
+    return 0;
+  case RF_NIL_EFFECT:
+    return r.untyped;
+  case RF_STRUCT:
+    return r.as_ty != TY_CLASS;
+  case RF_NULLABLE: {
+    const TyTraits *tr = ty_traits_of(r.as_ty);
+    return !tr || tr->needs_root;
+  }
+  default:
+    return 1;
+  }
+}
+/* See repr.h. */
+int repr_box_allocates(const Compiler *c, Repr r) {
+  switch (repr_box_form(c, r)) {
+  case RF_PASS: case RF_NIL_EFFECT: case RF_INT: case RF_INT_NIL: case RF_FLT:
+  case RF_FLT_NIL: case RF_BIGINT: case RF_BOOL: case RF_SYM:
+  case RF_NULLABLE: case RF_NULLABLE_DYN: case RF_STRBUF_HANDLE:
+  case RF_STRBUF_ELEM: case RF_PTR_ARRAY:
+    return 0;
+  case RF_STRUCT:
+    /* a struct held by value (a Range, Complex, Rational, Tms) is copied into a
+       cell; a Time is held by pointer (its Repr kind says struct, its C type
+       says otherwise) and a Class is tagged with its index */
+    return ty_is_struct_valued(r.as_ty) && r.as_ty != TY_CLASS;
+  default:
+    return 1;   /* a copy (RF_VOBJ), a fresh handle, a shape-specific box */
+  }
 }
 
 const char *repr_form_name(int form) {

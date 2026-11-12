@@ -88,6 +88,13 @@ static int hash_reader_class(Compiler *c) {
   return 0;
 }
 
+/* See codegen_call_arms.h. */
+int emit_main_text_call(Compiler *c, int id, Buf *b) {
+  if (!cplan_main_text_call(c, id)) return 0;
+  buf_puts(b, "SPL(\"main\")");
+  return 1;
+}
+
 int emit_call_identity_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt) {
   /* between?(lo, hi): lo <= self <= hi */
   if (sp_streq(name, "between?") && argc == 2) {
@@ -799,6 +806,9 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
        answer different kinds, on a receiver not dispatched by class: the
        call is boxed (infer_call's instance_exec arm), so is this site's value */
     int ie_fwd_boxed = 0;
+    /* the block spliced is the one the enclosing splice was given, so its
+       body is that block's definition-site code (as a yield splices it) */
+    int ie_blk_fwd = 0;
     if (nt_call_has_block_arg(nt, id) && call_forwards_own_block(c, id) &&
         g_ie_poly_node != id && (recv < 0 || comp_ntype(c, recv) != TY_POLY)) {
       Scope *fsc = comp_scope_of(c, id);
@@ -822,6 +832,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         return 1;
       }
       blk = g_block_id;
+      ie_blk_fwd = blk >= 0;
     }
     TyKind rtype = ie_self_cls >= 0 ? ty_object(ie_self_cls) : comp_ntype(c, recv);
     if (blk >= 0 && ty_is_object(rtype) &&
@@ -1057,6 +1068,17 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
           else { g_loop_break_var = NULL; g_ie_next_var = NULL; }
           g_c_loop_depth++;   /* the do{} wrapper makes `continue` valid */
         }
+        /* A forwarded block's body runs in its definition site's block
+           context, as a yield splices it: its own `&block` names the block
+           one level out, not the one being spliced, which re-spliced the
+           same body until the compiler ran out of stack (#11649) */
+        int sv_ieb = g_block_id, sv_iefb = g_yield_block_fallback;
+        const char *sv_iebpn = g_block_param_name, *sv_iebown = g_block_owner_param_name;
+        if (ie_blk_fwd) {
+          g_block_id = g_yield_block_fallback; g_yield_block_fallback = -1;
+          g_block_param_name = g_block_owner_param_name;
+          g_block_owner_param_name = g_yield_block_fallback_param_name;
+        }
         for (int j = 0; j < upto; j++) emit_stmt(c, ie_bb[j], g_pre, g_indent);
         if (!last_as_stmt) {
           Buf vb; memset(&vb, 0, sizeof vb);
@@ -1075,6 +1097,8 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
           }
           free(vb.p);
         }
+        g_block_id = sv_ieb; g_yield_block_fallback = sv_iefb;
+        g_block_param_name = sv_iebpn; g_block_owner_param_name = sv_iebown;
         if (ie_bn_wrap) {
           g_c_loop_depth--;
           g_loop_break_var = sv_lb; g_ie_next_var = sv_nx;
@@ -1355,7 +1379,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       free(fzref.p);
       if (fzrun) {
         int fzcall = nt_kind(nt, fzb) == NK_CallNode;
-        int mk = fzcall ? view_bind(fzb, "%s", thr) : -1;
+        int mk = fzcall ? view_bind_temp(fzb, th) : -1;
         buf_puts(b, " (void)(");
         emit_expr_for_effect(c, recv, b);
         buf_puts(b, ");");
@@ -1391,7 +1415,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
          does a method the class defines itself: Nokogiri's Node#dup is a deep
          copy, and the built-in shallow copy took its place (#5450). Not for
          a call an alias captured the builtin for (builtin_only). */
-      !(!nt_int(nt, id, "builtin_only", 0) && ty_is_object(comp_ntype(c, recv)) &&
+      !(!cplan_builtin_call(c, id) && ty_is_object(comp_ntype(c, recv)) &&
         comp_resolve_member(c, ty_object_class(comp_ntype(c, recv)), name, 0, NULL, NULL) != SP_MEMBER_NONE) &&
       !(comp_ntype(c, recv) == TY_POLY && an_user_defines_method(c, name))) {
     int dargs = nt_ref(nt, id, "arguments");
@@ -1582,7 +1606,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
          does a method the class defines itself: Nokogiri's Node#dup is a deep
          copy, and the built-in shallow copy took its place (#5450). Not for
          a call an alias captured the builtin for (builtin_only). */
-      !(!nt_int(nt, id, "builtin_only", 0) && ty_is_object(comp_ntype(c, recv)) &&
+      !(!cplan_builtin_call(c, id) && ty_is_object(comp_ntype(c, recv)) &&
         comp_resolve_member(c, ty_object_class(comp_ntype(c, recv)), name, 0, NULL, NULL) != SP_MEMBER_NONE) &&
       !(argc == 0 && repr_of(c, recv).kind == RK_BOXED && !sp_streq(name, "itself") && user_defines_or_reads(c, name))) {
     int args = nt_ref(nt, id, "arguments");
@@ -1803,7 +1827,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
    name of the String, and the call answers it (or its frozen face), or nil. */
 static int emit_safe_nav_freeze_handle(Compiler *c, int id, const char *name, int recv, Buf *b) {
   if (g_sn_skip == id || !is_freeze_name(name) || call_plain_argc(c, id) != 0 ||
-      nt_ref(c->nt, id, "block") >= 0 || cplan_user(c, id)->dispatch != CP_NONE) return 0;
+      nt_ref(c->nt, id, "block") >= 0 || cplan_user(c, id).dispatch != CP_NONE) return 0;
   /* a receiver a caller already holds as the handle (emit_bang_self_handle
      binds it) is taken as it is */
   if (repr_of(c, recv).as_ty != TY_STRBUF &&
@@ -2296,8 +2320,12 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
       int sn_cont = needs_root(rrt) && rrt != TY_POLY && rrt != TY_STRING && !ty_is_object(rrt);
       if ((sn_obj || rrt == TY_STRING || sn_scalar || sn_cont) && g_sn_skip != id) {
         int tsn2 = ++g_tmp;
-        /* (an attribute assignment marked to hand out its handle answers it) */
-        TyKind ret2 = (repr_of(c, id).demand || (repr_of(c, id).handle && repr_write_share(c, id)))
+        /* (an attribute assignment marked to hand out its handle answers it,
+           and so does a String Array's element read written as the handle
+           the Array holds: the nil arm and the slot of a hoisted guard are
+           that handle's) */
+        TyKind ret2 = (repr_of(c, id).demand || (repr_of(c, id).handle && repr_write_share(c, id)) ||
+                       typed_elem_read_raw(rrt, id))
                       ? TY_STRBUF : repr_of(c, id).as_ty;
         /* The temp lives in g_pre (statement scope), not an inline ({ }):
            the re-entered dispatch hoists its (substituted) receiver into
@@ -2902,7 +2930,7 @@ int emit_call_object_override_arms(Compiler *c, int id, Buf *b, const NodeTable 
     }
     /* TrueClass.new / FalseClass.new / NilClass.new: no allocator */
     if (nm0 && sp_streq(nm0, "new") && rv0 >= 0 && nt_kind(nt, rv0) == NK_ConstantReadNode) {
-      const char *cn0 = nt_key_name(nt, rv0);
+      const char *cn0 = key_name(c, rv0);
       if (cn0 && (is_immediate_class_name(cn0))) {
         buf_printf(b, "(sp_raise_cls(\"NoMethodError\","
                       " (&(\"\\xff\" \"undefined method 'new' for class %s\")[1])), 0)", cn0);
@@ -3092,6 +3120,29 @@ static int emit_bivar_table_op(Compiler *c, const BopCtx *x, char op, Buf *b) {
   return 1;
 }
 
+/* The dead value after that raise, in the C form call `id` already has:
+   boxed, an oint that carries its nil, or the plain zero of its type. */
+const char *ivar_raise_tail(Compiler *c, int id) {
+  Repr rp = repr_of(c, id);
+  if (rp.kind == RK_BOXED) return "sp_box_nil()";
+  if (oint_kind(rp.as_ty) && node_is_oint(c, id)) return oint_nil(rp.as_ty);
+  return raise_tail_value_c(c, rp.as_ty);
+}
+void emit_ivar_name_error(Compiler *c, Buf *b, const char *sym, int arg) {
+  size_t n = strlen(sym ? sym : "") + 64;
+  char *msg = malloc(n);
+  snprintf(msg, n, "'%s' is not allowed as an instance variable name", sym ? sym : "");
+  /* a Symbol name is NameError#name as it is; a String one would be the
+     String itself, which the staged text (interned) cannot carry */
+  int as_sym = arg >= 0 && nt_kind(c->nt, arg) == NK_SymbolNode;
+  buf_puts(b, "sp_raise_cls(\"NameError\", ");
+  if (as_sym) { buf_puts(b, "(sp_exc_stage_name("); emit_str_literal(b, sym ? sym : ""); buf_puts(b, "), "); }
+  emit_str_literal(b, msg);
+  if (as_sym) buf_puts(b, ")");
+  buf_puts(b, ")");
+  free(msg);
+}
+
 int emit_op_ivar_reflection(Compiler *c, const BopCtx *x, Buf *b) {
   const NodeTable *nt = c->nt;
   int id = x->id, recv = x->recv, argc;
@@ -3123,9 +3174,8 @@ int emit_op_ivar_reflection(Compiler *c, const BopCtx *x, Buf *b) {
     else { buf_puts(b, "(void)("); emit_expr_for_effect(c, argv[k], b); buf_puts(b, "); "); }
   }
   if (tn >= 0) buf_printf(b, "sp_ivar_name_check(_t%d); ", tn);
-  /* a literal name with no `@` is NameError before anything else */
-  if (argc >= 1 && sym && sym[0] != '@')
-    buf_printf(b, "sp_raise_cls(\"NameError\", \"'%s' is not allowed as an instance variable name\"); ", sym);
+  /* a literal name that is no ivar name is NameError before anything else */
+  if (argc >= 1 && sym && !ivar_name_ok(sym)) { emit_ivar_name_error(c, b, sym, argv[0]); buf_puts(b, "; "); }
   /* the prefix is rooted: the receiver's inspect allocates before the
      message is built, and a collection there freed it */
   if (is_set)
@@ -3180,7 +3230,13 @@ int emit_call_display_ivar_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
     const char *ivn = nt_kind(nt, argv[0]) == NK_SymbolNode
                         ? nt_str(nt, argv[0], "value") : nt_str(nt, argv[0], "content");
     int dcid = ty_object_class(rt);
-    int have = ivn && ivn[0] == '@' && comp_ivar_index(&c->classes[dcid], ivn) >= 0;
+    /* a name that is no ivar name raises, the receiver evaluated first */
+    if (!ivar_name_ok(ivn)) {
+      buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), ");
+      emit_ivar_name_error(c, b, ivn, argv[0]); buf_puts(b, ", (sp_bool)0)");
+      return 1;
+    }
+    int have = comp_ivar_index(&c->classes[dcid], ivn) >= 0;
     /* one nothing has set yet is not defined (ivar_set_kind) */
     if (have && ((ivar_set_kind(c, dcid, ivn) & 1) ||
                  poly_ivar_unset_marked(c, dcid, comp_ivar_index(&c->classes[dcid], ivn)))) {
@@ -3193,7 +3249,7 @@ int emit_call_display_ivar_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
     }
     /* a name the class does not declare: in the object's table, where a
        computed instance_variable_set may have put it (#8219) */
-    if (!have && ivn && ivn[0] == '@' && c->classes[dcid].computed_ivar_set && !comp_ty_value_obj(c, rt)) {
+    if (!have && c->classes[dcid].computed_ivar_set && !comp_ty_value_obj(c, rt)) {
       buf_printf(b, "sp_bivar_defined_p((const void *)("); emit_expr(c, recv, b);
       buf_printf(b, "), sp_sym_intern(\"%s\"))", ivn);
       return 1;
@@ -3517,13 +3573,15 @@ int emit_object_ivar_call(Compiler *c, int id, const char *name, int recv, TyKin
     NodeKind rk = nt_kind(nt, recv);
     int recv_lvalue = (rk == NK_LocalVariableReadNode ||
                               rk == NK_InstanceVariableReadNode || rk == NK_SelfNode);
-    /* A name without a leading `@` is never a valid ivar name: raise NameError
-       at runtime (evaluating the receiver first for its side effects). */
-    if (!sym || sym[0] != '@') {
-      if (recv >= 0) { buf_puts(b, "(("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), "); }
-      else buf_puts(b, "(");
-      buf_printf(b, "sp_raise_cls(\"NameError\", \"'%s' is not allowed as an instance variable name\"), sp_box_nil())",
-                 sym ? sym : "");
+    /* A name that is no ivar name (`"bad"`, `:@1`) raises NameError at
+       run time, after the receiver and a set's value are evaluated. */
+    if (!ivar_name_ok(sym)) {
+      buf_puts(b, "(");
+      if (recv >= 0) { buf_puts(b, "(void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), "); }
+      if (is_set) { buf_puts(b, "(void)("); emit_expr_for_effect(c, argv[1], b); buf_puts(b, "), "); }
+      emit_ivar_name_error(c, b, sym, argv[0]);
+      /* (a set keeps its value's type: `@1` reads as a slot to the analysis) */
+      buf_printf(b, ", %s)", ivar_raise_tail(c, id));
       return 1;
     }
     if (is_set && c->classes[cid].is_data) return emit_data_ivar_set(c, id, recv, argv[1], cid, b);

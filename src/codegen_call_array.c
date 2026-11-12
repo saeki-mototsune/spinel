@@ -239,8 +239,10 @@ int emit_op_array_last(Compiler *c, const BopCtx *x, Buf *b) {
   }
   else {
     const char *k = array_kind(x->rt);
-    buf_printf(b, "({ %s _t%d = %s%s%s; sp_%sArray_get(_t%d, sp_%sArray_length(_t%d) - 1); })",
-               c_type_name(x->rt), t, pre, rb.p ? rb.p : "", post, k, t, k, t);
+    int rd = typed_elem_read_open(x->rt, x->id, b);
+    buf_printf(b, "({ %s _t%d = %s%s%s; sp_%sArray_get%s(_t%d, sp_%sArray_length(_t%d) - 1); })",
+               c_type_name(x->rt), t, pre, rb.p ? rb.p : "", post, k, typed_elem_store_sfx(x->rt), t, k, t);
+    if (rd) buf_puts(b, ")");
   }
   free(rb.p);
   return 1;
@@ -633,7 +635,7 @@ int emit_op_array_setop(Compiler *c, const BopCtx *x, Buf *b) {
     buf_printf(&pre, "({ sp_%sArray *_t%d = %s; SP_GC_ROOT(_t%d); ", k, tr, rx.p ? rx.p : "", tr);
     free(rx.p);
     int sv = g_n_argov;
-    view_bind(recv, "_t%d", tr);
+    view_bind_temp(recv, tr);
     for (int j = 0; j < argc; j++) {
       Repr ar = repr_of(c, argv[j]);
       if (ar.untyped) continue;
@@ -644,7 +646,7 @@ int emit_op_array_setop(Compiler *c, const BopCtx *x, Buf *b) {
       buf_puts(&pre, "; ");
       emit_gc_root_tmp(c, ar.as_ty, ta, &pre);
       buf_puts(&pre, " ");
-      view_bind(argv[j], "_t%d", ta);
+      view_bind_temp(argv[j], ta);
     }
     nil_recv_check(name, tr, &pre);
     int tok = view_push_repr(c, recv, VR_NIL_TESTED, 1);
@@ -936,13 +938,14 @@ int emit_op_array_minmax(Compiler *c, const BopCtx *x, Buf *b) {
   if (sp_streq(name, "minmax") && argc == 0 && block < 0) {
     int t = ++g_tmp, o = ++g_tmp;
     int is_str = rt == TY_STR_ARRAY;
-    const char *et = is_str ? "const char *" : rt == TY_FLOAT_ARRAY ? "sp_ofloat " : "sp_oint ";
+    const char *et = is_str ? "sp_String *" : rt == TY_FLOAT_ARRAY ? "sp_ofloat " : "sp_oint ";
     buf_printf(b, "({ sp_%sArray *_t%d = ", k, t); emit_nil_ck_recv(c, recv, rt, "cmp", 0, b);
     buf_puts(b, ";");
     if (is_str) buf_printf(b, " SP_GC_ROOT(_t%d);", t);
     /* an empty receiver answers [nil, nil]: an Integer or Float pair
        carries those nils in its bitmap */
-    const char *ms = is_str ? "" : "_o", *mo = is_str ? "" : "_o";
+    /* (a String Array's extremes are elements, taken and pushed as the handles it holds) */
+    const char *ms = is_str ? typed_elem_store_sfx(rt) : "_o", *mo = ms;
     buf_printf(b, " %s_mn%d = sp_%sArray_min%s(_t%d); %s_mx%d = sp_%sArray_max%s(_t%d);"
                   " sp_%sArray *_t%d = sp_%sArray_new(); sp_%sArray_push%s(_t%d, _mn%d);"
                   " sp_%sArray_push%s(_t%d, _mx%d); _t%d; })",
@@ -1644,7 +1647,7 @@ int emit_op_array_product(Compiler *c, const BopCtx *x, Buf *b) {
     buf_printf(b, " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);", tr, tr);
     buf_printf(b, " for (sp_int _t%d = 0; _t%d < sp_%sArray_length(_t%d); _t%d++) {", ti, ti, k, ta, ti);
     buf_printf(b, " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d); sp_PolyArray_push(_t%d, ", te, te, te);
-    char ee[96]; snprintf(ee, sizeof ee, "sp_%sArray_get(_t%d, _t%d)", k, ta, ti);
+    char ee[96]; typed_elem_getf(ee, sizeof ee, rt, k, "_t%d, _t%d", ta, ti);
     emit_boxed_text(c, ty_array_elem(rt), ee, b);
     buf_printf(b, "); sp_PolyArray_push(_t%d, sp_box_poly_array(_t%d)); }", tr, te);
     buf_printf(b, " _t%d; })", tr);
@@ -2463,6 +2466,7 @@ int emit_call_append_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       const char *psfx = nil_store_sfx(c, k, argv[a]);
       buf_printf(b, "sp_%sArray_push%s(_t%d, ", k, psfx[0] || art == TY_POLY_ARRAY ? psfx : typed_elem_store_sfx(art), t);
       Buf vb; memset(&vb, 0, sizeof vb);
+      int is_held = 0;
       if (art == TY_POLY_ARRAY) emit_boxed(c, argv[a], &vb);
       /* a poly value into a String, Integer or Float array: its nil is the
          slot's nil, and a value of another kind is refused, as the statement
@@ -2496,9 +2500,9 @@ int emit_call_append_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       /* an Integer or Float value that can be nil stores with it; any other
          value keeps the push's own coercion (and its refusal wording) */
       else if (oint_kind(elem) && nil_store_sfx(c, k, argv[a])[0]) emit_elem_store_value(c, k, argv[a], &vb);
-      else emit_typed_elem_coerce(c, argv[a], art, "an Array push", &vb);
+      else is_held = emit_typed_elem_coerce(c, argv[a], art, "an Array push", &vb);
       /* the value as the element is held (a String Array's handle) */
-      if (art == TY_POLY_ARRAY || psfx[0]) buf_puts(b, vb.p ? vb.p : "");
+      if (art == TY_POLY_ARRAY || psfx[0] || is_held) buf_puts(b, vb.p ? vb.p : "");
       else emit_typed_elem_hold(c, argv[a], art, vb.p ? vb.p : "", b);
       free(vb.p);
       buf_puts(b, "); ");
@@ -2517,7 +2521,7 @@ int emit_call_append_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
 int emit_call_store_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt) {
   /* Fiber[:k] = v (expression form) */
   if (sp_streq(name, "[]=") && argc == 2 && recv >= 0) {
-    if (fiber_storage_recv(nt, recv)) {
+    if (fiber_storage_recv(c, nt, recv)) {
       Repr fvtr = repr_of(c, argv[1]);
       TyKind fvt = fvtr.as_ty;
       /* Fiber storage is poly-valued. A nil/void/untyped value has no scalar
@@ -2786,7 +2790,7 @@ int aset_range_held(Compiler *c, TyKind rt, const int *argv) {
 void emit_aset_range_held(Compiler *c, int id, int recv, TyKind rt, const int *argv, Buf *b) {
   buf_puts(b, "({ ");
   int tr = hold_operand(c, recv, rt, 0, ++g_tmp, 1, " ", b);
-  int rbind = view_bind(recv, "_t%d", tr);
+  int rbind = view_bind_temp(recv, tr);
   int ti = ++g_tmp;
   buf_printf(b, "sp_RbVal _t%d = ", ti); emit_expr(c, argv[0], b);
   /* A boxed value (promote's Integers): held once, each arm takes it boxed
@@ -2797,7 +2801,7 @@ void emit_aset_range_held(Compiler *c, int id, int recv, TyKind rt, const int *a
     int tv = ++g_tmp;
     buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_RbVal _t%d = ", ti, tv); emit_boxed(c, argv[1], b);
     buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); if ((_t%d = sp_poly_frange_ix(_t%d)).tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_RANGE) { (void)", tv, ti, ti, ti);
-    int vbind = view_bind(argv[1], "_t%d", tv);
+    int vbind = view_bind_temp(argv[1], tv);
     int vv = view_push(c, argv[1], TY_POLY);
     int bind = view_bind(argv[0], "(*(sp_Range *)_t%d.v.p)", ti);
     int v = view_push(c, argv[0], TY_RANGE);
@@ -2855,7 +2859,7 @@ static int slice_bang_range_held(Compiler *c, int id, TyKind rt, int argc, const
 static void emit_slice_bang_range_held(Compiler *c, int id, int recv, TyKind rt, const int *argv, Buf *b) {
   buf_puts(b, "({ ");
   int tr = hold_operand(c, recv, rt, 0, ++g_tmp, 1, " ", b);
-  int rbind = view_bind(recv, "_t%d", tr);
+  int rbind = view_bind_temp(recv, tr);
   int ti = ++g_tmp;
   buf_printf(b, "sp_RbVal _t%d = ", ti); emit_expr(c, argv[0], b);
   buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); ((_t%d = sp_poly_frange_ix(_t%d)).tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_RANGE) ? ", ti, ti, ti, ti);
@@ -2917,12 +2921,12 @@ int frange_index_view(Compiler *c, int id) {
   for (int i = 0; i < n; i++) {
     if (comp_ntype(c, argv[i]) != TY_FLOAT_RANGE) continue;
     if (!subtree_is_pure_read(c, argv[i]) && g_pre) {
-      if (!held) view_bind(recv, "_t%d", hold_operand_pre(c, recv, repr_of(c, recv).as_ty, 0, ++g_tmp, 1));
+      if (!held) view_bind_temp(recv, hold_operand_pre(c, recv, repr_of(c, recv).as_ty, 0, ++g_tmp, 1));
       held = 1;
       for (; done < i; done++)
         if (comp_ntype(c, argv[done]) != TY_FLOAT_RANGE &&
             (!subtree_is_pure_read(c, argv[done]) || read_rebound_by(c, argv[done], argv[i])))
-          view_bind(argv[done], "_t%d", hold_operand_pre(c, argv[done], repr_of(c, argv[done]).as_ty, 0, ++g_tmp, 1));
+          view_bind_temp(argv[done], hold_operand_pre(c, argv[done], repr_of(c, argv[done]).as_ty, 0, ++g_tmp, 1));
       done = i + 1;
       /* (a literal in parentheses too: `(f(1.5)..f(2.5))` left its ends
          to the C argument order, which runs the last first under gcc) */
@@ -2931,7 +2935,7 @@ int frange_index_view(Compiler *c, int id) {
         for (int e = 0; e < 2; e++) {
           int x = nt_ref(nt, rn, e ? "right" : "left");
           if (x >= 0 && !subtree_is_pure_read(c, x))
-            view_bind(x, "_t%d", hold_operand_pre(c, x, repr_of(c, x).as_ty, 0, ++g_tmp, 1));
+            view_bind_temp(x, hold_operand_pre(c, x, repr_of(c, x).as_ty, 0, ++g_tmp, 1));
         }
     }
     Buf ab = expr_buf(c, argv[i]);
@@ -2941,7 +2945,7 @@ int frange_index_view(Compiler *c, int id) {
       int t = ++g_tmp;
       emit_indent(g_pre, g_indent);
       buf_printf(g_pre, "sp_Range _t%d = sp_frange_ix(%s);\n", t, at);
-      view_bind(argv[i], "_t%d", t);
+      view_bind_temp(argv[i], t);
     }
     else { free(ab.p); view_unwind(mark); return -1; }
     free(ab.p);
@@ -2997,12 +3001,13 @@ int emit_call_array_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
         if (voint) buf_puts(b, oint_ctype(et)); else emit_ctype(c, held != TY_UNKNOWN ? held : et, b);
         buf_printf(b, " _t%d = ", tv);
         Buf vb; memset(&vb, 0, sizeof vb);
+        int is_held = 0;
         if (vboxed && et == TY_INT) { buf_puts(&vb, "sp_poly_elem_i("); emit_expr(c, argv[1], &vb); buf_puts(&vb, ")"); }
         else if (vboxed && et == TY_STRING) { buf_puts(&vb, "sp_poly_elem_s("); emit_expr(c, argv[1], &vb); buf_puts(&vb, ")"); }
         else if (vboxed && et == TY_FLOAT) { buf_puts(&vb, "sp_poly_elem_f("); emit_expr(c, argv[1], &vb); buf_puts(&vb, ")"); }
         else if (voint) emit_oint_expr(c, argv[1], et, &vb);
-        else emit_typed_elem_coerce(c, argv[1], rt, "an Array element store", &vb);
-        if (voint) buf_puts(b, vb.p ? vb.p : "");
+        else is_held = emit_typed_elem_coerce(c, argv[1], rt, "an Array element store", &vb);
+        if (voint || is_held) buf_puts(b, vb.p ? vb.p : "");
         else emit_typed_elem_hold(c, argv[1], rt, vb.p ? vb.p : "", b);
         free(vb.p);
         const char *vsfx = nil_store_sfx(c, k, argv[1]);
@@ -3172,7 +3177,7 @@ static int arysub_bind(Compiler *c, int n, TyKind k) {
       int bx = ++g_tmp;
       emit_indent(g_pre, g_indent);
       buf_printf(g_pre, "sp_RbVal _t%d = sp_box_nullable_obj((void *)_t%d, SP_BUILTIN_STRBUF); SP_GC_ROOT_RBVAL(_t%d);\n", bx, t, bx);
-      return view_bind(n, "_t%d", bx);
+      return view_bind_temp(n, bx);
     }
     /* (one representation: the read face is the payload itself, which a
        String slot takes back to the instance; the copy is made here, or
@@ -3192,7 +3197,7 @@ static int arysub_bind(Compiler *c, int n, TyKind k) {
     int t = ++g_tmp;
     emit_indent(g_pre, g_indent);
     buf_printf(g_pre, "%s *_t%d = (%s *)(%s); SP_GC_ROOT(_t%d);\n", at, t, at, rb.p ? rb.p : "NULL", t);
-    slot = view_bind(n, "_t%d", t);
+    slot = view_bind_temp(n, t);
   }
   free(cast.p);
   free(rb.p);

@@ -184,7 +184,7 @@ static int interp_changes_var(Compiler *c, int n, NodeKind vk, const char *vn) {
     const char *nm = k == NK_CallNode ? nt_str(nt, n, "name") : NULL;
     int has_blk = k == NK_CallNode && nt_ref(nt, n, "block") >= 0;
     int callish = nm && is_rebinding_reach_call(nm);
-    int user = k == NK_CallNode && (cplan_user(c, n)->mi >= 0 || cplan_user(c, n)->dispatch != CP_NONE);
+    int user = k == NK_CallNode && (cplan_user(c, n).mi >= 0 || cplan_user(c, n).dispatch != CP_NONE);
     int opaque = user || has_blk || callish || k == NK_YieldNode || k == NK_SuperNode || k == NK_ForwardingSuperNode ||
                  k == NK_LambdaNode;
     if (opaque && vn) {
@@ -214,9 +214,9 @@ static int interp_changes_var(Compiler *c, int n, NodeKind vk, const char *vn) {
 static const char *interp_reader_var(Compiler *c, int call, char *buf, size_t cap) {
   const NodeTable *nt = c->nt;
   if (nt_kind(nt, call) != NK_CallNode) return NULL;
-  const CallPlan *p = cplan_user(c, call);
-  if (p->mi >= 0 && p->dispatch == CP_DIRECT) {
-    int body = c->scopes[p->mi].body, n = 0;
+  const CallPlan p = cplan_user(c, call);
+  if (p.mi >= 0 && p.dispatch == CP_DIRECT) {
+    int body = c->scopes[p.mi].body, n = 0;
     const int *st = body >= 0 && nt_kind(nt, body) == NK_StatementsNode ? nt_arr(nt, body, "body", &n) : NULL;
     int last = n == 1 ? st[0] : (body >= 0 && nt_kind(nt, body) == NK_InstanceVariableReadNode ? body : -1);
     return last >= 0 && nt_kind(nt, last) == NK_InstanceVariableReadNode ? nt_str(nt, last, "name") : NULL;
@@ -225,7 +225,7 @@ static const char *interp_reader_var(Compiler *c, int call, char *buf, size_t ca
   const char *nm = nt_str(nt, call, "name");
   int r = nt_ref(nt, call, "receiver");
   Scope *sc = comp_scope_of(c, call);
-  if (p->mi < 0 && nm && (r < 0 || nt_kind(nt, r) == NK_SelfNode) && nt_ref(nt, call, "arguments") < 0 &&
+  if (p.mi < 0 && nm && (r < 0 || nt_kind(nt, r) == NK_SelfNode) && nt_ref(nt, call, "arguments") < 0 &&
       nt_ref(nt, call, "block") < 0 && sc && sc->class_id >= 0 && !sc->is_cmethod &&
       comp_reader_in_chain(c, sc->class_id, nm, NULL)) {
     snprintf(buf, cap, "@%s", nm);
@@ -249,7 +249,7 @@ static int interp_var_read_late(Compiler *c, const int *parts, int n, int k, int
   while (b >= 0 && nt_kind(nt, b) == NK_CallNode) {
     const char *nm = nt_str(nt, b, "name");
     int r = nt_paren_single(c->nt, nt_ref(nt, b, "receiver")), argc = call_plain_argc(c, b);
-    if (!nm || r < 0 || comp_ntype(c, r) != TY_STRING || cplan_user(c, b)->mi >= 0) break;
+    if (!nm || r < 0 || comp_ntype(c, r) != TY_STRING || cplan_user(c, b).mi >= 0) break;
     int self = (bop_answers_self(TY_STRING, nm, argc, nt_ref(nt, b, "block") >= 0) & (BOPF_SELF | BOPF_SELF_OR_NIL)) ||
                (argc == 0 && is_string_self_answer(nm));
     if (!self) break;
@@ -340,6 +340,8 @@ static void interp_plan(Compiler *c, int id, InterpPlan *pl) {
          it: hoisted to g_pre they ran before the whole enclosing expression,
          so `"#{x}" + "#{x = "b"}"` read x after the assignment (#5574) */
       for (int si = 0; si + 1 < bn; si++) emit_stmt(c, body[si], &decls, 0);
+      /* an empty `#{}` is nil, whose to_s writes nothing */
+      if (expr < 0) continue;
       NodeKind ek = nt_kind(nt, expr);
       /* a part of a class the program reopened with its own to_s is already
          `<part>.to_s` (desugar_interp_reopened_to_s) */
@@ -1063,15 +1065,12 @@ int loop_has_valued_break(Compiler *c, int root) {
   return 0;
 }
 
-/* A receiverless `raise`/`fail` call: it diverges, so in a value position it
-   yields no value (its C form is void). A branch whose value is such a call
-   must be emitted as a statement, not assigned to the result temp. */
+/* A call that runs Kernel's raise (cplan_kernel_raise): it diverges, so in
+   a value position it yields no value (its C form is void). A branch whose
+   value is such a call must be emitted as a statement, not assigned to the
+   result temp. */
 static int node_is_raise(Compiler *c, int nd) {
-  const NodeTable *nt = c->nt;
-  if (nd < 0 || nt_kind(nt, nd) != NK_CallNode) return 0;
-  if (nt_ref(nt, nd, "receiver") >= 0) return 0;
-  const char *nm = nt_str(nt, nd, "name");
-  return nm && (is_raise_alias(nm));
+  return nd >= 0 && cplan_kernel_raise(c, nd);
 }
 
 /* One arm of a value-position if/unless: box a concrete arm into a poly
@@ -1401,7 +1400,12 @@ void const_path_written(const NodeTable *nt, int id, char *out, size_t cap) {
    that can never resolve -- a dropped require reads as a runtime engine bug
    otherwise (#3976). Deduplicated by name so a constant read in a loop body
    warns once. */
+static void warn_undefined_constant_why(Compiler *c, int id, const char *nm, const char *why);
 static void warn_undefined_constant(Compiler *c, int id, const char *nm) {
+  warn_undefined_constant_why(c, id, nm, NULL);
+}
+/* ...with the reason said, where it is neither of the two a read has */
+static void warn_undefined_constant_why(Compiler *c, int id, const char *nm, const char *why) {
   static char seen[64][128];
   static int nseen = 0;
   if (!nm || !*nm) return;
@@ -1414,7 +1418,7 @@ static void warn_undefined_constant(Compiler *c, int id, const char *nm) {
   if (!file || !*file) file = "source.rb";
   /* `Point::LIMIT` with LIMIT written at the top level only: defined, but
      not where the path looks (const_path_misses_toplevel) */
-  const char *why = const_path_misses_toplevel(c, id)
+  if (!why) why = const_path_misses_toplevel(c, id)
     ? "only the top level defines it, which a path through a class or module does not reach"
     : "defined nowhere in the program";
   if (ln > 0)
@@ -2161,7 +2165,7 @@ void emit_expr(Compiler *c, int id, Buf *b) {
   TyKind ot = opr.as_ty;
   /* a node bound to a hoisted temp (view_bind) is that plain temp */
   int bound = 0, bound_o = 0;
-  for (int i = g_n_argov - 1; i >= 0 && !bound; i--) if (g_argov_node[i] == id) { bound = 1; bound_o = g_argov_oint[i]; }
+  for (int i = g_n_argov - 1; i >= 0 && !bound; i--) if (g_argov_node[i] == id) { bound = 1; bound_o = g_argov_flag[i] & ARGOV_OINT; }
   int is_o = bound ? oint_kind(ot) && bound_o : opr.opt_producer;
   NodeKind ok = nt_kind(c->nt, id);
   int leaf_o = !bound && want_o && !is_o && (ok == NK_NilNode || opr.kind == RK_OPT);
@@ -4102,6 +4106,25 @@ int const_read_raises(Compiler *c, int id) {
   return r;
 }
 
+/* See codegen_internal.h. */
+void emit_const_lookup_failure(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  int par = nt_kind(nt, id) == NK_ConstantPathNode ? nt_ref(nt, id, "parent") : -1;
+  if (par < 0 || const_read_raises(c, id)) { emit_expr(c, id, b); return; }
+  int pk = const_node_class_index(c, par);
+  const char *own = pk >= 0 ? class_ruby_name(c, pk) : NULL, *nm = nt_str(nt, id, "written_name");
+  char full[512];
+  if (!nm) nm = nt_str(nt, id, "name");
+  if (own && nm) snprintf(full, sizeof full, "%s::%s", own, nm);
+  else const_path_written(nt, id, full, sizeof full);
+  if (!const_ref_is_rescued(c, id) && !const_ref_is_guarded(c, id))
+    warn_undefined_constant_why(c, id, full, "the class or module the path names it in holds no such constant");
+  Buf pre = {0};
+  emit_const_read_prefix(c, par, &pre);
+  emit_const_undefined_raise(b, pre.p, full);
+  free(pre.p);
+}
+
 static int emit_constant_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *ty, int slot) {
   if (!nt_kind_is_constant(nt_kind(nt, id))) return 0;
   int par = nt_kind(nt, id) == NK_ConstantPathNode ? nt_ref(nt, id, "parent") : -1;
@@ -4228,7 +4251,7 @@ static int defined_value_parent(const NodeTable *nt, int par) {
 static int defined_value_path(Compiler *c, int v, Buf *b) {
   const NodeTable *nt = c->nt;
   int par = nt_ref(nt, v, "parent");
-  const char *nm = nt_key_name(nt, v);
+  const char *nm = key_name(c, v);
   if (par < 0 || !nm) return 0;
   if (!defined_value_parent(nt, par)) return 0;
   Repr pr = repr_of(c, par);
@@ -4921,17 +4944,18 @@ static int emit_array_hash_literal_expr(Compiler *c, int id, Buf *b, const NodeT
       }
 else {
         Buf el; memset(&el, 0, sizeof el);
+        int is_held = 0;
         /* element preludes flow to g_pre first; an untyped element (a raise
            token, a void call) is coerced to the element type */
         /* an element that can be nil stores with it (the array's own nil) */
         const char *esfx = nil_store_sfx(c, k, els[j]);
         if (esfx[0] && (sp_streq(k, "Int") || sp_streq(k, "Float"))) emit_elem_store_value(c, k, els[j], &el);
         else if (repr_of(c, els[j]).untyped) emit_unresolved_coerced(c, els[j], ty_array_elem(at), &el);
-        else emit_typed_elem_coerce(c, els[j], at, "an Array literal's element", &el);
+        else is_held = emit_typed_elem_coerce(c, els[j], at, "an Array literal's element", &el);
         emit_indent(g_pre, g_indent);
         /* each element as the Array holds it (emit_typed_elem_hold) */
         buf_printf(g_pre, "sp_%sArray_push%s(_t%d, ", k, esfx[0] ? esfx : typed_elem_store_sfx(at), t);
-        if (esfx[0]) buf_puts(g_pre, el.p ? el.p : "");
+        if (esfx[0] || is_held) buf_puts(g_pre, el.p ? el.p : "");
         else emit_typed_elem_hold(c, els[j], at, el.p ? el.p : "", g_pre);
         buf_puts(g_pre, ");\n");
         free(el.p);
@@ -6471,7 +6495,7 @@ static int masgn_hold_target_parts(Compiler *c, int id) {
       emit_gc_root_tmp(c, vt, t, g_pre);
       buf_puts(g_pre, "\n");
       free(vb.p);
-      view_bind(v, "_t%d", t);
+      view_bind_temp(v, t);
       held++;
     }
   }
@@ -6717,7 +6741,7 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
       emit_gc_root_tmp(c, st, ts, &lb);
       buf_puts(&lb, "\n");
       free(eb.p);
-      view_bind(subs[i], "_t%d", ts);
+      view_bind_temp(subs[i], ts);
     }
     int tr = ++g_tmp;
     Buf rb; memset(&rb, 0, sizeof rb);
@@ -6774,7 +6798,7 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
     else if (irr.elem == TY_STRING) {
       buf_printf(b, "({ sp_StrArray *_t%d = ", ta2); emit_expr(c, ir, b);
       buf_printf(b, "; sp_int _t%d = ", tb2); emit_int_expr(c, iav[0], b);
-      buf_printf(b, "; const char *_t%d = SP_STR_B(sp_StrArray_get(_t%d, _t%d));", tc2, ta2, tb2);
+      buf_printf(b, "; const char *_t%d = SP_STR_B(sp_StrArray_get_e(_t%d, _t%d));", tc2, ta2, tb2);
       buf_printf(b, " if (%s_t%d) { ", is_or2 ? "!" : "", tc2);
       emit_guarded_slot_assign(c, iv, tc2, b);
       buf_printf(b, "; sp_StrArray_set(_t%d, _t%d, _t%d); } _t%d; })", ta2, tb2, tc2, tc2);
@@ -6994,7 +7018,7 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
      one (a forwarded real proc answers by its pointer). The read itself
      would name lv_<blk>, which no inline site declares (#4477). */
   {
-    const char *pn = nt_key_name(nt, id);
+    const char *pn = key_name(c, id);
     int pr = nt_ref(nt, id, "receiver");
     if (pn && (sp_streq(pn, "nil?") || sp_streq(pn, "!")) && pr >= 0 &&
         nt_kind(nt, pr) == NK_LocalVariableReadNode) {
@@ -7201,7 +7225,7 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
            boxes (ran_first_handle), not its variable's, which the stores
            may have rebound */
         if (vt == TY_STRBUF) ran_first_bind(v, t, t);
-        else view_bind(v, "_t%d", t);
+        else view_bind_temp(v, t);
       }
       free(vb.p);
       held++;

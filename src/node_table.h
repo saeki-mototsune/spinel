@@ -497,6 +497,13 @@ static inline int nt_ignore_visibility(const NodeTable *nt, int id) {
 static inline void nt_set_ignore_visibility(NodeTable *nt, int id, int on) {
   nt_node_set_int(nt, id, "ignore_visibility", on ? 1 : 0);
 }
+/* A desugar that writes a value it computes in place of call id makes the
+   call the builtin's identity, `recv.itself`, which no visibility closes
+   (a program's private itself, a top-level def, is not what it runs). */
+static inline void nt_set_itself_call(NodeTable *nt, int id) {
+  nt_node_set_str(nt, id, "name", "itself");
+  nt_set_ignore_visibility(nt, id, 1);
+}
 /* A synthesized implicit-self call spells its receiver explicitly while
    retaining the private-call permission of the receiverless form. An
    explicit denial from a public_send rewrite stays denied. */
@@ -516,6 +523,17 @@ static inline int nt_attr_write(const NodeTable *nt, int id) {
 }
 static inline void nt_set_attr_write(NodeTable *nt, int id, int on) {
   if (on || nt_attr_write(nt, id)) nt_node_set_int(nt, id, "attr_write", on ? 1 : 0);
+}
+/* The call binds the builtin's own method of its name, whatever the program
+   defines: a call a desugar wrote for the compiler's own use, or an alias
+   that captured the builtin. The desugars write the record through these two,
+   and only the call plan reads it (cplan_builtin_call, call_plan.h). The
+   record stays on the node, so a clone of the subtree carries it. */
+static inline void nt_mark_builtin_call(NodeTable *nt, int id) {
+  nt_node_set_int(nt, id, "builtin_only", 1);
+}
+static inline void nt_clear_builtin_call(NodeTable *nt, int id) {
+  nt_node_set_int(nt, id, "builtin_only", 0);
 }
 static inline int nt_ref(const NodeTable *nt, int id, const char *key) {
   NT_WORK();

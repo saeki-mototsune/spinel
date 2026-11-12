@@ -160,7 +160,7 @@ static int share_target_armed_plan(Compiler *c, const CallPlan *p, int call, int
   int recv = nt_ref(c->nt, call, "receiver");
   /* (a receiver of no type the walk follows the user methods of: with
      them gone its builtin arm is an unknown call, which joins UNKNOWN) */
-  if (recv < 0 || comp_ntype_stored(c, recv) != TY_POLY) return 1;
+  if (recv < 0 || comp_ntype_settled(c, recv) != TY_POLY) return 1;
   const ClsSet *cs = cls_fact_node(c, recv);
   if (!cs || cs->all) return 1;
   const char *nm = nt_str(c->nt, call, "name");
@@ -172,7 +172,8 @@ static int share_target_armed_plan(Compiler *c, const CallPlan *p, int call, int
   return 0;
 }
 int share_target_armed(Compiler *c, int call, int mi) {
-  return share_target_armed_plan(c, cplan_user_fresh(c, call), call, mi);
+  const CallPlan p = cplan_user_fresh(c, call);
+  return share_target_armed_plan(c, &p, call, mi);
 }
 /* The methods call enters (cplan_entries) when `entries`, else those whose
    return is its value (cplan_targets), that the share walk follows. */
@@ -180,9 +181,8 @@ static int sh_targets_in(Compiler *c, int call, int *out, int cap, int entries) 
   int n = entries ? cplan_entries(c, call, out, cap) : cplan_targets(c, call, out, cap), m = 0;
   if (n == CPT_UNKNOWN) return -1;
   if (n == 0) return sh_copied_self_targets(c, call, out, cap);
-  /* the plan once for the call: cplan_user_fresh answers in a buffer the
-     next resolution overwrites, so it is copied */
-  CallPlan p = *cplan_user_fresh(c, call);
+  /* the plan once for the call */
+  CallPlan p = cplan_user_fresh(c, call);
   for (int i = 0; i < n; i++)
     if (share_target_reachable(c, call, out[i]) && share_target_armed_plan(c, &p, call, out[i])) out[m++] = out[i];
   return m;
@@ -202,7 +202,7 @@ static int sh_copied_self_targets(Compiler *c, int call, int *out, int cap) {
   const char *name = nt_kind(nt, call) == NK_CallNode ? nt_str(nt, call, "name") : NULL;
   Scope *s = comp_scope_of(c, call);
   int si = (int)(s - c->scopes);
-  if (!name || nt_ref(nt, call, "receiver") >= 0 || nt_int(nt, call, "builtin_only", 0) || !comp_scope_copied_away(c, si) ||
+  if (!name || nt_ref(nt, call, "receiver") >= 0 || cplan_builtin_call(c, call) || !comp_scope_copied_away(c, si) ||
       s->is_cmethod || s->def_node < 0)
     return 0;
   /* (a name no class answers, a builtin's, reaches none) */
@@ -225,7 +225,7 @@ static int sh_copied_self_targets(Compiler *c, int call, int *out, int cap) {
   return n;
 }
 int share_target_reachable(Compiler *c, int call, int mi) {
-  if (mi < 0 || mi >= c->nscopes || !c->scopes[mi].is_cmethod || cplan_user_fresh(c, call)->via != UC_POLY)
+  if (mi < 0 || mi >= c->nscopes || !c->scopes[mi].is_cmethod || cplan_user_fresh(c, call).via != UC_POLY)
     return 1;
   int ncc = 0;
   const PolyCand *ccs = comp_cmethod_candidates(c, c->scopes[mi].name, &ncc);
@@ -240,18 +240,18 @@ int share_target_reachable(Compiler *c, int call, int mi) {
 }
 /* does a call reach a user method (sh_targets != 0), without listing them */
 static int sh_has_targets(Compiler *c, int call) {
-  const CallPlan *p = cplan_user_fresh(c, call);
-  if (p->dispatch == CP_REFUSE) return 0;
+  const CallPlan p = cplan_user_fresh(c, call);
+  if (p.dispatch == CP_REFUSE) return 0;
   /* (a module's self call that names no method of the module reaches the
      includers' methods its copies call, sh_copied_self_targets: a `puts`
      they define is no Kernel#puts) */
-  if (p->mi < 0) {
+  if (p.mi < 0) {
     int tg[CPT_MAX];
     return sh_copied_self_targets(c, call, tg, CPT_MAX) != 0;
   }
   /* (a boxed receiver's plan lists only the methods its arms reach:
      share_target_reachable, share_target_armed; none may be left) */
-  if (p->via != UC_POLY) return 1;
+  if (p.via != UC_POLY) return 1;
   int tg[CPT_MAX];
   return sh_targets(c, call, tg, CPT_MAX) != 0;
 }
@@ -308,7 +308,7 @@ int share_exact_new_class(Compiler *c, int n) {
    class facts rule out (cls_fact_excludes). 0 for an argument of any other type, whose
    conversion is the builtin's; more than cap when they do not fit. */
 static int sh_string_conv_methods(Compiler *c, int arg, int *mis, int cap) {
-  TyKind at = comp_ntype_stored(c, arg);
+  TyKind at = comp_ntype_settled(c, arg);
   int obj = ty_is_object(at), ocid = obj ? ty_object_class(at) : -1, n = 0;
   int exact = obj && share_exact_new_class(c, arg) == ocid;
   if ((!obj && at != TY_POLY && at != TY_UNKNOWN)) return 0;
@@ -393,7 +393,7 @@ static int sh_yielder_new(Compiler *c, int u) {
   const NodeTable *nt = c->nt;
   int r = nt_ref(nt, u, "receiver");
   NodeKind rk = r >= 0 ? nt_kind(nt, r) : NK_NONE;
-  const char *cn = rk == NK_ConstantReadNode || rk == NK_ConstantPathNode ? nt_key_name(nt, r) : NULL;
+  const char *cn = rk == NK_ConstantReadNode || rk == NK_ConstantPathNode ? key_name(c, r) : NULL;
   const char *nm = nt_str(nt, u, "name");
   return cn && nm && bop_share_named(BOP_ANY_RECV, nm) == BSH_NEW && const_node_class_index(c, r) < 0 &&
          bop_share_named(BOP_CLASS_NEW, cn) == BSH_NEW_YIELDER;
@@ -456,7 +456,7 @@ static void sh_ivar_writes_build(ShareFacts *F, Compiler *c) {
       const char *old = argc >= 2 ? sh_lit_name(nt, argv[1]) : NULL;
       if (!old || name_is_plain_setter(old)) F->ivw_all = 1;
     }
-    else if (r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode && is_marshal_const(nt_key_name(nt, r)))
+    else if (r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode && is_marshal_const(key_name(c, r)))
       F->ivw_all = 1;
   }
   NT_FOREACH_KIND(nt, NK_AliasMethodNode, u) {
@@ -590,7 +590,7 @@ int share_call_stores_block(Compiler *c, int n) {
   int recv = nt_ref(nt, n, "receiver");
   NodeKind rk = recv >= 0 ? nt_kind(nt, recv) : NK_NONE;
   if (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) {
-    const char *cn = nt_key_name(nt, recv);
+    const char *cn = key_name(c, recv);
     return cn && sp_streq(nm, "new") && (sp_streq(cn, "Array") || sp_streq(cn, "Hash"));
   }
   static const TyKind fams[] = { BOP_ANY_ARRAY, BOP_ANY_HASH, BOP_ANY_RECV };
@@ -820,7 +820,7 @@ static ShareFacts *sh_memo_build(Compiler *c) {
   if (!F->blk_dyn || !F->blk_unk || !F->fresh_blk) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   memset(F->fresh_blk, -1, ns);
   NT_FOREACH_KIND(nt, NK_ConstantReadNode, cr)
-    if (!F->ostruct && nt_key_name(nt, cr) && sp_streq(nt_key_name(nt, cr), "OpenStruct")) F->ostruct = 1;
+    if (!F->ostruct && key_name(c, cr) && sp_streq(key_name(c, cr), "OpenStruct")) F->ostruct = 1;
   sh_mb_build(F, c);
   sh_index_blocks(F, c);
   return F;
@@ -937,9 +937,9 @@ int share_builtin_fresh(Compiler *c, int call) {
   /* A scope-name lookup can miss an alias's method. Every returning user
      arm must occur in the target set whose return identities we check. */
   int tg[CPT_MAX], n = cplan_targets(c, call, tg, CPT_MAX);
-  const PolyPlan *p = cplan_poly_fresh(c, call);
-  for (int i = 0; i < p->n; i++) {
-    const PolyArm *a = &p->arm[i];
+  const PolyPlan p = cplan_poly_fresh(c, call);
+  for (int i = 0; i < p.n; i++) {
+    const PolyArm *a = &p.arm[i];
     if (a->kind != PA_USER && a->kind != PA_PROC_FORM) continue;
     int found = 0;
     for (int j = 0; j < n; j++) if (tg[j] == a->mi) { found = 1; break; }
@@ -952,8 +952,8 @@ int share_builtin_fresh(Compiler *c, int call) {
      some builtin class has; for a name none has (CRuby's tables, as
      strbuf_poly_user_boxes asks) both only raise NoMethodError. */
   int generic_raises = !builtin_object_method_known(name) && !builtin_instance_name_known(name);
-  for (int i = 0; i < p->n; i++) {
-    const PolyArm *a = &p->arm[i];
+  for (int i = 0; i < p.n; i++) {
+    const PolyArm *a = &p.arm[i];
     if (a->kind == PA_USER || a->kind == PA_ARITY || a->kind == PA_VIS || sh_arm_io_read_fresh(c, call, a)) continue;
     if (a->kind == PA_TRIAL && (a->key == PA_KEY_TRIAL + PT_DEFAULT0 ||
                                a->key == PA_KEY_TRIAL + PT_DEFAULT_N)) continue;
@@ -962,7 +962,7 @@ int share_builtin_fresh(Compiler *c, int call) {
       continue;
     return 0;
   }
-  return p->n > 0;
+  return p.n > 0;
 }
 /* ---- calls whose members the plan does not list (#9258) ----
    A call on a boxed receiver whose name more classes define than the plan
@@ -1135,7 +1135,7 @@ static int sh_self_call_targets(Compiler *c, int call, const char *nm, int *out,
   int ci = cur ? (int)(cur - c->scopes) : -1;
   if (ci <= 0 || cur->is_cmethod || cur->class_id < 0 || !cur->name || cur->def_node < 0) return -1;
   if (core_method_name(nm) || object_public_method_name(nm) ||
-      bop_share_kernel(nm, nt_int(nt, call, "builtin_only", 0)) || bop_share_named(BOP_ANY_RECV, nm))
+      bop_share_kernel(nm, cplan_builtin_call(c, call)) || bop_share_named(BOP_ANY_RECV, nm))
     return -1;
   /* the enclosing method may also run on a class whose chain gives its
      name another method: under an alias, or taken out of its class and
@@ -1308,7 +1308,7 @@ static int sh_user_call_fresh(Compiler *c, int call, int depth) {
   if (sh_assign_call(c, call)) return 0;
   /* A boxed dispatch can take a builtin arm too: its user targets alone
      do not prove freshness (String#to_s can answer its receiver). */
-  if (cplan_user_fresh(c, call)->via == UC_POLY && !share_builtin_fresh(c, call)) return 0;
+  if (cplan_user_fresh(c, call).via == UC_POLY && !share_builtin_fresh(c, call)) return 0;
   int tg[64];
   int n = cplan_targets(c, call, tg, 64);
   if (n == CPT_UNKNOWN) return sh_name_call_fresh(c, call);
@@ -1421,7 +1421,7 @@ static int sh_fresh_elems(Compiler *c, int r, int depth) {
      names them: `sort_by { |x| ... }` is left to the block's own facts, and
      a name the program may answer itself to the Array rows,
      share_builtin_overridden.) */
-  if (nm && recv >= 0 && blk < 0 && ty_is_array(comp_ntype_stored(c, recv)) &&
+  if (nm && recv >= 0 && blk < 0 && ty_is_array(comp_ntype_settled(c, recv)) &&
       sh_answers_elems_run(bop_share_named(BOP_ANY_ARRAY, nm), call_plain_argc(c, r)) &&
       !share_builtin_overridden(c, "Array", nm))
     return sh_fresh_elems(c, recv, depth + 1);
@@ -1433,7 +1433,7 @@ static int sh_fresh_elems(Compiler *c, int r, int depth) {
     return bn > 0 && !sh_has_next(nt, body) && share_value_fresh(c, bb[bn - 1], depth + 1);
   }
   if (nt_kind(nt, blk) != NK_BlockArgumentNode || nt_kind(nt, nt_ref(nt, blk, "expression")) != NK_SymbolNode) return 0;
-  TyKind at = comp_ntype_stored(c, recv);
+  TyKind at = comp_ntype_settled(c, recv);
   TyKind et = ty_is_array(at) ? ty_array_elem(at) : TY_UNKNOWN;
   return et != TY_UNKNOWN && !sh_may_hold(c, et);
 }
@@ -1478,7 +1478,7 @@ static int sh_callable_fresh(Compiler *c, int k, int depth) {
   else body = nt_ref(nt, un ? nt_ref(nt, k, "block") : k, "body");
   int bn = 0; const int *bb = body >= 0 && nt_kind(nt, body) == NK_StatementsNode ? nt_arr(nt, body, "body", &bn) : NULL;
   if (bn == 0 || sh_has_jump(nt, body)) return 0;
-  TyKind t = comp_ntype_stored(c, bb[bn - 1]);
+  TyKind t = comp_ntype_settled(c, bb[bn - 1]);
   return (t != TY_STRING && t != TY_STRBUF && t != TY_POLY && t != TY_UNKNOWN) ||
          share_value_fresh(c, bb[bn - 1], depth + 1);
 }
@@ -1574,8 +1574,8 @@ static int sh_builtin_call_pure(Compiler *c, int n) {
   const char *name = nt_str(c->nt, n, "name");
   if (!name || is_receiver_conversion(name) || sh_has_targets(c, n)) return 0;
   int recv = nt_ref(c->nt, n, "receiver");
-  int s = recv >= 0 ? bop_share_named(sh_family(comp_ntype_stored(c, recv)), name)
-                     : bop_share_kernel(name, nt_int(c->nt, n, "builtin_only", 0));
+  int s = recv >= 0 ? bop_share_named(sh_family(comp_ntype_settled(c, recv)), name)
+                     : bop_share_kernel(name, cplan_builtin_call(c, n));
   if (!s) s = bop_share_named(BOP_ANY_RECV, name);
   return s == BSH_PURE;
 }
@@ -1599,7 +1599,7 @@ static int sh_value_fresh_leaf(Compiler *c, int n, int depth) {
       if (mis[i] < 0 || scope_ret_param(c, mis[i]) >= 0 || !scope_ret_fresh(c, mis[i]))
         return 0;
     /* (a boxed argument may be a String, which Kernel#String answers itself) */
-    return nconv <= 64 && (ty_is_object(comp_ntype_stored(c, conv)) || share_value_fresh(c, conv, depth + 1));
+    return nconv <= 64 && (ty_is_object(comp_ntype_settled(c, conv)) || share_value_fresh(c, conv, depth + 1));
   }
   if (k == NK_YieldNode) {
     int mi = sh_method_index(c, n);
@@ -1610,9 +1610,9 @@ static int sh_value_fresh_leaf(Compiler *c, int n, int depth) {
      call of it does (sh_user_call_fresh); not where it answers a
      parameter, which zsuper hands on unseen */
   if (k == NK_SuperNode || k == NK_ForwardingSuperNode) {
-    const CallPlan *p = cplan_user_fresh(c, n);
-    int mi = p->mi;
-    if (!c->share || p->dispatch != CP_DIRECT || mi <= 0 || mi >= c->nscopes || scope_ret_param(c, mi) >= 0)
+    const CallPlan p = cplan_user_fresh(c, n);
+    int mi = p.mi;
+    if (!c->share || p.dispatch != CP_DIRECT || mi <= 0 || mi >= c->nscopes || scope_ret_param(c, mi) >= 0)
       return 0;
     return scope_ret_fresh(c, mi);
   }
@@ -1624,7 +1624,7 @@ static int sh_value_fresh_leaf(Compiler *c, int n, int depth) {
   int rcv = nt_ref(nt, n, "receiver");
   const char *cn = nt_str(nt, n, "name");
   if (cn && rcv >= 0 && nt_ref(nt, n, "block") < 0 && !sh_has_targets(c, n)) {
-    if (nt_kind(nt, rcv) == NK_ConstantReadNode && is_env_const(nt_key_name(nt, rcv)) && is_aref_name(cn))
+    if (nt_kind(nt, rcv) == NK_ConstantReadNode && is_env_const(key_name(c, rcv)) && is_aref_name(cn))
       return 1;
     if ((is_receiver_conversion(cn) || is_freeze_name(cn)) && call_plain_argc(c, n) == 0)
       return share_value_fresh(c, rcv, depth + 1);
@@ -1687,7 +1687,7 @@ int share_value_needs_handle(Compiler *c, int v) {
   if (k == NK_NilNode || k == NK_StringNode || k == NK_ArrayNode || k == NK_HashNode ||
       k == NK_RangeNode || k == NK_SymbolNode)
     return SHN_NO;
-  TyKind t = comp_ntype_stored(c, v);
+  TyKind t = comp_ntype_settled(c, v);
   if (t != TY_STRING && t != TY_STRBUF && t != TY_POLY) return SHN_NO;
   Scope *sc = comp_scope_of(c, v);
   if (!sc || !sc->reachable || share_frozen_string(c, v)) return SHN_NO;
@@ -1730,13 +1730,13 @@ static int sh_poly_to_s_self(const Compiler *c, int u) {
   if (recv < 0 || repr_of(c, recv).kind != RK_BOXED ||
       (sci >= 0 && comp_method_in_chain((Compiler *)c, sci, "to_s", NULL) >= 0))
     return 0;
-  const PolyPlan *p = cplan_poly((Compiler *)c, u);
+  const PolyPlan p = cplan_poly((Compiler *)c, u);
   int dflt = 0;
-  for (int i = 0; i < p->n; i++) {
-    if (p->arm[i].kind == PA_TRIAL && p->arm[i].key == PA_KEY_TRIAL + PT_STR) return 0;
-    dflt |= p->arm[i].kind == PA_BUILTIN && p->arm[i].key == PA_KEY_BUILTIN + PB_D_TO_S;
+  for (int i = 0; i < p.n; i++) {
+    if (p.arm[i].kind == PA_TRIAL && p.arm[i].key == PA_KEY_TRIAL + PT_STR) return 0;
+    dflt |= p.arm[i].kind == PA_BUILTIN && p.arm[i].key == PA_KEY_BUILTIN + PB_D_TO_S;
   }
-  return dflt && p->ret == TY_POLY;
+  return dflt && p.ret == TY_POLY;
 }
 /* Is call u's one target a `def m = @iv` reader of an instance method,
    its whole body that read, of a slot its class keeps boxed? */
@@ -1771,7 +1771,7 @@ static int sh_carry_kind(const Compiler *c, int n, int by_repr, int lift, int *o
   int u = nt_paren_single(c->nt, n);
   if (u >= 0 && nt_kind(c->nt, u) == NK_CallNode && is_freeze_name(nt_str(c->nt, u, "name")) &&
       call_plain_argc((Compiler *)c, u) == 0 && nt_ref(c->nt, u, "block") < 0 &&
-      cplan_user((Compiler *)c, u)->dispatch == CP_NONE) {
+      cplan_user((Compiler *)c, u).dispatch == CP_NONE) {
     int r = nt_ref(c->nt, u, "receiver");
     if (r >= 0 && (share_value_fresh((Compiler *)c, r, 0) || share_node_carries_handle(c, r))) {
       *op = nt_paren_single(c->nt, r);
@@ -1785,10 +1785,10 @@ static int sh_carry_kind(const Compiler *c, int n, int by_repr, int lift, int *o
      String itself: `{ host: req.host }` with two classes answering host. */
   if (u >= 0 && nt_kind(c->nt, u) == NK_CallNode && nt_ref(c->nt, u, "receiver") >= 0 && repr_of(c, nt_ref(c->nt, u, "receiver")).kind == RK_BOXED &&
       nt_ref(c->nt, u, "block") < 0) {
-    const PolyPlan *pp = cplan_poly_arms((Compiler *)c, u);
-    int all = pp->n > 0;
-    for (int i = 0; i < pp->n && all; i++) {
-      const PolyArm *a = &pp->arm[i];
+    const PolyPlan pp = cplan_poly_arms((Compiler *)c, u);
+    int all = pp.n > 0;
+    for (int i = 0; i < pp.n && all; i++) {
+      const PolyArm *a = &pp.arm[i];
       if (a->kind == PA_READER) all = a->vty == TY_STRBUF;
       /* (a method whose return is the handle itself, `h[k] = v`'s value,
          answers it as a reader's arm does) */
@@ -1840,7 +1840,7 @@ static int sh_carry_kind(const Compiler *c, int n, int by_repr, int lift, int *o
      a frozen one, exactly as the typed value route does. */
   if (r.kind == RK_BOXED && nt_kind(c->nt, n) == NK_CallNode &&
       is_unary_plus(nt_str(c->nt, n, "name")) &&
-      cplan_user((Compiler *)c, n)->dispatch == CP_NONE) return SPK_BOX;
+      cplan_user((Compiler *)c, n).dispatch == CP_NONE) return SPK_BOX;
   /* A boxed append answers its receiver's box, appended in place: a chain
      over a base that carries (`(+v) << x`) keeps that base's handle. */
   if (r.kind == RK_BOXED && nt_kind(c->nt, n) == NK_CallNode) {
@@ -1899,7 +1899,7 @@ static int sh_plain_operand(Compiler *c, int n) {
     return 1;
   case NK_CallNode: {
     int recv = nt_ref(nt, n, "receiver");
-    TyKind rt = recv >= 0 ? comp_ntype_stored(c, recv) : TY_VOID;
+    TyKind rt = recv >= 0 ? comp_ntype(c, recv) : TY_VOID;
     /* a freeze moves no payload and changes no byte: a borrowed key read
        beside one stays the live buffer (`h[k] = k.freeze`) */
     if ((rt == TY_STRING || rt == TY_STRBUF) && is_freeze_name(nt_str(nt, n, "name")) &&
@@ -1944,7 +1944,7 @@ static int sh_hash_key_call(Compiler *c, int n) {
   int recv = nt_ref(nt, n, "receiver");
   const char *name = nt_str(nt, n, "name");
   if (recv < 0 || !name) return 0;
-  TyKind rt = comp_ntype_stored(c, recv);
+  TyKind rt = comp_ntype(c, recv);
   if (rt != TY_STR_INT_HASH && rt != TY_STR_STR_HASH && rt != TY_STR_POLY_HASH) return 0;
   if (sh_has_targets(c, n)) return 0;
   if (is_store_alias(name)) return 1;
@@ -1969,7 +1969,7 @@ void share_mark_borrows(Compiler *c) {
   /* a String-keyed Hash literal stores each entry as such a call does:
      its key, beside a plain value */
   NT_FOREACH_KIND(nt, NK_HashNode, n) {
-    TyKind ht = comp_ntype_stored(c, n);
+    TyKind ht = comp_ntype(c, n);
     if (ht != TY_STR_INT_HASH && ht != TY_STR_STR_HASH && ht != TY_STR_POLY_HASH) continue;
     int en = 0; const int *el = nt_arr(nt, n, "elements", &en);
     for (int i = 0; i < en; i++) {

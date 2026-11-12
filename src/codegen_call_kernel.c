@@ -108,7 +108,7 @@ int emit_dispatch_row_answer(Compiler *c, int id, const int *atmp, int natmp, Ty
   int ov = g_n_argov;
   if (atmp)
     for (int a = 0; a < argc && a < natmp; a++)
-      if (subtree_has_side_effect(c, argv[a])) view_bind(argv[a], "_t%d", atmp[a]);
+      if (subtree_has_side_effect(c, argv[a])) view_bind_temp(argv[a], atmp[a]);
   Buf rb; memset(&rb, 0, sizeof rb);
   const BuiltinOp *op = name ? bop_find(BOP_KERNEL, name, argc, nt_ref(c->nt, id, "block") >= 0) : NULL;
   int ok = op && emit_builtin_op_arm_text(c, id, -1, BOP_KERNEL, name, NULL, 0, &rb);   /* (one arm of a dispatch: the node answers what the dispatch does) */
@@ -150,11 +150,21 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
      the hooks in reverse order, from main()'s tail and from every other path
      that ends the program. The registration expression evaluates to the proc;
      sp_at_exit_push locks the table in the threaded build. */
-  if (recv < 0 && sp_streq(name, "at_exit") && nt_ref(nt, id, "block") >= 0 && !bare_call_class_owned(c, id)) {
+  /* `END { }` (the parser's at_exit marked end_once) is Kernel's whatever
+     the program defines, and registers its block the first time it runs
+     only, as CRuby does */
+  int end_once = nt_int(nt, id, "end_once", 0);
+  if (recv < 0 && sp_streq(name, "at_exit") && nt_ref(nt, id, "block") >= 0 && (end_once || !bare_call_class_owned(c, id))) {
     g_needs_at_exit = 1;
+    int to = end_once ? ++g_tmp : 0;
+    /* END's value is nil: the registering expression is run for its effect.
+       The first-time flag is swapped atomically, so two threads that run
+       the same END register it once */
+    if (end_once) buf_printf(b, "({ static int _t%d; if (!SP_ATOMIC_EXCHANGE(&_t%d, 1, __ATOMIC_ACQ_REL)) { ", to, to);
     buf_puts(b, "sp_at_exit_push(");
     emit_proc_literal(c, id, b);
     buf_puts(b, ")");
+    if (end_once) buf_puts(b, "; } 0; })");
     return 1;
   }
 
@@ -326,7 +336,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
      `module_function; def format(...)` beside a sibling that calls it
      bare lost to Kernel#format (#4592). Same ownership test every
      other Kernel arm here makes. */
-  int kconv = (recv < 0 && (nt_int(nt, id, "builtin_only", 0) || call_target(c, id, -1, name, CT_TOP, NULL) < 0) &&
+  int kconv = (recv < 0 && (cplan_builtin_call(c, id) || call_target(c, id, -1, name, CT_TOP, NULL) < 0) &&
                !bare_call_class_owned(c, id));
   if (!kconv && recv >= 0) {
     TyKind krt = comp_ntype(c, recv);
@@ -1068,12 +1078,6 @@ static int env_str_checked(const Compiler *c, int v) {
   const char *s = nt_kind(c->nt, v) == NK_StringNode ? nt_str(c->nt, v, "content") : NULL;
   return !s || strlen(s) != nt_str_len(c->nt, v, "content");
 }
-/* Does ENV operand v build a value where it stands, a new String or box
-   that only the C temp it lands in holds? An operand the operand-order
-   rewrite ran ahead of the call is its rooted temp already. */
-static int env_operand_new(Compiler *c, int v) {
-  return !arg_ran_first(v, 0) && operand_allocates_beside(c, v);
-}
 /* ENV name or value (value != 0) node v as a C string, checked */
 static void emit_env_str(Compiler *c, int v, int value, Buf *b) {
   if (env_str_checked(c, v)) buf_puts(b, "sp_env_chk(");
@@ -1352,7 +1356,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         const char *lty = nt_type(nt, last);
         const char *lnm = (lty && sp_streq(lty, "CallNode")) ? nt_str(nt, last, "name") : NULL;
         int last_throw = (lnm && is_throw_name(lnm) && nt_ref(nt, last, "receiver") < 0 &&
-                          cplan_user_fresh(c, last)->mi < 0);
+                          cplan_user_fresh(c, last).mi < 0);
         Repr lr = repr_of(c, last);
         TyKind lt = lr.as_ty;
         /* TY_NIL includes a tail `loop { throw ... }` (a break-less loop
@@ -1504,7 +1508,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
 
   /* Fiber[:k] / Fiber.current[:k] -> sp_Fiber_storage_get */
   if (recv >= 0 && sp_streq(name, "[]") && argc == 1) {
-    if (fiber_storage_recv(nt, recv)) {
+    if (fiber_storage_recv(c, nt, recv)) {
       buf_puts(b, "sp_Fiber_storage_get(sp_fiber_current, ");
       emit_fiber_storage_key(c, argv[0], b);
       buf_puts(b, ")");
@@ -1516,7 +1520,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
   {
     int erecv = nt_ref(nt, id, "receiver");
     NodeKind erk = nt_kind(nt, erecv);
-    const char *ern = (erk == NK_ConstantReadNode) ? nt_key_name(nt, erecv) : NULL;
+    const char *ern = (erk == NK_ConstantReadNode) ? key_name(c, erecv) : NULL;
     if (ern && sp_streq(ern, "ENV")) {
       const char *enm = nt_str(nt, id, "name");
       int eac = 0; const int *eav = call_args(nt, id, &eac);
@@ -1665,7 +1669,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         /* a key the operand builds (`ENV.delete(key(1))`) is a new String
            nothing else holds, and it too reaches unsetenv past that
            allocation; a variable's or a literal's is held where it is */
-        int key_new = !key_handle && env_operand_new(c, eav[0]);
+        int key_new = !key_handle && operand_allocates_beside(c, eav[0]);
         buf_printf(b, "({ const char *_t%d = ", t1); emit_env_str(c, eav[0], 0, b);
         if (key_handle || key_new) buf_printf(b, "; SP_GC_ROOT(_t%d)", t1);
         buf_printf(b, "; const char *_t%d = getenv(_t%d);"
@@ -1733,7 +1737,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
   if (recv >= 0 && sp_streq(name, "[]") && argc == 1) {
     NodeKind rty2_k = nt_kind(nt, recv);
     if (rty2_k == NK_ConstantReadNode) {
-      const char *rn = nt_key_name(nt, recv);
+      const char *rn = key_name(c, recv);
       if (rn && sp_streq(rn, "ENV")) {
         buf_puts(b, "sp_env_str(getenv("); emit_env_str(c, argv[0], 0, b); buf_puts(b, "))");
         return 1;
@@ -1754,7 +1758,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
           buf_printf(b, "({ const char *_t%d = ", tk); emit_str_expr(c, argv[0], b);
           /* a key the operand builds (`ENV["K#{i}"] = v`) is held across the
              value's evaluation when that can allocate */
-          if (env_operand_new(c, argv[0]) && env_operand_new(c, argv[1]))
+          if (operand_allocates_beside(c, argv[0]) && operand_allocates_beside(c, argv[1]))
             buf_printf(b, "; SP_GC_ROOT(_t%d)", tk);
           /* a nil VALUE unsets the variable; only the key is strict */
           buf_printf(b, "; const char *_t%d = ", tv); emit_str_expr_nilable(c, argv[1], b);
@@ -1813,7 +1817,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         int tk = ++g_tmp, tky = ++g_tmp, tv = ++g_tmp, td = ++g_tmp;
         buf_printf(b, "({ const char *_t%d = ", tky); emit_str_expr(c, argv[0], b);
         /* a key the operand builds is held across a default that can allocate */
-        if (argc >= 2 && env_operand_new(c, argv[0]) && env_operand_new(c, argv[1]))
+        if (argc >= 2 && operand_allocates_beside(c, argv[0]) && operand_allocates_beside(c, argv[1]))
           buf_printf(b, "; SP_GC_ROOT(_t%d)", tky);
         /* the default is an argument: it evaluates whether or not the
            variable is set, before the lookup */
