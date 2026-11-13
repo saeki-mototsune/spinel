@@ -216,6 +216,9 @@ extern int g_dump_load_record;   /* --dump-load-record */
    before p is UNKNOWN. A p with no point (a method body) asks as of the
    end of the load phase. */
 enum { ELAB_NO, ELAB_YES, ELAB_UNKNOWN };
+/* (an answer of the method lookups that read an undef: the lookup stops
+   there, the name is undefined: elab_main_singleton_at) */
+enum { ELAB_STOP = 3 };
 enum { LR_MAY_IN = 2 };   /* LrDef.may */
 /* When a call's block (or an END body) runs, from the syntax alone
    (elab_block_runs): not now, at a time the syntax does not tell (a later
@@ -245,7 +248,12 @@ typedef struct {
                            is the singleton of; unused in other versions */
   unsigned char unplaced; /* in a body the walk does not place (a builder's
                              block, lr_body_defs): no version, and no query
-                             at a point sees it */
+                             at a point sees it; LR_UNPLACED_LATER for a
+                             visibility word that runs at a time the record
+                             does not order (lr_unplaced_words), which also
+                             applies at no point nor as the load ends, and
+                             leaves which entry is live as it was
+                             (lr_hist_unarmed) */
   int body;             /* a version a method body makes (lr_body_versions):
                            the def whose body holds it; such a version has
                            no load point but an extent, from the first
@@ -261,7 +269,11 @@ typedef struct {
                            where it runs: it raises there and makes no
                            method, so it is no version and no entry
                            (elab_absent_aliases) */
+  unsigned char arm_vis; /* a version's: the visibility its face arm takes
+                            (elab_version_vis, -1 for the run's), plus 2;
+                            0 not asked yet */
 } LrDef;
+enum { LR_UNPLACED_LATER = 2 };   /* LrDef.unplaced */
 typedef struct { int node, body; } LrOpen;
 typedef enum { LR_INCLUDE, LR_EXTEND, LR_PREPEND, LR_SG_PREPEND } LrMixKind;   /* LR_SG_PREPEND: a prepend of the singleton class, ahead of its own methods */
 /* kind: LrMixKind; mod: the module's class, -2 one the record does not
@@ -331,8 +343,9 @@ void const_writes_free(Compiler *c);
    table: ELAB_YES with *out a program's `def self.m` (or alias) there, or
    with *out NULL the core's own singleton method (main_singleton_method:
    `to_s`, `inspect`) that main has from the start; ELAB_NO when the
-   singleton holds no method of the name, ELAB_UNKNOWN when the record
-   cannot say. */
+   singleton holds no method of the name, ELAB_STOP where an undef there
+   (main's own, a prepended or an extended module's) stops the lookup, the
+   core's methods' too, ELAB_UNKNOWN when the record cannot say. */
 int elab_main_singleton_at(Compiler *c, const char *name, LoadPoint p, const LrDef **out);
 /* the version of cls's method `name` (singleton when sg) live at p, through
    its ancestors as they stood at p; *out (when asked) the version found. A
@@ -469,6 +482,11 @@ int elab_method_versions(Compiler *c, const char *name);
    main's) history of it hold more than one version, or an alias, which
    names the version it captured? */
 int elab_method_replaced(Compiler *c, const char *name);
+/* may the visibility of `name` differ between two points of the load: does
+   one of its histories hold a visibility change of it (`private :m`), or
+   do the methods its versions give have more than one visibility (a
+   module's private one and a class's public one)? */
+int elab_method_vis_varies(Compiler *c, const char *name);
 /* does a call of `name` run, or open the window of the bodies around it,
    ahead of the first version of one of its histories, where the name is
    absent on that class and side? */
@@ -579,6 +597,11 @@ int elab_in_kept_block(Compiler *c, int id);
    (elab_block_runs: a lazy chain's) or in an END body: it may run any time
    after its point too */
 int elab_runs_later(Compiler *c, int id);
+/* ...and whether node id is in a block whose run time the record does not
+   place for certain (elab_block_runs: any answer but ELAB_BLK_NOW, a
+   block kept, assumed to run now, given to a call the record cannot read,
+   or run later) or in an END body, with no def or lambda between */
+int elab_in_unplaced_block(Compiler *c, int id);
 void elab_window_open(Compiler *c, ElabWindow *w);
 /* the versions of cls's method `name` (singleton when sg) a call running
    over window w can reach, each once, into out[0..cap) (NULL: none): the
@@ -594,6 +617,11 @@ void elab_window_open(Compiler *c, ElabWindow *w);
    define). */
 enum { ELAB_SPAN_ANY = -2 };
 int elab_method_span(Compiler *c, int cls, const char *name, int sg, const ElabWindow *w, const LrDef **out, int cap);
+/* ...over the whole load and after it, for an instance of cls: the
+   versions of its instance method `name` an object with cls among its
+   ancestors may meet from the first statement one may exist (lr_rta) on;
+   -1 in a program of more regions too */
+int elab_instance_span(Compiler *c, int cls, const char *name, const LrDef **out, int cap);
 /* The versions call id may meet as cls's `name` (singleton when sg), the
    one fact the call plan binds the call from (ct_version_at) and the record
    asks whether a version is met by (elab_version_met): where the call runs
@@ -622,8 +650,9 @@ int elab_call_span(Compiler *c, int id, int cls, const char *name, int sg, int o
 /* does the program reach the version made at def node `def` on cls's
    chain (its singleton's when sg) under `name`: is a call of the name, or
    a Method's maker naming it, whose self may be cls or a class under it,
-   bound to it by the versions it may meet (elab_call_meet), or does an
-   alias capture it? */
+   bound to it by the versions it may meet (elab_call_meet:
+   elab_version_called), or does an alias capture it (elab_version_met)? */
+int elab_version_called(Compiler *c, int cls, int sg, const char *name, int def);
 int elab_version_met(Compiler *c, int cls, int sg, const char *name, int def);
 /* does cls's chain (its singleton's when sg) hold still for `name` from p
    to the load's end: each mixin of a module that has or may have the name
@@ -637,11 +666,14 @@ int elab_chain_settled(Compiler *c, int cls, int sg, const char *name, LoadPoint
    first (prepends, own, includes, then the superclass's; where a
    singleton's chain ends, the instance methods it goes on into: for
    main's own singleton, Object's), into
-   out[0..cap): each with its history (hist, the run-time cell its
-   statement writes, call_plan.c's version entries) and its number there,
-   1-based. How many; -1 when a class on the chain is one the record does
-   not hold, a mixin's module is not known, or past cap. */
-typedef struct { const LrDef *v; int hist, n; } ElabVersion;
+   out[0..cap): each with its history (hist), the run-time cell its
+   statement writes (cell, call_plan.c's version entries: its history's,
+   or for main's and Object's histories of a name, which are one entry of
+   Object's table, the one both write) and its number there, 1-based, in
+   the record's order over both. How many; -1 when a class on the chain is
+   one the record does not hold, a mixin's module is not known, or past
+   cap. */
+typedef struct { const LrDef *v; int hist, cell, n; } ElabVersion;
 int elab_chain_versions(Compiler *c, int cls, int sg, const char *name, ElabVersion *out, int cap);
 /* the late bit of the histories of `name` that versions vs[0..n) are in
    (elab_chain_versions): 2 where a call may run ahead of the first version
@@ -653,6 +685,30 @@ int elab_versions_late(Compiler *c, const char *name, const ElabVersion *vs, int
 /* ...and the versions of cls's own history of `name` alone, numbered as
    there */
 int elab_history_versions(Compiler *c, int cls, int sg, const char *name, ElabVersion *out, int cap);
+/* ...and whether one of them is the method scope `scope` made of (its def
+   or alias: LrDef.scope): 1, 0, or -1 with no record */
+int elab_history_holds_scope(Compiler *c, int cls, int sg, const char *name, int scope);
+/* ...and whether main's history of `name` and Object's are one entry of
+   Object's method table, each holding a version (a top-level def and a
+   reopening of Object's): their versions write one cell, and a call on main
+   meets them along Object's chain */
+int elab_main_object_one_entry(Compiler *c, const char *name);
+/* ...and the visibility (SP_VIS_*) version ev's arm of a face entry takes:
+   its def's, or that of a visibility word the record proves runs on the
+   version ahead of every call that may meet it; -1 where only the run
+   tells, a word the record cannot place on the version or ahead of its
+   calls, which the arm reads of the version's visibility cell. Asked once
+   per version (LrDef.arm_vis). */
+int elab_version_vis(Compiler *c, const ElabVersion *ev);
+/* ...and the visibility words that write that cell (`public :m`, in the
+   version's history or the one that is one table entry with it), by the
+   index i of the two histories' entries: 1 for a word (its node and
+   visibility in *node, *vis), 0 for another entry, -1 past the last. */
+int elab_version_word(Compiler *c, const ElabVersion *ev, int i, int *node, int *vis);
+/* ...and whether Object's own history of `name` (its reopenings' defs, not
+   main's top-level ones) holds a live version at p: ELAB_YES, ELAB_NO, or
+   ELAB_UNKNOWN where the record cannot say */
+int elab_object_own_version_at(Compiler *c, const char *name, LoadPoint p);
 /* ...and whether main's top-level history of `name` holds a version whose node carries the int mark `mark` (set by a desugar) */
 int elab_main_history_marked(Compiler *c, const char *name, const char *mark);
 /* The state of the record and the node table an answer of elab_chain_versions
@@ -835,12 +891,14 @@ int elab_method_vis_at(Compiler *c, int cls, const char *name, int sg, LoadPoint
 /* the visibility bit (1 public, 2 protected, 4 private) of main's own
    method `name` where node runs: a top-level def or alias, a method of
    Object's own; 0 where main has none there; -1 where the record cannot
-   tell (node in a method body, a def under a condition, an undef) */
+   tell (node in a method body, a def under a condition, an undef, an
+   Object entry of the name under a condition, an entry of either that may
+   run again before node) */
 int elab_main_method_vis_at(Compiler *c, int node, const char *name);
 /* Is main's def of `name` (a top-level def or alias) the live entry of
    Object's method table where node runs, rather than Object's own def?
    The later of the two answers: 1 main's, 0 Object's, -1 where the record
-   cannot tell. */
+   cannot tell (as elab_main_method_vis_at). */
 int elab_main_def_live_at(Compiler *c, int node, const char *name);
 /* ... when no change of it follows: elab_method_vis_at's answer at p, or -1
    where an entry of the name's histories along cls's superclass chain at or
@@ -977,6 +1035,9 @@ int an_super_backtick_shape(Compiler *c, int id, const Scope *s, int *arg);
 int an_prog_meta_by_value(void);
 /* 1 or -1 when `id` is that Integer literal, parenthesized or not; 0 otherwise */
 int an_unit_int_literal(const NodeTable *nt, int id);
+/* the timeout: value of a call in Queue's timed pop / push form, -1 otherwise
+   (analyze_infer.c) */
+int an_queue_timeout_arg(const NodeTable *nt, int id);
 /* a push onto a typed Array a builtin call just built, given an element of
    another kind: it answers the general Array (analyze_infer.c) */
 int an_push_widens_fresh(Compiler *c, int id);
@@ -1017,10 +1078,6 @@ int an_tail_answers_nil(Compiler *c, int mi);
    the methods are defined in; after it, the facts as decided. */
 int scope_ret_handle(Compiler *c, int mi);
 int scope_ret_fresh(Compiler *c, int mi);
-/* Does call's iterator drop what its block answers: one of the each family,
-   builtin, or every program method of the name yields only where the value
-   is dropped and hands its block on only to such an iterator? */
-int an_iter_discards_block(Compiler *c, int call);
 /* Does method mi answer a String literal on every path (no `return`)? A
    frozen literal keeps one identity, the handle its site has,
    which a handle made over its bytes finds. */
@@ -1329,8 +1386,6 @@ int an_user_recv_defines_method(Compiler *c, const char *name);
 /* obj.methods / public_methods / singleton_methods on an instance of `cid`
    fold to a static symbol list */
 int an_object_methods_listable(Compiler *c, int cid, const char *name);
-int an_module_methods_listable(Compiler *c, int m, const char *name);
-int an_module_defines(Compiler *c, int m, const char *nm, int *vis);
 int an_object_methods_all_arg(Compiler *c, int cid, int argc, const int *argv);
 int an_poly_object_methods_listable(Compiler *c, int id, const char *name, int argc, const int *argv);   /* a boxed receiver's list, per class it can hold */
 /* obj.methods / public_methods on a builtin value: the core class it lists as */

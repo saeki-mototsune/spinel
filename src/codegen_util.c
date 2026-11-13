@@ -2539,9 +2539,13 @@ static int ivs_method_sets(Compiler *c, int mi, const char *ivn, int depth, int 
   }
   return ivs_writes_toplevel(c, nt_ref(c->nt, m->def_node, "body"), ivn, mi, depth, strict);
 }
+/* ...by every initialize a `new` of class cid may run (cplan_new_initializers) */
 static int ivs_init_sets(Compiler *c, int cid, const char *ivn, int depth, int strict) {
-  if (cid < 0) return 0;
-  return ivs_method_sets(c, comp_method_in_chain(c, cid, "initialize", NULL), ivn, depth, strict);
+  int ms[VER_MAX_ARMS], whole, n = cplan_new_initializers(c, cid, ms, VER_MAX_ARMS, &whole);
+  if (!whole) return 0;
+  for (int i = 0; i < n; i++)
+    if (!ivs_method_sets(c, ms[i], ivn, depth, strict)) return 0;
+  return n > 0;
 }
 /* May code under `n`, run in method scope mi, see the object's ivars:
    self handed on (kept in an ivar of its own, it is not), a reflective read
@@ -2687,9 +2691,21 @@ static int ivs_order_method(Compiler *c, int mi, int leaf, int *ord, int *n, int
   }
   return ivs_order_walk(c, nt_ref(c->nt, m->def_node, "body"), mi, leaf, ord, n, depth);
 }
+/* ...of every initialize a `new` of class cid may run
+   (cplan_new_initializers), when they all give the one order */
 static int ivs_order_init(Compiler *c, int cid, int leaf, int *ord, int *n, int depth) {
-  if (cid < 0) return 1;
-  return ivs_order_method(c, comp_method_in_chain(c, cid, "initialize", NULL), leaf, ord, n, depth);
+  int ms[VER_MAX_ARMS], whole, nm = cplan_new_initializers(c, cid, ms, VER_MAX_ARMS, &whole), n0 = *n;
+  if (!whole || nm == 0) return whole;
+  if (!ivs_order_method(c, ms[0], leaf, ord, n, depth)) return 0;
+  int *o2 = nm > 1 ? malloc(sizeof(int) * (size_t)(c->classes[leaf].nivars + 1)) : NULL, ok = 1;
+  if (nm > 1 && !o2) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int i = 1; i < nm && ok; i++) {
+    int k = n0;
+    memcpy(o2, ord, sizeof(int) * (size_t)n0);
+    ok = ivs_order_method(c, ms[i], leaf, o2, &k, depth) && k == *n && !memcmp(o2, ord, sizeof(int) * (size_t)k);
+  }
+  free(o2);
+  return ok;
 }
 static void ivs_order_add(Compiler *c, int leaf, const char *ivn, int *ord, int *n) {
   int ix = comp_ivar_index(&c->classes[leaf], ivn);
@@ -7066,6 +7082,10 @@ void mc_number_versions(Compiler *c) {
   for (int s = 1; s < c->nscopes; s++) {
     Scope *sc = &c->scopes[s];
     if (sc->entry && sc->entry != ENTRY_NAMED && sc->reachable) mc_number_entry(c, &dn, s);
+    /* a replaced version's proc form (an initialize version's,
+       make_yield_proc_forms) is spelled with its source's number: its
+       source comes first in the table */
+    if (sc->is_proc_form && sc->pf_source && !sc->version_n) sc->version_n = c->scopes[sc->pf_source - 1].version_n;
     if (!sc->replaced || !sc->reachable || sc->version_n || sc->main_n) continue;
     if (sc->class_id < 0) sc->version_n = mc_number_top(c, &dn, sc, "%s__redef%d", &top);
     else sc->version_n = ++cls;
@@ -7076,10 +7096,20 @@ void mc_number_versions(Compiler *c) {
 static int mc_same_method(const Scope *a, const Scope *b) {
   return a->class_id == b->class_id && a->is_cmethod == b->is_cmethod && (a->entry == ENTRY_DISPATCH) == (b->entry == ENTRY_DISPATCH) && sp_streq(a->name, b->name);
 }
-/* (`_struct_inspect` is a Struct's default text where both inspect and to_s
-   are the program's: struct_default_text_fn) */
-static const char *const mc_class_helpers[] = { "_alloc", "_dup", "_gc_scan", "_struct_inspect", NULL };
-enum { MC_NHELPERS = 4 };
+/* The suffix of class helper i of MC_NHELPERS (`sp_<class>_<suffix>`).
+   `_struct_inspect` is a Struct's default text where both inspect and to_s
+   are the program's (struct_default_text_fn); `_new_members` its members
+   constructor beside one that runs its initialize (emit_struct_members_ctor). */
+enum { MC_NHELPERS = 5 };
+static const char *mc_class_helper(int i) {
+  switch (i) {
+    case 0: return "_alloc";
+    case 1: return "_dup";
+    case 2: return "_gc_scan";
+    case 3: return "_struct_inspect";
+    default: return "_new_members";
+  }
+}
 /* A method whose name another has, as *first and *later; *first is -1 when
    the name is a class's helper or typedef. A class helper's name that is
    another class's typedef (`class Y__gc_scan` beside Y's sp_Y__gc_scan) is
@@ -7104,7 +7134,7 @@ static int mc_find_clash(Compiler *c, int *first, int *later) {
     } else {
       const ClassInfo *ci = &c->classes[(-i - 1) / MC_NHELPERS];
       if (ci->is_builtin_const || !ci->c_name) continue;
-      nm = mc_ring_setf(c, "sp_%s_%s", ci->c_name, mc_class_helpers[(-i - 1) % MC_NHELPERS]);
+      nm = mc_ring_setf(c, "sp_%s_%s", ci->c_name, mc_class_helper((-i - 1) % MC_NHELPERS));
     }
     unsigned h = 2166136261u;
     for (const char *q = nm; *q; q++) h = (h ^ (unsigned char)*q) * 16777619u;
@@ -7328,6 +7358,11 @@ int scope_is_shadowed(Compiler *c, int s) {
   /* a replaced method version, and a version entry, is a function of its
      own while a call bound to it reaches it (compute_reachable) */
   if (c->scopes[s].replaced || c->scopes[s].entry) return !c->scopes[s].reachable;
+  /* so is a replaced version's proc form (an initialize version's,
+     make_yield_proc_forms) while its source is: the table's clone after it
+     has its name but not its function */
+  int src = proc_form_source(c, s);
+  if (src >= 0 && c->scopes[src].replaced) return !c->scopes[src].reachable;
   /* Before the scopes settle, the scan's answer holds while the scope
      index is frozen (the inference fixpoint among others): a scope is then
      only appended, and the indexed ones keep their names and classes

@@ -1746,6 +1746,7 @@ int emit_call_or_write_via_methods(Compiler *c, int id, int is_or, Buf *b) {
     int trv = ++g_tmp; char rv[32]; snprintf(rv, sizeof rv, "_t%d", trv);
     char head[400]; snprintf(head, sizeof head, "undefined method '%s' for an instance of ", attr);
     buf_puts(b, "({ "); emit_ctype(c, rt, b); buf_printf(b, " %s = ", rv); emit_expr(c, recv, b); buf_puts(b, "; ");
+    if (!recv_never_nil(c, recv)) nil_recv_check(attr, trv, b);
     emit_orw_raise(c, head, cid, rt, rv, b);
     buf_printf(b, "; %s; })", oint_kind(want) && node_is_oint(c, id) ? oint_nil(want)
                                                                     : default_value_from_compiler(c, want));
@@ -1767,6 +1768,7 @@ int emit_call_or_write_via_methods(Compiler *c, int id, int is_or, Buf *b) {
   if (rvis != SP_VIS_PUBLIC) {
     int trv = ++g_tmp; char rv[32]; snprintf(rv, sizeof rv, "_t%d", trv);
     buf_puts(b, "({ "); emit_ctype(c, rt, b); buf_printf(b, " %s = ", rv); emit_expr(c, recv, b); buf_puts(b, "; ");
+    if (!recv_never_nil(c, recv)) nil_recv_check(attr, trv, b);
     emit_orw_vis_raise(c, rvis, attr, cid, rt, rv, b);
     buf_printf(b, "; %s; })", oint_kind(want) && node_is_oint(c, id) ? oint_nil(want)
                                                                     : default_value_from_compiler(c, want));
@@ -1798,6 +1800,9 @@ int emit_call_or_write_via_methods(Compiler *c, int id, int is_or, Buf *b) {
   int ro = (rk == SP_MEMBER_METHOD && oint_kind(rdt) && method_ret_is_oint(&c->scopes[rmi])) || rnb >= 0;
   buf_puts(b, "({ ");
   emit_ctype(c, rt, b); buf_printf(b, " _t%d = ", tr); emit_expr(c, recv, b); buf_puts(b, "; ");
+  /* a receiver that can be nil raises for the reader first, as CRuby's
+     `nil.v ||= 1` does; the reader and the writer take a NULL self */
+  if (!recv_never_nil(c, recv)) nil_recv_check(attr, tr, b);
   if (!comp_ty_value_obj(c, rt)) buf_printf(b, "SP_GC_ROOT(_t%d); ", tr);
   /* the reader, once */
   if (ro) buf_puts(b, oint_ctype(rdt)); else emit_ctype(c, rdt, b);
@@ -2890,7 +2895,8 @@ static int emit_local_ivar_write_expr(Compiler *c, int id, Buf *b, const NodeTab
          the method can run on: it is nil, so `||=` answers the value it runs
          (the nil it writes, a frozen receiver refusing the write) and `&&=`
          answers nil without running it. Read as a field, the C named a
-         member the struct does not have. */
+         member the struct does not have.
+         (register_locals now gives `@x ||= v` a slot, so this is mostly the `&&=` form) */
       /* (an instance method's only: a class body's ivar is the class's, its
          storage a civ_ static) */
       else if (cws3 && cws3->class_id >= 0 && !cws3->is_cmethod && !tl3 && comp_ntype(c, v) == TY_NIL &&
@@ -4335,7 +4341,8 @@ static int emit_defined_value(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       }
       for (int kk = 0; kk < nt->count && !res; kk++) {
         NodeKind kt_k = nt_kind(nt, kk);
-        if (kt_k == NK_InstanceVariableWriteNode &&
+        /* `@x ||= v` writes it on its first run, as a plain write does */
+        if ((kt_k == NK_InstanceVariableWriteNode || kt_k == NK_InstanceVariableOrWriteNode) &&
             inm && nt_str(nt, kk, "name") && sp_streq(nt_str(nt, kk, "name"), inm))
           res = "instance-variable";
         /* a reflective `instance_variable_set(:@x, v)` writes it too */
@@ -6998,6 +7005,15 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
          assign to whatever the yield's value was typed as (a String local
          took an sp_int and the C build stopped) */
       { Repr yt_repr = repr_of(c, id);
+        /* a yield no block reaches has no type of its own: the sentinel
+           takes the one of the write its value goes to, which the write
+           does not convert (`@r = yield` into an Integer slot) */
+        if (yt_repr.as_ty == TY_UNKNOWN && yt_repr.kind != RK_BOXED) {
+          VpUp up;
+          vp_climb(nt, codegen_node_parents(c, id), id, VPS_ALL & ~VP_WRITES, &up);
+          if (up.kind == VPU_ENDED && up.parent >= 0 && vp_is_value_edge(nt, up.parent, up.node, VP_WRITES))
+            yt_repr = repr_of(c, up.parent);
+        }
         TyKind yt = yt_repr.as_ty;
         if (yt_repr.kind == RK_BOXED || yt == TY_UNKNOWN || yt == TY_NIL || yt == TY_VOID) buf_puts(b, "sp_box_nil())");
         else if (yt == TY_INT) buf_puts(b, "(sp_int)0)");
@@ -7341,6 +7357,9 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
       int tr = ++g_tmp;
       buf_puts(b, "({ ");
       emit_ctype(c, rt, b); buf_printf(b, " _t%d = ", tr); emit_expr(c, recv, b); buf_puts(b, "; ");
+      /* a receiver that can be nil: CRuby raises NoMethodError for the
+         reader (the statement form says more) */
+      if (!recv_never_nil(c, recv)) nil_recv_check(attr, tr, b);
       char lhs[300]; snprintf(lhs, sizeof lhs, "_t%d->iv_%s", tr, iv_c(attr));
       char apfx[32]; snprintf(apfx, sizeof apfx, "_t%d->", tr);
       char tn[32], mk[300]; snprintf(tn, sizeof tn, "_t%d", tr);

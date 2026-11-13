@@ -33,6 +33,7 @@ int sp_requires_non_boot_feature(void);
 void sp_feature_mark(const char *name);
 int sp_feature_enabled(const char *name);
 int        sp_feature_required(const char *name); /* require was actually written (gate-independent) */
+int        sp_features_required_count(void);
 /* Add a `-I <dir>` feature search root (see resolve_plain_requires). */
 void sp_add_feature_root(const char *dir);
 
@@ -120,6 +121,8 @@ static inline void comp_touch_key(int key) {
 #define CLS_BK_OTHER CORE_N
 #define CLS_BK_WORDS ((CORE_N + 64) / 64)
 typedef struct { unsigned char all, bv, os, pr, bc; unsigned long long bk[CLS_BK_WORDS]; int n, nw; unsigned long long *w; int *wi; } ClsSet;
+/* A hashed name set (keys borrowed, not copied); zero-initialize to start (anh_*, analyze_internal.h). */
+typedef struct { const char **key; int *next, *head, n, cap, nb; } ANameHash;
 static inline int cls_bk_has(const ClsSet *s, int k) { return (int)((s->bk[k >> 6] >> (k & 63)) & 1); }
 /* the position of the first word at word index q or past it */
 static inline int cls_set_word_from(const ClsSet *s, int q) {
@@ -330,6 +333,8 @@ typedef struct {
   int gvar_seeded; /* (globals) gvar_seeded_before_read's answer, asked once:
                       0 not asked yet, 1 a read can see its first nil, 2 a
                       non-nil value is written before anything can read it */
+  unsigned char ver_cell; /* (globals) a version cell the call plan made
+                             (ver_cell_node), not a global of the program's */
   int or_written; /* some write to this local is a `||=`, which can run before
                      any definite assignment (`v ||= 5; v += 2`, a definite
                      write in one branch only, a block local reset each
@@ -626,6 +631,11 @@ typedef struct {
                             site answers by folding. A real value use has no
                             such answer -- the block must be an sp_Proc *. */
   char *blk_param;  /* name of the `&block` parameter, or NULL (anon -> "") */
+  /* cplan_block_value_ignored's answer for this method while
+     Compiler.bvi_epoch stands: BVI_BUSY while it is asked, at method depth
+     bvi_depth */
+  int bvi_epoch, bvi_depth;
+  unsigned char bvi_state;
 
   /* Compile-time `define_method` unrolling: a method synthesized from
      `[lits].each { |v| define_method("m_#{v}") { body } }`. Within this
@@ -1402,6 +1412,10 @@ typedef struct {
                        set of user classes its value can hold (analyze_cls.c,
                        #8530); 0 is every class. Read through cls_fact_node. */
   ClsSet *cls_pool; int ncls_pool, cls_fact_n;
+  /* the class count the facts were solved with: a set holds class k's
+     Class object as member k + cls_fact_ncls, and a class registered after
+     (k >= cls_fact_ncls) is in no set */
+  int cls_fact_ncls;
   struct CplanMemo *cplan_memo;   /* the call plans kept per node where the node is read as itself, and the storage the plans handed out point into (call_plan.c), made on first use */
   struct SendOwners *send_owners; int nsend_owners, csend_owners;   /* per send name, the builtin classes the tables give as answering it (cplan_send_split_owners) */
   unsigned long long (*cls_bk_sub)[CLS_BK_WORDS]; unsigned char *cls_bk_sub_ok;   /* per builtin class, the mask of it and the classes below it, made on first ask (cls_bk_subtree) */
@@ -1473,6 +1487,17 @@ typedef struct {
      are of; next NULL for none made. Made at an asking period's first ask
      and freed when the period ends */
   struct DefOwners { int *kd, *kc, *head, *tail, *next, cap, nscopes; } def_owners;
+  /* the dynamic send's candidate memo (analyze_desugar.c, dsn_memo_begin):
+     each class's names, the call plan's list for each class, the program's
+     instance-method names, and the names every object answers, kept from
+     one run of the passes to the next while nothing they read has moved
+     (the stamps); freed with the compiler. lits is the set of literal names dsend_candidates took from the program's
+     source (its keys point into that answer, valid until the caller frees
+     it), which the pass reads after it. */
+  struct DsnMemo { int on, ncls, nscp, keyed; unsigned sgen, shape, tgen;
+                   char ***names; int *n; char **inames; int ninames; int *every; int nevery;
+                   char ***own; int *nown;
+                   ANameHash lits; } dsn;
   /* the top-level scope of each file root (nt_root), by graph id: 0 for the
      entry (analyze_program.c) */
   int *file_scope;
@@ -1499,7 +1524,7 @@ typedef struct {
   int *anon_struct_ids;
   int n_anon_struct_ids, anon_struct_ids_valid;
   int has_anonymous_classes; /* Class.new identities with execution-time names */
-  int user_define_method;    /* 0 not asked yet, 1 none, 2 the program defines or aliases its own define_method */
+  int user_define_method;    /* 0 not asked yet, else 1 + the UDM_ kinds of the program's own define_method (an_user_define_method_kinds; 1 none) */
 
   /* local-write-by-name index; see comp_lvw_first */
   int *lvw_head;        /* [lvw_nbuckets] first write id in each name bucket */
@@ -1712,6 +1737,9 @@ typedef struct {
   struct CplanToAryEntries *to_ary_entries;
   char *exc_text_late;  /* the plain exception text dispatchers, defined after the globals (emit_exc_text_dispatch) */
   int exc_text_super;        /* exc_text_override_calls_super's memo: 0 unasked, 1 no, 2 yes */
+  /* emitting a body that lands in g_procs ahead of the constructors: a
+     fiber's, a Hash default block's (ahead_body_enter, emit_pool_fwd) */
+  int ahead_bodies;
   /* body-node id -> enclosing BlockNode id (lazy; emit_stmts block-local
      resets). Covers the first blk_body_map_n nodes, extended as the table
      grows; -1 = not a block body. */
@@ -1886,17 +1914,23 @@ typedef struct {
      them (call_plan.c, mixin_copies_module); 0 for cls's chain; behind:
      1 + the method a guard entry's method_missing else arm stands for,
      the one behind the mixins that finds no method (guard_entry_make),
-     0 for none. Each name
+     0 for none; face: VF_NONE, or the visibility the arms of the versions
+     that are closed to it raise for (call_plan.h). Each name
      is the entry's own copy (ver_entry_add), as in ver_late, ver_memo and
      the chain counts: a caller may ask with a name it frees itself
      (desugar_call_op_write's setter name) */
-  struct VerEntry { char *name; int guard, cls, sg, ar, scope, absent, cells, finds, from, behind; } *ver_entries;
+  struct VerEntry { char *name; int guard, cls, sg, ar, scope, absent, cells, finds, from, behind, face; } *ver_entries;
   int nver_entries;
+  /* per global (c->gvars' index, the first nver_cell_dropped of them): 1 for
+     a version cell no emitted code reads, whose declaration and writes the C
+     leaves out (call_plan.c, ver_cells_settle) */
+  unsigned char *ver_cell_dropped;
+  int nver_cell_dropped;
   /* the chains a typed call may meet with no version made yet, whose
      entry is not asked for that yet (call_plan.c, ver_absent_note); mm:
      where the call runs, method_missing is on the chain (1), is not (2),
      or both (ver_mm_at) */
-  struct VerLate { char *name; int cls, sg, mi, ar, mm, span; } *ver_late;   /* span: a call past the build that spans versions */
+  struct VerLate { char *name; int cls, sg, mi, ar, mm, span, face; } *ver_late;   /* span: a call past the build that spans versions; face: the entry's it binds (VF_*) */
   int nver_late;
   int nver_refl;   /* the named entries whose name reflection does not answer (call_plan.c, ver_refl_named) */
   int ncond_disp;  /* the dispatchers defs under a run-time condition are lowered to (analyze_desugar.c; call_plan.c, ver_list_held) */
@@ -1911,6 +1945,8 @@ typedef struct {
   int nver_defer;
   struct VerChain *ver_chain;   /* how many versions a class's chain holds of a name, by (class, side, name) (call_plan.c, ver_chain_count) */
   struct VerHold *ver_hold;   /* the holders of a name worth asking, by name (call_plan.c, ver_holders) */
+  struct NewInits *new_inits;   /* the initialize methods a `new` of a class may run, by class (call_plan.c, cplan_new_initializers) */
+  struct NewSites *new_sites;   /* the initialize each `new` site runs, by (site, class) (call_plan.c, cplan_new_initialize) */
   /* per method scope, made once (call_plan.c, cplan_scope_facts): whether
      it holds a super that reaches no method, and whether a method_missing
      answers for self or hands the name on */
@@ -1920,7 +1956,7 @@ typedef struct {
      count) and ver_names one scope-holding entry of each name (ver_entries_index) */
   int *ver_ix, *ver_ix_next, *ver_names, *ver_names_next;
   unsigned ver_ix_nb;
-  struct VerPin { int node, scope; } *ver_pins;
+  struct VerPin { int node, scope, vis; } *ver_pins;
   int nver_pins;
   /* the entries are made (ver_entries_build): the versions the calls get
      are kept, and a call that reaches a later prepend's copy binds its
@@ -1989,12 +2025,20 @@ typedef struct {
     int *own;
     int cap;
   } ie_map;
+  /* cplan_block_value_ignored's answers (call_plan.c): their number, which
+     moves with the node table, the types, the methods or their index
+     (bvi_stamp); how many asks are open, how many methods deep one is, and
+     the shallowest method still being asked that an answer rested on */
+  int bvi_epoch, bvi_calls, bvi_mdepth, bvi_low;
+  struct { unsigned long ty, edits; unsigned version, scope_gen; int nscopes; } bvi_stamp;
 } Compiler;
 enum { PRES_UNMARKED = 1, PRES_REMOVED = 2 };
 
 AutoloadRegistration *comp_autoloads(const Compiler *c, int node, int *count);
 Compiler *comp_new(const NodeTable *nt);
 void comp_free(Compiler *c);
+/* the dynamic send's candidate memo and literal set (Compiler.dsn), dropped (analyze_desugar.c) */
+void dsn_free(Compiler *c);
 void ic_free(Compiler *c);   /* implicit_calls.c */
 void yvt_free(Compiler *c);  /* analyze_util.c */
 /* Is `name` one of the n strings in `list`? (0 for a NULL name) */
@@ -2488,7 +2532,7 @@ static inline int comp_object_defines(Compiler *c, const char *name) {
   return oc >= 0 && comp_method_in_chain(c, oc, name, NULL) >= 0;
 }
 int        send_def_just_supers(Compiler *c, int mi);          /* analyze_desugar.c */
-int        send_family_program_owns(Compiler *c, const char *name);
+int        send_family_defined_anywhere(Compiler *c, const char *name);   /* analyze_desugar.c */
 /* Array subclasses (#7449, ClassInfo.ary_root): the root of class cid's
    Array chain or -1; the same for an object type (-1 for any other type);
    the kind of the Array the chain's instances embed, TY_POLY_ARRAY once the
@@ -2591,6 +2635,9 @@ int cls_fact_bounded(Compiler *c, int k);
    known, k is bounded, and k is not in it? A call on recv then never
    reaches k's method, so the binding and the dispatch may leave it out. */
 int cls_fact_excludes(Compiler *c, int recv, int k);
+/* ...and as a Class object: may recv's value not be class k itself (a
+   `new` on it then builds no k)? */
+int cls_fact_excludes_class_value(Compiler *c, int recv, int k);
 /* May node's value be an OpenStruct (an OpenStruct.new reaches it, or the
    walk has no answer for it), in a program that requires "ostruct"? */
 int cls_fact_may_ostruct(Compiler *c, int node);
@@ -2657,6 +2704,8 @@ int        class_is_exc_subclass(Compiler *c, int ci);   /* analyze.c */
 int        comp_plain_class(Compiler *c, int cid);    /* only Object's and Kernel's builtin methods behind the class: no core class or core module among its ancestors */
 int        comp_enum_behind(Compiler *c, int cid);    /* Enumerable's methods behind the class: Enumerable, or an Array, Struct or native ancestor */
 int        core_method_vis(const char *cls, const char *m, int inherit, const char **owner);   /* codegen_call_class.c */
+int        core_vis_of_bit(int bit);   /* codegen_call_class.c: SP_VIS_* of a core_method_vis bit */
+int        core_bit_of_vis(int vis);   /* ...and the bit of an SP_VIS_* */
 int        core_method_undefined(const char *cls, const char *m);
 int        builtin_ancestor_def_ran(Compiler *c, int id, int k, const char *qm);   /* codegen_call_class.c */
 int        builtin_ancestor_accessor(Compiler *c, int k, const char *qm);   /* codegen_call_class.c */   /* does core class cls undefine an ancestor's m itself (Complex#round)? codegen_call_class.c */

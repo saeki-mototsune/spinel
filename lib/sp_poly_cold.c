@@ -575,7 +575,12 @@ static const char *sp_poly_class_name_arm(sp_RbVal v, int *id)
         case SP_BUILTIN_YIELDER: return SPL("Enumerator::Yielder");
         case SP_BUILTIN_RANDOM: return SPL("Random");
         case SP_BUILTIN_ARGF: return SPL("ARGF.class");
-        case SP_BUILTIN_EXCEPTION: return sp_exc_class_name((volatile struct sp_Exception_s *)v.v.p);
+        case SP_BUILTIN_EXCEPTION: {
+          /* a builtin exception class carries its id (sp_Exception.cls_id) */
+          const sp_Exception *e = (const sp_Exception *)v.v.p;
+          if (e && e->cls_id) *id = e->cls_id;
+          return sp_exc_class_name((volatile struct sp_Exception_s *)v.v.p);
+        }
         default: { sp_Class c = {v.cls_id}; return sp_class_to_s(c); }
       }
     default: return (*id = SP_BCLS_OBJECT, SPL("Object"));
@@ -944,6 +949,10 @@ sp_RbVal sp_poly_slice_or_call(sp_RbVal v, sp_RbVal a, sp_RbVal b)
   /* a shared String handle receiver reads as its bytes; a capture name
      does below, while a callable's argument stays the String itself */
   if (sp_poly_is_strbuf(v)) v = sp_poly_strbuf_deref(v);
+  /* `sym[/re/, n]` on a boxed Symbol matches the name, as Symbol#[] does:
+     read as a two-integer slice, the Regexp operand raised TypeError */
+  if (v.tag == SP_TAG_SYM && a.tag == SP_TAG_OBJ && a.v.p && a.cls_id == SP_BUILTIN_REGEX)
+    v = sp_box_str(sp_sym_to_s((sp_sym)v.v.i));
   /* `s[/re/, n]` on a boxed String: capture n of the first match, nil when
      there is none -- the form the typed emitter answers inline. Read as a
      two-integer slice, the Regexp operand raised TypeError (campfire's

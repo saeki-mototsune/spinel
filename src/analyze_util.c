@@ -1882,11 +1882,56 @@ static int chain_is_lazy_valued_1(Compiler *c, int node) {
    chain in the same scope, return the chain node so a forcing call on the
    variable can fuse it as if written inline; else -1. Models sym_static_value.
    (#2932) */
+/* The local names a lazy chain may be written to: a plain write's value
+   whose receivers lead to a blockless `lazy` call, or to a read of a name
+   of the set (chain_is_lazy_valued's walk, with no scope asked, so more
+   names than it answers for). Rebuilt when the node table changes. The
+   reads asked about name another local nearly always, and the writes of
+   their name, across every method of the program, were walked each time:
+   a 4,000-method program spent more on it than its whole growth in the
+   other passes (#11708). */
+static ANameHash g_lzw_names;
+static const NodeTable *g_lzw_nt;
+static unsigned g_lzw_ver;
+static int g_lzw_cnt = -1;
+static int lzw_value_leads_lazy(const NodeTable *nt, int v, const ANameHash *names) {
+  for (int cur = v, hops = 0; cur >= 0 && hops < 64; hops++) {
+    NodeKind k = nt_kind(nt, cur);
+    if (k == NK_LocalVariableReadNode) {
+      const char *rn = nt_str(nt, cur, "name");
+      return rn && anh_has(names, rn);
+    }
+    if (k != NK_CallNode) return 0;
+    const char *nm = nt_str(nt, cur, "name");
+    if (nm && sp_streq(nm, "lazy") && nt_ref(nt, cur, "block") < 0) return 1;
+    cur = nt_ref(nt, cur, "receiver");
+  }
+  return 0;
+}
+static int lazy_written_name(Compiler *c, const char *vn) {
+  const NodeTable *nt = c->nt;
+  if (g_lzw_nt != nt || g_lzw_ver != nt->version || g_lzw_cnt != nt->count) {
+    anh_free(&g_lzw_names); memset(&g_lzw_names, 0, sizeof g_lzw_names);
+    for (int grew = 1; grew; ) {
+      grew = 0;
+      for (int w = comp_kind_first(c, NK_LocalVariableWriteNode); w >= 0; w = comp_kind_next(c, w)) {
+        const char *wn = nt_str(nt, w, "name");
+        if (!wn || anh_has(&g_lzw_names, wn) || !lzw_value_leads_lazy(nt, nt_ref(nt, w, "value"), &g_lzw_names)) continue;
+        anh_add(&g_lzw_names, wn);
+        grew = 1;
+      }
+    }
+    g_lzw_nt = nt; g_lzw_ver = nt->version; g_lzw_cnt = nt->count;
+  }
+  return anh_has(&g_lzw_names, vn);
+}
 int lazy_alias_chain(Compiler *c, int var_read) {
   const NodeTable *nt = c->nt;
   if (var_read < 0 || nt_kind(nt, var_read) != NK_LocalVariableReadNode) return -1;
   const char *vn = nt_str(nt, var_read, "name");
   if (!vn) return -1;
+  /* (no write of the name can hold a lazy chain: none is the one) */
+  if (!lazy_written_name(c, vn)) return -1;
   Scope *sc = comp_scope_of(c, var_read);
   /* The plain writes first, through the name index: the answer is -1 unless
      there is exactly one, in this scope, whose value is a lazy chain. The
@@ -3411,14 +3456,15 @@ static int yvt_callee_index_scan(Compiler *c, int cid) {
   else {
     TyKind crt = infer_type(c, crecv);
     if (ty_is_object(crt)) rmi = call_target(c, cid, ty_object_class(crt), cn, 0, NULL);
-    /* `Klass.new { block }`: the block feeds the class's initialize. A
-       scoped receiver (`NS::Klass`) resolves by its leaf name, the key
-       classes are indexed under. */
-    else if (cn && sp_streq(cn, "new") && nt_type(nt, crecv) &&
+    /* `Klass.new { block }`: the block feeds the initialize the plan
+       answers the site with (cplan_new_initialize), the version current
+       there. A scoped receiver (`NS::Klass`) resolves by its leaf name,
+       the key classes are indexed under. */
+    else if (is_new_name(cn) && nt_type(nt, crecv) &&
              (nt_kind(nt, crecv) == NK_ConstantReadNode ||
               nt_kind(nt, crecv) == NK_ConstantPathNode)) {
       int nci = const_node_class_index(c, crecv);
-      if (nci >= 0) rmi = call_target(c, cid, nci, "initialize", 0, NULL);
+      if (nci >= 0) rmi = cplan_new_initialize(c, cid, nci, NULL);
     }
     /* `Klass.m { block }` / `Mod.m { block }` / `NS::Klass.m { block }`: a
        class/module self-method (singleton). Resolve the constant and look
@@ -3548,10 +3594,14 @@ static int bsv_foreign(TyKind t, TyKind want) {
 
 /* What block_store_value_ty gathers from a block's values: the first of a
    kind bsv_foreign takes for `want`, and whether one is an Integer (1)
-   and one a Float (2). */
+   and one a Float (2). A nil found first gives way to a later value of
+   another kind: `x == 1 ? nil : :tag` on an Integer Array answered nil,
+   the Array widened only to a nullable Integer, and the Symbol was
+   stored as an Integer. The kind that holds the Symbol holds nil too. */
 typedef struct { TyKind want, found; unsigned num; } BsvArms;
 static void bsv_leaf(BsvArms *a, TyKind t) {
-  if (a->found == TY_UNKNOWN && bsv_foreign(t, a->want)) a->found = t;
+  if ((a->found == TY_UNKNOWN || (a->found == TY_NIL && t != TY_NIL)) && bsv_foreign(t, a->want))
+    a->found = t;
   if (t == TY_INT) a->num |= 1;
   else if (t == TY_FLOAT) a->num |= 2;
 }
@@ -3623,7 +3673,8 @@ static void block_next_arms(Compiler *c, int node, BsvArms *a) {
    `next 1` beside `next "s"` to the boxed kind, which the store evidence
    leaves alone. So the typed Array stayed, and the nil raised TypeError or
    the String did not compile. The first value (tail or `next`, arm by arm)
-   of such a kind is answered, and the Array widens as it does for a block
+   of such a kind is answered (a nil gives way to a later value of another
+   kind, see bsv_leaf), and the Array widens as it does for a block
    with that one value. An `elem` not known yet (TY_UNKNOWN or TY_POLY: a
    row read out of a table) answers so only for values of mixed kinds, with
    one no Array of numbers or objects holds. `joined` otherwise. `*num`
@@ -5071,6 +5122,14 @@ int name_is_synth_method(Compiler *c, const char *m) {
      has, as `__inc foo`, is the program's own */
   if (comp_name_is_shadow_copy(c, m, SHADOW_INC)) return 1;
   if (comp_name_is_shadow_copy(c, m, SHADOW_PREP)) return 1;
+  /* `__spinel_civget_x` and its kin: the class methods that read and write
+     a class's instance variable x for code outside its body, known by the
+     mark on their DefNode (civ_ensure_accessor), so a method the program
+     names so is its own */
+  if (is_class_ivar_accessor_name(m)) {
+    for (int si = an_scopes_named_first(c, m); si >= 0; si = an_scopes_named_next(c, m, si))
+      if (c->scopes[si].def_node >= 0 && nt_int(c->nt, c->scopes[si].def_node, "civ_accessor", 0)) return 1;
+  }
   /* `m#pf`, the proc-form clone of a yielding method: `#` is never part of a
      Ruby method name */
   if (strchr(m, '#')) return 1;
@@ -5290,7 +5349,14 @@ static int method_obj_lookup(Compiler *c, int node, int *cls, int *sg) {
     int mi = comp_self_call_mi(c, node, sym);
     if (mi < 0) return cplan_capture_missing(c, node);
     k = c->scopes[mi].class_id, side = k >= 0 && c->scopes[mi].is_cmethod;
-    if (k < 0) return call_target(c, node, k, sym, CT_CAPTURE | CT_TOP, NULL);
+    if (k < 0) {
+      /* (a version of Object's that main's top-level ask meets is the
+         capture's on Object: ML_OBJECT) */
+      MethodLookup tl = { .def_class = -1 };
+      int t = call_target(c, node, k, sym, CT_CAPTURE | CT_TOP, &tl);
+      if (t >= 0 || tl.kind != ML_OBJECT) return t;
+      k = comp_core_class(c, CORE_OBJECT);
+    }
     goto found;
   }
   /* `self.method(:m)` in a class method: self is the class */
@@ -5303,7 +5369,7 @@ static int method_obj_lookup(Compiler *c, int node, int *cls, int *sg) {
      (desugar_builtin_method_obj) -- for an object accessor the wrapper is a
      TOP-LEVEL def, not in the object's own class chain, so resolve it there. */
   if (sym[0] == '_' && sym[1] == '_' && sym[2] == 'b' && sym[3] == 'a' && sym[4] == 'm')
-    return comp_method_index(c, sym);
+    return call_target(c, node, -1, sym, CT_CAPTURE | CT_TOP, NULL);
   if (ty_is_object(rt)) { k = ty_object_class(rt); goto found; }
   /* Klass.method(:cmeth) / Module.method(:mf): the class-side method */
   if (rt == TY_CLASS && (nt_kind(nt, recv) == NK_ConstantReadNode ||
@@ -6580,7 +6646,7 @@ static void si_call_targets(Compiler *c, SiFacts *f, int from, int id, const cha
   if (r >= 0 && sp_streq(nm, "new") && (nt_kind(nt, r) == NK_ConstantReadNode || nt_kind(nt, r) == NK_ConstantPathNode)) {
     int k = const_node_class_index(c, r);
     if (k >= 0) {
-      int mi = comp_method_in_chain(c, k, "initialize", NULL);
+      int mi = cplan_new_initialize(c, id, k, NULL);
       if (mi >= 0) si_target(f, from, mi, hit);
       return;
     }
@@ -6802,6 +6868,14 @@ int respond_to_cells_shape(const NodeTable *nt, int id) {
   NodeKind rk = recv >= 0 ? nt_kind(nt, recv) : NK_SelfNode, ak = ac == 2 ? nt_kind(nt, av[1]) : NK_FalseNode;
   return av && (ac == 1 || ac == 2) && nt_kind(nt, av[0]) == NK_SymbolNode && (ak == NK_TrueNode || ak == NK_FalseNode) &&
          (rk == NK_SelfNode || rk == NK_ConstantReadNode || rk == NK_ConstantPathNode);
+}
+/* See analyze_internal.h. */
+int list_cells_shape(const NodeTable *nt, int id) {
+  int ac = 0, recv = nt_kind(nt, id) == NK_CallNode ? nt_ref(nt, id, "receiver") : -1;
+  if (recv < 0 || !is_singleton_method_list(nt_str(nt, id, "name")) || nt_ref(nt, id, "block") >= 0) return 0;
+  const int *av = call_args(nt, id, &ac);
+  NodeKind rk = nt_kind(nt, recv), ak = ac == 1 ? nt_kind(nt, av[0]) : NK_TrueNode;
+  return ac <= 1 && (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) && (ak == NK_TrueNode || ak == NK_FalseNode);
 }
 /* See analyze_internal.h. */
 int capture_cells_shape(const NodeTable *nt, int id) {

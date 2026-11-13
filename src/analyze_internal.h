@@ -104,12 +104,10 @@ typedef struct { int *pos; char *done; } DUPos;
 int *du_parent_map(const NodeTable *nt);
 int du_read_maybe_unset(const NodeTable *nt, const int *par, DUPos *dp, int rd, const char *nm);
 void du_memo_free(void);
-/* The edges an_value_dropped (and cow_user_block_value, which asks of the
-   block it ends at) climbs: where a value is passed on to the statement or
-   the block that holds it. */
+/* The edges an_value_dropped climbs: where a value is passed on to the
+   statement or the block that holds it. */
 enum { AN_DROP_CLIMB = VPS_ALL };
-int an_value_dropped(const NodeTable *nt, const int *parent, int node);
-int cow_user_block_value(Compiler *c, const int *parent, int id);
+int an_value_dropped(Compiler *c, const int *parent, int node);
 /* The String rule for a local or parameter slot: it holds the handle (analyze_pass.c) */
 int slot_take_string_handle(Compiler *c, LocalVar *lv);
 /* A runtime protocol name: the emitted program can call the method with
@@ -347,6 +345,11 @@ int an_name_binder_free(Compiler *c, const char *name);
 int an_native_defines_method(Compiler *c, const char *name);
 int an_user_recv_defines_method(Compiler *c, const char *name);
 int an_user_define_method(Compiler *c);
+/* where the program's own define_method sits (an_user_define_method_kinds):
+   the self a receiverless define_method could reach it from */
+enum { UDM_CLASS_SELF = 1, UDM_INSTANCE_SELF = 2, UDM_ANY_SELF = 4 };
+int an_user_define_method_kinds(Compiler *c);
+int an_user_define_method_reaches(Compiler *c, int class_self);
 extern int g_yvt_unify_all;
 /* The return type of a call to method `mi`. A method whose body is just a
    bare `yield` returns the block's value -- and since it inlines per call
@@ -579,6 +582,9 @@ int respond_to_cells_shape(const NodeTable *nt, int id);
    constant, self or no receiver: a Method's maker that takes the entry a
    call of the name takes (lr_refl_take)? */
 int capture_cells_shape(const NodeTable *nt, int id);
+/* Is call id a `C.singleton_methods` (or `(true)`, `(false)`) on a constant: a class's class-side
+   method list whose names the version cells may answer (cplan_list_cells; lr_refl_take asks it)? */
+int list_cells_shape(const NodeTable *nt, int id);
 /* May a respond_to? answer for a name other than by the methods: the program
    defines respond_to_missing?. The cells answer no respond_to? then. */
 int respond_to_missing_defined(Compiler *c);
@@ -1036,6 +1042,7 @@ int disp_raise_no_method_self(Compiler *c, const char *name, const char *head, i
 int disp_forward_call(NodeTable *nt, const char *callee, int ar, int blk);
 int disp_self_call(NodeTable *nt, const char *callee, int ar, int blk);
 int disp_when_unspread(Compiler *c, int call);
+int disp_cell_test(NodeTable *nt, const char *sel, int val, int then, int els);
 int disp_super_call(NodeTable *nt, int ar, int blk);
 int disp_method_missing_call(NodeTable *nt, const char *name, int ar, int blk);
 int desugar_dynamic_respond_to(Compiler *c);
@@ -1060,6 +1067,7 @@ int desugar_value_form_drop_block(Compiler *c);
 int desugar_iter_splat_args(Compiler *c);
 int desugar_builtin_iter_block_shapes(Compiler *c);
 int desugar_enum_pair_lone_param(Compiler *c);
+int prune_unnamed_methods(Compiler *c);   /* blank the methods nothing names and reading tells nothing (#11708) */
 int sym_block_values(Compiler *c, int id);
 void enum_hop_yield_view(Compiler *c, int id, int hop);
 int sym_proc_poly_pair_view(Compiler *c, int id);
@@ -1133,8 +1141,7 @@ void compute_instantiated(Compiler *c, int early);
 int aname_has(ANameSet *s, const char *nm);
 void aname_add(ANameSet *s, const char *nm);
 void a_collect_alias_used(Compiler *c, int id, ANameSet *out, int depth);   /* names a closure reads through a lazy chain local */
-/* A hashed name set (keys borrowed, not copied); zero-initialize to start. */
-typedef struct { const char **key; int *next, *head, n, cap, nb; } ANameHash;
+/* (ANameHash: compiler.h) */
 int anh_has(const ANameHash *st, const char *nm);
 int anh_find(const ANameHash *st, const char *nm);   /* insertion index, or -1 */
 void anh_add(ANameHash *st, const char *nm);

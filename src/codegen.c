@@ -420,7 +420,7 @@ static int poll_pure_shape(Compiler *c, int si) {
   if (s->rest_idx >= 0 || s->kwrest_idx >= 0 || s->nrequired != s->nparams) return 0;
   if (s->ret != TY_INT && s->ret != TY_FLOAT && s->ret != TY_BOOL) return 0;
   if (method_is_void(s) || sp_streq(s->name, "initialize")) return 0;   /* the wrapper returns the value */
-  if (scope_has_begin(c, si) || cmethod_takes_self_cls(c, si)) return 0;
+  if (scope_has_begin(c, si) || cmethod_takes_self_cls(c, s)) return 0;
   if (s->class_id >= 0 && !s->is_cmethod) {
     const ClassInfo *ci = &c->classes[s->class_id];
     if (ci->is_value_type || ci->is_struct || ci->is_native_class) return 0;
@@ -4257,10 +4257,11 @@ int method_is_void(Scope *s) {
    care. */
 static int8_t *g_cm_selfcls = NULL;
 static int g_cm_selfcls_n = -1;
-int cmethod_takes_self_cls(Compiler *c, int si) {
-  if (si < 0 || si >= c->nscopes) return 0;
-  Scope *s = &c->scopes[si];
+int cmethod_takes_self_cls(Compiler *c, const Scope *s) {
+  if (!s) return 0;
   if (!s->is_cmethod || s->class_id < 0 || s->body < 0) return 0;
+  /* (the memo, the nodes' scope table and the lookups below are all keyed by the index) */
+  int si = (int)(s - c->scopes);
   if (g_cm_selfcls_n != c->nscopes) {
     free(g_cm_selfcls);
     g_cm_selfcls = (int8_t *)calloc((size_t)c->nscopes, 1);
@@ -4293,7 +4294,7 @@ int cmethod_takes_self_cls(Compiler *c, int si) {
           int cmi = call_target(c, nid, s->class_id, nm, CT_CMETHOD, NULL);
           if (cmi >= 0 && cmi != si) {
             g_cm_selfcls[si] = 0;
-            if (cmethod_takes_self_cls(c, cmi)) ans = 1;
+            if (cmethod_takes_self_cls(c, &c->scopes[cmi])) ans = 1;
             g_cm_selfcls[si] = -1;
           }
         }
@@ -4315,7 +4316,7 @@ static int g_cls_tok_mi = -1;
 static char g_cls_tok[64];
 
 const char *emit_cmethod_self_cls_arg(Compiler *c, int mi, int recv_cls, Buf *b) {
-  if (!cmethod_takes_self_cls(c, mi)) return "";
+  if (mi < 0 || !cmethod_takes_self_cls(c, &c->scopes[mi])) return "";
   int rc = recv_cls >= 0 || recv_cls <= -100 ? recv_cls : c->scopes[mi].class_id;
   if (rc == c->scopes[mi].class_id && class_reopen_cmethod(c, -1, -1, c->scopes[mi].name) == mi) rc = builtin_class_id("Class");
   buf_printf(b, "((sp_Class){%d, NULL})", rc);
@@ -5774,7 +5775,7 @@ void emit_method_signature(Compiler *c, Scope *s, Buf *b) {
   buf_puts(b, mc_method(c, s));
   buf_puts(b, "(");
   int wrote = 0;
-  if (cmethod_takes_self_cls(c, (int)(s - c->scopes))) {
+  if (cmethod_takes_self_cls(c, s)) {
     buf_puts(b, "sp_Class _sp_cls");
     wrote = 1;
   }
@@ -7779,15 +7780,15 @@ void emit_method(Compiler *c, Scope *s, Buf *b) {
   }
   else emit_method_signature(c, s, b);
   buf_puts(b, " {\n");
-  /* the program's own #inspect, #to_s or #message, where the program
-     reopens Array#inspect: it runs as outside a pp, so its p and inspect
+  /* the program's own #inspect, #to_s or #message, where a pp prints
+     through sp_pp_inspect (pp_prints_by_rt): it runs as outside a pp, so its p and inspect
      calls run that method, however it was reached (a Struct member's, an
      exception's message). Each return sets the flag back to its value at
      entry, so the pp that reached the method prints the rest of its value
      without that method. A raise out of it leaves the flag cleared, the
      state outside a pp; a boxed render's call (SP_PP_USER) restores it. */
   if (s->name && (sp_streq(s->name, "inspect") || sp_streq(s->name, "to_s") || sp_streq(s->name, "message")) &&
-      array_user_inspect_mi(c) >= 0)
+      pp_prints_by_rt(c))
     buf_puts(b, "  int _sp_ppw SP_CLEANUP(sp_pp_user_leave) = sp_pp_user_enter();\n");
   /* The singleton override does not exist until the statement that created it
      has run (#4084). The object carries its parent's cls_id until then, so a
@@ -7916,7 +7917,7 @@ void emit_method(Compiler *c, Scope *s, Buf *b) {
   const char *saved_self9 = g_self;
   char cm_self9[32];
   if (s->class_id >= 0 && s->is_cmethod) {
-    if (cmethod_takes_self_cls(c, (int)(s - c->scopes)))
+    if (cmethod_takes_self_cls(c, s))
       snprintf(cm_self9, sizeof cm_self9, "_sp_cls");
     else
       snprintf(cm_self9, sizeof cm_self9, "((sp_Class){%d})", s->class_id);
@@ -8882,8 +8883,8 @@ static int gen_yields_multi(const Compiler *c, int id, const char *yname) {
   return 0;
 }
 
-/* emitting a fiber body, which lands in g_procs ahead of the constructors */
-static int g_in_fiber_body = 0;
+void ahead_body_enter(Compiler *c) { c->ahead_bodies++; }
+void ahead_body_leave(Compiler *c) { c->ahead_bodies--; }
 
 /* A Fiber or Thread block's parameter list (`pn`, the requireds' count) and,
    for the full binding, every name in it. */
@@ -9251,7 +9252,7 @@ static void emit_fiber_new_here(Compiler *c, int id, Buf *b, int as_gen, int siz
   /* A class method that takes its receiving class as _sp_cls hands it to the
      body in the capture struct too: the body is a function of its own, where
      _sp_cls is not in scope (a `to_enum` in such a method). */
-  int cap_cls = encl && encl->is_cmethod && cmethod_takes_self_cls(c, (int)(encl - c->scopes));
+  int cap_cls = encl && encl->is_cmethod && cmethod_takes_self_cls(c, encl);
 
   /* Emit capture struct + GC scan function when there are captured vars or self */
   if (ncap > 0 || cap_self || cap_cls) {
@@ -9311,7 +9312,7 @@ static void emit_fiber_new_here(Compiler *c, int id, Buf *b, int as_gen, int siz
      scope). */
   Buf body_buf = {0};
   Buf *pb = &body_buf;
-  g_in_fiber_body++;
+  ahead_body_enter(c);
   buf_printf(pb, "static void %s(sp_Fiber *_fb) {\n", fname);
   buf_puts(pb, "    SP_GC_SAVE();\n");
   size_t fib_frame_ins = pb->len;
@@ -9641,7 +9642,7 @@ static void emit_fiber_new_here(Compiler *c, int id, Buf *b, int as_gen, int siz
      precede this definition there; both sit at file scope. */
   buf_puts(&g_procs, body_buf.p ? body_buf.p : "");
   free(body_buf.p);
-  g_in_fiber_body--;
+  ahead_body_leave(c);
 
   /* Restore emission state */
   ren_unpark(&ren_sv);
@@ -10329,7 +10330,7 @@ static void emit_proc_param_slot(Compiler *c, Scope *bs, LocalVar *lv, Buf *pb, 
    receiving class the capture struct carries in (cap_cls) when the method
    takes one, so a subclass's call sees itself; else the method's own class. */
 static const char *proc_cmethod_self(Compiler *c, Scope *bs, char *out, size_t n) {
-  if (cmethod_takes_self_cls(c, (int)(bs - c->scopes))) return "_sp_cls";
+  if (cmethod_takes_self_cls(c, bs)) return "_sp_cls";
   snprintf(out, n, "((sp_Class){%d})", bs->class_id);
   return out;
 }
@@ -10790,7 +10791,7 @@ else if (orecv >= 0 && onm) {
      referenced an identifier that is not in scope. Carry it in the capture
      struct, the way instance self is carried (#3797). */
   int cap_cls = ie_cls < 0 && bs && bs->is_cmethod &&
-                cmethod_takes_self_cls(c, (int)(bs - c->scopes));
+                cmethod_takes_self_cls(c, bs);
   int self_is_value = cap_self && c->classes[scls].is_value_type;
   /* an Object / Array / Hash / Numeric reopening holds self boxed (its
      methods take `sp_RbVal self`): captured as the boxed value */
@@ -12224,6 +12225,7 @@ void emit_class_struct(Compiler *c, ClassInfo *ci, Buf *b) {
     buf_puts(b, "  sp_bool has_recv;\n");
     buf_puts(b, "  sp_bool has_key;\n");
     buf_puts(b, "  sp_bool priv_call;\n");
+    buf_puts(b, "  int cls_id;\n");
     buf_puts(b, "  sp_StrArray *backtrace;\n");
     buf_puts(b, "  void *msg_h;\n");
     /* the nil bytes follow the base fields: the runtime reads msg_h through
@@ -12641,8 +12643,16 @@ static void emit_struct_default_inspect(Compiler *c, ClassInfo *ci, int cid, con
     if (mcn) {
       /* a struct/data (or user-#inspect) member recurses into its own inspect */
       char ivn[128]; snprintf(ivn, sizeof ivn, "%s", iv_c(ci->ivars[i] + 1));
-      buf_printf(b, "  sp_String_append(s, self->iv_%s ? %s((sp_%s *)self->iv_%s) : \"nil\");\n",
-                 ivn, obj_str_fn(c, ty_object_class(mt), 1), mcn, ivn);
+      int mc = ty_object_class(mt);
+      /* inside a pp, a Struct or Data member with its own #inspect shows its
+         record layout too (record_pp_skips_inspect) */
+      if (pp_prints_by_rt(c) && record_pp_skips_inspect(c, mc))
+        buf_printf(b, "  sp_String_append(s, !self->iv_%s ? \"nil\" : sp_pp_printing ? sp_%s_%s((sp_%s *)self->iv_%s) : %s((sp_%s *)self->iv_%s));\n",
+                   ivn, c->classes[mc].c_name, struct_default_text_fn(c, mc), c->classes[mc].c_name, ivn,
+                   obj_str_fn(c, mc, 1), mcn, ivn);
+      else
+        buf_printf(b, "  sp_String_append(s, self->iv_%s ? %s((sp_%s *)self->iv_%s) : \"nil\");\n",
+                   ivn, obj_str_fn(c, mc, 1), mcn, ivn);
     }
     else {
       Buf ivb; memset(&ivb, 0, sizeof ivb); buf_printf(&ivb, "self->iv_%s", iv_c(ci->ivars[i] + 1));
@@ -12656,6 +12666,93 @@ static void emit_struct_default_inspect(Compiler *c, ClassInfo *ci, int cid, con
   buf_puts(b, "  return s->data;\n}\n");
 }
 
+/* Does Struct or Data class cid's constructor sp_<cid>_new run the
+   program's initialize, a reachable one on its chain, taking that one's
+   parameters, rather than fill the members (emit_class_new)? */
+static int struct_ctor_runs_init(Compiler *c, int cid) {
+  int si = comp_method_in_chain(c, cid, "initialize", NULL);
+  return si >= 0 && c->scopes[si].reachable;
+}
+/* The C name of class cid's members constructor (emit_struct_members_ctor) */
+void emit_struct_members_ctor_name(Compiler *c, int cid, Buf *b) {
+  buf_printf(b, struct_ctor_runs_init(c, cid) ? "sp_%s__new_members" : "sp_%s_new", c->classes[cid].c_name);
+}
+/* The constructor of Struct or Data class ci that fills the members from
+   its arguments, one per member, in order: sp_<ci>_new, or where that one
+   runs the program's initialize (struct_ctor_runs_init) the one a site the
+   plan answers no initialize at builds with (emit_struct_members_ctors) */
+static void emit_struct_members_ctor(Compiler *c, ClassInfo *ci, Buf *b) {
+  int cid = (int)(ci - c->classes);
+  buf_printf(b, "static sp_%s *", ci->c_name);
+  emit_struct_members_ctor_name(c, cid, b);
+  buf_puts(b, "(");
+  for (int i = 0; i < ci->nmembers; i++) {
+    if (i) buf_puts(b, ", ");
+    emit_ctype(c, ci->ivar_types[i], b);
+    buf_printf(b, " a%d", i);
+  }
+  if (ci->nmembers == 0) buf_puts(b, "void");
+  buf_puts(b, ") {\n");
+  /* Root every heap-backed member argument before allocating the struct:
+     SP_POOL_NEW can trigger a GC, and a member value that is a fresh,
+     otherwise-unrooted temporary (e.g. a `data[8, 8].delete("\0").upcase`
+     WAD lump name) would be swept before it is stored into the ivar,
+     leaving a dangling pointer the collector later reads (use-after-free). */
+  for (int i = 0; i < ci->nmembers; i++) {
+    TyKind mt = ci->ivar_types[i];
+    /* Gate on needs_root() -- the codebase's authoritative "this type is a
+       heap pointer the GC scans" predicate -- so EVERY heap-backed member
+       (bigint, obj_array, proc/method/exception, io/fiber/etc.) is rooted,
+       not just strings/poly/object/array/hash. A fresh bigint or obj_array
+       temporary is just as sweepable across SP_POOL_NEW's GC as a string. */
+    if (mt == TY_STRING)      buf_printf(b, "  SP_GC_ROOT_STR(a%d);\n", i);
+    else if (mt == TY_POLY)   buf_printf(b, "  SP_GC_ROOT_RBVAL(a%d);\n", i);
+    /* a String Range by value: what it carries (emit_srange_param_root) */
+    else if (mt == TY_STR_RANGE) { char name[32]; snprintf(name, sizeof name, "a%d", i); emit_srange_param_root(c, name, b); }
+    else if (needs_root(mt))  buf_printf(b, "  SP_GC_ROOT(a%d);\n", i);
+  }
+  buf_printf(b, "  sp_%s *self = SP_POOL_NEW(%s, %s%s%s);\n",
+            ci->c_name, ci->c_name,
+            class_needs_scan(ci) ? "sp_" : "", class_needs_scan(ci) ? ci->c_name : "NULL",
+            class_needs_scan(ci) ? "__gc_scan" : "");
+  buf_puts(b, "  SP_GC_ROOT(self);\n");
+  buf_printf(b, "  self->cls_id = %d;\n", ctor_cls_id(c, cid));
+  for (int i = 0; i < ci->nmembers; i++)
+    buf_printf(b, "  self->iv_%s = a%d;\n", iv_c(ci->ivars[i] + 1), i);  /* skip leading '@' */
+  /* an attr's or a method's own ivar is no member: it starts nil */
+  emit_ivar_nil_inits_from(c, b, ci, ci->nmembers, "self->", "  ", ";\n");
+  /* Data instances are frozen from construction (CRuby); Struct is mutable. */
+  if (ci->is_data) buf_puts(b, "  sp_gc_freeze(self);\n");
+  buf_puts(b, "  return self;\n}\n");
+}
+/* The members constructors of the Struct and Data classes whose
+   sp_<cid>_new runs the program's initialize, for the sites the plan
+   answers none at (cplan_new_initialize): each one texts[0..ntexts) call,
+   its prototype into protos, itself into defs. The calls are all found
+   before the first is written: defs may be one of the texts, and grows. */
+static void emit_struct_members_ctors(Compiler *c, const char *const *texts, int ntexts, Buf *protos, Buf *defs) {
+  unsigned char *used = calloc((size_t)c->nclasses + 1, 1);
+  for (int k = 0; k < c->nclasses; k++) {
+    ClassInfo *ci = &c->classes[k];
+    if (!ci->is_struct || ci->is_native_class || !struct_ctor_runs_init(c, k)) continue;
+    Buf call; memset(&call, 0, sizeof call);
+    emit_struct_members_ctor_name(c, k, &call);
+    buf_puts(&call, "(");
+    for (int t = 0; t < ntexts && !used[k]; t++) used[k] = texts[t] && strstr(texts[t], call.p) != NULL;
+    free(call.p);
+  }
+  for (int k = 0; k < c->nclasses; k++) {
+    if (!used[k]) continue;
+    ClassInfo *ci = &c->classes[k];
+    Buf def; memset(&def, 0, sizeof def);
+    emit_struct_members_ctor(c, ci, &def);
+    const char *open = strstr(def.p, ") {\n");
+    buf_printf(protos, "%.*s);\n", (int)(open - def.p), def.p);
+    buf_puts(defs, def.p);
+    free(def.p);
+  }
+  free(used);
+}
 void emit_class_new(Compiler *c, ClassInfo *ci, Buf *b) {
   /* Native (C-backed) class: constructor + methods live in the package; nothing
      is generated here (see the native_method externs + .new emission). */
@@ -12666,7 +12763,7 @@ void emit_class_new(Compiler *c, ClassInfo *ci, Buf *b) {
   if (ci->is_struct) {
     int sinit_def = cid;
     int sinit = comp_method_in_chain(c, cid, "initialize", &sinit_def);
-    if (sinit >= 0 && c->scopes[sinit].reachable) {
+    if (struct_ctor_runs_init(c, cid)) {
       /* Custom `initialize` override (a `Struct.new(...) do def initialize ...
          super(...) end end` block, e.g. doom's Visplane): the constructor
          allocates a blank instance and delegates to the user initialize -- the
@@ -12729,45 +12826,7 @@ void emit_class_new(Compiler *c, ClassInfo *ci, Buf *b) {
     }
     /* Struct constructor: one parameter per member, set the backing ivars. */
     buf_printf(b, "SP_POOL_DEFINE(%s)\n", ci->c_name);
-    buf_printf(b, "static sp_%s *sp_%s_new(", ci->c_name, ci->c_name);
-    for (int i = 0; i < ci->nmembers; i++) {
-      if (i) buf_puts(b, ", ");
-      emit_ctype(c, ci->ivar_types[i], b);
-      buf_printf(b, " a%d", i);
-    }
-    if (ci->nmembers == 0) buf_puts(b, "void");
-    buf_puts(b, ") {\n");
-    /* Root every heap-backed member argument before allocating the struct:
-       SP_POOL_NEW can trigger a GC, and a member value that is a fresh,
-       otherwise-unrooted temporary (e.g. a `data[8, 8].delete("\0").upcase`
-       WAD lump name) would be swept before it is stored into the ivar,
-       leaving a dangling pointer the collector later reads (use-after-free). */
-    for (int i = 0; i < ci->nmembers; i++) {
-      TyKind mt = ci->ivar_types[i];
-      /* Gate on needs_root() -- the codebase's authoritative "this type is a
-         heap pointer the GC scans" predicate -- so EVERY heap-backed member
-         (bigint, obj_array, proc/method/exception, io/fiber/etc.) is rooted,
-         not just strings/poly/object/array/hash. A fresh bigint or obj_array
-         temporary is just as sweepable across SP_POOL_NEW's GC as a string. */
-      if (mt == TY_STRING)      buf_printf(b, "  SP_GC_ROOT_STR(a%d);\n", i);
-      else if (mt == TY_POLY)   buf_printf(b, "  SP_GC_ROOT_RBVAL(a%d);\n", i);
-      /* a String Range by value: what it carries (emit_srange_param_root) */
-      else if (mt == TY_STR_RANGE) { char name[32]; snprintf(name, sizeof name, "a%d", i); emit_srange_param_root(c, name, b); }
-      else if (needs_root(mt))  buf_printf(b, "  SP_GC_ROOT(a%d);\n", i);
-    }
-    buf_printf(b, "  sp_%s *self = SP_POOL_NEW(%s, %s%s%s);\n",
-              ci->c_name, ci->c_name,
-              class_needs_scan(ci) ? "sp_" : "", class_needs_scan(ci) ? ci->c_name : "NULL",
-              class_needs_scan(ci) ? "__gc_scan" : "");
-    buf_puts(b, "  SP_GC_ROOT(self);\n");
-    buf_printf(b, "  self->cls_id = %d;\n", ctor_cls_id(c, cid));
-    for (int i = 0; i < ci->nmembers; i++)
-      buf_printf(b, "  self->iv_%s = a%d;\n", iv_c(ci->ivars[i] + 1), i);  /* skip leading '@' */
-    /* an attr's or a method's own ivar is no member: it starts nil */
-    emit_ivar_nil_inits_from(c, b, ci, ci->nmembers, "self->", "  ", ";\n");
-    /* Data instances are frozen from construction (CRuby); Struct is mutable. */
-    if (ci->is_data) buf_puts(b, "  sp_gc_freeze(self);\n");
-    buf_puts(b, "  return self;\n}\n");
+    emit_struct_members_ctor(c, ci, b);
     struct_meta:;
     /* Struct/Data #inspect: the default representation, generated unless the
        user redefined the method, so a user override wins. */
@@ -13010,7 +13069,7 @@ void emit_own_class_alloc(Compiler *c, int id, int base, Buf *b) {
        allocates that class */
     /* (the token `self` reads there: a yielding method inlined at its
        caller reads g_self, a parameter default the call's class) */
-    if (cmethod_takes_self_cls(c, (int)(s - c->scopes)))
+    if (cmethod_takes_self_cls(c, s))
       snprintf(sel, sizeof sel, "(%s).cls_id", s->yields && g_self ? g_self : cmethod_cls_token(c, s));
   }
   else if (!comp_ty_value_obj(c, ty_object(base))) {
@@ -13040,12 +13099,12 @@ void emit_own_class_alloc(Compiler *c, int id, int base, Buf *b) {
   buf_puts(b, "; })");
 }
 
-/* A proc or fiber body is written out ahead of the classes'
-   constructors, and so ahead of the SP_POOL_DEFINE this names: declare
-   the pool to it (a Class value's `new` built inline in a block did not
-   compile). */
+/* A proc, fiber or Hash default block body is written out ahead of the
+   classes' constructors, and so ahead of the SP_POOL_DEFINE this names:
+   declare the pool to it (a Class value's `new` built inline in a block
+   did not compile). */
 void emit_pool_fwd(Compiler *c, int cid) {
-  if (!g_in_proc_body && !g_in_fiber_body) return;
+  if (!g_in_proc_body && !c->ahead_bodies) return;
   if (g_pool_fwd_n < c->nclasses) {
     g_pool_fwd = realloc(g_pool_fwd, (size_t)c->nclasses);
     memset(g_pool_fwd + g_pool_fwd_n, 0, (size_t)(c->nclasses - g_pool_fwd_n));
@@ -14312,6 +14371,25 @@ static int class_inspectable(Compiler *c, int i) {
      and printed #<Object> (#3813) */
   return 1;
 }
+/* Does the object inspect switch (sp_obj_inspect_sw) call class cid's own
+   #inspect for an object of cid or of any class below it? Then a pp that
+   prints the boxed object through sp_pp_inspect runs that method as the
+   typed call does. */
+static int obj_arm_calls_own_inspect1(Compiler *c, int i) {
+  ClassInfo *ci = &c->classes[i];
+  if (!class_has_obj_arm(c, i)) return 1;   /* no object of it to print */
+  if (!class_inspectable(c, i) || comp_ty_value_obj(c, ty_object(i))) return 0;
+  int mi = display_method_scope(c, i, 1, NULL);
+  if (mi < 0 || ci->is_native_class) return 0;
+  const Scope *s = &c->scopes[mi];
+  return s->reachable && !s->yields && s->nparams == 0 && (s->ret == TY_STRING || s->ret == TY_POLY);
+}
+int obj_arm_calls_own_inspect(Compiler *c, int cid) {
+  if (cid < 0 || cid >= c->nclasses || !g_emit_obj_dispatch) return 0;
+  for (int i = 0; i < c->nclasses; i++)
+    if ((i == cid || is_descendant(c, i, cid)) && !obj_arm_calls_own_inspect1(c, i)) return 0;
+  return 1;
+}
 /* Does the program have a `def inspect = super` reaching Kernel#inspect
    (an_super_object_text)? Only then is sp_obj_kernel_inspect emitted. */
 int obj_kernel_inspect_used(Compiler *c) {
@@ -14540,8 +14618,8 @@ static void emit_obj_cls_name_rt(Buf *b) {
    sp_pp_printing for the call, so what that method prints or inspects runs
    the program's Array#inspect as CRuby does, also inside a pp. (A raise
    out of the method leaves the flag cleared, the state outside a pp.) */
-static const char *ppu_open(Compiler *c) { return array_user_inspect_mi(c) >= 0 ? "SP_PP_USER(" : ""; }
-static const char *ppu_close(Compiler *c) { return array_user_inspect_mi(c) >= 0 ? ")" : ""; }
+static const char *ppu_open(Compiler *c) { return pp_prints_by_rt(c) ? "SP_PP_USER(" : ""; }
+static const char *ppu_close(Compiler *c) { return pp_prints_by_rt(c) ? ")" : ""; }
 static int emit_display_yield_arm(Compiler *c, int cid, int mi, int def, int by_value, Buf *b) {
   if (mi < 0 || !c->scopes[mi].yields) return 0;
   int pf = scope_proc_form_of(c, mi);
@@ -14695,6 +14773,20 @@ static void emit_obj_inspect_dispatch(Compiler *c, Buf *b) {
   Buf *outer = b; b = &sw;
   buf_puts(b, "static const char *sp_obj_inspect_sw(int cls_id, void *p) {\n");
   emit_hook_object_root(b, "SP_GC_ROOT", "p");
+  /* inside a pp (sp_pp_printing), a Struct or Data class with its own
+     #inspect prints its record layout, as CRuby's pp does
+     (record_pp_skips_inspect) */
+  if (pp_prints_by_rt(c)) {
+    int any = 0;
+    for (int i = 0; i < c->nclasses; i++) {
+      if (!class_has_obj_arm(c, i) || !record_pp_skips_inspect(c, i)) continue;
+      if (!any) buf_puts(b, "  if (sp_pp_printing) switch (cls_id) {\n");
+      any = 1;
+      buf_printf(b, "    case %d: return sp_%s_%s((sp_%s *)p);\n", i, c->classes[i].c_name,
+                 struct_default_text_fn(c, i), c->classes[i].c_name);
+    }
+    if (any) buf_puts(b, "    default: break;\n  }\n");
+  }
   buf_puts(b, "  switch (cls_id) {\n");
   for (int i = 0; i < c->nclasses; i++) {
     if (!class_has_obj_arm(c, i)) continue;
@@ -16468,9 +16560,8 @@ void emit_super(Compiler *c, int id, Buf *b) {
        filters `super` that way) */
     if (cmi < 0 && sp_streq(uname, "subclasses") && nt_ref(c->nt, id, "arguments") < 0) {
       int ta = ++g_tmp, tc = ++g_tmp;
-      int si = (int)(s - c->scopes);
       buf_printf(b, "({ sp_Class _t%d = ", tc);
-      if (cmethod_takes_self_cls(c, si)) buf_puts(b, cmethod_cls_token(c, s));
+      if (cmethod_takes_self_cls(c, s)) buf_puts(b, cmethod_cls_token(c, s));
       else buf_printf(b, "((sp_Class){%d, NULL})", s->class_id);
       buf_printf(b, "; sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);", ta, ta);
       for (int k = 0; k < c->nclasses; k++) {
@@ -16492,9 +16583,8 @@ void emit_super(Compiler *c, int id, Buf *b) {
         (sp_streq(uname, "ancestors") ||
          (sp_streq(uname, "superclass") && !comp_class_is_module(c, &c->classes[s->class_id])))) {
       int tc = ++g_tmp;
-      int si = (int)(s - c->scopes);
       buf_printf(b, "({ sp_Class _t%d = ", tc);
-      if (cmethod_takes_self_cls(c, si)) buf_puts(b, cmethod_cls_token(c, s));
+      if (cmethod_takes_self_cls(c, s)) buf_puts(b, cmethod_cls_token(c, s));
       else buf_printf(b, "((sp_Class){%d, NULL})", s->class_id);
       Repr sr = repr_of(c, id);
       if (sp_streq(uname, "ancestors"))
@@ -16531,10 +16621,9 @@ void emit_super(Compiler *c, int id, Buf *b) {
       }
       if (ok) {
         int tc = ++g_tmp, tm = ++g_tmp;
-        int si = (int)(s - c->scopes);
         Repr sr = repr_of(c, id);
         buf_printf(b, "%s({ sp_Class _t%d = ", sr.kind == RK_BOXED ? "sp_box_bool(" : "", tc);
-        if (cmethod_takes_self_cls(c, si)) buf_puts(b, cmethod_cls_token(c, s));
+        if (cmethod_takes_self_cls(c, s)) buf_puts(b, cmethod_cls_token(c, s));
         else buf_printf(b, "((sp_Class){%d, NULL})", s->class_id);
         buf_printf(b, "; sp_Class _t%d = %s; if (!sp_class_is_module_val(_t%d)) "
                       "sp_raise_cls(\"TypeError\", \"wrong argument type Class (expected Module)\"); "
@@ -16557,20 +16646,20 @@ void emit_super(Compiler *c, int id, Buf *b) {
     if (g_plan_check) ucall_observe(c, id, cmi, cdef, 0);
     buf_printf(b, "%s(", mc_method(c, &c->scopes[cmi]));
     /* `super` in a class method keeps the receiving class: forward ours. */
-    if (cmethod_takes_self_cls(c, cmi))
+    if (cmethod_takes_self_cls(c, &c->scopes[cmi]))
     {
       /* a body that does not take its receiving class is only ever run on
          its own class: pass that, not "none", or the parent's body builds
          and names the parent (#5995) */
       char own[48];
       snprintf(own, sizeof own, "((sp_Class){%d, NULL})", s->class_id);
-      buf_printf(b, "%s%s", cmethod_takes_self_cls(c, (int)(s - c->scopes)) ? "_sp_cls" : own,
+      buf_printf(b, "%s%s", cmethod_takes_self_cls(c, s) ? "_sp_cls" : own,
                  c->scopes[cmi].nparams > 0 ? ", " : "");
     }
     if (ty_k == NK_ForwardingSuperNode) emit_zsuper_args(c, s, &c->scopes[cmi], "", b);
     else emit_args_filled(c, cmi, nt_ref(c->nt, id, "arguments"), "", b);
     emit_super_block_arg(c, id, s, &c->scopes[cmi],
-                         c->scopes[cmi].nparams > 0 || cmethod_takes_self_cls(c, cmi), b);
+                         c->scopes[cmi].nparams > 0 || cmethod_takes_self_cls(c, &c->scopes[cmi]), b);
     buf_puts(b, ")");
     return;
   }
@@ -17017,21 +17106,6 @@ void emit_super(Compiler *c, int id, Buf *b) {
        BasicObject's or Kernel's (comp_super_object_builtin): the same object,
        false, the frozen bit, the object itself or Kernel's row's answer */
     if (uname && emit_super_object_builtin(c, id, s, uname, b)) return;
-    /* `super` from the program's own send, __send__ or public_send that no
-       ancestor of the program defines is Object's: it dispatches on the name
-       at run time, which no emitted code here does, so it is refused rather
-       than answered by a NoMethodError CRuby does not raise. An override
-       whose whole body is `super` is let through while no other override
-       exists: every send then lowers past it (send_family_user_answers), so
-       its body never runs. */
-    if (uname && is_send_family(uname) &&
-        (!send_def_just_supers(c, (int)(s - c->scopes)) || send_family_program_owns(c, uname))) {
-      static char msg[320];
-      snprintf(msg, sizeof msg, "unsupported `super` in a program-defined `%s`: "
-               "it reaches Object#%s, which a program method cannot call yet "
-               "(only a `%s` whose whole body is `super` is supported, in a program with no other `%s` of its own)", uname, uname, uname, uname);
-      unsupported_feature(c, id, msg);
-    }
     /* No superclass method anywhere (parent chain, included-module shadow, and
        the exception-initialize special case all missed). CRuby raises
        NoMethodError at runtime, so emit that rather than rejecting at compile
@@ -18433,7 +18507,7 @@ void emit_regex_section(Compiler *c, Buf *b) {
   if (g_gen_obj_struct_values)
     buf_puts(b, "  sp_obj_struct_values_fn = sp_obj_struct_values;\n");
   {
-    static const char *const lacks[] = { "last", "join", "sample", "shuffle", "flatten", "at", "pack",
+    static const char *const lacks[] = { "last", "join", "sample", "shuffle", "shuffle!", "flatten", "at", "pack",
                                          "rotate", "values_at", "length", "empty?", "include?", "member?",
                                          "count", "first", NULL };
     /* one entry per name: an Object#last leaves IO#length raising */
@@ -18444,6 +18518,21 @@ void emit_regex_section(Compiler *c, Buf *b) {
         any = 1;
       }
     if (any) buf_puts(b, ", NULL }; sp_poly_root_lacks_names = rl; }\n");
+  }
+  {
+    /* the Array names a boxed Enumerator lacks (sp_poly_ary_chk, the names
+       up to "values_at" above) that a reopened Enumerator or Enumerable
+       defines, or all of them when one defines method_missing */
+    static const char *const lacks[] = { "last", "join", "sample", "shuffle", "shuffle!", "flatten", "at", "pack",
+                                         "rotate", "values_at", NULL };
+    int mm = reopened_owns(c, "Enumerator", "method_missing") || reopened_owns(c, "Enumerable", "method_missing");
+    int any = 0;
+    for (int i = 0; lacks[i]; i++)
+      if (mm || reopened_owns(c, "Enumerator", lacks[i]) || reopened_owns(c, "Enumerable", lacks[i])) {
+        buf_printf(b, "%s\"%s\"", any ? ", " : "  { static const char *const el[] = { ", lacks[i]);
+        any = 1;
+      }
+    if (any) buf_puts(b, ", NULL }; sp_poly_enum_lacks_names = el; }\n");
   }
   if (obj_to_a_any(c))
     buf_puts(b, "  sp_obj_to_a_fn = sp_obj_to_a;\n");
@@ -20780,7 +20869,7 @@ static void ext_generate_cruby_shim(Compiler *c) {
               c->classes[sc->class_id].name, sc->name);
       exit(1);
     }
-    if (cmethod_takes_self_cls(c, s9)) {
+    if (cmethod_takes_self_cls(c, sc)) {
       fprintf(stderr, "spinel: --ext cruby: %s.%s: a subclass-dispatched class "
                       "method cannot be an entry\n",
               c->classes[sc->class_id].name, sc->name);
@@ -21027,7 +21116,7 @@ static void ext_emit_method_thunk(Compiler *c, int ci, int s, Buf *b) {
   const char *sep = "";
   if (sc->is_cmethod) {
     /* a class method a subclass may call takes the class it was called on */
-    if (cmethod_takes_self_cls(c, s)) { buf_puts(&call, "(sp_Class){ self.cls_id, 0 }"); sep = ", "; }
+    if (cmethod_takes_self_cls(c, sc)) { buf_puts(&call, "(sp_Class){ self.cls_id, 0 }"); sep = ", "; }
   }
   else {
     if (def != ci && !vt) buf_printf(&call, "(%s *)", class_ctype(c, def));
@@ -22810,6 +22899,31 @@ int array_user_inspect_mi(Compiler *c) {
   if (s->nparams > 0 || s->yields || (s->blk_param && s->blk_param[0]) || (TyKind)s->ret != TY_STRING) return -1;
   return mi;
 }
+/* Does pp print an instance of class cid by the record layout
+   (`#<struct S a=1>`, `#<data D v=1>`) and not by the class's own
+   #inspect? It does for a Struct or Data class that has its own #inspect:
+   CRuby's pp uses Struct#pretty_print / Data#pretty_print, which leave
+   that method out (p still uses it). */
+int record_pp_skips_inspect(Compiler *c, int cid) {
+  if (cid < 0 || cid >= c->nclasses) return 0;
+  ClassInfo *ci = &c->classes[cid];
+  if (!(ci->is_struct || ci->is_data) || ci->is_native_class) return 0;
+  int mi = display_method_scope(c, cid, 1, NULL);
+  return mi >= 0 && c->scopes[mi].reachable;
+}
+/* Does a pp print through sp_pp_inspect? It does where the program reopens
+   Array#inspect, or where it calls pp and has a Struct or Data class with
+   its own #inspect (record_pp_skips_inspect). Then the program's own
+   #inspect, #to_s and #message clear sp_pp_printing while they run. */
+int an_calls_named_first(Compiler *c, const char *name);   /* analyze_internal.h */
+int pp_prints_by_rt(Compiler *c) {
+  static Compiler *at; static int ncls = -1, val;
+  if (at == c && ncls == c->nclasses) return val;
+  at = c; ncls = c->nclasses; val = array_user_inspect_mi(c) >= 0;
+  if (!val && an_calls_named_first(c, "pp") >= 0)
+    for (int i = 0; i < c->nclasses && !val; i++) val = record_pp_skips_inspect(c, i);
+  return val;
+}
 /* sp_class_user_to_s / sp_class_user_inspect: a class's own class method
    to_s or inspect (cls_user_display_mi) for the class printed, NULL for any
    other, which prints by its name */
@@ -23853,7 +23967,7 @@ char *codegen_program(const NodeTable *nt) {
      ahead of the proc functions so a proc body may reference them by name. */
   for (int i = 0; i < c->ngvars; i++) {
     LocalVar *lv = &c->gvars[i];
-    if (!is_scalar_ret(lv->type)) continue;
+    if (!is_scalar_ret(lv->type) || cplan_cell_dropped(c, lv)) continue;   /* (a version cell nothing reads) */
     buf_puts(&b, "static ");
     int goint = gvar_is_oint(c, lv);
     if (goint) buf_puts(&b, oint_ctype(lv->type)); else emit_ctype(c, lv->type, &b);
@@ -23927,7 +24041,7 @@ char *codegen_program(const NodeTable *nt) {
     Buf mk; memset(&mk, 0, sizeof mk);
     for (int i = 0; i < c->ngvars; i++) {
       LocalVar *lv = &c->gvars[i];
-      if (!is_scalar_ret(lv->type)) continue;
+      if (!is_scalar_ret(lv->type) || cplan_cell_dropped(c, lv)) continue;
       char name[512]; snprintf(name, sizeof name, "gv_%s", lv->name);
       emit_global_mark_line(c, lv->type, name, &mk);
     }
@@ -24392,6 +24506,9 @@ char *codegen_program(const NodeTable *nt) {
     const char *vmt[4] = { g_procs.p, body->p, b.p, g_pd_defs.p };
     emit_value_methods_helpers(c, vmt, 4, &g_pd_protos, &g_pd_defs);
     emit_class_value_responds_helper(c, vmt, 4, &g_pd_protos, &g_pd_defs);
+    /* (the helpers above may have grown g_pd_defs: its text read again) */
+    const char *smt[4] = { g_procs.p, body->p, b.p, g_pd_defs.p };
+    emit_struct_members_ctors(c, smt, 4, &g_pd_protos, &g_pd_defs);
     emit_obj_to_ary_entry_dispatch(c, &g_pd_protos, &g_pd_defs); }
   if (isa_ext) {
     if (calls_poly_is_a(b.p + isa_ext_at) || calls_poly_is_a(g_procs.p) ||

@@ -15,6 +15,8 @@
 
 int is_zip_name(const char *n);       /* zip: tuple-yielding iteration */
 int is_dig_name(const char *n);       /* dig: a path through containers */
+extern const char *const class_ivar_accessor_fmt[4];   /* the name of each kind of a class ivar accessor, `%s` its ivar */
+int is_class_ivar_accessor_name(const char *n);   /* __spinel_civget_x and its kin */
 int is_call_alias(const char *n);     /* call () []: a Proc/Method's invocation */
 int is_method_invoke(const char *n);  /* call () [] ===: Method invocation */
 int is_bind_call(const char *n);  /* bind_call: an UnboundMethod bound and called in one */
@@ -35,6 +37,7 @@ int is_inspect_name(const char *n);       /* inspect */
 int is_object_class_name(const char *n);   /* Object alone: the top level's constants */
 int is_object_root(const char *n);    /* Object Kernel BasicObject: the classes every object has */
 int is_send_family(const char *n);    /* send __send__ public_send */
+int is_public_send(const char *n);    /* public_send, which enforces visibility */
 int builtin_name_takes_keywords(const char *n);   /* a builtin of the name takes keywords in CRuby (clone, round, lines ...) */
 /* Does a CRuby fact of a method of `feature` hold for this program: a core
    method's (feature NULL) always, a library's (io/console) where the
@@ -132,6 +135,7 @@ int is_catch_name(const char *n); /* catch: a tagged non-local jump target */
 int is_throw_name(const char *n); /* throw: a tagged non-local jump */
 int is_diverging_call(const char *n); /* raise fail throw exit exit! abort: a Kernel call that never returns */
 int is_block_loop_method(const char *n); /* times each upto downto step loop each_with_index: a block run an unbounded number of times */
+int is_block_value_dropped_iter(const char *n); /* the above, each_entry reverse_each each_slice each_cons each_char each_line each_byte each_codepoint each_key each_value each_pair each_with_object: a builtin iterator that answers its receiver, a memo or nil, never its block's value */
 
 int is_each_window(const char *n); /* each_cons each_slice: consecutive or disjoint element windows */
 int is_sum_name(const char *n);
@@ -516,12 +520,14 @@ int builtin_object_method_known(const char *m);   /* one of Object's own methods
 const char *builtin_method_owner(const char *cls, const char *m);   /* the class or module defining builtin cls's m */
 const char *builtin_bool_method_owner(const char *cls, const char *m);   /* ...a true's or false's m, of class cls when known; NULL where it is not known */
 const char *builtin_function_owner(const char *m);   /* the module defining the function a receiverless method(:m) binds */
+extern const char RESPOND_TO_NAME[];   /* "respond_to?", the name a lookup of the calls that ask presence goes by */
 int is_respond_to_name(const char *n); /* respond_to?: does the receiver itself answer a name */
 int is_method_presence_query(const char *n); /* 1: respond_to? *method_defined? (public_)instance_method (public_)method; 2: (public_)instance_methods (public_)methods, answered for the whole program; 3: private_/protected_instance_methods, private_/protected_methods, singleton_methods, answered by the receiver's chain */
 int is_instance_method_list(const char *n); /* (public_|private_|protected_)instance_methods */
 int method_list_vis_mask(const char *n); /* the visibilities a method list shows, 1 << SP_VIS_* each: public and protected for instance_methods, methods, singleton_methods; the prefixed forms one; 0 for no list */
 int is_instance_method_table_read(const char *n); /* is_instance_method_list names, instance_method */
 int is_class_value_reflection(const char *n); /* a listing, const_defined?, class_variable_get/set/defined?: from the receiver's class */
+extern const char SINGLETON_METHODS_NAME[];   /* "singleton_methods", the name a lookup of the class-side lists goes by */
 int is_singleton_method_list(const char *n); /* singleton_methods */
 int builtin_every_object_answers(const char *m, int cmeth); /* Object's own, Kernel's, Object's; with cmeth Module's too */
 int builtin_class_id_answers(int id, const char *m, int cmeth); /* the builtin class of cls_id id, or one above it, has m (cmeth: a class method) */

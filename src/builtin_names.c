@@ -134,7 +134,10 @@ int is_object_root(const char *n) {
 }
 
 int is_send_family(const char *n) {
-  return sp_streq(n, "send") || sp_streq(n, "__send__") || sp_streq(n, "public_send");
+  return sp_streq(n, "send") || sp_streq(n, "__send__") || is_public_send(n);
+}
+int is_public_send(const char *n) {
+  return sp_streq(n, "public_send");
 }
 
 /* The calls whose arguments name a method by a value (a Symbol, a String,
@@ -2026,7 +2029,8 @@ const char *builtin_function_owner(const char *m) {
 
 /* respond_to?: whether the receiver itself answers a name, publicly or
    with include_all any */
-int is_respond_to_name(const char *n) { return n && sp_streq(n, "respond_to?"); }
+const char RESPOND_TO_NAME[] = "respond_to?";
+int is_respond_to_name(const char *n) { return n && sp_streq(n, RESPOND_TO_NAME); }
 /* A question whether a receiver has a method: of one by name (1), or a
    list of its methods: one that answers the whole program (2), or one a
    receiver's own chain decides (3) */
@@ -2039,8 +2043,22 @@ int is_method_presence_query(const char *n) {
     "private_methods", "protected_methods", "singleton_methods", NULL };
   return builtin_name_in(n, by_name) ? 1 : builtin_name_in(n, lists) ? 2 : builtin_name_in(n, chain_lists) ? 3 : 0;
 }
+/* The class methods that read and write a class's instance variable x for code
+   outside its body (desugar_const_ivar_access, desugar_body_ivars): the
+   getter, the setter, `defined?(@x)` and `instance_variable_defined?(:@x)`
+   (the index is the accessor's kind). Compiler-made, no Ruby method. */
+const char *const class_ivar_accessor_fmt[4] = {
+  "__spinel_civget_%s", "__spinel_civset_%s", "__spinel_civdef_%s", "__spinel_civhas_%s" };
+int is_class_ivar_accessor_name(const char *n) {
+  for (int k = 0; n && k < 4; k++) {
+    size_t l = (size_t)(strchr(class_ivar_accessor_fmt[k], '%') - class_ivar_accessor_fmt[k]);
+    if (strncmp(n, class_ivar_accessor_fmt[k], l) == 0) return 1;
+  }
+  return 0;
+}
 /* A list of an object's own singleton methods (a class's, asked of the class) */
-int is_singleton_method_list(const char *n) { return n && sp_streq(n, "singleton_methods"); }
+const char SINGLETON_METHODS_NAME[] = "singleton_methods";
+int is_singleton_method_list(const char *n) { return n && sp_streq(n, SINGLETON_METHODS_NAME); }
 /* A list of a class's instance methods, asked of the class or module itself
    (the others, asked of a class, list its class methods) */
 int is_instance_method_list(const char *n) {
@@ -2231,9 +2249,16 @@ unsigned builtin_name_group_hash(const char *name) {
    must be sure a method exists (must) counts only what CRuby has with no
    library or with a required one at the version CRuby ships. */
 enum { BMT_PUBLIC = 1 << 14 };   /* public in every run that has the name */
+/* (kept while no feature is added: every builtin-table lookup asks it, and
+   the 12 asks of the set were a twentieth of a large program's analysis) */
 static unsigned bmt_loaded(void) {
-  unsigned m = 1;
+  static int seen = -1;
+  static unsigned m;
+  int n = sp_features_required_count();
+  if (n == seen) return m;
+  m = 1;
   for (unsigned i = 0; i < sizeof BMT_LIBS / sizeof *BMT_LIBS; i++) if (sp_feature_required(BMT_LIBS[i])) m |= 2u << i;
+  seen = n;
   return m;
 }
 static int bmt_has(const char *const *names, const unsigned short *flags, int n, const char *m, unsigned must, int pub) {
@@ -2319,14 +2344,23 @@ int builtin_answers_ahead_of(const char *cls, const char *m, const char *root) {
 /* The i-th ancestor of builtin class or module cls in CRuby's lookup order (0: cls itself), counting only those a
    library the program has defines; NULL past the last, and for a name with no table. The walk of a mixin's `super`
    steps through these, asking each for the name it looks up (builtin_owns_instance_method). */
+/* (a walk asks i = 0, 1, ... of one class: the step after the last one
+   answered goes on from its ancestor, not from the first again, which made
+   every walk quadratic in the ancestors) */
+static struct { const BuiltinMethodTable *t; unsigned must; int i, k; } bmt_walk = { NULL, 0, -1, -1 };
 const char *builtin_ancestor_at(const char *cls, int i) {
   const BuiltinMethodTable *t = bmt_find(cls);
   unsigned must = bmt_loaded();
   if (!t || !(t->flags & must)) return NULL;
-  for (int k = 0; k < t->nanc; k++) {
+  int k = 0, j = i;
+  if (bmt_walk.t == t && bmt_walk.must == must && i > bmt_walk.i) k = bmt_walk.k + 1, j = i - bmt_walk.i - 1;
+  for (; k < t->nanc; k++) {
     const BuiltinMethodTable *a = bmt_find(t->ancestors[k]);
     if (!a || !((t->aflags[k] & must) && (a->flags & must))) continue;
-    if (i-- == 0) return t->ancestors[k];
+    if (j-- == 0) {
+      bmt_walk.t = t, bmt_walk.must = must, bmt_walk.i = i, bmt_walk.k = k;
+      return t->ancestors[k];
+    }
   }
   return NULL;
 }
@@ -3161,4 +3195,9 @@ int kernel_private_method(const char *name) {
   SP_KERNEL_PRIVATE(X)
 #undef X
   return 0;
+}
+
+int is_block_value_dropped_iter(const char *n) {
+  return is_block_loop_method(n) || is_each_walk(n) || is_each_window(n) || is_str_each_iter(n) ||
+         is_hash_key_value_each(n) || sp_streq(n, "each_pair") || sp_streq(n, "each_with_object");
 }

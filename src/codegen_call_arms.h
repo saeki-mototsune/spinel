@@ -53,6 +53,7 @@ int emit_call_append_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
 int emit_call_store_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
 int emit_call_array_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
 int emit_array_random_kw(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
+int emit_poly_queue_timeout(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
 int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_handle_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
@@ -158,6 +159,9 @@ int object_private_method_name(const char *qm);
 const char *const *object_private_method_names(void); /* NULL-terminated */
 int respond_to_runtime_reaches(Compiler *c, TyKind rt);
 int root_reopen_defines(Compiler *c, const char *qm);
+/* 1 when the program's reopen of the builtin class or module `cls` (its
+   chain) defines `name` */
+int reopened_owns(Compiler *c, const char *cls, const char *name);
 int bool_side_responds(Compiler *c, const char *qm, int include_all, int foldable, int *ta, int *fa);
 int root_reopen_defines_own(Compiler *c, int k, const char *qm);   /* a root reopening k defines qm itself (def, attr_reader, attr_writer) */
 int root_reopen_method_vis(Compiler *c, int cid, const char *qm);   /* an Object, Kernel or BasicObject reopening's method qm: its visibility, or -1 */
@@ -187,7 +191,8 @@ void ffi_check_buffer_bounds(Compiler *c, int id, int arg, const char *kind, int
 extern int g_setter_value_inner;
 int emit_cmethod_setter_assign(Compiler *c, int id, Buf *b);
 int ctor_alloc_decl(Compiler *c, int cid, Buf *b);
-char *ctor_self_text(Compiler *c, int cid, int t);
+char *ctor_self_text(Compiler *c, int cid, int initm, int t);
+int ctor_new_runs(Compiler *c, int cid, int initm);
 void ctor_arity_add(CtorArityArms *g, int ci, const char *msg);
 void ctor_arity_emit(CtorArityArms *g, Buf *b);
 int ctor_arity_error(Compiler *c, int ci, int initm, int argc, char *msg, size_t n);
@@ -207,15 +212,15 @@ void emit_class_value_new_kw(Compiler *c, int id, int recv, int boxed, Buf *b);
    object's is its class's, so anything else
    switches on -1, no arm's label, and takes the default's NoMethodError. */
 void emit_class_value_new_switch(Compiler *c, int rt2, int kt, int boxed, Buf *b);
-void emit_ctor_arm_case(Compiler *c, int ci, int rt2, int self_t, const char *pre, const char *args, int given, Buf *b);
+void emit_ctor_arm_case(Compiler *c, int ci, int initm, int rt2, int self_t, const char *pre, const char *args, int given, Buf *b);
 void struct_nil_fill_stmts(Compiler *c, int ci, int given, const char *obj, Buf *out);
 void emit_ctor_arm_param(Compiler *c, Scope *is, int j, const ArgLayout *L, const int *atmp, Buf *pdpre, Buf *out);
 void emit_ctor_block_slot(Compiler *c, int id, int initm, const char *lead, Buf *b);
-int emit_ctor_splice_arm(Compiler *c, int id, int ci, int initm, int rt2, Buf *b);
+int emit_ctor_splice_arm(Compiler *c, int id, int ci, int rt2, Buf *b);
 void emit_exc_msg_arg(Compiler *c, int arg, Buf *b);
 void emit_exc_new_msg(Compiler *c, const char *cn, int arg, Buf *b);
-int emit_exc_sub_new_arm(Compiler *c, int ci, int argc, const int *atmp, int rt2, Buf *b);
-int emit_exc_sub_new_arm_splat(Compiler *c, int ci, int tsa, const char *pre, int rt2, Buf *b);
+int emit_exc_sub_new_arm(Compiler *c, int id, int ci, int argc, const int *atmp, int rt2, Buf *b);
+int emit_exc_sub_new_arm_splat(Compiler *c, int id, int ci, int tsa, const char *pre, int rt2, Buf *b);
 int emit_syserr_family_new(Compiler *c, int id, const char *cn, int argc, const int *argv, Buf *b);
 int emit_user_new_arm(Compiler *c, int id, int ci, int argc, const int *atmp, int hoisted, int rt2, Buf *b);
 extern int g_ctor_blk_tmp;

@@ -5101,6 +5101,9 @@ infer-test: $(SPINEL) $(SP_RT_LIB)
 	grep -Eq 'sp_IntArray \* *lv_row ' "$$tmp/mtr.c" || { echo "infer-test: FAIL (a row read out of a mapped table stayed boxed)"; ok=0; }; \
 	grep -Eq 'sp_PolyArray \* *lv_rows' "$$tmp/mtr.c" || { echo "infer-test: FAIL (a table mapped from a HASH must stay boxed -- its emitter cannot build a pointer array, and narrowing it stops the program running)"; grep -oE 'sp_[A-Za-z]+Array \* *lv_rows' "$$tmp/mtr.c" | head -1; ok=0; }; \
 	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_mul\(sp_o?int [A-Za-z_]+, sp_o?int [A-Za-z_]+\)' "$$tmp/mtr.c" || { echo "infer-test: FAIL (a helper reading an element of a mapped table bound a boxed parameter)"; grep -E 'sp_F_s_mul\(' "$$tmp/mtr.c" | head -1; ok=0; }; \
+	$(SPINEL) test/map_object_block_narrows.rb -c --no-line-map -o "$$tmp/mob.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile map_object_block_narrows)"; exit 1; }; \
+	grep -Eq 'sp_PtrArray \* *lv_a = NULL;' "$$tmp/mob.c" && grep -Eq 'sp_PtrArray \* *iv_cells;' "$$tmp/mob.c" || { echo "infer-test: FAIL (a map whose block answers one class built a boxed Array)"; ok=0; }; \
+	for f in nexts mixed boxed from_hash; do grep -Eq "^static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_PolyArray \* sp_$$f\(" "$$tmp/mob.c" || { echo "infer-test: FAIL (a map with a next, two classes, a boxed tail or a Hash receiver narrowed: $$f)"; ok=0; }; done; \
 	$(SPINEL) test/nested_table_iter.rb -c --no-line-map -o "$$tmp/nti.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile nested_table_iter)"; exit 1; }; \
 	grep -Eq 'sp_mul\(sp_PtrArray \* *lv_a, sp_PtrArray \* *lv_b\)' "$$tmp/nti.c" || { echo "infer-test: FAIL (a nested table passed as a method argument stayed boxed)"; grep -E 'sp_mul\(' "$$tmp/nti.c" | head -1; ok=0; }; \
 	grep -Eq 'sp_FloatArray \* *lv_bj' "$$tmp/nti.c" || { echo "infer-test: FAIL (each_with_index on that argument did not yield a float row)"; ok=0; }; \
@@ -5941,6 +5944,14 @@ COND_DEFS_LIMIT ?= 2.2
 # def, reads 7.0x to 7.4x). A time ratio moves with the machine's load; only a
 # rise past the limit is a finding.
 COND_DEFS_CPU_LIMIT ?= 9.0
+# A Base with N subclasses and 200 methods calling two methods on one of
+# them, at N=400 and N=800 (test/scale/face_landings.sh), by the CPU time of
+# the pre-fixpoint phase (the best of three): the face each class a call may
+# land on asks (ct_face_for) did lookups the count does not see, Object's
+# method_missing and the top-level methods, once per class (3.1x; 2.1x
+# without). A time ratio moves with the machine's load; only a rise past the
+# limit is a finding.
+FACE_LANDINGS_LIMIT ?= 2.6
 # N nested classes, each of a leaf name of its own (test/scale/class_qualification.sh),
 # and ten calls per class, at N=400 and N=800: the work of the nested program
 # less the work of the same program with the classes at the top level, which
@@ -6168,6 +6179,13 @@ scale-test: $(SPINEL_WORK)
 	gen cond_defs 800 q8.rb; gen cond_defs 3200 q32.rb; \
 	qta=$$(cpu q8.rb) || { rm -rf "$$tmp"; exit 1; }; \
 	qtb=$$(cpu q32.rb) || { rm -rf "$$tmp"; exit 1; }; \
+	phase () { b=; for i in 1 2 3; do \
+	  t=$$(SP_TIMING=1 $(SPINEL_WORK) -c -o "$$tmp/fl.c" "$$tmp/$$1" 2>&1 | sed -n "s/^spinel-timing: phase=$$2 ms=//p" | head -1); \
+	  [ -n "$$t" ] || { echo "scale-test: FAIL (spinel-work timed no $$2 on $$1)" >&2; return 1; }; \
+	  b=$$(awk -v b="$$b" -v t="$$t" 'BEGIN { print (b == "" || t < b) ? t : b }'); done; echo "$$b"; }; \
+	gen face_landings 400 fl4.rb; gen face_landings 800 fl8.rb; \
+	fla=$$(phase fl4.rb an_pre_fixpoint) || { rm -rf "$$tmp"; exit 1; }; \
+	flb=$$(phase fl8.rb an_pre_fixpoint) || { rm -rf "$$tmp"; exit 1; }; \
 	rm -rf "$$tmp"; \
 	if [ -z "$$wa" ] || [ -z "$$wb" ] || [ -z "$$fa" ] || [ -z "$$fb" ] || [ -z "$$pa" ] || [ -z "$$pb" ] || \
 	   [ -z "$$ha" ] || [ -z "$$hb" ] || [ -z "$$ca" ] || [ -z "$$cb" ] || [ -z "$$sa" ] || [ -z "$$sb" ] || \
@@ -6262,7 +6280,10 @@ scale-test: $(SPINEL_WORK)
 	  { [ $$? -eq 2 ] || echo "scale-test: FAIL (the mixins grew superlinearly: a walk of the program per mixin statement, see erm_declared_as, or the load record's cells rewritten per copy, see elab_hold)"; exit 1; }; \
 	awk -v a="$$qta" -v b="$$qtb" -v lim="$(COND_DEFS_CPU_LIMIT)" 'BEGIN { if (a <= 0) a = 0.01; r = b / a; \
 	  printf "scale-test: open method history CPU time at 4x the histories is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
-	  { echo "scale-test: FAIL (the open histories' asks or makes did work the count does not see once per history, such as a whole-program map: see ver_entries_build)"; exit 1; }
+	  { echo "scale-test: FAIL (the open histories' asks or makes did work the count does not see once per history, such as a whole-program map: see ver_entries_build)"; exit 1; }; \
+	awk -v a="$$fla" -v b="$$flb" -v lim="$(FACE_LANDINGS_LIMIT)" 'BEGIN { if (a <= 0) a = 0.01; r = b / a; \
+	  printf "scale-test: visibility face CPU time at 2x the landing classes is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
+	  { echo "scale-test: FAIL (each class a call may land on asked lookups that answer the same for every class: see ct_face_for)"; exit 1; }
 
 .PHONY: bisect-test
 # `spinel bisect`, end to end. The search has its own corpus test

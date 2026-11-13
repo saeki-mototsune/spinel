@@ -957,7 +957,7 @@ extern TyKind g_result_ty;
 extern const char *g_method_pr_label;
 extern const char *g_method_pr_var;
 extern const char *g_proc_return_home;
-int cmethod_takes_self_cls(Compiler *c, int si);
+int cmethod_takes_self_cls(Compiler *c, const Scope *s);
 const char *emit_cmethod_self_cls_arg(Compiler *c, int mi, int recv_cls, Buf *b);
 int emit_class_cmethod_eqq(Compiler *c, int ci, const char *subj, TyKind pt, int node, int boxed, Buf *b);
 const char *cmethod_cls_token(Compiler *c, Scope *encl);
@@ -1481,6 +1481,9 @@ int head_held_box(Compiler *c, int node);
    it (an immediate, a pointer the head's temp roots), the box is declared
    without a root of its own. Answers the temp the arm reads. */
 int hold_operand(Compiler *c, int node, TyKind ty, int boxed, int t, int root, const char *sep, Buf *b);
+/* `recv.equal?(arg)` as the builtin identity, whatever the program
+   defines: both operands boxed, the receiver first, sp_poly_equal */
+void emit_value_identity(Compiler *c, int recv, int arg, Buf *b);
 /* The hold of String `node` that a slot or a container keeps, as its
    handle: `sp_String *_t<t> = SP_STR_HDL(<handle>);` and, when `root`, its
    root, into b. The bytes are taken where the hold is read (SP_STR_B), so
@@ -1554,6 +1557,13 @@ void emit_str_append_arg(Compiler *c, int arg, const char *rtext, Buf *b);
 /* ...for a consumer that takes every argument before it appends any: a
    String argument is read as a copy (emit_str_expr_own). */
 void emit_str_append_arg_own(Compiler *c, int arg, const char *rtext, Buf *b);
+/* Is argument `arg` of an append of `argc` that takes every argument before
+   it appends any (concat, append_as_bytes) staged as a copy? One of several
+   is, since its String may be the receiver the first append grows, or one a
+   later argument changes. A new String no name holds yet (share_value_fresh:
+   a literal, `x + y`, a method answering its own local's String) is neither,
+   and is staged as it is. */
+int str_append_arg_staged_own(Compiler *c, int argc, int arg);
 void emit_str_force_encoding(Compiler *c, const char *name, const char *r, const int *argv, int argc, Buf *b);
 int rest_shortfall_required(Compiler *c, Scope *m);
 /* Emit a hash key, unboxing a poly value to the typed-hash's key type. */
@@ -1746,9 +1756,14 @@ int emit_regex_pat_to_buf(Compiler *c, int nid, Buf *b);
 int nameset_has(NameSet *s, const char *nm);
 /* the program's own Array#inspect (a reopened Array), or -1 (codegen.c) */
 int array_user_inspect_mi(Compiler *c);
-/* a pp where the program reopens Array#inspect: printed through
-   sp_pp_inspect (codegen_stmt.c) */
-int pp_leaves_array_inspect(Compiler *c, const char *name);
+/* does pp print a record of class cid by its layout, not by the class's
+   own #inspect; does a pp print through sp_pp_inspect (codegen.c) */
+int record_pp_skips_inspect(Compiler *c, int cid);
+int pp_prints_by_rt(Compiler *c);
+/* does sp_obj_inspect_sw call class cid's own #inspect (codegen.c) */
+int obj_arm_calls_own_inspect(Compiler *c, int cid);
+/* a pp that prints through sp_pp_inspect (codegen_stmt.c) */
+int pp_leaves_own_inspect(Compiler *c, const char *name);
 void emit_param_cell_publish(Compiler *c, int blk, const char *pname, Buf *b, int indent);
 void nameset_add(NameSet *s, const char *nm);
 /* Emit the C lvalue for local `name` in the current emission context: a
@@ -2278,7 +2293,11 @@ int each_split_applies(Compiler *c, int id);
    Hash, Range, String Range or Enumerator (codegen_poly_plan.c) */
 void emit_penum_kind_test(Buf *b, int tv);
 void emit_obj_alloc_expr(Compiler *c, int cid, Buf *b);
+void emit_struct_members_ctor_name(Compiler *c, int cid, Buf *b);
 void emit_pool_fwd(Compiler *c, int cid);
+/* a body written to g_procs ahead of the constructors begins and ends (emit_pool_fwd) */
+void ahead_body_enter(Compiler *c);
+void ahead_body_leave(Compiler *c);
 void emit_own_class_alloc(Compiler *c, int id, int base, Buf *b);
 void emit_arg_or_default(Compiler *c, Scope *m, int idx, int provided, Buf *out);
 int declare_default_locals(Compiler *c, Scope *m, int dnode);
@@ -2740,8 +2759,14 @@ int view_mark(void);
    class every value of a builtin arm is (String's pre-arm), NULL where the
    arm takes any builtin's value: the class whose lookup decides whether
    the arm's call reaches the program's Object method
-   (cplan_arm_object_target). */
-typedef struct { int pd_skip, prbd_skip, builtin_arm, send_split, each_inline, each_dispatch, gap_watch; int *gap_hit; const char *arm_cls; } ArmCtx;
+   (cplan_arm_object_target). dsend names the innermost dynamic send being
+   emitted (emit_dynamic_send), a frame on its caller's stack that links the
+   ones it is emitted inside of: an arm that reaches a yielding method
+   expands its body, which may hold the same send, and the send is not
+   emitted again inside its own arms. */
+typedef struct DsendFrame { int id, depth; const struct DsendFrame *up; } DsendFrame;
+typedef struct { int pd_skip, prbd_skip, builtin_arm, send_split, each_inline, each_dispatch, gap_watch; int *gap_hit; const char *arm_cls;
+                 const DsendFrame *dsend; } ArmCtx;
 extern ArmCtx g_arm;
 #define g_pd_skip (g_arm.pd_skip)
 #define g_prbd_skip (g_arm.prbd_skip)
@@ -2749,6 +2774,8 @@ extern ArmCtx g_arm;
 int view_push_arm(int pd_skip, int prbd_skip, int builtin_arm);
 /* the arm context with call id's gap watched into *hit (ArmCtx.gap_watch), popped by view_pop */
 int view_push_gap_watch(int id, int *hit);
+/* the arm context with frame f the innermost dynamic send (ArmCtx.dsend), popped by view_pop */
+int view_push_dsend(const DsendFrame *f);
 /* A node pinned to one face kind for the inference asked under it,
    pushed and popped like a view (view_pop) and put back by view_unwind
    (face_of, analyze.h). */
@@ -3034,6 +3061,8 @@ int emit_object_ivar_call(Compiler *c, int id, const char *name, int recv, TyKin
 const char *case_map_suffix(Compiler *c, int argc, const int *argv);
 int emit_op_poly_case_options(Compiler *c, const BopCtx *x, Buf *b);
 int user_defines_or_reads(Compiler *c, const char *name);
+/* does an instance method of that name call super? (codegen_call.c) */
+int user_defines_calls_super(Compiler *c, const char *name);
 int splat_mutator_block_ok(Compiler *c, int id);
 int poly_cls_value_owns(Compiler *c, int id, const char *name);
 int base_arg_may_gc(Compiler *c, int arg);

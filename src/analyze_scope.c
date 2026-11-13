@@ -5,6 +5,7 @@
 #include "share.h"
 #include "value_pos.h"
 #include "holder.h"
+#include "method_table_check.h"
 #include <stdint.h>
 #include <ctype.h>
 #include <stdio.h>
@@ -255,7 +256,7 @@ static int new_site_reaches(Compiler *c, int id, int init) {
   if (rk != NK_ConstantReadNode && rk != NK_ConstantPathNode)
     return 0;
   int cid = const_node_class_index(c, recv);
-  return cid >= 0 && comp_method_in_chain(c, cid, "initialize", NULL) == init;
+  return cid >= 0 && cplan_new_initialize(c, id, cid, NULL) == init;
 }
 
 /* `def initialize(...)` is reached through `Klass.new(...)`, never a call named
@@ -1404,28 +1405,56 @@ void refuse_native_singleton_reopen(Compiler *c, Scope *s) {
   refuse_native_class_reopen(c, s->def_node, recv, ci, encl >= 0 && block_body_class(c->nt, encl), nt_str(c->nt, recv, "name"));
 }
 
-/* Whether the program defines or aliases a define_method of its own (a def,
-   a singleton def, `alias` or `alias_method`), whose call with a computed name
-   is then an ordinary call. Asked once per compile: the first computed-name
-   call scans the node table and the answer is kept on the Compiler. */
-int an_user_define_method(Compiler *c) {
-  if (c->user_define_method) return c->user_define_method == 2;
+/* Where the program defines or aliases a define_method of its own (a def,
+   a singleton def, `alias` or `alias_method`), whose call with a computed
+   name is then an ordinary call: the UDM_ kinds, by the self a receiverless
+   define_method could reach it from. A `def self.define_method`, one in a
+   `class << self`, or one in a reopened Module or Class answers the self
+   of a class body or a class method (UDM_CLASS_SELF); one in an ordinary
+   class's body answers an instance of that class, the self of its instance
+   methods (UDM_INSTANCE_SELF); a module's (extended or included), a
+   reopened Object's or BasicObject's, a top-level def's (Object's private
+   method) and an alias answer either (UDM_ANY_SELF). Asked once per
+   compile: the first computed-name call scans the node table and the
+   kinds are kept on the Compiler. */
+int an_user_define_method_kinds(Compiler *c) {
+  if (c->user_define_method) return c->user_define_method - 1;
   const NodeTable *nt = c->nt;
-  int found = 0;
-  NT_FOREACH_KIND(nt, NK_DefNode, d)
-    if (is_define_method_name(nt_str(nt, d, "name"))) found = 1;
+  int kinds = 0, *par = NULL;
+  NT_FOREACH_KIND(nt, NK_DefNode, d) {
+    if (!is_define_method_name(nt_str(nt, d, "name"))) continue;
+    if (nt_ref(nt, d, "receiver") >= 0) { kinds |= UDM_CLASS_SELF; continue; }
+    if (!par) par = an_parent_map(nt);
+    int h = par[d];
+    while (h >= 0 && nt_kind(nt, h) != NK_ClassNode && nt_kind(nt, h) != NK_ModuleNode &&
+           nt_kind(nt, h) != NK_SingletonClassNode) h = par[h];
+    const char *k = h >= 0 && nt_kind(nt, h) == NK_ClassNode ? const_key_at(c, nt_ref(nt, h, "constant_path")) : NULL;
+    if (h < 0 || nt_kind(nt, h) == NK_ModuleNode) kinds |= UDM_ANY_SELF;
+    else if (nt_kind(nt, h) == NK_SingletonClassNode) kinds |= UDM_CLASS_SELF;
+    else if (k && (sp_streq(k, "Module") || sp_streq(k, "Class"))) kinds |= UDM_CLASS_SELF;
+    else if (k && (sp_streq(k, "Object") || sp_streq(k, "BasicObject"))) kinds |= UDM_ANY_SELF;
+    else kinds |= UDM_INSTANCE_SELF;
+  }
+  free(par);
   NT_FOREACH_KIND(nt, NK_AliasMethodNode, a) {
     int nn = nt_ref(nt, a, "new_name");
-    if (nn >= 0 && is_define_method_name(nt_str(nt, nn, "value"))) found = 1;
+    if (nn >= 0 && is_define_method_name(nt_str(nt, nn, "value"))) kinds |= UDM_ANY_SELF;
   }
   NT_FOREACH_KIND(nt, NK_CallNode, k) {
     int an = nt_ref(nt, k, "arguments"), ac = 0;
     const int *av = an >= 0 ? nt_arr(nt, an, "arguments", &ac) : NULL;
     if (ac > 0 && is_alias_method_name(nt_str(nt, k, "name")) &&
-        is_define_method_name(nt_str(nt, av[0], "value"))) found = 1;
+        is_define_method_name(nt_str(nt, av[0], "value"))) kinds |= UDM_ANY_SELF;
   }
-  c->user_define_method = found ? 2 : 1;
-  return found;
+  c->user_define_method = kinds + 1;
+  return kinds;
+}
+int an_user_define_method(Compiler *c) { return an_user_define_method_kinds(c) != 0; }
+/* ...one that a receiverless define_method whose self is a class (class_self:
+   a class body's or a class method's) or an instance could reach */
+int an_user_define_method_reaches(Compiler *c, int class_self) {
+  int kinds = an_user_define_method_kinds(c);
+  return (kinds & UDM_ANY_SELF) || (kinds & (class_self ? UDM_CLASS_SELF : UDM_INSTANCE_SELF));
 }
 
 /* Does nothing in the program name the method `name`: no call of it, and no
@@ -1946,7 +1975,7 @@ static void walk_scope_in(Compiler *c, int id, WalkCtx w) {
          rule) */
       if (ac == 2 && bx == -2 && scope_idx == 0 && nt_kind(c->nt, av[1]) == NK_LocalVariableReadNode) proc_ref = 1;
       if (ac > 0 && (proc_ref || (nt_kind(c->nt, av[0]) != NK_SymbolNode && nt_kind(c->nt, av[0]) != NK_StringNode)) &&
-          !an_user_define_method(c)) {
+          !an_user_define_method_reaches(c, scope_idx == 0 || c->scopes[scope_idx].is_cmethod)) {
         NodeTable *nt = (NodeTable *)c->nt;
         int ds = detached_scope(c);
         file_detached(c, nt_ref(nt, id, "block"), ds, 0);
@@ -2424,6 +2453,12 @@ void register_locals(Compiler *c) {
     if (k == NK_InstanceVariableWriteNode ||
         k == NK_InstanceVariableReadNode ||
         k == NK_InstanceVariableOperatorWriteNode ||
+        /* `@x ||= v` always writes on its first run (the ivar starts nil),
+           so it defines the ivar as a plain write does: `@c ||= nil` alone
+           left the class no slot, and instance_variables, inspect and
+           instance_variable_defined? never saw @c. (`@x &&= v` writes only
+           a truthy ivar, which some other write made.) */
+        k == NK_InstanceVariableOrWriteNode ||
         /* the multi-assign target form (`@a, @b = ...`) also defines the ivar,
            so it must be interned for the struct field (#3273). */
         k == NK_InstanceVariableTargetNode) {
@@ -2927,6 +2962,124 @@ static int rsl_frozen_literal(const NodeTable *nt, int v) {
   return mn && sp_streq(mn, "freeze") && nt_ref(nt, v, "arguments") < 0 && r >= 0 &&
          nt_kind(nt, r) == NK_ArrayNode && !rsl_own_method(nt, "Array", "freeze");
 }
+/* The program's own Hash method of the name, or one of Object's or
+   Kernel's, answers in place of the builtin's */
+static int rsl_no_own_hash_method(const NodeTable *nt, const char *m) {
+  return !rsl_own_method(nt, "Hash", m) && !rsl_own_method(nt, "Object", m) && !rsl_own_method(nt, "Kernel", m);
+}
+/* Does read r of a literal Hash constant leave the Hash as it is? A call on
+   it that only reads it (keys, size, key?, ...), one that answers a value
+   of it (`[]`, fetch, dig, values), or a `**` of it. With values, the
+   values the read answers must be lists it keeps (rsl_read_keeps_list: a splat, a transform the resolver
+   reads), so the symbol lists it holds stay as written too. A `[]` or
+   fetch of a symbol key whose value in literal h is a scalar (a number, a
+   symbol, nil, true, false) answers a value nothing can change in place. */
+static int rsl_scalar_at(const NodeTable *nt, int h, int p) {
+  int args = nt_ref(nt, p, "arguments"), an = 0;
+  const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &an) : NULL;
+  const char *want = an == 1 && nt_kind(nt, av[0]) == NK_SymbolNode ? nt_str(nt, av[0], "value") : NULL;
+  int hn = 0, val = -1;
+  const int *els = want ? nt_arr(nt, h, "elements", &hn) : NULL;
+  for (int e = 0; e < hn; e++) {
+    int key = nt_ref(nt, els[e], "key");
+    const char *kn = key >= 0 && nt_kind(nt, key) == NK_SymbolNode ? nt_str(nt, key, "value") : NULL;
+    if (!kn) return 0;
+    if (sp_streq(kn, want)) val = nt_ref(nt, els[e], "value");
+  }
+  NodeKind vk = val >= 0 ? nt_kind(nt, val) : NK_NilNode;
+  return val >= 0 && (vk == NK_IntegerNode || vk == NK_FloatNode || vk == NK_SymbolNode || vk == NK_NilNode ||
+                      vk == NK_TrueNode || vk == NK_FalseNode);
+}
+static int rsl_read_keeps_hash(Compiler *c, const int *par, int r, int h, int values) {
+  const NodeTable *nt = c->nt;
+  int p = par[r];
+  /* (`**OPTS` copies the pairs into a new Hash) */
+  if (!values && p >= 0 && nt_kind(nt, p) == NK_AssocSplatNode) return 1;
+  if (p < 0 || nt_kind(nt, p) != NK_CallNode || nt_ref(nt, p, "receiver") != r || nt_ref(nt, p, "block") >= 0) return 0;
+  const char *m = nt_str(nt, p, "name");
+  static const char *const READ[] = { "keys", "size", "length", "empty?", "key?", "has_key?", "include?", "member?", NULL };
+  static const char *const VALUE[] = { "[]", "fetch", "dig", "values", NULL };
+  if (!m || !rsl_no_own_hash_method(nt, m)) return 0;
+  for (int i = 0; READ[i]; i++) if (sp_streq(m, READ[i])) return 1;
+  if ((sp_streq(m, "[]") || sp_streq(m, "fetch")) && rsl_scalar_at(nt, h, p)) return 1;
+  for (int i = 0; VALUE[i]; i++) if (sp_streq(m, VALUE[i])) return !values || rsl_read_keeps_list(c, par, p);
+  return 0;
+}
+/* The literal Hash (a HashNode) that node stands for: the literal, its
+   `.freeze`, or a constant the program writes once with one, whose every
+   read leaves it as written (rsl_read_keeps_hash, with values: the lists
+   it holds as well; `X::OPTS` reaches it by another node kind). -1 for
+   anything else, or a literal with a `**`. */
+static int rsl_hash_literal(Compiler *c, int node, int depth, int values) {
+  const NodeTable *nt = c->nt;
+  if (node < 0 || depth > 8) return -1;
+  NodeKind k = nt_kind(nt, node);
+  if (k == NK_HashNode) {
+    int en = 0; const int *els = nt_arr(nt, node, "elements", &en);
+    for (int e = 0; e < en; e++) if (nt_kind(nt, els[e]) != NK_AssocNode) return -1;
+    return node;
+  }
+  if (k == NK_CallNode) {
+    const char *mn = nt_str(nt, node, "name");
+    if (!mn || !sp_streq(mn, "freeze") || nt_ref(nt, node, "arguments") >= 0 || nt_ref(nt, node, "block") >= 0 ||
+        !rsl_no_own_hash_method(nt, "freeze")) return -1;
+    return rsl_hash_literal(c, nt_ref(nt, node, "receiver"), depth + 1, values);
+  }
+  if (k != NK_ConstantReadNode && k != NK_ConstantPathNode) return -1;
+  const char *cn = nt_str(nt, node, "name");
+  int src = -1, wnode = -1;
+  for (int w = 0; cn && w < nt->count; w++) {
+    NodeKind wk = nt_kind(nt, w);
+    if (wk != NK_ConstantWriteNode && wk != NK_ConstantOperatorWriteNode && wk != NK_ConstantOrWriteNode &&
+        wk != NK_ConstantAndWriteNode && wk != NK_ConstantTargetNode) continue;
+    const char *wn = nt_str(nt, w, "name");
+    if (!wn || !sp_streq(wn, cn)) continue;
+    if (src >= 0 || wk != NK_ConstantWriteNode) return -1;
+    src = nt_ref(nt, w, "value");
+    wnode = w;
+  }
+  if (src < 0) return -1;
+  const int *par = comp_parent_map(c);
+  /* `Lock::DEFAULTS` (#11729): the one write of the name stands in the body
+     of a class or module the path's parent names by its last name, or at a
+     file's top level for `::DEFAULTS`; a path to another namespace is not
+     read (CRuby answers it with a NameError, or with an ancestor's) */
+  if (k == NK_ConstantPathNode) {
+    int pp = nt_ref(nt, node, "parent"), owner = -1;
+    for (int a = par[wnode]; a >= 0 && owner < 0; a = par[a])
+      if (nt_kind(nt, a) == NK_ClassNode || nt_kind(nt, a) == NK_ModuleNode) owner = a;
+      else if (nt_kind(nt, a) == NK_DefNode || nt_kind(nt, a) == NK_BlockNode || nt_kind(nt, a) == NK_SingletonClassNode) return -1;
+    if (pp < 0) { if (owner >= 0) return -1; }
+    else {
+      /* the class the path's parent names where the read runs, as the load
+         record resolves the reference (elab_class_ref_at: none for a name
+         written only later), is the one the write's body opened
+         (elab_header_class): `Outer::Lock::DEFAULTS` does not read a
+         top-level Lock's, whatever the last names are */
+      NodeKind pk = nt_kind(nt, pp);
+      int core = -1;
+      int pc = pk == NK_ConstantReadNode || pk == NK_ConstantPathNode ? elab_class_ref_at(c, pp, &core) : -1;
+      if (core >= 0) pc = -1;
+      int oc = owner >= 0 ? elab_header_class(c, owner, NULL, NULL) : -1;
+      if (pc < 0 || oc < 0 || pc != oc) return -1;
+    }
+  }
+  int h = rsl_hash_literal(c, src, depth + 1, values);
+  /* every read of it, bare or by a path (a path that is a write's target,
+     `Lock::DEFAULTS = ...`, is no read that keeps it) */
+  static const NodeKind READS[] = { NK_ConstantReadNode, NK_ConstantPathNode };
+  for (int ri = 0; h >= 0 && ri < 2; ri++)
+    NT_FOREACH_KIND(nt, READS[ri], r) {
+      const char *rn = nt_str(nt, r, "name");
+      if (!rn || !sp_streq(rn, cn)) continue;
+      /* (the parent of a path read, `Outer::Lock` in `Outer::Lock::X`, is a
+         read of another constant) */
+      if (ri == 0 && par[r] >= 0 && nt_kind(nt, par[r]) == NK_ConstantPathNode && nt_ref(nt, par[r], "parent") == r) continue;
+      if (ri == 1 && par[r] >= 0 && nt_kind(nt, par[r]) == NK_ConstantPathNode && nt_ref(nt, par[r], "parent") == r) continue;
+      if (!rsl_read_keeps_hash(c, par, r, h, values)) return -1;
+    }
+  return h;
+}
 int resolve_symbol_list(Compiler *c, int node, const char **out, int cap, int depth) {
   const NodeTable *nt = c->nt;
   if (node < 0 || depth > 8) return -1;
@@ -3023,6 +3176,38 @@ int resolve_symbol_list(Compiler *c, int node, const char **out, int cap, int de
       int n = resolve_symbol_list(c, recv, out, cap, depth + 1);
       rsl_strings = was;
       return n;
+    }
+    /* `*OPTS.keys` and `*OPTS[:name]` of a literal Hash (#11711): its
+       symbol keys, in order, or the symbol list one symbol key holds */
+    if ((sp_streq(mn, "keys") && an == 0) || (sp_streq(mn, "[]") && an == 1)) {
+      int h = nt_ref(nt, node, "block") < 0 && rsl_no_own_hash_method(nt, mn) ? rsl_hash_literal(c, recv, depth + 1, an == 1) : -1;
+      if (h >= 0) {
+        int hn = 0; const int *els = nt_arr(nt, h, "elements", &hn);
+        if (an == 0) {
+          int w = 0;
+          for (int e = 0; e < hn; e++) {
+            int key = nt_ref(nt, els[e], "key");
+            const char *kn = key >= 0 && nt_kind(nt, key) == NK_SymbolNode ? nt_str(nt, key, "value") : NULL;
+            if (!kn) return -1;
+            int dup = 0;
+            for (int j = 0; j < w; j++) if (sp_streq(out[j], kn)) { dup = 1; break; }
+            if (dup) continue;
+            if (w >= cap) return -1;
+            out[w++] = kn;
+          }
+          return w;
+        }
+        const int *av = nt_arr(nt, args, "arguments", &an);
+        const char *want = nt_kind(nt, av[0]) == NK_SymbolNode ? nt_str(nt, av[0], "value") : NULL;
+        int val = -1;
+        for (int e = 0; want && e < hn; e++) {
+          int key = nt_ref(nt, els[e], "key");
+          const char *kn = key >= 0 && nt_kind(nt, key) == NK_SymbolNode ? nt_str(nt, key, "value") : NULL;
+          if (!kn) return -1;   /* (a key of another kind may equal it) */
+          if (sp_streq(kn, want)) val = nt_ref(nt, els[e], "value");   /* the last one wins */
+        }
+        return val >= 0 ? resolve_symbol_list(c, val, out, cap, depth + 1) : -1;
+      }
     }
     int n = resolve_symbol_list(c, recv, out, cap, depth + 1);
     if (n < 0) return -1;
@@ -3352,11 +3537,12 @@ static int sg_block_handoff(const NodeTable *nt, int n, const char *blk) {
   return rn && sp_streq(rn, blk);
 }
 
-/* Does class `ci`'s initialize hand its block the new object, and nothing
-   else: every hand-off in it passes `self` first? */
-static int sg_initialize_yields_self(Compiler *c, int ci) {
+/* Does the initialize of class `ci` a `new` (call id) runs there hand its
+   block the new object, and nothing else: every hand-off in it passes
+   `self` first? */
+static int sg_initialize_yields_self(Compiler *c, int id, int ci) {
   const NodeTable *nt = c->nt;
-  int mi = comp_method_in_chain(c, ci, "initialize", NULL);
+  int mi = cplan_new_initialize(c, id, ci, NULL);
   if (mi < 0 || c->scopes[mi].body < 0) return 0;
   const char *blk = c->scopes[mi].blk_param;
   if (blk && !blk[0]) blk = NULL;
@@ -3411,7 +3597,7 @@ static int sg_block_param_new(Compiler *c, int id, const char *name, int *out_ci
     if (nt_kind(nt, n) == NK_CallNode && nt_ref(nt, n, "block") == blk) { call = n; break; }
   if (call < 0) return -1;
   int ci = sg_new_class_ci(c, call);
-  if (ci < 0 || !sg_initialize_yields_self(c, ci)) return -1;
+  if (ci < 0 || !sg_initialize_yields_self(c, call, ci)) return -1;
   *out_ci = ci;
   return call;
 }
@@ -4962,10 +5148,8 @@ static void mf_copy_arms(Compiler *c, int cls, int disp, int at, int own) {
    under that name, else the module function the name stood for (an alias
    of one is a singleton alias of it) or a copy of the method it stood for.
    A define_method under the bare word gets a copy too, and its instance
-   method stays one: a module function's one scope is reached from an
-   includer by a bare call only (desugar_module_function_call), and the
-   method is the includer's to send. A copy under a run-time condition is
-   taken as made, as the tree reading took it. The arms of a conditional
+   method stays one: the method is the includer's to send. A copy under
+   a run-time condition is taken as made, as the tree reading took it. The arms of a conditional
    def (`m#__cond1`, ...) are not taken from the record: a copy of the
    dispatcher gives the module its arms (mf_copy_arms), and so does a
    bare module_function over an if/else chain every branch of which
@@ -7882,70 +8066,18 @@ static int scope_body_has_super(Compiler *c, int scope_idx) {
 static int inc_super_reached(Compiler *c, int mi, int cls, const char *name) {
   return scope_body_has_super(c, mi) || elab_history_absent(c, cls, 0, name);
 }
-
-/* True when the scope body reads or writes an instance variable. A module
-   instance method that touches an ivar must be re-attributed (cloned) to the
-   includer so the ivar types against the includer's slot, not a separate
-   module-owned slot: a module cannot be instantiated, so in CRuby its methods
-   always run on the includer's instance and there is a single ivar. With a
-   shared body the module slot (typed only from module-side usage) and the
-   includer slot diverge, and the transplanted method -- emitted taking the
-   includer as self -- reads self's includer-typed ivar through the module type. */
-static int scope_body_uses_ivar(Compiler *c, int scope_idx) {
-  const NodeTable *nt = c->nt;
-  for (int id = 0; id < nt->count; id++) {
-    if (c->nscope[id] != scope_idx) continue;
-    NodeKind k = nt_kind(nt, id);
-    if (k == NK_InstanceVariableReadNode ||
-        k == NK_InstanceVariableWriteNode ||
-        k == NK_InstanceVariableOperatorWriteNode ||
-        k == NK_InstanceVariableOrWriteNode ||
-        k == NK_InstanceVariableAndWriteNode ||
-        k == NK_InstanceVariableTargetNode)
-      return 1;
-  }
-  return 0;
-}
-
-/* A `module_function` method is registered class-level (is_cmethod), so the
-   include transplant below skipped it and a receiverless call to it was
-   rewritten onto the module (`Rt.peek`). That is sound only for a body that
-   does not depend on its receiver, and the rewrite's comment claimed exactly
-   that -- wrongly. Through an includer CRuby runs such a method on the
-   INSTANCE: `@x` is the instance's ivar, `self` is the instance, and a
-   receiverless sibling call dispatches on the instance's class, where the
-   includer may override it. Spinel gave the module's own storage (a
-   `civ_<Mod>_<name>` global), the Module object, and the module's sibling.
-
-   Which bodies care: an ivar, a self, or a receiverless call. A body with none
-   of those runs the same either way and keeps the single shared copy. */
-static int module_function_self_dependent(Compiler *c, int scope_idx) {
-  const NodeTable *nt = c->nt;
-  if (scope_body_uses_ivar(c, scope_idx)) return 1;
-  for (int id = 0; id < nt->count; id++) {
-    if (c->nscope[id] != scope_idx) continue;
-    NodeKind k = nt_kind(nt, id);
-    if (k == NK_SelfNode) return 1;
-    if (k == NK_CallNode && nt_ref(nt, id, "receiver") < 0) return 1;
-  }
-  return 0;
-}
-
-/* Does module mod have a singleton method named nm other than the
-   module_function copy mf (`def M.a` or `def self.a` after the
-   module_function, a `class << self` def)? Then the module function's
-   singleton is not its instance method any more: a receiverless call in an
-   includer must reach the includer's copy, not the module's singleton
-   (desugar_module_function_call rewrites it onto the module unless the
-   includer holds a copy of its own). */
-static int module_function_singleton_replaced(Compiler *c, int mod, const char *nm, int mf) {
-  for (int si = 0; si < c->nscopes; si++) {
-    const Scope *s = &c->scopes[si];
-    if (si != mf && s->class_id == mod && s->is_cmethod && !s->is_module_function &&
-        s->name && sp_streq(s->name, nm))
-      return 1;
-  }
-  return 0;
+/* Does the program reach module method ms behind class ci's own method
+   own of its name (on the class side when sg): a super in own's body, or
+   a call that meets the module's version before own replaces it
+   (elab_version_called: the call plan maps that version to the copy)? An
+   include or an extend keeps the copy, under a hidden name, behind own
+   in the class's chain only then. */
+static int mixin_reached_behind_own(Compiler *c, int ci, int sg, int own, int ms) {
+  /* (on the class side, an alias that captures the version reaches it as
+     well, elab_version_met: `alias n m` in a subclass's singleton, whose
+     copy's super starts from the extend's copy) */
+  if (sg) return scope_body_has_super(c, own) || elab_version_met(c, ci, sg, c->scopes[ms].name, c->scopes[ms].def_node);
+  return scope_body_has_super(c, own) || elab_version_called(c, ci, sg, c->scopes[ms].name, c->scopes[ms].def_node);
 }
 
 /* Give a copied method its own default values: clone each one and walk it
@@ -8306,11 +8438,10 @@ static void include_module_methods(Compiler *c, int ci, int mod_id, int guard, i
   for (int ms = 0; ms < snap; ms++) {
     Scope *src = &c->scopes[ms];
     if (src->class_id != mod_id || !src->name) continue;
-    /* a module_function method whose body depends on its receiver needs a
-       per-includer copy; everything else class-level stays module-side */
-    if (src->is_cmethod &&
-        !(src->is_module_function && (module_function_self_dependent(c, ms) ||
-                                      module_function_singleton_replaced(c, mod_id, src->name, ms))))
+    /* a module function is the module's private instance method too, so
+       an includer gets a copy, as of an instance method; every other
+       class-level method stays module-side */
+    if (src->is_cmethod && !src->is_module_function)
       continue;
     /* a module function a later instance def of the name replaced (`def a`
        after `module_function :a`): the includer gets that public def, not
@@ -8332,7 +8463,15 @@ static void include_module_methods(Compiler *c, int ci, int mod_id, int guard, i
        hidden name of this class's own, as the class's spelling of the same
        name may be taken, standing in front of nothing; include_chain_copy
        carries the chain */
-    int own = src->shadow ? -1 : comp_method_in_class(c, ci, src->name), behind = -1;
+    /* (a module's own module function is its instance method too, in front
+       of what the module includes; a top-level def is Object's own private
+       method, main's singleton method is not) */
+    int oc = -1, own = src->shadow ? -1 : comp_self_method_in_chain(c, ci, src->name, &oc), behind = -1;
+    if (oc != ci) own = -1;
+    if (own < 0 && !src->shadow && ci == comp_core_class(c, CORE_OBJECT)) {
+      int top = comp_method_index(c, src->name);
+      if (top >= 0 && !c->scopes[top].is_cmethod) own = top;
+    }
     int guarded = guard && !src->is_cmethod && !src->shadow;
     if (src->shadow) {
       /* (one the class has already, from the module mixed in before that
@@ -8412,17 +8551,21 @@ static void include_module_methods(Compiler *c, int ci, int mod_id, int guard, i
       /* The class overrides the module method. If the override calls super,
          the module method is the super target: copy it under a shadow name
          and chain to it so emit_super reaches it via the prepend-super path.
-         An alias the module makes of it reaches it too: then it is copied
-         under a shadow name only, which the alias names
-         (register_include_attrs). Otherwise the module method is simply
-         shadowed -- nothing to emit. */
-      int super_reaches = inc_super_reached(c, own, ci, src->name);
-      if (!super_reaches && !module_aliases_name(&c->classes[mod_id], src->name) &&
+         A call that meets the module's version before the override's def
+         runs (mixin_reached_behind_own) reaches it too, which the call plan
+         maps that version to: then it is chained the same way, as the
+         override's super would reach it, so it is reached wherever the
+         name is (compute_reachable), as an extend's copy is. An alias the
+         module makes of it reaches it too: then it is copied under a
+         shadow name only, which the alias names (register_include_attrs).
+         Otherwise the module method is simply shadowed -- nothing to emit. */
+      int behind_own = elab_history_absent(c, ci, 0, src->name) || mixin_reached_behind_own(c, ci, 0, own, ms);
+      if (!behind_own && !module_aliases_name(&c->classes[mod_id], src->name) &&
           !class_aliases_name(&c->classes[ci], src->name)) {
         if (!src->is_module_function) src->is_transplanted_source = 1;
         continue;
       }
-      const char *existing = super_reaches ? comp_prep_chain_target(c, ci, src->name) : NULL;
+      const char *existing = behind_own ? comp_prep_chain_target(c, ci, src->name) : NULL;
       /* spaces keep the shadow unwritable in Ruby source, so an explicit
          `obj.__inc_0_tag` finds nothing and raises; mc() folds them back
          to underscores, so the C symbol is unchanged (#3738) */
@@ -8445,7 +8588,7 @@ static void include_module_methods(Compiler *c, int ci, int mod_id, int guard, i
         comp_prep_chain_add(cif, inc_shadow, prev);
         free(prev);
       }
-      else if (super_reaches) {
+      else if (behind_own) {
         comp_prep_chain_add(&c->classes[ci], src->name, inc_shadow);
       }
       dst_name = inc_shadow;
@@ -8469,7 +8612,7 @@ static void include_module_methods(Compiler *c, int ci, int mod_id, int guard, i
        self to the includer -- a shared body would resolve that self to the
        module and mis-splice; or
        (d) the body touches an ivar, which must type against the includer's
-       slot rather than a divergent module-owned slot (scope_body_uses_ivar); or
+       slot rather than a divergent module-owned slot; or
        (e) the method takes a &block param. A block-taking module method must be
        inlinable per includer so a forwarded block literal threads through the
        call chain and can be spliced (a collector builder `col(&b) = build(tag,
@@ -9213,6 +9356,28 @@ static int super_lands_on_attr(Compiler *c, int ci, const char *base, int want_w
   return 0;
 }
 
+/* Does class ci's own body declare the accessor uname (a writer as `x=`),
+   still the class's last version of the name as the load phase ends? A
+   prepended module's copy with no def of the class behind it (no shadow)
+   reaches that accessor with `super`: CRuby looks in the class itself
+   right after the prepended module. A Struct's or a Data's member, which no
+   call declares, counts where the class builds the record itself (a Data
+   member has no writer). */
+static int class_own_attr_live(Compiler *c, int ci, const char *uname, const char *base, int want_write) {
+  ClassInfo *k = &c->classes[ci];
+  if (k->is_struct && !(want_write && k->is_data) && !(k->parent >= 0 && c->classes[k->parent].is_struct)) {
+    char iv[260];
+    snprintf(iv, sizeof iv, "@%s", base);
+    if (comp_member_index(k, iv) >= 0) return !elab_inst_attr_replaced(c, ci, uname);
+  }
+  int n = 0;
+  const ElabSurface *v = elab_class_surface(c, ci, 0, &n);
+  for (int i = 0; i < n; i++)
+    if (sp_streq(v[i].name, uname) && (want_write ? v[i].writer : v[i].reader))
+      return !elab_inst_attr_replaced(c, ci, uname);
+  return 0;
+}
+
 /* `super` from a method overriding an attribute calls the generated reader or
    writer, which has no function of its own: it reads or writes the backing
    ivar. Rewrite the super into that ivar access in place, so the write types
@@ -9271,7 +9436,9 @@ void rewrite_attr_supers(Compiler *c) {
       if (nreq + nopt != (is_write ? 1 : 0) || s->nparams != nreq + nopt) continue;
       if (is_write) fwd_name = s->pnames[0];
     }
-    if (!super_lands_on_attr(c, s->class_id, base, is_write)) continue;
+    /* (a prepended module's copy reaches the class's own accessor first) */
+    if (!(s->is_prepend_copy && class_own_attr_live(c, s->class_id, uname, base, is_write)) &&
+        !super_lands_on_attr(c, s->class_id, base, is_write)) continue;
     char ivn[260];
     snprintf(ivn, sizeof ivn, "@%s", base);
     int line = (int)nt_int(nt, id, "node_line", 0);
@@ -9467,14 +9634,14 @@ static int extend_class_with(Compiler *c, int ci, int mod_id, int inherited, int
        sits behind it: a super in the own method reaches the module's,
        copied in under a shadow name, in front of any module extended
        earlier. So does a call that meets the module's version before the
-       own method replaces it (elab_version_met): the call plan maps that
-       version to the copy. With neither, nothing can reach the copy. */
+       own method replaces it: the call plan maps that version to the copy
+       (mixin_reached_behind_own). With neither, nothing can reach the copy. */
     char *own_name = NULL;
     int guard = 0, behind_mi = -1;
     char behind[256] = "";
     if (own >= 0 && !c->scopes[own].is_extend_copy && !prepend) {
       extend_alias_refuse_own(c, mod_id, ci, src->name);
-      if (!scope_body_has_super(c, own) && !elab_version_met(c, ci, 1, src->name, src->def_node)) continue;
+      if (!mixin_reached_behind_own(c, ci, 1, own, ms)) continue;
       ClassInfo *cif = &c->classes[ci];
       char key[320];
       snprintf(behind, sizeof behind, "__inc %d %s", cif->prep_shadow_count++, src->name);
@@ -10938,6 +11105,31 @@ static int class_defines_member(Compiler *c, int ci, const char *name) {
   return 0;
 }
 
+/* Does module mod define instance method or attribute name (a writer
+   `x=` as attr_writer / attr_accessor :x)? */
+static int module_defines_member(Compiler *c, int mod, const char *name) {
+  if (mod < 0 || mod >= c->nclasses) return 0;
+  if (comp_method_in_chain(c, mod, name, NULL) >= 0 || comp_reader_in_chain(c, mod, name, NULL)) return 1;
+  size_t ln = strlen(name);
+  char base[300];
+  if (ln < 2 || name[ln - 1] != '=' || ln - 1 >= sizeof base) return 0;
+  memcpy(base, name, ln - 1); base[ln - 1] = 0;
+  return comp_writer_in_chain(c, mod, base, NULL) != 0;
+}
+/* 1 when a module class cls prepends defines name. The load record knows
+   each prepend before register_prepends fills prepended_mods, which runs
+   after the first inherit_members. */
+static int prepend_defines(Compiler *c, int cls, const char *name) {
+  const ClassInfo *k = &c->classes[cls];
+  for (int m = 0; m < k->nprepended_mods; m++)
+    if (k->prepended_mods[m] != cls && module_defines_member(c, k->prepended_mods[m], name)) return 1;
+  int n = 0;
+  const LrMixin *mx = elab_class_mixins(c, cls, &n);
+  for (int i = 0; mx && i < n; i++)
+    if (mx[i].kind == LR_PREPEND && mx[i].mod != cls && module_defines_member(c, mx[i].mod, name)) return 1;
+  return 0;
+}
+
 /* Merge inherited ivar/reader/writer NAMES into subclasses so the struct
    layout is [parent ivars..., own ivars...] (cast-compatible). Types are
    propagated later in the fixpoint. Parent-first order. */
@@ -11092,13 +11284,16 @@ void inherit_members(Compiler *c) {
       /* a reader the parent's own later def (or alias) replaces is not the
          parent's method any more: the def answers the child too */
       if (!ci->is_struct && elab_inst_attr_replaced(c, p, pc->readers[k])) continue;
+      /* nor is one a module the parent prepends defines: the module's
+         method stands in front of it for the child too */
+      if (!ci->is_struct && prepend_defines(c, p, pc->readers[k])) continue;
       if (!class_defines_member(c, i, pc->readers[k]) && (!undeffed || ci->is_struct))
         comp_add_reader(ci, pc->readers[k]);
     }
     for (int k = 0; k < pc->nwriters; k++) {
       char wn[300];
       snprintf(wn, sizeof wn, "%s=", pc->writers[k]);
-      if (!ci->is_struct && elab_inst_attr_replaced(c, p, wn)) continue;
+      if (!ci->is_struct && (elab_inst_attr_replaced(c, p, wn) || prepend_defines(c, p, wn))) continue;
       if (!class_defines_member(c, i, wn)) comp_add_writer(ci, pc->writers[k]);
     }
     }
@@ -11874,7 +12069,7 @@ static int pivs_param(Compiler *c, Scope *s, const char *pn, char *set, int dept
       int rc = rn ? const_node_class_index(c, r) : -1;
       if (rc < 0) { if (rn && is_builtin_class_name(rn)) continue; return 0; }
       if (comp_cmethod_in_chain(c, rc, "new", NULL) >= 0) return 0;
-      if (comp_method_in_chain(c, rc, "initialize", NULL) != (int)(s - c->scopes)) continue;
+      if (cplan_new_initialize(c, u, rc, NULL) != (int)(s - c->scopes)) continue;
     }
     if (!pn) {
       int r = nt_ref(nt, u, "receiver");
@@ -12311,7 +12506,17 @@ static int pivs_callable_lit(Compiler *c, int v) {
              ? comp_scope_of(c, v) : NULL;
   return s && s->class_id < 0 && comp_method_index(c, nt_str(nt, av[0], "value")) >= 0;
 }
+static int pivs_value_walk(Compiler *c, int v, char *set, int depth);
+/* The walk of value v. It is a whole-program walk whose memo the first node that asks fills, so the check names v
+   itself the frame of what it reads (a read of a class method of a class the value names is the value's own, not
+   that of the node that happened to ask). */
 static int pivs_value_uncached(Compiler *c, int v, char *set, int depth) {
+  MtabMark mk = mtab_push(c, v);
+  int ok = pivs_value_walk(c, v, set, depth);
+  mtab_pop(c, mk);
+  return ok;
+}
+static int pivs_value_walk(Compiler *c, int v, char *set, int depth) {
   const NodeTable *nt = c->nt;
   int br = pivs_branches(c, v, set, depth, 0);
   if (br >= 0) return br;
