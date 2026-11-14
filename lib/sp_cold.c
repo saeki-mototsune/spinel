@@ -439,8 +439,17 @@ static double sp_c_num(const char *p, char **end) {
   *end = (char *)q;
   return v;
 }
+/* A part the parse read as a Float ("1.0", "2e3") or as a Rational ("1/2",
+   which a Complex keeps in its Float slot, as Complex(Rational(1, 2), 0)
+   does): the part-kind flag the Complex carries, so "1.0+2i".to_c is
+   (1.0+2i) and eql? to Complex(1.0, 2). */
+static int sp_c_num_is_f(const char *p, const char *end) {
+  for (; p < end; p++) if (*p == '.' || *p == 'e' || *p == 'E' || *p == '/') return 1;
+  return 0;
+}
 static sp_Complex sp_str_to_c_impl(const char *s, int strict) {
   double re = 0, im = 0;
+  unsigned char fl = 0;
   int parsed = 0;
   const char *fin = s;   /* first byte NOT consumed by the parse */
   if (s) {
@@ -454,14 +463,16 @@ static sp_Complex sp_str_to_c_impl(const char *s, int strict) {
       parsed = 1;
       /* rational-syntax component "n/d" */
       if (*end == '/') { const char *dp = end + 1; char *de = NULL; double d = sp_c_num(dp, &de); if (de != dp) { sp_str_to_c_zero_den(dp, d); a /= d; end = de; } }
-      if (*end == 'i') { im = a; fin = end + 1; }
+      int af = sp_c_num_is_f(p, end);
+      if (*end == 'i') { im = a; fin = end + 1; if (af) fl |= SP_CPLX_IM_F; }
       else {
         re = a;
+        if (af) fl |= SP_CPLX_RE_F;
         const char *q = end;
         double b2 = sp_c_num(q, &end);
         if (end != q) {
           if (*end == '/') { const char *dp = end + 1; char *de = NULL; double d = sp_c_num(dp, &de); if (de != dp) { sp_str_to_c_zero_den(dp, d); b2 /= d; end = de; } }
-          if (*end == 'i') { im = b2; fin = end + 1; }
+          if (*end == 'i') { im = b2; fin = end + 1; if (sp_c_num_is_f(q, end)) fl |= SP_CPLX_IM_F; }
           else fin = q;   /* an imaginary number without the 'i' suffix ("1+2") is invalid */
         }
         else if ((*q == '+' || *q == '-') && q[1] == 'i') { im = (*q == '-') ? -1.0 : 1.0; fin = q + 2; }
@@ -484,7 +495,7 @@ static sp_Complex sp_str_to_c_impl(const char *s, int strict) {
     if (sp_convert_soft) { sp_convert_failed = 1; return (sp_Complex){ 0.0, 0.0 }; }
     sp_raise_cls("ArgumentError", sp_sprintf("invalid value for convert(): \"%s\"", s ? s : ""));
   }
-  return (sp_Complex){ (sp_float)re, (sp_float)im };
+  return (sp_Complex){ (sp_float)re, (sp_float)im, fl };
 }
 /* String#to_c: a leading complex, the rest ignored, (0+0i) when none. */
 sp_Complex sp_str_to_c(const char *s) { return sp_str_to_c_impl(s, 0); }
@@ -2490,6 +2501,7 @@ const char *sp_File_gets_sep(sp_File *f, const char *sep, sp_int limit, sp_bool 
     memcpy(r, buf, n); r[n] = 0;
     free(buf);
     sp_str_set_len(r, n);
+    if (sp_File_reads_binary(f)) sp_str_mark_binary(r);   /* a socket's line is BINARY */
     f->lineno++;
     return r;
   }
@@ -2538,6 +2550,7 @@ const char *sp_File_gets_sep(sp_File *f, const char *sep, sp_int limit, sp_bool 
   char *r = sp_str_alloc(len);
   memcpy(r, buf, len); r[len] = 0;
   sp_str_set_len(r, len);
+  if (sp_File_reads_binary(f)) sp_str_mark_binary(r);
   f->lineno++;
   return r;
 }
@@ -5972,8 +5985,14 @@ sp_bool sp_StrArray_eq(sp_StrArray*a,sp_StrArray*b){SP_GC_ROOT(a);SP_GC_ROOT(b);
    anything else keeps the Float class. The INTPTR guard mirrors
    sp_complex_mag: casting an out-of-range double to sp_int is UB. */
 sp_RbVal sp_complex_comp_v(sp_float v, int is_f) {
-  if (!is_f && v >= -(sp_float)INTPTR_MAX && v <= (sp_float)INTPTR_MAX && v == (sp_float)(sp_int)v)
-    return sp_box_int((sp_int)v);
+  /* An Integer part is an Integer whatever its size: an Integer when it
+     fits the slot, else a Bignum (the part past 2**63 after a product, or
+     past 2**31 on a 32-bit build), never the Float that holds it. The range
+     test comes before any cast, since a cast out of range is undefined. */
+  if (!is_f && isfinite(v) && v == floor(v)) {
+    if (v >= -9223372036854775808.0 && v < 9223372036854775808.0) return sp_box_i64((int64_t)v);
+    return sp_box_bigint(sp_bigint_new_double(v));
+  }
   return sp_box_float(v);
 }
 /* CRuby Complex#abs: Integer only via the zero-component shortcut (|other|)
@@ -6546,7 +6565,8 @@ sp_float sp_brat_to_f(sp_BigRational *r) {SP_GC_ROOT(r);
    generated sym_intern / obj_dump / obj_load. */
 sp_RbVal sp_marv_arr_new(void) { return sp_box_poly_array(sp_PolyArray_new()); }
 void sp_marv_arr_push(sp_RbVal a, sp_RbVal v) {SP_GC_ROOT_RBVAL(a);SP_GC_ROOT_RBVAL(v); sp_PolyArray_push((sp_PolyArray *)a.v.p, v); }
-sp_RbVal sp_marv_box_complex(sp_float re, sp_float im) { sp_Complex c; c.re = re; c.im = im; return sp_box_complex(c); }
+/* a loaded Complex keeps each part's kind (fl), which its eql?, hash and inspect read */
+sp_RbVal sp_marv_box_complex(sp_float re, sp_float im, int fl) { sp_Complex c; c.re = re; c.im = im; c.fl = (unsigned char)fl; return sp_box_complex(c); }
 sp_RbVal sp_marv_box_rational(sp_int n, sp_int d) { return sp_box_rational(sp_rational_new(n, d)); }
 void sp_marv_raise(const char *cls, const char *msg) {SP_GC_ROOT_STR(msg); sp_raise_cls(cls, msg); }
 

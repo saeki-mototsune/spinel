@@ -2377,7 +2377,7 @@ int const_set_slot(Compiler *c, int call, const char *n, const char **key) {
     *key = comp_const(c, n) ? n : NULL;
   } else if (cn) {
     *key = const_value_owned_key(c, ci, n);
-  } else if (qc_leaf_qualified(n)) {
+  } else if (qc_leaf_qualified(c, n)) {
     return CS_AMBIG;
   } else {
     *key = comp_const(c, n) ? n : NULL;
@@ -2442,7 +2442,7 @@ const char *const_get_resolve(Compiler *c, int rk, const char *cgn, int *cls) {
   }
   LocalVar *cv = comp_const(c, cgn);
   /* the common case, one constant of that leaf and no class: no body scan */
-  if (cv && cv->type != TY_UNKNOWN && !qc_leaf_qualified(cgn) && !class_leaf_any(c, cgn) &&
+  if (cv && cv->type != TY_UNKNOWN && !qc_leaf_qualified(c, cgn) && !class_leaf_any(c, cgn) &&
       cg_flat_seen(c, rk, cgn)) return cgn;
   /* R's ancestors in CRuby's order: the modules R prepends and includes
      come before its superclass. Past them (Object), the superclass walk. */
@@ -2968,6 +2968,15 @@ int is_blk_param_call(Compiler *c, int node, int mi) {
   const char *rn = nt_str(nt, recv, "name");
   const char *bp = c->scopes[mi].blk_param;
   return rn && bp && bp[0] && sp_streq(rn, bp);
+}
+/* A yield, or the call of its method's own `&blk` (`blk.call`, the explicit
+   form of yield): its value is what the site's block answers. */
+int is_yield_or_blk_param_call(Compiler *c, int node) {
+  if (node < 0) return 0;
+  if (nt_kind(c->nt, node) == NK_YieldNode) return 1;
+  Scope *s = comp_scope_of(c, node);
+  int mi = s ? (int)(s - c->scopes) : -1;
+  return mi > 0 && is_blk_param_call(c, node, mi);
 }
 /* Is the `return` written in a lambda (`-> { return 1 }`, `lambda { return 1 }`)?
    It leaves the lambda, not the method the lambda is written in. */
@@ -4203,10 +4212,7 @@ int an_native_defines_method(Compiler *c, const char *name) {
    it does not take the name from a builtin (`def uniq(o) = o.uniq`). */
 int an_user_recv_defines_method(Compiler *c, const char *name) {
   if (!an_user_defines_method(c, name)) return 0;
-  if (comp_method_index(c, name) < 0) return 1;
-  for (int uk = 0; uk < c->nclasses; uk++)
-    if (comp_method_in_chain(c, uk, name, NULL) >= 0) return 1;
-  return 0;
+  return comp_name_responder(c, -1, name, 0) < 0 || comp_name_answered(c, name, 0);
 }
 /* A call of merge!, update or fetch_values with no argument is a Hash or Array
    method only when the program defines no method of that name: with one (on
@@ -4219,9 +4225,7 @@ int an_zero_arg_builtin_shadowed(Compiler *c, const char *name, int argc) {
   /* asked directly, not through an_user_defines_method: the builtin-only
      derivation (a user class owning the name beside a builtin receiver) must
      keep the program's definition in view too */
-  for (int uk = 0; uk < c->nclasses; uk++)
-    if (comp_method_in_chain(c, uk, name, NULL) >= 0) return 1;
-  return udm_aliased_name(c, name);
+  return comp_name_answered(c, name, 0) || udm_aliased_name(c, name);
 }
 int an_user_defines_method(Compiler *c, const char *name) {
   if (an_builtin_only_p()) return 0;   /* deriving the builtin-only answer (#3459) */
@@ -4230,9 +4234,7 @@ int an_user_defines_method(Compiler *c, const char *name) {
   if (!comp_scope_index_is_frozen()) {
     /* scope shape may still change without the counts moving (renames);
        don't consult or populate the memo outside the frozen fixpoint. */
-    for (int uk = 0; uk < c->nclasses; uk++)
-      if (comp_method_in_chain(c, uk, name, NULL) >= 0) return 1;
-    return comp_method_index(c, name) >= 0;
+    return comp_name_answered(c, name, 0) || comp_name_responder(c, -1, name, 0) >= 0;
   }
   unsigned gen = comp_scope_index_gen();
   /* A frozen index only grows: the builtins' rewrites add a method per
@@ -4275,8 +4277,7 @@ int an_user_defines_method(Compiler *c, const char *name) {
   if (udm_aliased_name(c, name)) {
     /* the name is an alias source somewhere: per-class resolution can redirect
        it, so only the full scan answers exactly (rare -- memoized above) */
-    for (int uk = 0; uk < c->nclasses; uk++)
-      if (comp_method_in_chain(c, uk, name, NULL) >= 0) { ans = 1; break; }
+    ans = comp_name_answered(c, name, 0);
   }
   else {
     /* no alias redirects this name anywhere, so resolution is the identity for
@@ -4284,7 +4285,7 @@ int an_user_defines_method(Compiler *c, const char *name) {
        class as the chain start) */
     ans = udm_defined_name(c, name);
   }
-  if (!ans) ans = comp_method_index(c, name) >= 0;
+  if (!ans) ans = comp_name_responder(c, -1, name, 0) >= 0;
   if (again >= 0) { udm_ans[again] = (signed char)ans; return ans; }
   /* a full memo grows, and its buckets with it (as an_user_defines_or_reads'
      does): past 4,096 names it stopped recording, and every later name
@@ -5265,8 +5266,10 @@ const char *method_sym_arg(Compiler *c, int node) {
 
 /* Does call node's receiver hold an object whose class's chain has a
    program def of `method` (an instance method the program wrote, not the
-   builtin's)? Only a receiver typed as one object class is asked, or no
-   receiver in an instance method, whose self is an object of its class. */
+   builtin's) that the call meets: the plan's target of the call
+   (call_target), so a def made after the call does not answer it? Only a
+   receiver typed as one object class is asked, or no receiver in an
+   instance method, whose self is an object of its class. */
 int method_user_override_recv(Compiler *c, int node) {
   const NodeTable *nt = c->nt;
   int recv = nt_ref(nt, node, "receiver"), k;
@@ -5285,7 +5288,7 @@ int method_user_override_recv(Compiler *c, int node) {
     k = ty_object_class(rt);
   }
   if (k < 0 || k >= c->nclasses) return 0;
-  int mi = comp_method_in_chain(c, k, "method", NULL);
+  int mi = call_target(c, node, k, "method", 0, NULL);
   return mi >= 0 && mi < c->nscopes && c->scopes[mi].def_node >= 0 &&
          !nt_int(nt, c->scopes[mi].def_node, "node_bi", 0);
 }
@@ -6176,11 +6179,12 @@ int io_family_class(Compiler *c, int k) {
    builtin it overrides: the reopenings are out of sight for that call
    alone, not for the calls in its arguments. */
 int g_io_skip_reopen = 0, g_io_skip_node = -1;
-int io_reopen_class(Compiler *c, const char *name) {
+int io_reopen_class(Compiler *c, int id, const char *name) {
   if (!name || g_io_skip_reopen) return -1;
   for (int i = 0; io_family[i] >= 0; i++) {
-    int k = comp_core_class(c, io_family[i]), def = -1;
-    if (k >= 0 && comp_method_in_chain(c, k, name, &def) >= 0 && io_family_class(c, def)) return def;
+    int k = comp_core_class(c, io_family[i]);
+    MethodLookup ml = { .def_class = -1 };
+    if (k >= 0 && call_target(c, id, k, name, 0, &ml) >= 0 && io_family_class(c, ml.def_class)) return ml.def_class;
   }
   return -1;
 }
@@ -6205,12 +6209,13 @@ static const int *io_family_classes(Compiler *c, int *n) {
   *n = iofc_n;
   return iofc_ids;
 }
-int io_reopen_defs(Compiler *c, const char *name, int public_only, int *ks, int max) {
+int io_reopen_defs(Compiler *c, int id, const char *name, int public_only, int *ks, int max) {
   int n = 0, nf = 0;
   const int *fam = io_family_classes(c, &nf);
   for (int i = 0; i < nf && n < max; i++) {
-    int k = fam[i], def = -1;
-    if (comp_method_in_chain(c, k, name, &def) < 0 || def != k) continue;
+    int k = fam[i];
+    MethodLookup ml = { .def_class = -1 };
+    if (call_target(c, id, k, name, 0, &ml) < 0 || ml.def_class != k) continue;
     if (public_only && comp_method_vis_in_chain(c, k, name) != SP_VIS_PUBLIC) continue;
     ks[n++] = k;
   }
@@ -6218,11 +6223,11 @@ int io_reopen_defs(Compiler *c, const char *name, int public_only, int *ks, int 
 }
 /* Do the reopenings defining `name` answer different types? A typed IO's
    call is then boxed, each kind's answer boxed into it. */
-int io_reopen_ret_mixed(Compiler *c, const char *name) {
-  int ks[16], n = io_reopen_defs(c, name, 0, ks, 16);
+int io_reopen_ret_mixed(Compiler *c, int id, const char *name) {
+  int ks[16], n = io_reopen_defs(c, id, name, 0, ks, 16);
   for (int i = 1; i < n; i++)
-    if (c->scopes[comp_method_in_chain(c, ks[i], name, NULL)].ret !=
-        c->scopes[comp_method_in_chain(c, ks[0], name, NULL)].ret) return 1;
+    if (c->scopes[call_target(c, id, ks[i], name, 0, NULL)].ret !=
+        c->scopes[call_target(c, id, ks[0], name, 0, NULL)].ret) return 1;
   return 0;
 }
 /* The builtin superclass of an IO-family class, as lib/sp_io.c walks a
@@ -6244,8 +6249,8 @@ int io_family_descends(Compiler *c, int k, int owner) {
 }
 /* Does some IO kind reach no reopening of `name` (no IO#name among them),
    so that the builtin answers for it? */
-int io_reopen_leaves_builtin(Compiler *c, const char *name) {
-  int ks[16], n = io_reopen_defs(c, name, 0, ks, 16);
+int io_reopen_leaves_builtin(Compiler *c, int id, const char *name) {
+  int ks[16], n = io_reopen_defs(c, id, name, 0, ks, 16);
   for (int i = 0; i < n; i++) if (sp_streq(c->classes[ks[i]].name, "IO")) return 0;
   return n > 0;
 }
@@ -7036,19 +7041,30 @@ int ext_class_exported(Compiler *c, int class_id) {
 /* Whether the method of scope si has a shape the thunk calls, seen from
    class_id (the class it is answered for): public there, not initialize,
    fixed positional parameters (no optional, rest, keyword or block
-   parameter, no yield). */
+   parameter, no yield). A method with optional or rest parameters is
+   called through its forwarders, which have that shape
+   (desugar_ext_forwarders). */
 static int ext_method_shape(Compiler *c, int class_id, int si) {
   if (si <= 0 || si >= c->nscopes || class_id < 0 || class_id >= c->nclasses) return 0;
   Scope *sc = &c->scopes[si];
   if (!sc->name || sc->class_id < 0 || is_initialize_name(sc->name)) return 0;
   if (sc->replaced || sc->entry != ENTRY_NONE) return 0;
+  /* a forwarder stands for the method it calls: that method is public,
+     and the class answers the one the forwarder was written beside */
+  const char *vis_name = ext_fwd_orig(sc->name, NULL, NULL);
+  if (vis_name) {
+    int osi = sc->is_cmethod ? comp_cmethod_in_chain(c, class_id, vis_name, NULL)
+                             : comp_method_in_chain(c, class_id, vis_name, NULL);
+    if (osi < 0 || c->scopes[osi].class_id != sc->class_id) return 0;
+  }
+  else vis_name = sc->name;
   if (sc->is_cmethod) {
     int at = -1;
-    if (comp_cmethod_vis_declared(c, class_id, sc->name, &at) != SP_VIS_PUBLIC) return 0;
+    if (comp_cmethod_vis_declared(c, class_id, vis_name, &at) != SP_VIS_PUBLIC) return 0;
   }
   else {
     if (comp_class_is_module(c, &c->classes[class_id])) return 0;   /* no instance */
-    if (comp_method_vis_in_chain(c, class_id, sc->name) != SP_VIS_PUBLIC) return 0;
+    if (comp_method_vis_in_chain(c, class_id, vis_name) != SP_VIS_PUBLIC) return 0;
   }
   if (sc->rest_idx >= 0 || sc->kwrest_idx >= 0 || sc->nrequired != sc->nparams || sc->ps_nkw > 0 ||
       (sc->blk_param && sc->blk_param[0]) || sc->yields)
@@ -7117,6 +7133,34 @@ static int ext_listed_descendant(Compiler *c, const char *name) {
   return found;
 }
 
+/* Whether the list names the class definition of that key, or a class
+   under it: the definitions whose methods a table can hold. */
+int ext_class_def_wanted(Compiler *c, const char *key) {
+  if (!g_ext_classes || !*g_ext_classes || !key) return 0;
+  return ext_name_listed(key) || ext_listed_descendant(c, key);
+}
+
+/* A forwarder of desugar_ext_forwarders is named
+   `spinel_ext_fwd__<n>__<name>` (n fixed arguments) or
+   `spinel_ext_fwdr__<n>__<name>` (n fixed arguments, then the rest in an
+   Array). Answers <name> with n in *nfixed and the rest flag in *rest, or
+   NULL for another name. */
+const char *ext_fwd_orig(const char *name, int *nfixed, int *rest) {
+  if (!name || strncmp(name, "spinel_ext_fwd", 14)) return NULL;
+  const char *p = name + 14;
+  int r = *p == 'r';
+  if (r) p++;
+  if (p[0] != '_' || p[1] != '_') return NULL;
+  p += 2;
+  int n = 0;
+  if (*p < '0' || *p > '9') return NULL;
+  while (*p >= '0' && *p <= '9') n = n * 10 + (*p++ - '0');
+  if (p[0] != '_' || p[1] != '_' || !p[2]) return NULL;
+  if (nfixed) *nfixed = n;
+  if (rest) *rest = r;
+  return p + 2;
+}
+
 /* Whether a host can call the method of scope si by name, so that it runs
    though nothing in the program names it: its shape is one the thunk
    calls, and the list names its class or a class under it. */
@@ -7125,5 +7169,6 @@ int ext_scope_host_callable(Compiler *c, int si) {
   Scope *sc = &c->scopes[si];
   if (sc->class_id < 0 || !ext_method_shape(c, sc->class_id, si)) return 0;
   if (ext_class_exported(c, sc->class_id)) return 1;
-  return c->classes[sc->class_id].name && ext_listed_descendant(c, c->classes[sc->class_id].name);
+  const char *cn = elab_class_walk_name(c, sc->class_id);
+  return cn && ext_listed_descendant(c, cn);
 }

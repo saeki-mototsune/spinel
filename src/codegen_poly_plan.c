@@ -1539,6 +1539,8 @@ void emit_poly_user_arms_n(Compiler *c, int id, const char *name, const PolyUser
   free(arms);
 }
 
+int g_poly_pub_keep = 0;
+
 /* One user-class arm of a poly dispatch with arguments: `case k:` calling
    `call`, its value (mret, from the method or its proc form ms) into the
    result temp _t<tr> as the call's type ret takes it. The conversion
@@ -1584,6 +1586,9 @@ int emit_poly_user_arm_n(Compiler *c, int id, int k, const char *call, TyKind mr
        zero-argument arm) */
     else if (plan_put_strsub(c, ret, mret, call, b)) {}
     else plan_put_plain(so, ret, call, b);
+    /* (a dispatch whose String a pickup takes keeps what this arm
+       published: a builtin arm after it publishes nothing) */
+    if (g_poly_pub_keep) buf_printf(b, "; _t%d = _sp_ret_strbuf", g_poly_pub_keep);
   }
   buf_puts(b, "; break;");
   return conv;
@@ -1984,7 +1989,7 @@ int poly_key_prim(Compiler *c, int call, const char *name, int argc, int kwh, in
   const int *pks = comp_prim_reopen_classes(c, &npk);
   for (int ki = 0; ki < npk; ki++) {
     int k = pks[ki];
-    if (comp_method_in_chain(c, k, name, NULL) < 0 && !comp_reader_in_chain(c, k, name, NULL)) continue;
+    if (!comp_class_answers(c, k, name)) continue;
     int pmi = call_target(c, call, k, name, 0, NULL);
     char pexp[600];
     if (pmi < 0) continue;
@@ -4807,9 +4812,9 @@ void emit_poly_cases_n(Compiler *c, int id, const char *name, const PolySpecials
     if (repr_of(c, argv[0]).kind == RK_BOXED) snprintf(fa, sizeof fa, "sp_poly_arg_str_chk(_t%d)", atmp[0]);
     else snprintf(fa, sizeof fa, "%s", strarg);
     if (ret == TY_POLY)
-      buf_printf(b, " case SP_BUILTIN_TIME: _t%d = sp_box_str(sp_time_strftime((sp_Time *)_t%d.v.p, %s)); break;", tr, tv, fa);
+      buf_printf(b, " case SP_BUILTIN_TIME: _t%d = sp_box_str(sp_time_strftime_s((sp_Time *)_t%d.v.p, %s)); break;", tr, tv, fa);
     else
-      buf_printf(b, " case SP_BUILTIN_TIME: _t%d = sp_time_strftime((sp_Time *)_t%d.v.p, %s); break;", tr, tv, fa);
+      buf_printf(b, " case SP_BUILTIN_TIME: _t%d = sp_time_strftime_s((sp_Time *)_t%d.v.p, %s); break;", tr, tv, fa);
     /* with user arms in the switch, the default is theirs to emit */
     if (ps->ncand == 0)
       buf_printf(b, " default: sp_raise_cls(\"NoMethodError\", sp_nomethod_msg(\"strftime\", _t%d)); break;", tv);
@@ -4820,29 +4825,28 @@ void emit_poly_cases_n(Compiler *c, int id, const char *name, const PolySpecials
   if ((is_aref || is_fetch) && comp_ntype(c, argv[0]) == TY_STRING) {
     if (g_plan_check) pa_observe(PA_BUILTIN, PA_KEY_BUILTIN + PB_AREF_STR, -1, TY_UNKNOWN, PC_SAME);
     TyKind trt = is_scalar_ret(ret) ? ret : TY_INT;  /* the result temp's type */
-    static const struct { const char *cls, *hn; TyKind vt; } HV[] = {
-      {"SP_BUILTIN_STR_STR_HASH", "StrStr", TY_STRING},
-      {"SP_BUILTIN_STR_INT_HASH", "StrInt", TY_INT},
-      {"SP_BUILTIN_STR_POLY_HASH", "StrPoly", TY_POLY},
-    };
+    static const TyKind HV[] = { TY_STR_STR_HASH, TY_STR_INT_HASH, TY_STR_POLY_HASH };
     for (unsigned hvi = 0; hvi < sizeof HV / sizeof HV[0]; hvi++) {
+      TyKind ht = HV[hvi];
+      const char *hn = ty_hash_cname(ht), *hcls = hash_box_cls(ht);
       /* only a variant whose value fits the result temp can be emitted */
-      if (ret != TY_POLY && HV[hvi].vt != trt) continue;
-      char getx[200];
-      snprintf(getx, sizeof getx, "sp_%sHash_get((sp_%sHash *)_t%d.v.p, %s)", HV[hvi].hn, HV[hvi].hn, tv, strarg);
+      if (ret != TY_POLY && ty_hash_val(ht) != trt) continue;
+      char hx[200], getx[200];
+      snprintf(hx, sizeof hx, "(sp_%sHash *)_t%d.v.p", hn, tv);
+      snprintf(getx, sizeof getx, "sp_%sHash_get(%s, %s)", hn, hx, strarg);
       /* `[]` answers the hash's default on a miss, which the storage's
          own read already knows: the has_key gate below is fetch's, and
          in front of `[]` it answered nil for a Hash.new("") (#5544) */
       if (is_aref) {
         char gx[96]; snprintf(gx, sizeof gx, "sp_poly_get_str(_t%d, %s)", tv, strarg);
-        buf_printf(b, " case %s: _t%d = ", HV[hvi].cls, tr);
+        buf_printf(b, " case %s: _t%d = ", hcls, tr);
         if (ret == TY_POLY) buf_puts(b, gx); else emit_unbox_text(c, trt, gx, b);
         buf_puts(b, "; break;");
         continue;
       }
-      buf_printf(b, " case %s: _t%d = sp_%sHash_has_key((sp_%sHash *)_t%d.v.p, %s) ? ",
-                 HV[hvi].cls, tr, HV[hvi].hn, HV[hvi].hn, tv, strarg);
-      if (ret == TY_POLY) emit_boxed_text(c, HV[hvi].vt, getx, b); else buf_puts(b, getx);
+      buf_printf(b, " case %s: _t%d = sp_%sHash_has_key(%s, %s) ? ", hcls, tr, hn, hx, strarg);
+      /* (boxed: a String value as the Hash holds it, the handle's own box) */
+      if (ret == TY_POLY) emit_hash_val_box_text(c, ht, hx, strarg, b); else buf_puts(b, getx);
       buf_puts(b, " : ");
       if (is_fetch) emit_poly_fetch_absent(c, argc, atmp, argc == 2 ? atmp_ty[1] : TY_UNKNOWN, argv[0], ret, trt, b);
       else buf_puts(b, ret == TY_POLY ? "sp_box_nil()" : default_value_from_compiler(c, trt));

@@ -81,6 +81,7 @@ int is_tap_name(const char *n);       /* tap */
 int is_quantifier(const char *n);     /* all? any? none? one? */
 int is_name_error_class(const char *n);   /* NameError NoMethodError: .new(msg, name, ...) */
 int is_no_method_error_class(const char *n);   /* NoMethodError: .new(msg, name, args, ...) */
+int is_name_error_root_class(const char *n);   /* NameError alone: a variable-like call's error */
 int is_set_op(const char *n);         /* & intersection | union - difference */
 int is_combination_family(const char *n);  /* combination permutation repeated_combination repeated_permutation */
 /* the visibility word a call names: module_function first, so that a
@@ -403,6 +404,7 @@ int is_array_or_object_class(const char *n); /* Array Object */
 int is_array_hash_or_object_class(const char *n); /* Array Hash Object */
 
 int is_integer_class_name(const char *n); /* Fixnum Integer */
+int is_rational_class_name(const char *n); /* Rational */
 
 int is_ivar_access(const char *n);   /* instance_variable_get instance_variable_set */
 int is_plus_op(const char *n);       /* +: the operator `+=` writes through */
@@ -438,6 +440,7 @@ int is_constless_builtin_name(const char *n);  /* a builtin class or module with
 int is_autoload_name(const char *n);
 int is_file_load_name(const char *n);    /* require require_relative load autoload: a call that runs a file's text */
 int is_load_error_catch_name(const char *n);   /* LoadError ScriptError Exception */
+int is_load_error_name(const char *n);         /* LoadError alone */
 int is_script_error_name(const char *n);       /* ScriptError LoadError NotImplementedError SyntaxError */
 int is_load_how_missing(const char *how);
 int is_load_how_set(const char *how);
@@ -459,6 +462,8 @@ int builtin_class_val_id(const char *name);   /* ...-1 for none: the cls_id of i
 int is_comparable_module_method(const char *name); /* < <= == > >= between? clamp: Comparable's own */
 int builtin_comparable_owns(const char *cls, const char *name); /* Comparable's, on a class including it */
 int builtin_comparable_arity(const char *name);
+int builtin_enumerable_owns(const char *cls, const char *name); /* Enumerable's, on Array or Hash, not the class's own */
+int builtin_enumerable_arity(const char *name, int *out);
 int builtin_numeric_owns(const char *cls, const char *name); /* Numeric's, on Integer or Float */
 int builtin_numeric_arity(const char *name, int *out);
 
@@ -745,7 +750,9 @@ int is_cvar_get_name(const char *n);       /* class_variable_get */
 int is_cvar_defined_name(const char *n);   /* class_variable_defined? */
 int is_cvar_reflection_name(const char *n);   /* class_variable_get class_variable_set class_variable_defined? */
 int is_hook_protocol_name(const char *n);  /* append_features extend_object prepend_features: what include, extend and prepend send before their hooks */
+int is_errinfo_gvar_name(const char *n); /* $!, the exception being handled */
 int is_port_gvar_name(const char *n);      /* $stdout $stderr $>: assigning an object makes it the port output goes to */
+int is_checked_gvar_name(const char *n);   /* a global whose write CRuby checks or refuses (with the $): $~ $/ $\ $, $; $. $-0 $-F $-i $stdout $stderr $> $0 $PROGRAM_NAME, $@ (an ArgumentError), and the read-only $$ $? $* $: $" $< $! $FILENAME $LOAD_PATH $LOADED_FEATURES $-I $-W $-a $-l $-p */
 
 /* A name the compiler synthesizes for a protocol method (the no-argument
    display wrappers `__noarg to_s` and `__noarg inspect`, the Enumerable

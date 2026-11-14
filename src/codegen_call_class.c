@@ -471,13 +471,13 @@ static void emit_respond_to_runtime_name(Compiler *c, int id, Buf *b, int recv, 
     /* a private one too when the second argument is true (_a) */
     Buf ab;
     memset(&ab, 0, sizeof ab);
-    emit_io_pick(c, tv, ms->name, 0, &ab);
+    emit_io_pick(c, -1, tv, ms->name, 0, &ab);
     int pt = ++g_tmp;
     char pn[24]; snprintf(pn, sizeof pn, "_p%d", pt);
     buf_printf(b, " || (_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_IO && !strcmp(_n%d, \"", tv, tv, tv);
     emit_c_escaped(b, ms->name);
     buf_printf(b, "\") && ({ int %s = %s; %s != 0x7fffffff && (_a%d || ", pn, ab.p, pn, tv);
-    emit_io_pick_public(c, ms->name, pn, b);
+    emit_io_pick_public(c, -1, ms->name, pn, b);
     buf_puts(b, "); }))");
     free(ab.p);
   }
@@ -1869,6 +1869,62 @@ static int ffi_str_arg_beside_alloc(Compiler *c, int fi, int argc, const int *ar
    of C type ctype, declared in pre ahead of the call, rooting it for the
    call when it is a String (root_str) that Ruby code run by the call could
    collect. */
+/* An `offload: true` call (FfiFunc.offload): `call` is the plain call text,
+   `callee(arg, ...)`. Its arguments go into a struct of the spec types,
+   which a thunk at file scope (in g_procs) passes to the callee on an
+   offload thread (sp_offload_call), keeping the answer and errno there for
+   the caller; pre/base/hold/rel are the temp form's pieces, as for a
+   blocking call. */
+static void ffi_emit_offload(Compiler *c, int fi, const char *call, const char *ret_spec, int is_void_ret,
+                             int fixed_argc, Buf *out, const char *pre, const char *base, const char *hold,
+                             const char *rel) {
+  static int seq;
+  int n = ++seq;
+  const char *lp = strchr(call, '(');
+  size_t clen = lp ? (size_t)(lp - call) : strlen(call);
+  /* the arguments: the text between the call's parentheses, split at its
+     top-level commas */
+  const char *args = lp ? lp + 1 : "";
+  size_t alen = strlen(args);
+  if (alen && args[alen - 1] == ')') alen--;
+  Buf init; memset(&init, 0, sizeof init);
+  int depth = 0, nargs = 0;
+  size_t start = 0;
+  for (size_t i = 0; i <= alen; i++) {
+    char ch = i < alen ? args[i] : ',';
+    if (ch == '(' || ch == '[' || ch == '{') depth++;
+    else if (ch == ')' || ch == ']' || ch == '}') depth--;
+    else if (ch == '"' || ch == '\'') {
+      char q = ch;
+      for (i++; i < alen && args[i] != q; i++) if (args[i] == '\\') i++;
+    }
+    else if (ch == ',' && depth == 0) {
+      if (i > start || i < alen) {
+        if (nargs) buf_puts(&init, ", ");
+        buf_printf(&init, "%.*s", (int)(i - start), args + start);
+        nargs++;
+      }
+      start = i + 1;
+    }
+  }
+  if (nargs != fixed_argc) nargs = fixed_argc;
+  Buf *g = &g_procs;
+  buf_printf(g, "struct _sp_off%d_s { ", n);
+  for (int ai = 0; ai < fixed_argc; ai++) buf_printf(g, "%s a%d; ", ffi_c_type(c->ffi_funcs[fi].args[ai]), ai);
+  if (!is_void_ret) buf_printf(g, "%s r; ", ffi_c_type(ret_spec));
+  buf_printf(g, "int e; };\nstatic void _sp_off%d(void *p_) {\n  struct _sp_off%d_s *p = (struct _sp_off%d_s *)p_;\n  ", n, n, n);
+  if (!is_void_ret) buf_puts(g, "p->r = ");
+  buf_printf(g, "%.*s(", (int)clen, call);
+  for (int ai = 0; ai < fixed_argc; ai++) buf_printf(g, "%sp->a%d", ai ? ", " : "", ai);
+  buf_puts(g, ");\n  p->e = errno;\n}\n");
+  buf_printf(out, "({ %s%s%sstruct _sp_off%d_s _o%d = { %s%s0 }; sp_offload_call(_sp_off%d, &_o%d); errno = _o%d.e; %s",
+             pre ? pre : "", base ? base : "", hold ? hold : "", n, n, init.p ? init.p : "", init.p ? ", " : "",
+             n, n, n, rel ? rel : "");
+  if (!is_void_ret) buf_printf(out, "_o%d.r; })", n);
+  else buf_puts(out, "(void)0; })");
+  free(init.p);
+}
+
 static void ffi_arg_to_temp(Buf *call, size_t at, Buf *pre, const char *ctype, int tb, int ai, int root_str) {
   buf_printf(pre, "%s _b%d_%d = %s; ", ctype, tb, ai, call->p + at);
   if (root_str)
@@ -2514,6 +2570,7 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           int ptr_slot = asi && sp_streq(asi->c_type, "void *");
           int iob_writing = !sp_streq(spec, "buffer_in");
           if (ptr_slot && iob_cls >= 0 && (at == ty_object(iob_cls) || (ar.kind == RK_BOXED && use_temps))) {
+            buf_printf(&base_buf, "void * _bs%d_%d = NULL; SP_GC_ROOT(_bs%d_%d); ", tb, ai, tb, ai);
             if (ar.kind == RK_BOXED) {
               buf_printf(&pre_buf, "sp_RbVal _bk%d_%d = ", tb, ai);
               emit_expr(c, argv[ai], &pre_buf);
@@ -2526,8 +2583,8 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
                                    "sp_raise_cls(\"TypeError\", sp_sprintf(\"no implicit conversion of %%s into a C pointer\", "
                                    "sp_poly_class_name(_bk%d_%d))); ",
                          tb, ai, tb, ai, tb, ai, tb, ai, tb, ai);
-              buf_printf(&base_buf, "void * _b%d_%d = sp_IOBuffer_ffi_ptr(_bk%d_%d, %d, %d); ",
-                         tb, ai, tb, ai, iob_cls, iob_writing);
+              buf_printf(&base_buf, "void * _b%d_%d = sp_IOBuffer_ffi_ptr(_bk%d_%d, %d, %d, &_bs%d_%d); ",
+                         tb, ai, tb, ai, iob_cls, iob_writing, tb, ai);
               buf_printf(&hold_buf, "sp_int _bh%d_%d = sp_IOBuffer_ffi_hold_v(_bk%d_%d, %d); ", tb, ai, tb, ai, iob_cls);
               buf_printf(&rel_buf, "sp_IOBuffer_ffi_release_v(_bk%d_%d, %d, _bh%d_%d); ", tb, ai, iob_cls, tb, ai);
             }
@@ -2535,8 +2592,8 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
               buf_printf(&pre_buf, "sp_IOBuffer *_bk%d_%d = ", tb, ai);
               emit_expr(c, argv[ai], &pre_buf);
               buf_printf(&pre_buf, "; SP_GC_ROOT(_bk%d_%d); ", tb, ai);
-              buf_printf(&base_buf, "void * _b%d_%d = sp_IOBuffer_ffi_base(_bk%d_%d, %d); ",
-                         tb, ai, tb, ai, iob_writing);
+              buf_printf(&base_buf, "void * _b%d_%d = sp_IOBuffer_ffi_base(_bk%d_%d, %d, &_bs%d_%d); ",
+                         tb, ai, tb, ai, iob_writing, tb, ai);
               buf_printf(&hold_buf, "sp_int _bh%d_%d = sp_IOBuffer_ffi_hold(_bk%d_%d); ", tb, ai, tb, ai);
               buf_printf(&rel_buf, "sp_IOBuffer_ffi_release(_bk%d_%d, _bh%d_%d); ", tb, ai, tb, ai);
             }
@@ -2670,7 +2727,17 @@ int emit_call_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
           }
         }
         buf_puts(&call_buf, ")");
-        if (blocking) {
+        if (blocking && c->ffi_funcs[fi].offload) {
+          /* `offload: true`: the call runs on another OS thread, the
+             arguments and the answer in a struct the thunk reads and
+             writes; the calling green thread waits as on I/O */
+          if (is_vararg) unsupported(c, id, "ffi_func offload: true on a variadic function");
+          Buf w; memset(&w, 0, sizeof w);
+          ffi_emit_offload(c, fi, call_buf.p, ret_spec, is_void_ret, fixed_argc, &w,
+                           pre_buf.p, base_buf.p, hold_buf.p, rel_buf.p);
+          free(call_buf.p); call_buf = w;
+        }
+        else if (blocking) {
           /* the worker is out of the world for exactly the call */
           Buf w; memset(&w, 0, sizeof w);
           if (is_void_ret)
@@ -3886,8 +3953,8 @@ int emit_call_new_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const c
           Buf mh; memset(&mh, 0, sizeof mh);
           int mk, hm = !class_is_syserr(c, ci) && argc >= 1 && comp_ntype(c, argv[0]) == TY_STRING &&
                        exc_msg_hold(c, argv[0], b, &mh, &mk);
-          if (hm) buf_printf(b, "((sp_%s *)sp_exc_attach_msg(", c->classes[ci].nivars > 0 ? c->classes[ci].c_name : "Exception");
-          if (c->classes[ci].nivars > 0)
+          if (hm) buf_printf(b, "((sp_%s *)sp_exc_attach_msg(", comp_inst_ivar_count(&c->classes[ci]) > 0 ? c->classes[ci].c_name : "Exception");
+          if (comp_inst_ivar_count(&c->classes[ci]) > 0)
             buf_printf(b, "((sp_%s *)sp_exc_new_sub_sized(sizeof(sp_%s), \"%s\", ",
                        c->classes[ci].c_name, c->classes[ci].c_name, cn2);
           else
@@ -3898,7 +3965,7 @@ int emit_call_new_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const c
             emit_syserr_call(c, id, "sp_syserr_msg_a", lead, argc, argv, b);
           }
           else emit_exc_msg_arg(c, argc >= 1 ? argv[0] : -1, b);
-          buf_puts(b, c->classes[ci].nivars > 0 ? "))" : ")");
+          buf_puts(b, comp_inst_ivar_count(&c->classes[ci]) > 0 ? "))" : ")");
           if (hm) buf_printf(b, ", %s))", mh.p);
           if (hm) exc_msg_release(b, mk);
           free(mh.p);
@@ -5743,7 +5810,7 @@ int emit_call_class_method_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
               ClassInfo *kc = &c->classes[k];
               int ik = comp_method_in_chain(c, k, "initialize", NULL);
               if (kc->is_value_type || kc->is_struct || kc->is_native_class || ik < 0 || c->scopes[ik].yields ||
-                  comp_cmethod_in_chain(c, k, "new", NULL) >= 0) plain = 0;
+                  call_target(c, id, k, "new", CT_CMETHOD, NULL) >= 0) plain = 0;
               subs++;
             }
             for (int a = 0; subs && plain && a < dargc; a++)
@@ -5785,7 +5852,7 @@ int emit_call_class_method_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
             int ik = comp_method_in_chain(c, k, "initialize", NULL);
             if (kc->is_value_type || kc->is_struct || kc->is_native_class ||
                 (ik >= 0 && c->scopes[ik].yields) ||
-                comp_cmethod_in_chain(c, k, "new", NULL) >= 0) { plain = 0; break; }
+                call_target(c, id, k, "new", CT_CMETHOD, NULL) >= 0) { plain = 0; break; }
             nsub++;
           }
           if (plain && nsub > 0) {
@@ -5905,7 +5972,7 @@ int emit_call_class_method_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
           call_target(c, id, iencl->class_id, name, 0, NULL) >= 0)
         goto skip_toplevel_include;
     }
-    int imi = comp_included_method_index(c, name, id);
+    int imi = call_target(c, id, -1, name, CT_INCLUDED, NULL);
     if (imi >= 0) {
       Scope *ms = &c->scopes[imi];
       if (g_plan_check) ucall_observe(c, id, imi, ms->class_id, 0);
@@ -6325,7 +6392,7 @@ int emit_call_reopen_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     default: break;
     }
     if (oc_cn >= 0) {
-      int oc_ci = rt == TY_IO ? io_reopen_class(c, name) : comp_core_class(c, oc_cn);
+      int oc_ci = rt == TY_IO ? io_reopen_class(c, id, name) : comp_core_class(c, oc_cn);
       if (oc_ci >= 0) {
         int oc_mi = call_target(c, id, oc_ci, name, 0, NULL);
         if (oc_mi >= 0 && rt == TY_IO) { emit_io_reopen_call(c, id, recv, name, b); return 1; }

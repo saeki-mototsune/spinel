@@ -1261,6 +1261,8 @@ int emit_op_method_arity(Compiler *c, const BopCtx *x, Buf *b) {
     }
     /* ...and Numeric's, which Integer's and Float's leave out */
     else if (msym && mcls && builtin_numeric_owns(mcls, msym) && builtin_numeric_arity(msym, &ba)) have_ba = 1;
+    /* ...and Enumerable's, which Array's and Hash's leave out */
+    else if (msym && mcls && builtin_enumerable_owns(mcls, msym) && builtin_enumerable_arity(msym, &ba)) have_ba = 1;
     /* A receiverless Kernel wrapper (`method(:String)`) has no receiver
        class; the builtin's real arity is keyed under "Kernel" (#4395). */
     else if (is_bam && mrecv < 0 && msym && builtin_method_arity("Kernel", msym, &ba)) have_ba = 1;
@@ -2400,6 +2402,11 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
     buf_puts(b, mi >= 0 || bop ? "sp_bm_set_thunk(sp_bm_set_abi(sp_bound_method_new_d(" : "sp_bm_set_thunk(sp_bm_set_abi(sp_bound_method_new(");
     if (self_rooted) buf_printf(b, "_t%d", self_tmp);
     else if (recv >= 0 && repr_of(c, recv).as_ty == TY_CLASS) buf_puts(b, "NULL");
+    /* (a Range is a value, not a pointer the self slot takes: one bound here
+       has no wrapper, so the bind raises; its receiver runs for its effects) */
+    else if (recv >= 0 && repr_of(c, recv).as_ty == TY_RANGE && repr_of(c, recv).kind != RK_BOXED) {
+      buf_puts(b, "((void)("); emit_expr(c, recv, b); buf_puts(b, "), (void *)NULL)");
+    }
     else if (recv >= 0) { buf_puts(b, "(void *)("); emit_expr(c, recv, b); buf_puts(b, ")"); }
     /* (on main, Object's method binds main: ML_OBJECT, method_obj_lookup) */
     else if (self_bound && self_is_main_raw(c, id)) { buf_puts(b, "sp_main_self().v.p"); self_kind = "SP_BM_SELF_MAIN"; }
@@ -2695,6 +2702,15 @@ static void emit_capture_absent_raise(Compiler *c, int id, const CallPlan *plan,
   buf_printf(b, "\" \"' for class '%s%s%s'\")[1]));", open, cn ? cn : c->classes[plan->owner_ci].name, close);
 }
 
+/* ...and for a capture on main, whose singleton class CRuby names by
+   main's default inspect (`#<Class:#<Object:0x...>>`) */
+static void emit_main_capture_absent_raise(Compiler *c, int id, Buf *b) {
+  const char *mn = method_sym_arg(c, id);
+  buf_puts(b, "sp_raise_cls(\"NameError\", sp_sprintf(\"undefined method '%s' for class '#<Class:#<Object:0x%016llx>>'\", \"");
+  emit_c_escaped(b, mn ? mn : "");
+  buf_puts(b, "\", (unsigned long long)(uintptr_t)sp_main_self().v.p));");
+}
+
 int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
   refuse_from_plan(c, id, CRF_CAPTURE, "refuse-capture");
   CallPlan plan = cplan_method_call(c, id);
@@ -2742,7 +2758,13 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       continue;
     }
     /* (no method there, CPLAN_ARM_NONE: the maker's NameError, as where no
-       entry is made) */
+       entry is made; on main's entry, naming main's singleton class) */
+    if (to[i] == CPLAN_ARM_NONE && c->scopes[mi].class_id < 0) {
+      buf_puts(b, "{ ");
+      emit_main_capture_absent_raise(c, id, b);
+      buf_printf(b, " _t%d = NULL; }\n", tr);
+      continue;
+    }
     buf_printf(b, "{ _t%d = ", tr);
     if (!emit_method_obj_target(c, id, b, nt, name, recv, argc, argv, to[i] == CPLAN_ARM_NONE ? -1 : cplan_capture_arm(c, id, to[i]))) {
       if (vr >= 0) view_unbind(vr);

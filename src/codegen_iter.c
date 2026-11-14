@@ -323,10 +323,8 @@ int local_is_handle(Compiler *c, int a) {
 /* --share-strings: a read of an ivar whose slot is the rule's handle */
 int ivar_read_is_handle(Compiler *c, int a) {
   if (a < 0 || nt_kind(c->nt, a) != NK_InstanceVariableReadNode) return 0;
-  const char *nm = nt_str(c->nt, a, "name");
-  int cid = nm ? strbuf_ivar_owner(c, a) : -1;
-  int iv = cid >= 0 ? comp_ivar_index(&c->classes[cid], nm) : -1;
-  return iv >= 0 && repr_of_ivar(c, cid, iv).share;
+  HolderRef h;
+  return holder_of_node_slot(c, a, &h) && h.idx >= 0 && repr_of_ivar(c, h.cid, h.idx).share;
 }
 /* A local that is the shared handle, as a reference to the handle itself
    rather than the copy a plain read of it takes. 0 when it is none. */
@@ -335,11 +333,14 @@ int ivar_read_is_handle(Compiler *c, int a) {
    takes a fresh handle of a String element, which keeps a frozen one
    frozen, or the handle a boxed element holds; any other takes `src`.
    Without the rule a parameter whose slot is a mutable String is bound
-   the same way: the element is no sp_String * either. */
+   the same way: the element is no sp_String * either. A `src` of type
+   TY_STRBUF is the handle a typed container holds (elem_held): the
+   handle itself into a handle slot, its bytes into any other. */
 void emit_strbuf_param_bind(Compiler *c, const LocalVar *pv, TyKind want, const char *src, Buf *b) {
   int h = repr_of_slot(c, pv).kind == RK_STRBUF;
+  if (want == TY_STRBUF) buf_printf(b, h ? "%s" : "SP_STR_B(%s)", src);
   /* (one representation: the source may be the element itself, SP_STR_HDL) */
-  if (h && want == TY_STRING) buf_printf(b, "SP_STR_HDL(%s)", src);
+  else if (h && want == TY_STRING) buf_printf(b, "SP_STR_HDL(%s)", src);
   else if (h && want == TY_POLY) buf_printf(b, "sp_poly_as_strbuf(%s)", src);
   else buf_puts(b, src);
 }
@@ -551,7 +552,7 @@ static void inline_target_lookup(Compiler *c, int id, const char *name, int recv
        called through the module. One that touches an instance variable is
        left to that arm, which refuses it: main holds no module state. */
     if (t->mi < 0) {
-      int imi = comp_included_method_index(c, name, id);
+      int imi = call_target(c, id, -1, name, CT_INCLUDED, NULL);
       if (imi >= 0 && !scope_uses_ivars(c, imi)) {
         t->mi = imi;
         if (c->scopes[imi].is_cmethod) t->cm_class = c->scopes[imi].class_id;
@@ -1572,7 +1573,7 @@ static int block_tail_needs_value_form(Compiler *c, int id) {
      void; the expression form holds it in a slot of its own (and nil where
      no break has a value) */
   if (nt_ref(nt, id, "receiver") < 0 && sp_streq(nm, "loop") && nt_ref(nt, id, "block") >= 0 &&
-      nt_ref(nt, id, "arguments") < 0 && comp_method_index(c, "loop") < 0) return 1;
+      nt_ref(nt, id, "arguments") < 0 && call_target(c, id, -1, "loop", CT_TOP, NULL) < 0) return 1;
   /* a String mutator that answers its receiver (concat, replace, insert,
      prepend): the statement form changes the String and has no value,
      and the block answers the String (#8400) */
@@ -2605,8 +2606,13 @@ void emit_block_binds(Compiler *c, int blk, const int *yargs, int yc,
 static int block_tail_raises_untyped(Compiler *c, int tail, TyKind want_ty) {
   if (want_ty == TY_UNKNOWN || want_ty == TY_VOID || want_ty == TY_NIL) return 0;
   if (const_read_raises(c, tail)) return 1;
-  return (want_ty != TY_POLY || g_promote_mode) &&
-         nt_kind(c->nt, tail) == NK_CallNode && comp_ntype(c, tail) == TY_UNKNOWN;
+  if (nt_kind(c->nt, tail) != NK_CallNode || comp_ntype(c, tail) != TY_UNKNOWN) return 0;
+  /* a boxed slot takes the gate's raise as it is, but not a call that
+     answers no value (a `super` with no method above, `(const char *)0`
+     after it), one that never returns, or one no class answers (`nil.at(0)`,
+     its placeholder 0) */
+  return want_ty != TY_POLY || g_promote_mode ||
+         call_answers_no_value(c, tail) || call_never_returns(c, tail) || call_unanswered_boxed(c, tail);
 }
 
 static int block_tail_lacks_value(Compiler *c, int id, int poly) {
@@ -3722,7 +3728,7 @@ int call_targets_yielding_method(Compiler *c, int id) {
        E } }` under `include T` gave "invalid argument type 'void' to unary
        expression" at check's `unless yield`. */
     if (mi < 0) {
-      int imi = comp_included_method_index(c, name, id);
+      int imi = call_target(c, id, -1, name, CT_INCLUDED, NULL);
       if (imi >= 0 && !scope_uses_ivars(c, imi)) mi = imi;
     }
   }
@@ -4081,6 +4087,11 @@ int emit_tap_then_expr(Compiler *c, int id, Buf *b) {
   int recv = nt_ref(nt, id, "receiver");
   if (recv < 0) return 0;
   TyKind et = repr_of(c, recv).as_ty;
+  /* `x&.then { }` on a pointer whose NULL is nil (a Regexp, a Proc, an
+     Exception a nil-defaulted parameter holds): the safe-navigation guard
+     comes first and re-enters here for the non-nil arm (#11851) */
+  if (nt_safe_nav(nt, id) && g_sn_skip != id && ty_null_is_nil(et) && et != TY_POLY &&
+      et != TY_STRING && !ty_is_object(et) && node_may_be_null_nil(c, recv)) return 0;
   /* an object whose class writes its own tap / then is called */
   if (ty_is_object(et) && call_target(c, id, ty_object_class(et), name, 0, NULL) >= 0) return 0;
   /* a boxed receiver that may be one goes through the dispatch, whose
@@ -4707,12 +4718,6 @@ int emit_iter_value_expr(Compiler *c, int id, Buf *b) {
   return 1;
 }
 
-/* A walk over an Integer-valued typed Hash that may hold a nil value
-   (hash_vals_nullable, D3b-ii): its values are read through `_vget`, with
-   the nil */
-static int iter_hash_vnil(Compiler *c, int recv, TyKind rt) {
-  return (rt == TY_STR_INT_HASH || rt == TY_INT_INT_HASH) && hash_vals_nullable(c, recv);
-}
 /* Bind such a value (`src`, an sp_oint) to block parameter pv: as is into
    an oint slot, boxed into a boxed one; a plain Integer slot takes it
    through sp_oint_arg, whose nil is the TypeError */
@@ -4849,8 +4854,14 @@ int emit_hash_filter_loop(Compiler *c, int recv, int block, TyKind rt, const cha
     buf_printf(b, "sp_PolyArray_push(_t%d, ", tp); emit_boxed_text(c, hkt, ks, b); buf_puts(b, ");\n");
     emit_indent(b, indent + 1);
     buf_printf(b, "sp_PolyArray_push(_t%d, ", tp);
-    if (iter_hash_vnil(c, recv, rt)) buf_printf(b, "sp_box_oint(%s)", hash_order_oval(rt, t, ti));
-    else emit_boxed_text(c, hvt, hash_order_val(rt, t, ti), b);
+    if (hash_int_vals_nil(c, recv, rt)) buf_printf(b, "sp_box_oint(%s)", hash_order_oval(rt, t, ti));
+    else if (rt == TY_POLY_POLY_HASH) buf_puts(b, hash_order_val(rt, t, ti));
+    else {
+      char hs2[32], ks2[64];
+      snprintf(hs2, sizeof hs2, "_t%d", t);
+      snprintf(ks2, sizeof ks2, "_t%d->order[_t%d]", t, ti);
+      emit_hash_val_box_text(c, rt, hs2, ks2, b);
+    }
     buf_puts(b, ");\n");
     char vals[32]; snprintf(vals, sizeof vals, "_t%d", tp);
     emit_boxed_step_binds(c, block, vals, b, indent + 1, 0);
@@ -4866,7 +4877,7 @@ int emit_hash_filter_loop(Compiler *c, int recv, int block, TyKind rt, const cha
     else if (hkt == TY_STRING) buf_printf(b, " SP_GC_ROOT_STR(lv_%s);", kp);
     buf_puts(b, "\n");
   }
-  if (vp && iter_hash_vnil(c, recv, rt)) {
+  if (vp && hash_int_vals_nil(c, recv, rt)) {
     /* a value that can be nil (D3b-ii), bound as the parameter holds it */
     emit_indent(b, indent + 1);
     buf_puts(b, vlv && slot_is_oint(vlv) ? "sp_oint" : "sp_int");
@@ -4875,9 +4886,17 @@ int emit_hash_filter_loop(Compiler *c, int recv, int block, TyKind rt, const cha
     buf_puts(b, ";\n");
   }
   else if (vp) {
-    emit_indent(b, indent + 1); emit_ctype(c, hvt, b);
-    buf_printf(b, " lv_%s = %s;", vp, hash_order_val(rt, t, ti));
+    /* a value of a Hash that holds the handle (elem_held) binds as that
+       handle into a parameter whose slot is one, its bytes into any other */
+    int vh = typed_elem_held(rt) == TY_STRBUF && repr_of_slot(c, vlv).kind == RK_STRBUF;
+    emit_indent(b, indent + 1);
+    if (vh) buf_puts(b, "sp_String *"); else emit_ctype(c, hvt, b);
+    buf_printf(b, " lv_%s = ", vp);
+    if (typed_elem_held(rt) == TY_STRBUF) emit_strbuf_param_bind(c, vlv, TY_STRBUF, hash_order_val(rt, t, ti), b);
+    else buf_puts(b, hash_order_val(rt, t, ti));
+    buf_puts(b, ";");
     if (hvt == TY_POLY) buf_printf(b, " SP_GC_ROOT_RBVAL(lv_%s);", vp);
+    else if (vh) buf_printf(b, " SP_GC_ROOT(lv_%s);", vp);
     else if (hvt == TY_STRING) buf_printf(b, " SP_GC_ROOT_STR(lv_%s);", vp);
     buf_puts(b, "\n");
   }
@@ -6792,13 +6811,15 @@ static int iter_ewi_zip_poly_arms(Compiler *c, int id, Buf *b, int indent, const
   }
 
   /* array.zip(other) { |a, b| ... } -- block form, returns nil */
-  if (is_zip_name(name) && (ty_is_array(rt) || rt == TY_POLY) && block >= 0) {
+  /* (an Array of one class, narrow_object_arrays, is walked as a typed one:
+     its element read as its sp_X *, nil past its end) */
+  if (is_zip_name(name) && (ty_is_array(rt) || ty_is_obj_array(rt) || rt == TY_POLY) && block >= 0) {
     int zargs_n = nt_ref(nt, id, "arguments");
     int zargc = 0; const int *zargv = zargs_n >= 0 ? nt_arr(nt, zargs_n, "arguments", &zargc) : NULL;
     /* The receiver, too, can be an array only at run time (a row read out of a
        poly table): walk it through the boxed accessors. Without this the call
        fell to the runtime dispatch, which has no zip arm at all. */
-    int recv_poly = !ty_is_array(rt);
+    int recv_poly = !ty_is_array(rt) && !ty_is_obj_array(rt);
     const char *k = recv_poly ? "Poly" : array_iter_kind(rt);
     int zsplat = nt_argv_has_splat(nt, zargv, zargc);
     if (k && (zargc != 1 || zsplat)) {
@@ -6807,14 +6828,15 @@ static int iter_ewi_zip_poly_arms(Compiler *c, int id, Buf *b, int indent, const
     }
     if (k && zargc == 1 && zargv) {
       TyKind a0t = repr_of(c, zargv[0]).as_ty;
-      const char *k2 = ty_is_array(a0t) ? array_iter_kind(a0t) : NULL;
+      int a0_typed = ty_is_array(a0t) || ty_is_obj_array(a0t);
+      const char *k2 = a0_typed ? array_iter_kind(a0t) : NULL;
       /* The other operand may be an array only at run time (a poly element of
          a table of rows). Read it through the boxed accessor rather than
          handing an sp_RbVal to the typed one. */
       int arg_poly = (k2 == NULL);
       if (!k2) k2 = k;
       TyKind et = recv_poly ? TY_POLY : ty_array_elem(rt);
-      TyKind et2 = ty_is_array(a0t) ? ty_array_elem(a0t) : (arg_poly ? TY_POLY : et);
+      TyKind et2 = a0_typed ? ty_array_elem(a0t) : (arg_poly ? TY_POLY : et);
       const char *p1n = block_param_name(c, block, 1); if (p1n) p1n = rename_local(p1n);
       int t = ++g_tmp;
       Buf rb; memset(&rb, 0, sizeof rb);
@@ -6842,7 +6864,7 @@ static int iter_ewi_zip_poly_arms(Compiler *c, int id, Buf *b, int indent, const
         /* (a receiver or operand the block may rebind is read once: the
            walk is over the objects the call was made with) */
         hoist_loop_recv_as(c, rt, &rb, b, indent, !hcv_node_stable(c, body, block, recv));
-        if (ty_is_array(a0t)) hoist_loop_recv_as(c, a0t, &ob, b, indent, !hcv_node_stable(c, body, block, zargv[0]));
+        if (a0_typed) hoist_loop_recv_as(c, a0t, &ob, b, indent, !hcv_node_stable(c, body, block, zargv[0]));
       }
       /* An operand that is no typed array is taken as CRuby's block zip
          takes it, once ahead of the walk (sp_zip_block_arg, as
@@ -7248,14 +7270,16 @@ static int iter_hash_arms(Compiler *c, Buf *b, int indent, int block, const char
       }
       else {
         char kx[256], vx[288];
-        int vn = iter_hash_vnil(c, recv, rt);
+        int vn = hash_int_vals_nil(c, recv, rt);
         snprintf(kx, sizeof kx, "%s->order[_t%d]", rb.p, t);
-        snprintf(vx, sizeof vx, "sp_%sHash_%s(%s, %s->order[_t%d])", hn, vn ? "vget" : "get", rb.p, rb.p, t);
+        snprintf(vx, sizeof vx, "sp_%sHash_%s%s(%s, %s->order[_t%d])", hn, vn ? "vget" : "get",
+                 vn ? "" : typed_elem_store_sfx(rt), rb.p, rb.p, t);
         Buf bx; memset(&bx, 0, sizeof bx);
         emit_boxed_text(c, ty_hash_key(rt), kx, &bx);
         buf_printf(b, "sp_PolyArray_push(_t%d, %s); ", tpp, bx.p ? bx.p : ""); free(bx.p);
         memset(&bx, 0, sizeof bx);
-        if (vn) buf_printf(&bx, "sp_box_oint(%s)", vx); else emit_boxed_text(c, ty_hash_val(rt), vx, &bx);
+        if (vn) buf_printf(&bx, "sp_box_oint(%s)", vx);
+        else emit_held_boxed_text(c, typed_elem_held(rt), vx, &bx);
         buf_printf(b, "sp_PolyArray_push(_t%d, %s); ", tpp, bx.p ? bx.p : ""); free(bx.p);
       }
       buf_printf(b, "sp_box_poly_array(_t%d); })", tpp);
@@ -7291,11 +7315,14 @@ static int iter_hash_arms(Compiler *c, Buf *b, int indent, int block, const char
       TyKind want1 = ty_hash_val(rt);
       int box1 = pv1 && pv1->type == TY_POLY && want1 != TY_POLY;
       char src1[256];
-      int vn1 = iter_hash_vnil(c, recv, rt);
+      int vn1 = hash_int_vals_nil(c, recv, rt);
       if (rt == TY_POLY_POLY_HASH)
         snprintf(src1, sizeof src1, "%s->vals[%s->order[_t%d]]", rb.p, rb.p, t);
       else
-        snprintf(src1, sizeof src1, "sp_%sHash_%s(%s, %s->order[_t%d])", hn, vn1 ? "vget" : "get", rb.p, rb.p, t);
+        snprintf(src1, sizeof src1, "sp_%sHash_%s%s(%s, %s->order[_t%d])", hn, vn1 ? "vget" : "get",
+                 vn1 ? "" : typed_elem_store_sfx(rt), rb.p, rb.p, t);
+      /* (the value as the Hash holds it, elem_held) */
+      want1 = typed_elem_held(rt);
       emit_indent(b, indent + 1);
       buf_printf(b, "lv_%s = ", p1);
       /* a value that can be nil (D3b-ii): already the oint */
@@ -7309,7 +7336,7 @@ static int iter_hash_arms(Compiler *c, Buf *b, int indent, int block, const char
       /* a boxed value into a typed parameter: unboxed to its type */
       else if (want1 == TY_POLY && pv1 && pv1->type != TY_POLY && pv1->type != TY_UNKNOWN && !box1)
         emit_unbox_text(c, pv1->type, src1, b);
-      else if (box1) emit_boxed_text(c, want1, src1, b); else emit_strbuf_param_bind(c, pv1, want1, src1, b);
+      else if (box1) emit_held_boxed_text(c, want1, src1, b); else emit_strbuf_param_bind(c, pv1, want1, src1, b);
       buf_puts(b, ";\n");
     }
     emit_loop_body(c, body, b, indent + 1);
@@ -7358,15 +7385,19 @@ static int iter_hash_arms(Compiler *c, Buf *b, int indent, int block, const char
         else
           snprintf(src, sizeof src, "%s->keys[%s->order[_t%d]]", rb.p, rb.p, t);
       }
-      else if (is_val)
-        snprintf(src, sizeof src, "sp_%sHash_%s(%s, %s->order[_t%d])", hn,
-                 iter_hash_vnil(c, recv, rt) ? "vget" : "get", rb.p, rb.p, t);
+      else if (is_val) {
+        int vn = hash_int_vals_nil(c, recv, rt);
+        snprintf(src, sizeof src, "sp_%sHash_%s%s(%s, %s->order[_t%d])", hn, vn ? "vget" : "get",
+                 vn ? "" : typed_elem_store_sfx(rt), rb.p, rb.p, t);
+        /* (the value as the Hash holds it, elem_held) */
+        want = typed_elem_held(rt);
+      }
       else
         snprintf(src, sizeof src, "%s->order[_t%d]", rb.p, t);
       emit_indent(b, indent + 1);
       buf_printf(b, "lv_%s = ", p0);
-      if (is_val && iter_hash_vnil(c, recv, rt)) iter_bind_hash_oval(c, pv, src, b);
-      else if (box) emit_boxed_text(c, want, src, b);
+      if (is_val && hash_int_vals_nil(c, recv, rt)) iter_bind_hash_oval(c, pv, src, b);
+      else if (box) emit_held_boxed_text(c, want, src, b);
       else if (unbox) emit_unbox_text(c, pv->type, src, b);
       else emit_strbuf_param_bind(c, pv, want, src, b);
       buf_puts(b, ";\n");

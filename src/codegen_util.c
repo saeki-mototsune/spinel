@@ -5,6 +5,7 @@
 #include "holder.h"
 #include "value_pos.h"
 #include "builtin_ops.h"
+#include "implicit_calls.h"
 #include "codegen_call_arms.h"
 #include <ctype.h>
 
@@ -740,19 +741,23 @@ int subtree_may_allocate(const NodeTable *nt, int id) {
    rule made the handle) renders as a fresh copy of the live buffer, not as
    the slot itself. A read marked to hand out the handle (strbuf_box)
    copies nothing. The checks are strbuf_slot_text's, without the emission
-   it does, on the read inside any parentheses (`(a) == b`). */
+   it does, on the read inside any parentheses (`(a) == b`). A node the
+   binder ran into a temp first answers no: reading its temp allocates
+   nothing, though its evaluation did (subtree_may_allocate asks that). */
 int operand_may_allocate(Compiler *c, int id) {
+  int inner = nt_paren_single(c->nt, id);
+  /* a node the binder ran into a temp first is read as that temp, which
+     allocates nothing, whatever its subtree does */
+  if (view_ran_first(id) || (inner >= 0 && view_ran_first(inner))) return 0;
   if (subtree_may_allocate(c->nt, id)) return 1;
-  id = nt_paren_single(c->nt, id);
-  if (id < 0 || view_ran_first(id) || repr_of(c, id).handle) return 0;
+  id = inner;
+  if (id < 0 || repr_of(c, id).handle) return 0;
   if (strbuf_local_name(c, id)) return 1;
   if (repr_self_shared(c, id)) return 1;
   if (repr_static_read_kind(nt_kind(c->nt, id)) && repr_of(c, id).share) return 1;
   if (nt_kind(c->nt, id) != NK_InstanceVariableReadNode) return 0;
-  const char *nm = nt_str(c->nt, id, "name");
-  int cid = nm ? strbuf_ivar_owner(c, id) : -1;
-  int iv = cid >= 0 ? comp_ivar_index(&c->classes[cid], nm) : -1;
-  return iv >= 0 && c->classes[cid].ivar_types[iv] == TY_STRBUF;
+  HolderRef h;
+  return holder_of_node_slot(c, id, &h) && h.idx >= 0 && c->classes[h.cid].ivar_types[h.idx] == TY_STRBUF;
 }
 /* True if evaluating the subtree at `id` can be observed by, or can observe,
    a sibling argument's evaluation: any call (a user method, a mutating builtin,
@@ -781,6 +786,36 @@ int call_is_scalar_op(Compiler *c, int id) {
   int scalar_r = (rt == TY_INT || rt == TY_FLOAT || rt == TY_BOOL);
   int scalar_v = (vt == TY_INT || vt == TY_FLOAT || vt == TY_BOOL);
   return scalar_r && scalar_v;
+}
+/* call_is_scalar_op asks the receiver and the result, not the operand. An
+   Integer's or a Float's operator hands an operand of another class to that
+   operand's own coerce, to_int or ==, the program's code, so a reader asks
+   one of these too. */
+/* ...whose one operand is a number or a boolean: what a plain C value and a
+   format argument take, with no conversion that could allocate. */
+int scalar_op_over_scalars(Compiler *c, int id) {
+  int ac = 0;
+  const int *av = call_args(c->nt, id, &ac);
+  TyKind t = ac == 1 ? comp_ntype(c, av[0]) : TY_UNKNOWN;
+  return call_is_scalar_op(c, id) && (t == TY_INT || t == TY_FLOAT || t == TY_BOOL);
+}
+/* ...of Integers and Floats alone, the receiver and every operand: the
+   operators the pure-argument walks take (arg_runs_nothing). */
+int scalar_op_over_numbers(Compiler *c, int id) {
+  if (!call_is_scalar_op(c, id) || comp_ntype(c, nt_ref(c->nt, id, "receiver")) == TY_BOOL) return 0;
+  int ac = 0;
+  const int *av = call_args(c->nt, id, &ac);
+  for (int i = 0; i < ac; i++)
+    if (comp_ntype(c, av[i]) != TY_INT && comp_ntype(c, av[i]) != TY_FLOAT) return 0;
+  return 1;
+}
+/* ...whose operand reaches no method of the program's: `1 << obj` runs
+   obj.to_int and `1 | obj` obj.coerce, the calls the implicit-call table
+   names, when the program defines one and the operand may be its object
+   (ic_node_may_call_program). What the operand-order record and the pure
+   walk take. */
+int scalar_op_runs_no_code(Compiler *c, int id) {
+  return call_is_scalar_op(c, id) && !ic_node_may_call_program(c, id);
 }
 /* Can a builtin operator over scalars (call_is_scalar_op) raise? A
    quotient of two Integers and any modulo (a Float one too) raise
@@ -817,9 +852,9 @@ int call_unused_block(Compiler *c, int id) {
   return nt_kind(nt, blk) == NK_BlockArgumentNode && !subtree_has_side_effect(c, blk) ? blk : -1;
 }
 
-int subtree_has_side_effect(Compiler *c, int id) {
+/* See codegen_internal.h. */
+int node_has_side_effect(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
-  if (id < 0) return 0;
   const char *ty = nt_type(nt, id);
   NodeKind k = nt_kind(nt, id);
   if (!ty) return 0;
@@ -833,6 +868,13 @@ int subtree_has_side_effect(Compiler *c, int id) {
   /* a bare Array.new / Hash.new is as empty and as unobservable as the
      literal `[]` / `{}`, which is no effect */
   if (k == NK_CallNode && !call_is_scalar_op(c, id) && !node_is_empty_container(c, id)) return 1;
+  return -1;
+}
+int subtree_has_side_effect(Compiler *c, int id) {
+  const NodeTable *nt = c->nt;
+  if (id < 0) return 0;
+  int own = node_has_side_effect(c, id);
+  if (own >= 0) return own;
   int nr = nt_num_refs(nt, id);
   for (int i = 0; i < nr; i++)
     if (subtree_has_side_effect(c, nt_ref_at(nt, id, i))) return 1;
@@ -845,19 +887,18 @@ int subtree_has_side_effect(Compiler *c, int id) {
   }
   return 0;
 }
-/* See codegen_internal.h. A write names the variable; a call on self
-   follows the one method the classes from `cls` down define for it, up to
-   a few calls deep; anything else that runs code of the program's -- a
-   call on another object, a yield, a super, a block -- may write it. */
-int subtree_may_write_ivar(Compiler *c, int id, const char *iv, int cls, int depth) {
+/* See compiler.h. A write names the variable; a call on self follows the
+   one method the classes from `cls` down define for it, up to a few calls
+   deep; anything else that runs code of the program's -- a call on another
+   object, a yield, a super, a block -- may write any. */
+int node_ivar_writes(Compiler *c, int id, int cls, int depth, IvarWriteFn add, void *ctx) {
   const NodeTable *nt = c->nt;
-  if (id < 0) return 0;
   const char *ty = nt_type(nt, id);
   NodeKind k = nt_kind(nt, id);
   if (!ty) return 0;
   if (!strncmp(ty, "InstanceVariable", 16) && (strstr(ty, "Write") || strstr(ty, "Target"))) {
     const char *wn = nt_str(nt, id, "name");
-    if (!wn || sp_streq(wn, iv)) return 1;
+    if (!wn || add(ctx, wn)) return 1;
   }
   if (k == NK_SuperNode || k == NK_ForwardingSuperNode || k == NK_YieldNode ||
       k == NK_BlockNode || k == NK_LambdaNode || k == NK_BlockArgumentNode)
@@ -868,19 +909,36 @@ int subtree_may_write_ivar(Compiler *c, int id, const char *iv, int cls, int dep
     if (recv >= 0 && nt_kind(nt, recv) != NK_SelfNode) return 1;
     int mi = cls >= 0 && nm && depth < 3 ? call_target(c, id, cls, nm, 0, NULL) : -1;
     if (mi < 0 || c->scopes[mi].def_node < 0 || dispatch_impl_count(c, id, cls, nm) != 1) return 1;
-    if (subtree_may_write_ivar(c, nt_ref(nt, c->scopes[mi].def_node, "body"), iv, cls, depth + 1)) return 1;
+    if (subtree_ivar_writes(c, nt_ref(nt, c->scopes[mi].def_node, "body"), cls, depth + 1, add, ctx)) return 1;
   }
+  return -1;
+}
+int subtree_ivar_writes(Compiler *c, int id, int cls, int depth, IvarWriteFn add, void *ctx) {
+  const NodeTable *nt = c->nt;
+  if (id < 0) return 0;
+  int own = node_ivar_writes(c, id, cls, depth, add, ctx);
+  if (own >= 0) return own;
   int nr = nt_num_refs(nt, id);
   for (int i = 0; i < nr; i++)
-    if (subtree_may_write_ivar(c, nt_ref_at(nt, id, i), iv, cls, depth)) return 1;
+    if (subtree_ivar_writes(c, nt_ref_at(nt, id, i), cls, depth, add, ctx)) return 1;
   int na = nt_num_arrs(nt, id);
   for (int i = 0; i < na; i++) {
     int n = 0;
     const int *ids = nt_arr_at(nt, id, i, &n);
     for (int j = 0; j < n; j++)
-      if (subtree_may_write_ivar(c, ids[j], iv, cls, depth)) return 1;
+      if (subtree_ivar_writes(c, ids[j], cls, depth, add, ctx)) return 1;
   }
   return 0;
+}
+/* the one name asked: stop at its write */
+static int ivar_write_is(void *iv, const char *wn) {
+  return sp_streq(wn, (const char *)iv);
+}
+int node_may_write_ivar(Compiler *c, int id, const char *iv, int cls, int depth) {
+  return node_ivar_writes(c, id, cls, depth, ivar_write_is, (void *)iv);
+}
+int subtree_may_write_ivar(Compiler *c, int id, const char *iv, int cls, int depth) {
+  return subtree_ivar_writes(c, id, cls, depth, ivar_write_is, (void *)iv);
 }
 int  g_tmp = 0;
 int  g_one_held = 0;
@@ -1244,7 +1302,7 @@ static int yield_builtin_method_site_type(const Compiler *c, int id, TyKind *out
   if (!sp_yield_site_type(c, recv, &rt)) return 0;
   /* a site whose class reopens the name: the reopen's return type, for an
      Array or Hash as for a scalar (yield_recv_chain_kind says why) */
-  { int rmi = cplan_builtin_call(c, id) ? -1 : comp_builtin_kind_reopen_mi((Compiler *)c, rt, op);
+  { int rmi = cplan_builtin_call(c, id) ? -1 : comp_builtin_kind_reopen_mi((Compiler *)c, id, rt, op);
     if (rmi >= 0) {
       TyKind rr = c->scopes[rmi].ret;
       if (rr == TY_UNKNOWN || rr == TY_VOID) return 0;
@@ -1408,6 +1466,9 @@ int g_dm_subst_node = -1;
 int g_ie_class_id = -1;
 int g_ie_discard_value = 0;
 int g_ie_nil_ivars = 0;
+int ie_nil_ivar_read(Compiler *c, int node) {
+  return g_ie_nil_ivars && ie_class_of(c, node) < 0;
+}
 const char *g_rescue_cls = NULL, *g_rescue_msg = NULL;
 const char *g_retry_label = NULL;
 int g_redo_stack[64];
@@ -2002,14 +2063,15 @@ int g_re_init_needed = 0;
    the array it lands in (unshift, insert, fill) as able to hold one.
 
    How the element is held is the container's ty_traits row (rt, the
-   Array's kind): its elem_held column names the kind, and its elem_sfx
-   the suffix of the runtime entries that store it. A String Array holds
-   the String's handle (sp_strelem), stored through the `_e` entries: the
-   value is taken as its handle where it is written (emit_typed_elem_hold),
-   so a String in hand is stored as itself rather than handed over as its
-   bytes for the runtime to find the handle again (sp_strelem_fx). */
+   Array's kind, or the Hash's whose value it is): its elem_held column
+   names the kind, and its elem_sfx the suffix of the runtime entries that
+   store it. A String Array, and a Hash of String values, hold the String's
+   handle (sp_strelem), stored through the `_e` entries: the value is taken
+   as its handle where it is written (emit_typed_elem_hold), so a String in
+   hand is stored as itself rather than handed over as its bytes for the
+   runtime to find the handle again (sp_strelem_fx). */
 void emit_typed_elem_value(Compiler *c, int node, TyKind rt, Buf *b) {
-  TyKind et = ty_array_elem(rt);
+  TyKind et = typed_elem_kind(rt);
   Repr vr = repr_of(c, node);
   TyKind vt = vr.as_ty;
   Buf v; memset(&v, 0, sizeof v);
@@ -2026,20 +2088,26 @@ void emit_typed_elem_value(Compiler *c, int node, TyKind rt, Buf *b) {
     emit_unresolved_coerced(c, node, et, &v);
   else if (et == TY_INT) emit_int_expr_nilable(c, node, &v);
   else if (et == TY_FLOAT) emit_float_expr(c, node, &v);
-  else is_held = emit_typed_elem_coerce(c, node, rt, "an Array element", &v);
+  else is_held = emit_typed_elem_coerce(c, node, rt, ty_is_hash(rt) ? "a Hash element store" : "an Array element", &v);
   if (is_held) buf_puts(b, v.p ? v.p : "");
   else emit_typed_elem_hold(c, node, rt, v.p ? v.p : "", b);
   free(v.p);
 }
-/* The suffix of the element-store entries of typed Array kind rt (the
-   elem_sfx column), or NULL for a kind that is no typed Array */
+/* The element kind of typed container kind rt: an Array's element, a
+   Hash's value */
+TyKind typed_elem_kind(TyKind rt) {
+  return ty_is_hash(rt) ? ty_hash_val(rt) : ty_array_elem(rt);
+}
+/* The suffix of the element-store entries of typed container kind rt (the
+   elem_sfx column: a typed Array, a Hash of String values), or NULL for a
+   kind that has none */
 const char *typed_elem_sfx(TyKind rt) {
   const TyTraits *tr = ty_traits_of(rt);
   return tr ? tr->elem_sfx : NULL;
 }
-/* The kind typed Array kind rt holds its element as (the elem_held
+/* The kind typed container kind rt holds its element as (the elem_held
    column): the element's own kind, or the handle (TY_STRBUF) for a String
-   element; TY_UNKNOWN for a kind that is no typed Array */
+   element or a Hash's String value; TY_UNKNOWN for a kind that has none */
 TyKind typed_elem_held(TyKind rt) {
   const TyTraits *tr = ty_traits_of(rt);
   return tr ? (TyKind)tr->elem_held : TY_UNKNOWN;
@@ -2048,6 +2116,20 @@ TyKind typed_elem_held(TyKind rt) {
 const char *typed_elem_store_sfx(TyKind rt) {
   const char *s = typed_elem_sfx(rt);
   return s ? s : "";
+}
+/* Can a value of an Integer-valued typed Hash (kind rt, receiver recv) be
+   nil? Where analyze marked the Hash as able to hold one (hash_vals_nullable,
+   D3b-ii) its values are read through `_vget`, with the nil. */
+int hash_int_vals_nil(Compiler *c, int recv, TyKind rt) {
+  return (rt == TY_STR_INT_HASH || rt == TY_INT_INT_HASH) && hash_vals_nullable(c, recv);
+}
+/* text, an element (or value) read from a typed container as the container
+   holds it (typed_elem_held), boxed: a String one, held as the handle, boxes
+   as the handle's own box (SP_SEBOX, nil for NULL), which keeps its
+   identity; any other as emit_boxed_text boxes its kind. */
+void emit_held_boxed_text(Compiler *c, TyKind held, const char *text, Buf *b) {
+  if (held == TY_STRBUF) buf_printf(b, "SP_SEBOX(%s)", text);
+  else emit_boxed_text(c, held, text, b);
 }
 /* Value node into an element of typed Array kind rt, as its slot converts
    or refuses it (emit_coerce), the face aside: where the element is held as
@@ -2059,7 +2141,7 @@ const char *typed_elem_store_sfx(TyKind rt) {
    already: the answer is 1 then, and the text is not handed to
    emit_typed_elem_hold; 0 for every other text. */
 int emit_typed_elem_coerce(Compiler *c, int node, TyKind rt, const char *what, Buf *b) {
-  TyKind et = ty_array_elem(rt), from = TY_UNKNOWN;
+  TyKind et = typed_elem_kind(rt), from = TY_UNKNOWN;
   if (typed_elem_held(rt) == TY_STRBUF && repr_coerce_plan(c, node, et, CO_HOLD, &from) == CF_FIT &&
       (from == TY_STRING || from == TY_STRBUF)) {
     if (repr_of(c, node).kind != RK_BOXED && one_str_elem_call(c, node, TY_UNKNOWN)) {
@@ -2099,6 +2181,8 @@ int typed_elem_hold_may_make(Compiler *c, int node, TyKind rt) {
   if (node < 0) return 0;
   NodeKind k = nt_kind(c->nt, node);
   if (k == NK_NilNode) return 0;
+  /* a frozen literal is held as its own static object (strbuf_new_of_text) */
+  if (k == NK_StringNode && nt_int(c->nt, node, "fzl", 0)) return 0;
   int var = k == NK_LocalVariableReadNode || k == NK_InstanceVariableReadNode || repr_static_read_kind(k);
   return !(var && repr_of(c, node).handle);
 }
@@ -2487,26 +2571,6 @@ const char *strbuf_local_name(Compiler *c, int recv) {
   LocalVar *rl = rs ? scope_local(rs, rn) : NULL;
   return repr_of_slot(c, rl).kind == RK_STRBUF ? rn : NULL;
 }
-/* The owning class slot of an ivar READ node, mirroring the read emitter's
-   storage resolution: instance method -> its class; top-level method ->
-   the Toplevel pseudo-class; a class method -> its class, whose civ_ slot
-   holds it (strbuf_slot_text); an instance_eval context returns -1 (its
-   storage is not a per-instance field). */
-int strbuf_ivar_owner(Compiler *c, int node) {
-  /* (--share-strings: an ivar in an instance_eval/exec splice is the
-     rebound receiver's, as the ivar emitter takes it: `K.new(s).instance_exec
-     { @name }` read the surrounding scope's slot facts for K's @name) */
-  if (ie_class_of(c, node) >= 0) return ie_class_of(c, node);
-  Scope *cs = comp_scope_of(c, node);
-  if (!cs) return -1;
-  if (cs->is_cmethod) return cs->class_id;
-  if (cs->class_id >= 0) return cs->class_id;
-  if (g_ie_class_id >= 0) return g_ie_class_id;
-  /* a block or a proc written in a class or module body reads the body
-     class's own slot, as the read emitter resolves it */
-  if (holder_cbody(c, node) >= 0) return holder_cbody(c, node);
-  return c->toplevel_class;
-}
 /* ---- Is an object's ivar set? ----
    An object lays out every ivar its class can hold, and a slot nothing has
    written yet reads nil -- which instance_variables, instance_variable_
@@ -2708,7 +2772,7 @@ static int ivs_order_init(Compiler *c, int cid, int leaf, int *ord, int *n, int 
   return ok;
 }
 static void ivs_order_add(Compiler *c, int leaf, const char *ivn, int *ord, int *n) {
-  int ix = comp_ivar_index(&c->classes[leaf], ivn);
+  int ix = comp_inst_ivar_index(&c->classes[leaf], ivn);
   for (int i = 0; ix >= 0 && i < *n; i++) if (ord[i] == ix) return;
   if (ix >= 0) ord[(*n)++] = ix;
 }
@@ -2743,7 +2807,8 @@ static int ivs_order_walk(Compiler *c, int body, int mi, int leaf, int *ord, int
   if (k == NK_StatementsNode) {
     int cnt = 0; const int *st = nt_arr(nt, body, "body", &cnt);
     /* once every ivar has been entered, the rest cannot change the order */
-    for (int i = 0; i < cnt && *n < c->classes[leaf].nivars; i++)
+    int ninst = comp_inst_ivar_count(&c->classes[leaf]);
+    for (int i = 0; i < cnt && *n < ninst; i++)
       if (!ivs_order_walk(c, st[i], mi, leaf, ord, n, depth)) return 0;
     return 1;
   }
@@ -3080,7 +3145,7 @@ static int ivs_tracked(Compiler *c, int cid, const char *ivn, int *memo, int *bm
   /* the base kinds of the members, and whether one is observed; only then
      do the costlier checks of initialize's order and of the writes run */
   for (int k = 0; k < c->nclasses && fam > 0; k++) {
-    int iv = c->classes[k].presence_family == fam ? comp_ivar_index(&c->classes[k], ivn) : -1;
+    int iv = c->classes[k].presence_family == fam ? comp_inst_ivar_index(&c->classes[k], ivn) : -1;
     if (iv < 0) continue;
     int slot = iv < 64 ? k * 64 + iv : -1;
     int base = slot >= 0 && bmemo[slot] >= 0 ? bmemo[slot] : ivs_base_kind(c, k, ivn);
@@ -3090,7 +3155,7 @@ static int ivs_tracked(Compiler *c, int cid, const char *ivn, int *memo, int *bm
     set0 |= base == 0;
   }
   for (int k = 0; k < c->nclasses && seen; k++) {
-    int iv = c->classes[k].presence_family == fam ? comp_ivar_index(&c->classes[k], ivn) : -1;
+    int iv = c->classes[k].presence_family == fam ? comp_inst_ivar_index(&c->classes[k], ivn) : -1;
     if (iv < 0) continue;
     int base = iv < 64 ? bmemo[k * 64 + iv] : ivs_base_kind(c, k, ivn);
     if (base == 0 && !needs && !ivs_init_sets(c, k, ivn, 0, 1)) needs = 1;
@@ -3099,7 +3164,7 @@ static int ivs_tracked(Compiler *c, int cid, const char *ivn, int *memo, int *bm
   if (seen && !needs && set0) needs = (comp_pres_flags(c, ivn) & PRES_REMOVED) != 0;
   int tracked = seen && needs && !unmarked;
   for (int k = 0; k < c->nclasses && fam > 0; k++) {
-    int iv = c->classes[k].presence_family == fam ? comp_ivar_index(&c->classes[k], ivn) : -1;
+    int iv = c->classes[k].presence_family == fam ? comp_inst_ivar_index(&c->classes[k], ivn) : -1;
     if (iv >= 0 && iv < 64 && bmemo[k * 64 + iv] >= 0) memo[k * 64 + iv] = tracked ? 3 : bmemo[k * 64 + iv];
   }
   return tracked;
@@ -3111,7 +3176,7 @@ static unsigned g_ivs_flush_gen = 0;
 static int ivs_kind(Compiler *c, int cid, const char *ivn) {
   if (cid < 0 || cid >= c->nclasses || !ivn) return 2;
   ClassInfo *ci = &c->classes[cid];
-  int iv = comp_ivar_index(ci, ivn);
+  int iv = comp_inst_ivar_index(ci, ivn);
   if (iv < 0) return 2;
   int n = c->nclasses * 64;
   if (c->pres_memo_n != n * 2) {
@@ -3167,7 +3232,7 @@ static int ivs_kind(Compiler *c, int cid, const char *ivn) {
 int ivar_ranked(Compiler *c, int cid) {
   /* a class with no ivars has no rank to keep, nor a counter */
   if (!c->pres_seen || cid < 0 || cid >= c->nclasses || c->classes[cid].presence_family <= 0 ||
-      c->classes[cid].nivars == 0) return 0;
+      comp_inst_ivar_count(&c->classes[cid]) == 0) return 0;
   int fam = c->classes[cid].presence_family;
   if (c->pres_rank_n != c->nclasses) {
     free(c->pres_rank);
@@ -3186,23 +3251,25 @@ int ivar_ranked(Compiler *c, int cid) {
     ok = !ki->is_value_type && !class_is_exc_subclass(c, k);
     int late = 0;
     for (int j = 0; j < ki->nivars && ok; j++) {
+      if (!comp_ivar_on(ki, j, IVS_INST)) continue;
       ok = !ivs_unmarked_write(c, k, ki->ivars[j]);
       late |= ivs_kind(c, k, ki->ivars[j]) != 0;
     }
     /* an object whose ivars all initialize assigns, unconditionally and
        first, has its class's order; one with a single ivar has no order */
-    varies |= late && ki->nivars > 1;
+    varies |= late && comp_inst_ivar_count(ki) > 1;
   }
   *m = seen && varies && ok ? 2 : 1;
   return *m == 2;
 }
 int ivar_set_kind(Compiler *c, int cid, const char *ivn) {
   int kind = ivs_kind(c, cid, ivn);
-  if (kind == 3 || cid < 0 || cid >= c->nclasses || comp_ivar_index(&c->classes[cid], ivn) < 0) return kind;
+  if (kind == 3 || cid < 0 || cid >= c->nclasses || comp_inst_ivar_index(&c->classes[cid], ivn) < 0) return kind;
   return ivar_ranked(c, cid) ? 3 : kind;
 }
 /* A listing of a ranked class's ivars (ivar_ranked) walks those assigned in
-   the order they were first: `case <index>:` per ivar between these, with
+   the order they were first: `case <index>:` per ivar between these, the
+   index its place among the object's fields (ivar_listing_order_new's), with
    _ixk the position in the walk (0 for the first). obj is the object. */
 void emit_ivar_order_open(Compiler *c, int cid, const char *obj, Buf *b) {
   ClassInfo *ci = &c->classes[cid];
@@ -3213,21 +3280,24 @@ void emit_ivar_order_open(Compiler *c, int cid, const char *obj, Buf *b) {
 void emit_ivar_order_close(Buf *b) {
   buf_puts(b, "} }");
 }
-/* The order the listings of class cid walk its ivars in, ord[0..nivars):
+/* The order the listings of class cid walk its object's ivars in, ord[0..*n)
+   with *n its instance fields (a class-level ivar is the class object's):
    the order initialize assigns them in where it assigns every one
    unconditionally (kind 0 all), else the layout's. A family that keeps the
-   rank of each first assignment (ivar_ranked) sorts at run time instead. */
+   rank of each first assignment (ivar_ranked) sorts at run time instead,
+   by the place in the layout's. */
 /* ... cached per class (Compiler.pres_ord), the walk being initialize's size.
    Objects made without initialize (allocate, Marshal.load) have no such
    order: the program that makes any lists in the layout's. */
 /* ... the order class cid lists its ivars in, from initialize's, when it has one */
 static int ivs_static_order(Compiler *c, int cid, int *ord) {
   ClassInfo *ci = &c->classes[cid];
-  int n = 0, ok = ci->nivars > 1 && !ci->is_struct && !ci->is_data && !c->pres_noinit && !ivar_ranked(c, cid);
-  for (int j = 0; j < ci->nivars && ok; j++) ok = ivar_set_kind(c, cid, ci->ivars[j]) == 0;
-  return ok && ivs_order_init(c, cid, cid, ord, &n, 0) && n == ci->nivars;
+  int ni = comp_inst_ivar_count(ci);
+  int n = 0, ok = ni > 1 && !ci->is_struct && !ci->is_data && !c->pres_noinit && !ivar_ranked(c, cid);
+  for (int j = 0; j < ci->nivars && ok; j++) ok = !comp_ivar_on(ci, j, IVS_INST) || ivar_set_kind(c, cid, ci->ivars[j]) == 0;
+  return ok && ivs_order_init(c, cid, cid, ord, &n, 0) && n == ni;
 }
-int *ivar_listing_order_new(Compiler *c, int cid) {
+int *ivar_listing_order_new(Compiler *c, int cid, int *n) {
   ClassInfo *ci = &c->classes[cid];
   size_t sz = sizeof(int) * (size_t)(ci->nivars > 0 ? ci->nivars : 1);
   if (c->pres_ord_n != c->nclasses) {
@@ -3240,9 +3310,12 @@ int *ivar_listing_order_new(Compiler *c, int cid) {
   if (!c->pres_ord[cid]) {
     int *ord = (int *)malloc(sz);
     if (!ord) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-    if (!ivs_static_order(c, cid, ord)) for (int j = 0; j < ci->nivars; j++) ord[j] = j;
+    if (!ivs_static_order(c, cid, ord))
+      for (int j = 0, k = 0; j < ci->nivars; j++)
+        if (comp_ivar_on(ci, j, IVS_INST)) ord[k++] = j;
     c->pres_ord[cid] = ord;
   }
+  *n = comp_inst_ivar_count(ci);
   int *copy = (int *)malloc(sz);
   if (!copy) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   memcpy(copy, c->pres_ord[cid], sz);
@@ -3254,7 +3327,7 @@ int *ivar_listing_order_new(Compiler *c, int cid) {
    2): set or unset cannot be read off the value, so the constructor seeds
    it with a nil carrying SP_IVAR_UNSET_MARK in its cls_id. */
 int poly_ivar_unset_marked(Compiler *c, int cid, int iv) {
-  if (cid < 0 || cid >= c->nclasses || iv < 0 || iv >= c->classes[cid].nivars) return 0;
+  if (cid < 0 || cid >= c->nclasses || !comp_ivar_on(&c->classes[cid], iv, IVS_INST)) return 0;
   ClassInfo *ci = &c->classes[cid];
   if (ci->ivar_types[iv] != TY_POLY || (ci->is_struct && iv < ci->nmembers)) return 0;
   return ivar_set_kind(c, cid, ci->ivars[iv]) == 2;
@@ -3356,7 +3429,7 @@ int civ_defined_probed(Compiler *c, const char *nm) {
    nothing asks (civ_defined_probed). */
 const char *civ_set_mark(Compiler *c, int cid, const char *nm, char *buf, size_t cap) {
   if (cid < 0 || cid >= c->nclasses || !nm || nm[0] != '@' || nm[1] == '@') return NULL;
-  if (comp_ivar_index(&c->classes[cid], nm) < 0 || !civ_defined_probed(c, nm)) return NULL;
+  if (comp_class_ivar_index(&c->classes[cid], nm) < 0 || !civ_defined_probed(c, nm)) return NULL;
   /* a long class name outgrows the caller's buffer: as ivar_set_mark, a
      mark that does not fit is made on the heap, whole */
   const char *cn = c->classes[cid].name, *iv = iv_c(nm + 1);
@@ -3381,31 +3454,14 @@ void emit_civ_slot_decl(Compiler *c, int cid, const char *nm, const char *ctype,
   if (civ_defined_probed(c, nm))
     buf_printf(b, "static int civ_%s_%s__set = 0;\n", c->classes[cid].name, iv_c(nm + 1));
 }
-/* The class whose civ_ slot ivar node `node` (scope s) stores into or reads,
-   by the write emitters' rule: a class method's ivar is its class's, a
-   class body's (outside an instance_eval) the body class's, any other one
-   outside a class the Toplevel pseudo-class's; -1 for an instance's field. */
-int civ_class_of(Compiler *c, int node, Scope *s) {
-  if (!s) return -1;
-  if (s->is_cmethod) return s->class_id;
-  if (s->class_id >= 0 || g_ie_class_id >= 0 || ie_class_of(c, node) >= 0) return -1;
-  if (g_class_body_id >= 0) return g_class_body_id;
-  return c->toplevel_class;
-}
-/* The same for ivar write node `w`, which stores into self: an instance
-   method's, or an instance_eval body's, whose self is the rebound receiver
-   (the class the write emitters take, ie_class_of first); for a
-   class-level ivar's write, its civ_ slot's set flag (civ_set_mark). */
+/* The statement that marks ivar write node `w`'s slot assigned after its
+   store (holder_ivar_side): an object's field's flag (ivar_set_mark), or a
+   class-level ivar's civ_ slot's set flag (civ_set_mark). */
 const char *ivar_write_mark(Compiler *c, int w, char *buf, size_t cap) {
-  Scope *s = comp_scope_of(c, w);
   const char *nm = nt_str(c->nt, w, "name");
-  int iec = ie_class_of(c, w);
-  if (s && nm && iec < 0) {
-    int gc = civ_class_of(c, w, s);
-    if (gc >= 0) return civ_set_mark(c, gc, nm, buf, cap);
-  }
-  int cid = iec >= 0 ? iec : s && !s->is_cmethod && s->class_id >= 0 ? s->class_id : g_ie_class_id;
-  if (!s || cid < 0 || !nm || !g_self) return NULL;
+  int cid, side = nm ? holder_ivar_side(c, w, &cid) : 0;
+  if (side == IVS_CLASS) return civ_set_mark(c, cid, nm, buf, cap);
+  if (side != IVS_INST || !g_self) return NULL;
   return ivar_set_mark(c, cid, nm, g_self, g_self_deref, buf, cap);
 }
 int *an_parent_map(const NodeTable *nt);
@@ -3526,13 +3582,21 @@ int emit_empty_container_for_slot(Compiler *c, int v, TyKind slot, Buf *b) {
     if (hv != TY_POLY && dt != TY_UNKNOWN && dt != hv && !(hv == TY_FLOAT && dt == TY_INT) &&
         !(hv == TY_STRING && dt == TY_STRBUF))
       unsupported(c, v, "a Hash.new default of another type than the typed hash slot's values");
-    buf_printf(b, "sp_%sHash_new_with_default(", hcn);
-    if (ty_hash_val(slot) == TY_POLY) emit_boxed(c, av[0], b);
-    else emit_expr(c, av[0], b);
-    buf_puts(b, ")");
+    emit_hash_new_with_default(c, slot, av[0], b);
     return 1;
   }
   return 0;
+}
+/* `Hash.new(d)` built as typed Hash kind ht, by the kind's own
+   new_with_default entry: the default d held as the Hash holds a value --
+   boxed for a Hash of boxed values, the handle for a Hash of String values
+   (elem_held, through the _e entry), else as it is */
+void emit_hash_new_with_default(Compiler *c, TyKind ht, int d, Buf *b) {
+  buf_printf(b, "sp_%sHash_new_with_default%s(", ty_hash_cname(ht), typed_elem_store_sfx(ht));
+  if (ty_hash_val(ht) == TY_POLY) emit_boxed(c, d, b);
+  else if (typed_elem_held(ht) == TY_STRBUF) emit_typed_elem_value(c, d, ht, b);
+  else emit_expr(c, d, b);
+  buf_puts(b, ")");
 }
 
 /* emit_poly_rhs_coerced's conversion of a boxed value into a scalar or a
@@ -3958,15 +4022,15 @@ void strh_elem_handle_text(Compiler *c, int v, Buf *b) {
   for (int i = g_n_argov - 1; i >= 0 && !bound; i--) bound = g_argov_node[i] == call || g_argov_node[i] == v;
   if (!bound && recv >= 0 && typed_elem_held(repr_of(c, recv).as_ty) == TY_STRBUF &&
       one_str_elem_call(c, call, TY_UNKNOWN)) {
-    /* a read of an Array that holds the handle, as written (no sequence in
-       parentheses), is the element as the Array holds it: the read's own
-       text (typed_elem_read_raw) */
+    /* a read of an Array, or of a Hash's value, that holds the handle, as
+       written (no sequence in parentheses), is the element as the
+       container holds it: the read's own text (typed_elem_read_raw) */
     g_one_elem_raw = call;
     emit_expr(c, call, b);
   }
   else {
-    /* (a String Hash's read answers the value's bytes, or a temp it is
-       bound to of either face; the handle is its owner, SP_STR_HDL) */
+    /* (a read in a parenthesised sequence, or a temp an emitter bound it
+       to, of either face; the handle is its owner, SP_STR_HDL) */
     g_one_elem_raw = v;
     buf_puts(b, "SP_STR_HDL(");
     emit_expr(c, v, b);
@@ -3974,8 +4038,9 @@ void strh_elem_handle_text(Compiler *c, int v, Buf *b) {
   }
   g_one_elem_raw = save;
 }
-/* Is node id's read of an element of typed Array kind rt written as the
-   handle the Array holds (elem_held), sp_String *: the raw read
+/* Is node id's read of an element of typed container kind rt (an Array's
+   element, a Hash's value) written as the handle the container holds
+   (elem_held), sp_String *: the raw read
    g_one_elem_raw names, whose consumer (emit_expr, strh_elem_handle_text)
    takes the face it wants of it? Any other read of such an Array is the
    element's bytes. The one place an emitter asks which of the two C types
@@ -5873,6 +5938,49 @@ int call_unanswered_boxed(Compiler *c, int id) {
   Repr rr = repr_of(c, recv);
   return rr.kind == RK_BOXED || rr.as_ty == TY_NIL || call_unanswered_boxed(c, recv);
 }
+/* Is mi's body exactly one statement, a call chain whose innermost receiver
+   is a receiverless raise (`(raise "x").select { ... }.map { ... }`)? */
+static int body_is_call_on_raise(Compiler *c, int mi) {
+  const NodeTable *nt = c->nt;
+  int body = c->scopes[mi].body;
+  if (body < 0) return 0;
+  /* nor one with a `return` anywhere, which may leave before the raise runs
+     (`raise([1].each { return @x })`) */
+  const Scope *s = &c->scopes[mi];
+  for (int r = comp_ret_first(c, mi); r >= 0; r = comp_ret_next(c, r))
+    if (nt_kind(c->nt, r) == NK_ReturnNode && comp_scope_of(c, r) == s) return 0;
+  int n = body;
+  if (nt_kind(nt, body) == NK_StatementsNode) {
+    int cnt = 0;
+    const int *stmts = nt_arr(nt, body, "body", &cnt);
+    if (cnt != 1) return 0;
+    n = stmts[0];
+  }
+  if (nt_kind(nt, n) != NK_CallNode || nt_ref(nt, n, "receiver") < 0) return 0;
+  while (nt_kind(nt, n) == NK_CallNode) {
+    int r = nt_ref(nt, n, "receiver");
+    if (r < 0) {
+      const char *rn = nt_str(nt, n, "name");
+      return rn && is_raise_alias(rn) && !bare_call_class_owned(c, n);
+    }
+    n = nt_paren_single(nt, r);
+  }
+  return 0;
+}
+
+/* Does a class below mi's own define `nm`, which a self call in mi's class may dispatch to? */
+static int overridden_below(Compiler *c, int id, int mi, const char *nm) {
+  int owner = c->scopes[mi].class_id;
+  if (owner < 0) return 0;
+  for (int ci = 0; ci < c->nclasses; ci++) {
+    if (ci == owner || !is_descendant(c, ci, owner)) continue;
+    MethodLookup ml = { .def_class = -1 };
+    int m = call_target(c, id, ci, nm, 0, &ml);
+    if (m >= 0 && m != mi) return 1;
+  }
+  return 0;
+}
+
 int call_never_returns(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   if (id < 0 || nt_kind(nt, id) != NK_CallNode) return 0;
@@ -5880,9 +5988,18 @@ int call_never_returns(Compiler *c, int id) {
   /* a call on such a receiver never runs, whatever its own type
      (`m.version - 1 > 2`: the `-` raises before `>` is reached) */
   if (recv >= 0 && call_never_returns(c, recv)) return 1;
-  if (comp_ntype(c, id) != TY_VOID) return 0;
   const char *nm = nt_str(nt, id, "name");
   if (!nm) return 0;
+  /* nor an untyped self call to a method whose one statement is a call on a
+     raise's value (`def engines = (raise "x").select { ... }`): the raise
+     runs first, and the method never answers. Not one a subclass overrides
+     (abstract_raise_override_return): dispatch may reach a body that
+     returns. */
+  if ((recv < 0 || nt_kind(nt, recv) == NK_SelfNode) && comp_ntype(c, id) == TY_UNKNOWN) {
+    int smi = comp_self_call_mi(c, id, nm);
+    if (smi >= 0 && body_is_call_on_raise(c, smi) && !overridden_below(c, id, smi, nm)) return 1;
+  }
+  if (comp_ntype(c, id) != TY_VOID) return 0;
   if (recv < 0 && (is_raise_alias(nm))) return 1;
   int mi = -1;
   if (recv < 0 || nt_kind(nt, recv) == NK_SelfNode) mi = comp_self_call_mi(c, id, nm);
@@ -7728,6 +7845,22 @@ int class_is_builtin_module_reopen(Compiler *c, int cid) {
   const char *qn = class_ruby_name(c, cid);
   return qn && is_builtin_module_name(qn) && builtin_class_id(qn) != 0;
 }
+/* Is class entry `cid` the program's reopening of a builtin class
+   (`class Module; def m; end`, Method, BasicObject, Data)? Its values
+   (String, a Method, 5) carry the builtin's own tag or id, never the
+   entry's, so an is_a?, an instance_of? or a `when` on that entry must also
+   ask the runtime, by the class's Ruby name (Process::Status, not Status),
+   as for a builtin module (class_is_builtin_module_reopen). A program's own
+   class of the same leaf name in another module (`Ns::Method`) is not one,
+   and neither is a constant the program assigns (`Data = Struct.new(:a)`,
+   `BasicObject = Class.new`): only a `class` header reopens. */
+int class_is_builtin_class_reopen(Compiler *c, int cid) {
+  if (cid < 0 || cid >= c->nclasses) return 0;
+  int def = c->classes[cid].def_node;
+  if (def < 0 || nt_kind(c->nt, def) != NK_ClassNode) return 0;
+  const char *qn = class_ruby_name(c, cid);
+  return qn && is_builtin_class_name(qn);
+}
 int ty_matches_class(Compiler *c, TyKind t, const char *cn, int exact) {
   const char *self_cls = NULL;
   switch (t) {
@@ -7948,7 +8081,7 @@ int ty_gc_holds_refs(Compiler *c, TyKind t) {
   if (!comp_ty_value_obj(c, t)) return 0;
   ClassInfo *vc = &c->classes[ty_object_class(t)];
   for (int i = 0; i < vc->nivars; i++)
-    if (vc->ivar_types[i] == TY_STRING) return 1;
+    if (comp_ivar_on(vc, i, IVS_INST) && vc->ivar_types[i] == TY_STRING) return 1;
   return 0;
 }
 /* Root a temp of a kind ty_gc_holds_refs answers: as emit_gc_root_tmp, or
@@ -7979,7 +8112,7 @@ void emit_gc_root_tmp_refs(Compiler *c, TyKind t, int tmp, Buf *b) {
   ClassInfo *vc = &c->classes[ty_object_class(t)];
   const char *sep = "";
   for (int i = 0; i < vc->nivars; i++)
-    if (vc->ivar_types[i] == TY_STRING || vc->ivar_types[i] == TY_STRBUF) {
+    if (comp_ivar_on(vc, i, IVS_INST) && (vc->ivar_types[i] == TY_STRING || vc->ivar_types[i] == TY_STRBUF)) {
       buf_printf(b, "%sSP_GC_ROOT(_t%d.iv_%s);", sep, tmp, iv_c(vc->ivars[i] + 1));
       sep = " ";
     }
@@ -8425,7 +8558,8 @@ static int class_is_allocated(Compiler *c, int cid) {
 static int ivar_has_nilbit_own(Compiler *c, int cid, int iv) {
   if (cid < 0 || cid >= c->nclasses) return 0;
   ClassInfo *ci = &c->classes[cid];
-  if (iv < 0 || iv >= ci->nivars || !oint_kind(ci->ivar_types[iv])) return 0;
+  /* (a class-level ivar is the class object's: its civ_ static, civ_is_oint) */
+  if (!comp_ivar_on(ci, iv, IVS_INST) || !oint_kind(ci->ivar_types[iv])) return 0;
   if (ci->ivar_nullable_int && ci->ivar_nullable_int[iv]) return 1;
   if (class_is_allocated(c, cid)) return 1;
   /* a Struct / Data member is assigned by the generated constructor */
@@ -8515,36 +8649,27 @@ void ivar_nilbit_assign(Compiler *c, int cid, int iv, const char *obj, const cha
   snprintf(out, cap, "%siv__nilb[%d] = %s", obj, k, nil);
 }
 
-/* The ivar an InstanceVariableReadNode / write names, as the read emitter
-   resolves it (emit_ivar_cvar_gvar_expr): the object's field of class
-   `*cid` (kind 1), or the class-level / top-level static civ_C_x (kind 2);
-   0 when the class has no such slot. */
+/* The ivar an InstanceVariableReadNode / write names, by holder_ivar_side:
+   the object's field of class `*cid` (kind 1), or the class-level /
+   top-level static civ_C_x (kind 2); 0 when the class has no such slot. */
 int ivar_node_slot(Compiler *c, int node, int *cid, int *iv) {
-  HolderRef h;
   *cid = *iv = -1;
-  Scope *cs = comp_scope_of(c, node);
   const char *nm = nt_str(c->nt, node, "name");
-  if (!nm) return 0;
-  /* inside an instance_eval / instance_exec splice: the receiver's class
-     (the analysis's map for the node, else the splice being emitted) */
-  int iec = ie_class_of(c, node);
-  if (iec < 0 && cs && cs->class_id < 0 && !cs->is_cmethod) iec = g_ie_class_id;
-  if (iec >= 0) {
-    for (int k = iec; k >= 0; k = c->classes[k].parent) {
-      int i = comp_ivar_index(&c->classes[k], nm);
+  int k, side = nm ? holder_ivar_side(c, node, &k) : 0;
+  if (!side) return 0;
+  /* an object's field: its class's own, or, for an instance_eval
+     receiver, the nearest class above it that lays the name out */
+  if (side == IVS_INST) {
+    for (; k >= 0; k = c->classes[k].parent) {
+      int i = comp_inst_ivar_index(&c->classes[k], nm);
       if (i >= 0) { *cid = k; *iv = i; return 1; }
     }
     return 0;
   }
-  /* a class body outside any def: the class-level static */
-  if (cs && cs->class_id < 0 && !cs->is_cmethod && g_class_body_id >= 0) {
-    int i = comp_ivar_index(&c->classes[g_class_body_id], nm);
-    if (i < 0) return 0;
-    *cid = g_class_body_id; *iv = i; return 2;
-  }
-  if (!holder_of_node_in(c, node, g_class_body_id, &h) || h.idx < 0) return 0;
-  *cid = h.cid; *iv = h.idx;
-  return h.cls_slot ? 2 : 1;
+  int i = comp_class_ivar_index(&c->classes[k], nm);
+  if (i < 0) return 0;
+  *cid = k; *iv = i;
+  return 2;
 }
 /* The head of a Range walk, `for (VAR = first; ...; VAR += step)`, whose
    bounds may sit at the ends of sp_int: `i >= last` with last at INTPTR_MIN
@@ -8796,15 +8921,22 @@ void emit_ivar_orw_value(Compiler *c, int id, TyKind t, int elems_handle, const 
   else emit_slot_orw_value(c, t, elems_handle, ref, v, is_or, mark, b);
 }
 /* `obj.x ||= v` through the attribute's field (class cid, ivar iv, receiver
-   prefix pfx such as "_t3->") */
-void emit_attr_orw_value(Compiler *c, int cid, int iv, const char *pfx, TyKind t, int elems_handle,
+   temp recv such as "_t3", prefix pfx such as "_t3->"). The store is the
+   writer's `@x = v`: a frozen receiver refuses it, where the store runs. */
+void emit_attr_orw_value(Compiler *c, int cid, int iv, const char *recv, const char *pfx, TyKind t, int elems_handle,
                          const char *ref, int v, int is_or, const char *mark, Buf *b) {
   char nt[300];
+  Buf fz; memset(&fz, 0, sizeof fz);
+  emit_frozen_obj_guard(c, cid, recv, &fz);
+  const char *sv_guard = g_orw_store_guard;
+  g_orw_store_guard = fz.p;
   if (oint_kind(t) && iv >= 0 && ivar_has_nilbit(c, cid, iv)) {
     ivar_nilbit_test(c, cid, iv, pfx, nt, sizeof nt);
     emit_slot_orw_value_o(c, t, 0, ref, v, is_or, nt, cid, iv, pfx, mark, b);
   }
   else emit_slot_orw_value(c, t, elems_handle, ref, v, is_or, mark, b);
+  g_orw_store_guard = sv_guard;
+  free(fz.p);
 }
 /* The nil test of ivar iv of class cid behind `ref` ("self->iv_x", the
    field) for an or-write statement: the bit, the oint's flag, or NULL */

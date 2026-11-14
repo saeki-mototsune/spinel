@@ -205,10 +205,6 @@ static void cf_words_own(ClsSet *s) {
 static void cf_bk_bit(unsigned long long *bk, int k) {
   if (k >= 0 && k <= CLS_BK_OTHER) bk[k >> 6] |= 1ULL << (k & 63);
 }
-static int cf_bk_any_p(const ClsSet *s) {
-  for (int i = 0; i < CLS_BK_WORDS; i++) if (s->bk[i]) return 1;
-  return 0;
-}
 
 /* See compiler.h. */
 void cls_pool_free(ClsSet *pool, int n) {
@@ -238,7 +234,7 @@ static int cf_pool(CF *f, ClsSet *s) {
   int n = 0;
   for (int i = 0; i < s->nw; i++) n += __builtin_popcountll(s->w[i]);
   s->n = n;
-  if (n == 0 && !s->bv && !s->os && !cf_bk_any_p(s)) return CF_EMPTY;
+  if (n == 0 && !s->bv && !s->os && !cls_bk_any(s)) return CF_EMPTY;
   /* The unified walk keeps its old bound: a set past CF_UNIFIED_MAX is
      every class. It is the coarse second bound the facts meet with, whose
      classes join whole equivalence classes; unbounded, a program's every
@@ -2183,6 +2179,17 @@ static void cf_builtin_rule(CF *f, int v, int recv_el, const int *argv, int argc
   /* Exception#cause is the exception being handled when this one was
      raised: one of any class, not its receiver's */
   if (nm && sp_streq(nm, "cause") && argc == 0) cf_add_set(f, v, f->exc_set);
+  /* enum.to_set is Set.new(enum.to_a) once the program has the set package's
+     Set (analyze.c, LR_TO_SET, which runs after these facts): its answer is
+     one of Set's instances, so a poly call on it keeps Set's arms. Read as
+     only a builtin value, `[[1, 1]].map { |a| a.to_set }[0].size` left Set
+     out of the receiver's classes (cls_fact_excludes) and answered NoMethodError
+     (Kilau K-044). A superset is safe: it only adds a class a poly receiver may
+     hold, and where the rewrite declines the call stays the builtin's. */
+  if (nm && sp_streq(nm, "to_set") && argc == 0) {
+    int sk = comp_builtin_class_named(f->c, "Set");
+    if (sk >= 0 && sk < f->c->nclasses) cf_add_set(f, v, f->desc[sk]);
+  }
   /* (directed) Thread#value is what the thread's block answered, which was
      handed to the runtime (cf_poison_class_call) */
   if (nm && sp_streq(nm, "value") && argc == 0 && CF_CLOSED(f) && f->rtc >= 0) cf_edge(f, f->rtc, v);
@@ -2957,7 +2964,7 @@ static void cf_call_known(CF *f, int v, int pidx, int recv_el, const char *nm, c
   if (!nil_raises && (cf_set_classless(f, pidx) || (s->bv && (s->bc || !ctor)) || s->os)) builtin = 1;
   /* a receiver that may be a builtin value (bk) answers a builtin's value too, though the classes of the
      program in its set took the call: any builtin, in the builtin part alone */
-  if (!builtin && cf_bk_any_p(s)) cf_add_set(f, v, cf_bk_any(f));
+  if (!builtin && cls_bk_any(s)) cf_add_set(f, v, cf_bk_any(f));
   if (builtin) {
     /* Deferred until the classes have settled: the builtin answer unifies
        the receiver with the call's value and arguments, which a receiver
@@ -3618,7 +3625,7 @@ static void cf_call(CF *f, int v) {
        main's), so its method answers a bare call no class or top-level def
        did: the one the call binds (comp_included_method_index) */
     if (!found) {
-      int mi = comp_included_method_index(c, nm, v);
+      int mi = call_target(c, v, -1, nm, CT_INCLUDED, NULL);
       if (mi >= 0 && cf_user_target(f, v, mi, argv, argc, blk)) found = 1;
     }
     if (found) return;
@@ -4927,7 +4934,7 @@ static void cf_why_report(CF *f) {
 /* the builtin part of a fact: +builtin, and [the classes bk holds] when it names any ("any" for every one) */
 static void cf_dump_builtin(const ClsSet *s) {
   fprintf(stderr, " +builtin");
-  if (!cf_bk_any_p(s)) return;
+  if (!cls_bk_any(s)) return;
   int all = 1;
   for (int i = 0; i < CLS_BK_WORDS; i++) all &= s->bk[i] == ~0ULL;
   fprintf(stderr, "[");
@@ -4944,8 +4951,8 @@ static void cf_dump_facts(Compiler *c) {
       const ClsSet *s = cls_fact_node(c, id);
       int p = c->cls_fact && id < c->cls_fact_n ? c->cls_fact[id] : -1;
       const char *fp = nt_file_path(nt, (int)nt_int(nt, id, "node_file", 0));
-      fprintf(stderr, "cls-val: %s:%d %s node %d value:%s", fp && *fp ? fp : "?", (int)nt_int(nt, id, "node_line", 0), nt_str(nt, id, "name") ? nt_str(nt, id, "name") : "?", id, p == 0 ? " ANY" : !s ? " ?" : s->n == 0 && !s->bv && !cf_bk_any_p(s) ? " none" : "");
-      if (s) { for (int i = cls_set_next(s, -1); i >= 0; i = cls_set_next(s, i)) fprintf(stderr, " %d", i); if (s->bv || cf_bk_any_p(s)) cf_dump_builtin(s); if (s->os) fprintf(stderr, " +ostruct"); if (s->pr) fprintf(stderr, " +proc"); }
+      fprintf(stderr, "cls-val: %s:%d %s node %d value:%s", fp && *fp ? fp : "?", (int)nt_int(nt, id, "node_line", 0), nt_str(nt, id, "name") ? nt_str(nt, id, "name") : "?", id, p == 0 ? " ANY" : !s ? " ?" : s->n == 0 && !s->bv && !cls_bk_any(s) ? " none" : "");
+      if (s) { for (int i = cls_set_next(s, -1); i >= 0; i = cls_set_next(s, i)) fprintf(stderr, " %d", i); if (s->bv || cls_bk_any(s)) cf_dump_builtin(s); if (s->os) fprintf(stderr, " +ostruct"); if (s->pr) fprintf(stderr, " +proc"); }
       fprintf(stderr, "\n");
     }
     return;
@@ -4980,7 +4987,7 @@ static void cf_dump_facts(Compiler *c) {
       }
       fprintf(stderr, i >= c->nclasses ? " Class(%s)" : " %s", cn);
     }
-    if (s && (s->bv || cf_bk_any_p(s))) cf_dump_builtin(s);
+    if (s && (s->bv || cls_bk_any(s))) cf_dump_builtin(s);
     fprintf(stderr, "\n");
   }
 }
@@ -5574,7 +5581,7 @@ static void cf_meet(Compiler *c, const int *df, const ClsSet *dp, int dn, int **
       for (int i = 0; i < CLS_BK_WORDS; i++) m.bk[i] = us->bk[i] & ds->bk[i];
     }
     for (int i = 0; i < m.nw; i++) m.n += __builtin_popcountll(mw[i]);
-    if (m.n == 0 && !m.bv && !m.os && !cf_bk_any_p(&m)) { fact[v] = CF_EMPTY; continue; }
+    if (m.n == 0 && !m.bv && !m.os && !cls_bk_any(&m)) { fact[v] = CF_EMPTY; continue; }
     unsigned h = cf_set_hash(&m) & (unsigned)(hcap - 1);
     while (ht[h] >= 0 && !cf_set_eq(&pool[ht[h]], &m)) h = (h + 1) & (unsigned)(hcap - 1);
     if (ht[h] >= 0) { fact[v] = ht[h]; continue; }
@@ -5662,7 +5669,7 @@ int cls_fact_may_hold_builtin(Compiler *c, int node, int core) {
   if (!s || core == CORE_NILCLASS) return 1;
   /* a node no value reaches (code nothing runs, or a flow the pass lacks)
      rules nothing out, as cls_fact_excludes does */
-  if (s->n == 0 && !s->bv && !s->os && !cf_bk_any_p(s)) return 1;
+  if (s->n == 0 && !s->bv && !s->os && !cls_bk_any(s)) return 1;
   /* a builtin class the core table lacks may be anything below Object */
   if (cls_bk_has(s, CLS_BK_OTHER) || s->os) return 1;
   /* a member that is a builtin class the program reopens stands for that class and its builtin subclasses

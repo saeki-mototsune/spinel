@@ -155,6 +155,8 @@ int prog_load_ncand(const NodeTable *nt, int load);
 int prog_load_cand(const NodeTable *nt, int load, int k);
 int prog_load_open(const NodeTable *nt, int load);
 int prog_rescue_runs(const NodeTable *nt, int rescue);
+enum { PROG_RS_MAY, PROG_RS_STARTS, PROG_RS_SURE };
+int prog_rescue_sure(const NodeTable *nt, int st);
 int prog_load_path_seeded(const NodeTable *nt);
 void prog_top_stmts(const Compiler *c, void (*fn)(void *ud, int stmt), void *ud);
 int *prog_top_seq(const Compiler *c, int *n, int **file);
@@ -202,6 +204,8 @@ void elab_free(Compiler *c);
 void elab_note_const_writes(Compiler *c);   /* the source's constant writes, before any pass */
 void elab_note_spliced_const_write(Compiler *c, int node);   /* ...and one a form of the walk splices in (#10791) */
 int elab_source_writes_const(Compiler *c, const char *name, int top);   /* ...one of them writes `name` (top: where the top level finds it) */
+int elab_source_values_const(Compiler *c, const char *name);   /* ...one of them gives `name` a value (`K = e.class`), not a class or module header */
+int elab_source_const_opaque(Compiler *c, const char *name);   /* ...one of them gives `name` a value that no constant spells (`K = e.class`), not an alias of a constant or `Class.new(C)` */
 int elab_consts_by_value(Compiler *c, int unheld);   /* may it write a constant by a name it computes (const_set, eval; unheld: autoload, const_missing)? */
 int elab_lexical_header(const NodeTable *nt, const int *par, int id);   /* the header whose body is id's lexical scope, -1 for the top level */
 extern int g_dump_load_record;   /* --dump-load-record */
@@ -341,11 +345,12 @@ int const_writes_next(Compiler *c, int node);
 void const_writes_free(Compiler *c);
 /* What main's own singleton answers for `name` at p, ahead of Object's
    table: ELAB_YES with *out a program's `def self.m` (or alias) there, or
-   with *out NULL the core's own singleton method (main_singleton_method:
-   `to_s`, `inspect`) that main has from the start; ELAB_NO when the
-   singleton holds no method of the name, ELAB_STOP where an undef there
-   (main's own, a prepended or an extended module's) stops the lookup, the
-   core's methods' too, ELAB_UNKNOWN when the record cannot say. */
+   with *out NULL the core's own method of main's (main_self_method:
+   `to_s`, `inspect`, `include`, `private`, ...) that main has from the
+   start; ELAB_NO when the singleton holds no method of the name,
+   ELAB_STOP where an undef there (main's own, a prepended or an extended
+   module's) stops the lookup, the core's methods' too, ELAB_UNKNOWN when
+   the record cannot say. */
 int elab_main_singleton_at(Compiler *c, const char *name, LoadPoint p, const LrDef **out);
 /* the version of cls's method `name` (singleton when sg) live at p, through
    its ancestors as they stood at p; *out (when asked) the version found. A
@@ -515,10 +520,14 @@ void elab_mark_versions(Compiler *c);
 /* does node run whenever the body of def node `def` runs: is it inside that
    body with no lambda, nested def or deferred block between? */
 int elab_runs_with(Compiler *c, int node, int def);
-/* does node run when its statement does, for certain: every block around
-   it runs at once (ELAB_BLK_NOW), no END body around it, and the climb
-   reaches a file's root? */
-int elab_blocks_run_now(Compiler *c, int node);
+/* does node run when its statement does, for certain: every block between
+   it and the body it runs in (a def's, or a file's root) runs at once
+   where its call runs, with no lambda or END body between? */
+int elab_blocks_run_at_once(Compiler *c, int node);
+/* may a method of the program's take a call of nm over from the builtin's:
+   one it defines by that name anywhere (elab_names_method), or a
+   method_missing? (NULL: not known, so it may.) */
+int elab_program_may_take(Compiler *c, const char *nm);
 /* the scope walk made method scope `scope` of def or define_method node
    `node`: the record's version of it holds it (LrDef.scope) */
 void elab_def_scope(Compiler *c, int node, int scope);
@@ -534,6 +543,7 @@ int elab_body_def(Compiler *c, int node);
    applied `[lits].each` unrolls (dm_each_inner)? 1 for one at no point,
    which the record leaves to its body */
 int elab_def_applied(Compiler *c, int def);
+int elab_version_held_row(const LrDef *v, const char *name, int cside);   /* a version recorded under a condition of a name a Kernel row answers, on the instance side */
 /* call_target's questions about call id read the record's facts as its
    first such question found them (analyze_elab.c): 1 when the frame is in,
    until elab_plan_leave; 0 for a node it cannot place */
@@ -813,7 +823,16 @@ int elab_class_ref_at(Compiler *c, int node, int *core);
    (`Object.new`), or a constant holding one? */
 int elab_value_not_module(Compiler *c, int node);
 void gvar_writes_free(Compiler *c);   /* the names gvar_has_write kept (analyze_infer.c) */
-int elab_class_named(Compiler *c, int node);   /* the program class a constant read names wherever its lookup finds one, -1 for none known */
+/* What a pass that asks elab_class_named for many reads holds (built on
+   the first ask that needs it, freed by elab_names_end; zero-initialize to
+   start): the program's class headers by the Ruby path each spells, which a
+   path through a builtin (`Regexp::Syntax::Token`) is matched against, and
+   its classes by Ruby name and by leaf (elab_const_keys), so that no read
+   scans every header or class. The record and the classes must not change
+   while it is used. */
+typedef struct ElabNames ElabNames;
+void elab_names_end(ElabNames *nx);
+int elab_class_named(Compiler *c, ElabNames *nx, int node);   /* the program class a constant read names wherever its lookup finds one, -1 for none known */
 int elab_class_candidates(Compiler *c, int node, int **out);   /* the classes a constant read the record cannot settle may name, in a buffer *out the caller frees; -1 for no bounded answer */
 /* the node -> class map: the class class or module header `node` opens,
    as registration decided it there (below -1: none); *owner and *leaf,
@@ -1397,7 +1416,7 @@ int ewo_memo_passed_to_callable_at(Compiler *c, int callid, int pidx);
 
 /* Class index when a receiverless instance_eval/exec resolves to self, else -1. */
 int ie_implicit_self_class(Compiler *c, int id);
-int ie_poly_self_classes(Compiler *c, const char *name, int body, int *out, int max,
+int ie_poly_self_classes(Compiler *c, int call, const char *name, int body, int *out, int max,
                          const char **need);
 int *ie_body_retype(Compiler *c, int body, int cls);
 void ie_body_restore(Compiler *c, int *snap);

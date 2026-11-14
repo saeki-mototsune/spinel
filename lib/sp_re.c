@@ -1004,6 +1004,7 @@ sp_oint sp_re_byteindex_opt(mrb_regexp_pattern *pat, const char *str, sp_int sta
   sp_int bl = (sp_int)sp_str_byte_len(str);
   if (start < 0) start += bl;
   if (start < 0 || start > bl) return sp_oint_nil();
+  sp_str_byte_pos_check(str, bl, start);
   int caps[64];
   int n = spinel_re_exec(pat, str, (int64_t)bl, start, caps, 64, sp_str_is_binary(str));
   if (n <= 0 || caps[0] < 0) return sp_oint_nil();
@@ -1018,6 +1019,7 @@ sp_oint sp_re_byterindex_opt(mrb_regexp_pattern *pat, const char *str, sp_int st
   if (start < 0) start += bl;
   if (start < 0) return sp_oint_nil();
   if (start > bl) start = bl;
+  sp_str_byte_pos_check(str, bl, start);
   /* the match STARTING latest wins (a match at 3 beats a longer one at 2),
      so probe each start position from `start` downward */
   int caps[2], at;
@@ -1119,7 +1121,7 @@ else {
     }
   }
   if (out_len == in_len) {
-    return sp_str_one_answer(src);
+    return sp_str_dup(src);   /* a new String, as CRuby answers, never the argument */
   }
   char *buf = sp_str_alloc(out_len);
   size_t j = 0;

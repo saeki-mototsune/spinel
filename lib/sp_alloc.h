@@ -306,7 +306,7 @@ static SP_ALWAYS_INLINE inline char *sp_str_alloc_born(size_t len, int nogc) {
   char *body = (char *)(h + 1);
   body[0] = (char)0xfe;
   body[1 + len] = 0;
-  r->data = body + 1; r->len = (int64_t)len; r->cap = (int64_t)len; r->binary = 0;
+  r->data = body + 1; r->len = (int64_t)len; r->cap = (int64_t)len; r->binary = 0; r->temporarily_locked = 0;
   if (sp_alloc_report_on) sp_alloc_report_str(len);
   return body + 1;
 }
@@ -1060,7 +1060,13 @@ static inline sp_bool sp_str_is_frozen_val(const char *s) {
   if (SP_UNLIKELY(m == 0xfd)) return sp_str_fd_owner_frozen(s);
   return TRUE;
 }
+static inline sp_bool sp_str_is_locked(const char *s) {
+  const struct sp_String_s *owner = sp_str_fd_owner(s);
+  return owner && owner->temporarily_locked;
+}
+SP_NORETURN void sp_raise_locked_str(void);
 static inline void sp_str_check_mutable(const char *s) {
+  if (sp_str_is_locked(s)) sp_raise_locked_str();
   if (sp_str_is_frozen_val(s)) sp_raise_frozen_str(s);
 }
 /* A String a runtime object keeps past the call (a File's path, a
@@ -1335,6 +1341,7 @@ typedef struct { sp_Bigint *num, *den; } sp_BigRational;
 int sp_bigint_sign(sp_Bigint *b);
 sp_Bigint *sp_bigint_sub(sp_Bigint *a, sp_Bigint *b);
 sp_Bigint *sp_bigint_new_int(int64_t v);
+sp_Bigint *sp_bigint_new_double(double d);
 int64_t sp_bigint_to_int(sp_Bigint *b);
 intptr_t sp_bigint_bit_length(sp_Bigint *b);
 sp_Bigint *sp_bigint_gcd(sp_Bigint *a, sp_Bigint *b);
@@ -1368,7 +1375,7 @@ sp_Bigint *sp_brat_round_b(sp_BigRational *r);
    count for no real gain, so those two stay put instead. */
 sp_RbVal sp_marv_arr_new(void);
 void sp_marv_arr_push(sp_RbVal a, sp_RbVal v);
-sp_RbVal sp_marv_box_complex(sp_float re, sp_float im);
+sp_RbVal sp_marv_box_complex(sp_float re, sp_float im, int fl);
 sp_RbVal sp_marv_box_rational(sp_int n, sp_int d);
 void sp_marv_raise(const char *cls, const char *msg);
 

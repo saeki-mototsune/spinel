@@ -20,10 +20,16 @@ static int sp_complex_mag(char *out, size_t sz, sp_float v, int is_f) {
   if (isinf(v)) return snprintf(out, sz, "Infinity");
   if (isnan(v)) return snprintf(out, sz, "NaN");
   if (is_f) return snprintf(out, sz, "%s", sp_float_to_s(v));
-  /* a float outside sp_int's range makes (sp_int)v undefined behavior; only
-     integer-print a whole value that fits, else fall through to %g. */
-  if (v >= -(sp_float)INTPTR_MAX && v <= (sp_float)INTPTR_MAX && v == (sp_int)v)
-    return snprintf(out, sz, "%lld", (long long)v);
+  /* a whole Integer part prints as an Integer whatever its size: past
+     2**63 (a product) or past 2**31 (a 32-bit build) through a Bignum.
+     v is a finite magnitude here, and the range test comes before the
+     cast, since a cast out of range is undefined. */
+  if (v == floor(v)) {
+    if (v < 9223372036854775808.0) return snprintf(out, sz, "%lld", (long long)v);
+    sp_Bigint *b = sp_bigint_new_double(v);
+    SP_GC_ROOT(b);
+    return snprintf(out, sz, "%s", sp_bigint_to_s(b));
+  }
   { char fb[32]; sp_format_float(v, fb, sizeof fb, 'g', -2, '\0'); return snprintf(out, sz, "%s", fb); }
 }
 /* Append the imaginary part ("+<mag>i" / "-<mag>i") to buf. MRI inserts a `*`
@@ -31,7 +37,7 @@ static int sp_complex_mag(char *out, size_t sz, sp_float v, int is_f) {
    while a plain number is written as `10i`. */
 static int sp_complex_imag(char *buf, int n, size_t sz, sp_float im, int is_f) {   /* buf: a stack buffer, as above */
   if (n < 0 || (size_t)n >= sz) return 0;
-  char mag[64];
+  char mag[352];
   /* The sign of a Float part is its sign bit, which is set for -0.0 (that is
      not < 0): "1-0.0i", not "1+-0.0*i". A NaN is written "+NaN*i" whatever
      its sign bit, as CRuby does. An Integer-classed part has no -0. */
@@ -41,7 +47,7 @@ static int sp_complex_imag(char *buf, int n, size_t sz, sp_float im, int is_f) {
   return snprintf(buf + n, sz - (size_t)n, "%c%s%si", neg ? '-' : '+', mag, sep);
 }
 const char *sp_complex_inspect(sp_Complex c) {
-  char buf[128], re[64];
+  char buf[768], re[352];
   sp_complex_mag(re, sizeof re, c.re < 0 ? -c.re : c.re, c.fl & SP_CPLX_RE_F);
   int n = snprintf(buf, sizeof buf, "(%s%s", c.re < 0 ? "-" : "", re);
   if (n < 0) n = 0; else if (n >= (int)sizeof buf) n = (int)sizeof buf - 1;
@@ -55,7 +61,7 @@ const char *sp_complex_inspect(sp_Complex c) {
 }
 /* Complex#to_s: bare `re+imi` (no surrounding parens, unlike #inspect). */
 const char *sp_complex_to_s(sp_Complex c) {
-  char buf[128], re[64];
+  char buf[768], re[352];
   sp_complex_mag(re, sizeof re, c.re < 0 ? -c.re : c.re, c.fl & SP_CPLX_RE_F);
   int n = snprintf(buf, sizeof buf, "%s%s", c.re < 0 ? "-" : "", re);
   if (n < 0) n = 0; else if (n >= (int)sizeof buf) n = (int)sizeof buf - 1;
@@ -119,6 +125,58 @@ sp_Complex sp_complex_polar(sp_float m, sp_float a, int m_is_f) {
 }
 sp_Complex sp_complex_add(sp_Complex a, sp_Complex b) { sp_Complex c; c.re = a.re + b.re; c.im = a.im + b.im; c.fl = a.fl | b.fl; return c; }
 sp_Complex sp_complex_mul(sp_Complex a, sp_Complex b) { sp_Complex c; c.re = (a.re * b.re) - (a.im * b.im); c.im = (a.re * b.im) + (a.im * b.re); c.fl = (a.fl | b.fl) ? (SP_CPLX_RE_F | SP_CPLX_IM_F) : 0; return c; }
+/* Complex * a real number (Integer, Float or Rational): each part times the
+   real, as CRuby's Complex#* does for a real argument, so each part keeps
+   its own kind: Complex(1.0, 2) * 3 is (3.0+6i). The Complex * Complex
+   formula above made both parts Float when either side had a Float part.
+   is_f: the real is a Float (or a Rational, which a part keeps in its Float
+   slot). */
+sp_Complex sp_complex_mul_r(sp_Complex a, sp_float v, int is_f) {
+  sp_Complex c; c.re = a.re * v; c.im = a.im * v;
+  c.fl = (unsigned char)(a.fl | (is_f ? (SP_CPLX_RE_F | SP_CPLX_IM_F) : 0));
+  /* an Integer part has no -0: Complex(-1, 2) * 0 is (0+0i), and its
+     parts times 1.0 are 0.0, not -0.0 */
+  if (!(c.fl & SP_CPLX_RE_F)) c.re += 0.0;
+  if (!(c.fl & SP_CPLX_IM_F)) c.im += 0.0;
+  return c;
+}
+/* An Integer (evaluated first) times a Complex. CRuby multiplies each part
+   only for a Fixnum (-2**62 <= n < 2**62): 3 * Complex(1.0, 2) is (3.0+6i).
+   A larger Integer becomes Complex(n, 0) and runs the Complex formula, so a
+   Float part makes both parts Float. */
+sp_Complex sp_complex_imul(int64_t n, sp_Complex a) {
+  if (n < -4611686018427387904LL || n > 4611686018427387903LL) {
+    sp_Complex r; r.re = (sp_float)n; r.im = 0; r.fl = 0;
+    return sp_complex_mul(r, a);
+  }
+  return sp_complex_mul_r(a, (sp_float)n, 0);
+}
+/* A Float or a Rational (evaluated first) times a Complex: CRuby runs the
+   Complex formula on Complex(v, 0), so both parts are Float, and:
+   - real = v*re - 0*im, imaginary = v*im + 0*re, with an exact Integer 0;
+     0 times an Integer part is an exact 0 and changes nothing, 0 times a
+     Float part is a 0.0 with that part's sign (NaN for a NaN part), so
+     3.0 * Complex(-0.0, -1.0) is (0.0-3.0i) and 3.0 * Complex(NaN, 1) is
+     (NaN+NaN*i);
+   - a non-NaN Float times a zero (and a zero times a non-NaN Float part)
+     uses only the sign of the nonzero side, so Infinity * 0.0 is 0.0, not
+     NaN: 0.0 * Complex(Infinity, 1) is (0.0+0.0i). */
+static sp_float sp_complex_fmul_term(sp_float v, sp_float p, int p_is_f) {
+  if (v != 0 && p == 0 && !isnan(v)) return copysign(1.0, v) * p;
+  if (v == 0 && p != 0 && p_is_f && !isnan(p)) return v * copysign(1.0, p);
+  return v * p;
+}
+static sp_float sp_complex_zero_term(sp_float p) { return isnan(p) ? p : copysign(0.0, p); }
+sp_Complex sp_complex_fmul(sp_float v, sp_Complex a) {
+  int re_f = a.fl & SP_CPLX_RE_F, im_f = a.fl & SP_CPLX_IM_F;
+  sp_Complex c;
+  c.re = sp_complex_fmul_term(v, a.re, re_f);
+  if (im_f) c.re = c.re - sp_complex_zero_term(a.im);
+  c.im = sp_complex_fmul_term(v, a.im, im_f);
+  if (re_f) c.im = c.im + sp_complex_zero_term(a.re);
+  c.fl = SP_CPLX_RE_F | SP_CPLX_IM_F;
+  return c;
+}
 sp_Complex sp_complex_conjugate(sp_Complex a) { sp_Complex c; c.re = a.re; c.im = -a.im; c.fl = a.fl; return c; }
 sp_Complex sp_complex_sub(sp_Complex a, sp_Complex b) { sp_Complex c; c.re = a.re - b.re; c.im = a.im - b.im; c.fl = a.fl | b.fl; return c; }
 sp_Complex sp_complex_div(sp_Complex a, sp_Complex b) {
@@ -134,10 +192,18 @@ sp_Complex sp_complex_div_real(sp_Complex a, sp_float b) {
   sp_Complex c; c.re = a.re / b; c.im = a.im / b; c.fl = SP_CPLX_RE_F | SP_CPLX_IM_F; return c;
 }
 /* Complex divided by an Integer follows integer zero-division rules: dividing
-   by 0 raises ZeroDivisionError, as in MRI (a Float divisor gives Infinity). */
+   by 0 raises ZeroDivisionError, as in MRI (a Float divisor gives Infinity).
+   An Integer part stays an Integer when b divides it, else it becomes a
+   Rational (Integer#quo), which a Complex keeps in its Float slot with the
+   Float flag, as Complex(Rational(5, 2), 0) does: so Complex(5, 9) / 2 is
+   eql? to Complex(Rational(5, 2), Rational(9, 2)), and Complex(4, 8) / 2 is
+   (2+4i). */
 sp_Complex sp_complex_div_int(sp_Complex a, sp_int b) {
   if (b == 0) sp_raise_cls("ZeroDivisionError", "divided by 0");
-  sp_Complex c; c.re = a.re / (sp_float)b; c.im = a.im / (sp_float)b; c.fl = a.fl; return c;
+  sp_Complex c; c.re = a.re / (sp_float)b; c.im = a.im / (sp_float)b; c.fl = a.fl;
+  if (c.re != floor(c.re)) c.fl |= SP_CPLX_RE_F;
+  if (c.im != floor(c.im)) c.fl |= SP_CPLX_IM_F;
+  return c;
 }
 sp_Complex sp_complex_neg(sp_Complex a) { sp_Complex c; c.re = -a.re; c.im = -a.im; c.fl = a.fl; return c; }
 sp_float sp_complex_abs2(sp_Complex a) { return (a.re * a.re) + (a.im * a.im); }

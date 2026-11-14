@@ -5710,7 +5710,7 @@ int infer_write_types(Compiler *c) {
     if (!is_ie) {
       TyKind vrt = infer_type(c, vrecv);
       int tramp = ty_is_object(vrt) &&
-                  comp_trampoline_kind(c, ty_object_class(vrt), vnm, NULL);
+                  comp_trampoline_kind(c, call_target(c, val_id, ty_object_class(vrt), vnm, 0, NULL));
       /* An iterator block that assigns a local has the same shape: the block
          body's locals sit at higher node ids than this write, so the main loop
          derived the element type with them still reset to UNKNOWN and the slot
@@ -10228,6 +10228,13 @@ int infer_default_param_types(Compiler *c) {
       if (dt == TY_NIL || dt == TY_UNKNOWN || dt == TY_VOID) continue;
       LocalVar *p = scope_local(sc, sc->pnames[i]);
       if (!p || p->rbs_seeded) continue;
+      /* narrow_object_arrays took the default as one of the parameter's
+         sources and narrowed it anyway: a default that reads as the poly
+         array is that table built at the narrowed kind, as a narrowed
+         local's write is (lv_keep_decisions). Joined, the two array kinds
+         gave the poly scalar, the write pass put the pin back, and the
+         fixpoint ran to its cap. */
+      if (dt == TY_POLY_ARRAY && ty_is_ptr_array(p->oa_pin) && p->type == p->oa_pin) continue;
       /* an empty literal default is untyped by the rule above, not by any
          value: say so; another default's value speaks for itself */
       TyKind merged = ty_unify(p->type, dt);
@@ -12038,7 +12045,7 @@ static int infer_param_types_ex(Compiler *c, int settle, const NodeTypes *before
         else mi = comp_cbody_call_mi(c, id, name);
       }
       if (mi < 0) mi = call_target(c, id, -1, name, CT_TOP, NULL);
-      if (mi < 0) mi = comp_included_method_index(c, name, id);
+      if (mi < 0) mi = call_target(c, id, -1, name, CT_INCLUDED, NULL);
       changed |= bind_call_params(c, id, mi);
       /* Propagate to descendant classes that directly override the same method.
          When Base#foo calls bar(arg), and Sub overrides bar, Sub#bar must also
@@ -15069,7 +15076,7 @@ int desugar_dir_surface(Compiler *c) {
     }
     /* Kernel#open(path, ...) is File.open when no user method shadows it (#2816) */
     if (nm && recv < 0 && sp_streq(nm, "open") &&
-        comp_method_index(c, "open") < 0 &&
+        call_target(c, id, -1, "open", CT_TOP, NULL) < 0 &&
         /* ...and no enclosing chain owns it either: comp_method_index sees
            only a TOP-LEVEL def, so a module's own `open` lost to File.open
            when a sibling called it bare (#4592) */
@@ -16510,6 +16517,15 @@ static int ple_npw = 0;
    literal even though the container/arg holds a reference, not the literal
    itself (#3175). */
 static void ple_mark_escaped(Compiler *c, int x);
+/* Do ivar nodes `a` and `b` name the same slot (holder_of_node)? A module
+   or class body's `@b = ->(c) { }` runs in a scope of no class, yet its
+   @b is the one the body's singleton methods (`def self.b = @b`) read: the
+   scope's class alone kept the two apart. */
+static int ivar_same_holder(Compiler *c, int a, int b) {
+  HolderRef ha, hb;
+  return holder_of_node_slot(c, a, &ha) && holder_of_node_slot(c, b, &hb) &&
+         ha.cid >= 0 && ha.cid == hb.cid && ha.cls_slot == hb.cls_slot;
+}
 typedef struct { Compiler *c; int self; } PleMark;
 static int ple_mark_leaf(const VpLeaf *leaf, void *ud) {
   PleMark *m = ud;
@@ -16555,7 +16571,8 @@ static void ple_mark_escaped(Compiler *c, int x) {
   if (!vn) return;
   for (int i = 0; i < ple_npw; i++) {
     if (ple_pw[i * 4] != want_kind) continue;
-    if (want_kind != 1 && ple_pw[i * 4 + 1] != want_idx) continue;
+    if (want_kind != 1 && ple_pw[i * 4 + 1] != want_idx &&
+        !(want_kind == 2 && ivar_same_holder(c, ple_pw[i * 4 + 2], x))) continue;
     const char *wn = nt_str(nt, ple_pw[i * 4 + 2], "name");
     if (!wn || !sp_streq(wn, vn)) continue;
     ple_escaped[ple_pw[i * 4 + 3]] = 1;
@@ -16563,10 +16580,13 @@ static void ple_mark_escaped(Compiler *c, int x) {
 }
 /* The proc literals among the value positions of a value, and how many
    positions there are */
-typedef struct { Compiler *c; int *lit; int nlit, cap, nleaf; } PleLeaves;
+typedef struct { Compiler *c; int *lit; int nlit, cap, nleaf, ivars; } PleLeaves;
 static int ple_leaf(const VpLeaf *leaf, void *ud) {
   PleLeaves *p = ud;
   p->nleaf++;
+  /* (an ivar read among a tail's values: ple_mark_tail_literals) */
+  if (p->ivars && leaf->kind == VPK_EXPR && nt_kind(p->c->nt, leaf->node) == NK_InstanceVariableReadNode)
+    ple_mark_escaped(p->c, leaf->node);
   if (leaf->kind != VPK_EXPR ||
       !(nt_kind(p->c->nt, leaf->node) == NK_LambdaNode || is_proc_create(p->c, leaf->node))) return 0;
   if (p->nlit == p->cap) {
@@ -16579,10 +16599,14 @@ static int ple_leaf(const VpLeaf *leaf, void *ud) {
   return 0;
 }
 /* The proc literals among the value positions of `tail` (the value a method,
-   a lambda or a block answers) escape: the caller has the type-erased proc. */
+   a lambda or a block answers) escape: the caller has the type-erased proc.
+   So do the literals an ivar there holds: `def self.b = @b` hands out the
+   lambda the body wrote to @b, and its caller's `V.b.call(obj)` names no
+   literal, so the parameter kept the Integer default and read the object
+   as an Integer. */
 static void ple_mark_tail_literals(Compiler *c, int tail) {
   if (tail < 0 || tail >= ple_ntc) return;
-  PleLeaves pl = { c, NULL, 0, 0, 0 };
+  PleLeaves pl = { c, NULL, 0, 0, 0, 1 };
   for_each_value_position(c->nt, tail, VP_AND_LEFT | VPS_ALL, ple_leaf, &pl);
   for (int q = 0; q < pl.nlit; q++) ple_escaped[pl.lit[q]] = 1;
   free(pl.lit);
@@ -16633,6 +16657,25 @@ static void ple_build(Compiler *c) {
       }
       free(pl.lit);
     }
+  }
+  /* An attr_reader answers its ivar as a method's tail does (`class << self;
+     attr_reader :b; end` for a body's `@b = ->(c) { }`, or an instance's
+     `attr_reader :b` for one `initialize` writes): the caller of `V.b` has
+     the type-erased proc, so the literal escapes. An instance ivar's reader
+     may be declared by any class that has the slot (a subclass's). */
+  for (int i = 0; i < ple_npw; i++) {
+    if (ple_pw[i * 4] != 2) continue;
+    HolderRef h;
+    int w = ple_pw[i * 4 + 2];
+    if (!holder_of_node_slot(c, w, &h) || h.cid < 0 || !h.name || h.name[0] != '@') continue;
+    const char *rn = h.name + 1;
+    int hit = 0;
+    if (h.cls_slot) hit = comp_is_sg_reader(&c->classes[h.cid], rn);
+    else
+      for (int k = 0; k < c->nclasses && !hit; k++)
+        hit = comp_is_reader(&c->classes[k], rn) &&
+              (k == h.cid || comp_ivar_index(&c->classes[k], h.name) >= 0);
+    if (hit) ple_escaped[ple_pw[i * 4 + 3]] = 1;
   }
   NT_FOREACH_KIND(nt, NK_CallNode, id) {
     int ca = nt_ref(nt, id, "arguments");
@@ -17242,10 +17285,13 @@ static int infer_zip_block_params(Compiler *c, int id, int block, const char *p0
   }
   Scope *zs = comp_scope_of(c, block);
   const char *zp1s = block_param_name(c, block, 1);
-  LocalVar *ep0 = scope_local_intern(zs, p0); ep0->is_block_param = 1;
   /* a SOLO param receives the boxed TUPLE ([e1, e2]); two params
-     auto-splat it */
-  if (lv_widen(ep0, zp1s ? ty_array_elem(rt) : TY_POLY)) changed = 1;
+     auto-splat it. The first of two, pinned to the element class of an
+     object array the receiver narrows to (narrow_walk_block_params), keeps
+     its pin while the receiver still reads boxed, as the other params do:
+     widening it here and pinning it there changed it every round, and the
+     fixpoint ran to its cap. */
+  if (bp_widen(zs, p0, zp1s ? ty_array_elem(rt) : TY_POLY)) changed = 1;
   const char *zp1 = zp1s;
   if (zp1) {
     int zargs = nt_ref(nt, id, "arguments");
@@ -18710,7 +18756,7 @@ static int cs_type_proc_name(Compiler *c, int recv, const int *argv, int argc, i
     }
     else if (want_kind == 2) {
       Scope *ws = comp_scope_of(c, w);
-      if (!ws || ws->class_id != call_cls) continue;
+      if (!ws || (ws->class_id != call_cls && !ivar_same_holder(c, w, recv))) continue;
     }
     const char *wname = nt_str(nt, w, "name");
     if (!wname || !sp_streq(wname, varname)) continue;
@@ -18905,7 +18951,7 @@ int infer_block_params(Compiler *c) {
     else {
       if (!ty_is_object(rt)) continue;
       if (!sp_streq(cname, "instance_eval") &&
-          comp_trampoline_kind(c, ty_object_class(rt), cname, NULL) != 1) continue;
+          comp_trampoline_kind(c, call_target(c, id, ty_object_class(rt), cname, 0, NULL)) != 1) continue;
     }
     int blk = nt_ref(nt, id, "block");
     if (blk < 0) continue;
@@ -18950,7 +18996,7 @@ int infer_block_params(Compiler *c) {
     else if (!sp_streq(cname, "instance_exec")) {
       TyKind xrt = infer_type(c, xrecv);
       if (!ty_is_object(xrt) ||
-          comp_trampoline_kind(c, ty_object_class(xrt), cname, NULL) != 2) continue;
+          comp_trampoline_kind(c, call_target(c, id, ty_object_class(xrt), cname, 0, NULL)) != 2) continue;
     }
     int blk = nt_ref(nt, id, "block");
     if (blk < 0) continue;
@@ -19508,6 +19554,17 @@ static int scope_tail_unresolved_call(Compiler *c, int s) {
   if (recv < 0) return 0;
   TyKind lt = infer_type(c, last);
   if (lt != TY_VOID && lt != TY_UNKNOWN) return 0;
+  /* While the guesses are held at bottom, an argument not typed yet can
+     still give a builtin's answer its type: `1.0 / i` in a method no call
+     has bound `i` of yet is a Float division, not a call nothing resolves.
+     Typed POLY for that round, the return reached its callers, and where a
+     caller hands the value back as an argument (`u = [h(u)]`, `@v = f(@u)`)
+     the parameter, which only widens, kept the whole loop boxed. */
+  if (g_infer_optimistic) {
+    int la = nt_ref(nt, last, "arguments"), lac = 0;
+    const int *lav = la >= 0 ? nt_arr(nt, la, "arguments", &lac) : NULL;
+    for (int k = 0; k < lac; k++) if (infer_type(c, lav[k]) == TY_UNKNOWN) return 0;
+  }
   /* A builtin-typed receiver: the name is either one of that type's methods
      (and would have a type) or nothing at all. An object/poly/unknown receiver
      is not decided here -- the fixpoint may still settle it. */
@@ -19633,7 +19690,7 @@ int backprop_call_target(Compiler *c, int call_id) {
     /* self's class methods first in a class method, then its instance
        chain, then a top-level def, as inference resolves the call */
     int mi = comp_self_call_mi(c, call_id, name);
-    if (mi < 0) mi = comp_included_method_index(c, name, call_id);
+    if (mi < 0) mi = call_target(c, call_id, -1, name, CT_INCLUDED, NULL);
     return mi;
   }
   NodeKind rk = nt_kind(nt, recv);
@@ -20113,6 +20170,15 @@ static int irt_scope(Compiler *c, int s, IrtCtx *x) {
     int tk = empty_body ? 0 : an_empty_container_kind(c, sc->body);
     if (r == TY_UNKNOWN && an_empty_container_disagrees(tk, ret_acc[s])) r = TY_POLY;
     r = ty_unify(r, ret_acc[s]);
+    /* ...and where nothing else settles a type (`return [] if d == 0;
+       m(d - 1) + [d]`, whose tail waits on the method's own value), once
+       the rounds are no longer optimistic the empty literal is the value,
+       as it is for an if/else arm (an_empty_arm_join): left UNKNOWN the
+       method became a void C function and the recursive call answered
+       nil. Only one kind of empty literal, and a tail that is not one. */
+    int ek = ret_empty ? ret_empty[s] : 0;
+    if (r == TY_UNKNOWN && !g_infer_optimistic && !tk && (ek == 1 || ek == 2))
+      r = ek == 1 ? TY_POLY_ARRAY : TY_POLY_POLY_HASH;
   }
   if (has_ret && has_ret[s] && ret_empty && ret_empty[s] &&
       (an_empty_container_disagrees(ret_empty[s] & 1, r) ||
@@ -20361,6 +20427,51 @@ static int irt_settle_callers(Compiler *c, IrtCtx *x) {
   return changed;
 }
 
+/* `return v if v.is_a?(K)` (kind_of?, instance_of?): the return can only
+   ever answer a K. The class K, a plain user class (a module's value is
+   any includer, a reopened builtin's keeps the builtin's type, #3109), and
+   in *ret the return, for the IfNode id of that one-statement shape; -1
+   for any other. K is a constant, or self in a class method (`return text
+   if text.is_a?(self)` in `def self.parse`), the method's class. */
+int isa_guard_class(Compiler *c, int id, int *ret) {
+  const NodeTable *nt = c->nt;
+  if (nt_kind(nt, id) != NK_IfNode) return -1;
+  int pred = nt_ref(nt, id, "predicate");
+  if (pred < 0 || nt_kind(nt, pred) != NK_CallNode) return -1;
+  const char *pn = nt_str(nt, pred, "name");
+  if (!pn || !is_kind_query(pn)) return -1;
+  int prec = nt_ref(nt, pred, "receiver");
+  if (prec < 0 || nt_kind(nt, prec) != NK_LocalVariableReadNode) return -1;
+  const char *vn = nt_str(nt, prec, "name");
+  int pargs = nt_ref(nt, pred, "arguments");
+  int pan = 0; const int *pav = pargs >= 0 ? nt_arr(nt, pargs, "arguments", &pan) : NULL;
+  if (pan != 1 || !pav) return -1;
+  NodeKind ak = nt_kind(nt, pav[0]);
+  int kcid = -1;
+  if (ak == NK_ConstantReadNode || ak == NK_ConstantPathNode) {
+    const char *kn = key_name(c, pav[0]);
+    kcid = kn ? const_node_class_index(c, pav[0]) : -1;
+    if (kcid >= 0 && is_builtin_reopen(kn)) return -1;
+  }
+  else if (ak == NK_SelfNode) {
+    Scope *sc = comp_scope_of(c, id);
+    kcid = sc && sc->is_cmethod ? sc->class_id : -1;
+    if (kcid >= 0 && kcid < c->nclasses && is_builtin_reopen(c->classes[kcid].name)) return -1;
+  }
+  if (kcid < 0 || kcid >= c->nclasses || comp_class_is_module(c, &c->classes[kcid])) return -1;
+  /* single-statement then-arm returning the SAME variable */
+  int stm = nt_ref(nt, id, "statements");
+  int sn = 0; const int *sb = stm >= 0 ? nt_arr(nt, stm, "body", &sn) : NULL;
+  if (sn != 1 || !sb || nt_kind(nt, sb[0]) != NK_ReturnNode) return -1;
+  int ra = nt_ref(nt, sb[0], "arguments");
+  int ran = 0; const int *rav = ra >= 0 ? nt_arr(nt, ra, "arguments", &ran) : NULL;
+  if (ran != 1 || !rav || nt_kind(nt, rav[0]) != NK_LocalVariableReadNode) return -1;
+  const char *rn = nt_str(nt, rav[0], "name");
+  if (!vn || !rn || !sp_streq(vn, rn)) return -1;
+  if (ret) *ret = sb[0];
+  return kcid;
+}
+
 int infer_return_types(Compiler *c) {
   const NodeTable *nt = c->nt;
   int changed = 0;
@@ -20386,40 +20497,11 @@ int infer_return_types(Compiler *c) {
      method named after a builtin (URI#join) on the union collapsed to the
      builtin String signature (#3259). */
   TyKind *ret_narrow = (TyKind *)calloc((size_t)(nt->count > 0 ? nt->count : 1), sizeof(TyKind));
-  if (ret_narrow) {
-    for (int id = 0; id < nt->count; id++) {
-      if (nt_kind(nt, id) != NK_IfNode) continue;
-      int pred = nt_ref(nt, id, "predicate");
-      NodeKind pk = nt_kind(nt, pred);
-      if (pk != NK_CallNode) continue;
-      const char *pn = nt_str(nt, pred, "name");
-      if (!pn || !is_kind_query(pn)) continue;
-      int prec = nt_ref(nt, pred, "receiver");
-      if (prec < 0 ||
-          nt_kind(nt, prec) != NK_LocalVariableReadNode) continue;
-      const char *vn = nt_str(nt, prec, "name");
-      int pargs = nt_ref(nt, pred, "arguments");
-      int pan = 0; const int *pav = pargs >= 0 ? nt_arr(nt, pargs, "arguments", &pan) : NULL;
-      if (pan != 1 || !pav) continue;
-      NodeKind ak = nt_kind(nt, pav[0]);
-      const char *kn = ((ak == NK_ConstantReadNode ||
-                                ak == NK_ConstantPathNode))
-                         ? key_name(c, pav[0]) : NULL;
-      int kcid = kn ? const_node_class_index(c, pav[0]) : -1;
-      if (kcid < 0) continue;
-      /* single-statement then-arm returning the SAME variable */
-      int stm = nt_ref(nt, id, "statements");
-      int sn = 0; const int *sb = stm >= 0 ? nt_arr(nt, stm, "body", &sn) : NULL;
-      if (sn != 1 || !sb || nt_kind(nt, sb[0]) != NK_ReturnNode) continue;
-      int ra = nt_ref(nt, sb[0], "arguments");
-      int ran = 0; const int *rav = ra >= 0 ? nt_arr(nt, ra, "arguments", &ran) : NULL;
-      if (ran != 1 || !rav ||
-          nt_kind(nt, rav[0]) != NK_LocalVariableReadNode) continue;
-      const char *rn = nt_str(nt, rav[0], "name");
-      if (!vn || !rn || !sp_streq(vn, rn)) continue;
-      ret_narrow[sb[0]] = ty_object(kcid);
+  if (ret_narrow)
+    NT_FOREACH_KIND(nt, NK_IfNode, id) {
+      int rn = -1, kcid = isa_guard_class(c, id, &rn);
+      if (kcid >= 0) ret_narrow[rn] = ty_object(kcid);
     }
-  }
   if (ret_acc && has_ret) {
     /* `return x unless block_given?` (or `if !block_given?`) in a yielding
        method: the return a BLOCKLESS call answers. Its type is kept apart

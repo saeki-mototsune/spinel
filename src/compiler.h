@@ -124,6 +124,11 @@ typedef struct { unsigned char all, bv, os, pr, bc; unsigned long long bk[CLS_BK
 /* A hashed name set (keys borrowed, not copied); zero-initialize to start (anh_*, analyze_internal.h). */
 typedef struct { const char **key; int *next, *head, n, cap, nb; } ANameHash;
 static inline int cls_bk_has(const ClsSet *s, int k) { return (int)((s->bk[k >> 6] >> (k & 63)) & 1); }
+/* does the builtin part by class hold any class (a literal's seed has it with bv 0)? */
+static inline int cls_bk_any(const ClsSet *s) {
+  for (int i = 0; i < CLS_BK_WORDS; i++) if (s->bk[i]) return 1;
+  return 0;
+}
 /* the position of the first word at word index q or past it */
 static inline int cls_set_word_from(const ClsSet *s, int q) {
   int lo = 0, hi = s->nw;
@@ -859,6 +864,13 @@ typedef struct {
   int parent;          /* superclass index, or -1 */
   char **ivars;        /* instance variable names, incl. leading '@' */
   NameIdx ivars_ix;    /* comp_ivar_index's index of ivars */
+  unsigned char *ivar_side; /* per ivar, which object holds it (IVS_*): an
+                               instance (its field iv_<x>), the class object
+                               itself or main for the Toplevel pseudo-class
+                               (the static civ_<Class>_<x>), or both, when
+                               the program names it on both. In Ruby they
+                               are different variables; a name used on one
+                               side lays out nothing on the other. */
   SP_TY_FIELD TyKind *ivar_types;
   unsigned char *ivar_str_shared; /* (#3227) the slot is a shared-mutable
                                      string handle (sp_String *): survives
@@ -1130,6 +1142,7 @@ typedef struct {
   int nprep_chain, cprep_chain;
   int prep_shadow_count; /* next shadow index to assign */
   int enclosing_class;   /* index of enclosing module/class, or -1 for top-level */
+  unsigned char ruby_name_derived;   /* (ruby_name_cache is class_ruby_name's, built from the names) */
   char *ruby_name_cache; /* the qualified Ruby name, built once by
                             class_ruby_name. Cached so the pointer it returns
                             STAYS VALID: it used to be a shared static buffer,
@@ -1206,6 +1219,11 @@ typedef struct {
                       (sp_native_enter/leave): a collection does not wait for it.
                       An ffi_callback from inside it comes back in for the method
                       (sp_native_callback_enter/leave) */
+  int offload;     /* `offload: true` (spinel's own, not the ffi gem's): the C
+                      function runs on another OS thread (sp_offload_call), and
+                      the calling green thread waits as on I/O, its worker free
+                      for the others; implies blocking. Its declaration's
+                      node + 1, 0 for none */
   int via_fp;      /* a literal attach_function of the bundled ffi package: the
                       callee is the function pointer the attach resolves at run
                       time (FFI::Native.note_fp), not an extern (#11362) */
@@ -1497,6 +1515,12 @@ typedef struct {
   struct DsnMemo { int on, ncls, nscp, keyed; unsigned sgen, shape, tgen;
                    char ***names; int *n; char **inames; int ninames; int *every; int nevery;
                    char ***own; int *nown;
+                   /* every class's names but a module's, in class order, each
+                      once, send's family left out (dsn_all_names), with the set
+                      of them (all_seen) and the set of every name, send's
+                      family among them (all_any, its keys); built once */
+                   char **all; int nall, all_built; ANameHash all_seen, all_any;
+                   char **all_any_keys; int nall_any;
                    ANameHash lits; } dsn;
   /* the top-level scope of each file root (nt_root), by graph id: 0 for the
      entry (analyze_program.c) */
@@ -1728,6 +1752,7 @@ typedef struct {
   /* the methods CRuby calls that the program does not name, as the last
      reachability run found them (implicit_calls.h); freed with the Compiler */
   struct IcState *ic;
+  struct QcConstNames *qc_consts;   /* the qualified names the class pass gave constants, and their leaves (analyze_internal.h) */
   struct YvtIndex *yvt;   /* yield_value_type's call-site index (analyze_internal.h), built on first use */
   int uses_exc_text_handle;  /* emitted shared exception text routes, to_s/message bits */
   /* a boxed site converts through sp_obj_to_ary_entry (emit_boxed_to_ary_arms):
@@ -1799,6 +1824,9 @@ typedef struct {
      arguments to (a proc form, or a method with a `&blk` it calls), or 0 */
   int proc_arg_src;
   struct ShareFacts *share;
+  /* the operand-order record (order_plan.c): per operand list, where each
+     operand is evaluated; built by the analysis phase operand_order */
+  struct OrderFacts *order;
   /* the String plan's memo (share_plan.c): per node, its need, the role of
      its consumer, and its type when the need was asked, filled at seal under
      --share-strings, and the node table's version then */
@@ -1915,28 +1943,38 @@ typedef struct {
      1 + the method a guard entry's method_missing else arm stands for,
      the one behind the mixins that finds no method (guard_entry_make),
      0 for none; face: VF_NONE, or the visibility the arms of the versions
-     that are closed to it raise for (call_plan.h). Each name
+     that are closed to it raise for (call_plan.h); vis, 1 where a class method's respond_to? reads the
+     entry's cells (cplan_cmethod_presence), so its versions' visibility cells are written whatever the face
+     (ver_presence_mark). Each name
      is the entry's own copy (ver_entry_add), as in ver_late, ver_memo and
      the chain counts: a caller may ask with a name it frees itself
      (desugar_call_op_write's setter name) */
-  struct VerEntry { char *name; int guard, cls, sg, ar, scope, absent, cells, finds, from, behind, face; } *ver_entries;
+  struct VerEntry { char *name; int guard, cls, sg, ar, scope, absent, cells, finds, from, behind, face, vis; } *ver_entries;
   int nver_entries;
   /* per global (c->gvars' index, the first nver_cell_dropped of them): 1 for
      a version cell no emitted code reads, whose declaration and writes the C
      leaves out (call_plan.c, ver_cells_settle) */
   unsigned char *ver_cell_dropped;
   int nver_cell_dropped;
+  /* the visibility cells a visibility word inside an expression writes as
+     its own call runs (`c && public(:m, :n)`), one per cell, with the
+     value (call_plan.c, ver_cells_put; cplan_vis_cell_after) */
+  struct VerVisAfter { int node, cell, v; } *ver_vis_after;
+  int nver_vis_after;
   /* the chains a typed call may meet with no version made yet, whose
      entry is not asked for that yet (call_plan.c, ver_absent_note); mm:
      where the call runs, method_missing is on the chain (1), is not (2),
      or both (ver_mm_at) */
   struct VerLate { char *name; int cls, sg, mi, ar, mm, span, face; } *ver_late;   /* span: a call past the build that spans versions; face: the entry's it binds (VF_*) */
   int nver_late;
-  int nver_refl;   /* the named entries whose name reflection does not answer (call_plan.c, ver_refl_named) */
+  int nver_refl;   /* the public histories whose name reflection does not answer (call_plan.c, ver_refl_named), the private ones in nver_refl_priv: a public list names none of those */
+  int nver_refl_priv, nver_bycount;   /* ...and the histories held by count, whose versions carry the mark (ver_named_make) */
   int ncond_disp;  /* the dispatchers defs under a run-time condition are lowered to (analyze_desugar.c; call_plan.c, ver_list_held) */
   char **rsc_names;   /* the names a class or module body defines, which `::Name` must not be read as the bare Name for (analyze_desugar.c, desugar_root_scoped_constants) */
   int n_rsc_names;
   int nomethod_init;   /* 1 none, 2 a class NoMethodError defines an initialize (analyze_desugar.c, disp_raise_with); 0 not asked yet */
+  int nvcall_twins;   /* the VF_VCALL twins ver_vcall_twins made: call_target asks for one only when there are any */
+  int nameerror_init;  /* ...the same of a class NameError, for the error a variable-like call raises */
   int ncond_lone_disp;  /* those of them a lone def at the top level, in a module or in Object or BasicObject is lowered to (call_plan.c, feature_limit) */
   /* the open histories no reader names yet, sorted by name (call_plan.c,
      ver_named_one): made once a call names one, taken 1 when asked for and
@@ -1958,6 +1996,11 @@ typedef struct {
   unsigned ver_ix_nb;
   struct VerPin { int node, scope, vis; } *ver_pins;
   int nver_pins;
+  /* the names of main's builtins whose calls the plan put behind an
+     undef's cell (ver_main_undef_guards), whose cells are written as an
+     entry's chain's are, once (cells) */
+  struct VerGuard { const char *name; int cells; } *ver_guards;
+  int nver_guards;
   /* the entries are made (ver_entries_build): the versions the calls get
      are kept, and a call that reaches a later prepend's copy binds its
      guard entry */
@@ -2018,11 +2061,21 @@ typedef struct {
      program's (nil, a number, a String), so its ivars are nil; and the class a
      block body's own instance_eval / exec call (or a forwarder to one) runs it
      on, -1 for a body that only sits inside such a block, whose class it shares
-     in cls. All three have cap entries. */
+     in cls; and whether the receiver has no type yet this round, so the
+     block's ivars wait for its class. rb flags (IE_RB_*) the nodes whose
+     self is rebound to another object (ie_rebound_marks); rb_ver counts the
+     times those flags changed, rb_scan is the node count the block
+     structure was last read at. prm is, by a block's body, its parameters'
+     node (-1 where none). All six have cap entries. */
   struct {
     int *cls;
     unsigned char *nonobj;
     int *own;
+    unsigned char *pending;
+    unsigned char *rb;
+    int *prm;
+    unsigned rb_ver;
+    int rb_scan;
     int cap;
   } ie_map;
   /* cplan_block_value_ignored's answers (call_plan.c): their number, which
@@ -2033,6 +2086,7 @@ typedef struct {
   struct { unsigned long ty, edits; unsigned version, scope_gen; int nscopes; } bvi_stamp;
 } Compiler;
 enum { PRES_UNMARKED = 1, PRES_REMOVED = 2 };
+enum { IE_RB_IN = 1, IE_RB_OWN = 2, IE_RB_ROOT = 4 };
 
 AutoloadRegistration *comp_autoloads(const Compiler *c, int node, int *count);
 Compiler *comp_new(const NodeTable *nt);
@@ -2084,6 +2138,16 @@ int comp_is_local_write(NodeKind k);
    it, a self call whose method may, or anything else that runs code
    (codegen_util.c) */
 int subtree_may_write_ivar(Compiler *c, int id, const char *iv, int cls, int depth);
+/* ...its answer at `id` itself: 1 yes, 0 no for the whole subtree, -1 ask
+   the node's operands (a self call's method body is asked here, one level
+   deeper). */
+int node_may_write_ivar(Compiler *c, int id, const char *iv, int cls, int depth);
+/* Both questions' one rule, for every instance variable at once: each name
+   the node (subtree) may write is handed to `add`, which answers nonzero to
+   stop; 1 when it may write any or `add` stopped it, else as above. */
+typedef int (*IvarWriteFn)(void *ctx, const char *iv);
+int node_ivar_writes(Compiler *c, int id, int cls, int depth, IvarWriteFn add, void *ctx);
+int subtree_ivar_writes(Compiler *c, int id, int cls, int depth, IvarWriteFn add, void *ctx);
 int comp_lvw_first(Compiler *c, const char *name);
 int comp_module_includes(Compiler *c, int m, int mod, int depth);
 int comp_class_singleton_has_module(Compiler *c, int ci, int mod);
@@ -2105,7 +2169,10 @@ void comp_ivarg_invalidate(Compiler *c);
 int comp_ivarg_next(const Compiler *c, int e);
 int comp_ivarg_call(const Compiler *c, int e);
 int comp_ivarg_arg(const Compiler *c, int e);
-/* The owning class of an ivar read or write node, or -1. */
+/* The class whose ivar table holds the ivar a read or write node names, by
+   holder_ivar_side (an instance_eval block's receiver, a class method's or
+   a class or module body's class, main's Toplevel), or -1. Its entry is
+   the name's in that table: the two sides of one name share it. */
 int comp_ivar_owner(Compiler *c, int node);
 /* The PRES_* facts of an ivar name (Compiler.pres_names), and adding one */
 int comp_pres_flags(const Compiler *c, const char *ivn);
@@ -2291,9 +2358,14 @@ int const_seg_builtin(Compiler *c, int id);
 
 /* Classes. */
 ClassInfo *comp_class_new(Compiler *c, const char *name, int def_node);
+void comp_class_rename(Compiler *c, int i, const char *name);
+void comp_class_relink(Compiler *c);
+const char *elab_class_walk_name(const Compiler *c, int k);   /* the name the walk gives class k (analyze_elab.c) */
+int elab_class_provisional(const Compiler *c, int k);         /* does class k walk under a provisional name */
 void       comp_class_nested(Compiler *c, int k, int encl);   /* class k lies inside class encl: not the builtin its leaf names */
 int        comp_class_in_namespace(const Compiler *c, int k);   /* does class k lie inside a class or module other than Object, whose body is the top level's? */
 int comp_toplevel_class_make(Compiler *c);
+int comp_main_extend_defines(Compiler *c, int call_id, const char *name);
 int        comp_class_index(Compiler *c, const char *name);   /* -1 if none */
 /* The first-created class for a CORE_* slot, -1 if no class has been made
    or the slot is negative. */
@@ -2418,7 +2490,8 @@ int        const_path_value_const(Compiler *c, int k, const char *nm, const int 
 const LocalVar *const_value_path_top(Compiler *c, const char *nm); /* the top-level NM `Object::NM` reads through a value, or NULL */
 int        const_path_value_class(Compiler *c, int k, const char *nm); /* the class nested as NM in K's chain, -1 for none */
 int        const_written_through_value(Compiler *c, const char *nm); /* `m::NM = v` / const_set with m a value: no chain can be read for NM */
-int        qc_leaf_qualified(const char *leaf);
+int        qc_leaf_qualified(Compiler *c, const char *leaf);
+void       qc_const_names_free(Compiler *c);   /* analyze.c */
 const char *time_strict_parser_call(Compiler *c, int id);
 /* Class index of a `class_eval`/`module_eval { defs }` reopen, else -1.
    enclosing_class resolves bare/`self.` receivers (the class whose body we are
@@ -2426,7 +2499,13 @@ const char *time_strict_parser_call(Compiler *c, int id);
 int        class_eval_reopen_class(Compiler *c, int id, int enclosing_class);
 int        class_reopen_cmethod(Compiler *c, int call, int recv, const char *name); /* a method the program adds to Class, run by `call` (-1: no call) */
 int        comp_ivar_index(ClassInfo *ci, const char *name);  /* -1 if none */
-int        comp_ivar_intern(ClassInfo *ci, const char *name); /* find or add; returns index */
+/* The objects an ivar of a class can be held by (ClassInfo.ivar_side) */
+enum { IVS_INST = 1, IVS_CLASS = 2 };
+int        comp_ivar_intern(ClassInfo *ci, const char *name, int side); /* find or add, on side (IVS_*); returns index */
+int        comp_ivar_on(const ClassInfo *ci, int iv, int side);   /* is ivar iv held on side (IVS_*)? */
+int        comp_inst_ivar_index(ClassInfo *ci, const char *name); /* an instance's field for name, -1 if none */
+int        comp_class_ivar_index(ClassInfo *ci, const char *name); /* the class object's own ivar, -1 if none */
+int        comp_inst_ivar_count(const ClassInfo *ci);             /* how many ivars an instance lays out */
 int        comp_member_intern(ClassInfo *ci, const char *name);
 int        comp_member_index(ClassInfo *ci, const char *name);
 int        comp_cvar_index(ClassInfo *ci, const char *name);  /* class var; -1 if none */
@@ -2477,11 +2556,11 @@ int        class_eqq_answers_value(Compiler *c);
 int        io_family_name(const char *n);
 int        io_family_class(Compiler *c, int k);
 /* The reopened IO-family class whose method `name` a typed IO calls, or -1. */
-int        io_reopen_class(Compiler *c, const char *name);
+int        io_reopen_class(Compiler *c, int id, const char *name);
 extern int g_io_skip_reopen, g_io_skip_node;
-int        io_reopen_leaves_builtin(Compiler *c, const char *name);
-int        io_reopen_defs(Compiler *c, const char *name, int public_only, int *ks, int max);
-int        io_reopen_ret_mixed(Compiler *c, const char *name);
+int        io_reopen_leaves_builtin(Compiler *c, int id, const char *name);
+int        io_reopen_defs(Compiler *c, int id, const char *name, int public_only, int *ks, int max);
+int        io_reopen_ret_mixed(Compiler *c, int id, const char *name);
 int        io_family_descends(Compiler *c, int k, int owner);
 const char *io_super_name(const char *k);
 /* Like comp_method_in_class but walks the superclass chain. On success,
@@ -2526,11 +2605,21 @@ int        comp_name_reader_any(Compiler *c, const char *name);
    asks it for every argument-less call on a receiver that can be anything,
    at every solve. */
 const int *comp_name_reader_owners(Compiler *c, const char *name, int *n);
-/* does Object's program define a method of the name? */
-static inline int comp_object_defines(Compiler *c, const char *name) {
-  int oc = comp_core_class(c, CORE_OBJECT);
-  return oc >= 0 && comp_method_in_chain(c, oc, name, NULL) >= 0;
-}
+/* Does any class's chain answer `name` (on the class side when is_cm)?
+   comp_name_responders' count, asked where the list cannot be built too: the
+   candidate owner of "is the name defined by a class of the program". */
+int        comp_name_answered(Compiler *c, const char *name, int is_cm);
+/* The scope class cls's chain finds for `name` as one of the name's
+   responders, or -1 where it is not one: its class side with CT_CMETHOD, its
+   own table only with CT_OWN (an override), the top-level functions for
+   cls < 0. No record is asked: a candidate, not what one call runs. */
+int        comp_name_responder(Compiler *c, int cls, const char *name, unsigned side);
+/* Does class k's chain hold a method or an attribute reader of `name`: one
+   of the name's candidates for a boxed dispatch (comp_poly_candidates' test,
+   asked of one class), as a def or an attr_reader gives an arm? */
+int        comp_class_answers(Compiler *c, int k, const char *name);
+/* Does any class's chain answer an attribute writer of base? */
+int        comp_name_writer_any(Compiler *c, const char *base);
 int        send_def_just_supers(Compiler *c, int mi);          /* analyze_desugar.c */
 int        send_family_defined_anywhere(Compiler *c, const char *name);   /* analyze_desugar.c */
 /* Array subclasses (#7449, ClassInfo.ary_root): the root of class cid's
@@ -2546,7 +2635,7 @@ TyKind     comp_ary_kind(Compiler *c, int cid);
 /* Whether Array answers a call named n on an instance of Array subclass
    cid: no method, reader or writer of the class chain takes the name, it
    asks nothing about the object itself, and Array has it. */
-int        comp_arysub_name_is_array(Compiler *c, int cid, const char *n);
+int        comp_arysub_name_is_array(Compiler *c, int id, int cid, const char *n);
 /* Call `id` on rt (an Array subclass instance) is Array's, answered as the
    embedded Array's kind *kind; what Array answers, as the builtin-op rows
    say (bop_answers_self: BOPF_SELF, BOPF_SELF_OR_NIL, BOPF_SELF_EXACT...);
@@ -2569,10 +2658,10 @@ int        comp_arysub_emb(Compiler *c, int cid);
 int        comp_arysub_str_boxed(const char *n);
 int        comp_arysub_builtin(Compiler *c, int cid);
 /* a name the builtin cid's chain embeds answers (comp_array_method_name, or Hash's) */
-int        comp_arysub_builtin_name(Compiler *c, int cid, const char *n);
+int        comp_arysub_builtin_name(Compiler *c, int id, int cid, const char *n);
 int        comp_arysub_reopen(Compiler *c, int cid);
-int        comp_builtin_kind_reopen_mi(Compiler *c, TyKind t, const char *name);
-int        comp_builtin_name_reopened(Compiler *c, const char *name);
+int        comp_builtin_kind_reopen_mi(Compiler *c, int id, TyKind t, const char *name);
+int        comp_builtin_name_reopened(Compiler *c, int id, const char *name);
 int        comp_yield_chain_reopened(Compiler *c, int call);
 /* Record method `name`'s visibility on a class (overwrite-or-append). */
 void       comp_method_vis_set(ClassInfo *ci, const char *name, int kind);
@@ -2600,11 +2689,14 @@ int        ext_class_exported(Compiler *c, int class_id);
 int        ext_item_classes(Compiler *c, const char *item, int *a, int *b);
 int        ext_method_exported(Compiler *c, int class_id, int si, int typed);
 int        ext_scope_host_callable(Compiler *c, int si);
+int        ext_class_def_wanted(Compiler *c, const char *key);
+const char *ext_fwd_orig(const char *name, int *nfixed, int *rest);
 int        ext_ty_crosses(TyKind t);
 int        comp_method_vis_declared(Compiler *c, int class_id, const char *name, int *at);
-/* Detect an instance_eval/exec trampoline (def m(args,&b); instance_eval/exec(args,&b); end).
-   Returns 1 (eval) / 2 (exec) / 0; sets *def_class to the defining class. */
-int        comp_trampoline_kind(Compiler *c, int class_id, const char *name, int *def_class);
+/* Is method mi (the one the plan answered for a call, -1 for none) an
+   instance_eval/exec trampoline (def m(args,&b); instance_eval/exec(args,&b); end)?
+   Returns 1 (eval) / 2 (exec) / 0. */
+int        comp_trampoline_kind(Compiler *c, int mi);
 /* Stage-1 fold for module singleton accessors holding a constant. */
 int        comp_sg_const_binding(Compiler *c, int class_id, const char *base);
 int        comp_sg_reader_const(Compiler *c, int call_id); /* const class idx for `Class.reader`, or -1 */

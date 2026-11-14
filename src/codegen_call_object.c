@@ -788,7 +788,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       ie_self_cls = g_emitting_class_id;
   }
   if (!ie_direct && recv >= 0 && nt_ref(nt, id, "block") >= 0 && ty_is_object(comp_ntype(c, recv)))
-    ie_tramp = comp_trampoline_kind(c, ty_object_class(comp_ntype(c, recv)), name, NULL);
+    ie_tramp = comp_trampoline_kind(c, call_target(c, id, ty_object_class(comp_ntype(c, recv)), name, 0, NULL));
   /* a RECEIVERLESS call to a trampoline method inside an instance method:
      self is the receiver (`go { ... }` where `def go(&b) = instance_exec(&b)`).
      Without this the call lowers to the real method, whose body is the
@@ -796,7 +796,7 @@ int emit_call_instance_eval_arms(Compiler *c, int id, Buf *b, const NodeTable *n
   if (!ie_direct && !ie_tramp && recv < 0 && nt_ref(nt, id, "block") >= 0) {
     Scope *trs = comp_scope_of(c, id);
     if (trs && trs->class_id >= 0 && !trs->is_cmethod) {
-      ie_tramp = comp_trampoline_kind(c, trs->class_id, name, NULL);
+      ie_tramp = comp_trampoline_kind(c, call_target(c, id, trs->class_id, name, 0, NULL));
       if (ie_tramp) ie_self_cls = trs->class_id;
     }
   }
@@ -1225,6 +1225,12 @@ static void emit_obj_struct_copy(Compiler *c, int cid, int to, int td, Buf *b) {
              class_needs_scan(dci) ? "__gc_scan" : "", td, to);
   if (any) buf_puts(b, "} } ");
 }
+/* Does Object's own chain, as the program reopens it, hold an instance
+   method `name` (its own def or a module it includes)? */
+static int main_object_chain_defines(Compiler *c, const char *name) {
+  int oc = comp_core_class(c, CORE_OBJECT);
+  return oc >= 0 && oc < c->nclasses && comp_method_in_chain(c, oc, name, NULL) >= 0;
+}
 int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc) {
   if (recv >= 0 && (comp_ntype(c, recv) == TY_RANGE || comp_ntype(c, recv) == TY_FLOAT_RANGE ||
                    comp_ntype(c, recv) == TY_STR_RANGE) &&
@@ -1259,6 +1265,18 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     }
   }
 
+  /* Hash[h] of one Hash: a new Hash of its pairs, where h.to_h (the
+     rewrite) answers h itself; the copy takes no default, as CRuby's */
+  if (recv >= 0 && sp_streq(name, "to_h") && argc == 0 && nt_ref(nt, id, "block") < 0 &&
+      nt_int(nt, id, "hash_brackets", 0) && ty_is_hash(comp_ntype(c, recv)) &&
+      ty_hash_cname(comp_ntype(c, recv)) && comp_ntype(c, id) == comp_ntype(c, recv)) {
+    const char *hn = ty_hash_cname(comp_ntype(c, recv));
+    int t = ++g_tmp;
+    buf_printf(b, "({ sp_%sHash *_t%d = sp_%sHash_new(); SP_GC_ROOT(_t%d); sp_%sHash_replace(_t%d, ",
+               hn, t, hn, t, hn, t);
+    emit_expr(c, recv, b); buf_puts(b, "); })");
+    return 1;
+  }
   /* freeze / frozen? on hashes use the GC-header frozen bit, and to_h is the
      hash itself: builtin-op rows of the same stage */
   if (recv >= 0 && ty_is_hash(comp_ntype(c, recv)) &&
@@ -1614,7 +1632,11 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       !(!cplan_builtin_call(c, id) && ty_is_object(comp_ntype(c, recv)) &&
         comp_resolve_member(c, ty_object_class(comp_ntype(c, recv)), name, 0, NULL, NULL) != SP_MEMBER_NONE) &&
       !(argc == 0 && repr_of(c, recv).kind == RK_BOXED && user_defines_or_reads(c, name) &&
-        (!is_itself_name(name) || !user_defines_calls_super(c, name)))) {
+        (!is_itself_name(name) || !user_defines_calls_super(c, name))) &&
+      /* main is an Object: a method Object's chain holds (a module
+         `Object.include` gave it, `Mine#clone`) answers ahead of Kernel's */
+      !(!cplan_builtin_call(c, id) && nt_kind(nt, recv) == NK_SelfNode && self_is_main_raw(c, recv) &&
+        main_object_chain_defines(c, name))) {
     int args = nt_ref(nt, id, "arguments");
     int argc0 = 0; if (args >= 0) nt_arr(nt, args, "arguments", &argc0);
     /* hash, string, array, and native-bound object dup/clone require real
@@ -2324,7 +2346,12 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
       /* a typed array or hash is a pointer too, and a slice past the end
          (`a[4..]&.size`) or a container miss hands it NULL (#4524) */
       int sn_cont = needs_root(rrt) && rrt != TY_POLY && rrt != TY_STRING && !ty_is_object(rrt);
-      if ((sn_obj || rrt == TY_STRING || sn_scalar || sn_cont) && g_sn_skip != id) {
+      /* any other pointer whose NULL is nil (a Regexp, a Proc, an Exception
+         a nil-defaulted parameter holds): the guard was dropped and the
+         call ran on the nil (#11851) */
+      int sn_ptr = ty_null_is_nil(rrt) && rrt != TY_POLY && rrt != TY_STRING &&
+                   rrr.kind != RK_VOBJ && node_may_be_null_nil(c, recv);
+      if ((sn_obj || rrt == TY_STRING || sn_scalar || sn_cont || sn_ptr) && g_sn_skip != id) {
         int tsn2 = ++g_tmp;
         /* (an attribute assignment marked to hand out its handle answers it,
            and so does a String Array's element read written as the handle
@@ -2394,9 +2421,11 @@ int emit_call_safe_nav_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
         else if (sn_scalar)
           buf_printf(g_pre, "%s _sn%d = %s; %s _snv%d = _sn%d.v;\n", oint_ctype(rrt), tsn2,
                      rsn.p ? rsn.p : oint_nil(rrt), c_type_name(rrt), tsn2, tsn2);
-        else if (sn_cont) {
+        else if (sn_cont || sn_ptr) {
           emit_ctype(c, rrt, g_pre);
-          buf_printf(g_pre, " _sn%d = %s; SP_GC_ROOT(_sn%d);\n", tsn2, rsn.p ? rsn.p : "NULL", tsn2);
+          buf_printf(g_pre, " _sn%d = %s;", tsn2, rsn.p ? rsn.p : "NULL");
+          if (needs_root(rrt)) buf_printf(g_pre, " SP_GC_ROOT(_sn%d);", tsn2);
+          buf_puts(g_pre, "\n");
         }
         else
           buf_printf(g_pre, "const char *_sn%d = %s; SP_GC_ROOT_STR(_sn%d);\n",
@@ -3225,7 +3254,7 @@ int emit_call_display_ivar_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
     buf_puts(b, "), stdout))");
     return 1;
   }
-  if (recv >= 0 && (ty_builtin_ivar_less(rt) || is_bivar_access(name)) && !comp_object_defines(c, name) &&
+  if (recv >= 0 && (ty_builtin_ivar_less(rt) || is_bivar_access(name)) && cplan_core_method(c, id, CORE_OBJECT, name) < 0 &&
       emit_builtin_op(c, id, recv, BOP_IVAR_LESS, name, b)) return 1;
   if (recv >= 0 && rt == TY_EXCEPTION && emit_exc_ivar_call(c, id, name, recv, b)) return 1;
   /* instance_variable_defined?(:@x / '@x') on a statically-typed object:
@@ -3242,10 +3271,10 @@ int emit_call_display_ivar_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
       emit_ivar_name_error(c, b, ivn, argv[0]); buf_puts(b, ", (sp_bool)0)");
       return 1;
     }
-    int have = comp_ivar_index(&c->classes[dcid], ivn) >= 0;
+    /* (an object's own: a class-level ivar is the class object's) */
+    int div = comp_inst_ivar_index(&c->classes[dcid], ivn), have = div >= 0;
     /* one nothing has set yet is not defined (ivar_set_kind) */
-    if (have && ((ivar_set_kind(c, dcid, ivn) & 1) ||
-                 poly_ivar_unset_marked(c, dcid, comp_ivar_index(&c->classes[dcid], ivn)))) {
+    if (have && ((ivar_set_kind(c, dcid, ivn) & 1) || poly_ivar_unset_marked(c, dcid, div))) {
       int tro = ++g_tmp;
       char ex[160], tb[256];
       snprintf(ex, sizeof ex, "_t%d->iv_%s", tro, iv_c(ivn + 1));
@@ -3278,14 +3307,14 @@ void emit_ivar_list_fill(Compiler *c, int k, const char *obj, const char *arr, i
     buf_puts(b, " ");
     emit_ivar_order_open(c, k, obj, b);
   }
-  int *ord = ivar_listing_order_new(c, k);
+  int nord, *ord = ivar_listing_order_new(c, k, &nord);
   /* Data/Struct members are NOT @-instance variables in CRuby (#2849) */
-  for (int jj = ivc->is_struct ? ivc->nmembers : 0; jj < ivc->nivars; jj++) {
+  for (int jj = ivc->is_struct ? ivc->nmembers : 0; jj < nord; jj++) {
     int ji = ord[jj];
     char ex[200], tb[300];
     snprintf(ex, sizeof ex, "%s->iv_%s", obj, iv_c(ivc->ivars[ji] + 1));
     const char *set = ranked ? NULL : ivar_set_test(c, k, ivc->ivars[ji], ex, tb, sizeof tb);
-    if (ranked) buf_printf(b, "case %d:", ji);
+    if (ranked) buf_printf(b, "case %d:", jj);
     if (set) buf_printf(b, " if %s", set);
     buf_printf(b, " sp_PolyArray_push(%s, sp_box_sym(sp_sym_intern(\"%s\")));", arr, ivc->ivars[ji]);
     if (ranked) buf_puts(b, " break; ");
@@ -3310,13 +3339,13 @@ static int ivar_list_mixed(Compiler *c, int recv, int cid) {
         comp_cmethod_in_chain(c, cid, "new", NULL) < 0) return 0;
   }
   int ranked = ivar_ranked(c, cid);
-  int *base = ivar_listing_order_new(c, cid), mixed = 0;
+  int nbase, *base = ivar_listing_order_new(c, cid, &nbase), mixed = 0;
   for (int d = 0; d < c->nclasses && !mixed; d++) {
     if (d == cid || !is_descendant(c, d, cid) || !c->classes[d].instantiated) continue;
-    if (c->classes[d].nivars != ci->nivars) { mixed = 1; break; }
+    if (comp_inst_ivar_count(&c->classes[d]) != nbase) { mixed = 1; break; }
     if (ranked) continue;
-    int *od = ivar_listing_order_new(c, d);
-    for (int i = 0; i < ci->nivars && !mixed; i++) mixed = base[i] != od[i];
+    int nod, *od = ivar_listing_order_new(c, d, &nod);
+    for (int i = 0; i < nbase && !mixed; i++) mixed = base[i] != od[i];
     free(od);
   }
   free(base);
@@ -3332,6 +3361,7 @@ int emit_object_ivar_list(Compiler *c, int recv, int ivcid, Buf *b) {
      slot is read off the receiver, held once */
   int any1 = 0, tracked = 0;
   for (int ji = ivc->is_struct ? ivc->nmembers : 0; ji < ivc->nivars; ji++) {
+    if (!comp_ivar_on(ivc, ji, IVS_INST)) continue;
     int kind = ivar_set_kind(c, ivcid, ivc->ivars[ji]);
     any1 |= kind & 1;
     tracked |= kind == 3;
@@ -3349,7 +3379,8 @@ int emit_object_ivar_list(Compiler *c, int recv, int ivcid, Buf *b) {
     for (int d = 0; d < c->nclasses; d++) {
       if (d != ivcid && (!is_descendant(c, d, ivcid) || !c->classes[d].instantiated)) continue;
       reads |= ivar_ranked(c, d) | c->classes[d].computed_ivar_set;
-      for (int j = 0; j < c->classes[d].nivars; j++) reads |= ivar_set_kind(c, d, c->classes[d].ivars[j]) & 1;
+      for (int j = 0; j < c->classes[d].nivars; j++)
+        if (comp_ivar_on(&c->classes[d], j, IVS_INST)) reads |= ivar_set_kind(c, d, c->classes[d].ivars[j]) & 1;
     }
     buf_printf(b, "({ sp_%s *_t%d = ", ivc->c_name, tro); emit_expr(c, recv, b);
     buf_printf(b, "; int _t%dc = _t%d->cls_id;", tro, tro);
@@ -3384,14 +3415,14 @@ int emit_object_ivar_list(Compiler *c, int recv, int ivcid, Buf *b) {
     char ob[32]; snprintf(ob, sizeof ob, "_t%d", tro);
     emit_ivar_order_open(c, ivcid, ob, b);
   }
-  int *ord = ivar_listing_order_new(c, ivcid);
+  int nord, *ord = ivar_listing_order_new(c, ivcid, &nord);
   /* Data/Struct members are NOT @-instance variables in CRuby (#2849) */
-  for (int jj = ivc->is_struct ? ivc->nmembers : 0; jj < ivc->nivars; jj++) {
+  for (int jj = ivc->is_struct ? ivc->nmembers : 0; jj < nord; jj++) {
     int ji = ord[jj];
     char ex[160], tb[256];
     snprintf(ex, sizeof ex, "_t%d->iv_%s", tro, iv_c(ivc->ivars[ji] + 1));
     const char *set = any1 && !ranked ? ivar_set_test(c, ivcid, ivc->ivars[ji], ex, tb, sizeof tb) : NULL;
-    if (ranked) buf_printf(b, "case %d: ", ji);
+    if (ranked) buf_printf(b, "case %d: ", jj);
     if (set) buf_printf(b, "if %s ", set);
     buf_printf(b, "sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(\"%s\"))); ", tia, ivc->ivars[ji]);
     if (ranked) buf_puts(b, "break; ");
@@ -3595,7 +3626,7 @@ int emit_object_ivar_call(Compiler *c, int id, const char *name, int recv, TyKin
     /* Data/Struct members live in the layout but are NOT @-instance
        variables in CRuby: a get answers nil, not the member (#2849) */
     for (int i = c->classes[cid].is_struct ? c->classes[cid].nmembers : 0; i < c->classes[cid].nivars; i++)
-      if (sp_streq(c->classes[cid].ivars[i], sym)) { mi = i; break; }
+      if (comp_ivar_on(&c->classes[cid], i, IVS_INST) && sp_streq(c->classes[cid].ivars[i], sym)) { mi = i; break; }
     if (mi >= 0) {
       /* A value object is passed by value, so a field write only sticks when
          the receiver is an lvalue (a local / ivar / self); a pointer object

@@ -1226,6 +1226,16 @@ int emit_op_array_flatten(Compiler *c, const BopCtx *x, Buf *b) {
                  t, t2, lk, t, t2, t2);
       return 1;
     }
+    /* a new Array, as CRuby's flatten always answers (a frozen receiver's
+       too): the receiver itself was answered, and a push onto it raised
+       FrozenError or changed the original */
+    if (k) {
+      int t = ++g_tmp;
+      buf_printf(b, "({ sp_%sArray *_t%d = ", k, t); emit_expr(c, recv, b);
+      buf_printf(b, "; if (!_t%d) sp_raise_nomethod(sp_nomethod_msg(\"flatten\", sp_box_nil()));"
+                    " sp_%sArray_dup(_t%d); })", t, k, t);
+      return 1;
+    }
     emit_expr(c, recv, b); return 1;
   }
   if ((sp_streq(name, "flatten!") || sp_streq(name, "flatten")) && argc == 1) {
@@ -2606,6 +2616,11 @@ int emit_call_store_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
            default block, whose value is what the read answers): boxed once,
            so the store and the expression's value are the one handle */
         if (is_poly_hash && repr_of(c, argv[1]).handle) decl_type = TY_POLY;
+        /* a String into a Hash of String values is held as its handle
+           (elem_held, emit_typed_elem_value), the temp built ahead of the
+           store; the expression answers it in the face it is typed */
+        int vheld = typed_elem_held(rt) == TY_STRBUF && !unbox_poly_val && !coerce_unknown_val;
+        if (vheld) decl_type = TY_STRBUF;
         if (vpolyo) buf_puts(b, oint_ctype(vpt));
         else if (voset || vboxo) buf_puts(b, "sp_oint"); else emit_ctype(c, decl_type, b);
         buf_printf(b, " _t%d = ", tv);
@@ -2619,16 +2634,18 @@ int emit_call_store_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
           buf_printf(b, "%s(", fn); emit_expr(c, argv[1], b); buf_puts(b, ")");
         }
         else if (coerce_unknown_val) emit_unresolved_coerced(c, argv[1], hvt, b);
+        else if (vheld) emit_typed_elem_value(c, argv[1], rt, b);
         else if (decl_type == TY_POLY) emit_boxed(c, argv[1], b);
         else emit_expr_face(c, argv[1], decl_type, b);
         /* a key that is a shared String slot's read is a fresh copy, read
            in the set after the value: the value is held across it */
-        if (tk < 0 && strbuf_read_copies(c, argv[0]) && operand_may_allocate(c, argv[1])) {
+        if (tk < 0 && strbuf_read_copies(c, argv[0]) && (operand_may_allocate(c, argv[1]) || (vheld && typed_elem_hold_may_make(c, argv[1], rt)))) {
           buf_puts(b, "; "); emit_gc_root_tmp(c, decl_type, tv, b);
         }
         buf_puts(b, "; if (sp_gc_is_frozen("); emit_node_or_tmp(c, recv, tr, b);
         buf_puts(b, ")) sp_raise_frozen_hash_at("); emit_node_or_tmp(c, recv, tr, b); buf_printf(b, ", %s); ", hash_box_cls(rt));
-        buf_printf(b, "sp_%sHash_%s(", hn, voset || vboxo ? "oset" : "set"); emit_node_or_tmp(c, recv, tr, b); buf_puts(b, ", ");
+        buf_printf(b, "sp_%sHash_%s%s(", hn, voset || vboxo ? "oset" : "set", voset || vboxo ? "" : typed_elem_store_sfx(rt));
+        emit_node_or_tmp(c, recv, tr, b); buf_puts(b, ", ");
         if (tk >= 0) buf_printf(b, "_t%d", tk);
         else emit_hash_store_key(c, argv[0], rt, b);  /* unbox a poly key to the hash's key type */
         buf_puts(b, ", ");
@@ -2647,6 +2664,9 @@ int emit_call_store_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         if (is_poly_hash && decl_type != TY_POLY) {
           emit_boxed_text(c, decl_type, tvn, b);
         }
+        else if (vheld) buf_puts(b, tvn);
+        /* (a boxed or an unresolved String value: held as its handle on its way in) */
+        else if (typed_elem_held(rt) == TY_STRBUF) emit_typed_elem_hold(c, argv[1], rt, tvn, b);
         else if (!is_poly_hash) emit_coerce_text(c, argv[1], decl_type, hvt, CO_HOLD, tvn, "a Hash element store", b);
         else buf_printf(b, "_t%d", tv);
         /* For poly-hash receivers the expression returns the boxed value

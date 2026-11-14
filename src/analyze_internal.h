@@ -164,6 +164,7 @@ int builtin_recv_owner_classes(const char *name, const char **out, int cap);
 int poly_splat_keyed(const char *name);
 int an_bi_generic_splat(Compiler *c, int id);
 int builtin_kernel_fn_span(const char *name, int with_block, int *lo, int *hi);
+int builtin_cmethod_span(const char *cls, const char *name, int *lo, int *hi);
 int builtin_arity_violation(Compiler *c, int id, int non_nil);
 int builtin_count_refused_boxed(Compiler *c, int id);
 int io_library_count_refused(Compiler *c, int id, const struct BuiltinOp *op, const char *name);
@@ -295,6 +296,7 @@ int super_forwards_caller_block(Compiler *c, int id);
 /* 1 if `node` is `<&block-param>.call(...)` / .() / [] for method mi -- the
    explicit-call equivalent of `yield`, inlined the same way. */
 int is_blk_param_call(Compiler *c, int node, int mi);
+int is_yield_or_blk_param_call(Compiler *c, int node);
 /* 1 if `node` is an instance_eval / instance_exec handing the method's own block on
    as the value the method ends with: inlined, it answers each site's block value. */
 int ie_forwards_block_tail(Compiler *c, int node);
@@ -440,11 +442,15 @@ void walk_scope(Compiler *c, int id, int scope_idx, int class_id);
    main's file) holding it; fpartial: partial, counted from the frame. sure:
    an else clause that runs whenever its
    condition is reached (the condition's predicate is a constant false,
-   nt_pred_const). */
+   nt_pred_const). rescued: the body of a begin with rescue clauses, whose
+   statements may not run but for those that run whenever the begin does
+   (prog_rescue_sure), or a list in the first of them that may raise,
+   which runs: 1 in the begin's own frame, 2 in a frame opened under it (a
+   class body), whose statements may not run only from outside it. */
 typedef struct {
   int e, file, top, frame, depth, rep;
   int list;   /* the statement list the node is an element of (a StatementsNode), -1 for a lone expression */
-  unsigned char may, partial, kind, bits, defer, fmay, fpartial, sure, kept;
+  unsigned char may, partial, kind, bits, defer, fmay, fpartial, sure, kept, rescued;
 } ElabPos;
 enum { EP_NODE, EP_SPINE, EP_LIST, EP_NEW };
 ElabPos elab_child(Compiler *c, int p, int ch, const ElabPos *pp);
@@ -455,9 +461,18 @@ void elab_walk_leave(Compiler *c, int e);
 void elab_walk_rest(Compiler *c, int id, ElabPos pos);
 void elab_walk_site(Compiler *c, int id, const ElabPos *pos);
 int elab_header_entity(Compiler *c, int node, const ElabPos *pos);
+void elab_place_path(Compiler *c, int node, int path, const ElabPos *pos);
+int scope_qualified_name(Compiler *c, int id, int np, int salt, char *out, size_t cap, char *rb, size_t rcap);
+char **elab_const_key_map(Compiler *c);
+void qc_rule_prepare(Compiler *c, char **keys);
+void qc_rule_release(void);
+int qc_rule_qualifies(Compiler *c, int id, int k);
+int isa_guard_class(Compiler *c, int id, int *ret);   /* `return v if v.is_a?(K)`: K (analyze_pass.c) */
+int qc_rule_nested(Compiler *c, int id);
 void elab_builder_entity(Compiler *c, int node, const ElabPos *pos);
 void elab_header_opened(Compiler *c, int node, int cls, int made);
 int elab_rec_open(Compiler *c, int node, int cp, const char *cname, const char *rname, int encl);
+void elab_prov_apply(Compiler *c);
 void header_parent_encloses(Compiler *c, int par, int child, const char *leaf, int named);
 void elab_load_sites(Compiler *c, int stmt, void (*fn)(void *ud, int load, int in_place), void *ud);
 void walk_scope_stmt(Compiler *c, int stmt, int k, int scope_idx, ElabPos pos);
@@ -477,6 +492,8 @@ void register_singleton_defs(Compiler *c);
 void register_attr_versions(Compiler *c);
 void register_attrs(Compiler *c);
 void register_aliases(Compiler *c);
+void register_alias_methods(Compiler *c, int modules);   /* analyze_scope.c */
+void scope_copy_method_shape(Scope *dst, Scope *src);    /* analyze_scope.c */
 void register_undefs(Compiler *c);
 int is_c_ident(const char *s);
 void register_globals_consts(Compiler *c);
@@ -573,6 +590,8 @@ int class_is_comparable(Compiler *c, int cid);                   /* codegen_call
    declares the same). */
 int bare_call_class_owned(Compiler *c, int id);                  /* codegen_call.c */
 const int *call_args(const NodeTable *nt, int id, int *argc);    /* codegen_call.c */
+int recv_is_const(const Compiler *c, const NodeTable *nt, int recv, const char *name);  /* codegen_fold.c */
+int is_exc_name(const char *n);                                  /* codegen.c */
 /* Is call id a respond_to? the version cells may answer (cplan_cmethod_presence):
    by a literal Symbol, with a literal include_all if any, on a constant, self
    or no receiver? The load record asks it of the source's readers
@@ -615,6 +634,7 @@ int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out);
 int infer_arysub_call(Compiler *c, int id, TyKind *out);
 TyKind infer_op_assign_type(Compiler *c, TyKind lhs, int value);
 int infer_array_call(Compiler *c, int id, TyKind rt, TyKind *out);
+int infer_array_reduce(Compiler *c, int id, TyKind rt, TyKind *out);
 int infer_hash_call(Compiler *c, int id, TyKind rt, TyKind *out);
 /* bop_find for the call `id`, recording the row under --plan-check */
 struct BuiltinOp;
@@ -780,6 +800,7 @@ const LowerRow *lower_row_nt(const NodeTable *nt, int id, int family);   /* the 
 int desugar_kernel_reopen(Compiler *c);
 int desugar_singleton_class_mixin(Compiler *c);
 int desugar_explicit_receiver_mixin(Compiler *c);
+int desugar_table_loop_defines(Compiler *c);
 int desugar_attr_const_splat(Compiler *c);
 int desugar_sclass_readers_through_class(Compiler *c);
 int desugar_constant_path_self_alias(Compiler *c);
@@ -789,8 +810,8 @@ int desugar_handle_ivars(Compiler *c);
 int desugar_fiber_prepended_init(Compiler *c);
 int desugar_handle_reopen_self_recv(Compiler *c);
 int desugar_call_or_write_reopen(Compiler *c);
-int desugar_table_loops(Compiler *c);         /* analyze_ct.c */
 int ct_method_defined(const NodeTable *nt, const char *meth);   /* the program defines `meth` anywhere (analyze_ct.c) */
+int ct_in_walk_loop_block(const NodeTable *nt, const int *parent, int call);   /* a call in a loop the walk may run (analyze_ct.c) */
 
 /* ---- the lowering table (analyze_lower.c, #9898) ----
    The rewrites the load stage makes are the rows of one table, run by one
@@ -1033,12 +1054,24 @@ int attr_as_def(NodeTable *nt, int call, const char *base, int writer);   /* `de
 /* A dispatcher def over arms `<sel> == <val>` calling `callee` with the
    def's parameters passed on, and an else arm (disp_def_build,
    analyze_desugar.c); for that arm `raise NoMethodError.new(msg, :name,
-   [<args>], receiver: self)`, the args the def's ar parameters */
-typedef struct { const char *sel; int val; const char *callee; int hist; } DispArm;
+   [<args>], receiver: self)`, the args the def's ar parameters (with
+   vcall, the NameError a variable-like call raises: disp_raise_no_method's
+   vcall). An arm whose stmt is set (1 + a node) runs that statement in
+   place of the call: a version entry's arm for an undef raises there */
+typedef struct { const char *sel; int val; const char *callee; int hist, stmt; } DispArm;
 int disp_def_build(NodeTable *nt, int like, const char *name, int sg, int ar, int blk,
                    const DispArm *arm, int narm, int els);
-int disp_raise_no_method(Compiler *c, const char *name, const char *msg, int ar);
-int disp_raise_no_method_self(Compiler *c, const char *name, const char *head, int inst, int ar);
+/* `if <arm[0].sel> == <arm[0].val> || ... then <then> end`, a statement
+   ahead of a call kept as it is behind its versions' cells, and `(<st[0]>;
+   ...; <expr>)` (analyze_desugar.c) */
+int disp_cell_guard(NodeTable *nt, const DispArm *arm, int narm, int then);
+int disp_ahead(NodeTable *nt, const int *st, int n, int expr);
+/* The operands of call id that run code held in locals in CRuby's order,
+   their writes into *pre, malloc'd with room for one more (analyze.c): how
+   many, -1 for a form not held */
+int sd_hold_call_operands(Compiler *c, int id, int **pre);
+int disp_raise_no_method(Compiler *c, const char *name, const char *msg, int ar, int vcall);
+int disp_raise_no_method_self(Compiler *c, const char *name, const char *head, int inst, int ar, int vcall);
 int disp_forward_call(NodeTable *nt, const char *callee, int ar, int blk);
 int disp_self_call(NodeTable *nt, const char *callee, int ar, int blk);
 int disp_when_unspread(Compiler *c, int call);
@@ -1091,6 +1124,10 @@ int desugar_const_ivar_access(Compiler *c);
 int desugar_class_eval_ivars(Compiler *c);
 int desugar_builtin_ivars(Compiler *c);
 int desugar_send_aliases(Compiler *c);
+int desugar_ext_forwarders(Compiler *c);
+const char *const *elab_prov_qualified_leaves(int *n);
+void elab_prov_free_leaves(void);
+int elab_prov_any(void);
 int desugar_inherited_aliases(Compiler *c);
 int desugar_builtin_alias_calls(Compiler *c);
 int desugar_readers_over_inherited_defs(Compiler *c);
@@ -1146,6 +1183,30 @@ int anh_has(const ANameHash *st, const char *nm);
 int anh_find(const ANameHash *st, const char *nm);   /* insertion index, or -1 */
 void anh_add(ANameHash *st, const char *nm);
 void anh_free(ANameHash *st);
+void anh_copy(ANameHash *dst, const ANameHash *src);   /* dst, empty, takes src's names (keys shared) */
+/* Names with a number each (a node, a class, a write), added in any order
+   and sorted by name once (ani_sort); the entries of one name then follow
+   each other, in the order they were added. A scan of every entry for the
+   ones of a name, once per ask, was N^2 for N asks (ani_first finds the
+   first by bisection). Names are borrowed; zero-initialize to start. */
+typedef struct { const char *name; int v, ord; } ANameInt;
+typedef struct { ANameInt *e; int n, cap; } ANameIndex;
+void ani_add(ANameIndex *x, const char *name, int v);
+void ani_sort(ANameIndex *x);
+int ani_first(const ANameIndex *x, const char *name);   /* the first entry of name, x->n for none */
+void ani_free(ANameIndex *x);
+/* The lookups of the record's class questions (analyze_elab.c), held by the
+   pass that asks them, each built on the first question that needs it:
+   hdr, the class headers by the Ruby path each spells (a class number each,
+   -1 for a header whose class is not registered), and hdr_unknown, set when
+   a qualified header's class is not registered yet, which makes every
+   answer unknown; byname and byleaf, the classes by Ruby name and by the
+   last segment of it, in class order. The header names are the index's own
+   copies; the class names are the classes'. */
+struct ElabNames { ANameIndex hdr; int hdr_unknown, hdr_built; ANameIndex byname, byleaf; int cls_built; };
+/* The qualified names the class pass gave constants written under a module
+   path ("Mod__LIMIT"), and each tail after a "__": see qc_leaf_qualified. */
+struct QcConstNames { ANameHash quals, leaves; };
 void cr_class_only_names(Compiler *c, ANameHash *out);   /* the names only plain classes' methods hold */
 /* The block-passing call sites, and the supers, of the node table, indexed
    for yield_value_type and its kin (yvt_build, analyze_util.c): built once
@@ -1199,8 +1260,24 @@ void propagate_bigint_cascade(Compiler *c);
 void mark_ie_subtree(Compiler *c, int node, int cls);
 void build_ie_map(Compiler *c);
 int ie_block_body(Compiler *c, int blk);
+/* The block an instance_eval / instance_exec call on a receiver other than
+   self runs: its literal block, the block of a proc literal handed with `&`,
+   or that of the proc literal that is the one write of a local handed with
+   `&`; -1 for another call or block. */
+int ie_own_recv_block(Compiler *c, int call);
+/* The rebound marks, by node (c->ie_map.rb, cap entries), short of a def,
+   class or module: IE_RB_ROOT on each ie_own_recv_block, IE_RB_OWN on its
+   nodes, and IE_RB_IN on the nodes whose self is another object than their
+   scope's: OWN ones, and the blocks build_ie_map resolves to a call that
+   hands them to another receiver, a forwarding method's (`def build(&b) =
+   @root.instance_eval(&b)`) too. Read afresh by each build_ie_map, the
+   structure's also when the tree grew; c->ie_map.rb_ver moves with them. */
+const unsigned char *ie_rebound_marks(Compiler *c);
+int ie_rebound_node(Compiler *c, int node);
 int ie_class_of(Compiler *c, int node);
 int ie_own_class_of(Compiler *c, int node);
+/* Is the node in an instance_eval/exec block whose receiver this round has not typed yet? */
+int ie_pending_node(Compiler *c, int node);
 int blkp_params_node(Compiler *c, int create);
 int blkp_binds_param(Compiler *c, int create, const char *name);
 void blkp_rewrite_refs(Compiler *c, int node, const char *oldn, const char *newn);
@@ -1228,7 +1305,7 @@ int class_is_exc_reopen(Compiler *c, int ci);
    shared with a bundled extension's __cext_link (analyze_cext.c) */
 void ffi_semi_append(char **slot, const char *add);
 void *ffi_grow(void *p, int n, int *cap, int init, size_t sz);
-int exc_class_defines(Compiler *c, const char *name);
+int exc_class_defines(Compiler *c, int id, const char *name);
 int super_reaches_exc_text(Compiler *c, int id, int reopen);
 int exc_message_super_to_s(Compiler *c, int id, int *out, int cap);
 int exc_subclass_defines(Compiler *c, const char *name);

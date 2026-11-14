@@ -234,7 +234,10 @@ const char *sp_str_plus_lit(const char *a, const char *lit, size_t ll) {
 /* FrozenError naming the receiver, matching CRuby's
    "can't modify frozen String: \"abc\"" message shape. */
 void sp_exc_stage_recv(sp_RbVal v);   /* generated TU: stages FrozenError#receiver */
-void sp_raise_frozen_str(const char*s){SP_GC_ROOT_STR(s);const char*ins=sp_str_inspect(s);SP_GC_ROOT_STR(ins);const char*msg=sp_str_concat(&("\xff" "can't modify frozen String: ")[1],ins);SP_GC_ROOT_STR(msg);sp_exc_stage_recv(sp_box_str(s));sp_raise_cls("FrozenError",msg);}
+void sp_raise_locked_str(void) {
+  sp_raise_cls("RuntimeError", "can't modify string; temporarily locked");
+}
+void sp_raise_frozen_str(const char*s){if(sp_str_is_locked(s))sp_raise_locked_str();SP_GC_ROOT_STR(s);const char*ins=sp_str_inspect(s);SP_GC_ROOT_STR(ins);const char*msg=sp_str_concat(&("\xff" "can't modify frozen String: ")[1],ins);SP_GC_ROOT_STR(msg);sp_exc_stage_recv(sp_box_str(s));sp_raise_cls("FrozenError",msg);}
 /* Unicode case mapping, CRuby's (#11345): the tables are generated from CRuby
    by tools/gen_unicase_map.rb. A one-codepoint mapping is a range lookup, a
    run of codepoints that map by one delta (every one of them, or every other
@@ -498,6 +501,15 @@ const char*sp_str_byteslice_range(const char*s,sp_int lo,sp_int hi,int excl,int 
    negative length raises, start is checked against the byte length with
    the original (pre-normalization) index in the message; an overlong span
    clamps to the end. */
+/* CRuby's str_ensure_byte_pos: a byte offset `pos` of `s` (bl bytes long)
+   that falls inside a character, past its first byte, is an IndexError.
+   Either end of the String is a boundary, and a BINARY String has one at
+   every byte. */
+void sp_str_byte_pos_check(const char*s,sp_int bl,sp_int pos){
+  if(pos<=0||pos>=bl||sp_str_is_binary(s))return;
+  if(((unsigned char)s[pos]&0xC0)==0x80)
+    sp_raise_cls("IndexError",sp_sprintf("offset %lld does not land on character boundary",(long long)pos));
+}
 /* CRuby's str_check_beg_len: a byte span of `s` checked and clipped as
    bytesplice reads it -- a negative length, a start outside the String, and
    in a String of characters either end inside one, each an IndexError. */
@@ -507,11 +519,8 @@ static void sp_str_bsp_span(const char*s,sp_int*beg,sp_int*len){
   if(sl<*beg||(*beg<0&&*beg+sl<0))sp_raise_cls("IndexError",sp_sprintf("index %lld out of string",(long long)*beg));
   if(*beg<0)*beg+=sl;
   if(*len>sl-*beg)*len=sl-*beg;   /* never *beg+*len: a huge length overflows it */
-  if(sp_str_is_binary(s))return;
-  sp_int at[2]={*beg,*beg+*len};
-  for(int k=0;k<2;k++)
-    if(at[k]>0&&at[k]<sl&&((unsigned char)s[at[k]]&0xC0)==0x80)
-      sp_raise_cls("IndexError",sp_sprintf("offset %lld does not land on character boundary",(long long)at[k]));
+  sp_str_byte_pos_check(s,sl,*beg);
+  sp_str_byte_pos_check(s,sl,*beg+*len);
 }
 /* String#bytesplice(start, len, str, str_start, str_len): bytes start...start+len
    of s replaced by bytes str_start...str_start+str_len of val. The result
@@ -1051,9 +1060,9 @@ sp_oint sp_str_rindex_from(const char*s,const char*sub,sp_int pos){if(!s)sp_nil_
    arguments are BYTE offsets, not codepoint indices. Byte-oriented throughout
    (sp_bytestr), so no utf8 walk is needed. nil on miss. */
 sp_oint sp_str_byteindex(const char*s,const char*sub){if(!s)sp_nil_recv("byteindex");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");const char*f=sp_bytestr(s,sp_str_byte_len(s),sub,sp_str_byte_len(sub));return f?sp_oint_of((sp_int)(f-s)):sp_oint_nil();}
-sp_oint sp_str_byteindex_from(const char*s,const char*sub,sp_int start){if(!s)sp_nil_recv("byteindex");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");sp_int bl=(sp_int)sp_str_byte_len(s);if(start<0)start+=bl;if(start<0||start>bl)return sp_oint_nil();const char*f=sp_bytestr(s+start,(size_t)(bl-start),sub,sp_str_byte_len(sub));return f?sp_oint_of((sp_int)(f-s)):sp_oint_nil();}
+sp_oint sp_str_byteindex_from(const char*s,const char*sub,sp_int start){if(!s)sp_nil_recv("byteindex");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");sp_int bl=(sp_int)sp_str_byte_len(s);if(start<0)start+=bl;if(start<0||start>bl)return sp_oint_nil();sp_str_byte_pos_check(s,bl,start);const char*f=sp_bytestr(s+start,(size_t)(bl-start),sub,sp_str_byte_len(sub));return f?sp_oint_of((sp_int)(f-s)):sp_oint_nil();}
 sp_oint sp_str_byterindex(const char*s,const char*sub){if(!s)sp_nil_recv("byterindex");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");size_t sl=sp_str_byte_len(sub);size_t hn=sp_str_byte_len(s);if(sl==0)return sp_oint_of((sp_int)hn);const char*end=s+hn;const char*last=NULL;const char*p=s;while(p<end){const char*f=sp_bytestr(p,(size_t)(end-p),sub,sl);if(!f)break;last=f;p=f+1;}return last?sp_oint_of((sp_int)(last-s)):sp_oint_nil();}
-sp_oint sp_str_byterindex_from(const char*s,const char*sub,sp_int pos){if(!s)sp_nil_recv("byterindex");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");sp_int bl=(sp_int)sp_str_byte_len(s);if(pos<0)pos+=bl;if(pos<0)return sp_oint_nil();if(pos>bl)pos=bl;size_t sl=sp_str_byte_len(sub);if(sl==0)return sp_oint_of(pos);const char*end=s+bl;const char*p=s;sp_int best=-1;while(p<end){const char*f=sp_bytestr(p,(size_t)(end-p),sub,sl);if(!f)break;sp_int off=(sp_int)(f-s);if(off>pos)break;best=off;p=f+1;}return best<0?sp_oint_nil():sp_oint_of(best);}
+sp_oint sp_str_byterindex_from(const char*s,const char*sub,sp_int pos){if(!s)sp_nil_recv("byterindex");if(!sub)sp_raise_cls("TypeError","no implicit conversion of nil into String");sp_int bl=(sp_int)sp_str_byte_len(s);if(pos<0)pos+=bl;if(pos<0)return sp_oint_nil();if(pos>bl)pos=bl;sp_str_byte_pos_check(s,bl,pos);size_t sl=sp_str_byte_len(sub);if(sl==0)return sp_oint_of(pos);const char*end=s+bl;const char*p=s;sp_int best=-1;while(p<end){const char*f=sp_bytestr(p,(size_t)(end-p),sub,sl);if(!f)break;sp_int off=(sp_int)(f-s);if(off>pos)break;best=off;p=f+1;}return best<0?sp_oint_nil():sp_oint_of(best);}
 /* start/len are codepoint indices/counts. */
 /* The String a one-byte character c reads as: a BINARY string's own, or the
    shared one-character String, which costs no allocation; NULL for NUL,
@@ -1106,7 +1115,7 @@ const char*sp_str_sub_range_r(const char*s,sp_int start,sp_int end_,sp_int excl)
 const char*sp_str_sub_range_len_r(const char*s,sp_int cl,sp_int start,sp_int end_,sp_int excl){SP_GC_ROOT_STR(s);if(end_<0)end_+=cl;if(start<0)start+=cl;if(start<0)return NULL;if(end_>=cl){end_=cl;excl=1;}sp_int n=end_-start+(excl?0:1);if(n<0)n=0;return sp_str_sub_range_len(s,cl,start,n);}
 /* walks by INDEX to the header length: `while(*p)` stopped at an embedded NUL
    and reversed only the prefix */
-const char*sp_str_reverse(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("reverse");size_t bl=sp_str_byte_len(s);char*r=sp_str_alloc_raw(bl+1);size_t end=bl;for(size_t i=0;i<bl;){int cn=sp_utf8_advance(s+i);if(cn<1)cn=1;if((size_t)cn>bl-i)cn=(int)(bl-i);end-=(size_t)cn;memcpy(r+end,s+i,(size_t)cn);i+=(size_t)cn;}r[bl]=0;sp_str_set_len(r,bl);return sp_str_bin_like(s,r);}
+const char*sp_str_reverse(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("reverse");size_t bl=sp_str_byte_len(s);char*r=sp_str_alloc_raw(bl+1);size_t end=bl;int bin=sp_str_is_binary(s);for(size_t i=0;i<bl;){int cn=bin?1:sp_utf8_advance(s+i);if(cn<1)cn=1;if((size_t)cn>bl-i)cn=(int)(bl-i);end-=(size_t)cn;memcpy(r+end,s+i,(size_t)cn);i+=(size_t)cn;}r[bl]=0;sp_str_set_len(r,bl);return sp_str_bin_like(s,r);}
 sp_int sp_str_count(const char*s,const char*chars){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(chars);if(!s)sp_nil_recv("count");if(!chars)sp_raise_cls("TypeError","no implicit conversion of nil into String");int negate;size_t setn;uint32_t*set=sp_str_charset(s,chars,&negate,&setn);sp_int c=0;const char*p=s;const char*end=s+sp_str_byte_len(s);int bin=sp_str_is_binary(s);while(p<end){uint32_t cp;p+=sp_str_cp_at(p,&cp,bin);int in_set=sp_utf8_set_has(set,setn,cp);if(negate)in_set=!in_set;if(in_set)c++;}free(set);return c;}
 sp_int sp_str_count_n(const char*s,const char**chars,sp_int n){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("count");if(n<=0)return 0;size_t*setns=(size_t*)malloc(n*sizeof(size_t));uint32_t**sets=(uint32_t**)malloc(n*sizeof(uint32_t*));int*negs=(int*)malloc(n*sizeof(int));for(sp_int i=0;i<n;i++){if(!chars[i])sp_raise_cls("TypeError","no implicit conversion of nil into String");sets[i]=sp_str_charset(s,chars[i],&negs[i],&setns[i]);}sp_int c=0;const char*p=s;const char*end=s+sp_str_byte_len(s);int bin=sp_str_is_binary(s);while(p<end){uint32_t cp;p+=sp_str_cp_at(p,&cp,bin);int all=1;for(sp_int i=0;i<n;i++){int in_set=sp_utf8_set_has(sets[i],setns[i],cp);if(negs[i])in_set=!in_set;if(!in_set){all=0;break;}}if(all)c++;}for(sp_int i=0;i<n;i++)free(sets[i]);free(sets);free(setns);free(negs);return c;}
 /* The codepoints walked to the recorded byte length, as sp_str_chars walks:
@@ -1118,9 +1127,14 @@ sp_IntArray*sp_str_codepoints(const char*s){return sp_str_codepoints_all(s);}
    ordinary one-byte character and the characters after it are real (#3473) */
 sp_StrArray*sp_str_chars(const char*s){SP_GC_ROOT_STR(s);sp_StrArray*a=sp_StrArray_new();if(!s)sp_nil_recv("chars");SP_GC_ROOT(a);int bin=sp_str_is_binary(s);const char*end=s+sp_str_byte_len(s);const char*p=s;while(p<end){int n=bin?1:sp_utf8_advance(p);if(p+n>end)n=(int)(end-p);char*c=sp_str_alloc(n);memcpy(c,p,n);c[n]=0;sp_StrArray_push_e(a,sp_String_new_shared(sp_str_bin_like(s,c)));p+=n;}return a;}
 /* Issue #798: guard NULL inputs (CRuby treats nil/no-op gracefully). */
-const char*sp_str_tr(const char*s,const char*from,const char*to){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(from);SP_GC_ROOT_STR(to);if(!s)sp_nil_recv("tr");if(!from||!to)return sp_str_one_answer(s);int negate;size_t fn,tn;uint32_t*fcps=sp_str_charset(s,from,&negate,&fn);uint32_t*tcps=sp_charset_decode(to,sp_str_byte_len(to),sp_str_is_binary(s),&tn);size_t bl=sp_str_byte_len(s);size_t cap=((bl*4))+1;char*buf=(char*)malloc(cap);size_t n=0;const char*p=s,*pe=s+bl;int bin=sp_str_is_binary(s);while(p<pe){uint32_t cp;int cn=bin?(cp=(unsigned char)*p,1):sp_utf8_decode(p,&cp);size_t mi=fn;for(size_t j=0;j<fn;j++)if(fcps[j]==cp){mi=j;break;}int in_set=(mi<fn);if(negate)in_set=!in_set;if(in_set&&tn>0){uint32_t rep=negate?tcps[tn-1]:(mi<tn?tcps[mi]:tcps[tn-1]);if(bin)buf[n++]=(char)rep;else n+=sp_utf8_encode(rep,buf+n);}
+const char*sp_str_tr(const char*s,const char*from,const char*to){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(from);SP_GC_ROOT_STR(to);if(!s)sp_nil_recv("tr");if(!from||!to)return sp_str_one_answer(s);/* a BINARY replacement with high bytes makes the result BINARY, its bytes
+     written as they are, where the receiver is 7-bit (CRuby's rb_enc_check;
+     a receiver with UTF-8 characters is incompatible) */
+  int tobin=!sp_str_is_binary(s)&&sp_str_is_binary(to)&&!sp_str_ascii_only(to);
+  if(tobin&&!sp_str_ascii_only(s))sp_raise_cls("Encoding::CompatibilityError","incompatible character encodings: UTF-8 and BINARY (ASCII-8BIT)");
+  int negate;size_t fn,tn;uint32_t*fcps=sp_str_charset(s,from,&negate,&fn);uint32_t*tcps=sp_charset_decode(to,sp_str_byte_len(to),sp_str_is_binary(s)||tobin,&tn);size_t bl=sp_str_byte_len(s);size_t cap=((bl*4))+1;char*buf=(char*)malloc(cap);size_t n=0;const char*p=s,*pe=s+bl;int bin=sp_str_is_binary(s)||tobin;while(p<pe){uint32_t cp;int cn=bin?(cp=(unsigned char)*p,1):sp_utf8_decode(p,&cp);size_t mi=fn;for(size_t j=0;j<fn;j++)if(fcps[j]==cp){mi=j;break;}int in_set=(mi<fn);if(negate)in_set=!in_set;if(in_set&&tn>0){uint32_t rep=negate?tcps[tn-1]:(mi<tn?tcps[mi]:tcps[tn-1]);if(bin)buf[n++]=(char)rep;else n+=sp_utf8_encode(rep,buf+n);}
 else if(in_set){}
-else{memcpy(buf+n,p,cn);n+=cn;}p+=cn;}buf[n]=0;char*r=sp_str_alloc(n);memcpy(r,buf,n+1);free(buf);free(fcps);free(tcps);return sp_str_bin_like(s,r);}
+else{memcpy(buf+n,p,cn);n+=cn;}p+=cn;}buf[n]=0;char*r=sp_str_alloc(n);memcpy(r,buf,n+1);free(buf);free(fcps);free(tcps);if(tobin)sp_str_mark_binary(r);return sp_str_bin_like(s,r);}
 const char*sp_str_tr_s(const char*s,const char*from,const char*to){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(from);SP_GC_ROOT_STR(to);
   if(!s)sp_nil_recv("tr_s");
   if(!from||!to)return sp_str_one_answer(s);

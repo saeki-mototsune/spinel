@@ -699,6 +699,11 @@ static const BuiltinOp bop_rows[] = {
   { TY_COMPLEX, "-",   1, 1, BF_ANY, TY_COMPLEX, BOPE_TEMPLATE, "sp_complex_sub($r, $c0)", CX_NUM },
   { TY_COMPLEX, "-",   1, 1, BF_ANY, TY_COMPLEX, BOPE_TEMPLATE, CX_TYPEERROR },
   { TY_COMPLEX, "-",   0, 127, BF_ANY, TY_COMPLEX, BOPE_NONE },
+  /* a real argument multiplies each part, so each keeps its kind:
+     Complex(1.0, 2) * 3 is (3.0+6i) */
+  { TY_COMPLEX, "*",   1, 1, BF_ANY, TY_COMPLEX, BOPE_TEMPLATE, "sp_complex_mul_r($r, (sp_float)($e0), 0)", BOP_K(TY_INT) },
+  { TY_COMPLEX, "*",   1, 1, BF_ANY, TY_COMPLEX, BOPE_TEMPLATE, "sp_complex_mul_r($r, (sp_float)($e0), 1)", BOP_K(TY_FLOAT) },
+  { TY_COMPLEX, "*",   1, 1, BF_ANY, TY_COMPLEX, BOPE_TEMPLATE, "sp_complex_mul_poly($r, $b0)", BOP_K(TY_POLY) },
   { TY_COMPLEX, "*",   1, 1, BF_ANY, TY_COMPLEX, BOPE_TEMPLATE, "sp_complex_mul($r, $c0)", CX_NUM },
   { TY_COMPLEX, "*",   1, 1, BF_ANY, TY_COMPLEX, BOPE_TEMPLATE, CX_TYPEERROR },
   { TY_COMPLEX, "*",   0, 127, BF_ANY, TY_COMPLEX, BOPE_NONE },
@@ -796,18 +801,18 @@ static const BuiltinOp bop_rows[] = {
      number or not at run time: one that is no number is unequal, where
      the conversion to Float raised. */
   { TY_COMPLEX, "==",          1,   1, BF_ANY, TY_BOOL,       BOPE_TEMPLATE,
-    "({ sp_Complex _t$t = $r; sp_RbVal _t$u = $b0; sp_poly_tower_p(_t$u) && sp_complex_eq(_t$t, sp_poly_as_complex(_t$u)); })", BOP_K(TY_POLY) },
+    "({ sp_Complex _t$t = $r; sp_RbVal _t$u = $b0; SP_GC_ROOT_RBVAL(_t$u); sp_poly_tower_p(_t$u) && sp_poly_eq(sp_box_complex(_t$t), _t$u); })", BOP_K(TY_POLY) },
   { TY_COMPLEX, "==",          1,   1, BF_ANY, TY_BOOL,       BOPE_TEMPLATE, "(sp_complex_eq($r, $c0))", CX_NUM },
   { TY_COMPLEX, "==",          1,   1, BF_ANY, TY_BOOL,       BOPE_TEMPLATE, "((void)($r), (void)($b0), 0)" },
   { TY_COMPLEX, "==",          0, 127, BF_ANY, TY_BOOL,       BOPE_NONE },
   /* Complex#=== is Kernel#===, which is #== */
   { TY_COMPLEX, "===",         1,   1, BF_ANY, TY_BOOL,       BOPE_TEMPLATE,
-    "({ sp_Complex _t$t = $r; sp_RbVal _t$u = $b0; sp_poly_tower_p(_t$u) && sp_complex_eq(_t$t, sp_poly_as_complex(_t$u)); })", BOP_K(TY_POLY) },
+    "({ sp_Complex _t$t = $r; sp_RbVal _t$u = $b0; SP_GC_ROOT_RBVAL(_t$u); sp_poly_tower_p(_t$u) && sp_poly_eq(sp_box_complex(_t$t), _t$u); })", BOP_K(TY_POLY) },
   { TY_COMPLEX, "===",         1,   1, BF_ANY, TY_BOOL,       BOPE_TEMPLATE, "(sp_complex_eq($r, $c0))", CX_NUM },
   { TY_COMPLEX, "===",         1,   1, BF_ANY, TY_BOOL,       BOPE_TEMPLATE, "((void)($r), (void)($b0), 0)" },
   { TY_COMPLEX, "===",         0, 127, BF_ANY, TY_BOOL,       BOPE_NONE },
   { TY_COMPLEX, "!=",          1,   1, BF_ANY, TY_BOOL,       BOPE_TEMPLATE,
-    "({ sp_Complex _t$t = $r; sp_RbVal _t$u = $b0; !(sp_poly_tower_p(_t$u) && sp_complex_eq(_t$t, sp_poly_as_complex(_t$u))); })", BOP_K(TY_POLY) },
+    "({ sp_Complex _t$t = $r; sp_RbVal _t$u = $b0; SP_GC_ROOT_RBVAL(_t$u); !(sp_poly_tower_p(_t$u) && sp_poly_eq(sp_box_complex(_t$t), _t$u)); })", BOP_K(TY_POLY) },
   { TY_COMPLEX, "!=",          1,   1, BF_ANY, TY_BOOL,       BOPE_TEMPLATE, "(!sp_complex_eq($r, $c0))", CX_NUM },
   { TY_COMPLEX, "!=",          1,   1, BF_ANY, TY_BOOL,       BOPE_TEMPLATE, "((void)($r), (void)($b0), 1)" },
   { TY_COMPLEX, "!=",          0, 127, BF_ANY, TY_BOOL,       BOPE_NONE },
@@ -1048,14 +1053,17 @@ static const BuiltinOp bop_rows[] = {
   { TY_RATIONAL, "==",  1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "(sp_rational_to_f($r) == $f0)", BOP_K(TY_FLOAT) },
   { TY_RATIONAL, "==",  1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "(sp_rational_eq($r, $q0))", RAT_IR },
   { TY_RATIONAL, "==",  1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "(sp_poly_eq(sp_box_rational($r), $b0))", BOP_K(TY_POLY) | BOP_K(TY_UNKNOWN) },
+  { TY_RATIONAL, "==",  1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "(({ sp_Rational _t$u = $r; sp_Complex _t$t = $c0; _t$t.im == 0 && sp_poly_eq(sp_box_rational(_t$u), sp_complex_re_box(_t$t)); }))", BOP_K(TY_COMPLEX) },
   { TY_RATIONAL, "==",  1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "((void)($r), (void)($b0), 0)" },
   { TY_RATIONAL, "===", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "(sp_rational_to_f($r) == $f0)", BOP_K(TY_FLOAT) },
   { TY_RATIONAL, "===", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "(sp_rational_eq($r, $q0))", RAT_IR },
   { TY_RATIONAL, "===", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "(sp_poly_eq(sp_box_rational($r), $b0))", BOP_K(TY_POLY) | BOP_K(TY_UNKNOWN) },
+  { TY_RATIONAL, "===", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "(({ sp_Rational _t$u = $r; sp_Complex _t$t = $c0; _t$t.im == 0 && sp_poly_eq(sp_box_rational(_t$u), sp_complex_re_box(_t$t)); }))", BOP_K(TY_COMPLEX) },
   { TY_RATIONAL, "===", 1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "((void)($r), (void)($b0), 0)" },
   { TY_RATIONAL, "!=",  1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "(sp_rational_to_f($r) != $f0)", BOP_K(TY_FLOAT) },
   { TY_RATIONAL, "!=",  1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "(!sp_rational_eq($r, $q0))", RAT_IR },
   { TY_RATIONAL, "!=",  1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "(!sp_poly_eq(sp_box_rational($r), $b0))", BOP_K(TY_POLY) | BOP_K(TY_UNKNOWN) },
+  { TY_RATIONAL, "!=",  1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "(!({ sp_Rational _t$u = $r; sp_Complex _t$t = $c0; _t$t.im == 0 && sp_poly_eq(sp_box_rational(_t$u), sp_complex_re_box(_t$t)); }))", BOP_K(TY_COMPLEX) },
   { TY_RATIONAL, "!=",  1, 1, BF_ANY, TY_BOOL, BOPE_TEMPLATE, "((void)($r), (void)($b0), 1)" },
   /* Comparable#between? / #clamp via <=> (#2563): clamp between two
      Rationals answers the receiver or a bound; with another bound the
@@ -1471,7 +1479,7 @@ static const BuiltinOp bop_rows[] = {
   { TY_TIME, "xmlschema", 1,   1, BF_ANY, TY_STRING,     BOPE_TEMPLATE, "sp_time_iso8601_frac($r, $i0)", TY_UNKNOWN },  /* fraction digits (#3094) */
   { TY_TIME, "xmlschema", 0, 127, BF_ANY, TY_STRING,     BOPE_TEMPLATE, "sp_time_iso8601($r)", TY_UNKNOWN },
   { TY_TIME, "deconstruct_keys", 1,   1, BF_ANY, TY_POLY,       BOPE_NONE },  /* a boxed Symbol => Integer hash */
-  { TY_TIME, "strftime",  1,   1, BF_ANY, TY_STRING,     BOPE_TEMPLATE, "sp_time_strftime($r, $s0)", TY_UNKNOWN },
+  { TY_TIME, "strftime",  1,   1, BF_ANY, TY_STRING,     BOPE_TEMPLATE, "sp_time_strftime_s($r, $s0)", TY_UNKNOWN },
   { TY_TIME, "strftime",   0, 127, BF_ANY, TY_STRING,     BOPE_NONE },
   { TY_TIME, "to_f",      0, 127, BF_ANY, TY_FLOAT,      BOPE_TEMPLATE, "({ SP_TIME_TMP(_t$t) = ($r); sp_time_ns_to_f(_t$t->tv_sec, _t$t->tv_nsec); })", TY_UNKNOWN },  /* one read of the receiver (#2865) */
   { TY_TIME, "subsec",    0, 127, BF_ANY, TY_POLY,       BOPE_TEMPLATE, "({ SP_TIME_TMP(_t$t) = $r; _t$t->tv_nsec == 0 ? sp_box_int(0) : sp_box_rational(sp_rational_new((sp_int)_t$t->tv_nsec, 1000000000)); })", TY_UNKNOWN },  /* Integer 0 for a whole second, else a Rational */
@@ -3227,6 +3235,20 @@ static int bop_name_rows(const char *name, int want_kw) {
 }
 int bop_name_kwless(const char *name) { return bop_name_rows(name, 0); }
 int bop_name_keywords(const char *name) { return bop_name_rows(name, 1); }
+
+/* See builtin_ops.h. */
+int bop_kernel_answers(const char *name, int argc, int has_block) {
+  if (!name) return 0;
+  if (argc >= 0) {
+    const BuiltinOp *r = bop_find(BOP_KERNEL, name, argc, has_block);
+    return r && !(r->flags & BOPF_INTERNAL);
+  }
+  for (int i = 0; i < BOP_NROWS; i++) {
+    const BuiltinOp *r = &bop_rows[i];
+    if (r->recv == BOP_KERNEL && r->name[0] == name[0] && !(r->flags & BOPF_INTERNAL) && sp_streq(r->name, name)) return 1;
+  }
+  return 0;
+}
 
 /* See builtin_ops.h. */
 int bop_class_answers(const char *name, int argc, int has_block) {
