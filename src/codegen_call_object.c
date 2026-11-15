@@ -322,7 +322,7 @@ int emit_call_identity_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
          CRuby (which warns and defines it): fall through to the member read,
          which the inference already typed (#4190) */
       !(ty_is_object(rt) &&
-        comp_resolve_member(c, ty_object_class(rt), name, 0, NULL, NULL) == SP_MEMBER_ATTR)) {
+        call_attr_target(c, -1, ty_object_class(rt), name, 0, NULL))) {
     /* a nullable Integer or Float whose nil flag is set is nil, whose id
        is nil's */
     if ((rt == TY_INT || rt == TY_FLOAT) && call_returns_nullable_int(c, recv)) {
@@ -1232,6 +1232,7 @@ static int main_object_chain_defines(Compiler *c, const char *name) {
   return oc >= 0 && oc < c->nclasses && comp_method_in_chain(c, oc, name, NULL) >= 0;
 }
 int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc) {
+  MethodLookup ml = { .def_class = -1 };
   if (recv >= 0 && (comp_ntype(c, recv) == TY_RANGE || comp_ntype(c, recv) == TY_FLOAT_RANGE ||
                    comp_ntype(c, recv) == TY_STR_RANGE) &&
       emit_builtin_op_stage(c, id, recv, comp_ntype(c, recv), name, 1, b)) return 1;
@@ -1434,7 +1435,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
          copy, and the built-in shallow copy took its place (#5450). Not for
          a call an alias captured the builtin for (builtin_only). */
       !(!cplan_builtin_call(c, id) && ty_is_object(comp_ntype(c, recv)) &&
-        comp_resolve_member(c, ty_object_class(comp_ntype(c, recv)), name, 0, NULL, NULL) != SP_MEMBER_NONE) &&
+        (call_answers(c, -1, ty_object_class(comp_ntype(c, recv)), name, 0, &ml))) &&
       !(comp_ntype(c, recv) == TY_POLY && an_user_defines_method(c, name))) {
     int dargs = nt_ref(nt, id, "arguments");
     int dargc = 0; const int *dargv = dargs >= 0 ? nt_arr(nt, dargs, "arguments", &dargc) : NULL;
@@ -1630,7 +1631,7 @@ int emit_call_freeze_dup_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
          Not while a method of the name calls super (user_defines_calls_super):
          a reopened builtin's super does not reach the builtin method yet. */
       !(!cplan_builtin_call(c, id) && ty_is_object(comp_ntype(c, recv)) &&
-        comp_resolve_member(c, ty_object_class(comp_ntype(c, recv)), name, 0, NULL, NULL) != SP_MEMBER_NONE) &&
+        (call_answers(c, -1, ty_object_class(comp_ntype(c, recv)), name, 0, &ml))) &&
       !(argc == 0 && repr_of(c, recv).kind == RK_BOXED && user_defines_or_reads(c, name) &&
         (!is_itself_name(name) || !user_defines_calls_super(c, name))) &&
       /* main is an Object: a method Object's chain holds (a module
@@ -2909,7 +2910,7 @@ int emit_call_object_override_arms(Compiler *c, int id, Buf *b, const NodeTable 
       if (ac0 == 0 && !diag_user_defines(c, "itself") &&
           /* a generated READER of the name owns it, as in CRuby (#4190) */
           !(ty_is_object(irt0) &&
-            comp_resolve_member(c, ty_object_class(irt0), "itself", 0, NULL, NULL) == SP_MEMBER_ATTR)) {
+            call_attr_target(c, -1, ty_object_class(irt0), "itself", 0, NULL))) {
         emit_expr_as_value_of(c, nt_ref(nt, id, "receiver"), id, b);
         return 1;
       }
@@ -3138,6 +3139,12 @@ static int emit_bivar_table_op(Compiler *c, const BopCtx *x, char op, Buf *b) {
   const int *argv = call_args(nt, id, &argc);
   int tv = ++g_tmp;
   buf_puts(b, "({ "); tv = hold_operand(c, x->recv, TY_POLY, 1, tv, 1, " ", b);
+  /* (an instance of a program class under a builtin exception, in a method
+     naming an ivar the builtin's reopening holds in the map: keyed as the
+     exception it is, as the reopening's methods key it) */
+  { TyKind xt = repr_of(c, x->recv).ty;
+    if (ty_is_object(xt) && class_is_exc_subclass(c, ty_object_class(xt)))
+      buf_printf(b, "_t%d.cls_id = SP_BUILTIN_EXCEPTION; ", tv); }
   if (op == 'l') { buf_printf(b, "sp_bivar_list(_t%d); })", tv); return 1; }
   buf_printf(b, "sp_sym _k%d = ", tv); emit_bivar_name(c, argv[0], b); buf_puts(b, "; ");
   if (op == 'd') { buf_printf(b, "sp_bivar_defined(_t%d, _k%d); })", tv, tv); return 1; }
@@ -3235,7 +3242,7 @@ int emit_call_display_ivar_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
       /* the class's own `display`, a generated reader (#4190) or a def,
          owns the name, as in CRuby */
       !(ty_is_object(comp_ntype(c, recv)) &&
-        comp_resolve_member(c, ty_object_class(comp_ntype(c, recv)), name, 0, NULL, NULL) != SP_MEMBER_NONE) &&
+        (call_answers(c, -1, ty_object_class(comp_ntype(c, recv)), name, 0, NULL))) &&
       !(comp_ntype(c, recv) == TY_POLY && an_user_defines_method(c, name))) {
     /* Struct#to_s IS inspect in CRuby ("#<struct Point x=1, y=2>"); the
        boxed sp_poly_to_s default would print the bare-object form */

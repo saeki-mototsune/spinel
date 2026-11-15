@@ -361,6 +361,7 @@ int is_array_push_family(const char *n); /* << append prepend push unshift */
 int is_io_class_name(const char *n); /* File IO */
 int is_immediate_class_name(const char *n); /* FalseClass NilClass TrueClass */
 int is_object_base_name(const char *n); /* BasicObject Object */
+int is_basic_object_name(const char *n); /* BasicObject alone: the root a blank slate descends from */
 /* The classes a class's singleton chain ends in, which the load record
    holds by the header that reopens each (builtin_core_class_slot), are among
    these builtin rows. The list generates the builtin table and core-class
@@ -521,6 +522,8 @@ int is_dir_blockless_iter(const char *n);  /* foreach each_child: an Enumerator 
 
 int is_kernel_module_name(const char *n);
 int is_kernel_module_function(const char *n);
+/* ...and one that never consults self (not `binding`). */
+int kernel_function_ignores_self(const char *n);
 int builtin_object_method_known(const char *m);   /* one of Object's own methods every object answers */
 const char *builtin_method_owner(const char *cls, const char *m);   /* the class or module defining builtin cls's m */
 const char *builtin_bool_method_owner(const char *cls, const char *m);   /* ...a true's or false's m, of class cls when known; NULL where it is not known */
@@ -620,6 +623,10 @@ const char *builtin_operator_delegate(const char *name);
 int is_mul_op(const char *n); /* * */
 int is_pow_op(const char *n); /* ** */
 int is_minus_op(const char *n); /* - */
+int is_order_op(const char *n); /* < <= > >= */
+int is_ascending_order_op(const char *n); /* < <=: the receiver is the lesser side (is_order_op's other half is > >=) */
+int is_abs_name(const char *n); /* abs magnitude */
+int is_pred_name(const char *n); /* pred */
 int is_clone_name(const char *n); /* clone */
 int is_cover_name(const char *n); /* cover? */
 int is_flatten_name(const char *n); /* flatten */

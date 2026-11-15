@@ -1412,6 +1412,10 @@ int is_object_base_name(const char *n) {
   return sp_streq(n, "Object") || sp_streq(n, "BasicObject");
 }
 
+int is_basic_object_name(const char *n) {
+  return sp_streq(n, "BasicObject");
+}
+
 /* The first row of each name, through a table hashed on the first ask: the
    lookup compared the name with every row, and is asked of class names per
    call (is_builtin_reopen, of each class a poly block dispatch weighs). */
@@ -2014,6 +2018,15 @@ int is_kernel_module_function(const char *m) {
     NULL
   };
   return m && builtin_name_in(m, K);
+}
+
+/* Is m one of Kernel's module functions that never consults self (the ones
+   is_kernel_module_function lists, but `binding`, which captures it, and the
+   ones IO answers itself, which the names table does not list: a File as
+   self writes to the file) */
+int kernel_function_ignores_self(const char *m) {
+  static const char *const SELF[] = { "binding", "puts", "print", "printf", "gets", NULL };
+  return is_kernel_module_function(m) && !builtin_name_in(m, SELF);
 }
 
 /* The module that defines m, one of Object's own methods every object
@@ -2737,6 +2750,14 @@ int is_mul_op(const char *n) { return n && sp_streq(n, "*"); }
 int is_pow_op(const char *n) { return n && sp_streq(n, "**"); }
 
 int is_minus_op(const char *n) { return n && sp_streq(n, "-"); }
+
+int is_ascending_order_op(const char *n) { return n && (sp_streq(n, "<") || sp_streq(n, "<=")); }
+
+int is_order_op(const char *n) { return is_ascending_order_op(n) || (n && (sp_streq(n, ">") || sp_streq(n, ">="))); }
+
+int is_pred_name(const char *n) { return n && sp_streq(n, "pred"); }
+
+int is_abs_name(const char *n) { return n && (sp_streq(n, "abs") || sp_streq(n, "magnitude")); }
 
 int is_clone_name(const char *n) { return n && sp_streq(n, "clone"); }
 

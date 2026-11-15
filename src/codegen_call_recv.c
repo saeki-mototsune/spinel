@@ -3,6 +3,7 @@
    movement, no logic change. */
 
 #include "codegen_internal.h"
+#include "order_plan.h"
 
 int g_ivg_box_node = -1;
 #include "call_plan.h"
@@ -692,7 +693,7 @@ static int name_is_literal(Compiler *c, const char *name) {
    Object, Kernel or BasicObject, a top-level def or include), or a
    literal of the name may define it reflectively. */
 static int obj_may_answer(Compiler *c, int cid, const char *name) {
-  if (comp_method_in_chain(c, cid, name, NULL) >= 0 || comp_reader_in_chain(c, cid, name, NULL) ||
+  if (call_answers(c, -1, cid, name, 0, NULL) ||
       comp_subclass_answers(c, cid, name) || root_reopen_defines(c, name) ||
       comp_method_index(c, name) >= 0)
     return 1;
@@ -1524,22 +1525,60 @@ static int find_param_is_oint(Compiler *c, int block, const char *bp0, TyKind et
   return mlv && oint_kind(et) && slot_is_oint(mlv);
 }
 
-static void emit_find_elem_decl(Compiler *c, int block, const char *bp0, const char *bp, TyKind rt, const char *k,
+/* Is find's block parameter held boxed over a typed Array's elements? The
+   slot is poly when another block shares it and widened it: the builtin's
+   copy that desugar_builtin_enum_calls puts beside a receiver it saw boxed
+   binds the same parameter from its own boxed walk, and the receiver
+   narrowed to the typed Array only afterwards. The body was typed against
+   the slot, so it reads the parameter boxed. */
+static int find_param_is_boxed(Compiler *c, int block, const char *bp0, TyKind et) {
+  Scope *ms = comp_scope_of(c, block);
+  LocalVar *mlv = ms && bp0 ? scope_local(ms, bp0) : NULL;
+  return mlv && mlv->type == TY_POLY && et != TY_POLY;
+}
+
+/* Answers the temp a boxed parameter's element is kept in (0 for none): the
+   block may store over the entry or rebind the parameter, and find answers
+   the element it yielded. */
+static int emit_find_elem_decl(Compiler *c, int block, const char *bp0, const char *bp, TyKind rt, const char *k,
                                 TyKind et, int trecv, int ti) {
   Scope *ms = comp_scope_of(c, block);
   LocalVar *mlv = ms && bp0 ? scope_local(ms, bp0) : NULL;
   emit_indent(g_pre, g_indent + 1);
   if (find_param_is_oint(c, block, bp0, et)) {
     buf_printf(g_pre, "%s lv_%s = sp_%sArray_oget(_t%d, _t%d);\n", oint_ctype(et), bp, k, trecv, ti);
-    return;
+    return 0;
+  }
+  /* a boxed slot takes the element boxed, so the declaration agrees with
+     the body's reads of it; an Integer or Float element keeps its nil. The
+     element itself is kept first, rooted, as find's answer: a block that
+     replaces the entry may leave it held by that temp alone. The boxed
+     parameter is rooted too: boxing a String element can make a fresh one,
+     which only the declaration holds while the block runs and allocates. */
+  if (find_param_is_boxed(c, block, bp0, et)) {
+    int te = ++g_tmp;
+    char tn[24]; snprintf(tn, sizeof tn, "_t%d", te);
+    if (oint_kind(et)) {
+      buf_printf(g_pre, "%s %s = sp_%sArray_oget(_t%d, _t%d); ", oint_ctype(et), tn, k, trecv, ti);
+      buf_printf(g_pre, "sp_RbVal lv_%s = %s(%s);", bp, oint_box(et), tn);
+    }
+    else {
+      char rd[96]; typed_elem_getf(rd, sizeof rd, rt, k, "_t%d, _t%d", trecv, ti);
+      emit_ctype(c, et, g_pre); buf_printf(g_pre, " %s = %s; ", tn, rd);
+      emit_gc_root_var(c, et, tn, g_pre);
+      buf_printf(g_pre, " sp_RbVal lv_%s = ", bp); emit_boxed_text(c, et, tn, g_pre); buf_puts(g_pre, ";");
+    }
+    buf_printf(g_pre, " SP_GC_ROOT_RBVAL(lv_%s);\n", bp);
+    return te;
   }
   if (sp_streq(k, "Str") && mlv && mlv->type == TY_STRBUF) {
     emit_ctype(c, TY_STRBUF, g_pre);
     buf_printf(g_pre, " lv_%s = SP_STR_TO(lv_%s, sp_StrArray_get_e(_t%d, _t%d));\n", bp, bp, trecv, ti);
-    return;
+    return 0;
   }
   emit_ctype(c, et, g_pre);
   { char rd[96]; typed_elem_getf(rd, sizeof rd, rt, k, "_t%d, _t%d", trecv, ti); buf_printf(g_pre, " lv_%s = %s;\n", bp, rd); }
+  return 0;
 }
 
 static void emit_find_loop_head(Compiler *c, int id, const char *k, int ti, int trecv) {
@@ -2003,16 +2042,29 @@ static int emit_kind_array_iter_call(Compiler *c, int id, Buf *b, const NodeTabl
       emit_indent(g_pre, g_indent);
       buf_printf(g_pre, "sp_RbVal _t%d = sp_box_nil(); SP_GC_ROOT_RBVAL(_t%d);\n", tres, tres);
       emit_find_loop_head(c, id, k, ti, trecv);
-      if (bp) emit_find_elem_decl(c, block, block_param_name(c, block, 0), bp, rt, k, et, trecv, ti);
+      int tkeep = bp ? emit_find_elem_decl(c, block, block_param_name(c, block, 0), bp, rt, k, et, trecv, ti) : 0;
       for (int j = 0; j < bn - 1; j++) emit_stmt(c, bb[j], g_pre, g_indent + 1);
       int sv = g_indent; g_indent++;
-      Buf cb = expr_buf(c, bb[bn - 1]); g_indent = sv;
+      /* a boxed parameter's block value is tested by Ruby's truth rules: the
+         tail as written is a test only for a typed one (a boxed value is a
+         struct) */
+      Buf cb;
+      if (bp && find_param_is_boxed(c, block, block_param_name(c, block, 0), et)) {
+        memset(&cb, 0, sizeof cb); emit_cond(c, bb[bn - 1], &cb);
+      }
+      else cb = expr_buf(c, bb[bn - 1]);
+      g_indent = sv;
       emit_indent(g_pre, g_indent + 1);
       buf_printf(g_pre, "if (%s) { _t%d = ", cb.p ? cb.p : "0", tres);
       { Buf eltxt; memset(&eltxt, 0, sizeof eltxt);
-        if (bp) buf_printf(&eltxt, "lv_%s", bp);
+        /* a boxed parameter answers the element it was handed, kept before
+           the block ran (emit_find_elem_decl) */
+        if (tkeep) buf_printf(&eltxt, "_t%d", tkeep);
+        else if (bp) buf_printf(&eltxt, "lv_%s", bp);
         else { char rd[96]; typed_elem_getf(rd, sizeof rd, rt, k, "_t%d, _t%d", trecv, ti); buf_puts(&eltxt, rd); }
-        if (bp && find_param_is_oint(c, block, block_param_name(c, block, 0), et))
+        if (tkeep && oint_kind(et))   /* (keeps a nil element nil) */
+          buf_printf(g_pre, "%s(%s)", oint_box(et), eltxt.p);
+        else if (!tkeep && bp && find_param_is_oint(c, block, block_param_name(c, block, 0), et))
           buf_printf(g_pre, "%s(%s)", oint_box(et), eltxt.p);
         else emit_boxed_text(c, et, eltxt.p, g_pre);
         free(eltxt.p); }
@@ -2047,6 +2099,12 @@ static int emit_kind_array_iter_call(Compiler *c, int id, Buf *b, const NodeTabl
         emit_ctype(c, et, g_pre);
         if (et == TY_STRING) buf_printf(g_pre, " _t%d = NULL;\n", tres);
         else buf_printf(g_pre, " _t%d = 0;\n", tres);
+        /* the element a boxed parameter was handed may be held by the
+           answer alone once the block replaced its entry */
+        if (bp && find_param_is_boxed(c, block, block_param_name(c, block, 0), et)) {
+          char an[24]; snprintf(an, sizeof an, "_t%d", tres);
+          emit_indent(g_pre, g_indent); emit_gc_root_var(c, et, an, g_pre); buf_puts(g_pre, "\n");
+        }
       }
       emit_find_loop_head(c, id, k, ti, trecv);
       /* Declare the block param in the loop body (not a bare assignment) so
@@ -2054,13 +2112,19 @@ static int emit_kind_array_iter_call(Compiler *c, int id, Buf *b, const NodeTabl
          hoisted to the call site, the enclosing function has no top-level
          declaration for the block local. Shadows the method-scope slot in
          the ordinary in-body case, which is harmless. */
-      if (bp) emit_find_elem_decl(c, block, block_param_name(c, block, 0), bp, rt, k, et, trecv, ti);
+      int tkeep = bp ? emit_find_elem_decl(c, block, block_param_name(c, block, 0), bp, rt, k, et, trecv, ti) : 0;
+      /* a boxed parameter's block value is tested by Ruby's truth rules
+         (emit_cond), not read as the test itself, and find answers the
+         element it was handed, kept before the block ran, in the answer
+         slot's type */
+      int bpbox = tkeep > 0;
       Buf cb; memset(&cb, 0, sizeof cb);
       { IterStep st; emit_iter_step_open(c, block, 1, g_indent + 1, &st);
         int sv = g_indent; g_indent++;
-        emit_iter_step_cond(c, &st, 1, &cb); g_indent = sv; }
+        emit_iter_step_cond(c, &st, !bpbox, &cb); g_indent = sv; }
       emit_indent(g_pre, g_indent + 1);
-      if (bp && find_param_is_oint(c, block, block_param_name(c, block, 0), et))
+      if (bpbox) buf_printf(g_pre, "if (%s) { _t%d = _t%d; break; }\n", cb.p ? cb.p : "0", tres, tkeep);
+      else if (bp && find_param_is_oint(c, block, block_param_name(c, block, 0), et))
         buf_printf(g_pre, "if (%s) { _t%d = lv_%s; break; }\n", cb.p ? cb.p : "0", tres, bp);
       else if (bp && oint_kind(et)) buf_printf(g_pre, "if (%s) { _t%d = %s(lv_%s); break; }\n", cb.p ? cb.p : "0", tres, oint_of(et), bp);
       /* (one representation: the parameter may hold the handle; the answer
@@ -4900,13 +4964,21 @@ static int emit_str_mutator_call(Compiler *c, int id, Buf *b, const NodeTable *n
              they are held there too, ahead of it, as the plain receiver's
              are (held below) */
           Buf *hb = rd_call && sb_block_hoists(c, id) ? g_pre : b;
+          /* an argument that runs code may change the receiver in place
+             (and move its payload): the arguments are bound ahead of the
+             plain form, which reads the receiver's bytes from the handle
+             after them (the String group, string_group_at), and the bytes
+             the change is told by are the receiver's once it ran */
+          int late = 0;
+          for (int a = 0; a < argc && hb == b && !late; a++) late = order_runs_code(c, argv[a]);
           buf_puts(b, "({ ");
           size_t hat = hb->len;
           if (hb != b) emit_indent(hb, g_indent);
           buf_printf(hb, "sp_String *_t%d = SP_STR_HDL(%s);", tsb, lbB.p ? lbB.p : srefB.p);
           free(lbB.p); free(srefB.p);
           emit_route_recv_root(c, hrB, tsb, 0, NULL, TY_UNKNOWN, hb);
-          buf_printf(hb, " const char *_t%d = sp_String_cstr(_t%d); (void)_t%d;%s", tob, tsb, tob, hb != b ? "\n" : " ");
+          if (late) buf_puts(hb, " ");
+          else buf_printf(hb, " const char *_t%d = sp_String_cstr(_t%d); (void)_t%d;%s", tob, tsb, tob, hb != b ? "\n" : " ");
           /* (the handle read held ahead is the receiver's, written back
              below, as the enclosing bang declares it in the statement) */
           /* gsub!/sub! answer nil when no SUBSTITUTION was made, which the
@@ -4928,6 +5000,7 @@ static int emit_str_mutator_call(Compiler *c, int id, Buf *b, const NodeTable *n
             nC = 2;
             if (was_sb) { view_push(c, recv, TY_STRING); nC = 3; }
             view_bind_temp(recv, tob);
+            if (late) snprintf(g_argov_text[g_n_argov - 1], ARGOV_TEXT_LEN, "SP_STR_B(_t%d)", tsb);
           }
           /* a sibling, an operand or the block may run a sub of its own: the
              call enters the runtime through its wrapper, and a block form answers
@@ -4958,6 +5031,7 @@ static int emit_str_mutator_call(Compiler *c, int id, Buf *b, const NodeTable *n
              itself and every successful mutation answered nil (#4014). */
           int tchg = ++g_tmp;
           buf_printf(b, "const char *_t%d = %s; ", tnb, nbB.p ? nbB.p : "");
+          if (late) buf_printf(b, "const char *_t%d = sp_String_cstr(_t%d); (void)_t%d; ", tob, tsb, tob);
           if (sb_nil_nc || sb_same_ok)
             buf_printf(b, "int _t%d = !sp_str_eq(_t%d, _t%d)%s; ", tchg, tob, tnb, smB);
           if (sb_same_ok) buf_printf(b, "if (_t%d) ", tchg);
@@ -6076,6 +6150,15 @@ static int emit_array_call_arms(Compiler *c, int id, Buf *b) {
     int eblk = nt_ref(nt, id, "block");
     int boxed = repr_of(c, id).kind == RK_BOXED;
     char ans[32];
+    if (eblk < 0 && poly_each_line_args_enum(c, id)) {
+      /* asked its size: CRuby's Enumerator over those lines (nil size) */
+      buf_printf(b, " sp_Enumerator *_t%d = sp_enum_with_src(sp_Enumerator_new_from(sp_box_str_array(_t%d)), sp_box_str(_t%d), SPL(\"each_line\"));", ++g_tmp, ta, tl);
+      snprintf(ans, sizeof ans, "_t%d", g_tmp);
+      buf_puts(b, " ");
+      if (boxed) emit_boxed_text(c, TY_ENUMERATOR, ans, b); else buf_puts(b, ans);
+      buf_puts(b, "; })");
+      return 1;
+    }
     if (eblk < 0) {
       snprintf(ans, sizeof ans, "_t%d", ta);
       buf_puts(b, " ");
@@ -9619,17 +9702,22 @@ static int str_arms_pattern(Compiler *c, int id, Buf *b, const NodeTable *nt, co
 /* An Integer receiver's clamp, digits, allbits? / anybits? / nobits?,
    ceildiv, pow, coerce, eql? and equal? (emit_scalar_recv_arms's Integer
    chain; answers 1 when a branch was taken) */
-/* --int-overflow=promote typed the call poly: its value can leave the word
-   (2**63 - 1 + 1, |-2**63|, a power), so the boxed helper answers it, ahead
+/* The inference typed the call boxed: a power whose exponent may be negative
+   (a Rational), or under --int-overflow=promote a value that can leave the
+   word (2**63 - 1 + 1, |-2**63|, a power). The boxed helper answers it, ahead
    of the rows that compute in sp_int. Answers 1 when it emitted. */
-static int int_arms_promote(Compiler *c, int id, Buf *b, const char *name, int argc, const int *argv, const char *r) {
-  if (!g_promote_mode || repr_of(c, id).kind != RK_BOXED) return 0;
-  if (argc == 0 && (sp_streq(name, "succ") || sp_streq(name, "next"))) { buf_printf(b, "sp_poly_succ_m(sp_box_int(%s), 0)", r); return 1; }
-  if (argc == 0 && sp_streq(name, "pred")) { buf_printf(b, "sp_poly_int_pred(sp_box_int(%s))", r); return 1; }
-  if (argc == 0 && (sp_streq(name, "abs") || sp_streq(name, "magnitude"))) { buf_printf(b, "sp_poly_abs(sp_box_int(%s))", r); return 1; }
-  if (is_pow_name(name) && argc == 1 && (comp_ntype(c, argv[0]) == TY_INT || repr_of(c, argv[0]).kind == RK_BOXED)) {
-    buf_printf(b, "sp_poly_int_pow(sp_box_int(%s), ", r); emit_boxed(c, argv[0], b); buf_puts(b, ")"); return 1;
+static int int_arms_boxed(Compiler *c, int id, Buf *b, const char *name, int argc, const int *argv, const char *r) {
+  if (repr_of(c, id).kind != RK_BOXED) return 0;
+  if (is_pow_name(name) && argc == 1) {
+    Repr er = repr_of(c, argv[0]);
+    if (er.as_ty == TY_INT || er.kind == RK_BOXED) {
+      buf_printf(b, "sp_poly_int_pow(sp_box_int(%s), ", r); emit_boxed(c, argv[0], b); buf_puts(b, ")"); return 1;
+    }
   }
+  if (!g_promote_mode) return 0;
+  if (argc == 0 && is_succ_alias(name)) { buf_printf(b, "sp_poly_succ_m(sp_box_int(%s), 0)", r); return 1; }
+  if (argc == 0 && is_pred_name(name)) { buf_printf(b, "sp_poly_int_pred(sp_box_int(%s))", r); return 1; }
+  if (argc == 0 && is_abs_name(name)) { buf_printf(b, "sp_poly_abs(sp_box_int(%s))", r); return 1; }
   return 0;
 }
 
@@ -10322,8 +10410,14 @@ static int emit_scalar_recv_arms(Compiler *c, int id, Buf *b, const NodeTable *n
      the value cannot alias the handle (#3227). A method that only looks at
      the bytes and answers a scalar or a freshly built string keeps nothing,
      so it can read the live buffer instead -- `text[i]` in a scan loop was
-     copying the whole subject on every character. */
-  if (rt == TY_STRING && name && is_string_read_only_method(name))
+     copying the whole subject on every character. A receiver the operand
+     order holds as its handle ahead of the arguments
+     (emit_operands_in_order), or a bang holds ahead of its plain form, is
+     read from that hold, as its bytes: the slot may name another String by
+     the time the call runs. */
+  int rth = rt == TY_STRING && arg_ran_first(recv, 0) ? ran_first_handle(recv) : -1;
+  if (rth >= 0) buf_printf(&rs, "SP_STR_B(_t%d)", rth);
+  else if (rt == TY_STRING && name && is_string_read_only_method(name) && !arg_ran_first(recv, 0))
     emit_strbuf_read_ref(c, recv, &rs);
   /* a receiver that can be nil is rendered as its unwrapped oint, never as
      the checked plain read: the `$N` arms take the oint back out of it */
@@ -10405,14 +10499,21 @@ static int emit_scalar_recv_arms(Compiler *c, int id, Buf *b, const NodeTable *n
      that hoists a loop (a block call) binds the receiver there, so the held
      temp is declared at that point rather than inside the expression */
   size_t g_pre_mark = g_pre ? g_pre->len : 0;
-  /* A String receiver that is a fresh copy (a shared slot's reader) and is
-     never nil still needs the bound, rooted temp when an argument may
-     allocate: the guard below is the only path that holds it (g_noguard:
-     the hold without the nil test). An argument that is a pure read --
-     `s.getbyte(j * p + k)` -- builds nothing (operand_allocates_beside):
-     held for it, the receiver's bytes were fetched and rooted on every
-     iteration of a loop that reads them from its header cache. */
+  /* A String receiver that is a fresh value (a call's answer) only the
+     call's argument list holds, and is never nil, still needs the bound,
+     rooted temp when an argument may allocate: the guard below is the only
+     path that holds it (g_noguard: the hold without the nil test). A String
+     slot's read needs none: the slot holds its String, and an operand that
+     changes it or rebinds the slot is ordered ahead of the call, which holds
+     the slot's handle (emit_operands_in_order); nor does a receiver held so
+     already. An argument that is a pure read -- `s.getbyte(j * p + k)` --
+     builds nothing (operand_allocates_beside): held for it, the receiver
+     was fetched and rooted on every iteration of a loop that reads it. */
   int g_noguard = 0;
+  /* (a String receiver held beside an argument that runs code is held as
+     its handle, read as SP_STR_B where the arms read it; see the hold) */
+  int g_hdl = 0;
+  for (int ai = 0; rt == TY_STRING && ai < argc; ai++) g_hdl |= order_runs_code(c, argv[ai]);
   /* (--share-strings: `yield.equal?(x)` at a site whose block answers a
      String a holder keeps reads the yield's handle once, in equal?'s own
      arm (str_arms_convert): held here as its bytes, the handle was lost) */
@@ -10422,14 +10523,15 @@ static int emit_scalar_recv_arms(Compiler *c, int id, Buf *b, const NodeTable *n
      the arguments where CRuby reads it there, or take a shared String's
      handle: encode_hold) */
   int enc_holds = rt == TY_STRING && name && (sp_streq(name, "encode") || sp_streq(name, "encode!")) && argc <= 3;
-  if (rt == TY_STRING && name && recv >= 0 && operand_may_allocate(c, recv) && !y_ident && !enc_holds &&
+  if (rt == TY_STRING && name && recv >= 0 && subtree_may_allocate(nt, recv) && !arg_ran_first(recv, 0) &&
+      !y_ident && !enc_holds &&
       repr_of(c, recv).as_ty != TY_STRBUF &&   /* a handle is no fresh copy, and no const char * */
       !((!nil_answers_name(name)) && recv_may_be_sentinel(c, recv))) {
     for (int ai = 0; ai < argc && !g_noguard; ai++) g_noguard = operand_allocates_beside(c, argv[ai]);
     if (nt_safe_nav(nt, id)) g_noguard = 0;
     if (g_noguard) {
       g_tmpid = ++g_tmp;
-      snprintf(g_rname, sizeof g_rname, "_t%d", g_tmpid);
+      snprintf(g_rname, sizeof g_rname, g_hdl ? "SP_STR_B(_t%d)" : "_t%d", g_tmpid);
       g_outer_b = b; b = &gbody; r = g_rname;
       if (g_conv_hold) g_conv_hold->guarded = 1;
     }
@@ -10443,7 +10545,7 @@ static int emit_scalar_recv_arms(Compiler *c, int id, Buf *b, const NodeTable *n
          text at all, so a guard spliced into that text would vanish. The
          arms emit into gbody and the guard wraps whatever they produced. */
       g_tmpid = ++g_tmp;
-      snprintf(g_rname, sizeof g_rname, "_t%d", g_tmpid);
+      snprintf(g_rname, sizeof g_rname, g_hdl ? "SP_STR_B(_t%d)" : "_t%d", g_tmpid);
       g_outer_b = b; b = &gbody; r = g_rname;
       /* conversions the arms emit belong BELOW the guard's nil check --
          CRuby raises its NoMethodError without asking #to_str -- so the
@@ -10482,8 +10584,9 @@ static int emit_scalar_recv_arms(Compiler *c, int id, Buf *b, const NodeTable *n
   }
   else if (rt == TY_INT) {
     /* the arms that read only the receiver and the arguments: builtin-op
-       rows (builtin_ops.c), behind the promote-mode answers that leave the word */
-    if (int_arms_promote(c, id, b, name, argc, argv, r)) ;
+       rows (builtin_ops.c), behind the boxed answers (a power that may be a
+       Rational, the promote-mode ones that leave the word) */
+    if (int_arms_boxed(c, id, b, name, argc, argv, r)) ;
     else if (emit_builtin_op_text(c, id, recv, rt, name, r, b)) ;
     else if (int_arms_round_divide(c, id, b, nt, name, argc, argv, r)) ;
     else if (int_arms_clamp_pow(c, id, b, nt, name, recv, argc, argv, a0, r)) ;
@@ -10941,18 +11044,22 @@ static int emit_scalar_recv_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     if (handled) {
       /* the String's nil is the NULL pointer; an Integer's is its oint's
          flag, read through sp_oint_val (nil's NoMethodError). A String
-         receiver can be a fresh copy (a shared slot's reader, a method's
-         result) that only this temp holds: it is rooted when an argument,
-         evaluated inside the call below, may allocate. */
+         receiver can be a fresh value (a method's result) that only this
+         temp holds: it is rooted when an argument, evaluated inside the
+         call below, may allocate. Beside an argument that runs code (the
+         record's order_runs_code), which may change the String in place,
+         it is held as its handle (the receiver's text is of either face),
+         and its bytes are taken where the arms read it, after the
+         arguments ran; beside none, its bytes are what the arms read. */
       int g_root = 0;
       if (rt == TY_STRING)
         for (int ai = 0; ai < argc && !g_root; ai++) g_root = operand_allocates_beside(c, argv[ai]);
+      const char *g_decl = g_hdl ? "sp_String *_t%d = SP_STR_HDL(%s);" : "const char *_t%d = SP_STR_B(%s);";
       if (rt == TY_STRING && g_pre && pre_names_tmp(g_pre, g_pre_mark, g_tmpid)) {
         /* the body's prelude reads the held temp: declare it there */
         Buf hd; memset(&hd, 0, sizeof hd);
-        /* (one-String mode: the receiver's text may be a held handle) */
-        buf_printf(&hd, "const char *_t%d = SP_STR_B(%s); SP_GC_ROOT(_t%d);",
-                   g_tmpid, rs.p ? rs.p : "", g_tmpid);
+        buf_printf(&hd, g_decl, g_tmpid, rs.p ? rs.p : "");
+        buf_printf(&hd, " SP_GC_ROOT(_t%d);", g_tmpid);
         if (!g_noguard) buf_printf(&hd, " if (!_t%d) sp_nil_recv_raise(\"%s\");", g_tmpid, name);
         buf_puts(&hd, "\n");
         buf_insert_at(g_pre, g_pre_mark, hd.p);
@@ -10960,7 +11067,9 @@ static int emit_scalar_recv_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         buf_puts(b, "({ ");
       }
       else if (rt == TY_STRING) {
-        buf_printf(b, "({ const char *_t%d = SP_STR_B(%s); ", g_tmpid, rs.p ? rs.p : "");
+        buf_puts(b, "({ ");
+        buf_printf(b, g_decl, g_tmpid, rs.p ? rs.p : "");
+        buf_puts(b, " ");
         if (g_root) buf_printf(b, "SP_GC_ROOT(_t%d); ", g_tmpid);
         if (!g_noguard) buf_printf(b, "if (!_t%d) sp_nil_recv_raise(\"%s\"); ", g_tmpid, name);
       }
@@ -11689,7 +11798,7 @@ static int emit_struct_recv_call(Compiler *c, int id, Buf *b, const NodeTable *n
          Struct.new(:members) answers the member, not the member names. The
          iterator this file synthesizes for a struct is a method and is served
          by the object path below. */
-      comp_resolve_member(c, ty_object_class(rt), name, 0, NULL, NULL) == SP_MEMBER_NONE)) return 0;
+      !call_answers(c, -1, ty_object_class(rt), name, 0, NULL))) return 0;
   ClassInfo *sc = &c->classes[ty_object_class(rt)];
   /* #inspect / #to_s -> the generated (or user-overridden) struct/data stringifier */
   if ((is_text_conversion(name)) && argc == 0) {
@@ -12924,11 +13033,12 @@ int emit_object_call(Compiler *c, int id, Buf *b) {
      freeze sets it and returns self; frozen? reads it. Mutation of a frozen
      plain object's ivars is NOT trapped (raw C stores); the flag round-trip
      is what reflection-driven code observes. */
+  MethodLookup fml = { .def_class = -1 };
   if (recv >= 0 && ty_is_object(rt) && argc == 0 && nt_ref(nt, id, "block") < 0 &&
       (is_freeze_family(name)) &&
-      call_target(c, id, ty_object_class(rt), name, 0, NULL) < 0 &&
+      call_target(c, id, ty_object_class(rt), name, 0, &fml) < 0 &&
       /* a generated reader of the name owns it, as in CRuby (#4190) */
-      comp_resolve_member(c, ty_object_class(rt), name, 0, NULL, NULL) != SP_MEMBER_ATTR) {
+      fml.kind != ML_ATTR) {
     if (comp_ty_value_obj(c, rt)) {
       /* A value-type object (sp_X by value, no heap GC header to carry the
          frozen bit): freeze is a self-returning no-op and frozen? is false,
@@ -13323,142 +13433,141 @@ int emit_object_call(Compiler *c, int id, Buf *b) {
        same-class `def x`) overrides it via normal dispatch rather than
        reading the field. Whichever definition sits in the more-derived class
        wins; on a same-class tie the explicit method wins. */
-    int rdc = -1, mdc = -1;
-    if (comp_reader_in_chain(c, cid, name, &rdc)) {
-      int reader_wins = comp_resolve_member(c, cid, name, 0, &mdc, NULL) == SP_MEMBER_ATTR;
-      if (reader_wins) {
-        /* a reader is zero-arity: excess arguments are CRuby's ArgumentError
-           (a Struct member read with an argument answered the member). A
-           splat / keyword-hash / forwarding argument can be empty at run
-           time -- zero arguments to CRuby -- so those stay unguarded. */
-        int rdr_dynamic = nt_argv_has(nt, argv, argc, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_FORWARDING | NT_ARG_BLOCK);
-        if (argc > 0 && !rdr_dynamic) {
-          TyKind rrty2 = repr_of(c, id).as_ty;
-          buf_puts(b, "({ (void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "); ");
-          for (int ra = 0; ra < argc; ra++) {
-            buf_puts(b, "(void)("); emit_expr_for_effect(c, argv[ra], b); buf_puts(b, "); ");
-          }
-          buf_printf(b, "sp_raise_cls(\"ArgumentError\","
-                        " \"wrong number of arguments (given %d, expected 0)\"); %s; })",
-                     argc, raise_tail_c(c, id, rrty2));
-          return 1;
+    MethodLookup rml = { .def_class = -1 };
+    int rdc = -1;
+    if (call_attr_target(c, -1, cid, name, 0, &rml)) {
+      rdc = rml.def_class;
+      /* a reader is zero-arity: excess arguments are CRuby's ArgumentError
+         (a Struct member read with an argument answered the member). A
+         splat / keyword-hash / forwarding argument can be empty at run
+         time -- zero arguments to CRuby -- so those stay unguarded. */
+      int rdr_dynamic = nt_argv_has(nt, argv, argc, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_FORWARDING | NT_ARG_BLOCK);
+      if (argc > 0 && !rdr_dynamic) {
+        TyKind rrty2 = repr_of(c, id).as_ty;
+        buf_puts(b, "({ (void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "); ");
+        for (int ra = 0; ra < argc; ra++) {
+          buf_puts(b, "(void)("); emit_expr_for_effect(c, argv[ra], b); buf_puts(b, "); ");
         }
-        const char *rn2 = comp_resolve_alias(c, cid, name);
-        /* A receiver typed for this class can hold an instance of a subclass
-           whose `def` overrides the reader: `self` in one of the class's own
-           methods, or an object such a method answers. The read then
-           dispatches on the runtime class, as a receiverless call to the
-           reader does, and the receiver is evaluated once. */
-        /* --share-strings: the read as the handle (a demand, or the read
-           marked as the handle) or as a box, of a String slot a
-           descendant's def overrides: each arm's handle, as a receiverless
-           read takes it (emit_reader_override_handle). Read as the slot's
-           handle alone the override was skipped (`[self.h]` answered the
-           field), and as its copy the String lost its identity. */
-        if (!comp_ty_value_obj(c, rt)) {
-          char hivn[300]; snprintf(hivn, sizeof hivn, "@%s", rn2);
-          int hk = rdc >= 0 ? rdc : cid;
-          int hiv = comp_ivar_index(&c->classes[hk], hivn);
-          Repr hrp = repr_of(c, id);
-          int hboxed = hrp.as_ty == TY_POLY;
-          if (hiv >= 0 && c->classes[hk].ivar_types[hiv] == TY_STRBUF && (hrp.handle || hrp.demand || hboxed) &&
-              reader_override_handle_arms(c, id, cid, name, hboxed)) {
-            NodeKind hrk = nt_kind(nt, recv);
-            int hsimple = (hrk == NK_LocalVariableReadNode ||
-                                  hrk == NK_InstanceVariableReadNode || hrk == NK_SelfNode);
-            int ht = hsimple ? -1 : ++g_tmp;
-            Buf hs; memset(&hs, 0, sizeof hs);
-            if (hsimple) hs = expr_buf(c, recv);
-            else buf_printf(&hs, "_t%d", ht);
-            Buf hr; memset(&hr, 0, sizeof hr);
-            buf_printf(&hr, "(%s)->iv_%s", hs.p, iv_c(rn2));
-            if (!hsimple) {
-              buf_puts(b, "({ "); emit_ctype(c, rt, b);
-              buf_printf(b, " _t%d = ", ht); emit_expr(c, recv, b);
-              buf_printf(b, "; SP_GC_ROOT(_t%d); ", ht);
-            }
-            emit_reader_override_handle(c, id, cid, name, hs.p, hr.p, hboxed, b);
-            if (!hsimple) buf_puts(b, "; })");
-            free(hs.p); free(hr.p);
-            return 1;
-          }
-        }
-        TyKind ovty = comp_ty_value_obj(c, rt) ? TY_UNKNOWN : reader_override_ty(c, id, cid, name);
-        if (ovty != TY_UNKNOWN) {
-          NodeKind ovrk = nt_kind(nt, recv);
-          int ov_simple = (ovrk == NK_LocalVariableReadNode ||
-                                   ovrk == NK_InstanceVariableReadNode || ovrk == NK_SelfNode);
-          int ovt = ov_simple ? -1 : ++g_tmp;
-          Buf ovs; memset(&ovs, 0, sizeof ovs);
-          if (ov_simple) ovs = expr_buf(c, recv);
-          else buf_printf(&ovs, "_t%d", ovt);
-          Buf ovr; memset(&ovr, 0, sizeof ovr);
-          /* a field with a nil bit is read with it where the call's
-             consumer wants the oint, as below */
-          int ovk = rdc >= 0 ? rdc : cid;
-          char ovivn[300]; snprintf(ovivn, sizeof ovivn, "@%s", rn2);
-          int oviv = comp_ivar_index(&c->classes[ovk], ovivn);
-          int ov_oint = oviv >= 0 && node_is_oint(c, id) && ivar_has_nilbit(c, ovk, oviv);
-          if (ov_oint) {
-            char objp[320], bit[400];
-            snprintf(objp, sizeof objp, "(%s)->", ovs.p);
-            ivar_nilbit_test(c, ovk, oviv, objp, bit, sizeof bit);
-            buf_printf(&ovr, "((%s){ %siv_%s, (%s) != 0 })", oint_ctype(ovty), objp, iv_c(rn2), bit);
-          }
-          else buf_printf(&ovr, "(%s)->iv_%s", ovs.p, iv_c(rn2));
-          if (!ov_simple) {
-            buf_puts(b, "({ "); emit_ctype(c, rt, b);
-            buf_printf(b, " _t%d = ", ovt); emit_expr(c, recv, b);
-            buf_printf(b, "; SP_GC_ROOT(_t%d); ", ovt);
-          }
-          emit_reader_override_dispatch(c, id, cid, name, ovs.p, ovr.p, ovty, ov_oint, b);
-          if (!ov_simple) buf_puts(b, "; })");
-          free(ovs.p); free(ovr.p);
-          return 1;
-        }
-        /* a shared-mutable string slot reads out as a GC COPY of the current
-           contents (the raw sp_String* handle must not leak into a plain
-           string context); a demand-marked read hands out the handle (#3227) */
-        char ivfull[300]; snprintf(ivfull, sizeof ivfull, "@%s", rn2);
-        int rdiv = comp_ivar_index(&c->classes[rdc >= 0 ? rdc : cid], ivfull);
-        if (rdiv >= 0 &&
-            c->classes[rdc >= 0 ? rdc : cid].ivar_types[rdiv] == TY_STRBUF) {
-          int tvR = ++g_tmp;
-          buf_printf(b, "({ sp_String *_t%d = (", tvR);
-          emit_expr(c, recv, b);
-          buf_printf(b, ")%siv_%s; ", comp_ty_value_obj(c, rt) ? "." : "->", iv_c(rn2));
-          /* either mark is the same demand: strbuf_box carries it with the
-             node's type, strbuf_handle_demand without it (see compiler.h) */
-          if (repr_of(c, id).handle || repr_of(c, id).demand)
-            buf_printf(b, "_t%d; })", tvR);
-          /* the only consumer READS the bytes and keeps no pointer past the
-             call, so the live buffer serves it. The copy below is O(len) and
-             this read is typically in a loop: `ctx.buf.getbyte(i)` over a
-             200 KB buffer copied the whole string once per row. Same type,
-             same const char * -- the live buffer rather than a snapshot. */
-          else if (repr_of(c, id).read_raw && decide_node(c->nt, id, "strbuf-raw", NULL))
-            buf_printf(b, "_t%d ? sp_String_cstr(_t%d) : NULL; })", tvR, tvR);
-          else
-            { str_read_handle_tmp(b, tvR, 0); buf_puts(b, "; })"); }
-          return 1;
-        }
-        /* a field with a nil bit is read with it where the call's consumer
-           wants the oint (node_is_oint answers the reader by that bit) */
-        if (rdiv >= 0 && node_is_oint(c, id) &&
-            ivar_has_nilbit(c, rdc >= 0 ? rdc : cid, rdiv)) {
-          int rcls = rdc >= 0 ? rdc : cid;
-          TyKind rivt = c->classes[rcls].ivar_types[rdiv];
-          int trd = ++g_tmp;
-          char objp[48]; snprintf(objp, sizeof objp, "_t%d%s", trd, comp_ty_value_obj(c, rt) ? "." : "->");
-          char bit[400]; ivar_nilbit_test(c, rcls, rdiv, objp, bit, sizeof bit);
-          buf_puts(b, "({ "); emit_ctype(c, rt, b); buf_printf(b, " _t%d = ", trd); emit_expr(c, recv, b);
-          buf_printf(b, "; ((%s){ %siv_%s, (%s) != 0 }); })", oint_ctype(rivt), objp, iv_c(rn2), bit);
-          return 1;
-        }
-        buf_puts(b, "("); emit_expr(c, recv, b);
-        buf_printf(b, ")%siv_%s", comp_ty_value_obj(c, rt) ? "." : "->", iv_c(rn2));
+        buf_printf(b, "sp_raise_cls(\"ArgumentError\","
+                      " \"wrong number of arguments (given %d, expected 0)\"); %s; })",
+                   argc, raise_tail_c(c, id, rrty2));
         return 1;
       }
+      const char *rn2 = comp_resolve_alias(c, cid, name);
+      /* A receiver typed for this class can hold an instance of a subclass
+         whose `def` overrides the reader: `self` in one of the class's own
+         methods, or an object such a method answers. The read then
+         dispatches on the runtime class, as a receiverless call to the
+         reader does, and the receiver is evaluated once. */
+      /* --share-strings: the read as the handle (a demand, or the read
+         marked as the handle) or as a box, of a String slot a
+         descendant's def overrides: each arm's handle, as a receiverless
+         read takes it (emit_reader_override_handle). Read as the slot's
+         handle alone the override was skipped (`[self.h]` answered the
+         field), and as its copy the String lost its identity. */
+      if (!comp_ty_value_obj(c, rt)) {
+        char hivn[300]; snprintf(hivn, sizeof hivn, "@%s", rn2);
+        int hk = rdc >= 0 ? rdc : cid;
+        int hiv = comp_ivar_index(&c->classes[hk], hivn);
+        Repr hrp = repr_of(c, id);
+        int hboxed = hrp.as_ty == TY_POLY;
+        if (hiv >= 0 && c->classes[hk].ivar_types[hiv] == TY_STRBUF && (hrp.handle || hrp.demand || hboxed) &&
+            reader_override_handle_arms(c, id, cid, name, hboxed)) {
+          NodeKind hrk = nt_kind(nt, recv);
+          int hsimple = (hrk == NK_LocalVariableReadNode ||
+                                hrk == NK_InstanceVariableReadNode || hrk == NK_SelfNode);
+          int ht = hsimple ? -1 : ++g_tmp;
+          Buf hs; memset(&hs, 0, sizeof hs);
+          if (hsimple) hs = expr_buf(c, recv);
+          else buf_printf(&hs, "_t%d", ht);
+          Buf hr; memset(&hr, 0, sizeof hr);
+          buf_printf(&hr, "(%s)->iv_%s", hs.p, iv_c(rn2));
+          if (!hsimple) {
+            buf_puts(b, "({ "); emit_ctype(c, rt, b);
+            buf_printf(b, " _t%d = ", ht); emit_expr(c, recv, b);
+            buf_printf(b, "; SP_GC_ROOT(_t%d); ", ht);
+          }
+          emit_reader_override_handle(c, id, cid, name, hs.p, hr.p, hboxed, b);
+          if (!hsimple) buf_puts(b, "; })");
+          free(hs.p); free(hr.p);
+          return 1;
+        }
+      }
+      TyKind ovty = comp_ty_value_obj(c, rt) ? TY_UNKNOWN : reader_override_ty(c, id, cid, name);
+      if (ovty != TY_UNKNOWN) {
+        NodeKind ovrk = nt_kind(nt, recv);
+        int ov_simple = (ovrk == NK_LocalVariableReadNode ||
+                                 ovrk == NK_InstanceVariableReadNode || ovrk == NK_SelfNode);
+        int ovt = ov_simple ? -1 : ++g_tmp;
+        Buf ovs; memset(&ovs, 0, sizeof ovs);
+        if (ov_simple) ovs = expr_buf(c, recv);
+        else buf_printf(&ovs, "_t%d", ovt);
+        Buf ovr; memset(&ovr, 0, sizeof ovr);
+        /* a field with a nil bit is read with it where the call's
+           consumer wants the oint, as below */
+        int ovk = rdc >= 0 ? rdc : cid;
+        char ovivn[300]; snprintf(ovivn, sizeof ovivn, "@%s", rn2);
+        int oviv = comp_ivar_index(&c->classes[ovk], ovivn);
+        int ov_oint = oviv >= 0 && node_is_oint(c, id) && ivar_has_nilbit(c, ovk, oviv);
+        if (ov_oint) {
+          char objp[320], bit[400];
+          snprintf(objp, sizeof objp, "(%s)->", ovs.p);
+          ivar_nilbit_test(c, ovk, oviv, objp, bit, sizeof bit);
+          buf_printf(&ovr, "((%s){ %siv_%s, (%s) != 0 })", oint_ctype(ovty), objp, iv_c(rn2), bit);
+        }
+        else buf_printf(&ovr, "(%s)->iv_%s", ovs.p, iv_c(rn2));
+        if (!ov_simple) {
+          buf_puts(b, "({ "); emit_ctype(c, rt, b);
+          buf_printf(b, " _t%d = ", ovt); emit_expr(c, recv, b);
+          buf_printf(b, "; SP_GC_ROOT(_t%d); ", ovt);
+        }
+        emit_reader_override_dispatch(c, id, cid, name, ovs.p, ovr.p, ovty, ov_oint, b);
+        if (!ov_simple) buf_puts(b, "; })");
+        free(ovs.p); free(ovr.p);
+        return 1;
+      }
+      /* a shared-mutable string slot reads out as a GC COPY of the current
+         contents (the raw sp_String* handle must not leak into a plain
+         string context); a demand-marked read hands out the handle (#3227) */
+      char ivfull[300]; snprintf(ivfull, sizeof ivfull, "@%s", rn2);
+      int rdiv = comp_ivar_index(&c->classes[rdc >= 0 ? rdc : cid], ivfull);
+      if (rdiv >= 0 &&
+          c->classes[rdc >= 0 ? rdc : cid].ivar_types[rdiv] == TY_STRBUF) {
+        int tvR = ++g_tmp;
+        buf_printf(b, "({ sp_String *_t%d = (", tvR);
+        emit_expr(c, recv, b);
+        buf_printf(b, ")%siv_%s; ", comp_ty_value_obj(c, rt) ? "." : "->", iv_c(rn2));
+        /* either mark is the same demand: strbuf_box carries it with the
+           node's type, strbuf_handle_demand without it (see compiler.h) */
+        if (repr_of(c, id).handle || repr_of(c, id).demand)
+          buf_printf(b, "_t%d; })", tvR);
+        /* the only consumer READS the bytes and keeps no pointer past the
+           call, so the live buffer serves it. The copy below is O(len) and
+           this read is typically in a loop: `ctx.buf.getbyte(i)` over a
+           200 KB buffer copied the whole string once per row. Same type,
+           same const char * -- the live buffer rather than a snapshot. */
+        else if (repr_of(c, id).read_raw && decide_node(c->nt, id, "strbuf-raw", NULL))
+          buf_printf(b, "_t%d ? sp_String_cstr(_t%d) : NULL; })", tvR, tvR);
+        else
+          { str_read_handle_tmp(b, tvR, 0); buf_puts(b, "; })"); }
+        return 1;
+      }
+      /* a field with a nil bit is read with it where the call's consumer
+         wants the oint (node_is_oint answers the reader by that bit) */
+      if (rdiv >= 0 && node_is_oint(c, id) &&
+          ivar_has_nilbit(c, rdc >= 0 ? rdc : cid, rdiv)) {
+        int rcls = rdc >= 0 ? rdc : cid;
+        TyKind rivt = c->classes[rcls].ivar_types[rdiv];
+        int trd = ++g_tmp;
+        char objp[48]; snprintf(objp, sizeof objp, "_t%d%s", trd, comp_ty_value_obj(c, rt) ? "." : "->");
+        char bit[400]; ivar_nilbit_test(c, rcls, rdiv, objp, bit, sizeof bit);
+        buf_puts(b, "({ "); emit_ctype(c, rt, b); buf_printf(b, " _t%d = ", trd); emit_expr(c, recv, b);
+        buf_printf(b, "; ((%s){ %siv_%s, (%s) != 0 }); })", oint_ctype(rivt), objp, iv_c(rn2), bit);
+        return 1;
+      }
+      buf_puts(b, "("); emit_expr(c, recv, b);
+      buf_printf(b, ")%siv_%s", comp_ty_value_obj(c, rt) ? "." : "->", iv_c(rn2));
+      return 1;
     }
     /* Resolve through the plan for this receiver and emitted name.
        Aliases that captured a builtin have no user target in this context. */
@@ -17084,30 +17193,6 @@ static int emit_poly_call0_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
     { *out = 1; return 1; }
   }
   if (emit_builtin_op_stage(c, id, recv, rt, name, 1, b)) { *out = 1; return 1; }
-  if (sp_streq(name, "strip"))      { buf_puts(b, "sp_box_str(sp_str_strip(sp_poly_recv_s("); emit_expr(c, recv, b); buf_printf(b, ", \"strip\")))"); { *out = 1; return 1; } }
-  /* `strip` had an arm and its one-sided siblings did not, which is the
-     shape of most of what follows: a String reaching the dispatch through a
-     poly slot answered NoMethodError naming String, for a method String
-     has. Each of these already works on a concrete receiver and the runtime
-     function is the one that arm calls. */
-  if (sp_streq(name, "lstrip"))     { buf_puts(b, "sp_box_str(sp_str_lstrip(sp_poly_recv_s("); emit_expr(c, recv, b); buf_puts(b, ", \"lstrip\")))"); { *out = 1; return 1; } }
-  if (sp_streq(name, "rstrip"))     { buf_puts(b, "sp_box_str(sp_str_rstrip(sp_poly_recv_s("); emit_expr(c, recv, b); buf_puts(b, ", \"rstrip\")))"); { *out = 1; return 1; } }
-  /* to_str is the implicit-conversion protocol, so a poly slot holding a
-     String has to answer it: sp_poly_recv_s raises for anything else, which
-     is what a non-String must do here. */
-  if (sp_streq(name, "to_str") && argc == 0) {
-    /* --share-strings: a String's to_str is the String itself, so a box
-       holding one answers that box, as to_s does (sp_poly_to_s_box). */
-    {
-      int t = ++g_tmp;
-      buf_printf(b, "({ sp_RbVal _t%d = ", t); emit_expr(c, recv, b);
-      buf_printf(b, "; const char *_s%d = sp_poly_recv_s(_t%d, \"to_str\"); "
-                    "(_t%d.tag == SP_TAG_STR && _t%d.v.s) || sp_poly_is_strbuf(_t%d) ? _t%d : sp_box_str(_s%d); })",
-                 t, t, t, t, t, t, t);
-      { *out = 1; return 1; }
-    }
-    buf_puts(b, "sp_box_str(sp_poly_recv_s("); emit_expr(c, recv, b); buf_puts(b, ", \"to_str\"))"); { *out = 1; return 1; }
-  }
   if (sp_streq(name, "ascii_only?") && argc == 0) {
     buf_puts(b, "sp_box_bool(sp_str_ascii_only(sp_poly_recv_s("); emit_expr(c, recv, b); buf_puts(b, ", \"ascii_only?\")))"); { *out = 1; return 1; }
   }
@@ -17118,21 +17203,6 @@ static int emit_poly_call0_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
   if (sp_streq(name, "valid_encoding?") && argc == 0) {
     buf_puts(b, "sp_box_bool(sp_str_valid_encoding(sp_poly_recv_s("); emit_expr(c, recv, b); buf_puts(b, ", \"valid_encoding?\")))"); { *out = 1; return 1; }
   }
-  /* encode is a no-op on the concrete arm -- every string here is UTF-8 --
-     so the poly one only has to unbox and re-box, and raise for a
-     non-String the way the others do. */
-  if (sp_streq(name, "encode") && argc == 0) {
-    buf_puts(b, "sp_box_str(sp_poly_recv_s("); emit_expr(c, recv, b); buf_puts(b, ", \"encode\"))"); { *out = 1; return 1; }
-  }
-  if (sp_streq(name, "b") && argc == 0) {   /* a binary copy, as the String arm answers (#4441) */
-    buf_puts(b, "sp_box_str(sp_str_b(sp_poly_recv_s("); emit_expr(c, recv, b); buf_puts(b, ", \"b\")))"); { *out = 1; return 1; }
-  }
-  if (sp_streq(name, "scrub") && argc == 0) {
-    buf_puts(b, "sp_box_str(sp_str_scrub(sp_poly_recv_s("); emit_expr(c, recv, b); buf_puts(b, ", \"scrub\"), 0))"); { *out = 1; return 1; }
-  }
-  if (sp_streq(name, "dump") && argc == 0) {   /* the quoted form, as the String arm answers */
-    buf_puts(b, "sp_box_str(sp_str_dump(sp_poly_recv_s("); emit_expr(c, recv, b); buf_puts(b, ", \"dump\")))"); { *out = 1; return 1; }
-  }
   if (sp_streq(name, "reverse"))    { buf_puts(b, "sp_poly_reverse("); emit_expr(c, recv, b); buf_puts(b, ")"); { *out = 1; return 1; } }
   /* `encoding` on a boxed String: the concrete arm has answered it since
      #723, and the poly dispatch had no entry -- so a String read out of a
@@ -17142,8 +17212,6 @@ static int emit_poly_call0_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
     buf_puts(b, "sp_poly_encoding("); emit_expr(c, recv, b); buf_puts(b, ")");
     { *out = 1; return 1; }
   }
-  if (sp_streq(name, "chomp"))      { buf_puts(b, "sp_box_str(sp_str_chomp(sp_poly_recv_s("); emit_expr(c, recv, b); buf_printf(b, ", \"chomp\")))"); { *out = 1; return 1; } }
-  if (sp_streq(name, "chop"))       { buf_puts(b, "sp_box_str(sp_str_chop(sp_poly_recv_s("); emit_expr(c, recv, b); buf_printf(b, ", \"chop\")))"); { *out = 1; return 1; } }
   /* The one-String-argument transforms, which the table above covers only for
      the zero-argument shapes. A String arriving through a poly slot -- a
      Fiber#resume value, a container read -- had no arm for these and raised

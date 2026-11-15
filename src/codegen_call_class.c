@@ -238,7 +238,7 @@ int respond_to_runtime_reaches(Compiler *c, TyKind rt) {
    priv when k's chain does not answer it and u is the first root with it. */
 static void object_reopen_responds_name(Compiler *c, int k, const int *roots, int u, const char *nm,
                                         Buf *pub, Buf *priv) {
-  if (k >= 0 && (comp_method_in_chain(c, k, nm, NULL) >= 0 || comp_reader_in_chain(c, k, nm, NULL) ||
+  if (k >= 0 && (call_answers(c, -1, k, nm, 0, NULL) ||
                  comp_is_undeffed_in_chain(c, k, nm))) return;
   /* the first root that defines it answers (Object over Kernel) */
   for (int v = 0; v < u; v++) {
@@ -522,10 +522,11 @@ static const struct { const char *cls, *anc; } core_cls_ancestors[] = {
 #undef CCU
 #undef CCA
 
+/* (the method's name is compared ahead of the class's: a few entries share it, and the table is long) */
 static int core_own_vis(const char *cls, size_t cl, const char *m, const char **owner) {
   for (int i = 0; core_cls_methods[i].cls; i++)
-    if (strlen(core_cls_methods[i].cls) == cl && !strncmp(core_cls_methods[i].cls, cls, cl) &&
-        sp_streq(core_cls_methods[i].m, m)) {
+    if (core_cls_methods[i].m[0] == m[0] && sp_streq(core_cls_methods[i].m, m) &&
+        !strncmp(core_cls_methods[i].cls, cls, cl) && !core_cls_methods[i].cls[cl]) {
       if (owner && core_cls_methods[i].vis != CORE_VIS_UNDEF) *owner = core_cls_methods[i].cls;
       return core_cls_methods[i].vis;
     }
@@ -785,9 +786,10 @@ static int emit_boxed_responds_builtin_absent(Compiler *c, int recv, const char 
 
 /* respond_to?, method_defined? and its kin, const_set / const_get / const_defined? */
 /* The visibility of qm's method on the first of Object (a top-level def
-   is a private Object method), Kernel and BasicObject that defines it;
+   is a private Object method until a word makes it public, as the root
+   lookup has it at call id), Kernel and BasicObject that defines it;
    -1 when an undef on Object hides it */
-static int root_method_vis(Compiler *c, const char *qm) {
+static int root_method_vis(Compiler *c, int id, const char *qm) {
   static const int roots[] = { CORE_OBJECT, CORE_KERNEL, CORE_BASIC_OBJECT, -1 };
   char wbase[256];
   int is_wr = setter_base_name(qm, wbase, sizeof wbase);
@@ -798,7 +800,10 @@ static int root_method_vis(Compiler *c, const char *qm) {
     if (k >= 0 && (comp_method_in_class(c, k, qm) >= 0 || comp_is_reader(&c->classes[k], qm) ||
                    (is_wr && comp_is_writer(&c->classes[k], wbase))))
       return comp_method_vis_declared(c, k, qm, NULL);
-    if (roots[i] == CORE_OBJECT && call_target(c, -1, -1, qm, CT_TOP, NULL) >= 0) return SP_VIS_PRIVATE;
+    if (roots[i] == CORE_OBJECT && call_target(c, -1, -1, qm, CT_TOP, NULL) >= 0) {
+      int tv = cplan_top_def_vis(c, id, qm);
+      return tv >= 0 ? tv : SP_VIS_PRIVATE;
+    }
   }
   return SP_VIS_PUBLIC;
 }
@@ -864,8 +869,8 @@ static int flag_split_root_only(Compiler *c, const char *qm) {
 }
 /* the answer nil gives in a nil-able slot's nil arm: `_ia<ia>` the
    run-time include_all, 0 for none */
-static void emit_nil_side_answer(Compiler *c, const char *qm, int argc, const int *argv, int ia, Buf *b) {
-  int nil_prog, nil_too = nil_responds_static(c, qm, argc, argv, &nil_prog);
+static void emit_nil_side_answer(Compiler *c, int id, const char *qm, int argc, const int *argv, int ia, Buf *b) {
+  int nil_prog, nil_too = nil_responds_static(c, id, qm, argc, argv, &nil_prog);
   if (ia && nil_too == 2) buf_printf(b, "_ia%d", ia);
   else if (nil_prog) buf_printf(b, "%d", nil_too);
   else {
@@ -922,7 +927,7 @@ static int emit_respond_to_flag_split(Compiler *c, int id, int recv, TyKind rt, 
     if (num) emit_slot_truthy(rt, ref, b);
     else buf_printf(b, "%s != NULL", ref);
     buf_printf(b, " ? (_ia%d ? %d : %d) : ", t, an[1], an[0]);
-    emit_nil_side_answer(c, qm, argc, argv, t, b);
+    emit_nil_side_answer(c, id, qm, argc, argv, t, b);
   } else buf_printf(b, "(_ia%d ? %d : %d)", t, an[1], an[0]);
   buf_puts(b, "; })");
   if (boxed) buf_puts(b, ")");
@@ -936,6 +941,20 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     else if (ak == NK_StringNode) {
       qm = nt_str(nt, argv[0], "content");
       if (!qm) qm = nt_str(nt, argv[0], "unescaped");
+    }
+    /* main's def whose visibility only the run tells (a word under a condition, in a loop): every value
+       answers by its cell, and a private one to a true include_all */
+    const LocalVar *tg = qm && recv >= 0 && argc <= 2 && !ty_is_object(rt) && !any_class_responds(c, qm) ? cplan_top_def_cell(c, id, qm) : NULL;
+    if (tg) {
+      int boxed = repr_of(c, id).kind == RK_BOXED;
+      if (boxed) buf_puts(b, "sp_box_bool(");
+      buf_puts(b, "((void)(");
+      emit_expr_for_effect(c, recv, b);
+      buf_printf(b, repr_slot_kind(c, tg) == RK_BOXED ? "), sp_poly_eq(gv_%s, sp_box_int(%dLL))" : "), (gv_%s == %dLL)", tg->name, SP_VIS_PUBLIC);
+      if (argc >= 2) { buf_puts(b, " || ("); emit_cond(c, argv[1], b); buf_puts(b, ")"); }
+      buf_puts(b, ")");
+      if (boxed) buf_puts(b, ")");
+      return 1;
     }
     /* an exception answers a name a builtin exception's reopening defines
        only when its runtime class is under that reopening: asked at run
@@ -986,7 +1005,7 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     }
     if (qm) {
       int ans = respond_to_static_answer(c, id, recv, rt, qm, argc, argv);
-      int nil_prog, nil_too = nil_responds_static(c, qm, argc, argv, &nil_prog);
+      int nil_prog, nil_too = nil_responds_static(c, id, qm, argc, argv, &nil_prog);
       /* (a String slot that may hold nil holds it as NULL, as an object's) */
       int nil_str = ans >= 0 && !g_rto_nil_obj && recv >= 0 && nil_prog &&
                     (rt == TY_STRING || rt == TY_STRBUF) && repr_of(c, recv).may_nil;
@@ -1014,7 +1033,7 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         if (ia) { buf_printf(b, "int _ia%d = ", ia); emit_cond(c, argv[1], b); buf_puts(b, "; "); }
         emit_slot_truthy(rt, ref, b);
         buf_printf(b, " ? %d : ", ans);
-        emit_nil_side_answer(c, qm, argc, argv, ia, b);
+        emit_nil_side_answer(c, id, qm, argc, argv, ia, b);
         buf_puts(b, "; })");
         return 1;
       }
@@ -1081,11 +1100,21 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       }
       if (recv >= 0) {
         if (0) { }
+        /* a public top-level def is Object's public method: every value a boxed receiver may hold
+           answers it (no class of the program has one of the name) */
+        else if ((rt == TY_POLY || rt == TY_UNKNOWN) && !any_class_responds(c, qm) &&
+                 cplan_top_def_vis(c, id, qm) == SP_VIS_PUBLIC) {
+          int boxed = repr_of(c, id).kind == RK_BOXED;
+          buf_puts(b, boxed ? "sp_box_bool(((void)(" : "(((void)(");
+          emit_expr_for_effect(c, recv, b);
+          buf_puts(b, "), 1))");
+          return 1;
+        }
         else if ((rt == TY_CLASS && class_value_responds(c, 0, qm, NULL)) ||
                  ((rt == TY_POLY || rt == TY_UNKNOWN) && !any_class_responds(c, qm))) {
           /* a nil the poly value holds answers by the program's NilClass
              (Object, Kernel) where it defines, undefines or hides the name */
-          int nil_prog = 0, nil_ans = rt == TY_CLASS ? 0 : nil_responds_static(c, qm, argc, argv, &nil_prog);
+          int nil_prog = 0, nil_ans = rt == TY_CLASS ? 0 : nil_responds_static(c, id, qm, argc, argv, &nil_prog);
           /* (an include_all only the run time knows, which a private name
              of the program's NilClass, Object or Kernel answers by: read once) */
           NodeKind iak = argc >= 2 ? nt_kind(nt, argv[1]) : NK_TrueNode;
@@ -1101,7 +1130,7 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
             if (ia_once) { buf_printf(b, "int _ia%d = ", tv); emit_cond(c, argv[1], b); buf_puts(b, "; "); }
             if (nil_arm) {
               buf_printf(b, "_t%d.tag == SP_TAG_NIL ? (sp_bool)(", tv);
-              emit_nil_side_answer(c, qm, argc, argv, ia_once ? tv : 0, b);
+              emit_nil_side_answer(c, id, qm, argc, argv, ia_once ? tv : 0, b);
               buf_puts(b, ") : ");
             }
             buf_printf(b, "sp_poly_responds_builtin(_t%d", tv);
@@ -1139,10 +1168,10 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
           /* a nil the value holds answers by the program's NilClass (Object,
              Kernel) where it defines, undefines or hides the name: the
              builtin surface below does not know a private or undefined one */
-          { int nil_prog = 0, nil_ans = nil_responds_static(c, qm, argc, argv, &nil_prog);
+          { int nil_prog = 0, nil_ans = nil_responds_static(c, id, qm, argc, argv, &nil_prog);
             if (nil_prog && (nil_ans != 2 || ia_once)) {
               buf_printf(b, "_t%d.tag == SP_TAG_NIL ? (sp_bool)(", tv);
-              emit_nil_side_answer(c, qm, argc, argv, ia_once ? tv : 0, b);
+              emit_nil_side_answer(c, id, qm, argc, argv, ia_once ? tv : 0, b);
               buf_puts(b, ") : ");
             } }
           buf_puts(b, "(");
@@ -1228,7 +1257,7 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
              BasicObject that defines it: a private one only to a true
              include_all. A class with its own term above answers by it. */
           if (root_seen) {
-            int vis = root_method_vis(c, qm);
+            int vis = root_method_vis(c, id, qm);
             buf_printf(b, "%s(", first ? "" : " || ");
             if (vis < 0) buf_puts(b, "0");
             else if (vis == SP_VIS_PUBLIC) buf_puts(b, "1");
@@ -2015,6 +2044,39 @@ int attr_assign_slot(Compiler *c, int id, int *cid, int *iv) {
   snprintf(ivn, sizeof ivn, "@%s", base);
   *cid = defc < 0 ? ty_object_class(rt) : defc;
   *iv = comp_ivar_index(&c->classes[*cid], ivn);
+  return *iv >= 0;
+}
+
+/* The ivar slot of an attribute's `obj.x ||= v` or `obj.x &&= v` (node id)
+   that reads and stores the field itself: the reader and the writer are
+   both attr accessors the caller may call. Its class in *cid and ivar index
+   in *iv, or 0 for any other node: a half written out is called and one the
+   caller may not call raises (emit_call_or_write_via_methods), and a
+   receiver of no one class takes the two calls (desugar_call_or_write_reopen).
+   The write's value is what the field holds after it (the slot's String
+   too, under --share-strings: repr_write_share). The receiver's class is
+   read off its Repr's stored type, which is the node's type itself
+   (repr_of sets as_ty from comp_ntype and nothing else): the type the
+   write's emitter reads for the field it stores through, so the field
+   named here is that one. */
+int attr_orw_slot(Compiler *c, int id, int *cid, int *iv) {
+  const NodeTable *nt = c->nt;
+  NodeKind k = nt_kind(nt, id);
+  int recv = nt_ref(nt, id, "receiver");
+  const char *attr = nt_str(nt, id, "name");
+  if ((k != NK_CallOrWriteNode && k != NK_CallAndWriteNode) || recv < 0 || !attr || nt_ref(nt, id, "value") < 0) return 0;
+  TyKind rt = repr_of(c, recv).as_ty;
+  char wn[300], ivn[300];
+  if (!ty_is_object(rt) || (size_t)snprintf(wn, sizeof wn, "%s=", attr) >= sizeof wn) return 0;
+  int rc = ty_object_class(rt);
+  if (!call_attr_target(c, -1, rc, attr, 0, NULL) || !call_attr_target(c, -1, rc, attr, CT_WRITER, NULL))
+    return 0;
+  if (!nt_ignore_visibility(nt, id) && (method_vis_for_caller(c, id, rc, attr) != SP_VIS_PUBLIC ||
+                                        method_vis_for_caller(c, id, rc, wn) != SP_VIS_PUBLIC))
+    return 0;
+  snprintf(ivn, sizeof ivn, "@%s", attr);
+  *cid = rc;
+  *iv = comp_ivar_index(&c->classes[rc], ivn);
   return *iv >= 0;
 }
 
@@ -5499,21 +5561,29 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
          names: the constructor below builds it, where this dispatch had arms
          only for the classes with a `self.new` of their own */
       if (sp_streq(name, "new") && anon_struct_recv_ci(c, recv) >= 0) goto skip_cls_cmethod9;
-      TyKind uret9 = TY_UNKNOWN; int uret_set9 = 0, splat9 = nt_argv_splat_count(nt, argv, argc);
+      TyKind uret9 = TY_UNKNOWN, wret9 = TY_UNKNOWN;
+      int uret_set9 = 0, nwrong9 = 0, splat9 = nt_argv_splat_count(nt, argv, argc);
       for (int k = 0; k < c->nclasses; k++) {
         if (!comp_cv_arm_class(c, k) || cls_value_own_sg_answers(c, id, k, name, argc)) continue;
         int kmi = call_target(c, id, k, name, CT_CMETHOD, NULL);
         if (kmi < 0) continue;
+        TyKind kr = (TyKind)c->scopes[kmi].ret;
         /* Only the candidates this call could actually reach set the return
            type. One that cannot take this many arguments is not a possible
-           receiver here, so its return type is not part of the answer. */
-        if (!cplan_cls_arm_takes(c, id, kmi, argc, splat9)) continue;
+           receiver here, so its return type is not part of the answer --
+           unless no candidate can take the call: then every arm raises, and
+           the call is typed as the methods it names, as the inference does
+           (infer_class_module_call). */
+        if (!cplan_cls_arm_takes(c, id, kmi, argc, splat9)) {
+          wret9 = nwrong9++ == 0 || kr == wret9 ? kr : TY_POLY;
+          continue;
+        }
         ncand9++; defmi9 = kmi;
-        TyKind kr = (TyKind)c->scopes[kmi].ret;
         if (!uret_set9) { uret9 = kr; uret_set9 = 1; }
         else if (kr != uret9) uret9 = TY_POLY;
       }
-      if (ncand9 > 0) {
+      if (ncand9 == 0) uret9 = wret9;
+      if (ncand9 > 0 || nwrong9 > 0) {
         /* Every candidate must accept exactly this call's positional args (no
            block/yield). Different candidates may declare different param
            types, so emit_args_filled runs per arm against that method's
@@ -6310,6 +6380,35 @@ int emit_call_class_method_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
   return 0;
 }
 
+static int emit_root_reopen_call_plain(Compiler *c, int id, Buf *b, const NodeTable *nt, int recv, int ci, int mi);
+/* A call a visibility cell guards (CallPlan.vis_cell): main's def, which the lookup binds where
+   its visibility only the run tells, runs unless the cell holds private, where the call
+   raises the private method's NoMethodError as a closed call does (emit_vis_refusal_guard,
+   the plan's private arm). Answers whether it wrote the call; 0 leaves it to the unguarded
+   form (a cell no emitted code reads) */
+static int emit_vis_cell_call(Compiler *c, int id, const CallPlan *p, Buf *b, const NodeTable *nt, int recv) {
+  const LocalVar *g = cplan_vis_cell_var(c, p);
+  if (!g) return 0;
+  Buf call, refuse;
+  memset(&call, 0, sizeof call); memset(&refuse, 0, sizeof refuse);
+  /* (a receiver with an effect is held first, as both arms read it) */
+  int held = subtree_has_side_effect(c, recv), mark = g_n_argov;
+  if (held) {
+    argov_reserve();
+    view_bind_temp(recv, hold_operand_pre(c, recv, repr_of(c, recv).as_ty, 0, ++g_tmp, 1));
+  }
+  int made = emit_vis_refusal_guard(c, id, &refuse) && emit_root_reopen_call_plain(c, id, &call, nt, recv, p->owner_ci, p->mi);
+  if (held) view_unbind(mark);
+  if (!made) {
+    free(call.p); free(refuse.p);
+    return 0;
+  }
+  buf_printf(b, repr_slot_kind(c, g) == RK_BOXED ? "(sp_poly_eq(gv_%s, sp_box_int(%dLL)) ? %s : %s)" : "(gv_%s == %dLL ? %s : %s)",
+             g->name, SP_VIS_PRIVATE, refuse.p, call.p);
+  free(call.p); free(refuse.p);
+  return 1;
+}
+
 /* A program's method mi on a root class ci (NilClass, Numeric or Object)
    that call id runs on recv, which any receiver the lookup reaches the root
    for takes: the owner picks how the receiver is passed (nil carries
@@ -6317,9 +6416,15 @@ int emit_call_class_method_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
    through its proc form (#5779), with the call's block or without one: it
    has no symbol of its own, being spliced where it can. */
 int emit_root_reopen_call(Compiler *c, int id, Buf *b, const NodeTable *nt, int recv, int ci, int mi) {
+  const CallPlan p = cplan_user(c, id);
+  return p.mi == mi && p.vis_cell && emit_vis_cell_call(c, id, &p, b, nt, recv) ? 1 : emit_root_reopen_call_plain(c, id, b, nt, recv, ci, mi);
+}
+static int emit_root_reopen_call_plain(Compiler *c, int id, Buf *b, const NodeTable *nt, int recv, int ci, int mi) {
   if (emit_reopen_block_call(c, id, recv, mi, NULL, b)) return 1;
   if (g_plan_check) ucall_observe(c, id, mi, ci, 0);
-  if (ci == comp_core_class(c, CORE_NILCLASS)) {
+  /* a top-level def takes no self: the receiver runs for its effect, then the call */
+  int top = c->scopes[mi].class_id < 0;
+  if (!top && ci == comp_core_class(c, CORE_NILCLASS)) {
     /* (self is the `int self` the bool reopens take) */
     buf_printf(b, "((void)("); emit_expr_for_effect(c, recv, b);
     buf_printf(b, "), %s(0", mc_method(c, &c->scopes[mi]));
@@ -6328,7 +6433,7 @@ int emit_root_reopen_call(Compiler *c, int id, Buf *b, const NodeTable *nt, int 
     buf_puts(b, "))");
     return 1;
   }
-  if (ci == comp_core_class(c, CORE_NUMERIC)) {
+  if (!top && ci == comp_core_class(c, CORE_NUMERIC)) {
     size_t at = b->len;
     buf_printf(b, "%s(", mc_method(c, &c->scopes[mi]));
     int open = emit_reopen_recv_in_order(c, id, mi, recv, 1, NULL, at, b);
@@ -6342,10 +6447,16 @@ int emit_root_reopen_call(Compiler *c, int id, Buf *b, const NodeTable *nt, int 
   int void3 = method_is_void(&c->scopes[mi]) && want3 != TY_VOID && want3 != TY_UNKNOWN && want3 != TY_NIL;
   if (void3) buf_puts(b, "(");
   Buf call = {0};
-  buf_printf(&call, "%s(", mc_method(c, &c->scopes[mi]));
-  int open = emit_reopen_recv_args(c, id, mi, recv, 1, NULL, 0, &call);
-  emit_trailing_blk_arg(c, &c->scopes[mi], id, -1, &call);
-  buf_puts(&call, open ? "); })" : ")");
+  if (top) {
+    emit_top_recv_effect(c, recv);
+    emit_method_call(c, id, &call);
+  }
+  else {
+    buf_printf(&call, "%s(", mc_method(c, &c->scopes[mi]));
+    int open = emit_reopen_recv_args(c, id, mi, recv, 1, NULL, 0, &call);
+    emit_trailing_blk_arg(c, &c->scopes[mi], id, -1, &call);
+    buf_puts(&call, open ? "); })" : ")");
+  }
   /* (the value-less one's slot takes the nil below, not a coerced one) */
   if (void3) buf_puts(b, call.p);
   /* a method answering an Integer or Float with its nil beside it

@@ -2903,7 +2903,7 @@ static void emit_boxed_impl(Compiler *c, int node, Buf *b) {
      the no-block raise (#3399). */
   if (g_yield_proc_ref && yield_runs) {
     /* This helper's callers want a BOXED value, so ask for the poly form. */
-    emit_yield_proc_call(c, nt_ref(c->nt, node, "arguments"), TY_POLY, b, 0, 1);
+    emit_yield_proc_call(c, node, TY_POLY, b, 0, 1);
     RC(RF_YIELD, RW_YIELD);
     return;
   }
@@ -2969,7 +2969,7 @@ static void emit_boxed_impl(Compiler *c, int node, Buf *b) {
        the handle it keeps, else the endpoint's own String, as a `next` of it
        is (emit_boxed_next_value): the splice yields the box */
     if ((bt == TY_STRING || bt == TY_STRBUF) && strbuf_yield_tail_srange(c)) {
-      emit_block_invoke(c, nt_ref(c->nt, node, "arguments"), b, 0, 1, TY_POLY);
+      emit_block_invoke(c, node, b, 0, 1, TY_POLY);
       RC(RF_YIELD, RW_YIELD);
       return;
     }
@@ -5584,6 +5584,96 @@ static int method_inline_force(Compiler *c, Scope *s) {
   return decide_fn("inline-force", decide_method_site(c, s), NULL);
 }
 
+/* ---- wasm32: callees kept out of a function that holds a setjmp -----------
+   The wasm sjlj lowering stores the values live at every call made in a
+   function that holds a setjmp, so each call there costs tens of stores. The
+   C compiler inlines a static function with one call site whatever its size,
+   so a method with a rescue that calls a few such methods holds every call
+   they make: an app's Application#call, a rescue around four calls of the
+   framework's request handling (read_body, recognize, add_path_params and
+   the rescue's own handler, inlined into it), compiled to 87KB, and to 6.6KB
+   with those four kept out.
+
+   On --target=wasm32-wasi (not --exceptions=abort) a user method that a
+   call in a setjmp-holding scope resolves to (sjn_call_mi) is SP_NOINLINE
+   when it makes two or more calls of its own: inlined, it would bring them
+   all into that function, where the call to it is only one. A call that
+   does not resolve statically (a poly dispatch) is left as it is. The
+   method's other call sites lose
+   the inlining too, the forced one (SP_ALWAYS_INLINE) included: forced into
+   the setjmp function it costs the same. A yielder is spliced by the
+   emitter, not the C compiler, and a method that holds a setjmp of its own
+   is never inlined anyway. One set per program, built at the first ask as
+   the forced set is, so a definition agrees with its prototype. */
+static const NodeTable *g_sjn_nt = NULL;
+static int  g_sjn_nscopes = 0;
+static char *g_sjn_state = NULL;   /* per scope: 1 = noinline, 2 = looked at, inlinable */
+/* the calls of scope si that the C compiler cannot fold into a few
+   instructions: a named method or an index (an operator on a number is
+   one) */
+static int sjn_named_calls(Compiler *c, int si) {
+  int nids = 0, n = 0; const int *ids = cg_scope_nodes(c, si, &nids);
+  for (int k = 0; k < nids; k++) {
+    if (nt_kind(c->nt, ids[k]) != NK_CallNode) continue;
+    const char *nm = nt_str(c->nt, ids[k], "name");
+    if (nm && (isalpha((unsigned char)nm[0]) || nm[0] == '_' || nm[0] == '[')) n++;
+  }
+  return n;
+}
+/* The user method call `id` reaches, from what the analysis settled: a
+   bare call on self, a class method on a constant, or a call on a receiver
+   of one user class. It reads the receiver's settled type and infers
+   nothing: an inference from here, ahead of the emitter and outside the
+   context it emits in, would be remembered and change what it emits. */
+static int sjn_call_mi(Compiler *c, int id) {
+  const char *name = nt_str(c->nt, id, "name");
+  if (!name) return -1;
+  int recv = nt_ref(c->nt, id, "receiver"), mi = -1;
+  if (recv < 0) mi = comp_self_call_mi(c, id, name);
+  else {
+    NodeKind rk = nt_kind(c->nt, recv);
+    if (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) {
+      int ci = const_node_class_index(c, recv);
+      if (ci >= 0) mi = call_target(c, id, ci, name, CT_CMETHOD, NULL);
+    } else {
+      TyKind rt = comp_ntype_settled(c, recv);
+      if (ty_is_object(rt)) mi = call_target(c, id, ty_object_class(rt), name, 0, NULL);
+    }
+  }
+  return mi >= 0 && mi < c->nscopes ? mi : -1;
+}
+static void sjn_build(Compiler *c) {
+  free(g_sjn_state);
+  g_sjn_nt = c->nt; g_sjn_nscopes = c->nscopes;
+  g_sjn_state = (char *)calloc((size_t)(c->nscopes > 0 ? c->nscopes : 1), 1);
+  if (!g_sjn_state) return;
+  int ns = c->nscopes;
+  for (int si = 0; si < ns; si++) {
+    if (!scope_has_begin(c, si)) continue;
+    int nids = 0; const int *ids = cg_scope_nodes(c, si, &nids);
+    for (int k = 0; k < nids; k++) {
+      if (nt_kind(c->nt, ids[k]) != NK_CallNode) continue;
+      int mi = sjn_call_mi(c, ids[k]);
+      if (mi < 0 || mi == si || g_sjn_state[mi]) continue;
+      Scope *m = &c->scopes[mi];
+      int keep = !m->name || m->body < 0 || m->is_ext_entry || m->yields ||
+                 scope_has_begin(c, mi) || sjn_named_calls(c, mi) < 2;
+      g_sjn_state[mi] = keep ? 2 : 1;
+    }
+  }
+}
+static int method_noinline_sjlj(Compiler *c, Scope *s) {
+  if (!g_target_wasi || g_exc_abort) return 0;
+  if (g_debug || g_incremental) return 0;
+  /* fixed at the first ask for a table: the nodes and scopes codegen adds
+     later are not counted, and a scope made after it is left alone */
+  if (!g_sjn_state || g_sjn_nt != c->nt) sjn_build(c);
+  if (!g_sjn_state) return 0;
+  int si = (int)(s - c->scopes);
+  if (si < 0 || si >= g_sjn_nscopes) return 0;
+  return g_sjn_state[si] == 1;
+}
+
 /* The cls_id a fresh instance is stamped with. A synthesized singleton subclass
    starts as its PARENT: the `extend` / `def obj.m` that created the subclass
    has not run yet, and in Ruby the override takes effect from there rather than
@@ -5649,7 +5739,7 @@ static int sg_parent_answers_as_object(Compiler *c, int par, const char *n) {
   /* `!=` and `===` answer by the class's `==` */
   int eqs = sp_streq(n, "==") || sp_streq(n, "!=") || sp_streq(n, "===");
   if (eqs && !sp_streq(n, "==") && !sg_parent_answers_as_object(c, par, "==")) return 0;
-  if (comp_method_in_chain(c, par, n, NULL) >= 0 || comp_reader_in_chain(c, par, n, NULL) ||
+  if (call_answers(c, -1, par, n, 0, NULL) ||
       class_implicit_responds(c, par, n) || (eqs && class_is_comparable(c, par)))
     return 0;
   for (int p = par, d = 0; p >= 0 && d <= c->nclasses; d++) {
@@ -5944,6 +6034,7 @@ void emit_method_signature(Compiler *c, Scope *s, Buf *b) {
                         !c->classes[s->class_id].instantiated)
                        ? "SP_UNUSED " : "";
   const char *ihint = s->is_ext_entry ? ""   /* exported: no inline linkage */
+                    : method_noinline_sjlj(c, s) ? "SP_NOINLINE "
                     : method_inline_force(c, s) ? "inline SP_ALWAYS_INLINE "
                     : (method_inline_hint(c, s) ? "inline " : "");
   if (method_is_void(s)) { buf_puts(b, stor); buf_puts(b, ihint); buf_puts(b, unused); buf_puts(b, "void "); }
@@ -12753,7 +12844,7 @@ static int struct_member_owns(Compiler *c, int cid, const char *nm) {
   char iv[64]; snprintf(iv, sizeof iv, "@%s", nm);
   int idx = comp_ivar_index(ci, iv);
   return idx >= 0 && (ci->ivar_types[idx] == TY_STRING || ci->ivar_types[idx] == TY_STRBUF) &&
-         comp_resolve_member(c, cid, nm, 0, NULL, NULL) == SP_MEMBER_ATTR;
+         call_attr_target(c, -1, cid, nm, 0, NULL);
 }
 /* Does the program (a def) or a member own class cid's inspect or to_s? */
 static int struct_display_owned(Compiler *c, int cid, const char *nm) {
@@ -13931,7 +14022,7 @@ static int obj_to_a_method(Compiler *c, int cid, int *defc) {
    cid's ivars, or -1. Whatever it holds is the answer: a caller raises
    CRuby's TypeError for one that is not an Array. */
 static int obj_to_a_reader(Compiler *c, int cid) {
-  if (comp_resolve_member(c, cid, "to_a", 0, NULL, NULL) != SP_MEMBER_ATTR) return -1;
+  if (!call_attr_target(c, -1, cid, "to_a", 0, NULL)) return -1;
   const char *rn = comp_resolve_alias(c, cid, "to_a");
   ClassInfo *ci = &c->classes[cid];
   for (int j = 0; j < ci->nivars; j++) {
@@ -16930,7 +17021,12 @@ void emit_super(Compiler *c, int id, Buf *b) {
       const char *spar = class_is_exc_reopen(c, sci) ? c->classes[sci].name : exc_builtin_parent(c, sci);
       int spread = ty_k != NK_ForwardingSuperNode && argv2 && nt_argv_has_splat(c->nt, argv2, argc2) &&
                    !class_is_syserr(c, sci) && !exc_init_takes_own_args(spar);
-      if (spread || class_takes_exc_attrs(c, sci)) {
+      /* a bare super hands on a rest parameter's elements (and a **rest's
+         keywords), as `super(*a, **k)` does: the gathered Array itself is
+         no message */
+      int zspread = ty_k == NK_ForwardingSuperNode && (s->rest_idx >= 0 || s->kwrest_idx >= 0) &&
+                    !class_is_syserr(c, sci) && !class_is_sysexit(c, sci) && !exc_init_takes_own_args(spar);
+      if (spread || zspread || class_takes_exc_attrs(c, sci)) {
         char self_text[80]; snprintf(self_text, sizeof self_text, "(sp_Exception *)%s", g_self);
         if (ty_k == NK_ForwardingSuperNode) emit_exc_attrs_zsuper(c, id, s, self_text, b);
         else emit_exc_args_super(c, id, self_text, class_takes_exc_attrs(c, sci) ||

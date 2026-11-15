@@ -90,14 +90,17 @@ typedef struct {
   unsigned char core_hook; /* a super in a class method that reaches only a core hook's no-op: nothing of the program's answers it, and emit_super answers nil */
   unsigned char answers_receiver; /* mi is a class method of an ancestor of owner_ci that answers an instance of owner_ci (cmethod_receiver_class): the function returns a pointer to its own class's type, the call is cast to owner_ci's */
   const char *delegate;     /* the protocol method name, before alias resolution */
+  int vis_cell;             /* the history cell + 1 whose visibility cell guards the call (a top-level def's visibility only the run tells, cplan_root_top_def), 0 for none */
 } CallPlan;
 
 /* Is plan p a program's method on a root of the builtin classes (Object,
    or Numeric or NilClass ahead of it), one that answers every receiver the
-   lookup reaches it for (cplan_root_reopen)? The kinds of reopening below
-   that, a builtin class's own, bind by the receiver's type. */
+   lookup reaches it for (cplan_root_reopen)? A top-level def the lookup
+   finds open to an explicit receiver is one: Object's method from where it
+   runs, which takes no self. The kinds of reopening below that, a builtin
+   class's own, bind by the receiver's type. */
 int cplan_root_reopen_owner(Compiler *c, const CallPlan *p);
-/* ...and is call id's plan p such a binding that answers the call ahead
+/* Is call id's plan p a root reopening's binding (cplan_root_reopen) that answers the call ahead
    of the builtin arms (not an alias that captured the builtin's method,
    nor an exception accessor picked at run time, nor a private or
    protected method of a name a builtin has, nor one closed to the call)?
@@ -123,6 +126,9 @@ int cplan_reopen_target(Compiler *c, CallPlan p);
    twin of cplan_root_reopen, for the desugars that run before types exist
    (it holds for a receiver whose builtin class owns the name too). */
 int cplan_object_method_named(Compiler *c, const char *name);
+/* does call id run with main as self (receiverless or on self, at a file's
+   top level or in a method of main's own)? */
+int cplan_runs_on_main(Compiler *c, int id);
 /* Does call `call`, which takes a block, throw away every value its block
    answers? A builtin iterator of the each family does
    (is_block_value_dropped_iter: each, times, loop, each_char, ...), on any
@@ -230,12 +236,17 @@ CplanClassArm *cplan_capture_class_arms(Compiler *c, int mn, const char *sym, in
    differ in visibility, it binds the face entry that raises for the
    private ones (VF_PRIVATE), or with CT_PROTECTED also for the protected
    ones (VF_PUBLIC: public_send, or a caller to which a protected owner is
-   not open). */
-enum { CT_CMETHOD = 1, CT_OWN = 2, CT_TOP = 4, CT_REACH = 8, CT_CAPTURE = 16, CT_IMPLIED = 32, CT_INCLUDED = 64, CT_PUBLIC = 128, CT_PROTECTED = 256, CT_NOFACE = 512 };
+   not open).
+   CT_WRITER asks the instance side's writer: name is the attribute's base
+   (`x`), and the call is the setter `x=` (an attr_writer's, or a def's of
+   that name); without it, name is the method's own name, and a plain
+   name that happens to end in `=` finds no attribute. */
+enum { CT_CMETHOD = 1, CT_OWN = 2, CT_TOP = 4, CT_REACH = 8, CT_CAPTURE = 16, CT_IMPLIED = 32, CT_INCLUDED = 64, CT_PUBLIC = 128, CT_PROTECTED = 256, CT_NOFACE = 512, CT_WRITER = 1024 };
 /* CT_NOFACE asks the instance lookup with no visibility face, as a call
    that enforces nothing does: a private def is found. It is the one flag
-   that says so by itself; every other flag also leaves the face off, by
-   being a flag (ct_vis_flags). */
+   that says so by itself; every other flag but CT_WRITER (which asks the
+   writer of a call that enforces what the call does) also leaves the face
+   off, by being a flag (ct_vis_flags). */
 /* The face of a version entry (VerEntry.face): 0 the entry every arm of
    which runs its version, VF_PRIVATE one whose arms of a private version
    raise, VF_PUBLIC one whose arms of a private or a protected version do;
@@ -295,8 +306,12 @@ const char *call_sent_name(const NodeTable *nt, int id, int *used);
    ML_SINGLETON: a call on main that main's own singleton answers by the
    core's method it has from the start (`to_s`, `inspect`:
    elab_main_singleton_at), ahead of Object's table; no method of the
-   program's. */
-typedef enum { ML_METHOD, ML_ENTRY, ML_NONE, ML_OBJECT, ML_TABLE, ML_SINGLETON } MlKind;
+   program's. ML_ATTR: an attribute answers (attr_reader, attr_writer, a
+   Struct member) and no method of the instance side's chain ranks ahead of
+   it, as CRuby's lookup finds the nearer definition (a def of the same
+   class wins a tie); the scope is -1, def_class the class that declares
+   the attribute. Asked with CT_WRITER, the writer. */
+typedef enum { ML_METHOD, ML_ENTRY, ML_NONE, ML_OBJECT, ML_TABLE, ML_SINGLETON, ML_ATTR } MlKind;
 /* why the table answers: no window, or an unplaced capture (UNPLACED); the
    chain moves inside the window (MOVES); two or more versions, or a window
    with no version, and no entry (MANY); a version the plan cannot map
@@ -318,6 +333,13 @@ typedef enum { MLW_UNPLACED = 1, MLW_MOVES, MLW_MANY, MLW_UNMAPPED, MLW_DISAGREE
 typedef struct { MlKind kind; unsigned char why, copies, survey; short n; int def_class, from; } MethodLookup;
 /* ml (NULL for a caller that wants the scope only) */
 int call_target(Compiler *c, int id, int cls, const char *name, unsigned flags, MethodLookup *ml);
+/* Does an attribute (attr_reader, attr_writer, a Struct member) answer this
+   ask: call_target's answer has no scope and its kind is ML_ATTR? *out
+   (optional) is call_target's, so def_class names the class declaring it. */
+int call_attr_target(Compiler *c, int id, int cls, const char *name, unsigned flags, MethodLookup *out);
+/* Does a method or an attribute answer this ask (call_target's scope, or
+   ML_ATTR)? Its negation is "nothing of the program's answers". */
+int call_answers(Compiler *c, int id, int cls, const char *name, unsigned flags, MethodLookup *out);
 /* A super's parent-chain target, asked from class par under name; ml (NULL
    for the scope only) is call_target's, with from par (the lookup's start,
    whatever class answered: ml->def_class) */
@@ -434,6 +456,10 @@ void ver_prepend_cell_name(int cell, char out[32]);
 /* Once the last reachability has run: which version cells no emitted code
    reads, so the C writes none of them (Compiler.ver_cell_dropped) */
 void ver_cells_settle(Compiler *c);
+/* The global holding the visibility of the history a guarded call reads
+   (CallPlan.vis_cell): an Integer, SP_VIS_PRIVATE where the live version is private. NULL
+   for a call with no guard, and for a cell no emitted code reads (ver_cells_settle) */
+const LocalVar *cplan_vis_cell_var(Compiler *c, const CallPlan *p);
 /* Is global g such a cell? */
 int cplan_cell_dropped(const Compiler *c, const LocalVar *g);
 /* Is node id a write of such a cell the plan made (ver_cell_node), which the
@@ -466,12 +492,12 @@ int cplan_pinned(const Compiler *c, int id);
    entry's arm for that version raises with, instead of running it; 0 for
    an arm that runs, and for any other node */
 int cplan_pinned_vis(const Compiler *c, int id);
-/* flags = 0 (a call's instance-chain ask) with CT_PUBLIC (and CT_PROTECTED)
-   added where call id enforces visibility (an explicit receiver that is not
-   self, public_send) and has no block; any other flags as they are. call_target asks with
-   them, so that every reader that asks which method such a call runs gets
-   the entry the plan made for it (ct_face_for), and the survey of the
-   entries (ver_need) asks the same. */
+/* flags = 0 or CT_WRITER (a call's instance-chain ask) with CT_PUBLIC (and
+   CT_PROTECTED) added where call id enforces visibility (an explicit receiver
+   that is not self, public_send) and has no block; any other flags as they
+   are. call_target asks with them, so that every reader that asks which
+   method such a call runs gets the entry the plan made for it (ct_face_for),
+   and the survey of the entries (ver_need) asks the same. */
 unsigned ct_vis_flags(Compiler *c, int id, unsigned flags);
 /* the methods entry scope e's arms call, its else arm's last: at most
    VER_MAX_ARMS + 1; an open history's else arm, which calls none, as its
@@ -1122,7 +1148,18 @@ int cplan_nil_program_method(Compiler *c, int call, const char *name, int *nilcl
    on NilClass, Object, Kernel or BasicObject (-1 for none; 0 when an undef
    hides it). include_all is 1 or 0 when known, -1 when only the run time
    knows it: a private method then gives 2 (the include_all decides). */
-int cplan_nil_program_responds(Compiler *c, const char *name, int include_all);
+int cplan_nil_program_responds(Compiler *c, int call, const char *name, int include_all);
+/* The visibility (SP_VIS_*) of main's top-level def `name`, Object's method,
+   where call `call` runs, as the root lookup has it (cplan_root_method): a
+   def is private until a word makes it public. -1 where the program has no
+   such def, or the record cannot tell. The question of the reflection readers
+   (respond_to?). */
+int cplan_top_def_vis(Compiler *c, int call, const char *name);
+/* ...and the cell that holds it where only the run tells (cplan_top_def_vis answers -1): main's def
+   `name`, its one version, has run where call `call` runs, with a word whose order against the
+   call the run decides. The global holds SP_VIS_* (CallPlan.vis_cell); NULL for any other
+   def, and for a cell no emitted code reads. The respond_to? readers ask it */
+const LocalVar *cplan_top_def_cell(Compiler *c, int call, const char *name);
 /* The program's method CRuby's lookup of `name` on an instance of
    builtin class cls reaches first at the roots (NilClass, Numeric,
    Object -- a top-level def is Object's from where it runs, and the later
@@ -1160,6 +1197,10 @@ int cplan_class_answers_ahead_of_object(Compiler *c, int call, int k, const char
    dependencies (a class's method_missing, its chain), so a type that
    rests on its answer is asked again when they move. */
 int cplan_root_closed(Compiler *c, int id, int *vis);
+/* The private arm of a call a visibility cell guards (CallPlan.vis_cell): the def's scope, and
+   SP_VIS_PRIVATE in *vis, as cplan_root_closed answers a call closed to its receiver; -1 for any
+   other call. The refusal the guard raises where the cell says private is the closed call's */
+int cplan_guard_closed(Compiler *c, int id, int *vis);
 int cplan_nil_program_served(Compiler *c, int id);  /* codegen_call.c: nil's method's answer has the call's type */
 /* Is a nil fact's source `why` (nil_fact_why) a nil the program writes --
    a literal, a missing else, a safe navigation, a slot read before its
@@ -1343,11 +1384,13 @@ int cplan_sg_accessor(Compiler *c, int id, int ci, const char *name, char *slot,
    no version (each emitter then keeps its answer without versions).
    CP_SG_NONE where no def replaces the accessor. */
 int cplan_sg_version(Compiler *c, int id, int ci, const char *name);
-/* Does call node id, written with `name` (not a send or a capture of it),
-   run no method on class ci: the plan's answer for it is the class's
+/* Does call node id, written with `name` (not a send or a capture of it)
+   and bound to version mi, run no method on class ci: mi is a class side's
+   accessor version and the plan's answer for the call is the class's
    accessor slot (cplan_sg_accessor). The reach pass then reaches no scope
-   from it, though the version it binds to is the accessor's own. */
-int cplan_sg_slot_call(Compiler *c, int id, int ci, const char *name);
+   from it, though the version it binds to is the accessor's own. An
+   instance side's accessor version is a method the call reaches. */
+int cplan_sg_slot_call(Compiler *c, int id, int ci, const char *name, int mi);
 /* The class whose own class methods `respond_to?` call id asks about: a
    constant receiver's, or self's in a class method or a class body; -1 for
    any other receiver, an instance's, and for a call of another shape

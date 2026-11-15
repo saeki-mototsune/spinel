@@ -1449,6 +1449,9 @@ typedef struct {
   SP_TY_FIELD char *empty_arr_recv; /* [node_cap] empty `[]` used as a direct receiver/interpolation -> TY_POLY_ARRAY */
   SP_TY_FIELD char *empty_hash_recv; /* [node_cap] empty `{}` used as a direct receiver/interpolation -> TY_STR_POLY_HASH */
   SP_TY_FIELD char *empty_hash_arg;  /* [node_cap] empty `{}` passed as a user-method arg -> TY_POLY_POLY_HASH */
+  SP_TY_FIELD char *pow_signed;      /* [node_cap] an Integer power (`b ** e`, `b.pow(e)`, `x **= e`) whose run-time exponent the
+                                       facts do not show >= 0: it may be negative, so the power is a boxed Integer or Rational
+                                       (mark_int_pow_signed; only ever set) */
   char *store_misfit_arg; /* [node_cap] a typed array passed to a boxed parameter
                           the method stores an element into that the array
                           cannot hold: codegen refuses it unless the binding
@@ -1926,6 +1929,8 @@ typedef struct {
   /* the cells of the later prepends whose copies a guard entry chooses
      (Scope.mixin_guarded, ver_prepend_cell_name): 1 .. n_prepend_cells */
   int n_prepend_cells;
+  unsigned char *top_self_marks;      /* per scope: its top-level def reads self (call_plan.c, cplan_top_name_reads_self) */
+  unsigned long top_self_stamp;
   /* the version entries (call_plan.c, ver_entries_build): one method per
      (class, side, name, parameter count) for the calls whose version is
      known only at run time, or by guard (VER_ENTRY_*, call_plan.h), for
@@ -1961,6 +1966,17 @@ typedef struct {
      value (call_plan.c, ver_cells_put; cplan_vis_cell_after) */
   struct VerVisAfter { int node, cell, v; } *ver_vis_after;
   int nver_vis_after;
+  /* the visibility cells a call guard reads (CallPlan.vis_cell), one per call
+     and cell: the history's name, its cell, the call; written: its cell's
+     writes are placed (call_plan.c, ver_cells_put) */
+  struct VerVisRead { char *name; int cell, call, written; } *ver_vis_reads;
+  int nver_vis_reads, ver_vis_read_new;
+  /* ...each call's own cell + 1, by node (one cell per call), and each scope's state as a history a guard
+     may read: 1 its cell is listed, 2 it has none to list (a version the record proves, or more than one) */
+  int *ver_vis_call_cell, ver_vis_call_cap;
+  unsigned char *ver_vis_scope_mark; int ver_vis_scope_cap;
+  unsigned char *ver_vis_hist_seen; int ver_vis_hist_cap;   /* (the cells whose history is listed) */
+  unsigned long ver_vis_guard_stamp;   /* the tree's state ver_vis_guard_hists last read (nodes, scopes, edits, version) */
   /* the chains a typed call may meet with no version made yet, whose
      entry is not asked for that yet (call_plan.c, ver_absent_note); mm:
      where the call runs, method_missing is on the chain (1), is not (2),
@@ -2249,6 +2265,7 @@ int    comp_ffi_const_at(Compiler *c, int node, int *out);
 int    comp_included_method_index(Compiler *c, const char *name, int call_id);
 int    class_is_blank_slate(Compiler *c, int ci);   /* explicit `< BasicObject` descent */
 int    class_lacks_kernel(Compiler *c, int ci);     /* blank slate with no `include Kernel` */
+int    class_node_lacks_kernel(Compiler *c, int cnode);   /* ...of the class node, before the class table */
 int    comp_toplevel_mod_defines(Compiler *c, const char *name, int extend);
 
 /* Locals within a scope. */
@@ -2448,6 +2465,7 @@ int ostruct_keeps_method(const char *n);
 int ostruct_member_read(Compiler *c, int id, TyKind rt);
 int chain_is_lazy_valued(Compiler *c, int node);      /* CallNode chain evaluating to a Lazy */
 int poly_str_iter_enum(Compiler *c, int id);        /* boxed String iterator answers an Enumerator (analyze_infer_recv.c) */
+int poly_each_line_args_enum(Compiler *c, int id); /* boxed each_line(sep / chomp:) asked .size answers its Enumerator (analyze_infer_recv.c) */
 int poly_io_codepoint_enum(Compiler *c, int id);   /* boxed each_codepoint takes the IO arm (analyze_infer_recv.c) */
 int lazy_alias_chain(Compiler *c, int var_read);
 int lazy_method_chain(Compiler *c, int call);      /* parameterless method whose body is a lazy chain -> chain node, else -1 */
@@ -2609,15 +2627,16 @@ const int *comp_name_reader_owners(Compiler *c, const char *name, int *n);
    comp_name_responders' count, asked where the list cannot be built too: the
    candidate owner of "is the name defined by a class of the program". */
 int        comp_name_answered(Compiler *c, const char *name, int is_cm);
+/* Does any class or module of the program answer `name` on either side: an
+   instance method or a singleton one (a def self.x, class << self,
+   module_function, define_singleton_method, extend), an attribute (a
+   singleton one too: class << self; attr_reader), or a native class's binding? */
+int        comp_name_answered_any_side(Compiler *c, const char *name);
 /* The scope class cls's chain finds for `name` as one of the name's
    responders, or -1 where it is not one: its class side with CT_CMETHOD, its
    own table only with CT_OWN (an override), the top-level functions for
    cls < 0. No record is asked: a candidate, not what one call runs. */
 int        comp_name_responder(Compiler *c, int cls, const char *name, unsigned side);
-/* Does class k's chain hold a method or an attribute reader of `name`: one
-   of the name's candidates for a boxed dispatch (comp_poly_candidates' test,
-   asked of one class), as a def or an attr_reader gives an arm? */
-int        comp_class_answers(Compiler *c, int k, const char *name);
 /* Does any class's chain answer an attribute writer of base? */
 int        comp_name_writer_any(Compiler *c, const char *base);
 int        send_def_just_supers(Compiler *c, int mi);          /* analyze_desugar.c */
@@ -2874,15 +2893,6 @@ int comp_zsuper_plain_params(Compiler *c, const Scope *s, int *out, int cap);
 const BuiltinOp *comp_super_kernel_row(Compiler *c, const Scope *s, const char *uname, int id);
 /* Resolve `name` through the class's (chain-aware) alias table to the
    underlying method/attr name. Returns `name` unchanged if not aliased. */
-/* What a name means on a class: nothing, an attribute (attr_reader/writer,
-   Struct member, ...), or an explicit method. Both tables can own one name;
-   comp_resolve_member arbitrates once for every emission site. */
-enum { SP_MEMBER_NONE = 0, SP_MEMBER_ATTR, SP_MEMBER_METHOD };
-/* `name` is the bare name for a read and the BASE name for a write (the method
-   consulted is then `name=`). Reports the defining class and, for a method, its
-   scope index. */
-int         comp_resolve_member(Compiler *c, int class_id, const char *name, int want_write,
-                                int *def_class, int *method_index);
 const char *comp_resolve_alias(Compiler *c, int class_id, const char *name);
 const char *comp_resolve_alias_at(Compiler *c, int class_id, const char *name, int *start_cls);
 const char *comp_resolve_cm_alias_at(Compiler *c, int class_id, const char *name, int *start_cls);
@@ -2994,6 +3004,7 @@ static inline uint64_t comp_node_marks_digest(const Compiler *c, uint64_t h, int
   if (c->empty_arr_recv) h = mix(h, c->empty_arr_recv, (size_t)n * sizeof *c->empty_arr_recv);
   if (c->empty_hash_recv) h = mix(h, c->empty_hash_recv, (size_t)n * sizeof *c->empty_hash_recv);
   if (c->empty_hash_arg) h = mix(h, c->empty_hash_arg, (size_t)n * sizeof *c->empty_hash_arg);
+  if (c->pow_signed) h = mix(h, c->pow_signed, (size_t)n * sizeof *c->pow_signed);
   if (c->store_misfit_arg) h = mix(h, c->store_misfit_arg, (size_t)n * sizeof *c->store_misfit_arg);
   if (c->ivar_widen_src) h = mix(h, c->ivar_widen_src, (size_t)n * sizeof *c->ivar_widen_src);
   if (c->hash_want) h = mix(h, c->hash_want, (size_t)n * sizeof *c->hash_want);
@@ -3023,6 +3034,11 @@ static inline char comp_set_empty_hash_arg(Compiler *c, int id, char v) {
   if (c->empty_hash_arg[id] != v) { ((char *)c->empty_hash_arg)[id] = v; comp_touch_node(c, id); }
   return v;
 }
+static inline char comp_set_pow_signed(Compiler *c, int id, char v) {
+  if (c->pow_signed[id] != v) { ((char *)c->pow_signed)[id] = v; comp_touch_node(c, id); }
+  return v;
+}
+static inline int comp_pow_signed(const Compiler *c, int id) { return comp_node_in(c, id) && c->pow_signed[id]; }
 static inline TyKind comp_set_hash_want(Compiler *c, int id, TyKind v) {
   if (c->hash_want[id] != v) { ((TyKind *)c->hash_want)[id] = v; comp_touch_node(c, id); }
   return v;
