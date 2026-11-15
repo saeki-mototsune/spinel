@@ -2888,10 +2888,14 @@ int emit_call_object_override_arms(Compiler *c, int id, Buf *b, const NodeTable 
           !comp_reader_in_chain(c, bsci, bsnm, NULL) &&
           !comp_writer_in_chain(c, bsci, bsnm, NULL)) {
         const char *bscn = class_ruby_name(c, bsci) ? class_ruby_name(c, bsci) : c->classes[bsci].name;
+        /* (a bare identifier the walk gave self as its receiver is still
+           CRuby's variable-like call: its NameError and wording) */
+        int bsac = 0; call_args(nt, id, &bsac);
+        int bsv = nt_kind(nt, bsrecv) == NK_SelfNode && bsac == 0 && nt_ref(nt, id, "block") < 0 && nt_vcall(nt, id);
         buf_printf(b, "({ (void)("); emit_expr_for_effect(c, bsrecv, b);
         {
-          char head[200]; snprintf(head, sizeof head, "undefined method '%s' for an instance of ", bsnm);
-          buf_puts(b, "); sp_raise_cls(\"NoMethodError\", ");
+          char head[200]; snprintf(head, sizeof head, "%s '%s' for an instance of ", bsv ? "undefined local variable or method" : "undefined method", bsnm);
+          buf_printf(b, "); sp_raise_cls(\"%s\", ", bsv ? "NameError" : "NoMethodError");
           if (!anon_class_text(c, bsci, head, b)) buf_printf(b, "(&(\"\\xff\" \"%s%s\")[1])", head, bscn);
           buf_printf(b, "); %s; })", default_value_from_compiler(c, repr_of(c, id).as_ty));
         }
@@ -3139,12 +3143,6 @@ static int emit_bivar_table_op(Compiler *c, const BopCtx *x, char op, Buf *b) {
   const int *argv = call_args(nt, id, &argc);
   int tv = ++g_tmp;
   buf_puts(b, "({ "); tv = hold_operand(c, x->recv, TY_POLY, 1, tv, 1, " ", b);
-  /* (an instance of a program class under a builtin exception, in a method
-     naming an ivar the builtin's reopening holds in the map: keyed as the
-     exception it is, as the reopening's methods key it) */
-  { TyKind xt = repr_of(c, x->recv).ty;
-    if (ty_is_object(xt) && class_is_exc_subclass(c, ty_object_class(xt)))
-      buf_printf(b, "_t%d.cls_id = SP_BUILTIN_EXCEPTION; ", tv); }
   if (op == 'l') { buf_printf(b, "sp_bivar_list(_t%d); })", tv); return 1; }
   buf_printf(b, "sp_sym _k%d = ", tv); emit_bivar_name(c, argv[0], b); buf_puts(b, "; ");
   if (op == 'd') { buf_printf(b, "sp_bivar_defined(_t%d, _k%d); })", tv, tv); return 1; }
