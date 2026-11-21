@@ -1,0 +1,3 @@
+["yes"]
+[TypeError, "wrong argument type nil (expected String)"]
+2

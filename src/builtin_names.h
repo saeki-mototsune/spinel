@@ -73,6 +73,7 @@ int is_symbol_conversion(const char *n); /* to_sym intern: a Symbol made of a va
 int is_builtin_helper_name(const char *n); /* __x but not __x__: a builtins/ file's own helper */
 int is_opaque_reaching_call(const char *n); /* send family, call, new, lambda/proc, freeze, eval, instance_/class_/module_*, *method* */
 int is_async_code_entry(const char *recv, const char *n); /* Thread.new/start/fork, Fiber.new, trap, Signal.trap */
+int is_at_exit_name(const char *n);   /* at_exit: its block runs once the load phase is over, when the program exits */
 int is_deferred_block_call(const char *recv, const char *n); /* proc, Proc.new, define_method, at_exit, Enumerator.new, ...: the block runs later */
 int is_name_reader(const char *n);    /* name to_s inspect: a Class's or Module's name */
 int is_plain_builtin_reader(const char *n); /* name: every builtin with it reads a value */
@@ -81,7 +82,6 @@ int is_tap_name(const char *n);       /* tap */
 int is_quantifier(const char *n);     /* all? any? none? one? */
 int is_name_error_class(const char *n);   /* NameError NoMethodError: .new(msg, name, ...) */
 int is_no_method_error_class(const char *n);   /* NoMethodError: .new(msg, name, args, ...) */
-int is_name_error_root_class(const char *n);   /* NameError alone: a variable-like call's error */
 int is_set_op(const char *n);         /* & intersection | union - difference */
 int is_combination_family(const char *n);  /* combination permutation repeated_combination repeated_permutation */
 /* the visibility word a call names: module_function first, so that a
@@ -124,11 +124,15 @@ int is_quantifier_or_count(const char *n);  /* all? any? none? one? count: is_qu
 int is_array_self_mutator0(const char *n);   /* push append unshift: a bare call answering the Array itself */
 int is_push_unshift(const char *n);   /* << push append unshift: is_push_alias's names and unshift */
 int is_load_path_write(const char *n); /* << push append unshift prepend concat: the calls that add to $LOAD_PATH */
+int is_poly_object_surface_name(const char *n); /* hash object_id __id__ instance_variables: a boxed receiver's call is emitted as Object's builtin, whatever a reopened builtin defines */
 int is_identity_query(const char *n); /* equal? object_id __id__ frozen?: tells an object from its copy */
+int is_string_boxed_reader(const char *n);
+int string_boxed_reader_arity(const char *n);
 int is_len_alias(const char *n);      /* length size */
 int is_length_spelling(const char *n); /* size count empty? */
 int is_difference_spelling(const char *n); /* difference */
 int is_str_each_iter(const char *n);  /* each_char each_line each_byte each_codepoint: String's element iterators */
+int is_str_line_method(const char *name); /* String's lines and each_line */
 int is_freeze_name(const char *n);    /* freeze */
 int is_str_string_yield(const char *n); /* each_char each_line upto chars lines split scrub: String methods whose block takes a String */
 int is_unpack_name(const char *n); /* unpack: a String decoded into values, which a block takes one by one */
@@ -147,6 +151,7 @@ int is_endpoint_query(const char *n); /* first last: collection or Range endpoin
 int is_map_alias(const char *n); /* map collect: Enumerable transformation aliases */
 int is_instance_eval_family(const char *n); /* instance_eval instance_exec */
 int is_reflective_access(const char *n); /* instance_variable_get/set, class_variable_get/set, const_get/set, remove_* */
+int is_unspelled_ivar_writer(const char *n); /* instance_variable_set, instance_eval/exec, define_singleton_method, Marshal, YAML, Psych */
 int is_name_checked_call(const char *n); /* CRuby's answer turns on the name given: a NameError for one not allowed or not there */
 int is_reflective_listing(const char *n); /* instance_variables class_variables constants */
 int is_local_reflection(const char *n); /* eval binding local_variable_get/set local_variables */
@@ -202,6 +207,7 @@ int is_value_constructor(const char *recv, const char *meth); /* Hash.new, Array
 int is_array_new(const char *recv, const char *meth); /* Array.new */
 int is_array_class_name(const char *n); /* Array */
 int is_string_index(const char *n); /* index rindex */
+int is_rindex_name(const char *n);  /* rindex */
 int is_modulo_alias(const char *n); /* % modulo */
 int is_append_concat(const char *n); /* << concat */
 int is_socket_address(const char *n); /* addr peeraddr */
@@ -220,6 +226,12 @@ int is_object_loader(const char *recv, const char *meth, int argc); /* Marshal.l
 int is_method_bind_name(const char *n); /* bind bind_call */
 int is_timeout_call(const char *recv, const char *meth); /* Timeout.timeout(sec, klass) */
 int is_exception_ctor_name(const char *n); /* exception */
+int class_object_universal_method(const char *n); /* Class's public instance methods beyond Object's: new superclass ancestors attr ... */
+const char *class_object_universal_name(int i); /* ...the i-th of them, NULL past the last */
+int class_only_method(const char *n); /* new allocate attached_object subclasses superclass: not a module object's */
+int class_object_private_method(const char *n, int is_module); /* Class's or Module's private ones beyond Object's: included private ... */
+int class_object_answers_builtin(const char *n, int is_module); /* one of the two a class (module) object answers */
+int class_object_builtin_responds(const char *n, int is_module, int exc, int record); /* ...to respond_to?, with exception and a record class's own */
 int is_enumerator_maker(const char *n); /* to_enum enum_for */
 int is_allocate_name(const char *n); /* allocate */
 int is_ivar_remove_name(const char *n); /* remove_instance_variable */
@@ -230,10 +242,13 @@ const char *handle_attr_store(const char *n, int write); /* Thread Fiber: thread
 int is_frozen_value_class(const char *n); /* Integer Float Symbol NilClass TrueClass FalseClass Range */
 int is_nonblock_io(const char *n); /* read_nonblock write_nonblock */
 int is_io_read(const char *n); /* read */
+int is_io_sysread(const char *n);
+int io_output_buffer_pos(const char *n);
 
 int is_mul_or_pow(const char *n); /* * ** */
 int is_unary_sign(const char *n); /* +@ -@ */
 int is_unary_minus(const char *n); /* -@ */
+int is_casecmp_predicate(const char *n);
 int is_casecmp_family(const char *n); /* casecmp casecmp? */
 /* String#to_i([base]), #hex, #oct: the parses promote mode reads as a
    Bignum past sp_int */
@@ -249,6 +264,7 @@ int is_unary_plus(const char *n); /* +@ */
 int is_loop_name(const char *n); /* loop */
 int is_first_or_take(const char *n); /* first take */
 int is_lazy_force(const char *n); /* force to_a */
+int is_lazy_first(const char *n); /* first */
 int is_local_time(const char *n); /* getlocal localtime */
 int is_line_read(const char *n); /* gets readline */
 int is_open_constructor(const char *n); /* new open */
@@ -262,6 +278,7 @@ int is_sort_family(const char *n); /* sort sort! */
 int is_hash_transform(const char *n); /* transform_values transform_keys */
 int is_fallback_block_call(const char *n); /* fetch delete fetch_values: the block is the fallback */
 int is_delete_name(const char *n);       /* delete: removal by key (ENV's missing-key block answers) */
+int is_io_syswrite(const char *n);
 int is_io_write(const char *n); /* syswrite write */
 int is_to_integer(const char *n); /* to_i to_int */
 int is_match_operator(const char *n); /* !~ =~ */
@@ -294,6 +311,8 @@ int is_select_alias(const char *n); /* filter select */
 int is_format_alias(const char *n); /* format sprintf */
 int is_initialize_name(const char *n); /* initialize */
 int is_initialize_family(const char *n); /* initialize initialize_copy */
+int is_initialize_copy_name(const char *n); /* initialize_copy */
+int is_initialize_hook_name(const char *n); /* initialize initialize_copy initialize_clone initialize_dup: private on every class, defined or not */
 
 int is_iso8601_alias(const char *n); /* iso8601 xmlschema */
 int is_rfc2822_alias(const char *n);   /* rfc2822 rfc822 */
@@ -339,6 +358,9 @@ int is_bound_method_maker(const char *n);  /* method public_method: a Method of 
 int is_super_method_name(const char *n);   /* super_method: the Method one step up its owner's chain */
 /* const_get const_source_location nesting attached_object each_object eval binding */
 int is_constant_or_object_reflection(const char *n);
+/* is_constant_or_object_reflection, constants, __const_get__ __const_defined__: a call that reaches a
+   constant by a name it computes, or an object past the reads the program's syntax shows */
+int is_const_reaching_name(const char *n);
 int is_const_set_name(const char *n); /* const_set */
 int is_const_query_name(const char *n); /* const_get const_defined? const_source_location */
 int is_constants_list_name(const char *n); /* constants */
@@ -351,6 +373,7 @@ int is_basic_object_hook_name(const char *n); /* ...BasicObject's: singleton_met
 int is_const_added_name(const char *n); /* const_added */
 int is_method_missing_name(const char *n); /* method_missing respond_to_missing?: what a call of a name an object has no method by runs */
 extern const char METHOD_MISSING_NAME[];   /* "method_missing", the name a lookup of that method asks */
+int is_method_missing_method(const char *n);   /* method_missing itself, not respond_to_missing? (is_method_missing_name) */
 extern const char RESPOND_TO_MISSING_NAME[];   /* "respond_to_missing?", what a Method capture asks of a name it finds no method by */
 int definition_form_hooks(const char *form, int sg, const char **out); /* the hooks a definition form fires: included and append_features for include, method_added for attr_accessor, ... (up to 2) */
 int is_const_missing_name(const char *n); /* const_missing */
@@ -424,10 +447,17 @@ int is_string_read_only_method(const char *name);
 int str_mutator_str_args(const char *n, int argc, int *int_ok); /* the arguments a String mutator takes as Strings */
 
 int builtin_answers_ahead_of(const char *cls, const char *m, const char *root); /* an ancestor of cls ahead of root (NULL: any) owns instance method m, or undefines it (CRuby's tables) */
+const char *builtin_super_owner(const char *root, const char *m, int after_root);   /* the table name of the ancestor of root that a super's method m reaches, NULL for none */
+/* What an owner is, for the readers that ask: Kernel (the default inspect and to_s of a plain class), Struct or Data (the default
+   #<struct ...> text), any other builtin. */
+typedef enum { BOWN_NONE, BOWN_KERNEL, BOWN_STRUCT, BOWN_OTHER } BownKind;
+BownKind builtin_owner_kind(const char *owner);
+int builtin_table_known(const char *name);   /* CRuby's method tables hold the class or module, in a library the program has */
 const char *builtin_ancestor_at(const char *cls, int i);   /* the i-th ancestor (0: cls) in CRuby's lookup order, NULL past the last */
 int builtin_owns_instance_method(const char *cls, const char *m);   /* cls's own instance method m, any visibility (CRuby's tables) */
 const char *builtin_next_class_answering(int *i, const char *m);   /* the next class of the tables, from table *i, that Spinel has as a value and that answers m ahead of Object */
 int builtin_id_below_object_answers(int id, const char *m);   /* the builtin class with run-time id `id` does */
+int builtin_id_has_instance_method(int id, const char *m);   /* ...or an ancestor of its has m, any visibility, no undefine ahead */
 int builtin_mixin_module_id(const char *n);   /* Comparable Enumerable Kernel Math: its builtin id */
 int is_include_name(const char *n);
 int is_prepend_name(const char *n);
@@ -469,6 +499,7 @@ int builtin_numeric_owns(const char *cls, const char *name); /* Numeric's, on In
 int builtin_numeric_arity(const char *name, int *out);
 
 int is_gated_exception_accessor(const char *n); /* accessors owned by specific exception classes */
+const char *const *gated_exception_accessor_owners(const char *n); /* the builtin classes that define it, NULL-terminated; NULL when n is not gated */
 int is_symbol_exception_accessor(const char *n); /* exception accessors that can return a Symbol */
 
 int is_builtin_reopen_name(const char *name);
@@ -503,6 +534,7 @@ int is_pow_name(const char *n); /* pow: Integer power, with an optional modulus 
 
 int is_lazy_name(const char *n);         /* lazy: makes a Lazy of its receiver */
 int is_new_name(const char *n);          /* new: a class's constructor */
+int is_capacity_keyword(const char *n);  /* capacity: Hash.new's and String.new's keyword, an Integer through #to_int */
 int is_native_share_decl(const char *n); /* native_share: a package's share declaration */
 int is_proc_new(const char *recv, const char *meth); /* Proc.new */
 int is_method_ref_name(const char *n);   /* method: Kernel#method */
@@ -521,6 +553,8 @@ const char *dir_surface_alias(const char *n, int blockless_iter);
 int is_dir_blockless_iter(const char *n);  /* foreach each_child: an Enumerator without a block */
 
 int is_kernel_module_name(const char *n);
+int is_frame_reading_function(const char *n);   /* __method__ __callee__ __dir__ binding block_given? caller caller_locations local_variables: Kernel functions that read the calling frame */
+int builtin_method_takes_keywords(const char *owner, const char *m);   /* CRuby's parameters of owner's instance method m (BAP) list a keyword or a keyword rest */
 int is_kernel_module_function(const char *n);
 /* ...and one that never consults self (not `binding`). */
 int kernel_function_ignores_self(const char *n);
@@ -530,6 +564,9 @@ const char *builtin_bool_method_owner(const char *cls, const char *m);   /* ...a
 const char *builtin_function_owner(const char *m);   /* the module defining the function a receiverless method(:m) binds */
 extern const char RESPOND_TO_NAME[];   /* "respond_to?", the name a lookup of the calls that ask presence goes by */
 int is_respond_to_name(const char *n); /* respond_to?: does the receiver itself answer a name */
+extern const char *const struct_names[];   /* the names a Struct's instance answers from Struct (not a Data's), NULL-terminated */
+extern const char *const struct_core_names[];   /* the names a Struct and a Data answer from their core classes: members, to_h, deconstruct, deconstruct_keys, and Data's with */
+int is_struct_core_name(const char *n, int kind);   /* a name a Struct (kind 1) or a Data (kind 2) instance answers from its core class: members, to_h, deconstruct, deconstruct_keys, and Data#with or Struct's struct_names */
 int is_method_presence_query(const char *n); /* 1: respond_to? *method_defined? (public_)instance_method (public_)method; 2: (public_)instance_methods (public_)methods, answered for the whole program; 3: private_/protected_instance_methods, private_/protected_methods, singleton_methods, answered by the receiver's chain */
 int is_instance_method_list(const char *n); /* (public_|private_|protected_)instance_methods */
 int method_list_vis_mask(const char *n); /* the visibilities a method list shows, 1 << SP_VIS_* each: public and protected for instance_methods, methods, singleton_methods; the prefixed forms one; 0 for no list */
@@ -597,6 +634,8 @@ int is_math_module_name(const char *n);     /* Math */
 int is_native_decl_name(const char *n);     /* native_lib native_struct native_method ...: a module body's native binding declarations */
 int is_ffi_decl_name(const char *n);        /* ffi_lib attach_function attach_variable callback native_func ...: declarations made methods before the walk */
 int is_method_defined_query(const char *n); /* method_defined? public_/private_/protected_method_defined? */
+int method_defined_vis_mask(const char *n); /* the visibilities that query counts: 1 public, 2 protected, 4 private; 0 for any other name */
+int is_method_presence_name_query(const char *n);   /* respond_to? or a method_defined? query above */
 int is_undef_method_name(const char *n);  /* undef_method */
 int is_remove_method_name(const char *n); /* remove_method */
 int is_check_funcall_name(const char *n);   /* respond_to? respond_to_missing? method_missing: what rb_check_funcall asks */
@@ -620,6 +659,9 @@ int is_pop_name(const char *n);               /* pop */
 
 const char *encoding_const_name(const char *nm);  /* Encoding::NM's encoding name, or NULL */
 const char *builtin_operator_delegate(const char *name);
+/* what CRuby answers before it calls the delegate `gone` of operator `name` (BCUT_*) */
+enum { BCUT_NONE, BCUT_SAME_TRUE, BCUT_SAME_FALSE, BCUT_CLAMP };
+int builtin_operator_cut(const char *name, const char *gone);
 int is_mul_op(const char *n); /* * */
 int is_pow_op(const char *n); /* ** */
 int is_minus_op(const char *n); /* - */
@@ -721,13 +763,37 @@ int boot_package_rank_of_path(const char *path, size_t len);   /* the same for s
    Data, below which a program's class is an object of its own; BC_SG_BOOT
    a module CRuby 4.0 boots with its singleton class made (its module
    functions'), as Comparable and Enumerable are not; BC_OSTRUCT
-   OpenStruct, a constant only after `require "ostruct"` (builtin_row). */
-enum { BC_CLASS = 1, BC_MODULE = 2, BC_EXCEPTION = 4, BC_SOCKET = 8, BC_PLAIN = 16, BC_SG_BOOT = 32, BC_OSTRUCT = 64 };
+   OpenStruct, a constant only after `require "ostruct"` (builtin_row);
+   BC_TAGGED a class whose boxed value carries a tag of its own
+   (SP_TAG_INT, SP_TAG_CLASS, SP_TAG_ENCODING ...), not SP_TAG_OBJ.
+   BC_EMPTY_NEW a class whose `new` with no arguments builds a usable empty
+   value (`[]`, `{}`, `""`), the value CRuby's `new` leaves when the program's
+   own initialize runs instead of the builtin's and sets nothing: Time, Range,
+   Fiber and the like build an uninitialized object that raises when used.
+   BC_NEW_KEYWORDS a class whose `new` applies the keywords it is given itself
+   (String's `encoding:` and `capacity:`) or to which they make no difference
+   (Hash's `capacity:`), so that an initialize which drops them is not observed:
+   Time's `in:`, Fiber's `blocking:` and Regexp's `timeout:` take effect in
+   initialize. BC_INIT_NO_KEYWORDS a class whose initialize takes no
+   keywords and takes the ones it is given as a last positional Hash, so that
+   it sees the same call when a forward passes them on as that Hash (Array's
+   and Range's): Hash's takes `capacity:` as a keyword. BC_KEYWORDS_NEW_OWN
+   a class whose own `new`, given keywords, builds the value from them itself
+   and runs no initialize, a program's or its own (String's: `String.new("ab",
+   capacity: 10)`); its subclasses' `new` runs it. */
+enum { BC_CLASS = 1, BC_MODULE = 2, BC_EXCEPTION = 4, BC_SOCKET = 8, BC_PLAIN = 16, BC_SG_BOOT = 32, BC_OSTRUCT = 64,
+       BC_TAGGED = 128, BC_EMPTY_NEW = 256, BC_NEW_KEYWORDS = 512, BC_INIT_NO_KEYWORDS = 1024,
+       BC_KEYWORDS_NEW_OWN = 2048 };
 typedef struct { const char *name; int id; unsigned flags; } BuiltinClass;
 const BuiltinClass *builtin_class_at(int i);   /* the i-th row, NULL past the last */
 int is_native_class_name(const char *n);       /* any row: a class Spinel has without a library */
 int is_plain_builtin_superclass(int id);       /* BC_PLAIN or an exception: gives a program's subclass no method of an Enumerable walk */
 int builtin_singleton_at_boot(int slot);      /* BC_SG_BOOT of row slot (CORE_*): the module's singleton class exists before the program runs */
+int builtin_empty_new(const char *name);       /* BC_EMPTY_NEW of the class named name */
+int builtin_new_keywords(const char *name);    /* BC_NEW_KEYWORDS of the class named name */
+int builtin_init_no_keywords(const char *name); /* BC_INIT_NO_KEYWORDS of the class named name */
+int builtin_keywords_new_own(const char *name); /* BC_KEYWORDS_NEW_OWN of the class named name */
+int builtin_boxed_by_tag(int slot);           /* BC_TAGGED of row slot (CORE_*): a boxed value of the class carries a tag of its own, not SP_TAG_OBJ */
 /* names the compile-time evaluation and its questions ask about (ct_eval.c,
    analyze_ct.c) */
 int is_class_const_name(const char *n);    /* Class: the constant Class.new is called on */
@@ -742,8 +808,10 @@ int is_core_change_call(const char *n);    /* class_eval .. module_exec include 
 int is_singleton_reach_call(const char *n);/* define_singleton_method extend singleton_class instance_eval instance_exec: give an object methods of its own */
 int is_singleton_class_maker(const char *n, int argc); /* singleton_class extend define_singleton_method instance_variable_set class_variable_set private_class_method public_class_method refine, module_function with names: make a module's singleton class */
 int is_method_naming_call(const char *n);  /* define_method define_singleton_method alias_method remove_method undef_method attr*: give or take a method its argument names */
+int is_attr_name(const char *n);           /* attr attr_reader attr_writer attr_accessor: the Module methods that define accessors */
 int is_attr_decl_reader(const char *n);    /* attr attr_reader attr_accessor, and Spinel's class-body attribute attributes: declare a reader of each name */
 int is_attr_decl_writer(const char *n);    /* attr_writer attr_accessor attribute attributes: declare a writer of each name */
+int is_attr_may_write(const char *n);      /* is_attr_decl_writer's, and attr (`attr :x, true`) */
 int class_method_vis_of_name(const char *n); /* private_class_method public_class_method: BVIS_PRIVATE / BVIS_PUBLIC, else 0 */
 int is_refine_name(const char *n);         /* refine */
 int is_enum_helper_name(const char *n);   /* __enum_pairs __enum_count_int: the compiler's helpers a receiverless call names */

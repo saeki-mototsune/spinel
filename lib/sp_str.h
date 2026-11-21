@@ -22,6 +22,18 @@ const char *sp_sprintf(const char *fmt, ...) SP_PRINTF_FORMAT(1, 2);  /* defined
    (sp_str_lcache / SP_STR_LCACHE_*) lives in sp_alloc.h / sp_alloc.c. ---- */
 static inline int sp_utf8_char_len(unsigned char c){if(c<0x80)return 1;if(c<0xC0)return 1;if(c<0xE0)return 2;if(c<0xF0)return 3;return 4;}
 static inline int sp_utf8_advance(const char*p){int cn=sp_utf8_char_len((unsigned char)*p);int i=1;while(i<cn&&((unsigned char)p[i]&0xC0)==0x80)i++;return i;}
+/* The length of the valid UTF-8 character of two to four bytes at p, of the
+   avail bytes there, or 0 when the bytes are no such character: a stray
+   continuation byte, a lead byte past F4, a sequence cut short, an overlong
+   form, a surrogate half (ED A0..BF), or a code point past U+10FFFF, as
+   RFC 3629 and CRuby's precise length have it. An ASCII byte answers 0 too;
+   the caller takes it alone. */
+static inline int sp_utf8_valid_len(const unsigned char*p,size_t avail){unsigned c=p[0];int n=(c>=0xC2&&c<=0xDF)?2:(c>=0xE0&&c<=0xEF)?3:(c>=0xF0&&c<=0xF4)?4:0;if(!n||avail<(size_t)n)return 0;for(int i=1;i<n;i++)if((p[i]&0xC0)!=0x80)return 0;if(n==3&&((c==0xE0&&p[1]<0xA0)||(c==0xED&&p[1]>=0xA0)))return 0;if(n==4&&((c==0xF0&&p[1]<0x90)||(c==0xF4&&p[1]>=0x90)))return 0;return n;}
+/* At a known byte position inside the payload, malformed bytes take one unit. */
+static inline size_t sp_utf8_unit_len(const char *p, size_t available) {
+  int width = sp_utf8_valid_len((const unsigned char *)p, available);
+  return width > 0 ? (size_t)width : 1;
+}
 static inline int sp_utf8_decode(const char*p,uint32_t*out){unsigned char c=(unsigned char)p[0];if(c<0x80){*out=c;return 1;}if(c<0xC0){*out=c;return 1;}unsigned char c1=(unsigned char)p[1];if((c1&0xC0)!=0x80){*out=c;return 1;}if(c<0xE0){*out=((uint32_t)(c&0x1F)<<6)|(c1&0x3F);return 2;}unsigned char c2=(unsigned char)p[2];if((c2&0xC0)!=0x80){*out=c;return 1;}if(c<0xF0){*out=((uint32_t)(c&0x0F)<<12)|((uint32_t)(c1&0x3F)<<6)|(c2&0x3F);return 3;}unsigned char c3=(unsigned char)p[3];if((c3&0xC0)!=0x80){*out=c;return 1;}*out=((uint32_t)(c&0x07)<<18)|((uint32_t)(c1&0x3F)<<12)|((uint32_t)(c2&0x3F)<<6)|(c3&0x3F);return 4;}
 static inline int sp_utf8_encode(uint32_t cp,char*out){if(cp<0x80){out[0]=(char)cp;return 1;}if(cp<0x800){out[0]=(char)(0xC0|(cp>>6));out[1]=(char)(0x80|(cp&0x3F));return 2;}if(cp<0x10000){out[0]=(char)(0xE0|(cp>>12));out[1]=(char)(0x80|((cp>>6)&0x3F));out[2]=(char)(0x80|(cp&0x3F));return 3;}out[0]=(char)(0xF0|(cp>>18));out[1]=(char)(0x80|((cp>>12)&0x3F));out[2]=(char)(0x80|((cp>>6)&0x3F));out[3]=(char)(0x80|(cp&0x3F));return 4;}
 #define sp_str_lcache_hash sp_str_lcache_slot
@@ -34,7 +46,7 @@ static inline int sp_utf8_encode(uint32_t cp,char*out){if(cp<0x80){out[0]=(char)
    it a scan loop over a built-up string rewalked the whole buffer per index. */
 static inline int sp_str_cacheable(const char *s) {
   unsigned char m = ((const unsigned char *)s)[-1];
-  return m == 0xfe || m == 0xfc || m == 0xff || m == 0xf1 || m == 0xfd || m == 0xfb || m == 0xfa || m == 0xf8;
+  return m == 0xfe || m == 0xff || m == 0xf1 || m == 0xfd || m == 0xfb || m == 0xfa;
 }
 /* Byte-exact comparison of two heap strings. strcmp stops at the first NUL,
    so two strings that differ only after one compared equal and sorted equal --
@@ -81,7 +93,6 @@ sp_bool sp_str_valid_encoding(const char*s);
 const char*sp_str_field(const char*s,const char*sep,sp_int n);
 sp_int sp_str_field_count(const char*s,const char*sep);
 const char*sp_str_concat(const char*a,const char*b);
-const char*sp_str_append_bytes(const char*a,const char*b);
 const char*sp_str_concat3(const char*a,const char*b,const char*c);
 const char*sp_str_concat4(const char*a,const char*b,const char*c,const char*d);
 const char*sp_str_concat_arr(const char *const *parts,int n);
@@ -122,22 +133,23 @@ const char*sp_str_chop(const char*s);
 const char*sp_str_chr(const char*s);
 sp_int sp_str_byte_to_char(const char*s,sp_int byteoff);
 sp_bool sp_str_include(const char*s,const char*sub);
+sp_String *sp_str_slice_key(const char *s, const char *key);
 sp_bool sp_str_start_with(const char*s,const char*p);
 sp_bool sp_str_end_with(const char*s,const char*suf);
 sp_StrArray *sp_str_partition(const char *s, const char *sep);
 sp_StrArray *sp_str_rpartition(const char *s, const char *sep);
+sp_String *sp_str_line_next(const char *s, const char *sep, size_t *offset, sp_bool chomp);
 sp_StrArray*sp_str_lines(const char*s);
-sp_StrArray*sp_str_lines_sep(const char*s,const char*sep);
-sp_StrArray*sp_str_lines_sep_chomp(const char*s,const char*sep);
-sp_StrArray*sp_str_lines_chomp(const char*s);
 const char*sp_str_byteslice(const char*s,sp_int start,sp_int len);
 const char*sp_str_byteslice1(const char*s,sp_int i);
 const char*sp_str_byteslice_range(const char*s,sp_int lo,sp_int hi,int excl,int lo_none,int hi_none);
 const char*sp_str_bytesplice(const char*s,sp_int start,sp_int len,const char*val);
 const char*sp_str_bytesplice5(const char*s,sp_int start,sp_int len,const char*val,sp_int vstart,sp_int vlen);
+int sp_str_splice_encoding(const char *s, const char *val);
 int sp_str_bytesplice_check(const char*s,sp_int*start,sp_int*len,const char*val,sp_int*vstart,sp_int*vlen);
 int sp_str_ascii_only(const char*s);
 int sp_str_enc_step(int state, const char *acc, size_t acc_len, const char *part, size_t part_len, int part_bin);
+char *sp_str_bin_cat_like(const char *s, const char *rep, char *r);   /* a substitution's result, as s + rep */
 /* the common step inline: a part in the encoding so far keeps it */
 static inline int sp_str_enc_step_i(int state, const char *acc, size_t acc_len, const char *part, size_t part_len, int part_bin) {
   if (state == part_bin) return state;
@@ -147,6 +159,8 @@ const char*sp_str_format_strarr(const char*fmt,sp_StrArray*a);
 const char*sp_str_sub(const char*s,const char*pat,const char*rep);
 const char*sp_str_remove_first(const char*s,const char*pat);
 const char*sp_str_capitalize(const char*s);
+size_t sp_str_repeat_size(const char *s, sp_int n, size_t *unit);
+char *sp_str_repeat_write(char *dest, const char *s, size_t unit, size_t total);
 const char*sp_str_repeat(const char*s,sp_int n);
 sp_IntArray*sp_str_bytes(const char*s);
 const char *sp_str_crypt(const char *s, const char *salt);
@@ -161,7 +175,7 @@ const char*sp_str_dup(const char*s);
 static inline const char*sp_str_one_answer(const char*s){return s&&((const unsigned char*)s)[-1]==0xfd?sp_str_dup(s):s;}
 const char *sp_plain_char(unsigned char c);
 const char *sp_bin_char(unsigned char c);
-const char*sp_str_b(const char*s);
+sp_String *sp_String_binary_copy(const char *s);
 
 /* ---- utf8-dependent cold transforms (lib/sp_str.c, lib/sp_str_cold.c) ---- */
 /* nil-receiver raise: a nullable string carries nil as NULL, and CRuby
@@ -351,7 +365,7 @@ static inline const char*sp_str_hash_walk(const char*s,uint64_t*hp,int*hip){
 /* The byte length of a String with a header that goes on past the NUL at q,
    else 0 */
 static inline size_t sp_str_hash_past_nul(const char*s,unsigned char m,const char*q){
-  if(m==0xfe||m==0xfc||m==0xfd||m==0xf1||m==0xfb||m==0xfa||m==0xf8){
+  if(sp_str_marker_has_hdr(m)){
     uint32_t l=(((const sp_str_hdr*)(s-1))-1)->len;
     if(l!=SP_STR_LEN_UNSET&&l>(size_t)(q-s))return l;
   }
@@ -379,7 +393,7 @@ static inline uint64_t sp_str_hash_compute(const char*s){
    call, so this function calls nothing and needs no frame. */
 static SP_NOINLINE uint64_t sp_str_hash_miss_nul(const char*s,unsigned char m){
   uint64_t h=sp_str_hash_compute(s);
-  if(m==0xfd)return h;
+  if(m==0xfd||m==0xf9)return h;
   sp_str_hdr*hd=((sp_str_hdr*)(s-1))-1;
   hd->hash=h?h:1;
   return hd->hash;
@@ -390,11 +404,12 @@ static SP_NOINLINE uint64_t sp_str_hash_miss(const char*s,unsigned char m){
      String goes on past the NUL (an unset length goes to
      sp_str_hash_miss_nul too, which reads it), whether it is BINARY, and
      whether it keeps its hash */
-  if(m==0xfe||m==0xfc||m==0xfd||m==0xf1||m==0xfb||m==0xfa||m==0xf8){
+  if(sp_str_marker_has_hdr(m)){
     sp_str_hdr*hd=((sp_str_hdr*)(s-1))-1;
     if(SP_UNLIKELY(hd->len>(size_t)(q-s)))return sp_str_hash_miss_nul(s,m);
     if(hi&&(hd->size&SP_STR_SIZE_BINARY))h^=0x9e3779b97f4a7c15ULL;
-    if(m==0xfd)return h;
+    /* A retired view uses the hash word for its mark generation. */
+    if(m==0xfd||m==0xf9)return h;
     hd->hash=h?h:1;
     return hd->hash;
   }
@@ -409,7 +424,7 @@ static inline uint64_t sp_str_hash(const char*s){
   unsigned char m=((const unsigned char*)s)[-1];
   /* (0xfb, a static String with a header -- a one-byte slice of a BINARY
      String -- is never changed in place, so its hash is kept too, #10548) */
-  if(m==0xfe||m==0xfc||m==0xf1||m==0xfa||m==0xf8||m==0xfb){
+  if(m==0xfe||m==0xf1||m==0xfa||m==0xfb){
     uint64_t cached=(((sp_str_hdr*)(s-1))-1)->hash;
     if(cached)return cached;
   }

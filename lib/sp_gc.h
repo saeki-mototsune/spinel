@@ -18,7 +18,6 @@
  * The mark helpers below dispatch on the tag, so the type lives here
  * rather than in the generated TU. */
 #define SP_TAG_INT 0
-#define SP_TAG_STR 1
 #define SP_TAG_FLT 2
 #define SP_TAG_BOOL 3
 #define SP_TAG_NIL 4
@@ -40,6 +39,8 @@
 #define SP_BUILTIN_REGEX       (-33)
 /* ARGF: the one static sp_argf_obj, never GC heap, so it is not traced */
 #define SP_BUILTIN_ARGF        (-51)
+/* ENV: the one static sp_env_obj, never GC heap either */
+#define SP_BUILTIN_ENV         (-54)
 /* Wide value types (heap-copied crossing into a poly slot). Shared here so
    lib/sp_marshal.c can recognize them by cls_id. */
 #define SP_BUILTIN_COMPLEX  (-26)
@@ -112,9 +113,12 @@ static inline void **sp_gc_root_at(int i) {
 static inline int _sp_gc_root_push(void **p) { (void)p; return 0; }
 static inline void _sp_gc_root_pop(int *added) { (void)added; }
 #else
-static inline int _sp_gc_root_push(void **p) {
-  if (sp_gc_nroots < SP_GC_STACK_MAX) { sp_gc_roots[sp_gc_nroots++] = p; return 1; }
+static inline int sp_gc_push_at(int *depth, void ***slots, void **p) {
+  if (*depth < SP_GC_STACK_MAX) { slots[(*depth)++] = p; return 1; }
   return sp_gc_root_push_slow(p);
+}
+static inline int _sp_gc_root_push(void **p) {
+  return sp_gc_push_at(&sp_gc_nroots, sp_gc_roots, p);
 }
 static inline void _sp_gc_root_pop(int *added) { if (*added) sp_gc_nroots--; }
 #endif
@@ -142,9 +146,8 @@ static inline void sp_gc_cleanup(int *p) { sp_gc_nroots = *p; }
    byte is exactly 0xfe -- safe on arbitrary memory, unlike sp_gc_mark's
    header walk. Use this for string parameters in runtime helpers. */
 #define SP_GC_ROOT_STR(v) int SP_CLEANUP(_sp_gc_root_pop) _SP_GC_CONCAT(_sp_gcr_, __COUNTER__) = _sp_gc_root_push((void**)((uintptr_t)&(v) | (uintptr_t)2))
-/* a String Range by value: its endpoint strings and, built --share-strings,
-   the handles they came from (#8321) */
-#define SP_GC_ROOT_SRANGE(v) SP_GC_ROOT_STR((v).first); SP_GC_ROOT_STR((v).last); SP_GC_ROOT((v).hf); SP_GC_ROOT((v).hl)
+/* A by-value String Range owns its two endpoint handles. */
+#define SP_GC_ROOT_SRANGE(v) SP_GC_ROOT((v).first); SP_GC_ROOT((v).last)
 #define SP_GC_RESTORE() sp_gc_nroots = _gc_saved
 
 /* ---- root frames ----
@@ -172,6 +175,32 @@ typedef struct { int nv; int np; } sp_gc_frame_hdr;
 #define SP_GC_ENTRY_PTR(v)   ((void**)((uintptr_t)&(v) | _SP_GC_SLOT_TAG(v)))
 #define SP_GC_ENTRY_RBVAL(v) ((void**)((uintptr_t)&(v) | (uintptr_t)1))
 #define SP_GC_ENTRY_STR(v)   ((void**)((uintptr_t)&(v) | (uintptr_t)2))
+
+/* A direct caller can resolve the worker's TLS addresses outside its loop.
+   A started thread stays on its worker. Fiber switches change the contents
+   of these slots, so pass only their addresses. The overflow segment can
+   move and is looked up on each slow push. */
+typedef struct { int *depth; void ***slots; } sp_gc_root_ctx;
+static inline sp_gc_root_ctx sp_gc_current_roots(void) {
+  return (sp_gc_root_ctx){ &sp_gc_nroots, sp_gc_roots };
+}
+#ifdef SP_GC_NONE
+#define SP_GC_SAVE_CTX(ctx) SP_GC_SAVE()
+#define SP_GC_ROOT_CTX(ctx, entry) ((void)0)
+#define SP_GC_ROOT_FRAME_CTX(ctx, f) ((void)0)
+#else
+typedef struct { int *depth; int value; } sp_gc_root_mark;
+static inline void sp_gc_restore_mark(sp_gc_root_mark *mark) { *mark->depth = mark->value; }
+static inline void sp_gc_pop_mark(sp_gc_root_mark *mark) { if (mark->value) --*mark->depth; }
+#define SP_GC_SAVE_CTX(ctx) int _gc_saved = *(ctx).depth; \
+  sp_gc_root_mark SP_CLEANUP(sp_gc_restore_mark) _sp_gc_saved_mark = {(ctx).depth, _gc_saved}
+#define SP_GC_ROOT_CTX(ctx, entry) sp_gc_root_mark SP_CLEANUP(sp_gc_pop_mark) \
+  _SP_GC_CONCAT(_sp_gcr_, __COUNTER__) = {(ctx).depth, sp_gc_push_at((ctx).depth, (ctx).slots, (entry))}
+#define SP_GC_ROOT_FRAME_CTX(ctx, f) ((void)sp_gc_push_at((ctx).depth, (ctx).slots, (void**)((uintptr_t)&(f) | (uintptr_t)3)))
+#endif
+#define SP_GC_ROOT_PTR_CTX(ctx, v)   SP_GC_ROOT_CTX(ctx, SP_GC_ENTRY_PTR(v))
+#define SP_GC_ROOT_RBVAL_CTX(ctx, v) SP_GC_ROOT_CTX(ctx, SP_GC_ENTRY_RBVAL(v))
+#define SP_GC_ROOT_STR_CTX(ctx, v)   SP_GC_ROOT_CTX(ctx, SP_GC_ENTRY_STR(v))
 
 /* --gc=none (the emitted TU defines SP_GC_NONE): no collector runs, so
    nothing reads a root. The TU registers none -- its frames, its slots and
@@ -229,22 +258,10 @@ extern void *sp_gc_remembered[SP_GC_REMEMBERED_MAX];
 extern int sp_gc_nremembered;
 extern int sp_gc_rem_overflow;
 extern int sp_gc_minor_on;   /* read by sp_gc_wb below; set once before main */
-/* SPINEL_GC_OBJ_BUDGET=walk: the object collection budget is priced off the
-   whole set a mark walks (objects + strings) rather than the object heap
-   alone. Set once before main, beside the modes above; read by
-   sp_gc_retune_object, which is where the reasoning lives. */
+/* Controls for the mark-share report and the collection budget. */
 extern int sp_gc_obj_budget_mode;   /* 0 obj, 1 walk, 2 gated (default) */
 extern size_t sp_gc_obj_alpha1024;  /* the last gate decision, in 1024ths */
-extern int sp_gc_str_major_fixed;
-extern int sp_gc_str_major_sched;
-extern size_t sp_gc_str_majors;
 extern int sp_gc_obj_budget_fixed;
-extern int sp_gc_str_budget_fixed;
-extern int sp_gc_str_budget_mode;   /* 0 str, 1 walk, 2 gated (default) */
-/* Set for the duration of the string sweep hook on a minor cycle: only the
-   young string list may be swept, because the mark that just ran did not
-   walk old objects and so did not reach the strings they hold. */
-extern int sp_gc_str_minor_only;
 /* The barrier proper. Out of line and behind the mode test: with the minor
    mark off, which is the default, every store site pays one predictable
    branch instead of carrying the tag protocol and the remembered-set push
@@ -302,8 +319,8 @@ static inline void sp_gc_wb(void *obj) {
        (the same protocol sp_gc_wb_slow and sp_gc_mark read). */
     if (!obj) return;
     unsigned char pm = ((const unsigned char *)obj)[-1];
-    if (pm == 0xfd || pm == 0xff || pm == 0xf1 || pm == 0xf0 ||
-        pm == 0xfe || pm == 0xfc || pm == 0xfb || pm == 0xfa || pm == 0xf8) return;
+    if (pm == 0xfd || pm == 0xf9 || pm == 0xff || pm == 0xf1 || pm == 0xf0 ||
+        pm == 0xfe || pm == 0xfb || pm == 0xfa) return;
     const sp_gc_hdr *h = (const sp_gc_hdr *)obj - 1;
     if (!h->old || h->dirty) return;
     sp_gc_wb_slow(obj);
@@ -472,7 +489,7 @@ static inline int sp_slab_owns(const void *p) { return (uintptr_t)p - sp_slab_ba
 #define SP_GC_HEAP_PUSH(hdr) do { if (!sp_slab_owns(hdr)) { (hdr)->next = sp_gc_heap; sp_gc_heap = (hdr); } } while (0)
 #endif
 
-/* ---- Slab allocator for GC objects and heap strings (lib/sp_slab.c) ----
+/* ---- Slab allocator for GC objects and raw payloads (lib/sp_slab.c) ----
  * sp_slab_alloc answers a zeroed block of `need` bytes (header included) from
  * the calling worker's size-class chunks, in the current epoch's young
  * generation; sp_slab_alloc_raw a payload no sweep frees. A block's generation, mark and finalizer bit live in its chunk's
@@ -491,13 +508,9 @@ void  sp_slab_park(void *hdr);           /* a dead header about to be pooled: ou
 void  sp_slab_relive(void *hdr);         /* a pooled header handed out again */
 void  sp_slab_pin(const void *p);        /* a frozen heap string: immortal, as a literal is */
 void  sp_slab_mark_pinned(void);         /* the mark's roots: the pinned Strings in blocks the slab does not own */
-int   sp_slab_is_str(const void *p);
 int   sp_slab_is_live(const void *p);    /* allocated, in some generation */
-int   sp_slab_is_old(const void *p);
-int   sp_slab_is_marked(const void *p);
 void  sp_slab_describe(const void *p);   /* the verifiers: what the bitmaps say about a slot */
 void  sp_slab_verify_all(void);          /* SPINEL_GC_VERIFY: the bitmaps against their invariants */
-void  sp_slab_unmark(const void *p);
 /* the mark: sets the slot's mark bit, promotes a young slot (unless `aging`
    keeps it young); 0 when the slot was already marked this cycle */
 int   sp_slab_mark(const void *p, int aging, int *was_young);
@@ -511,14 +524,13 @@ extern int sp_slab_quar_on;
 int   sp_slab_is_quarantined(const void *p);
 void  sp_slab_quarantine_trim(void);     /* under the barrier: a quarantine past its size is let go */
 extern int sp_gc_alloc_fast_ok;         /* sp_gc_alloc's lean front may run: drop to 0 to route every allocation through the full form */        /* under the barrier: the workers' claimed-not-allocated runs are unclaimed */
-typedef struct { size_t freed_obj, freed_str, freed_slots, slots, swept, kept_young, parked; } sp_slab_sweep_stats;   /* swept: finalizers run; parked: bytes of headers held by their pools */
+typedef struct { size_t freed_slots, slots, swept, kept_young, parked; } sp_slab_sweep_stats;   /* swept: finalizers run; parked: bytes of headers held by their pools */
 /* one worker's chunks: frees what the closed epoch holds unmarked (and,
    at a full cycle, the old generation's unmarked); `die` runs a dead
    object's finalizer or recycler and answers 1 when the slot is freed, 0
    when the pool keeps the header */
 void  sp_slab_sweep_worker(int wid, int full, int aging, int (*die)(void *hdr), sp_slab_sweep_stats *st);
 void  sp_slab_each_object(int young, int old, void (*fn)(void *hdr, void *arg), void *arg);
-void  sp_slab_each_string(int young, int old, void (*fn)(void *hdr, void *arg), void *arg);
 void  sp_slab_release(void);
 void  sp_slab_release_worker(int wid);   /* one worker's lists, by their owner, beside the program */
 void  sp_slab_release_from(int first);   /* the slots from `first` on, under the barrier */
@@ -561,7 +573,7 @@ extern unsigned sp_gc_verify_probe;
    the two phases' costs are actually per; see sp_gc_sweep_young. */
 extern size_t sp_gc_ct_swept, sp_gc_ct_marked;
 extern double sp_gc_ph_mark, sp_gc_ph_oldsweep, sp_gc_ph_slotsweep,
-              sp_gc_ph_rembclear, sp_gc_ph_strsweep, sp_gc_ph_trim;
+              sp_gc_ph_rembclear, sp_gc_ph_trim;
 /* The mark, split the way sp_gc_mark_all walks: this worker's own root stack,
    every live fiber's saved roots, the globals hook, then the trace that drains
    what those three found. Named as sp_gc_dbg_phase names them under verify, so
@@ -573,16 +585,18 @@ extern double sp_gc_ph_mark, sp_gc_ph_oldsweep, sp_gc_ph_slotsweep,
    fibers hold live objects). Only the first is what slicing the fiber list to
    the parked workers would address (#4384). */
 extern double sp_gc_ph_slot_max;   /* longest single sweep task, summed (sp_sched.c) */
-extern double sp_gc_ph_task_sum, sp_gc_ph_task_obj, sp_gc_ph_task_sold, sp_gc_ph_task_syoung;   /* all tasks' time, by kind */
+extern double sp_gc_ph_task_sum, sp_gc_ph_task_obj;   /* all tasks' time, by kind */
 extern unsigned long long sp_gc_ph_mk_helpers, sp_gc_ph_mk_drains;
 extern double sp_gc_ph_mk_drain, sp_gc_ph_mk_join, sp_gc_ph_mk_idle;
-extern double sp_gc_ph_conc_wait, sp_gc_ph_conc_wall, sp_gc_ph_barrier, sp_gc_ph_park, sp_gc_ph_apply_obj, sp_gc_ph_apply_str, sp_gc_ph_apply_release; extern unsigned long long sp_gc_ph_conc_waits;
+extern double sp_gc_ph_conc_wait, sp_gc_ph_conc_wall, sp_gc_ph_barrier, sp_gc_ph_park, sp_gc_ph_apply_obj, sp_gc_ph_apply_release; extern unsigned long long sp_gc_ph_conc_waits;
 extern double sp_gc_ph_mk_roots, sp_gc_ph_mk_fibers,
               sp_gc_ph_mk_globals, sp_gc_ph_mk_scan;
 extern int sp_gc_ph_on;
 void sp_gc_collect(void);
 /* the collector the program installs; NULL under --gc=none (sp_alloc.c) */
 extern void (*sp_gc_collect_fn)(void);
+extern int sp_gc_full_next;
+long long sp_gc_live_objects(void);   /* GC.stat's heap_live_slots: the objects the heap holds (sp_gc.c) */   /* GC.start's: the next collection is a full one (sp_alloc.c) */
 #ifdef SP_THREADS
 /* Sweep one worker's young list on that worker (see sp_gc.c). Survivors come
    back as a local list for the collector to splice into the old heap. */
@@ -610,7 +624,7 @@ extern int sp_gc_par_mark_on;
 static inline unsigned *sp_gc_hdr_flags(sp_gc_hdr *h) { return (unsigned *)((char *)h + offsetof(sp_gc_hdr, size) + sizeof(size_t)); }
 void sp_gc_hdr_flags_check(void);
 /* The concurrent sweep (see sp_gc.c): the driver installs both or neither. */
-extern void (*sp_gc_conc_sweep_hook)(int full, int str_sweep, int str_major);
+extern void (*sp_gc_conc_sweep_hook)(int full);
 extern void (*sp_gc_conc_wait_hook)(void);
 extern int sp_gc_conc_on;
 /* The old object list, for the driver: detach it whole for a full cycle's
@@ -647,6 +661,9 @@ void sp_oom_die(void);
    the collector marks a table only while its object lives, and drops the
    entry of an object it frees (lib/sp_gc.c). */
 void *sp_ivtbl_get(const void *obj);
+/* the lock of the tables' contents: around every read and write of a table (lib/sp_gc.c) */
+void sp_ivtbl_tables_lock(void);
+void sp_ivtbl_tables_unlock(void);
 void sp_ivtbl_put(const void *obj, void *tbl);
 #ifdef SP_CEXT
 /* The same for the names a C extension sets without the @ (rb_iv_set(obj,
@@ -657,25 +674,13 @@ void sp_ivtbl_hidden_put(const void *obj, void *tbl);
 /* the TU's rendering of an ivar table, for Random#inspect (set with the first table) */
 extern const char *(*sp_ivtbl_inspect_fn)(void *tbl);
 
-/* ---- Embedder callbacks supplied by the generated TU ----
- * The collector cannot own the program's roots or string heap (they are
- * static state in the generated TU: the regexp match globals, ARGV, the
- * in-flight exception stack, and the heap-string free list). The TU
- * installs its mark-roots and string-sweep callbacks here at startup;
- * sp_gc_mark_all / sp_gc_collect invoke them through these pointers, the
- * same way fibers register sp_gc_mark_suspended_fibers_hook. */
+/* ---- Embedder callbacks supplied by the generated TU ---- */
 extern void (*sp_gc_mark_globals_hook)(void);
-extern void (*sp_gc_mark_io_timeouts_hook)(void);
+extern void (*sp_gc_mark_static_streams_hook)(void);
 #ifdef SP_CEXT
 extern void (*sp_gc_mark_cext_hook)(void);
 extern void (*sp_gc_sweep_cext_hook)(int full);
 #endif
-extern void (*sp_gc_str_sweep_hook)(void);
-/* Whether the string heap's own schedule (or its growth backstop) would take
-   a major this cycle. A string major needs a whole-heap mark, so under the
-   minor mark the object cycle it lands on has to be full; the collector asks
-   this before it decides. */
-extern int (*sp_gc_str_major_due_hook)(void);
 
 /* ---- value-introspection hooks (set by the generated TU at startup) ----
  * lib/sp_json.c (and other cold readers) own no container types; they reach the
@@ -698,9 +703,12 @@ extern void (*sp_json_hash_set_fn)(sp_RbVal, const char *, sp_RbVal);
 /* Recursive #inspect of a boxed value, for lib/sp_inspect.c's container walker
    (set to sp_poly_inspect; same idiom as the JSON hooks). */
 extern const char *(*sp_poly_inspect_fn)(sp_RbVal);
-/* #to_s of any boxed value, for a package that writes one (StringIO#puts):
-   the generated TU installs sp_poly_to_s, which renders a user object
-   through its own #to_s or the #<Name:0xADDR> default. */
+/* The archive formatter invokes an object override once. Native packages
+   can call it even in a program without a boxed-value renderer installed. */
+const char *sp_poly_to_s(sp_RbVal v);
+/* The display result and its byte length for native writers. */
+const char *sp_poly_to_s_bytes(sp_RbVal v, size_t *length);
+const char *sp_poly_to_s_bytes_owner(sp_RbVal v, size_t *length, struct sp_String_s **owner);
 extern const char *(*sp_poly_to_s_fn)(sp_RbVal);
 /* Convert a plain object (a Struct) to a boxed StrPoly hash of its members,
    generic (no format knowledge). The generated program installs it (switch on
@@ -722,6 +730,10 @@ extern const char *const *sp_poly_enum_lacks_names;
 /* user-object #to_a for container-read poly receivers (#3234): installed by
    the generated prologue when any instantiated class defines a no-arg to_a */
 extern sp_RbVal (*sp_obj_to_a_fn)(sp_RbVal);
+/* the elements a program Enumerable's #each yields, whatever its own #to_a
+   answers: installed when any instantiated class with an #each reaches
+   Enumerable */
+extern sp_RbVal (*sp_obj_each_a_fn)(sp_RbVal);
 /* #to_ary, the CONVERSION protocol -- distinct from to_a, the enumeration
    one: Kernel#Array asks to_ary first, and only a class that defines it
    answers here (#4187). */
@@ -738,16 +750,17 @@ extern sp_RbVal (*sp_obj_with_fn)(sp_RbVal, sp_RbVal);
 /* default Object#inspect for user objects: the generated TU installs a
    per-class ivar walk (sp_obj_inspect_sw); sp_poly_inspect's OBJ default
    consults it so nested/boxed objects render like CRuby */
-extern const char *(*sp_obj_inspect_fn)(int cls_id, void *p);
+extern sp_RbVal (*sp_obj_inspect_fn)(int cls_id, void *p, int *found);
 /* Same shape for user #to_s: sp_poly_to_s's OBJ default consults it so a
    boxed user object with a custom to_s renders through it. */
-extern const char *(*sp_obj_to_s_fn)(int cls_id, void *p);
+extern sp_RbVal (*sp_obj_to_s_fn)(int cls_id, void *p, int *found);
 /* CRuby's implicit conversion protocol on BOXED user objects: the runtime's
    Integer/String conversion sites (pack, typed-slot coercions) reach a
-   compiled #to_int / #to_str through these. A class without the method is
-   the default arm (*ok = 0 / NULL) and the caller raises CRuby's TypeError. */
+   compiled #to_int / #to_str through these. The default arm clears the
+   output flag. The String bridge returns the boxed result, preserving a
+   String subclass and distinguishing a missing conversion from nil. */
 extern sp_int (*sp_obj_to_int_fn)(int cls_id, void *p, int *ok);
-extern const char *(*sp_obj_to_str_fn)(int cls_id, void *p);
+extern sp_RbVal (*sp_obj_to_str_fn)(int cls_id, void *p, int *found);
 /* #to_path, which File/Dir/IO's path slots ask before #to_str (CRuby's
    rb_get_path); NULL when the class defines none. */
 extern const char *(*sp_obj_to_path_fn)(int cls_id, void *p);
@@ -787,13 +800,11 @@ extern int (*sp_class_kind_of_name_fn)(int cls, const char *name);
    program; NULL leaves only the builtin modules known) */
 extern int (*sp_class_is_module_fn)(sp_Class c);
 
-/* ---- Hot inline mark helpers (inlined into both sides) ----
- * String tag bytes: 0xfe heap-unmarked -> 0xfc marked (0xfa -> 0xf8 for a
- * collectable frozen one); others skipped. */
+/* ---- Marking addresses and String payload views ---- */
 #ifdef SP_GC_NONE
 static inline void sp_gc_mark_str(const char *s) { (void)s; }   /* (--gc=none: see sp_gc_mark) */
 #else
-void sp_gc_mark_str(const char *s);   /* lib/sp_gc.c: the bitmap mark of a slab string, the byte of a malloc'd one */
+void sp_gc_mark_str(const char *s);   /* byte views whose header immediately follows their owner */
 #endif
 /* The frozen bit of a GC object's header */
 static inline sp_bool sp_gc_is_frozen(void *p) { if (!p) return FALSE; return ((sp_gc_hdr *)((char *)p - sizeof(sp_gc_hdr)))->frozen; }
@@ -819,20 +830,17 @@ static inline void sp_mark_string(const char *s) {
     void *o = SP_STR_BORN_LINK(((const sp_str_hdr *)(s - 1)) - 1);
     if (o && (const char *)o + sizeof(struct sp_String_s) == (const char *)(((const sp_str_hdr *)(s - 1)) - 1)) sp_gc_mark(o);
   }
-  /* No frozen (0xf1) branch here: this is inlined into optcarrot's GC mark and
-     is layout-sensitive. A live frozen heap string is kept immortal by
-     sp_str_sweep instead (#1449). */
+  else if ((unsigned char)s[-1] == 0xf9) sp_gc_mark((void *)s);
 }
 static inline void sp_mark_rbval(sp_RbVal v) {
-  if (v.tag == SP_TAG_STR) sp_mark_string(v.v.s);
   /* A class boxed by name holds its name: a Method's owner is named with a
      fresh copy, and nothing else keeps that copy -- an Array holding the
      class printed the next string allocated in its place. Literal names
      (SPL), and the copy kept for an exception's class (sp_exc_class_name),
      are not heap strings and mark as nothing. */
-  else if (v.tag == SP_TAG_CLASS && v.cls_id == SP_CLASS_BY_NAME) sp_mark_string(v.v.s);
+  if (v.tag == SP_TAG_CLASS && v.cls_id == SP_CLASS_BY_NAME) sp_mark_string(v.v.s);
   else if (v.tag == SP_TAG_OBJ && v.cls_id != SP_BUILTIN_FOREIGN_PTR &&
-           v.cls_id != SP_BUILTIN_REGEX && v.cls_id != SP_BUILTIN_ARGF) sp_gc_mark(v.v.p);
+           v.cls_id != SP_BUILTIN_REGEX && v.cls_id != SP_BUILTIN_ARGF && v.cls_id != SP_BUILTIN_ENV) sp_gc_mark(v.v.p);
   else if (v.tag == SP_TAG_BIGINT) sp_gc_mark(v.v.p);
 }
 /* A scratch root: the proc calling convention's side channel keeps its last
@@ -843,8 +851,8 @@ static inline void sp_mark_rbval(sp_RbVal v) {
    some live object, marked a cycle longer than needed, which is harmless. */
 static inline void sp_mark_rbval_scratch(sp_RbVal v) {
   const void *h = NULL;
-  if (v.tag == SP_TAG_STR || (v.tag == SP_TAG_CLASS && v.cls_id == SP_CLASS_BY_NAME)) { if (v.v.s && ((unsigned char)v.v.s[-1] | 0x04) == 0xfe) h = ((const sp_str_hdr *)(v.v.s - 1)) - 1; }
-  else if ((v.tag == SP_TAG_OBJ && v.cls_id != SP_BUILTIN_FOREIGN_PTR && v.cls_id != SP_BUILTIN_REGEX && v.cls_id != SP_BUILTIN_ARGF) || v.tag == SP_TAG_BIGINT) { if (v.v.p) h = (const char *)v.v.p - sizeof(sp_gc_hdr); }
+  if (v.tag == SP_TAG_CLASS && v.cls_id == SP_CLASS_BY_NAME) { if (v.v.s && ((unsigned char)v.v.s[-1] | 0x04) == 0xfe) h = ((const sp_str_hdr *)(v.v.s - 1)) - 1; }
+  else if ((v.tag == SP_TAG_OBJ && v.cls_id != SP_BUILTIN_FOREIGN_PTR && v.cls_id != SP_BUILTIN_REGEX && v.cls_id != SP_BUILTIN_ARGF && v.cls_id != SP_BUILTIN_ENV) || v.tag == SP_TAG_BIGINT) { if (v.v.p) h = (const char *)v.v.p - sizeof(sp_gc_hdr); }
   /* (a String born inside its handle: the handle's GC object is the slot) */
   if (h && v.tag != SP_TAG_OBJ && v.tag != SP_TAG_BIGINT) {
     const void *o = SP_STR_BORN_LINK((const sp_str_hdr *)h);
@@ -863,10 +871,8 @@ static inline void sp_cell_scan_rbval(void *p) { sp_mark_rbval(*(sp_RbVal *)p); 
    strings to mark (sp_box_srange's scan, for the cell). */
 static inline void sp_cell_scan_srange(void *p) {
   sp_StrRange *r = (sp_StrRange *)p;
-  if (r->first) sp_mark_string(r->first);
-  if (r->last) sp_mark_string(r->last);
-  if (r->hf) sp_gc_mark(r->hf);
-  if (r->hl) sp_gc_mark(r->hl);
+  sp_gc_mark(r->first);
+  sp_gc_mark(r->last);
 }
 /* A captured Proc rides in an sp_int cell as (sp_int)(uintptr_t)ptr -- the cell
    is an integer slot, but what it holds is a collectable object, and without a

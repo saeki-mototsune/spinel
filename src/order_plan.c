@@ -246,10 +246,8 @@ static int call_is_poly_field_read(Compiler *c, int id) {
     return 0;
   for (int k = cls_set_next(s, -1); k >= 0; k = cls_set_next(s, k)) {
     if (k >= c->nclasses || c->classes[k].is_native_class) return 0;
-    int rdc = -1;
-    if (!comp_reader_in_chain(c, k, nm, &rdc)) return 0;
     if (!call_attr_target(c, -1, k, nm, 0, NULL)) return 0;
-    if (comp_method_vis_in_chain(c, k, nm) != SP_VIS_PUBLIC) return 0;
+    if (cplan_method_vis(c, id, k, nm, 0, NULL) != SP_VIS_PUBLIC) return 0;
   }
   return 1;
 }
@@ -305,6 +303,7 @@ typedef struct OrderFacts {
   int *row_of;            /* [n] the owner's row; -1 visited, nothing bound; -2 not visited */
   int *slot_at;           /* [n] the operand's slot, -1 */
   unsigned char *code;    /* [n] the walk's memo: 1 runs no code, 2 runs code */
+  unsigned char *drop;    /* [n] order_may_drop_state's answer: the OS_REASSIGN and OS_IMPL bits of order_sum, kept past the phase */
   /* --dump-order=all: the lists with no row, and why (1 every operand a
      pure read, 2 one code operand last beside immutable values) */
   int *none;
@@ -406,7 +405,8 @@ static OrderFacts *order_facts_new(int n) {
   f->row_of = malloc(sizeof *f->row_of * (size_t)(n + 1));
   f->slot_at = malloc(sizeof *f->slot_at * (size_t)(n + 1));
   f->code = calloc((size_t)n + 1, 1);
-  if (!f->row_of || !f->slot_at || !f->code) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  f->drop = calloc((size_t)n + 1, 1);
+  if (!f->row_of || !f->slot_at || !f->code || !f->drop) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   for (int i = 0; i < n; i++) { f->row_of[i] = -2; f->slot_at[i] = -1; }
   return f;
 }
@@ -431,7 +431,7 @@ static void order_facts_scratch_free(OrderFacts *f) {
 }
 static void order_facts_del(OrderFacts *f) {
   if (!f) return;
-  free(f->row); free(f->slot); free(f->row_of); free(f->slot_at); free(f->code);
+  free(f->row); free(f->slot); free(f->row_of); free(f->slot_at); free(f->code); free(f->drop);
   free(f->none); free(f->none_why);
   order_facts_scratch_free(f);
   free(f);
@@ -610,6 +610,12 @@ static unsigned order_sum(Compiler *c, OrderFacts *f, int id) {
   if (m) f->sum[id] = (unsigned char)r;
   return r;
 }
+/* See order_plan.h. */
+int order_may_drop_state(Compiler *c, int node) {
+  if (node < 0) return 0;
+  return !c->order || node >= c->order->n || c->order->drop[node] != 0;
+}
+
 /* A local's write at `x`, at place pos of the local index. */
 static void order_local_write_at(Compiler *c, OrderFacts *f, int x, int pos) {
   const char *wn = comp_is_local_write(nt_kind(c->nt, x)) ? nt_str(c->nt, x, "name") : NULL;
@@ -903,6 +909,7 @@ static OrderFacts *order_facts_make(Compiler *c) {
     facts_decide(c, f, id, &l);
   }
   oplist_free(&l);
+  for (int id = 0; id < f->n; id++) f->drop[id] = (unsigned char)(order_sum(c, f, id) & (OS_REASSIGN | OS_IMPL));
   order_facts_scratch_free(f);
   return f;
 }
@@ -1102,6 +1109,12 @@ void order_facts_check(Compiler *c) {
     /* (a node made after the phase has no row there) */
     const OpOrder *a = id < was->n && was->row_of[id] >= 0 ? &was->row[was->row_of[id]] : NULL;
     const OpOrder *b = now->row_of[id] >= 0 ? &now->row[now->row_of[id]] : NULL;
+    /* (the state column of a node the phase saw is what the phase left) */
+    if (id < was->n && was->drop[id] != now->drop[id]) {
+      bad++;
+      fprintf(stderr, "spinel: SPINEL_ORDER_CHECK: the state column of node %d (%s, line %lld) moved between the phase and the seal\n",
+              id, nt_type(c->nt, id) ? nt_type(c->nt, id) : "?", (long long)nt_int(c->nt, id, "node_line", 0));
+    }
     if (!order_rows_differ(was, a, now, b)) continue;
     bad++;
     fprintf(stderr, "spinel: SPINEL_ORDER_CHECK: the row of node %d (%s, line %lld) moved between the phase and the seal\n",

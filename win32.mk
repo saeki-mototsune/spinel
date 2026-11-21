@@ -61,6 +61,10 @@ lib/win32/lib%.a:
 	ar rcs $@
 lib/libspinel_rt.a lib/libspinel_rt_mt.a: | $(PLATFORM_STUB_LIBS)
 
+# Windows has no pseudo-terminal a POSIX pty package can open, and CRuby
+# builds no ext/pty there: the package's C is not compiled here.
+PLATFORM_NO_PKG_OBJS = packages/pty/sp_pty.o
+
 # every bundled package object includes the runtime headers, and so the shim's
 $(foreach p,$(wildcard packages/*/sp_*.c),$(p:.c=.o) $(p:.c=_mt.o)): $(PLATFORM_HDRS)
 
@@ -90,12 +94,15 @@ TEST_SKIP += test/process_spawn_failure_names_path.rb test/process_spawn_file_re
 TEST_SKIP += test/process_spawn_splat_and_pair.rb test/std_stream_stat.rb
 # the user database knows the current user alone, as uid 0, and no group
 TEST_SKIP += packages/etc/test/etc_each.rb packages/etc/test/etc_getgr.rb packages/etc/test/etc_getpw.rb
+TEST_SKIP += test/file_expand_path_user.rb
 # no fork: Process.daemon is NotImplementedError there, as in CRuby
 TEST_SKIP += test/process_daemon.rb
+# no pty package (PLATFORM_NO_PKG_OBJS above)
+TEST_SKIP += $(wildcard packages/pty/test/*.rb)
 # no job control: SIGSTOP ends a child, so no wait sees one stopped
 TEST_SKIP += test/process_wait_wuntraced.rb test/process_wait_flags_thread.rb
 # FIFOs (File.mkfifo)
-TEST_SKIP += test/fifo_open_does_not_pin_worker.rb test/issue_3118.rb
+TEST_SKIP += test/fifo_open_does_not_pin_worker.rb test/issue_3118.rb test/fifo_read_open_waits.rb
 # Linux's numeric O_* flags; ELF-only asm; NTFS's 100 ns file times
 TEST_SKIP += test/io_sysopen_flags.rb test/ffi_bool_return_low_byte.rb test/file_utime_nanoseconds.rb
 # what RbConfig and Gem.win_platform? answer on Windows, as in CRuby there

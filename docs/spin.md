@@ -361,10 +361,11 @@ comes to differ from another's without anyone noticing.
 
 Installed but outside the linker's default directories is a different case:
 Homebrew on Apple Silicon puts jemalloc in `/opt/homebrew/lib`, which Apple's
-linker does not search. When `pkg-config` knows the library, `spin` puts the
-directories it reports on `LIBRARY_PATH` for the build, so such a library links
-without any setup. `spin pack` writes no host path into what it packs; the
-build host's own linker and `LIBRARY_PATH` find it there.
+linker does not search. When `pkg-config` knows the library, `spin` adds the
+directories it reports to its flags as `--link -L<dir>`, so such a library
+links without any setup, under `spin build` and under a driver that compiles
+with `spin flags` alike. `spin pack` writes no host path into what it packs;
+the build host's own linker and `LIBRARY_PATH` find it there.
 
 On two Rails-derived applications compiled by spinel, `"jemalloc"` was worth
 +58% on one OS worker and +25% on twelve for a 420 KB page, and +22% and +59%
@@ -583,6 +584,35 @@ init function and an `.h` contract that states each entry's C signature;
 the emitted `ext/<name>/<name>.h` of any scaffolded gem is a worked example
 of the contract.
 
+A native String result has type `sp_String *`. Include the generated header
+and use `sp_String_cstr` for a text read after checking for `NULL`. The
+handle carries the byte length and encoding. A host sharing the kernel's
+Spinel runtime can root the handle while calling back into it. When the
+loaded library has its own runtime, the host copies the bytes using their
+length before another call into the kernel. The CRuby shim also copies the
+String with its length and encoding and returns `nil` for a null result.
+
+A host that loads the library as a shared object (`dlopen`, Python's
+ctypes, a Swift or C# binding) links it over the position-independent
+runtime: `make runtime-pic` builds `lib/libspinel_rt_pic.a`, and
+`cc -fPIC -shared -Ilib kernel.c lib/libspinel_rt_pic.a -lm -o libkernel.so`
+builds the object. The regular `libspinel_rt.a` is built for an executable,
+and a shared link refuses its relocations. A kernel that calls
+`String#crypt` adds `-lcrypt` on glibc Linux, as `spinel` does for a
+program: the shared link succeeds without it, and `dlopen` then refuses
+the object for its undefined `crypt`.
+
+A library that requires a bundled package with C of its own (`json`,
+`zlib`, `openssl`, ...) names its object in its C, as
+`/* SPINEL_LINK_OBJ: packages/json/sp_json.o */`; a shared object links
+the position-independent build beside it, `packages/json/sp_json_pic.o`,
+which `make runtime-pic` builds too. A library that uses threads links
+`lib/libspinel_rt_mt_pic.a` and the packages' `sp_<p>_mt_pic.o`, and is
+compiled with `-DSP_THREADS -fPIC` (not the `-ftls-model=initial-exec` an
+executable takes: a loaded object gets no room for this runtime's
+thread-local state in that model). Its thread-local reads cost more there:
+an allocating entry ran about 25% more instructions than in an executable.
+
 An entry can answer an object of the program (declare its return `untyped`
 in inline RBS, and the host gets it boxed). `--ext-class C,...` (a class
 by its name or by its path, `A::B`; or `--ext-class all`) exports the
@@ -592,13 +622,37 @@ which calls the method `name` of a boxed object, or the singleton method
 `name` of a boxed class value, with boxed arguments, and answers 0 when
 the class has no such method; and `sp_ext_methods(cls_id)`, the table of a
 class (each row a name, its arity, the class that defines it, whether it
-is a singleton method, and the thunk). The table holds the methods a `def`
-or a `def self.` defines, inherited ones included, and the `attr_*`
+is a singleton method, the thunk, and whether the row takes a block). The
+table holds the methods a `def`
+or a `def self.` defines, inherited ones and the ones of a module the
+class includes among them, and the `attr_*`
 readers and writers. A method with optional or rest parameters has one row
 for each count of arguments it takes: `def m(a, b = 1)` has the rows `m`
 of arity 1 and of arity 2, and a rest parameter makes a row of a negative
 arity, `-(n + 1)` for `n` arguments or more, as `Method#arity` counts. A
-method with a keyword or block parameter, or with a required parameter
+method with a block parameter, or one that yields, has its rows twice: the
+rows of a call with no block, and the same rows with `block` set, which
+`sp_ext_send_block(recv, name, argc, argv, block, &out)` calls with a
+boxed Proc. A host makes its Proc with `sp_proc_new(fn, cap, cap_scan)`:
+the runtime calls `fn(cap, argc, args)`, which reads its boxed argument
+`k` with `sp_proc_arg(k)` and answers with `sp_proc_ret_set(v)`
+(`test/ext/methods_blk_host.c`). A method that takes no block goes on
+without the block. The forwarders of a block are calls of the program
+with a block of no known kind, so a local of the method that holds what
+the block answers is boxed for every call of the method. The table of a
+class holds `new` too, as a singleton method of the class value: a row
+for each count of arguments its `initialize` takes (with `block` set too,
+when the `initialize` yields), or a row of no argument for a class with
+no `initialize`. A class that inherits its `initialize` has the rows of
+that `initialize`, and its `new` answers an object of the class itself
+(`test/ext/methods_new_host.c`). A class with a private `new`
+(`private_class_method :new`) has no row, and a class that defines
+`self.new`, or is under one that does, has the rows of that method. These
+have no row of `new`: a class under a class that is not of the program
+(`StandardError`, `Array`, a `Struct.new(...)`), a class that a
+`Class.new` or `Struct.new` call makes, and a class with the `initialize`
+of a module. A
+method with a keyword parameter, or with a required parameter
 after an optional one, stays out of the table, as does a private or
 protected one, and one
 with a parameter whose kind the thunk cannot check a host's argument

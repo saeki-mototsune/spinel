@@ -19,6 +19,7 @@ sp_RbVal sp_cext_ary_delete(sp_RbVal, sp_RbVal);
 double sp_cext_num2dbl(sp_RbVal);
 int sp_cext_integer_pack(sp_RbVal, void *, size_t, size_t);
 sp_RbVal sp_cext_sym2str(sp_sym);
+struct sp_String_s *sp_cext_sym_name_handle(sp_sym);
 sp_RbVal sp_cext_str_plus(sp_RbVal, sp_RbVal);
 sp_RbVal sp_cext_widen_array(sp_RbVal);
 
@@ -33,7 +34,6 @@ typedef struct {
     size_t constant_count;
     const char *name;   /* the extension's name: its Class.new classes are named by it */
 } sp_cext_extension;
-sp_PolyArray *sp_cext_share_new_array(sp_PolyArray *);
 void sp_cext_init(sp_cext_extension *);
 void sp_cext_lock(void);
 void sp_cext_unlock(void);

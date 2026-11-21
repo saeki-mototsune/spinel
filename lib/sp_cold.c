@@ -21,6 +21,7 @@
 #include <stdlib.h>
 #include <stdarg.h>   /* sp_sprintf */
 #include <unistd.h>
+#include <pwd.h>     /* getpwnam for File.expand_path("~user") */
 #include "sp_alloc.h"   /* sp_str_alloc / sp_str_set_len / sp_raise_cls */
 #include "sp_array.h"   /* sp_StrArray for Dir.glob */
 #include "sp_hash.h"    /* sp_StrIntHash for Dir.glob(sort: false) */
@@ -44,6 +45,7 @@
 #include "sp_system.h" /* sp_last_status for backtick */
 #include "sp_format.h" /* sp_float_to_rational for sp_float_denominator/numerator */
 #include <sys/select.h>  /* IO.select and the IO#wait_* readiness family */
+#include <sys/ioctl.h>   /* FIONREAD: a read-only FIFO open asking for a writer */
 #include <poll.h>        /* POLLIN/POLLOUT for the scheduler park behind them */
 #include <sys/socket.h> /* SOCK_STREAM / SOCK_DGRAM for Addrinfo */
 
@@ -260,6 +262,28 @@ int sp_fmt_binary_big(const char *spec, size_t sl, char conv, const char *mag,
   return o;
 }
 
+/* "~name" at the start of p: the home of that user from the passwd database,
+   as CRuby expands it, with *rest at the path after the name; ArgumentError
+   for a user it has not. NULL when p is not of that form ("~", "~/x", a
+   name with no tilde). Windows has no passwd database: NULL there. */
+static const char *sp_file_tilde_home(const char *p, const char **rest) {
+#if defined(_WIN32)
+  (void)p; (void)rest;
+  return NULL;
+#else
+  if (p[0] != '~' || p[1] == '\0' || p[1] == '/') return NULL;
+  size_t n = strcspn(p + 1, "/");
+  char user[256];
+  size_t m = n < sizeof user ? n : sizeof user - 1;
+  memcpy(user, p + 1, m);
+  user[m] = 0;
+  struct passwd *pw = getpwnam(user);
+  if (!pw) sp_raise_cls("ArgumentError", sp_sprintf("user %s doesn't exist", user));
+  *rest = p + 1 + n;
+  return pw->pw_dir;
+#endif
+}
+
 /* File.expand_path(path[, base]): absolute, `.`/`..`/`//`-normalized path.
    Depends only on sp_alloc.h + libc; no program-generated symbols. */
 const char *sp_file_expand_path(const char *path, const char *base) {
@@ -283,7 +307,11 @@ const char *sp_file_expand_path(const char *path, const char *base) {
      silences -Wformat-truncation (an error under the test harness's
      -Werror). 4000 chars/component is well past PATH_MAX, so real paths
      never truncate. */
-  if (path[0] == '~' && (path[1] == '\0' || path[1] == '/')) {
+  const char *urest, *uhome = sp_file_tilde_home(path, &urest);
+  if (uhome) {   /* ~user */
+    snprintf(raw, sizeof(raw), "%.4000s%.4000s", uhome, urest);
+  }
+  else if (path[0] == '~' && (path[1] == '\0' || path[1] == '/')) {
     snprintf(raw, sizeof(raw), "%.4000s%.4000s", home, path + 1);
   }
 #if defined(_WIN32)
@@ -297,7 +325,12 @@ const char *sp_file_expand_path(const char *path, const char *base) {
     char basebuf[8192];
     const char *b;
     if (base && base[0]) {
-      if (base[0] == '~' && (base[1] == '\0' || base[1] == '/')) {
+      const char *brest, *bhome = sp_file_tilde_home(base, &brest);
+      if (bhome) {   /* ~user */
+        snprintf(basebuf, sizeof(basebuf), "%.4000s%.4000s", bhome, brest);
+        b = basebuf;
+      }
+      else if (base[0] == '~' && (base[1] == '\0' || base[1] == '/')) {
         snprintf(basebuf, sizeof(basebuf), "%.4000s%.4000s", home, base + 1);
         b = basebuf;
       }
@@ -505,6 +538,7 @@ sp_Complex sp_str_to_c_strict(const char *s) { return sp_str_to_c_impl(s, 1); }
 /* FNM_DOTMATCH mode for the walk below: hidden entries (and ".") match a
    non-dot pattern; ".." never does, as CRuby's glob. Set by the _dot wrapper. */
 static int sp_glob_dotmatch = 0;
+static int sp_glob_flags = 0;   /* the FNM_NOESCAPE of the running glob */
 /* A glob walk holds open directories and brace buffers (as File.fnmatch's
    FNM_EXTGLOB holds the latter), so the matcher's ArgumentError waits until
    they are let go: under sp_glob_defer
@@ -690,12 +724,15 @@ static int sp_fnm_match(const char *p, const char *s, int flags) {
    leading dot is hidden unless the pattern asks for one or the glob runs
    under FNM_DOTMATCH, which is CRuby's rule. */
 static int sp_glob_comp_match(const char *comp, const char *name) {
-  return sp_fnm_match(comp, name, sp_glob_dotmatch ? SP_FNM_DOTMATCH : 0);
+  return sp_fnm_match(comp, name, (sp_glob_dotmatch ? SP_FNM_DOTMATCH : 0) | (sp_glob_flags & SP_FNM_NOESCAPE));
 }
 
+/* Whether a component is read from its directory by the matcher: a wildcard,
+   or a backslash, which escapes the character after it ("foo\\ bar" names
+   "foo bar") and so is not the name on the disk. */
 static int sp_glob_has_meta(const char *comp) {
   for (const char *p = comp; *p; p++)
-    if (*p == '*' || *p == '?' || *p == '[') return 1;
+    if (*p == '*' || *p == '?' || *p == '[' || *p == '\\') return 1;
   return 0;
 }
 
@@ -835,6 +872,7 @@ static void sp_glob_finish(void) {
   if (!sp_glob_bad) return;
   sp_glob_bad = 0;
   sp_glob_dotmatch = 0;
+  sp_glob_flags = 0;
   sp_raise_cls("ArgumentError", (&("\xff" "invalid byte sequence in UTF-8")[1]));
 }
 
@@ -1021,14 +1059,18 @@ sp_StrArray *sp_dir_glob_base(const char *pattern, const char *base) {
 }
 
 const char *sp_poly_inspect(sp_RbVal v);   /* lib/sp_poly_cold.c */
-/* Dir.glob's keyword options reuse the walk; sort: false keeps the walk's
-   order, which the filesystem gives. */
-sp_StrArray *sp_dir_glob_options(const char *pattern, const char *base, sp_bool dotmatch, sp_RbVal sort) {
+/* Dir.glob's flags and keyword options reuse the walk: FNM_DOTMATCH and
+   FNM_NOESCAPE reach the matcher of each component; FNM_CASEFOLD and the
+   others change nothing in a glob, as CRuby ignores them there (the case
+   rule is the filesystem's); sort: false keeps the walk's order, which the
+   filesystem gives. */
+sp_StrArray *sp_dir_glob_flags(const char *pattern, const char *base, sp_int flags, sp_RbVal sort) {
   SP_GC_ROOT_STR(pattern); SP_GC_ROOT_STR(base); SP_GC_ROOT_RBVAL(sort);
   if (sort.tag != SP_TAG_BOOL)
     sp_raise_cls("ArgumentError", sp_sprintf("expected true or false as sort: %s", sp_poly_inspect(sort)));
-  int old_dotmatch = sp_glob_dotmatch;
-  sp_glob_dotmatch = dotmatch;
+  int old_dotmatch = sp_glob_dotmatch, old_flags = sp_glob_flags;
+  sp_glob_dotmatch = (flags & SP_FNM_DOTMATCH) != 0;
+  sp_glob_flags = (int)flags;
   sp_StrArray *a;
   if (sort.v.i) a = sp_dir_glob_base(pattern, base);
   else {
@@ -1053,7 +1095,12 @@ sp_StrArray *sp_dir_glob_options(const char *pattern, const char *base, sp_bool 
     a->len = w;
   }
   sp_glob_dotmatch = old_dotmatch;
+  sp_glob_flags = old_flags;
   return a;
+}
+
+sp_StrArray *sp_dir_glob_options(const char *pattern, const char *base, sp_bool dotmatch, sp_RbVal sort) {
+  return sp_dir_glob_flags(pattern, base, dotmatch ? SP_FNM_DOTMATCH : 0, sort);
 }
 
 sp_StrArray *sp_dir_glob(const char *pattern) { return sp_dir_glob_base(pattern, NULL); }
@@ -1504,12 +1551,13 @@ sp_int sp_int_round_half(sp_int v, sp_int nd, int mode) {
 }
 
 sp_RbVal sp_poly_replace(sp_RbVal recv, sp_RbVal src);
+const char *sp_poly_class_name(sp_RbVal v);   /* lib/sp_poly_cold.c */
 
 static const char *sp_typed_elem_class(sp_RbVal v) {
   switch (v.tag) {
+    case SP_TAG_OBJ: return sp_poly_class_name(v);
     case SP_TAG_INT: case SP_TAG_BIGINT: return "Integer";
     case SP_TAG_FLT: return "Float";
-    case SP_TAG_STR: return "String";
     case SP_TAG_SYM: return "Symbol";
     case SP_TAG_BOOL: return v.v.i ? "true" : "false";
     default: return "Object";
@@ -1564,10 +1612,9 @@ static void sp_typed_array_replace_boxed(sp_RbVal recv, sp_RbVal src) {
       sp_StrArray *st = sp_StrArray_new(); SP_GC_ROOT(st);
       for (sp_int i = 0; i < els->len; i++) {
         sp_RbVal e = els->data[i];
-        if (e.tag == SP_TAG_STR) sp_StrArray_push_e(st, sp_String_new_shared(e.v.s));
-        else if (e.tag == SP_TAG_OBJ && e.cls_id == SP_BUILTIN_STRBUF)
+        if (e.tag == SP_TAG_OBJ && e.cls_id == SP_BUILTIN_STRBUF)
           sp_StrArray_push_e(st, (sp_strelem)e.v.p);   /* the handle itself: one String */
-        else if (e.tag == SP_TAG_NIL) sp_StrArray_push(st, NULL);
+        else if (e.tag == SP_TAG_NIL) sp_StrArray_push_e(st, NULL);
         else sp_typed_replace_elem_error(e, "String");
       }
       sp_StrArray_replace((sp_StrArray *)recv.v.p, st);
@@ -1591,10 +1638,7 @@ sp_RbVal sp_poly_replace(sp_RbVal recv, sp_RbVal src) {SP_GC_ROOT_RBVAL(recv);SP
      takes the source's encoding as well, as CRuby's replace does. */
   if (recv.cls_id == SP_BUILTIN_STRBUF) {
     sp_String *m = (sp_String *)recv.v.p;
-    const char *s2 = NULL;
-    if (src.tag == SP_TAG_STR) s2 = src.v.s;
-    else if (src.tag == SP_TAG_OBJ && src.cls_id == SP_BUILTIN_STRBUF)
-      s2 = sp_String_cstr((sp_String *)src.v.p);
+    const char *s2 = sp_rbval_string_bytes(src);
     if (s2) sp_String_set_bin_enc(m, s2);
     return recv;
   }
@@ -1811,6 +1855,7 @@ const char *sp_backtick(const char *cmd) {SP_GC_ROOT_STR(cmd);
   int st = 0;
   { extern int sp_sched_wait_child(int pid, int *status);
     if (sp_sched_wait_child((int)pid, &st) < 0) st = -1; }
+  void sp_sig_after_wait(void);
   /* the same wait-status layout sp_system_args leaves in $? */
   sp_last_status = st;
   sp_last_pid = (int)pid;
@@ -1819,6 +1864,10 @@ const char *sp_backtick(const char *cmd) {SP_GC_ROOT_STR(cmd);
   r[len] = 0;
   sp_str_set_len(r, len);
   free(buf);
+  /* the signals recorded in the wait run once the output is a String and
+     the buffer is freed: a trap that raises leaves nothing behind */
+  SP_GC_ROOT_STR(r);
+  sp_sig_after_wait();
   return r;
 }
 
@@ -1908,11 +1957,11 @@ static int sp_transpose_row_p(sp_RbVal rv) {
 }
 static const char *sp_transpose_row_class(sp_RbVal rv) {
   switch (rv.tag) {
+    case SP_TAG_OBJ: return sp_poly_class_name(rv);
     case SP_TAG_NIL: return "nil";
     case SP_TAG_BOOL: return rv.v.i ? "true" : "false";
     case SP_TAG_INT: return "Integer";
     case SP_TAG_FLT: return "Float";
-    case SP_TAG_STR: return "String";
     case SP_TAG_SYM: return "Symbol";
     default: return "Object";
   }
@@ -2032,10 +2081,9 @@ sp_PolyArray *sp_str_chars_poly(const char *s) {SP_GC_ROOT_STR(s);
   int bin = sp_str_is_binary(s);
   const char *end = s + sp_str_byte_len(s);
   for (const char *p = s; p < end; ) {
-    int n = bin ? 1 : sp_utf8_advance(p);
-    if (p + n > end) n = (int)(end - p);
-    char *c = sp_str_alloc(n); memcpy(c, p, n); c[n] = 0;
-    sp_PolyArray_push(a, sp_box_str(c));
+    size_t n = bin ? 1 : sp_utf8_unit_len(p, (size_t)(end - p));
+    sp_String *ch = bin ? sp_String_from_cbinstr(p, n) : sp_String_new_inline_len(p, n);
+    sp_PolyArray_push(a, sp_box_obj(ch, SP_BUILTIN_STRBUF));
     p += n;
   }
   return a;
@@ -2349,7 +2397,6 @@ sp_StrArray *sp_bt_format(void **buf, int n) {
 
 #include <fcntl.h>
 #include <sys/file.h>
-#include <pwd.h>
 #include "sp_sched.h"   /* sp_native_enter / sp_native_leave for a waiting flock */
 #include <sys/wait.h>
 
@@ -2610,11 +2657,11 @@ sp_oint sp_File_getbyte(sp_File *f) {
   return ch == EOF ? sp_oint_nil() : sp_oint_of((sp_int)ch);
 }
 sp_RbVal sp_File_ungetc(sp_File *f, sp_RbVal v) {
-  v = sp_rbval_str(v);
   sp_io_check_readable(f);
-  if (v.tag == SP_TAG_STR && v.v.s && v.v.s[0]) {
-    size_t n = sp_str_byte_len(v.v.s);
-    for (size_t i = n; i > 0; i--) sp_io_ungetc(f, (unsigned char)v.v.s[i - 1]);
+  const char *bytes = sp_rbval_string_bytes(v);
+  if (bytes && bytes[0]) {
+    size_t n = sp_str_byte_len(bytes);
+    for (size_t i = n; i > 0; i--) sp_io_ungetc(f, (unsigned char)bytes[i - 1]);
   }
   else if (v.tag == SP_TAG_INT) sp_io_ungetc(f, (int)v.v.i);
   return sp_box_nil();
@@ -2654,12 +2701,12 @@ sp_int sp_File_fsync(sp_File *f) {
   return 0;
 }
 sp_RbVal sp_File_putc(sp_File *f, sp_RbVal v) {
-  /* putc answers its argument itself: a shared String's handle is read
-     as its bytes for the write only */
-  sp_RbVal w = sp_rbval_str(v);
   SP_IO_OPEN(f);
   if (v.tag == SP_TAG_INT) sp_File_put_byte(f, (int)(v.v.i & 0xff));
-  else if (w.tag == SP_TAG_STR) { if (w.v.s && w.v.s[0]) sp_File_put_byte(f, w.v.s[0]); }
+  else if (sp_rbval_is_string(v)) {
+    const char *bytes = sp_rbval_string_bytes(v);
+    if (bytes && bytes[0]) sp_File_put_byte(f, bytes[0]);
+  }
   /* anything else is no character: CRuby converts it as an Integer and
      raises for nil (the boxed nil wrote nothing and answered nil) */
   else if (v.tag == SP_TAG_NIL) sp_raise_nil_to_int(0);
@@ -2874,6 +2921,92 @@ static void sp_file_open_raise(const char *path) {
   int e = errno;
   sp_raise_cls(sp_errno_class_name(e), sp_sprintf("%s @ rb_sysopen - %s", strerror(e), path ? path : ""));
 }
+/* A byte a read-only FIFO open took while asking for a writer (below): the
+   handle made of the descriptor gets it back (sp_fifo_pushback_apply). */
+static SP_TLS int sp_fifo_pushback_fd = -1;
+static SP_TLS unsigned char sp_fifo_pushback_byte;
+int sp_fifo_pushback_take(int fd, unsigned char *c) {
+  int has = sp_fifo_pushback_fd >= 0 && fd == sp_fifo_pushback_fd;
+  if (has) *c = sp_fifo_pushback_byte;
+  sp_fifo_pushback_fd = -1;
+  return has;
+}
+void sp_fifo_pushback_apply(sp_File *f) {
+  unsigned char c;
+  if (f && f->fp && sp_fifo_pushback_take(fileno(f->fp), &c)) ungetc(c, f->fp);
+  sp_fifo_pushback_fd = -1;
+}
+
+/* The descriptor of a FIFO open, blocking again: the O_NONBLOCK of the ask
+   goes, so every read and write after this behaves as it did. */
+static int sp_fifo_opened(int fd) {
+  int g = fcntl(fd, F_GETFL);
+  if (g >= 0) fcntl(fd, F_SETFL, g & ~O_NONBLOCK);
+  return fd;
+}
+
+/* A read-only open of a FIFO waits for a writer, as CRuby's does: the
+   non-blocking form returns at once with or without one, and a read then
+   meets the end of the file where CRuby's reader gets the writer's bytes.
+   With no other green thread alive the blocking open waits, in a native
+   section so a collection does not wait for it; nothing else runs here
+   anyway. With one alive the descriptor is asked until a writer is there, which
+   the kernel tells only through a read: bytes waiting (FIONREAD), or EAGAIN
+   for a writer that has sent none, where no writer answers the end of the
+   file. A byte that arrives between the two asks is read here and kept for
+   the handle (sp_fifo_pushback_apply). */
+static int sp_fifo_open_read(const char *path, int fl, int perm) {
+  sp_fifo_pushback_fd = -1;
+  if (!sp_sched_other_threads_live()) {
+    int fd;
+    sp_native_enter();
+    while ((fd = open(path, fl, (mode_t)perm)) < 0 && errno == EINTR) {}
+    int e = errno;
+    sp_native_leave();
+    errno = e;
+    return fd;
+  }
+  /* (opened once and asked again on the one descriptor, as CRuby's reader
+     holds the FIFO from its open on: a retry of the open by path met
+     ENOENT once the program had deleted the FIFO under a reader still
+     waiting, and the thread died of it at the program's end) */
+  int fd = open(path, fl | O_NONBLOCK, (mode_t)perm);
+  if (fd < 0) return -1;
+#ifdef __linux__
+  /* On Linux the descriptor itself says when to go on, and the thread
+     sleeps in the scheduler until it does: readable once a writer has
+     sent bytes, and hung up (POLLHUP) once a writer has come and gone,
+     which a FIFO no writer ever opened is not. Nothing is read here, so
+     no byte is taken from a child handed the descriptor, and the thread
+     is asleep the whole wait (Thread#status), where an ask every
+     millisecond ran between two asks. The open answers at the writer's
+     first byte or its close, not at its open: a writer that opens and
+     waits for the reader before it writes is not met. */
+  for (;;) {
+    struct pollfd pf = { fd, POLLIN, 0 };
+    int pr = poll(&pf, 1, 0);
+    if (pr > 0 && (pf.revents & (POLLIN | POLLHUP | POLLERR))) return sp_fifo_opened(fd);
+    if (pr < 0 && errno != EINTR) { int e = errno; close(fd); errno = e; return -1; }
+    /* (the IO layer's park, in both runtimes: the one without threads has
+       no scheduler wait to link, and never comes here) */
+    sp_io_wait_fd_readable(fd);
+  }
+#else
+  for (;;) {
+#ifdef FIONREAD
+    int avail = 0;
+    if (ioctl(fd, FIONREAD, &avail) == 0 && avail > 0) return sp_fifo_opened(fd);
+#endif
+    unsigned char c;
+    ssize_t n = read(fd, &c, 1);
+    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return sp_fifo_opened(fd);
+    if (n > 0) { sp_fifo_pushback_fd = fd; sp_fifo_pushback_byte = c; return sp_fifo_opened(fd); }
+    if (n < 0 && errno != EINTR) { int e = errno; close(fd); errno = e; return -1; }
+    sp_sleep(0.001);
+  }
+#endif
+}
+
 /* open(2) on a FIFO waits for the other end, and it waits in the kernel with
    no descriptor to wait on. A green thread is pinned to its OS worker, so
    that one syscall stalls every green thread pinned there, including the one
@@ -2890,13 +3023,13 @@ static void sp_file_open_raise(const char *path) {
    stat(2) does not block on a FIFO, so asking first is safe. Anything else,
    including a path that does not exist yet, opens exactly as before and pays
    one stat: no other shape inherits O_NONBLOCK's different answers. */
-static int sp_open_fifo_aware(const char *path, int fl, mode_t perm) {
+int sp_open_fifo_aware(const char *path, int fl, int perm) {
   struct stat st;
   if (stat(path, &st) != 0 || !S_ISFIFO(st.st_mode))
-    return open(path, fl, perm);
-  extern void sp_Thread_pass(void);
+    return open(path, fl, (mode_t)perm);
+  if ((fl & O_ACCMODE) == O_RDONLY) return sp_fifo_open_read(path, fl, perm);
   for (;;) {
-    int fd = open(path, fl | O_NONBLOCK, perm);
+    int fd = open(path, fl | O_NONBLOCK, (mode_t)perm);
     if (fd >= 0) {
       int g = fcntl(fd, F_GETFL);
       if (g >= 0) fcntl(fd, F_SETFL, g & ~O_NONBLOCK);
@@ -2906,21 +3039,25 @@ static int sp_open_fifo_aware(const char *path, int fl, mode_t perm) {
        invents: "no reader yet". Every other errno is the caller's, and is
        the same errno the blocking form would have given. */
     if (!(errno == ENXIO && (fl & O_ACCMODE) == O_WRONLY)) return -1;
-    sp_Thread_pass();
-    /* nothing else runnable: do not spin the worker. nanosleep rather than a
-       zero-fd poll, which is not portable to macOS. */
-    { struct timespec ts; ts.tv_sec = 0; ts.tv_nsec = 1000000; SP_SIG_BLOCKING(nanosleep(&ts, NULL)); }
+    /* The wait is a sleep of the scheduler: the green thread parks, so the
+       other threads run on this worker meanwhile, and the worker parks at
+       the barrier of a collection another worker starts. A Thread.pass and
+       a plain nanosleep did neither when nothing else was runnable here,
+       and a collector waiting for this worker waited for good, while the
+       thread that was to start the reader waited for the collection. */
+    sp_sleep(0.001);
   }
 }
 sp_File *sp_File_open_flags_perm(const char *path, sp_int fl, sp_oint perm) {SP_GC_ROOT_STR(path);
   path = sp_str_keep(path);   /* (the File keeps its path: a copy of a live payload, sp_str_keep) */
-  int fd = sp_open_fifo_aware(path ? path : "", (int)fl | O_CLOEXEC, (mode_t)(perm.nil ? 0666 : perm.v));
+  int fd = sp_open_fifo_aware(path ? path : "", (int)fl | O_CLOEXEC, (int)(perm.nil ? 0666 : perm.v));
   if (fd < 0) sp_file_open_raise(path);
   int acc = (int)fl & O_ACCMODE;
   const char *m = (acc == O_RDONLY) ? "r"
                 : (acc == O_WRONLY) ? (((int)fl & O_APPEND) ? "a" : "w")
                 : (((int)fl & O_APPEND) ? "a+" : "r+");
   sp_File *f = sp_io_fdopen(fd, m);
+  sp_fifo_pushback_apply(f);
   f->path = path;
   f->is_file = 1;
   return f;
@@ -2937,29 +3074,14 @@ sp_File *sp_File_open_flags(const char *path, sp_int fl) {
 sp_File *sp_File_open_perm(const char *path, const char *mode, sp_oint perm) {SP_GC_ROOT_STR(path);SP_GC_ROOT_STR(mode);
   path = sp_str_keep(path);   /* (the File keeps its path: a copy of a live payload, sp_str_keep) */
   const char *m = mode && mode[0] ? mode : "r";
-  int fl;
-  switch (m[0]) {
-    case 'r': fl = O_RDONLY; break;
-    case 'w': fl = O_WRONLY | O_CREAT | O_TRUNC; break;
-    case 'a': fl = O_WRONLY | O_CREAT | O_APPEND; break;
-    default:  sp_raise_cls("ArgumentError", sp_sprintf("invalid access mode %s", m)); return NULL;
-  }
-  for (const char *q = m + 1; *q && *q != ':'; q++) {
-    if (*q == '+') fl = (fl & ~O_ACCMODE) | O_RDWR;
-    else if (*q == 'x' && m[0] == 'w') fl |= O_EXCL;  /* exclusive create is a w mode only */
-    else if (*q != 'b' && *q != 't' && *q != 'e') {
-      sp_raise_cls("ArgumentError", sp_sprintf("invalid access mode %s", m)); return NULL;
-    }
-  }
-  int fd = sp_open_fifo_aware(path ? path : "", fl | O_CLOEXEC, (mode_t)(perm.nil ? 0666 : perm.v));
+  int fl = sp_io_mode_open_flags(m);   /* the grammar IO#reopen reads too (lib/sp_io.c) */
+  if (fl < 0) { sp_raise_cls("ArgumentError", sp_sprintf("invalid access mode %s", m)); return NULL; }
+  int fd = sp_open_fifo_aware(path ? path : "", fl | O_CLOEXEC, (int)(perm.nil ? 0666 : perm.v));
   if (fd < 0) sp_file_open_raise(path);
   /* fdopen reads its own mode grammar ("wx+" is write-only to it): hand it
      the access mode the flag word says, as the flags form does */
-  int acc = fl & O_ACCMODE;
-  const char *fm = (acc == O_RDONLY) ? "r"
-                 : (acc == O_WRONLY) ? ((fl & O_APPEND) ? "a" : "w")
-                 : ((fl & O_APPEND) ? "a+" : (m[0] == 'w') ? "w+" : "r+");
-  sp_File *f = sp_io_fdopen(fd, fm);
+  sp_File *f = sp_io_fdopen(fd, sp_io_fdopen_mode(fl));
+  sp_fifo_pushback_apply(f);
   f->path = sp_str_retained(path);
   f->mode = m;
   f->is_file = 1;
@@ -3333,9 +3455,30 @@ sp_bool sp_file_zero(const char *path) {
   if (S_ISDIR(st.st_mode)) return 0;
   return st.st_size == 0;
 }
+/* File.dirname: the separators at the end of the path go first, as CRuby
+   drops them ("/usr/bin/" is in "/usr"), then the last part and the
+   separators before it ("a/b///c" is in "a/b"); a path of separators is
+   the root, one with no separator left is ".". */
+#if defined(_WIN32)
+#define SP_DIRNAME_SEP(c) ((c) == '/' || (c) == '\\')   /* a backslash separates on Windows too */
+#else
+#define SP_DIRNAME_SEP(c) ((c) == '/')
+#endif
 const char *sp_file_dirname(const char *path) {SP_GC_ROOT_STR(path);
-  const char *s = strrchr(path, '/');
-  if (!s) { char *r = sp_str_alloc(1); r[0] = '.'; r[1] = 0; return r; }
+  size_t len = strlen(path);
+  while (len > 1 && SP_DIRNAME_SEP(path[len - 1])) len--;
+  const char *s = NULL;
+  for (size_t i = len; i > 0; i--) if (SP_DIRNAME_SEP(path[i - 1])) { s = path + i - 1; break; }
+  if (!s) {
+#if defined(_WIN32)
+    /* a drive's root ("C:/", "C://") has only the separators the loop above
+       passed over: the dirname is the root itself */
+    size_t rn = sp_file_path_root_len(path);
+    if (rn > 1) { char *r = sp_str_alloc((sp_int)rn); memcpy(r, path, rn); r[rn] = 0; return r; }
+#endif
+    char *r = sp_str_alloc(1); r[0] = '.'; r[1] = 0; return r;
+  }
+  while (s > path && SP_DIRNAME_SEP(s[-1])) s--;
   if (s == path) { char *r = sp_str_alloc(1); r[0] = '/'; r[1] = 0; return r; }
 #if defined(_WIN32)
   /* the separator of a drive's root ("C:/x") stays: the dirname is the root */
@@ -3901,7 +4044,7 @@ static void sp_dir_foreach_gen(sp_Fiber *f) {
   while ((name = sp_Dir_read(dir)) != NULL) {
     if (cap->children && (strcmp(name, ".") == 0 || strcmp(name, "..") == 0)) continue;
     if (binary) sp_str_as_binary(name);
-    sp_PolyArray_push(names, sp_box_str(name));
+    sp_PolyArray_push(names, sp_box_str_new(name));
   }
   sp_Dir_close(dir);
   for (sp_int i = 0; i < names->len; i++) sp_Fiber_yield(names->data[i]);
@@ -3972,7 +4115,7 @@ static void sp_dir_each_gen(sp_Fiber *f) {
   const char *entry = NULL; SP_GC_ROOT_STR(entry);
   sp_Dir_rewind(dir);
   while ((entry = sp_Dir_read(dir)) != NULL)
-    sp_Fiber_yield(sp_box_str(entry));
+    sp_Fiber_yield(sp_box_str_new(entry));
   sp_gc_wb((void *)f);
   f->yielded_value = sp_box_obj(dir, SP_BUILTIN_DIR);
 }
@@ -4269,6 +4412,20 @@ void sp_sig_run_pending(void) {
     sp_sig_unblock(no, 0);
   }
 }
+/* A wait for a child has answered and its caller has stored $?: the signals
+   recorded while it went on run now, as CRuby runs them on the way out of
+   its wait (a trap for CHLD, which the child's own end records; a default
+   SIGINT, whose raise then leaves $? set). */
+void sp_sig_after_wait(void) {
+  if (SP_ATOMIC_LOAD(&sp_sig_pending_flag, __ATOMIC_ACQUIRE)) sp_sig_run_pending();
+}
+/* Is a proc set for a signal (EXIT aside)? A child wait of a program with
+   one thread polls while one is, so the proc runs in the wait
+   (sp_sched_wait_child_flags). */
+int sp_sig_trap_set(void) {
+  for (int no = 1; no < SP_SIG_MAX; no++) if (sp_trap_proc[no]) return 1;
+  return 0;
+}
 #ifdef SP_THREADS
 /* The threaded runtime's trap thread: parks on the wake pipe the handler
    writes, and runs the procs (sp_sig_thread_dispatch hands a raise out of
@@ -4291,8 +4448,7 @@ static void sp_sig_thread_start(void) {
   sp_sig_wake[0] = pf[0];
   SP_ATOMIC_STORE(&sp_sig_wake[1], pf[1], __ATOMIC_RELEASE);   /* the handler writes it from here on */
   started = 1;
-  sp_thread *t = sp_Thread_spawn_fiber(sp_Fiber_new(sp_sig_thread_body), sp_box_nil());
-  sp_thread_set_internal(t);
+  sp_Thread_spawn_internal(sp_Fiber_new(sp_sig_thread_body));
   /* a delivery recorded before the pipe, whose proc has not run yet */
   if (SP_ATOMIC_LOAD(&sp_sig_pending_flag, __ATOMIC_ACQUIRE)) { char b = 0; ssize_t w = write(pf[1], &b, 1); (void)w; }
 }
@@ -4312,7 +4468,6 @@ void sp_sig_exit_dispatch(void) {
   if (p) { sp_int slot = 0; _sp_proc_poly_args[0] = sp_box_int(0); sp_proc_call(p, 1, &slot); }
 }
 sp_RbVal sp_signal_trap(sp_RbVal sig, sp_RbVal handler) {SP_GC_ROOT_RBVAL(sig);SP_GC_ROOT_RBVAL(handler);
-  handler = sp_rbval_str(handler);
   int no = sp_signal_resolve(sig);
   if (no == SIGKILL || no == SIGSTOP)
     sp_raise_cls("Errno::EINVAL",
@@ -4320,9 +4475,10 @@ sp_RbVal sp_signal_trap(sp_RbVal sig, sp_RbVal handler) {SP_GC_ROOT_RBVAL(sig);S
   /* the previous handler: a stored proc or command string; an untouched
      signal reads "DEFAULT", except EXIT whose default handler is nil (#2839) */
   sp_RbVal prev = sp_trap_proc[no] ? sp_box_proc((sp_Proc *)sp_trap_proc[no])
-                : sp_trap_state[no] ? sp_box_str(sp_trap_state[no])
+                : sp_trap_state[no] ? sp_box_str_fresh(sp_trap_state[no])
                 : no == 0 ? sp_box_nil()
-                : sp_box_str((&("\xff" "DEFAULT")[1]));
+                : sp_box_str_fresh((&("\xff" "DEFAULT")[1]));
+  SP_GC_ROOT_RBVAL(prev);
   if (handler.tag == SP_TAG_OBJ && handler.cls_id == SP_BUILTIN_PROC && handler.v.p) {
     sp_trap_proc[no] = (sp_Proc *)handler.v.p;
     sp_trap_state[no] = NULL;
@@ -4341,7 +4497,8 @@ sp_RbVal sp_signal_trap(sp_RbVal sig, sp_RbVal handler) {SP_GC_ROOT_RBVAL(sig);S
     }
   }
   else {
-    const char *hs = (handler.tag == SP_TAG_STR && handler.v.s) ? handler.v.s : "DEFAULT";
+    const char *hs = sp_rbval_string_bytes(handler);
+    if (!hs) hs = "DEFAULT";
     int ignore = strcmp(hs, "IGNORE") == 0 || strcmp(hs, "SIG_IGN") == 0;
     sp_trap_proc[no] = NULL;
     /* SYSTEM_DEFAULT reads back as itself (#2839); it installs SIG_DFL too.
@@ -4439,8 +4596,8 @@ sp_RbVal sp_env_shift(void) {
   SP_GC_ROOT_STR(v);
   sp_PolyArray *a = sp_PolyArray_new();
   SP_GC_ROOT(a);
-  sp_PolyArray_push(a, sp_box_str(k));
-  sp_PolyArray_push(a, sp_box_str(v));
+  sp_PolyArray_push(a, sp_box_str_new(k));
+  sp_PolyArray_push(a, sp_box_str_new(v));
   unsetenv(k);
   return sp_box_poly_array(a);
 }
@@ -4484,6 +4641,15 @@ sp_StrStrHash *sp_env_value(void) {
   sp_StrStrHash_mark_env(h);
   return h;
 }
+/* A store, a delete or a clear on the snapshot a boxed ENV is read through
+   (sp_env_box_read, marked by sp_StrStrHash_mark_env) goes on to the
+   environment, as ENV's own does (lib/sp_hash.c calls these). v NULL unsets. */
+void sp_env_write_through(const char *k, const char *v) {
+  if (v) setenv(sp_env_chk(k, 0), sp_env_chk(v, 1), 1);
+  else unsetenv(sp_env_chk(k, 0));
+}
+sp_StrStrHash *sp_env_clear(void);
+void sp_env_clear_through(void) { (void)sp_env_clear(); }
 sp_StrStrHash *sp_env_clear(void) {
   extern char **environ;
   for (;;) {   /* environ shifts under unsetenv: restart until empty */
@@ -4523,58 +4689,21 @@ sp_StrStrHash *sp_env_update_h(sp_StrStrHash *h, int replace) {
 /* Keys are spinel rodata literals (SPL: 0xff marker prefix) so the str-hash
    header cache's s[-1] read is in-bounds -- a bare C literal here would
    overread (and could alias a heap marker on some rodata layouts). */
-struct sp_gc_stat_str_acc { size_t *b; sp_int *c; };
-static void sp_gc_stat_str_cb(void *hdr, void *arg) {
-  struct sp_gc_stat_str_acc *a = (struct sp_gc_stat_str_acc *)arg;
-  *a->b += ((sp_str_hdr *)hdr)->size & SP_STR_SIZE_MASK; (*a->c)++;
+sp_StrIntHash *sp_gc_stat(void) {
+  /* Count objects before allocating the result. */
+  long long live_objs = sp_gc_live_objects();
+  sp_StrIntHash *stats = sp_StrIntHash_new();
+  SP_GC_ROOT(stats);
+  sp_StrIntHash_set(stats, SPL("bytes"), (sp_int)SP_GC_CTR_GET(sp_gc_bytes));
+  sp_StrIntHash_set(stats, SPL("heap_live_slots"), (sp_int)live_objs);
+  sp_StrIntHash_set(stats, SPL("old_bytes"), (sp_int)sp_gc_old_bytes);
+  sp_StrIntHash_set(stats, SPL("threshold"), (sp_int)sp_gc_threshold);
+  sp_StrIntHash_set(stats, SPL("cycle"), (sp_int)sp_gc_cycle);
+  sp_StrIntHash_set(stats, SPL("full_runs"), (sp_int)sp_gc_full_runs);
+  sp_StrIntHash_set(stats, SPL("remembered"), (sp_int)sp_gc_nremembered);
+  sp_StrIntHash_set(stats, SPL("remembered_peak"), (sp_int)sp_gc_rem_peak);
+  return stats;
 }
-void sp_slab_each_object(int young, int old, void (*fn)(void *hdr, void *arg), void *arg);
-static void sp_gc_stat_one_str_cb(void *hdr, void *arg) {
-  struct sp_gc_stat_str_acc *a = (struct sp_gc_stat_str_acc *)arg;
-  char *o = (char *)hdr + sizeof(sp_gc_hdr);
-  sp_str_hdr *sh = (sp_str_hdr *)(void *)(o + sizeof(struct sp_String_s));
-  if ((char *)SP_STR_BORN_LINK(sh) != o) return;
-  unsigned char m = ((unsigned char *)(sh + 1))[0];
-  if (m != 0xfe && m != 0xfa && m != 0xf1 && m != 0xfd) return;
-  *a->b += ((sp_gc_hdr *)hdr)->size; (*a->c)++;
-}
-sp_StrIntHash*sp_gc_stat(void){
-  /* The string heap (sp_str_heap) is malloc'd separately and deliberately
-     excluded from sp_gc_bytes (see sp_str_alloc). Surface its footprint so
-     GC.stat can explain "RSS huge but bytes tiny" for string-heavy workloads.
-     Prototype: O(n) walk; a production version maintains a running counter.
-     The walk holds the heap lock: sp_str_alloc pushes onto this list under
-     it from any worker, and an unlocked traversal could read a half-linked
-     node. Unlock before building the hash -- sp_gc_alloc takes the same
-     (non-recursive) lock. */
-  size_t str_bytes=0; sp_int str_count=0;
-  /* the slab strings: a bit per slot in the chunks' bitmaps, either
-     generation (a racy read against the allocating workers, benign for an
-     introspection stat), then the lists of the strings too large for it */
-  { struct sp_gc_stat_str_acc acc = { &str_bytes, &str_count };
-    sp_slab_each_string(1, 1, sp_gc_stat_str_cb, &acc);
-    /* one representation: a String lives in its handle's GC object, the
-       bytes inside it (sp_str_alloc_born, sp_String_new_inline_len) */
-    sp_slab_each_object(1, 1, sp_gc_stat_one_str_cb, &acc);
-  }
-#ifdef SP_THREADS
-  /* Per-worker lists (see sp_alloc.h): each has a single pusher, and only the
-     head moves, so a snapshot walk reaches fully-linked nodes -- at worst it
-     misses a just-pushed one (benign undercount for an introspection stat). */
-  { int nw = sp_active_workers; if (nw < 1) nw = 1; if (nw > SP_MAX_WORKERS) nw = SP_MAX_WORKERS;
-    for (int wi = 0; wi < nw; wi++) {
-      for(int sub=0; sub<SP_STR_YSUB; sub++)
-        for(sp_str_hdr*sh=sp_str_wslot[wi].young[sub]; sh; sh=sh->next){ str_bytes+=sh->size & SP_STR_SIZE_MASK; str_count++; }
-      for(sp_str_hdr*sh=sp_str_wslot[wi].old; sh; sh=sh->next){ str_bytes+=sh->size & SP_STR_SIZE_MASK; str_count++; } } }
-#else
-  SP_HEAP_LOCK();
-  /* Both generations: the split is an internal sweep optimization, so the
-     reported footprint has to stay the whole string heap. */
-  for(sp_str_hdr*sh=sp_str_heap; sh; sh=sh->next){ str_bytes+=sh->size & SP_STR_SIZE_MASK; str_count++; }
-  for(sp_str_hdr*sh=sp_str_old; sh; sh=sh->next){ str_bytes+=sh->size & SP_STR_SIZE_MASK; str_count++; }
-  SP_HEAP_UNLOCK();
-#endif
-  sp_StrIntHash*h=sp_StrIntHash_new();sp_StrIntHash_set(h,SPL("bytes"),(sp_int)SP_GC_CTR_GET(sp_gc_bytes));sp_StrIntHash_set(h,SPL("old_bytes"),(sp_int)sp_gc_old_bytes);sp_StrIntHash_set(h,SPL("threshold"),(sp_int)sp_gc_threshold);sp_StrIntHash_set(h,SPL("cycle"),(sp_int)sp_gc_cycle);sp_StrIntHash_set(h,SPL("full_runs"),(sp_int)sp_gc_full_runs);sp_StrIntHash_set(h,SPL("remembered"),(sp_int)sp_gc_nremembered);sp_StrIntHash_set(h,SPL("remembered_peak"),(sp_int)sp_gc_rem_peak);sp_StrIntHash_set(h,SPL("str_bytes"),(sp_int)str_bytes);sp_StrIntHash_set(h,SPL("str_count"),str_count);return h;}
 /* String#setbyte over value-semantics strings: copy-on-write (a literal's
    bytes are static storage). The caller re-binds an lvalue receiver. */
 const char *sp_str_setbyte_cow(const char *s, sp_int i, sp_int v) {SP_GC_ROOT_STR(s);
@@ -4595,7 +4724,7 @@ const char *sp_str_setbyte_cow(const char *s, sp_int i, sp_int v) {SP_GC_ROOT_ST
   }
   {
     unsigned char m = ((const unsigned char *)s)[-1];
-    if (m == 0xfe || m == 0xfc) {
+    if (m == 0xfe) {
       (((sp_str_hdr *)(s - 1)) - 1)->hash = 0;  /* invalidate cached key hash */
       (((sp_str_hdr *)(s - 1)) - 1)->size &= ~SP_STR_SIZE_ASCII7;  /* and the 7-bit answer */
       /* and the character count: an invalid byte changes it, and the
@@ -4843,15 +4972,7 @@ sp_int sp_int_pow(sp_int base, sp_int exp) {
 sp_StrArray *sp_argv_array_cache = NULL;
 
 void *sp_main_obj = NULL;
-sp_RbVal sp_main_self(void) {
-  void *m = SP_ATOMIC_LOAD(&sp_main_obj, __ATOMIC_ACQUIRE);
-  if (!m) {
-    void *fresh = sp_gc_alloc(1, NULL, NULL);   /* sizeof(sp_Object) */
-    if (SP_ATOMIC_CAS(&sp_main_obj, &m, fresh, 0, __ATOMIC_ACQ_REL, __ATOMIC_ACQUIRE))
-      m = fresh;   /* else another thread won; m holds its object */
-  }
-  return sp_box_obj(m, SP_BUILTIN_OBJECT);
-}
+
 sp_StrArray *sp_get_ARGV(void) {
   if (!sp_argv_array_cache) {
     sp_argv_array_cache = sp_StrArray_new();
@@ -4950,7 +5071,7 @@ SP_NORETURN void sp_raise_load_error(const char *feature) {
   SP_GC_ROOT_STR(feature);
   const char *f = sp_sprintf("%s", feature ? feature : "");
   SP_GC_ROOT_STR(f);
-  sp_exc_stage_key(sp_box_str(f));
+  sp_exc_stage_key(sp_box_str_new(f));
   sp_raise_cls("LoadError", sp_sprintf("cannot load such file -- %s", f));
 }
 sp_StrArray *sp_get_loaded_features(void) {
@@ -4962,7 +5083,7 @@ sp_StrArray *sp_get_load_path(void) {
   if (!sp_load_path_cache) {
     sp_load_path_cache = sp_StrArray_new();   /* (marked from here: the seeds allocate) */
     for (int i = 0; i < sp_load_seed_n; i++)
-      sp_StrArray_push(sp_load_path_cache, sp_sprintf("%s", sp_load_seed_dirs[i]));
+      sp_StrArray_push_e(sp_load_path_cache, sp_String_new_shared(sp_sprintf("%s", sp_load_seed_dirs[i])));
   }
   return sp_load_path_cache;
 }
@@ -5093,47 +5214,11 @@ sp_float sp_frange_max(sp_FloatRange r) {
   if (r.excl) sp_raise_cls("TypeError", "cannot exclude end value with non Integer begin value");
   return r.last;
 }
-/* String range ("a".."e"). The endpoints are the value; every traversal
-   materializes the element array, which is how a string range behaved before
-   it became a value of its own (#3064). A NULL endpoint is a nil bound: the
-   range is beginless or endless. */
-/* --share-strings (#8321): the Range read with each handle it keeps taken
-   as its bytes are now, so a change in place to the endpoint's String
-   shows through the Range. A Range without handles is answered as it is.
-   An endpoint the Range keeps as a handle holds NULL in its byte field (the
-   handle is its only holder, so no stale pointer is ever kept or marked);
-   this fills that field with the handle's own bytes, uncopied, for a read
-   that compares or formats them and keeps nothing: they are good only
-   until the next change to that String. sp_srange_held is the form whose
-   endpoints may be kept. */
-sp_StrRange sp_srange_live(sp_StrRange r) {
-  if (r.hf) r.first = sp_String_cstr((sp_String *)r.hf);
-  if (r.hl) r.last = sp_String_cstr((sp_String *)r.hl);
-  return r;
-}
-/* ...the Range with each kept endpoint read as a String of its own (a
-   copy of the handle's bytes): for an answer that may keep an endpoint, an
-   element of #to_a or the String #min / #max answer. */
-static sp_StrRange sp_srange_held(sp_StrRange r) {
-  sp_String *hf = (sp_String *)r.hf, *hl = (sp_String *)r.hl;
-  SP_GC_ROOT(hf); SP_GC_ROOT(hl);
-  /* one representation: the endpoint's bytes are the handle's own (a sink
-     finds the handle through them), as CRuby's #min answers the begin
-     object itself */
-  if (hf) r.first = sp_String_cstr(hf);
-  if (hl) r.last = sp_String_cstr(hl);
-  return r;
-}
-sp_StrRange sp_srange_new(const char *f, const char *l, sp_int e) {
-  /* (the Range keeps its endpoints and answers them again: sp_str_retained) */
-  sp_StrRange r; r.first = sp_str_retained(f); r.last = sp_str_retained(l); r.excl = e; r.unfrozen = 0; r.sym = 0; r.hf = NULL; r.hl = NULL; return r;
-}
 sp_StrArray *sp_srange_to_a(sp_StrRange r) {
-  r = sp_srange_held(r);
   SP_GC_ROOT_SRANGE(r);
   if (!r.first) sp_raise_cls("TypeError", "can't iterate from NilClass");
   if (!r.last) sp_raise_cls("RangeError", "cannot convert endless range to an array");
-  return sp_StrArray_from_string_range(r.first, r.last, r.excl);
+  return sp_StrArray_from_string_range(sp_srange_first(r), sp_srange_last(r), r.excl);
 }
 /* Range#first(n) and Range#take(n) on a String Range: the first n members,
    walked by succ and stopped at n, so an endless range (last NULL) answers
@@ -5147,8 +5232,8 @@ static int sp_srange_take_push(const char *m, void *arg) {
 }
 sp_StrArray *sp_srange_first_n(sp_RbVal box, sp_int n, int take) {
   SP_GC_ROOT_RBVAL(box);
-  sp_StrRange r = sp_srange_live(*(sp_StrRange *)box.v.p);
-  const char *cur = r.first, *last = r.last;
+  sp_StrRange r = *(sp_StrRange *)box.v.p;
+  const char *cur = sp_srange_first(r), *last = sp_srange_last(r);
   SP_GC_ROOT_STR(cur); SP_GC_ROOT_STR(last);
   if (n < 0) sp_raise_cls("ArgumentError", take ? "attempt to take negative size" : "negative array size (or size too big)");
   if (!cur) {
@@ -5167,8 +5252,8 @@ sp_StrArray *sp_srange_first_n(sp_RbVal box, sp_int n, int take) {
   return a;
 }
 sp_bool sp_srange_eq(sp_StrRange a, sp_StrRange b) {
-  a = sp_srange_live(a); b = sp_srange_live(b);
-  return a.excl == b.excl && a.sym == b.sym && sp_str_eq(a.first, b.first) && sp_str_eq(a.last, b.last);
+  return a.excl == b.excl && a.sym == b.sym && sp_str_eq(sp_srange_first(a), sp_srange_first(b)) &&
+         sp_str_eq(sp_srange_last(a), sp_srange_last(b));
 }
 /* #include? / #member?: whether the walk String#upto takes meets x, as
    CRuby's rb_str_include_range_p, stopping at the first equal member;
@@ -5180,72 +5265,87 @@ static int sp_srange_include_i(const char *m, void *arg) {
   return 1;
 }
 sp_bool sp_srange_include(sp_StrRange r, const char *x) {
-  r = sp_srange_live(r);
   SP_GC_ROOT_SRANGE(r);
   if (!r.first || !r.last)
     sp_raise_cls("TypeError", "cannot determine inclusion in beginless/endless ranges");
   if (!x) return 0;
+  const char *first = sp_srange_first(r), *last = sp_srange_last(r);
+  /* Two all-digit ends of at most 18 digits: sp_str_upto_each walks the
+     numbers between, each zero-padded to the begin's width, so x is one of
+     them when it is all digits, its number lies between the ends, and its
+     length is that width or its number's own, the longer. Answered from x
+     alone, where the walk built every string up to it
+     (('1'..'200000').include?('199999') built 199,999 of them). */
+  size_t sl = sp_str_byte_len(first), el = sp_str_byte_len(last), xl = sp_str_byte_len(x);
+  int digits = sl > 0 && el > 0 && sl <= 18 && el <= 18;
+  for (size_t i = 0; digits && i < sl; i++) if (first[i] < '0' || first[i] > '9') digits = 0;
+  for (size_t i = 0; digits && i < el; i++) if (last[i] < '0' || last[i] > '9') digits = 0;
+  if (digits) {
+    if (xl == 0 || xl > 19) return 0;
+    unsigned long long n = 0;
+    size_t lead = 0;
+    for (size_t i = 0; i < xl; i++) {
+      if (x[i] < '0' || x[i] > '9') return 0;
+      n = n * 10 + (unsigned long long)(x[i] - '0');
+      if (n == 0) lead = i + 1;
+    }
+    size_t own = xl - lead;   /* (the digits of n, 1 for 0) */
+    if (own == 0) own = 1;
+    if (xl != (own > sl ? own : sl)) return 0;
+    unsigned long long bi = strtoull(first, NULL, 10), ei = strtoull(last, NULL, 10);
+    return n >= bi && (r.excl ? n < ei : n <= ei);
+  }
   const char *v = x;
   SP_GC_ROOT_STR(v);
-  sp_str_upto_each(r.first, r.last, r.excl, sp_srange_include_i, &v);
+  sp_str_upto_each(first, last, r.excl, sp_srange_include_i, &v);
   return v == NULL;
 }
 /* #cover? / #=== compare lexicographically, no materialization. */
 sp_bool sp_srange_cover(sp_StrRange r, const char *x) {
-  r = sp_srange_live(r);
   if (!x) return 0;
-  if (r.first && strcmp(x, r.first) < 0) return 0;
-  if (r.last) { int d = strcmp(x, r.last); if (r.excl ? d >= 0 : d > 0) return 0; }
+  if (r.first && sp_str_cmp_bytes(x, sp_srange_first(r)) < 0) return 0;
+  if (r.last) { int d = sp_str_cmp_bytes(x, sp_srange_last(r)); if (r.excl ? d >= 0 : d > 0) return 0; }
   return 1;
 }
-/* #min / #max with no block, as CRuby's range_min / range_max: an open
-   side raises, an empty range (the begin past the end, or at it with the
-   end excluded) is nil, and an excluded end walks the members for the
-   least or greatest, since a String end cannot be stepped back from. NULL
-   is nil. */
-static const char *sp_srange_walk_extreme(sp_StrRange r, int greatest) {
+/* An excluded String end has no predecessor operation. Max walks the
+   members to find the greatest one. */
+static const char *sp_srange_walk_max(sp_StrRange r) {
   sp_StrArray *a = sp_srange_to_a(r); SP_GC_ROOT(a);
   const char *best = NULL; SP_GC_ROOT_STR(best);
   for (sp_int i = 0; i < sp_StrArray_length(a); i++) {
     const char *s = sp_StrArray_get(a, i);
-    if (!best || (greatest ? strcmp(s, best) > 0 : strcmp(s, best) < 0)) best = s;
+    if (!best || sp_str_cmp_bytes(s, best) > 0) best = s;
   }
   return best;
 }
 const char *sp_srange_min_v(sp_StrRange r) {
-  r = sp_srange_held(r);
   if (!r.first) sp_raise_cls("RangeError", "cannot get the minimum of beginless range");
-  if (r.excl) {
-    if (!r.last) sp_raise_cls("RangeError", "cannot get the minimum of endless range with custom comparison method");
-    return sp_srange_walk_extreme(r, 0);
+  if (r.last) {
+    int order = sp_str_cmp_bytes(sp_srange_first(r), sp_srange_last(r));
+    if (order > 0 || (order == 0 && r.excl)) return NULL;
   }
-  if (r.last && strcmp(r.first, r.last) > 0) return NULL;
-  return r.first;
+  return sp_srange_first(r);
 }
 const char *sp_srange_max_v(sp_StrRange r) {
-  r = sp_srange_held(r);
   if (!r.last) sp_raise_cls("RangeError", "cannot get the maximum of endless range");
   if (r.excl) {
     if (!r.first) sp_raise_cls("RangeError", "cannot get the maximum of beginless range with custom comparison method");
-    return sp_srange_walk_extreme(r, 1);
+    return sp_srange_walk_max(r);
   }
-  if (r.first && strcmp(r.first, r.last) > 0) return NULL;
-  return r.last;
+  if (r.first && sp_str_cmp_bytes(sp_srange_first(r), sp_srange_last(r)) > 0) return NULL;
+  return sp_srange_last(r);
 }
 const char *sp_srange_to_s(sp_StrRange r) {
-  r = sp_srange_live(r);
   SP_GC_ROOT_SRANGE(r);
-  return sp_sprintf("%s%s%s", r.first ? r.first : sp_str_empty,
-                    r.excl ? "..." : "..", r.last ? r.last : sp_str_empty);
+  return sp_sprintf("%s%s%s", r.first ? sp_srange_first(r) : sp_str_empty,
+                    r.excl ? "..." : "..", r.last ? sp_srange_last(r) : sp_str_empty);
 }
 /* The begin's inspect is a new String the end's inspect can collect, and
    the caller's range is a by-value pair nothing may root (#8322): both
    ends and the first answer are held here. */
 const char *sp_srange_inspect(sp_StrRange r) {
-  r = sp_srange_live(r);
-  SP_GC_ROOT(r.hf); SP_GC_ROOT(r.hl);
-  const char *f = r.first, *l = r.last;
-  SP_GC_ROOT_STR(f); SP_GC_ROOT_STR(l);
+  SP_GC_ROOT_SRANGE(r);
+  const char *f = sp_srange_first(r), *l = sp_srange_last(r);
   /* a Range of Symbols shows its ends as Symbols (:a..:c) */
   const char *(*show)(const char *) = r.sym ? sp_sym_inspect_name : sp_str_inspect;
   const char *lo = f ? show(f) : sp_str_empty;
@@ -5261,39 +5361,35 @@ const char *sp_srange_inspect(sp_StrRange r) {
    on the 32-bit target). */
 static void sp_srange_scan(void *p) {
   sp_StrRange *r = (sp_StrRange *)p;
-  if (r->first) sp_mark_string(r->first);
-  if (r->last) sp_mark_string(r->last);
-  if (r->hf) sp_gc_mark(r->hf);
-  if (r->hl) sp_gc_mark(r->hl);
+  sp_gc_mark(r->first);
+  sp_gc_mark(r->last);
 }
 sp_RbVal sp_box_srange(sp_StrRange v) {
-  const char *f = v.first, *l = v.last;
-  void *hf = v.hf, *hl = v.hl;
-  SP_GC_ROOT_STR(f); SP_GC_ROOT_STR(l); SP_GC_ROOT(hf); SP_GC_ROOT(hl);
+  SP_GC_ROOT_SRANGE(v);
   sp_StrRange *p = (sp_StrRange *)sp_gc_alloc(sizeof(sp_StrRange), NULL, sp_srange_scan);
   *p = v;
   return sp_box_obj(p, SP_BUILTIN_STR_RANGE);
 }
 
 /* An endless String Range (last NULL) walked as it is read: String#succ from
-   the begin, stepping `step` successors at a time, one fresh String per value,
+   the begin, stepping `step` successors at a time, one fresh handle per String,
    through the fiber-generator path (the String Range's mirror of
    sp_endless_range_gen), so #next, #first(n) and a lazy chain over it need no
    member Array, which an endless range cannot make. The capture holds the
    begin, which its scan marks. */
-typedef struct { const char *first; sp_int step; int sym; } sp_endless_srange_cap;
+typedef struct { struct sp_String_s *first; sp_int step; int sym; } sp_endless_srange_cap;
 static void sp_endless_srange_cap_scan(void *p) {
   sp_endless_srange_cap *cap = (sp_endless_srange_cap *)p;
-  if (cap->first) sp_mark_string(cap->first);
+  sp_gc_mark(cap->first);
 }
 static void sp_endless_srange_gen(sp_Fiber *f) {
   sp_endless_srange_cap *cap = (sp_endless_srange_cap *)f->user_data;
-  const char *cur = cap->first;
+  const char *cur = sp_str_dup(cap->first->data);
   SP_GC_ROOT_STR(cur);
   for (;;) {
     /* a Range of Symbols yields the Symbol of the name */
     if (cap->sym) sp_Fiber_yield(sp_box_sym(sp_json_sym_intern_fn(cur)));   /* the program's interner */
-    else sp_Fiber_yield(sp_box_str(sp_str_from_bytes(cur, sp_str_byte_len(cur))));
+    else sp_Fiber_yield(sp_box_obj(sp_String_new_unfrozen(cur), SP_BUILTIN_STRBUF));
     cur = sp_str_succ_n(cur, cap->step);
   }
 }
@@ -5301,15 +5397,13 @@ static void sp_endless_srange_gen(sp_Fiber *f) {
    members at a time; it reports `box` as its source. */
 sp_Enumerator *sp_srange_endless_enum(sp_RbVal box, sp_int step) {
   SP_GC_ROOT_RBVAL(box);
-  /* the begin as it is now (a copy, under --share-strings: the walk outlives
-     the handle's bytes) is held across the capture's allocation */
-  sp_StrRange held = sp_srange_held(*(sp_StrRange *)box.v.p);
-  const char *first = held.first;
-  SP_GC_ROOT_STR(first);
-  if (!first) sp_raise_cls("TypeError", "can't iterate from NilClass");
+  sp_StrRange range = *(sp_StrRange *)box.v.p;
+  if (!range.first) sp_raise_cls("TypeError", "can't iterate from NilClass");
   sp_endless_srange_cap *cap = (sp_endless_srange_cap *)sp_gc_alloc(sizeof *cap, NULL, sp_endless_srange_cap_scan);
   SP_GC_ROOT(cap);
-  cap->first = first; cap->step = step; cap->sym = held.sym;
+  cap->first = range.first;
+  cap->step = step;
+  cap->sym = range.sym;
   sp_Enumerator *e = sp_Enumerator_new_gen(sp_endless_srange_gen, cap, sp_box_nil());
   e->source = box; e->has_src = TRUE;   /* it inspects as the Range's own */
   e->size_nil = TRUE;   /* and has no size, as a String Range's own is nil */
@@ -5325,8 +5419,8 @@ sp_Enumerator *sp_srange_endless_enum(sp_RbVal box, sp_int step) {
 sp_Enumerator *sp_srange_stepped_enum(sp_RbVal src, sp_int n, const char *label, int written) {
   SP_GC_ROOT_STR(label);
   SP_GC_ROOT_RBVAL(src);
-  sp_StrRange r = sp_srange_held(*(sp_StrRange *)src.v.p);
-  SP_GC_ROOT_STR(r.first); SP_GC_ROOT_STR(r.last);
+  sp_StrRange r = *(sp_StrRange *)src.v.p;
+  SP_GC_ROOT_SRANGE(r);
   if (n <= 0 && r.last) {
     sp_srange_to_a(r);   /* a beginless range raises its TypeError first */
     sp_raise_cls("ArgumentError", "step can't be 0");
@@ -5337,7 +5431,7 @@ sp_Enumerator *sp_srange_stepped_enum(sp_RbVal src, sp_int n, const char *label,
     SP_GC_ROOT(all);
     sp_StrArray *v = sp_StrArray_new();
     SP_GC_ROOT(v);
-    for (sp_int i = 0; i < sp_StrArray_length(all); i += n) sp_StrArray_push(v, sp_StrArray_get(all, i));
+    for (sp_int i = 0; i < sp_StrArray_length(all); i += n) sp_StrArray_push_e(v, sp_StrArray_get_e(all, i));
     sp_PolyArray *items;
     if (r.sym) {   /* the members of a Range of Symbols are Symbols (the program's interner) */
       items = sp_PolyArray_new();
@@ -5444,15 +5538,14 @@ static const char *sp_encoding_canon(const char *n) {
   return NULL;
 }
 sp_RbVal sp_encoding_find(sp_RbVal v) {
-  v = sp_rbval_str(v);
   if (v.tag == SP_TAG_ENCODING) return v;
-  if (v.tag != SP_TAG_STR) {
+  if (!sp_rbval_is_string(v)) {
     const char *cn = v.tag == SP_TAG_NIL ? "nil" : v.tag == SP_TAG_INT ? "Integer"
                    : v.tag == SP_TAG_FLT ? "Float" : v.tag == SP_TAG_SYM ? "Symbol"
                    : v.tag == SP_TAG_BOOL ? (v.v.b ? "true" : "false") : "Object";
     sp_raise_cls("TypeError", sp_sprintf("no implicit conversion of %s into String", cn));
   }
-  const char *n = v.v.s;
+  const char *n = sp_rbval_string_bytes(v);
   if (!strcasecmp(n, "internal")) return sp_box_nil();
   const char *cn = sp_encoding_canon(n);
   if (cn) return sp_box_encoding((sp_Encoding){ cn });
@@ -5486,15 +5579,14 @@ int sp_force_encoding_mode(sp_RbVal enc) {
    external), 2 ASCII-8BIT, -1 another encoding, -2 a "BOM|" one, 0 a name
    no encoding has. `*nm` is the name. */
 static int sp_io_enc_side(sp_RbVal v, const char *s, const char **nm) {
-  v = sp_rbval_str(v);
   const char *n = NULL;
+  if (!s) s = sp_rbval_string_bytes(v);
   if (s) {
     if (!strncasecmp(s, "BOM|", 4)) { *nm = s; return -2; }
     n = sp_encoding_canon(s);
     if (!n) { *nm = s; return 0; }
   }
   else if (v.tag == SP_TAG_NIL) n = "UTF-8";
-  else if (v.tag == SP_TAG_STR) return sp_io_enc_side(v, v.v.s, nm);
   else n = sp_encoding_find(v).v.s;   /* an Encoding, or CRuby's TypeError */
   *nm = n;
   if (!strcmp(n, "ASCII-8BIT")) return 2;
@@ -5514,12 +5606,12 @@ static int sp_io_enc_side(sp_RbVal v, const char *s, const char **nm) {
 sp_File *sp_File_set_encoding(sp_File *f, sp_RbVal ext, sp_RbVal in) {
   SP_GC_ROOT(f); SP_GC_ROOT_RBVAL(ext); SP_GC_ROOT_RBVAL(in);
   SP_IO_OPEN(f);
-  ext = sp_rbval_str(ext); in = sp_rbval_str(in);
   char eb[64];
   const char *es = NULL, *is = NULL, *en, *inn;
-  if (ext.tag == SP_TAG_STR && in.tag == SP_TAG_NIL && strchr(ext.v.s, ':')) {
-    const char *colon = strchr(ext.v.s, ':');
-    snprintf(eb, sizeof eb, "%.*s", (int)(colon - ext.v.s), ext.v.s);
+  const char *ext_name = sp_rbval_string_bytes(ext);
+  const char *colon = ext_name && in.tag == SP_TAG_NIL ? strchr(ext_name, ':') : NULL;
+  if (colon) {
+    snprintf(eb, sizeof eb, "%.*s", (int)(colon - ext_name), ext_name);
     es = eb; is = colon + 1;
   }
   int e = sp_io_enc_side(ext, es, &en);
@@ -5542,7 +5634,7 @@ sp_File *sp_File_set_encoding(sp_File *f, sp_RbVal ext, sp_RbVal in) {
   f->ext_enc = (unsigned char)e;
   return f;
 }
-sp_RbVal sp_box_nullable_str(const char *v) { return v ? sp_box_str(v) : sp_box_nil(); }
+sp_RbVal sp_box_nullable_str(const char *v) { return sp_box_str_new(v); }
 /* An opaque foreign/FFI pointer: boxed with SP_BUILTIN_FOREIGN_PTR so the
    collector skips it (it is not a sp_gc_alloc allocation). NULL -> nil. */
 sp_RbVal sp_box_foreign_ptr(void *p) { return p ? sp_box_obj(p, SP_BUILTIN_FOREIGN_PTR) : sp_box_nil(); }
@@ -5803,8 +5895,8 @@ sp_RbVal sp_trange_send(sp_TimeRange *r, const char *n, int argc, sp_RbVal a0) {
     if (!strcmp(n, "min")) return sp_trange_min_v(r);
     if (!strcmp(n, "max")) return sp_trange_max_v(r);
     if (!strcmp(n, "exclude_end?")) return sp_box_bool(r->excl != 0);
-    if (!strcmp(n, "to_s")) return sp_box_str(sp_trange_to_s(r));
-    if (!strcmp(n, "inspect")) return sp_box_str(sp_trange_inspect(r));
+    if (!strcmp(n, "to_s")) return sp_box_str_new(sp_trange_to_s(r));
+    if (!strcmp(n, "inspect")) return sp_box_str_new(sp_trange_inspect(r));
     if (!strcmp(n, "hash")) return sp_box_int(sp_trange_hash(r));
     if (!strcmp(n, "frozen?")) return sp_box_bool(!r->unfrozen);
     if (!strcmp(n, "to_a") || !strcmp(n, "entries")) return sp_trange_to_a(r);
@@ -5906,6 +5998,7 @@ const char *sp_str_sub_str_str_hash(const char *str, const char *pat, sp_StrStrH
   memcpy(out, str, before);
   memcpy(out + before, rep, rlen);
   memcpy(out + before + rlen, found + plen, rest);
+  sp_str_bin_cat_like(str, rep, out);
   out[total] = 0;
   sp_str_set_len(out, total);
   return out;
@@ -5950,7 +6043,7 @@ const char *sp_str_gsub_str_str_hash(const char *str, const char *pat, sp_StrStr
   out[o] = 0;
   sp_str_set_len(out, o);
   if (sp_re_track_last) sp_re_set_lit_match(str, (sp_int)last, (sp_int)(last + plen));
-  return out;
+  return sp_str_bin_cat_like(str, rep, out);
 }
 /* Array#sum with a String initial value: concatenation fold ("abc" from
    ["a","b","c"].sum("")), CRuby's + on each element. */
@@ -6161,7 +6254,6 @@ sp_File *sp_io_wait_events(sp_File *f, double timeout, sp_int kind) {SP_GC_ROOT(
    ready_error], or nil when the timeout expires first. A nil array stands for
    "watch nothing", so all three nil is just a sleep. */
 sp_File *(*sp_user_to_io_hook)(sp_RbVal) = NULL;
-const char *sp_poly_class_name(sp_RbVal v);   /* lib/sp_poly_cold.c */
 static sp_File *sp_select_io_of(sp_RbVal v) {
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_IO && v.v.p) return (sp_File *)v.v.p;
   /* A user object that answers #to_io names the handle to wait on -- CRuby
@@ -6587,6 +6679,7 @@ static const char *re_gsub_hash(mrb_regexp_pattern *pat, const char *str, sp_Str
      the stack: the malloc was one of the two a page render made per escape */
   char out_sb[512];
   size_t cap = (slen * 2) + 64; char *out = cap <= sizeof out_sb ? out_sb : (char *)malloc(cap); size_t olen = 0;
+  int st = sp_str_is_binary(str) ? 1 : 0;   /* the encoding so far, by the rule of String#+ (sp_str_enc_step) */
   int64_t pos = 0; int caps[64];
   int lastcaps[64], lastn = 0;   /* the last match, for `$~` */
   #define GSH_GROW(need) do { size_t _nc = (need); \
@@ -6619,6 +6712,7 @@ static const char *re_gsub_hash(mrb_regexp_pattern *pat, const char *str, sp_Str
     size_t rlen = sp_str_byte_len(rep);
     if (olen + before + rlen >= cap) GSH_GROW(((olen + before + rlen) * 2) + 64);
     memcpy(out + olen, str + pos, before); olen += before;
+    if (st != 1) st = sp_str_enc_step(st, out, olen, rep, rlen, sp_str_is_binary(rep));
     memcpy(out + olen, rep, rlen); olen += rlen;
     if (kbuf != keybuf) free(kbuf);
     if (caps[0] == caps[1]) {
@@ -6644,7 +6738,8 @@ else {
   char *res = sp_str_alloc(olen);
   memcpy(res, out, olen);
   if (out != out_sb) free(out);
-  return sp_str_bin_like(str, res);   /* in the subject's encoding, as sp_re_gsub's */
+  if (st == 1) sp_str_mark_binary(res);   /* the receiver's encoding, or the one its replacements took it to */
+  return res;
 }
 const char *sp_re_gsub_str_str_hash(mrb_regexp_pattern *pat, const char *str, sp_StrStrHash *h) {
   return re_gsub_hash(pat, str, h, NULL);
@@ -6687,7 +6782,7 @@ static const char *re_sub_hash(mrb_regexp_pattern *pat, const char *str, sp_StrS
   out[total] = 0;
   sp_str_set_len(out, total);
   if (kbuf != keybuf) free(kbuf);
-  return sp_str_bin_like(str, out);   /* in the subject's encoding, as sp_re_sub's */
+  return sp_str_bin_cat_like(str, rep, out);   /* as the receiver + the replacement, as sp_re_sub's */
 }
 const char *sp_re_sub_str_str_hash(mrb_regexp_pattern *pat, const char *str, sp_StrStrHash *h) {
   return re_sub_hash(pat, str, h, NULL);
@@ -6891,16 +6986,15 @@ static int sp_enc_kw_replace(sp_RbVal v) {   /* `invalid: :replace` / `undef: :r
 /* A String argument as CRuby's StringValue takes it: a String, a shared
    String's bytes, or a user object's #to_str; anything else is the TypeError */
 static const char *sp_enc_str_arg(sp_RbVal v) {
-  if (v.tag == SP_TAG_STR && v.v.s) return v.v.s;
-  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF && v.v.p)
-    return sp_String_cstr((sp_String *)v.v.p);
+  const char *bytes = sp_rbval_string_bytes(v);
+  if (bytes) return bytes;
   if (v.tag == SP_TAG_OBJ && v.cls_id >= 0 && v.v.p && sp_obj_to_str_fn) {
     SP_GC_ROOT_RBVAL(v);   /* across the user #to_str */
-    const char *r = sp_obj_to_str_fn((int)v.cls_id, v.v.p);
+    const char *r = sp_String_cstr_nil(sp_obj_to_str_handle((int)v.cls_id, v.v.p));
     if (r) return r;
   }
   sp_raise_cls("TypeError", sp_sprintf("no implicit conversion of %s into String",
-                                       v.tag == SP_TAG_NIL || v.tag == SP_TAG_STR ? "nil"
+                                       v.tag == SP_TAG_NIL ? "nil"
                                        : v.tag == SP_TAG_BOOL ? (v.v.b ? "true" : "false")
                                        : sp_poly_class_name(v)));
   return NULL;
@@ -6976,12 +7070,15 @@ static void sp_enc_raise_at(const char *s, size_t i, size_t w, size_t bl, int ba
 const char *sp_str_encode(const char *s, int npos, sp_RbVal dst, sp_RbVal src,
                           sp_RbVal invalid, sp_RbVal undef, sp_RbVal replace) {
   SP_GC_ROOT_STR(s); SP_GC_ROOT_RBVAL(dst); SP_GC_ROOT_RBVAL(src); SP_GC_ROOT_RBVAL(replace);
-  replace = sp_rbval_str(replace);
   if (!s) sp_nil_recv("encode");
   sp_enc_opt_check(invalid, "invalid");
   sp_enc_opt_check(undef, "undefined");
   const char *repl = replace.tag == SP_TAG_NIL ? NULL : sp_enc_str_arg(replace);
   SP_GC_ROOT_STR(repl);
+  /* Encoding names can run to_str and mutate the selected replacement. */
+  if (repl && ((npos > 0 && dst.tag == SP_TAG_OBJ && dst.cls_id >= 0) ||
+               (npos > 1 && src.tag == SP_TAG_OBJ && src.cls_id >= 0)))
+    repl = sp_str_dup(repl);
   sp_int bad_len;
   if (repl && !sp_str_is_binary(repl) &&
       sp_str_scrub_bad(repl, (sp_int)sp_str_byte_len(repl), 0, &bad_len) < (sp_int)sp_str_byte_len(repl))
@@ -7161,12 +7258,26 @@ void sp_warning_warn(const char *msg) {
 /* FrozenError for a store into a frozen Array: the receiver is staged for
    FrozenError#receiver and its inspect ends the message, as CRuby's
    "can't modify frozen Array: [1, 2]" does (#4924). */
+/* The prefix that names a frozen value's class: an instance of a program's
+   subclass of Array, Hash or String is boxed as the builtin, and its class
+   is the subclass (sp_bsub_cls_fn), which CRuby's message names ("can't
+   modify frozen MyA: [5]"); any other value keeps `what` */
+const char *sp_frozen_what(sp_RbVal v, const char *what) {
+  if (sp_bsub_cls_fn && sp_obj_cls_name_fn && v.tag == SP_TAG_OBJ && v.cls_id < 0 && v.v.p) {
+    int k = sp_bsub_cls_fn(v);
+    const char *n = k >= 0 ? sp_obj_cls_name_fn(k) : NULL;
+    if (n) return sp_str_concat(&("\xff" "can't modify frozen ")[1], n);
+  }
+  return what;
+}
 void sp_raise_frozen_array_rv(sp_RbVal v) {
   SP_GC_ROOT_RBVAL(v);
-  const char *msg = &("\xff" "can't modify frozen Array")[1];
+  const char *what = sp_frozen_what(v, &("\xff" "can't modify frozen Array")[1]);
+  SP_GC_ROOT_STR(what);
+  const char *msg = what;
   if (sp_poly_inspect_fn) {
     const char *ins = sp_poly_inspect_fn(v); SP_GC_ROOT_STR(ins);
-    msg = sp_str_concat(&("\xff" "can't modify frozen Array: ")[1], ins);
+    msg = sp_str_concat3(what, &("\xff" ": ")[1], ins);
   }
   SP_GC_ROOT_STR(msg);
   sp_exc_stage_recv(v);

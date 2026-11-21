@@ -150,15 +150,15 @@ typedef enum {
                     scope, read and written through *_cell_<name> */
 } ReprCell;
 
-/* Is value v (of representation r) typed as the handle while its own text
-   is its String's bytes, the handle formed apart from that text: a fresh
-   one, wrapped around the bytes where it is stored (RS_FRESH), or the
-   handle a String Range keeps for its endpoint (strbuf_srange_tail), read
-   off the Range? An operand or an argument held ahead of its call is
-   held as the String, and the handle taken as its route takes it. */
-int repr_handle_apart(Compiler *c, int v, Repr r);
+/* Does the storage of r take a fresh handle formed from its byte result? */
+int repr_handle_apart(Repr r);
 /* Does a call's settled return route hand back a shared String handle? */
+int repr_native_call_handle(Compiler *c, int node);
 int repr_call_returns_handle(Compiler *c, int v);
+int repr_string_iterator_handle(Compiler *c, int node);
+/* The handle entry of a zero-argument native String reader. */
+const char *repr_native_string_symbol(const NativeMethod *m);
+const NativeMethod *repr_native_string_reader(Compiler *c, int node);
 int scope_always_raises(Compiler *c, int mi);
 const NativeMethod *repr_super_native_keeps(Compiler *c, int n); /* super into a native keeps binding (#9258) */
 /* The native binding whose handle a boxed call's arm for class k publishes. */
@@ -173,7 +173,11 @@ int repr_boxed_to_s_operand(Compiler *c, int v);
 int repr_boxed_reader_handle(Compiler *c, int v);
 /* The representation of node `node`'s value. */
 Repr repr_of(const Compiler *c, int node);
+/* Is the node an Integer Range held by value (an sp_Range)? */
+int repr_range_value(const Compiler *c, int v);
 int repr_self_handle(const Compiler *c, int scope);
+/* Self is an object whose leading payload is the embedded String handle. */
+int repr_self_string_object(const Compiler *c, int scope);
 int repr_self_boxed(const Compiler *c, int scope);
 int repr_self_shared(const Compiler *c, int node);
 /* The representation of a local variable's slot (a global's and a
@@ -186,6 +190,9 @@ Repr repr_array_operand(Compiler *c, int node);
    slot idx, and of method scope sc's value. */
 Repr repr_of_ivar(const Compiler *c, int cid, int iv);
 Repr repr_of_cvar(const Compiler *c, int cid, int idx);
+TyKind repr_call_result_storage(TyKind result);
+TyKind repr_poly_result_slot(TyKind result);
+TyKind repr_method_ret_storage(const Scope *sc);
 Repr repr_of_ret(const Compiler *c, const Scope *sc);
 /* repr_of_slot(c, lv).kind and repr_of_cvar(c, cid, idx).kind alone,
    without the rest (dyn_cls scans the classes): what inference asks of a
@@ -224,7 +231,7 @@ typedef enum {
   RF_FLT,           /* sp_box_float */
   RF_FLT_NIL,       /* a Float boxed with its nil: sp_box_ofloat */
   RF_BIGINT,        /* a Bignum, NULL as nil */
-  RF_STR,           /* sp_box_str */
+  RF_STR,           /* String handle box */
   RF_BOOL,
   RF_SYM,
   RF_STRUCT,        /* a by-value struct: a Range, Time, Complex, Rational,
@@ -260,19 +267,6 @@ extern int g_repr_check;
 /* --repr-check: ask repr_of of a node codegen is about to emit, whose
    answer is dropped; the C must not change (repr_of changes nothing) */
 void repr_check_ask(const Compiler *c, int node);
-/* The settled return walk's leaf decisions and the emitter's observations.
-   All callers guard these with g_repr_check; no shadow exists otherwise. */
-enum { RCH_NONE, RCH_PUBLISH, RCH_CLEAR, RCH_NIL, RCH_HANDLE, RCH_BYTES, RCH_BOXED };
-void repr_channel_predict(Compiler *c, int node, int mi, int form);
-int repr_channel_begin(Compiler *c, int node);
-int repr_channel_ensure(Compiler *c, int node);
-void repr_channel_note(Compiler *c, int node, int form);
-void repr_channel_end(Compiler *c, int frame);
-void repr_channel_boxed(Compiler *c, int node, int frame);
-void repr_channel_call(Compiler *c, int node, int mi);
-void repr_channel_pickup(Compiler *c, int node, int nil_guard);
-void repr_channel_report(Compiler *c);
-void repr_channel_free(Compiler *c);
 /* --dump-repr is on (#7501) */
 extern int g_dump_repr;
 /* --dump-repr: each slot's representation, one sorted line per slot, as

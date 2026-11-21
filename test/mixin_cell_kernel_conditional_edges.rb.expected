@@ -1,0 +1,7 @@
+NoMethodError
+NoMethodError
+NoMethodError
+NoMethodError
+1
+[:mm, :respond_to_missing?]
+[:blk, 42]

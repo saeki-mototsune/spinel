@@ -251,6 +251,14 @@ static void cw_stmt_walk(ConstWalk *w, int id, int depth) {
       if (was && (r || bi) && lv) { w->settled[id] = 1; w->seen[cw_index(w, lv)] = 1; }
       return;
     }
+    case NK_LoadNode: {
+      /* --load-model=graph: a require naming its file runs no code of its
+         own; the file's top level is walked at its load, in load order
+         (prog_top_stmts). One whose path is computed may load any. */
+      const char *how = nt_str(nt, id, "how");
+      if (!how || sp_streq(how, "set")) w->clean = 0;
+      return;
+    }
     case NK_ConstantOrWriteNode: case NK_ConstantAndWriteNode:
     case NK_ConstantOperatorWriteNode: case NK_ConstantPathOrWriteNode:
     case NK_ConstantPathAndWriteNode: case NK_ConstantPathOperatorWriteNode:
@@ -449,11 +457,9 @@ void an_const_presence(Compiler *c) {
         ((w.cmissing && !listed_only[i]) || comp_class_index(c, c->consts[i].name) >= 0))
       c->consts[i].const_early = 0;
   /* the name a flagged read shows ahead of the constant: "" at the top
-     level. Each mark is a string (nt_node_set_str), which changes the
-     table's version, and the next ask for the map after it (the presence
-     loop's load-point queries, comp_parent_map) rebuilds the map and frees
-     the one w.par holds: every mark is found first and set after the last
-     read, below the presence marks. */
+     level. Each mark is a string (nt_node_set_str); every mark is found
+     first and set after the last read of w.par (comp_parent_map, which the
+     edits nt_parents names replace), below the presence marks. */
   int *cref = calloc(nn, sizeof(int));   /* per node: 1 + its cw_cref_at, 0 for no flagged read */
   char *own = calloc(nn, 1);             /* per node: a read that asks its own class's flag */
   if (!cref || !own) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
@@ -580,10 +586,8 @@ int an_class_presence_write(Compiler *c, int id) {
   int ci = -1;
   if (k == NK_ClassNode || k == NK_ModuleNode) ci = elab_header_class(c, id, NULL, NULL);
   else if (k == NK_ConstantWriteNode || k == NK_ConstantPathWriteNode) {
-    int target = k == NK_ConstantWriteNode ? id : nt_ref(c->nt, id, "target");
-    const char *nm = const_key_at(c, target);
-    ci = nm ? comp_class_index(c, nm) : -1;
-    if (ci >= 0 && c->classes[ci].def_node != id) ci = -1;
+    /* (the class this write defines: `K = Class.new`) */
+    ci = comp_class_of_def(c, id);
   }
   return an_class_presence_is_read(c, ci) ? ci + 1 : 0;
 }

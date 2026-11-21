@@ -44,6 +44,7 @@
 #include <sys/stat.h>
 #include <errno.h>
 #include <dirent.h>
+#include <spawn.h>
 #include "timing.h"
 
 extern int g_no_root_elision;
@@ -580,7 +581,10 @@ static void usage(void) {
     "  --dump-implied-calls  Print the methods CRuby calls for each node of the program\n"
     "              that its text does not name, and exit (debug)\n"
     "  --method-table-check  Print the reads of the static method tables made outside\n"
-    "              call_target, and the answers that are the table's last definition (debug)\n");
+    "              call_target, and the answers that are the table's last definition (debug)\n\n"
+    "Environment:\n"
+    "  SPINEL_SKIP_BUILD_IF=SCRIPT  Before building from a Ruby file, run the shell script\n"
+    "              with the Ruby source and generated C paths. Exit 0 skips the build.\n");
 }
 
 /* --dump-ast (1), --dump-value-positions (2), --check-value-pos (3),
@@ -887,6 +891,25 @@ static int cc_native_build(const char *cmd, size_t src_at, size_t src_end, const
   if (cc_rc != 0 && !(cc_jobs > 1 && getenv("SPINEL_SPLIT_STRICT")))
     cc_rc = system(cmd);   /* the single unit, or the fallback */
   return cc_rc;
+}
+
+/* A result-cache consumer can recognize a previous run from the C before
+   the native build starts. Only its explicit success skips the build: a
+   missing script, cache miss or interrupted child leaves cc in charge. */
+static int skip_native_build(const char *source, const char *c_path) {
+  const char *check = getenv("SPINEL_SKIP_BUILD_IF");
+  if (!check || !*check || access(check, R_OK) != 0) return 0;
+  extern char **environ;
+  /* Pass paths as argv, including on native Windows where CreateProcess
+     cannot run a file by its shebang. The runner has a POSIX shell. */
+  char *args[] = { "sh", "--", (char *)check, (char *)source, (char *)c_path, NULL };
+  pid_t pid;
+  if (posix_spawnp(&pid, "sh", NULL, NULL, args, environ) != 0) return 0;
+  int status;
+  while (waitpid(pid, &status, 0) < 0) {
+    if (errno != EINTR) return 0;
+  }
+  return WIFEXITED(status) && WEXITSTATUS(status) == 0;
 }
 
 /* A pointer of the wrong type in generated code is a miscompile, not a style
@@ -1483,6 +1506,12 @@ int main(int argc, char **argv) {
     if (!print_build) { free(csrc); return 0; }
   }
 
+  if (!eval_used && !run_mode && !c_only && !print_build && skip_native_build(source, c_path)) {
+    remove(c_path);
+    free(csrc);
+    return 0;
+  }
+
   /* ---------- link: cc <generated C> -> native binary ---------- */
   char lib_dir[4096];
   resolve_lib_dir(argv[0], lib_dir, sizeof lib_dir);
@@ -1588,6 +1617,28 @@ int main(int argc, char **argv) {
      0 means unlimited in both -- in each compiler's own spelling; an unknown
      -f flag is an error, not a warning (#4152). */
   s_add(&cmd, cc_is_clang(cc_cmd) ? "-ferror-limit=0 " : "-fmax-errors=0 ");
+  /* gcc's preprocessor keeps where each piece of a system header macro's
+     expansion came from, and -E writes that down: every NULL (or stdout, or
+     INT64_MAX) a line of the generated C expands gets a line marker into
+     the header and back, and the rest of the line is padded with spaces to
+     the column it stood in. A whole Ruby statement is one C line, so a
+     line holding a few hundred NULLs came out of -E megabytes long, and a
+     large program's preprocessed unit for the split build (cc_split_build,
+     unit_cache.c) was tens of GB. Asked not to track macro expansions, gcc
+     writes the expansion in place, as clang does; only the notes a
+     diagnostic adds about the macro an expression came from go with it. The
+     flag is gcc's alone (clang refuses it), so it is asked for where the -f
+     spellings above are. */
+  if (!cc_is_clang(cc_cmd)) s_add(&cmd, "-ftrack-macro-expansion=0 ");
+  /* clang stops parsing at 256 nested brackets ("bracket nesting level
+     exceeded maximum of 256"), a guard of its own stack against
+     pathological input. The generated C nests a statement expression per
+     operand, arm and root, and six statements of an application with a
+     hundred thousand scopes went past it (a JSON encoder's
+     `value.as_json(@options) unless @options.empty?`, a delegator's
+     `target.send(method, *arguments, &block)`), each ending the build of
+     its unit. Lifted, in clang's own spelling; gcc has no such limit. */
+  if (cc_is_clang(cc_cmd)) s_add(&cmd, "-fbracket-depth=4096 ");
   /* With #line on, cc reports against the .rb -- but only the LINE is remapped.
      The column is the C one, and a whole Ruby line is emitted as one C line, so
      it routinely lands hundreds of columns past the end of the source line it
@@ -1669,6 +1720,10 @@ int main(int argc, char **argv) {
      right. --link -l flags go after -lm below, where DSOs belong. */
   for (int li = 0; li < n_link_extra; li++) {
     if (strncmp(link_extra[li], "-l", 2) == 0) continue;
+    /* --link -L<dir>: where a --link -l library is searched for. It is a
+       fact about this host, so the build report does not carry it: a pack
+       made from the report holds no host path. */
+    if (strncmp(link_extra[li], "-L", 2) == 0) { s_add_arg(&cmd, link_extra[li]); continue; }
     /* A threaded program needs the package's threaded object for the same
        reason the runtime archive has one: an object built without
        -DSP_THREADS reads the runtime's per-worker globals as non-TLS and the

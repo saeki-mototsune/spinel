@@ -1,5 +1,6 @@
 #include "sp_cext.h"
-#include "sp_alloc.h"
+#include "sp_string.h"
+#include "sp_str.h"
 #include <assert.h>
 #include <stdio.h>
 
@@ -31,6 +32,57 @@ int main(void) {
     assert(sp_cext_handle_count() == 1 && sp_cext_rbval(registered).v.p == early);
     rb_gc_unregister_address(&registered);
     for (int i = 0; i < 256 && sp_cext_handle_count(); ++i) sp_gc_collect();
+    assert(sp_cext_handle_count() == 0);
+    /* A class name large enough to use malloc instead of a slab slot. */
+    {
+        char *bytes = sp_str_alloc(4096);
+        memset(bytes, 'a', 4096);
+        const char *name = sp_str_retained(bytes);
+        SP_GC_ROOT_STR(name);
+        sp_RbVal cls = {SP_TAG_CLASS, SP_CLASS_BY_NAME, {.s = name}};
+        (void)sp_cext_value(cls);
+        sp_gc_full_next = 1;
+        sp_gc_collect();
+        assert(sp_cext_handle_count() == 1);
+    }
+    sp_gc_full_next = 1;
+    sp_gc_collect();
+    assert(sp_cext_handle_count() == 0);
+    /* Retiring an outside payload leaves a rooted byte view readable. Its
+       weak handle must still be canonical, and disappear with that view. */
+    {
+        char *payload = malloc(SP_FD_OVH + 4);
+        assert(payload);
+        char *bytes = sp_fd_setup(payload);
+        memcpy(bytes, "Name", 5);
+        const char *name = bytes;
+        SP_GC_ROOT_STR(name);
+        sp_RbVal cls = {SP_TAG_CLASS, SP_CLASS_BY_NAME, {.s = name}};
+        VALUE canonical = sp_cext_value(cls);
+        sp_fd_retire(payload);
+        char *binary_payload = malloc(SP_FD_OVH + 3);
+        assert(binary_payload);
+        const char *binary = sp_fd_setup(binary_payload);
+        SP_GC_ROOT_STR(binary);
+        memcpy((char *)binary, "\x80\0b", 4);
+        sp_str_set_len((char *)binary, 3);
+        sp_str_mark_binary((char *)binary);
+        sp_fd_retire(binary_payload);
+        sp_gc_full_next = 1;
+        sp_gc_collect();
+        assert(sp_cext_handle_count() == 1 && sp_cext_value(cls) == canonical);
+        assert(strcmp(name, "Name") == 0);
+        assert(sp_str_byte_len(binary) == 3 && sp_str_is_binary(binary));
+        char *copy = (char *)sp_str_from_bytes("\x80\0b", 3);
+        SP_GC_ROOT_STR(copy);
+        sp_str_mark_binary(copy);
+        const sp_str_hdr *retired = (const sp_str_hdr *)binary_payload;
+        uint64_t generation = retired->hash;
+        assert(sp_str_probe_eq(binary, copy) && sp_str_hash(binary) == sp_str_hash(copy));
+        assert(retired->hash == generation);
+    }
+    sp_gc_full_next = 1;
+    sp_gc_collect();
     assert(sp_cext_handle_count() == 0);
     sp_cext_arena_mark outer = sp_cext_arena_enter();
     long *object = sp_gc_alloc(sizeof(long), finalize, NULL);
@@ -99,22 +151,18 @@ int main(void) {
     for (int i = 0; i < 256 && !data_freed; ++i) sp_gc_collect();
     assert(data_freed == 1 && finalized == before + 1);
     outer = sp_cext_arena_enter();
-    char *text = sp_str_alloc(4);
-    memcpy(text, "text", 4);
-    sp_RbVal string = {SP_TAG_STR, 0, {.s = text}};
+    sp_RbVal string = sp_box_obj(sp_String_from_cstr("text"), SP_BUILTIN_STRBUF);
     VALUE s = sp_cext_value(string);
     assert(s == sp_cext_value(string));
     rb_global_variable(&s);
     sp_cext_arena_restore(outer);
     sp_gc_collect();
-    assert(strcmp(sp_cext_rbval(s).v.s, "text") == 0);
+    assert(strcmp(sp_rbval_string_bytes(sp_cext_rbval(s)), "text") == 0);
     assert(sp_cext_value(string) == s);
     rb_gc_unregister_address(&s);
-    /* The list string heap has its own sweep gate. Drive it rather than
-       assuming object collections reclaim strings immediately. */
-    sp_str_threshold = 0; sp_str_old_threshold = 0;
     size_t handles_before = sp_cext_handle_count();
-    for (int i = 0; i < 256 && sp_cext_handle_count() == handles_before; ++i) sp_gc_collect();
+    sp_gc_full_next = 1;
+    sp_gc_collect();
     assert(sp_cext_handle_count() < handles_before);
     /* Unwind several C calls at once, including an empty inner arena. */
     outer = sp_cext_arena_enter();

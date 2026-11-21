@@ -72,13 +72,14 @@ else if(c<0x20||c==0x7f){/* other control bytes render as \uNNNN (UTF-8 default,
 /* A byte that is not part of a valid UTF-8 sequence escapes as \xNN, the way
    CRuby renders it: `"a\x80b".inspect` is "a\x80b". Passing the raw byte
    through made the inspect output itself invalid UTF-8, so a terminal drew
-   U+FFFD -- inspect lost the one thing it was being asked about. A BINARY
-   string escapes every high byte, as the control-byte arm above already does
-   for it. A valid sequence is copied through unchanged. */
+   U+FFFD -- inspect lost the one thing it was being asked about. An overlong
+   form, a surrogate half and a code point past U+10FFFF are no character
+   either: each of their bytes escapes ("\xED\xB0\x80", not "\uDC00"). A
+   BINARY string escapes every high byte, as the control-byte arm above
+   already does for it. A valid sequence is copied through unchanged. */
 else if(c>=0x80){
-  int extra=(c&0xE0)==0xC0?1:(c&0xF0)==0xE0?2:(c&0xF8)==0xF0?3:-1;
-  int ok=extra>0&&!sp_str_is_binary(s)&&i+(size_t)extra<sl;
-  for(int k=1;ok&&k<=extra;k++)if(((unsigned char)s[i+(size_t)k]&0xC0)!=0x80)ok=0;
+  int extra=sp_str_is_binary(s)?0:sp_utf8_valid_len((const unsigned char*)s+i,sl-i)-1;
+  int ok=extra>0;
   if(!ok){snprintf(r+o,5,"\\x%02X",c);o+=4;}
   else{
     /* a valid character that does not print is spelled by its codepoint,
@@ -221,7 +222,7 @@ const char*sp_str_swapcase_fold(const char*s){(void)s;sp_str_fold_not_down();}
 const char*sp_str_upcase_ascii(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("upcase");size_t l=sp_str_byte_len(s);char*r=sp_str_alloc_raw(l+1);for(size_t i=0;i<l;i++){unsigned char ch=(unsigned char)s[i];r[i]=(ch>='a'&&ch<='z')?(char)(ch-32):(char)ch;}r[l]=0;sp_str_set_len(r,l);return sp_str_bin_like(s,r);}
 const char*sp_str_downcase_ascii(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("downcase");size_t l=sp_str_byte_len(s);char*r=sp_str_alloc_raw(l+1);for(size_t i=0;i<l;i++){unsigned char ch=(unsigned char)s[i];r[i]=(ch>='A'&&ch<='Z')?(char)(ch+32):(char)ch;}r[l]=0;sp_str_set_len(r,l);return sp_str_bin_like(s,r);}
 const char*sp_str_swapcase_ascii(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("swapcase");size_t l=sp_str_byte_len(s);char*r=sp_str_alloc_raw(l+1);for(size_t i=0;i<l;i++){unsigned char ch=(unsigned char)s[i];if(ch>='a'&&ch<='z')r[i]=(char)(ch-32);else if(ch>='A'&&ch<='Z')r[i]=(char)(ch+32);else r[i]=(char)ch;}r[l]=0;sp_str_set_len(r,l);return sp_str_bin_like(s,r);}
-const char*sp_str_capitalize_ascii(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("capitalize");size_t l=sp_str_byte_len(s);char*r=sp_str_alloc_raw(l+1);for(size_t i=0;i<l;i++){unsigned char ch=(unsigned char)s[i];if(i==0)r[i]=(ch>='a'&&ch<='z')?(char)(ch-32):(char)ch;else r[i]=(ch>='A'&&ch<='Z')?(char)(ch+32):(char)ch;}r[l]=0;sp_str_set_len(r,l);return sp_str_bin_like(s,r);}
+const char*sp_str_capitalize_ascii(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("capitalize");size_t l=sp_str_byte_len(s);if(l==0)return s;char*r=sp_str_alloc_raw(l+1);for(size_t i=0;i<l;i++){unsigned char ch=(unsigned char)s[i];if(i==0)r[i]=(ch>='a'&&ch<='z')?(char)(ch-32):(char)ch;else r[i]=(ch>='A'&&ch<='Z')?(char)(ch+32):(char)ch;}r[l]=0;sp_str_set_len(r,l);return sp_str_bin_like(s,r);}
 /* String#dump: a double-quoted, escaped form that sp_str_undump reverses.
    UTF-8 high bytes pass through literally (undump copies them back), so a
    dump/undump round-trip is byte-identical. */
@@ -248,22 +249,19 @@ const char*sp_str_dump(const char*s){SP_GC_ROOT_STR(s);
     /* CRuby dumps a NUL as \x00, never \0: the short form would run into a
        following digit (`"\0" "1"` dumps as "\x001", not "\01") */
     else if(c==0){out[oi++]='\\';out[oi++]='x';out[oi++]='0';out[oi++]='0';}
-    else if(c<0x20){oi+=(size_t)sprintf(out+oi,"\\x%02X",c);}
+    /* DEL is a control byte too: \x7F, as CRuby writes it */
+    else if(c<0x20||c==0x7f){oi+=(size_t)sprintf(out+oi,"\\x%02X",c);}
     /* #dump promises a pure-ASCII, re-evaluable form: a non-ASCII character
        is written as its \uXXXX escape (#3558) */
     /* a BINARY String's high bytes are bytes, each \xXX */
     else if(c>=0x80&&bin){oi+=(size_t)sprintf(out+oi,"\\x%02X",c);}
     else if(c>=0x80){
-      unsigned cp=0;int extra=0;
-      if((c&0xE0)==0xC0){cp=c&0x1Fu;extra=1;}
-      else if((c&0xF0)==0xE0){cp=c&0x0Fu;extra=2;}
-      else if((c&0xF8)==0xF0){cp=c&0x07u;extra=3;}
-      else{oi+=(size_t)sprintf(out+oi,"\\x%02X",c);continue;}
-      if(i+(size_t)extra>=n){oi+=(size_t)sprintf(out+oi,"\\x%02X",c);continue;}
-      /* a lead byte without its continuation bytes is no character: the
-         byte alone (\xD8\x00 is no U+0600) */
-      {int ok=1;for(int k=1;k<=extra;k++)if(((unsigned char)s[i+(size_t)k]&0xC0u)!=0x80u)ok=0;
-       if(!ok){oi+=(size_t)sprintf(out+oi,"\\x%02X",c);continue;}}
+      /* a byte that starts no valid character is the byte alone: a lead
+         byte without its continuation bytes (\xD8\x00 is no U+0600), an
+         overlong form, a surrogate half, a code point past U+10FFFF */
+      int extra=sp_utf8_valid_len((const unsigned char*)s+i,n-i)-1;
+      if(extra<1){oi+=(size_t)sprintf(out+oi,"\\x%02X",c);continue;}
+      unsigned cp=c&(extra==1?0x1Fu:extra==2?0x0Fu:0x07u);
       for(int k=0;k<extra;k++)cp=(cp<<6)|((unsigned char)s[++i]&0x3Fu);
       if(cp>0xFFFFu)oi+=(size_t)sprintf(out+oi,"\\u{%X}",cp);
       else oi+=(size_t)sprintf(out+oi,"\\u%04X",cp);
@@ -319,8 +317,11 @@ const char*sp_str_chop(const char*s){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("chop")
 /* slice!(str): s without the first occurrence of pat, or s itself when there
    is none. Unlike sub it sets no `$~`, as CRuby's slice! sets none. */
 const char*sp_str_remove_first(const char*s,const char*pat){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(pat);if(!s||!pat)return sp_str_one_answer(s);size_t pl=sp_str_byte_len(pat),sl=sp_str_byte_len(s);const char*f=sp_bytestr(s,sl,pat,pl);if(!f)return sp_str_one_answer(s);size_t n=(size_t)(f-s);char*r=sp_str_alloc_raw(sl-pl+1);memcpy(r,s,n);memcpy(r+n,f+pl,sl-n-pl);r[sl-pl]=0;sp_str_set_len(r,sl-pl);return r;}
-const char*sp_str_sub(const char*s,const char*pat,const char*rep){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(pat);SP_GC_ROOT_STR(rep);if(!s)sp_nil_recv("sub");if(!pat||!rep)return sp_str_one_answer(s);size_t pl0=sp_str_byte_len(pat),sl0=sp_str_byte_len(s);const char*f=sp_bytestr(s,sl0,pat,pl0);if(!f){if(sp_re_track_last)sp_re_clear_last_match();return sp_str_dup(s);}sp_re_sub_matched=1;if(sp_re_track_last)sp_re_set_lit_match(s,(sp_int)(f-s),(sp_int)(f-s+pl0));size_t el=0;char*rep_exp=sp_str_rep_expand(rep,pat,pl0,&el);const char*rp=rep_exp?rep_exp:rep;size_t pl=pl0,rl=rep_exp?el:sp_str_byte_len(rp),sl=sl0;char*r=sp_str_alloc_raw(sl-pl+rl+1);size_t n=f-s;memcpy(r,s,n);memcpy(r+n,rp,rl);memcpy(r+n+rl,f+pl,sl-n-pl);r[sl-pl+rl]=0;sp_str_set_len(r,sl-pl+rl);if(rep_exp)free(rep_exp);return sp_str_bin_like(s,r);}
-static const char*sp_str_capitalize_f(const char*s,uint32_t(*fu)(uint32_t),uint32_t(*fl)(uint32_t)){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("capitalize");if(sp_str_is_binary(s))return sp_str_case_bin(s,3);size_t l=sp_str_byte_len(s);char*r=sp_str_alloc_raw(l*3+1);size_t oi=0;int first=1;for(size_t i=0;i<l;){uint32_t cp;int n=sp_utf8_decode(s+i,&cp);i+=(size_t)n;if(first){
+const char*sp_str_sub(const char*s,const char*pat,const char*rep){SP_GC_ROOT_STR(s);SP_GC_ROOT_STR(pat);SP_GC_ROOT_STR(rep);if(!s)sp_nil_recv("sub");if(!pat||!rep)return sp_str_one_answer(s);size_t pl0=sp_str_byte_len(pat),sl0=sp_str_byte_len(s);const char*f=sp_bytestr(s,sl0,pat,pl0);if(!f){if(sp_re_track_last)sp_re_clear_last_match();return sp_str_dup(s);}sp_re_sub_matched=1;if(sp_re_track_last)sp_re_set_lit_match(s,(sp_int)(f-s),(sp_int)(f-s+pl0));size_t el=0;char*rep_exp=sp_str_rep_expand(rep,pat,pl0,&el);const char*rp=rep_exp?rep_exp:rep;size_t pl=pl0,rl=rep_exp?el:sp_str_byte_len(rp),sl=sl0;char*r=sp_str_alloc_raw(sl-pl+rl+1);size_t n=f-s;memcpy(r,s,n);memcpy(r+n,rp,rl);memcpy(r+n+rl,f+pl,sl-n-pl);r[sl-pl+rl]=0;sp_str_set_len(r,sl-pl+rl);if(rep_exp)free(rep_exp);return sp_str_bin_cat_like(s,rep,r);}
+/* (CRuby's capitalize answers the receiver itself for an empty String, in
+   every encoding and option: the bytes come back as they are, so the box of
+   the answer is the receiver's String) */
+static const char*sp_str_capitalize_f(const char*s,uint32_t(*fu)(uint32_t),uint32_t(*fl)(uint32_t)){SP_GC_ROOT_STR(s);if(!s)sp_nil_recv("capitalize");if(sp_str_byte_len(s)==0)return s;if(sp_str_is_binary(s))return sp_str_case_bin(s,3);size_t l=sp_str_byte_len(s);char*r=sp_str_alloc_raw(l*3+1);size_t oi=0;int first=1;for(size_t i=0;i<l;){uint32_t cp;int n=sp_utf8_decode(s+i,&cp);i+=(size_t)n;if(first){
   /* the first character's titlecase ("ǆ" is "ǅ", "ß" is "Ss"); a Turkic
      mapping of i/I first */
   uint32_t u=fu(cp);
@@ -467,7 +468,7 @@ const char*sp_str_gsub(const char*s,const char*pat,const char*rep){SP_GC_ROOT_ST
     }
     out[ol]=0;
     if(sp_re_track_last)sp_re_set_lit_match(s,(sp_int)sl,(sp_int)sl);   /* `$~`: the last, empty, match at the end */
-    char*r=sp_str_alloc(ol); memcpy(r,out,ol); sp_str_set_len(r,ol); free(out); if(rep_exp)free(rep_exp); return sp_str_bin_like(s,r);
+    char*r=sp_str_alloc(ol); memcpy(r,out,ol); sp_str_set_len(r,ol); free(out); if(rep_exp)free(rep_exp); return sp_str_bin_cat_like(s,rep,r);
   }
   size_t cap=(sl*2)+1;
   char*out=(char*)malloc(cap);
@@ -486,5 +487,7 @@ const char*sp_str_gsub(const char*s,const char*pat,const char*rep){SP_GC_ROOT_ST
   }
   /* `$~` is the last match, or nil when there was none */
   if(sp_re_track_last){if(last)sp_re_set_lit_match(s,(sp_int)(last-s),(sp_int)(last-s+pl));else sp_re_clear_last_match();}
-  out[ol]=0;char*r=sp_str_alloc(ol);memcpy(r,out,ol);sp_str_set_len(r,ol);free(out);if(rep_exp)free(rep_exp);return sp_str_bin_like(s,r);
+  out[ol]=0;char*r=sp_str_alloc(ol);memcpy(r,out,ol);sp_str_set_len(r,ol);free(out);if(rep_exp)free(rep_exp);
+  /* (with a replacement made, the encoding the receiver and the replacement share; with none, the receiver's) */
+  return last?sp_str_bin_cat_like(s,rep,r):sp_str_bin_like(s,r);
 }

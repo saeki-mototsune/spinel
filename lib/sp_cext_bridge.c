@@ -305,7 +305,7 @@ long long rb_num2ll(VALUE value) {
     sp_RbVal number=sp_cext_rbval(value);
     if(number.tag==SP_TAG_NIL)rb_raise(rb_eTypeError,"no implicit conversion from nil");
     if(number.tag==SP_TAG_BOOL)rb_raise(rb_eTypeError,"no implicit conversion from boolean");
-    if(number.tag==SP_TAG_STR || (number.tag==SP_TAG_OBJ && number.cls_id==SP_BUILTIN_STRBUF))
+    if(sp_rbval_is_string(number))
         rb_raise(rb_eTypeError,"no implicit conversion from string");
     return (long long)rb_num2long(value);
 }
@@ -457,7 +457,7 @@ static const char *type_name(int type) {
 }
 void rb_check_type(VALUE value,int type) {
     sp_RbVal object=sp_cext_rbval(value);
-    if(type==T_STRING && (object.tag==SP_TAG_STR || (object.tag==SP_TAG_OBJ && object.cls_id==SP_BUILTIN_STRBUF)))return;
+    if(type==T_STRING && sp_rbval_is_string(object))return;
     if(type==T_ARRAY && object.tag==SP_TAG_OBJ && object.cls_id==SP_BUILTIN_POLY_ARRAY)return;
     int actual=rb_type(value);
     /* an Array the analysis did not widen, or a String or Array subclass:
@@ -519,8 +519,7 @@ int rb_enc_find_index(const char *name) {
 }
 static int string_binary(VALUE value) {
     sp_RbVal r=sp_cext_rbval(value);
-    if(r.tag==SP_TAG_STR)return r.v.s && sp_str_is_binary(r.v.s);
-    if(r.tag==SP_TAG_OBJ && r.cls_id==SP_BUILTIN_STRBUF && r.v.p)return ((sp_String *)r.v.p)->binary;
+    if(sp_rbval_is_string(r))return sp_str_is_binary(sp_rbval_string_bytes(r));
     rb_raise(rb_eTypeError,"expected a String");
 }
 rb_encoding *rb_enc_get(VALUE value) { return string_binary(value) ? &ascii8bit : &utf8; }
@@ -532,12 +531,9 @@ VALUE rb_enc_from_encoding(rb_encoding *encoding) {
 }
 static rb_encoding *encoding_of(VALUE value) {
     sp_RbVal r=sp_cext_rbval(value);
-    if(r.tag==SP_TAG_ENCODING && r.v.s) {
-        int index=rb_enc_find_index(r.v.s);
-        if(index>=0)return rb_enc_from_index(index);
-    }
-    if(r.tag==SP_TAG_STR && r.v.s) {
-        int index=rb_enc_find_index(r.v.s);
+    const char *name=r.tag==SP_TAG_ENCODING ? r.v.s : sp_rbval_string_bytes(r);
+    if(name) {
+        int index=rb_enc_find_index(name);
         if(index>=0)return rb_enc_from_index(index);
     }
     rb_raise(rb_eArgError,"unknown encoding name");
@@ -564,12 +560,9 @@ VALUE rb_str_export_to_enc(VALUE value,rb_encoding *to) { return string_in_encod
 static sp_String *string(VALUE value) {
     sp_RbVal r=sp_cext_rbval(value);
     if(r.tag==SP_TAG_OBJ && r.cls_id==SP_BUILTIN_STRBUF)return r.v.p;
-    if(r.tag==SP_TAG_STR)sp_str_check_mutable(r.v.s);
     rb_raise(rb_eTypeError,"expected a shared String");
 }
 VALUE rb_str_freeze(VALUE v) {
-    sp_RbVal r=sp_cext_rbval(v);
-    if(r.tag==SP_TAG_STR && sp_str_is_frozen_val(r.v.s))return v;
     sp_String_freeze(string(v));return v;
 }
 VALUE rb_utf8_str_new(const char *bytes,long length) {
@@ -605,11 +598,13 @@ char *sp_cext_string_cstr(VALUE value) {
     return bytes;
 }
 char *sp_cext_string_ptr(VALUE v) {
-    sp_RbVal r=sp_cext_rbval(v);if(r.tag==SP_TAG_STR)return (char *)r.v.s;
+    sp_RbVal r=sp_cext_rbval(v);
+    if(sp_rbval_is_string(r))return (char *)sp_rbval_string_bytes(r);
     return string(v)->data;
 }
 long sp_cext_string_len(VALUE v) {
-    sp_RbVal r=sp_cext_rbval(v);if(r.tag==SP_TAG_STR)return (long)sp_str_byte_len(r.v.s);
+    sp_RbVal r=sp_cext_rbval(v);
+    if(sp_rbval_is_string(r))return (long)sp_str_byte_len(sp_rbval_string_bytes(r));
     return (long)string(v)->len;
 }
 VALUE rb_str_cat(VALUE v,const char *s,long len) { if(len<0)rb_raise(rb_eArgError,"negative string size");sp_String_append_n(string(v),s,(size_t)len);return v; }
@@ -618,23 +613,6 @@ static sp_PolyArray *array(VALUE value) {
     sp_RbVal r=sp_cext_rbval(value);
     if(r.tag==SP_TAG_OBJ && r.cls_id==SP_BUILTIN_POLY_ARRAY)return r.v.p;
     rb_raise(rb_eTypeError,"expected a widened Array");
-}
-sp_PolyArray *sp_cext_share_new_array(sp_PolyArray *array) {
-    SP_GC_ROOT(array);
-    if(!array)return array;
-    for(sp_int i=0;i<array->len;i++) {
-        sp_RbVal value=array->data[i];
-        if(value.tag==SP_TAG_STR && value.v.s && !sp_str_is_frozen_val(value.v.s)) {
-            sp_RbVal shared=value;
-            if(((const unsigned char *)value.v.s)[-1]==0xfd) {
-                sp_String *owner=(sp_String *)(void *)((sp_str_hdr *)sp_fd_base(value.v.s))->next;
-                if(owner && owner->data==value.v.s)shared=sp_box_obj(owner,SP_BUILTIN_STRBUF);
-            }
-            if(shared.tag==SP_TAG_STR)shared=sp_box_obj(sp_String_new_shared(value.v.s),SP_BUILTIN_STRBUF);
-            sp_gc_wb(array);array->data[i]=shared;
-        }
-    }
-    return array;
 }
 VALUE rb_ary_new(void) { return sp_cext_value(sp_box_poly_array(sp_PolyArray_new())); }
 VALUE rb_hash_new(void) { return sp_cext_value(sp_cext_hash_new()); }

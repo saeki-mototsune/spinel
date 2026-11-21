@@ -131,7 +131,14 @@ int sp_io_make_pipe(int fds[2]);
 /* IO.pipe end: wrap a raw pipe fd in a GC-managed sp_File. */
 sp_File *sp_io_fdopen(int fd, const char *mode);
 sp_File *sp_io_fdopen_ex(int fd, const char *mode, int owns_fd);
+/* a byte a read-only FIFO open took asking for a writer (lib/sp_cold.c): the
+   handle made of the descriptor gets it back */
+void sp_fifo_pushback_apply(sp_File *f);
+int sp_fifo_pushback_take(int fd, unsigned char *c);
 sp_File *sp_File_open_perm(const char *path, const char *mode, sp_oint perm);   /* a nil perm is CRuby's default, 0666 */
+int sp_io_mode_open_flags(const char *m);   /* the open(2) flags of a mode string, -1 for one File.open refuses */
+const char *sp_io_fdopen_mode(int fl);      /* the stdio mode that fits those flags */
+int sp_open_fifo_aware(const char *path, int fl, int perm);   /* open(2) that lets the other green threads run while a FIFO waits (lib/sp_cold.c) */
 /* Wrap a connected/listening socket fd. Reads stay on the buffered FILE* so
    #gets and friends work, except a connected stream socket's, which take a
    buffer of the handle's own (own_buf); writes bypass stdio straight to
@@ -167,7 +174,6 @@ size_t sp_io_rbuf_read(sp_File *f, void *buf, size_t n);
 ssize_t sp_io_rbuf_getline(sp_File *f, char **buf, size_t *cap);
 char *sp_io_rbuf_fgets(sp_File *f, char *buf, int size);
 size_t sp_io_rbuf_read_into(sp_File *f, char *buf, size_t n);
-size_t sp_io_rbuf_read_some(sp_File *f, char *buf, size_t n);
 size_t sp_io_rbuf_take(sp_File *f, void *buf, size_t n);
 /* Readers of an IO handle's stream call these instead of stdio: each is the
    stdio call of the same name on the handle's FILE, or, for a handle with
@@ -227,6 +233,8 @@ const char *sp_slurp_stream_parked(sp_File *f);
 sp_int sp_File_write(sp_File *f, const char *s);
 sp_int sp_File_write_bin(sp_File *f, const char *s);
 sp_int sp_File_syswrite(sp_File *f, const char *s, size_t n);
+sp_int sp_File_write_poly(sp_File *f, sp_RbVal v);
+sp_int sp_File_syswrite_poly(sp_File *f, sp_RbVal v);
 sp_int sp_File_close(sp_File *f);
 
 /* Every operation on a handle whose descriptor is gone raises IOError in
@@ -265,6 +273,8 @@ const char *sp_sock_read_nb(sp_File *f, sp_int len, sp_bool exc, sp_bool is_recv
 /* the byte count, or nil when the call would block (exception: false) */
 sp_oint sp_sock_write_nb(sp_File *f, const char *data, sp_bool exc);
 sp_oint sp_sock_write_nb_bin(sp_File *f, const char *data, sp_bool exc);
+sp_oint sp_sock_write_nb_n(sp_File *f, const char *data, size_t len, sp_bool exc);
+sp_oint sp_sock_write_nb_poly(sp_File *f, sp_RbVal v, sp_bool exc);
 sp_oint sp_sock_connect_nb(sp_File *f, const char *host, sp_int port, sp_bool exc);
 /* Addrinfo-form connect_nonblock (already-resolved endpoint) */
 sp_oint sp_sock_connect_nb_sa(sp_File *f, const char *sa, sp_int salen,
@@ -316,8 +326,10 @@ sp_int sp_sock_send(sp_File *f, const char *data, sp_int len, sp_int flags, cons
 sp_int sp_sock_shutdown(sp_File *f, sp_int how);
 sp_int sp_sock_const(const char *n);
 const char *sp_sock_recv(sp_File *f, sp_int len);
-const char *sp_sock_recvfrom(sp_File *f, sp_int len, const char **ip_out, sp_int *port_out);
+sp_PolyArray *sp_sock_recvfrom(sp_File *f, sp_int len);
 sp_int sp_sock_optval(sp_RbVal v);
+sp_int sp_sock_level_arg(sp_RbVal v);
+sp_int sp_sock_optname_arg(sp_int level, sp_RbVal v);
 sp_int sp_sock_setsockopt(sp_File *f, sp_int level, sp_int opt, sp_int value);
 sp_SockOpt *sp_sock_getsockopt(sp_File *f, sp_int level, sp_int opt);
 sp_int sp_sock_listen(sp_File *f, sp_int backlog);
@@ -343,6 +355,7 @@ void sp_File_set_close_on_exec(sp_File *f, sp_bool on);
 sp_int sp_File_fcntl(sp_File *f, sp_int cmd, sp_int arg);
 sp_int sp_File_pwrite(sp_File *f, const char *s, sp_int off);
 sp_int sp_File_pwrite_bin(sp_File *f, const char *s, sp_int off);
+sp_int sp_File_pwrite_n(sp_File *f, const char *s, size_t n, sp_int off);
 void sp_File_advise(sp_File *f, const char *kind, sp_int off, sp_int len);
 void sp_File_close_half(sp_File *f, sp_bool reading);
 sp_File *sp_File_reopen(sp_File *f, const char *path, const char *mode);
@@ -413,8 +426,8 @@ SP_NORETURN void sp_pread_raise_errno(sp_File *f);
    offset answers "", which its caller writes over the buffer. CRuby
    answers the buffer unchanged in each case. */
 void sp_pread_check(sp_File *f, sp_int len, sp_bool outbuf);
-/* A nil path (a NULL string at run time) is CRuby's TypeError, raised before
-   any syscall sees it; the multi-path File.delete checks every path first. */
+/* Reject nil and embedded NUL before passing a path to a syscall.
+   The multi-path File.delete checks every path first. */
 void sp_file_path_check(const char *path);
 
 #include <dirent.h>

@@ -18,15 +18,11 @@
    file offset. */
 static void emit_spawn_fd_options(Compiler *c, Buf *b, int tkv, int tfd, int tth, int topts, int town) {
   for (int i = 0; i < 3; i++) {
-    /* a filename boxed as the String's handle reads as the String (the arms
-       below test the String tag) */
-    char vref[48];
-    snprintf(vref, sizeof vref, "sp_poly_strbuf_deref(_t%d)", tkv);
     buf_printf(b,
       "{ sp_RbVal _t%d; sp_bool _t%d; int _prior; "
       "_t%d = sp_process_redirect_value(_t%d, %d, &_t%d, &_prior); "
       "if (_t%d) { if (_prior >= 0) sp_PolyArray_push(_t%d, _t%d->data[_prior]);\nelse { "
-      "  sp_RbVal _v = %s; "
+      "  sp_RbVal _v = _t%d; "
       "  if (_v.tag == SP_TAG_NIL) { "
       "    sp_PolyArray_push(_t%d, sp_box_int(-1)); "
       "  }\nelse if (_v.tag == SP_TAG_BOOL && !_v.v.i) { "
@@ -35,8 +31,8 @@ static void emit_spawn_fd_options(Compiler *c, Buf *b, int tkv, int tfd, int tth
       "    sp_PolyArray_push(_t%d, _v); "
       "  }\nelse if (_v.tag == SP_TAG_OBJ && _v.cls_id == SP_BUILTIN_IO && _v.v.p) { "
       "    sp_PolyArray_push(_t%d, sp_box_int(sp_File_fileno((sp_File*)_v.v.p))); "
-      "  }\nelse if (_v.tag == SP_TAG_STR) { "
-      "    sp_PolyArray_push(_t%d, sp_box_int(sp_process_open_redirect(_v.v.s, %d, _t%d))); "
+      "  }\nelse if (sp_rbval_is_string(_v)) { "
+      "    sp_PolyArray_push(_t%d, sp_box_int(sp_process_open_redirect(sp_rbval_string_bytes(_v), %d, _t%d))); "
       "  }\nelse if (_v.tag == SP_TAG_OBJ && _v.cls_id == SP_BUILTIN_POLY_ARRAY) { "
       "    sp_PolyArray *_a = (sp_PolyArray*)_v.v.p; "
       "    if (_a->len >= 2 && _a->data[0].tag == SP_TAG_SYM "
@@ -63,7 +59,7 @@ static void emit_spawn_fd_options(Compiler *c, Buf *b, int tkv, int tfd, int tth
       "  } "
       "}}\nelse { sp_PolyArray_push(_t%d, sp_box_int(-1)); } }",
       tkv, tfd, tkv, tth, i, tfd,
-      tfd, topts, topts, vref,
+      tfd, topts, topts, tkv,
       topts,
       topts,
       topts,
@@ -543,19 +539,8 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     }
     if ((sp_streq(name, "delete") || sp_streq(name, "unlink")) &&
         (argc >= 1 || sp_streq(nt_str(nt, recv, "name"), "File"))) {
-      /* a lone splat: every path of the Array converted and checked before
-         the first unlink, as the several-path form below does, and the count
-         answered */
       if (argc == 1 && nt_kind(nt, argv[0]) == NK_SplatNode) {
-        int tl = ++g_tmp, tq = ++g_tmp;
-        buf_printf(b, "({ sp_PolyArray *_t%d = sp_poly_to_poly_array(", tl); emit_boxed(c, argv[0], b);
-        buf_printf(b, "); SP_GC_ROOT(_t%d); sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
-                      " for (sp_int _i = 0; _i < _t%d->len; _i++)"
-                      " sp_PolyArray_push(_t%d, sp_box_str(sp_poly_arg_path(_t%d->data[_i])));"
-                      " for (sp_int _i = 0; _i < _t%d->len; _i++) sp_file_path_check(_t%d->data[_i].v.s);"
-                      " for (sp_int _i = 0; _i < _t%d->len; _i++) sp_file_delete(_t%d->data[_i].v.s);"
-                      " _t%d->len; })",
-                   tl, tq, tq, tl, tq, tl, tq, tq, tq, tq, tq);
+        buf_puts(b, "sp_file_delete_splat("); emit_boxed(c, argv[0], b); buf_puts(b, ")");
         return 1;
       }
       if (argc == 1) {
@@ -639,8 +624,8 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
          permission bits, which reach open(2) for either mode form */
       int mnode = kw_mode >= 0 ? kw_mode : argc >= 2 ? argv[1] : -1;
       int int_mode = mnode >= 0 &&
-                     (comp_ntype(c, mnode) == TY_INT ||
-                      obj_conv_method(c, comp_ntype(c, mnode), "to_int", TY_INT, NULL) >= 0);
+                     (repr_of(c, mnode).as_ty == TY_INT ||
+                      obj_conv_method(c, mnode, repr_of(c, mnode).as_ty, "to_int", TY_INT, NULL) >= 0);
       int perm = -1;
       if (nt_argv_kwh(nt, argv, argc) >= 0)
         perm = struct_kwarg_value(c, argv[argc - 1], "perm");
@@ -881,6 +866,17 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     if (sp_streq(name, "glob") && argc == 3 && nt_kind(nt, argv[2]) == NK_KeywordHashNode &&
         nt_kind(nt, argv[1]) != NK_KeywordHashNode &&
         emit_dir_glob_options(c, argv[0], argv[2], argv[1], b)) return 1;
+    /* Dir.glob(pattern, flags): a positional flag word with no keyword, which
+       sp_dir_glob_keywords reads as flags: does */
+    if (sp_streq(name, "glob") && argc == 2 && nt_kind(nt, argv[1]) != NK_KeywordHashNode &&
+        nt_kind(nt, argv[1]) != NK_SplatNode && nt_kind(nt, argv[0]) != NK_SplatNode &&
+        nt_kind(nt, argv[0]) != NK_ArrayNode && !ty_is_array(comp_ntype(c, argv[0])) &&
+        (comp_ntype(c, argv[1]) == TY_INT || nt_kind(nt, argv[1]) == NK_ConstantPathNode)) {
+      buf_puts(b, "({ ");
+      int first = emit_rooted_arg_list(c, argv, 2, "sp_RbVal", "SP_GC_ROOT_RBVAL", emit_boxed, NULL, b);
+      buf_printf(b, "sp_dir_glob_keywords(_t%d, sp_box_nil(), _t%d, 1, sp_box_nil(), 0); })", first, first + 1);
+      return 1;
+    }
     /* Dir[*pats] / Dir.glob(*pats), and Dir[a, b]: every pattern a splat
        holds or an argument names, gathered into one list for the union */
     if (sp_streq(name, "glob") && argc >= 1 &&
@@ -1043,7 +1039,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
       if (at != TY_INT && at != TY_FLOAT && at != TY_BIGINT && at != TY_UNKNOWN) {
         /* an object answering #to_int is its Integer; any other class is
            CRuby's "can't convert X into an exact number" */
-        if (ty_is_object(at) && obj_conv_method(c, at, "to_int", TY_INT, NULL) >= 0) {
+        if (ty_is_object(at) && obj_conv_method(c, argv[0], at, "to_int", TY_INT, NULL) >= 0) {
           buf_puts(b, "sp_time_at_int("); emit_int_expr(c, argv[0], b); buf_puts(b, ")");
           return 1;
         }
@@ -1186,7 +1182,7 @@ int emit_marshal_value_call(Compiler *c, int id, Buf *b) {
                 "if (!(_t%d.tag == SP_TAG_CLASS && _c%d.cls_id < 0 && _c%d.name && !strcmp(_c%d.name, \"Marshal\"))) "
                 "sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)); ",
              ta, tr, tr, tr, tr, tr, tr, tr, name, tr);
-  if (dump) buf_printf(b, "sp_box_str(sp_marshal_dump(_t%d)); })", ta);
+  if (dump) buf_printf(b, "sp_box_str_new(sp_marshal_dump(_t%d)); })", ta);
   else buf_printf(b, "const char *_s%d = sp_poly_arg_str_chk(_t%d); "
                      "sp_marshal_load(_s%d, (sp_int)sp_str_byte_len(_s%d)); })", ta, ta, ta, ta);
   return 1;
@@ -1375,6 +1371,19 @@ int emit_call_module_fn_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       const char *unit = NULL;
       if (argc >= 2 && nt_kind(nt, argv[1]) == NK_SymbolNode)
         unit = nt_str(nt, argv[1], "value");
+      /* a unit that is not a Symbol literal (a local, a keyword hash, a
+         String) is judged at run time: the clock id runs first, then the
+         unit; the result is boxed, an Integer or a Float by the unit */
+      if (argc == 2 && !unit && nt_kind(nt, argv[1]) != NK_NilNode) {
+        int t = ++g_tmp;
+        buf_printf(b, "({ sp_int _clk%d = ", t);
+        if (!emit_clock_id(c, argv[0], b)) emit_int_expr(c, argv[0], b);
+        buf_printf(b, "; sp_RbVal _clu%d = ", t);
+        emit_boxed(c, argv[1], b);
+        buf_printf(b, "; sp_process_clock_dyn(_clk%d, _clu%d, %d); })", t, t,
+                   sp_streq(name, "clock_getres") ? 1 : 0);
+        return 1;
+      }
       /* an unknown literal unit is CRuby's ArgumentError, not a silent
          float_second (#2727) */
       if (unit && !sp_streq(unit, "nanosecond") && !sp_streq(unit, "microsecond") &&
@@ -1553,6 +1562,16 @@ else {
     else if (sp_streq(name, "erf"))   cfn = "erf";
     else if (sp_streq(name, "erfc"))  cfn = "erfc";
     else if (sp_streq(name, "gamma")) cfn = "sp_math_gamma";
+    if (cfn && argc == 1 && sp_streq(name, "sqrt")) {
+      if (repr_of(c, argv[0]).as_ty == TY_COMPLEX) {
+        buf_puts(b, "sp_complex_math_sqrt("); emit_expr(c, argv[0], b); buf_puts(b, ")");
+        return 1;
+      }
+      if (repr_of(c, id).as_ty == TY_POLY) {
+        buf_puts(b, "sp_poly_math_sqrt("); emit_boxed(c, argv[0], b); buf_puts(b, ")");
+        return 1;
+      }
+    }
     if (cfn && argc == 1) {
       /* emit_math_arg casts a plain int and coerces a poly value alike -- a
          bare `if (a0t==TY_INT) "(double)"` cast left a poly-typed arg (e.g.
@@ -1599,8 +1618,8 @@ else {
         Buf a1; memset(&a1, 0, sizeof a1); emit_math_arg(c, argv[1], &a1);
         emit_indent(g_pre, g_indent);
         buf_printf(g_pre, "double _t%d = %s;\n", t1, a1.p ? a1.p : "0"); free(a1.p);
-        /* log base 1 is NaN in CRuby (the division log(x)/log(1) is x/0 = Inf) */
-        buf_printf(b, "(_t%d == 1.0 ? (0.0/0.0) : sp_math_log(_t%d) / sp_math_log(_t%d))", t1, t0, t1);
+        /* computed as CRuby computes it (sp_math_log_base) */
+        buf_printf(b, "sp_math_log_base(_t%d, _t%d)", t0, t1);
       }
       return 1;
     }
@@ -1650,7 +1669,7 @@ else {
      `{...}.to_json` inside a user #to_json is ordinary. A user class that
      defines its own to_json keeps the dispatch (this arm declines then). */
   if (recv >= 0 && sp_streq(name, "to_json") && nt_ref(nt, id, "block") < 0 &&
-      sp_feature_required("json") && json_to_json_is_builtin(c, recv)) {
+      sp_feature_required("json") && json_to_json_is_builtin(c, id, recv)) {
     /* every builtin's #to_json takes an optional state and nothing more
        (a boxed one, whose class the arity guard cannot name, included) */
     if (argc > 1) {
@@ -1660,9 +1679,17 @@ else {
                     " (const char *)0; })", argc);
       return 1;
     }
-    for (int a = 0; a < argc; a++) { buf_puts(b, "((void)("); emit_boxed(c, argv[a], b); buf_puts(b, "), "); }
+    /* a state given is read as generate's options (sp_json_generate_options),
+       the receiver evaluated first */
+    if (argc == 1) {
+      g_conv_emitted++;
+      int t = ++g_tmp;
+      buf_printf(b, "({ sp_RbVal _t%d = ", t); emit_boxed(c, recv, b);
+      buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_json_generate_options(_t%d, ", t, t); emit_boxed(c, argv[0], b);
+      buf_puts(b, ", 2); })");
+      return 1;
+    }
     buf_puts(b, "sp_json_val("); emit_boxed(c, recv, b); buf_puts(b, ")");
-    for (int a = 0; a < argc; a++) buf_puts(b, ")");
     return 1;
   }
 
@@ -1781,7 +1808,7 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
           if (sym_ok) buf_printf(b, "_t%d.tag == SP_TAG_SYM ? sp_time_s_parse_sym(%s, sp_sym_to_s((sp_sym)_t%d.v.i)) : ", tv, tfn, tv);
           buf_printf(b, "%s(_t%d.tag == SP_TAG_NIL ? (const char *)0 : ", tfn, tv);
           if (sp_streq(tfn, "sp_time_s_httpdate"))
-            buf_printf(b, "(_t%d.tag != SP_TAG_STR && !sp_poly_is_strbuf(_t%d))"
+            buf_printf(b, "(!sp_rbval_is_string(_t%d) && !sp_poly_is_strbuf(_t%d))"
                           " ? (sp_raise_nomethod(sp_nomethod_msg(\"match?\", _t%d)), (const char *)0) : ", tv, tv, tv);
           buf_printf(b, "sp_poly_arg_str_chk(_t%d)); })", tv);
         }
@@ -2044,13 +2071,6 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
           last_is_opts = 1;
         }
       }
-      /* exec's options (chdir:, redirections) are not taken: refused, not
-         dropped */
-      if (is_exec && last_is_opts) {
-        unsupported_feature(c, id, "exec with an options Hash (Process.spawn takes chdir: and the redirections)");
-        buf_puts(b, "0");
-        return 1;
-      }
       int n_args = extra - (last_is_opts ? 1 : 0);
       int has_splat = nt_argv_has_splat(nt, argv, n_args + 1);
       if (has_splat) {
@@ -2101,7 +2121,7 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
          time, so the test is made there */
       int tenv = 0;
       TyKind tfirst = nt_kind(nt, argv[0]) == NK_SplatNode ? TY_POLY : repr_of(c, argv[0]).as_ty;
-      if (!is_exec && (ty_is_hash(tfirst) || tfirst == TY_POLY || tfirst == TY_UNKNOWN)) {
+      if (ty_is_hash(tfirst) || tfirst == TY_POLY || tfirst == TY_UNKNOWN) {
         tenv = ++g_tmp;
         buf_printf(b, " sp_RbVal _t%d = sp_box_nil(); SP_GC_ROOT_RBVAL(_t%d);", tenv, tenv);
         buf_printf(b, " if (sp_json_kind(_t%d) == 2) { if (_t%d->len == 0) sp_raise_cls(\"ArgumentError\", \"wrong number of arguments (given 0, expected 1+)\");"
@@ -2168,17 +2188,14 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
             tfd, tkv, topts, tkv,
             topts);
         }
-        /* chdir: look up, must be String, or nil. --share-strings: a
-           directory boxed as the String's handle reads as the String, as a
-           redirect's filename does above */
+        /* Pass the original String box through to spawn's directory reader. */
         buf_printf(b,
           " { sp_RbVal _t%d; sp_bool _t%d; "
           "_t%d = sp_poly_hash_get_pair_val(_t%d, "
           "sp_box_sym(sp_sym_intern(\"chdir\")), &_t%d); ",
           tkv, tfd, tkv, tth, tfd);
-        buf_printf(b, "_t%d = sp_poly_strbuf_deref(_t%d); ", tkv, tkv);
         buf_printf(b,
-          "if (_t%d && _t%d.tag == SP_TAG_STR) "
+          "if (_t%d && sp_rbval_is_string(_t%d)) "
           "{ sp_PolyArray_push(_t%d, _t%d); } "
           "\nelse { sp_PolyArray_push(_t%d, sp_box_nil()); } }",
           tfd, tkv, topts, tkv,
@@ -2201,8 +2218,8 @@ int emit_call_builtin_cmethod_arms(Compiler *c, int id, Buf *b, const NodeTable 
       if (tenv) buf_printf(b, " sp_PolyArray_push(_t%d, _t%d);", topts, tenv);
       else buf_printf(b, " sp_PolyArray_push(_t%d, sp_box_nil());", topts);
       buf_printf(b, " sp_PolyArray_push(_t%d, _t%d);", topts, tunset);
-      if (is_exec)   /* Kernel#exec: the process becomes the command, or raises its Errno */
-        buf_printf(b, " sp_process_exec(_t%d, sp_box_poly_array(_t%d)); sp_int _r = 0; (void)_t%d;", tcmd, targs, topts);
+      if (is_exec)   /* Kernel#exec: the process becomes the command, with the options applied to it, or raises its Errno */
+        buf_printf(b, " sp_process_exec(_t%d, sp_box_poly_array(_t%d), sp_box_poly_array(_t%d)); sp_int _r = 0;", tcmd, targs, topts);
       else
         buf_printf(b, " sp_int _r = sp_process_spawn(_t%d, sp_box_poly_array(_t%d), sp_box_poly_array(_t%d));", tcmd, targs, topts);
       buf_printf(b, " _r; })\n");
@@ -2299,7 +2316,7 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
     /* find_index(v) { } where an Enumerable reopen of the program defines
        find_index: that method answers for the Enumerator, not a value row */
     if (sp_streq(name, "find_index") && argc >= 1 && nt_ref(nt, id, "block") >= 0 &&
-        an_enum_own_find_index(c)) return 0;
+        an_enum_own_find_index(c, id)) return 0;
     /* the readers that render the receiver and the arguments: builtin-op rows */
     if (emit_builtin_op(c, id, recv, TY_ENUMERATOR, name, b)) return 1;
     /* find_index(v) walks it only as far as the hit, so an endless one

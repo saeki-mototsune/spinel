@@ -22,16 +22,9 @@ static int sp_bytes_ascii(const char *p, size_t n) {
    sp_String_set_bin raised it after the splice it was handed. v may be a
    view of s's own bytes (`s[0] = s`), and is copied first.
 
-   The 7-bit bit (SP_STR_SIZE_ASCII7) says the length walk counted s as
-   bytes: all of them below 0x80, or an invalid one among them
-   (sp_str_length). The splice keeps it, so the next index into s reads no
-   bytes, only where it cannot change what any other byte decodes as: the
-   bytes taken out and put in are ASCII, and so are the bytes on either side
-   of the splice (or an end of s). An ASCII byte ends any sequence, so every
-   other byte decodes as it did, and a String the walk counted as bytes
-   still counts so. Anywhere else (`"\xffé"` given an ASCII first byte is
-   valid text again, `"\xC3a\xA9".slice!(1)` joins two bytes into "é") the
-   bit is cleared, and the next walk sets it again if it holds. */
+   SP_STR_SIZE_ASCII7 records that every byte is ASCII. A splice preserves
+   that proof only when the replacement and affected bytes are ASCII. An
+   arbitrary splice leaves the next reader to check the resulting bytes. */
 static void sp_String_splice_in(sp_String *s, size_t b, size_t e, const char *v, size_t vl, int bin) {
   if (sp_String_is_immutable(s)) { sp_raise_frozen_str(s->data); return; }
   char *own = NULL;
@@ -57,10 +50,10 @@ static void sp_String_splice_in(sp_String *s, size_t b, size_t e, const char *v,
   if (ascii7) sp_str_mark_ascii7(d);
 }
 /* s[from, n] = val by characters, in place: String#[]= of an index, a start
-   and a length, a Range or a substring, and String#insert. The checks are
-   sp_str_splice_at's, in its order (a negative length, then a start outside
-   the String: IndexError, or with range_form the RangeError), and the
-   result's encoding is the one its pieces joined in: the receiver's, unless
+   and a length, a Range or a substring, and String#insert. It checks the
+   length and start before splicing. A String store can use byte indexing
+   chosen before the replacement's conversion changes the receiver.
+   The result's encoding is the one its pieces joined in: the receiver's, unless
    val has high bytes in the other encoding, which the result takes where
    the receiver's kept bytes are all ASCII and is BINARY where they are not.
    keep_enc leaves the receiver's encoding as it is, as sp_String_set_bin did.
@@ -70,36 +63,29 @@ static void sp_String_splice_in(sp_String *s, size_t b, size_t e, const char *v,
    retirement are malloc and realloc), so neither can be collected under
    them, and a raise from a check leaves no root of theirs behind (an inline
    rescue does not restore sp_gc_nroots). */
-void sp_String_splice_chars(sp_String *s, sp_int from, sp_int n, const char *val, int range_form, int keep_enc) {
+void sp_String_splice_chars(sp_String *s, sp_int from, sp_int n, const char *val, int single_byte, int keep_enc) {
   if (SP_UNLIKELY(!s)) sp_nil_recv("[]=");
   /* (an empty String with the marker byte the readers look behind: a bare
      "" has none, and sp_str_byte_len reads the byte before it) */
-  if (!val) val = &("\xff" "")[1];
+  if (!val) val = sp_str_empty;
   const char *d = s->data;
-  sp_int len = (sp_int)sp_str_length(d);
   if (n < 0) { sp_raise_cls("IndexError", sp_sprintf("negative length %lld", (long long)n)); return; }
+  int bin = keep_enc ? -1 : sp_str_splice_encoding(d, val);
+  sp_int len = (sp_int)sp_str_length(d);
   sp_int from0 = from;
   if (from < 0) from += len;
   if (from < 0 || from > len) {
-    if (range_form) sp_raise_cls("RangeError", sp_sprintf("%lld out of range", (long long)from0));
-    else sp_raise_cls("IndexError", sp_sprintf("index %lld out of string", (long long)from0));
+    sp_raise_cls("IndexError", sp_sprintf("index %lld out of string", (long long)from0));
     return;
   }
   if (n > len - from) n = len - from;
   size_t bl = sp_str_byte_len(d), b, e, fb;
-  if (sp_str_fixed_width(d, &fb) || sp_str_is_binary(d)) { b = (size_t)from; e = b + (size_t)n; }
+  if (single_byte || sp_str_fixed_width(d, &fb) || sp_str_is_binary(d)) { b = (size_t)from; e = b + (size_t)n; }
   else {
     b = sp_utf8_byte_offset(d, from);
     e = b;
-    for (sp_int k = n; k > 0 && e < bl; k--) e += (size_t)sp_utf8_advance(d + e);
+    for (sp_int k = n; k > 0 && e < bl; k--) e += sp_utf8_unit_len(d + e, bl - e);
     if (e > bl) e = bl;
-  }
-  int bin = -1;
-  if (!keep_enc) {
-    int sb = sp_str_is_binary(d), vb = sp_str_is_binary(val);
-    bin = sb;
-    if (sb != vb && !sp_str_ascii_only(val))
-      bin = sp_bytes_ascii(d, b) && sp_bytes_ascii(d + e, bl - e) ? vb : 1;
   }
   sp_String_splice_in(s, b, e, val, sp_str_byte_len(val), bin);
 }
@@ -113,6 +99,23 @@ void sp_String_splice_bytes(sp_String *s, sp_int start, sp_int len, const char *
   if (!val) val = &("\xff" "")[1];
   int bin = sp_str_bytesplice_check(s->data, &start, &len, val, &vstart, &vlen);
   sp_String_splice_in(s, (size_t)start, (size_t)(start + len), val + vstart, (size_t)vlen, keep_enc ? -1 : bin);
+}
+/* A match supplies a byte span in the pre-conversion String. The replacement
+   may have changed the String, including the character boundaries at that span. */
+void sp_String_splice_match(sp_String *s, sp_int start, sp_int len, const char *val) {
+  if (!s) sp_nil_recv("[]=");
+  const char *bytes = sp_String_cstr(s);
+  if (!val) val = sp_str_empty;
+  int bin = sp_str_splice_encoding(bytes, val);
+  if (sp_String_is_immutable(s)) sp_raise_frozen_str(bytes);
+  size_t begin = (size_t)start, count = (size_t)len, length = (size_t)s->len;
+  if (begin > length || (begin == length && count > 0)) return;
+  size_t replacement = sp_str_byte_len(val);
+  if (count > length - begin) {
+    if (replacement == count) replacement = length - begin;
+    count = length - begin;
+  }
+  sp_String_splice_in(s, begin, begin + count, val, replacement, bin);
 }
 /* String#replace(s): replace entire content. */
 void sp_String_replace(sp_String*s,const char*t){SP_GC_ROOT(s);SP_GC_ROOT_STR(t);if (SP_UNLIKELY(!s)) sp_nil_recv("replace"); if (!t)return;if(sp_String_is_immutable(s)){sp_raise_frozen_str(s->data);return;}int64_t tl=(int64_t)strlen(t);if(!sp_fd_grow(s,tl))return;memcpy(s->data,t,tl);s->data[tl]='\0';s->len=tl;sp_fd_publish(s);}
@@ -139,16 +142,11 @@ int sp_fd_grow_inline(sp_String *s, int64_t need){
   return 1;
 }
 
-/* Symbol#to_s and #id2name: the symbol's name, frozen. CRuby 4.0 answers a
-   chilled String that warns at its first mutation and is to be frozen; the
-   program's string literals are frozen here already, and so is this one
-   (docs/limitations.md). The symbol table's own name is a plain static
-   without a header, so each symbol gets one frozen copy with a header (0xf1,
-   its link sp_sym_str_tag, which names no literal's handle: a handle made
-   of it is a new frozen handle), built at its first to_s and kept as long
-   as the symbol is; the collector neither marks nor sweeps it, and its
-   header keeps the length and the hash. The table is guarded by the heap
-   lock, as the dedup table is. */
+/* The cached spelling for Symbol#name and internal byte readers. The symbol
+   table's name has no frozen header of its own, so every symbol has one
+   frozen copy (0xf1, sp_sym_str_tag), built on first use and retained as long
+   as the symbol. Its header holds the length, hash and encoding flags. The
+   public to_s and id2name operations allocate their own String handles. */
 typedef struct { sp_str_hdr h; unsigned char m; char d[]; } sp_sym_str_obj;
 static const char**sp_sym_str_tab=NULL;
 static sp_int sp_sym_str_cap=0;
@@ -187,7 +185,6 @@ const char*sp_sym_to_s_frozen(sp_sym id){
   return r;
 }
 
-struct sp_String_s *sp_strelem_of(const char *b) { return sp_String_new_shared(b); }
 const char *sp_str_keep_copy(const char *s) { return sp_str_concat(s, sp_str_empty); }
 /* A Hash's String key made from `len` bytes at `data`: a frozen handle over
    a copy, whose payload is the key (sp_hash_key_str, sp_hash_key_from_bytes) */

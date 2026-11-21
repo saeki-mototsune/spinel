@@ -70,12 +70,17 @@ module Net
   end
 
   # Raised when the peer accepts the connection and then says nothing for
-  # read_timeout seconds, and when a connection cannot be established within
-  # open_timeout. Same classes and same base as CRuby's: Timeout::Error, so
-  # `rescue Timeout::Error` catches either, which is what a caller with a
-  # deadline writes.
+  # read_timeout seconds, when it stops taking the request for
+  # write_timeout seconds, and when a connection cannot be established
+  # within open_timeout. Same classes and same base as CRuby's:
+  # Timeout::Error, so `rescue Timeout::Error` catches any of them, which is
+  # what a caller with a deadline writes.
   class ReadTimeout < Timeout::Error
     def message = "Net::ReadTimeout"
+  end
+
+  class WriteTimeout < Timeout::Error
+    def message = "Net::WriteTimeout"
   end
 
   class OpenTimeout < Timeout::Error
@@ -287,6 +292,49 @@ module Net
       nil
     end
 
+    def each
+      @fields.each { |k, values| yield k, values.join(", ") }
+      nil
+    end
+
+    def each_name
+      @fields.each_key { |k| yield k }
+      nil
+    end
+
+    def each_key
+      @fields.each_key { |k| yield k }
+      nil
+    end
+
+    def each_value
+      @fields.each_value { |values| yield values.join(", ") }
+      nil
+    end
+
+    # Each header's values under its downcased name.
+    def to_hash
+      @fields.dup
+    end
+
+    # The header's value; for an absent one the block's answer for the
+    # downcased name, else the default given, else a KeyError.
+    def fetch(name, *default)
+      k = name.to_s.downcase
+      values = @fields[k]
+      return values.join(", ") unless values.nil?
+      return yield(k) if block_given?
+      return default[0] unless default.empty?
+      raise KeyError, "key not found: #{k.inspect}"
+    end
+
+    def content_length
+      return nil unless key?("content-length")
+      len = self["content-length"].slice(/\d+/)
+      raise HTTPHeaderSyntaxError, "wrong Content-Length format" if len.nil?
+      len.to_i
+    end
+
     # The media type alone, as CRuby answers it: `text/html; charset=utf-8`
     # reads `text/html`. The whole header made a type check written against
     # CRuby (`res.content_type == "text/html"`) fail for nearly every real
@@ -294,12 +342,36 @@ module Net
     # so is CRuby's main_type/sub_type split: a third `/` part is dropped and
     # an empty subtype leaves the main type alone (`text/` reads `text`).
     def content_type
+      main = main_type
+      return nil if main.nil?
+      sub = sub_type
+      sub.nil? ? main : main + "/" + sub
+    end
+
+    def main_type
       v = self["content-type"]
       return nil if v.nil?
-      parts = v.split(";", 2)[0].to_s.split("/")
-      main = parts[0].to_s.strip
-      return main if parts.length < 2
-      main + "/" + parts[1].to_s.strip
+      v.split(";", 2)[0].to_s.split("/")[0].to_s.strip
+    end
+
+    def sub_type
+      v = self["content-type"]
+      return nil if v.nil?
+      sub = v.split(";", 2)[0].to_s.split("/")[1]
+      sub.nil? ? nil : sub.strip
+    end
+
+    # The parameters after the media type, by name: `text/html;
+    # charset=utf-8` reads `{"charset" => "utf-8"}`.
+    def type_params
+      result = {}
+      list = self["content-type"].to_s.split(";")
+      list.shift
+      list.each do |param|
+        k, v = param.split("=", 2)
+        result[k.strip] = v.strip
+      end
+      result
     end
 
     # Raises unless the response is a 2xx, as CRuby's does. The message is the
@@ -407,8 +479,24 @@ module Net
   # forwards a request of any method builds directly (#11347). The two flags
   # say whether the method's request and response carry a body.
   class HTTPGenericRequest
-    attr_reader :method, :path, :decode_content
-    attr_accessor :body
+    attr_reader :method, :path, :decode_content, :body
+
+    # An IO the body is read from as it goes out, in place of `body`, as
+    # CRuby's: a body too large to hold, a file uploaded as it is read, a
+    # body a proxy forwards. The request states its length (Content-Length)
+    # or goes out chunked (Transfer-Encoding: chunked). Setting either of
+    # body and body_stream drops the other.
+    attr_reader :body_stream
+
+    def body=(body)
+      @body_stream = nil
+      @body = body
+    end
+
+    def body_stream=(io)
+      @body = ""
+      @body_stream = io
+    end
 
     def initialize(method, request_has_body, response_has_body, path, initheader = nil)
       @request_has_body = request_has_body
@@ -438,7 +526,9 @@ module Net
       # stored them downcased all along.
       @headers = {}
       @header_names = {}
+      @fields = {}
       @body = ""
+      @body_stream = nil
       @decode_content = false
       # CRuby's initheader half strips the value before it looks at it, and
       # so raises NoMethodError for anything without `strip`; this package
@@ -491,6 +581,7 @@ module Net
       if value.nil?
         @headers.delete(k)
         @header_names.delete(k)
+        @fields.delete(k)
         return nil
       end
       # An Array joins with ", ", the way CRuby serves a multi-valued header:
@@ -510,7 +601,48 @@ module Net
       raise ArgumentError, "header field value cannot include CR/LF" if crlf?(text)
       @headers[k] = text
       @header_names[k] = name.to_s
+      @fields[k] = value.is_a?(Array) ? value.map { |v| v.to_s } : [text]
       value
+    end
+
+    # Adds a value to the header, after the ones it holds, or sets it.
+    def add_field(name, value)
+      k = name.to_s.downcase
+      values = @fields[k]
+      return self[name] = value if values.nil?
+      added = value.is_a?(Array) ? value.map { |v| v.to_s } : [value.to_s]
+      self[@header_names[k]] = values + added
+    end
+
+    # Each value of the header, in the order they were set, or nil when it
+    # is absent. A copy.
+    def get_fields(name)
+      values = @fields[name.to_s.downcase]
+      values.nil? ? nil : values.map { |v| v.dup }
+    end
+
+    # The header's value; for an absent one the block's answer for the
+    # downcased name, else the default given, else a KeyError.
+    def fetch(name, *default)
+      k = name.to_s.downcase
+      values = @fields[k]
+      return values.join(", ") unless values.nil?
+      return yield(k) if block_given?
+      return default[0] unless default.empty?
+      raise KeyError, "key not found: #{k.inspect}"
+    end
+
+    # Removes the header and answers the values it held.
+    def delete(name)
+      k = name.to_s.downcase
+      @headers.delete(k)
+      @header_names.delete(k)
+      @fields.delete(k)
+    end
+
+    # Each header's values under its downcased name.
+    def to_hash
+      @fields.dup
     end
 
     # A copy, as CRuby's `@header[key].join(", ")` is a new String: appending
@@ -525,13 +657,6 @@ module Net
       @headers.key?(name.to_s.downcase)
     end
 
-    # Whether this kind of request carries a body, CRuby's REQUEST_HAS_BODY.
-    # Decided by the method rather than per class, since `Net::HTTP#post` and
-    # `Net::HTTP.post_form` build a plain HTTPRequest with the method name.
-    def request_body_permitted?
-      @method == "POST" || @method == "PUT" || @method == "PATCH"
-    end
-
     # Yields the spelling the caller wrote, not the downcased key: for a
     # request that is what goes out on the wire.
     def each_header
@@ -542,17 +667,36 @@ module Net
       nil
     end
 
+    # Whether Transfer-Encoding names chunked, as CRuby's chunked?.
+    def chunked?
+      field = self["Transfer-Encoding"]
+      !field.nil? && /(?:\A|[^\-\w])chunked(?![\-\w])/i.match?(field)
+    end
+
     def content_type=(v)
       self["Content-Type"] = v
     end
 
     def set_form_data(hash)
+      @body_stream = nil
       @body = URI.encode_www_form(hash)
       self["Content-Type"] = "application/x-www-form-urlencoded"
       @body
     end
 
+    def basic_auth(account, password)
+      self["Authorization"] = basic_encode(account, password)
+    end
+
+    def proxy_basic_auth(account, password)
+      self["Proxy-Authorization"] = basic_encode(account, password)
+    end
+
     private
+
+    def basic_encode(account, password)
+      "Basic " + ["#{account}:#{password}"].pack("m0")
+    end
 
     # A carriage return or a line feed in a header value would end the
     # header on the wire and make whatever follows it a header of its own.
@@ -609,8 +753,20 @@ module Net
       end
     end
 
+    class Options < HTTPRequest
+      def initialize(path, initheader = nil)
+        super("OPTIONS", path, initheader)
+      end
+    end
+
+    class Trace < HTTPRequest
+      def initialize(path, initheader = nil)
+        super("TRACE", path, initheader)
+      end
+    end
+
     attr_reader :address, :port
-    attr_accessor :use_ssl, :open_timeout, :read_timeout
+    attr_accessor :use_ssl, :open_timeout, :read_timeout, :write_timeout
 
     # CRuby's, handed to the TLS context the connection is made with. nil,
     # the default, leaves the context's own, VERIFY_PEER.
@@ -668,6 +824,7 @@ module Net
       @use_ssl = false
       @open_timeout = 60
       @read_timeout = 60
+      @write_timeout = 60
       @ssl_timeout = nil
       @keep_alive_timeout = 2
       @max_retries = 1
@@ -709,27 +866,42 @@ module Net
     # `ipaddr:` is the connect target; `Host:` and the TLS hostname stay
     # `address`. `nil` reads as unset, which is what CRuby's default is.
     def self.start(address, port = 80, use_ssl: false, ipaddr: nil,
-                   open_timeout: 60, read_timeout: 60)
+                   open_timeout: 60, read_timeout: 60, write_timeout: 60)
       http = HTTP.new(address, port)
       http.use_ssl = use_ssl
       http.ipaddr = ipaddr.to_s
       http.open_timeout = open_timeout
       http.read_timeout = read_timeout
+      http.write_timeout = write_timeout
       http.start { |h| yield h }
     end
 
-    # Net::HTTP.get(uri) -> the body String.
-    def self.get(uri)
-      get_response(uri).body
+    # Net::HTTP.get(uri, headers) -> the body String.
+    def self.get(uri, headers = nil)
+      get_response(uri, headers).body
     end
 
-    # Net::HTTP.get_response(uri) -> HTTPResponse.
-    def self.get_response(uri)
+    # Net::HTTP.get_response(uri, headers) -> HTTPResponse.
+    def self.get_response(uri, headers = nil)
       u = URI(uri)
       https = u.scheme == "https"
       http = HTTP.new(u.host, u.port)
       http.use_ssl = https
-      http.start { |h| h.request(HTTPRequest.new("GET", u.request_uri)) }
+      http.start { |h| h.request(HTTPRequest.new("GET", u.request_uri, headers)) }
+    end
+
+    def self.post(uri, body, headers = nil)
+      u = URI(uri)
+      http = HTTP.new(u.host, u.port)
+      http.use_ssl = (u.scheme == "https")
+      http.start { |h| h.post(u.request_uri, body, headers) }
+    end
+
+    def self.put(uri, body, headers = nil)
+      u = URI(uri)
+      http = HTTP.new(u.host, u.port)
+      http.use_ssl = (u.scheme == "https")
+      http.start { |h| h.put(u.request_uri, body, headers) }
     end
 
     def self.post_form(uri, params)
@@ -840,28 +1012,16 @@ module Net
     end
     private :do_finish
 
-    # open_timeout, honoured rather than stored: a non-blocking connect and a
-    # bounded wait for writability. A timeout of 0 or less means "no limit",
+    # open_timeout, honoured rather than stored: TCPSocket's own connect
+    # deadline, as CRuby's connect uses, which reads a refused connection
+    # from the socket's error. A timeout of 0 or less means "no limit",
     # which is how CRuby reads nil there.
     def connect_with_timeout
       limit = @open_timeout.nil? ? 0 : @open_timeout
-      target = conn_address
-      return TCPSocket.new(target, @port) if limit <= 0
-      s = Socket.new(Socket::AF_INET, Socket::SOCK_STREAM, 0)
-      begin
-        s.connect_nonblock(target, @port)
-      rescue IO::WaitWritable
-        if IO.select(nil, [s], nil, limit).nil?
-          s.close
-          raise OpenTimeout
-        end
-        begin
-          s.connect_nonblock(target, @port)
-        rescue Errno::EISCONN
-          # already connected: the wait above is what completed it
-        end
-      end
-      s
+      return TCPSocket.new(conn_address, @port) if limit <= 0
+      TCPSocket.new(conn_address, @port, connect_timeout: limit)
+    rescue IO::TimeoutError
+      raise OpenTimeout
     end
 
     # CRuby's private hook for the address the socket connects to: the pinned
@@ -881,9 +1041,10 @@ module Net
     end
     private :debug
 
-    def get(path, headers = nil)
-      req = HTTPRequest.new("GET", path, headers)
-      request(req)
+    # With a block, the body goes to it in pieces as they arrive; with dest,
+    # it is appended to dest. As in CRuby, so do post and patch.
+    def get(path, headers = nil, dest = nil, &block)
+      send_entity(HTTPRequest.new("GET", path, headers), dest, &block)
     end
 
     def head(path, headers = nil)
@@ -891,10 +1052,10 @@ module Net
       request(req)
     end
 
-    def post(path, body, headers = nil)
+    def post(path, body, headers = nil, dest = nil, &block)
       req = HTTPRequest.new("POST", path, headers)
       req.body = body
-      request(req)
+      send_entity(req, dest, &block)
     end
 
     def put(path, body, headers = nil)
@@ -903,15 +1064,66 @@ module Net
       request(req)
     end
 
-    def patch(path, body, headers = nil)
+    def patch(path, body, headers = nil, dest = nil, &block)
       req = Patch.new(path, headers)
       req.body = body
-      request(req)
+      send_entity(req, dest, &block)
     end
+
+    # The response goes to the block before its body is read, so the block
+    # can read it in pieces with read_body.
+    def request_get(path, headers = nil, &block)
+      request(Get.new(path, headers), &block)
+    end
+
+    def request_head(path, headers = nil, &block)
+      request(Head.new(path, headers), &block)
+    end
+
+    def request_post(path, body, headers = nil, &block)
+      req = Post.new(path, headers)
+      req.body = body
+      request(req, &block)
+    end
+
+    def request_put(path, body, headers = nil, &block)
+      req = Put.new(path, headers)
+      req.body = body
+      request(req, &block)
+    end
+
+    alias get2 request_get
+    alias head2 request_head
+    alias post2 request_post
+    alias put2 request_put
+
+    def send_entity(req, dest, &block)
+      res = nil
+      request(req) do |r|
+        r.read_body(dest, &block)
+        res = r
+      end
+      res
+    end
+    private :send_entity
 
     # Sends Depth: Infinity unless headers are given, as in CRuby.
     def delete(path, headers = { "Depth" => "Infinity" })
       request(Delete.new(path, headers))
+    end
+
+    def options(path, headers = nil)
+      request(Options.new(path, headers))
+    end
+
+    def trace(path, headers = nil)
+      request(Trace.new(path, headers))
+    end
+
+    def send_request(name, path, body = nil, headers = nil)
+      req = HTTPGenericRequest.new(name, !body.nil?, name != "HEAD", path, headers)
+      req.body = body unless body.nil?
+      request(req)
     end
 
     # Keep the connection alive through the block, then consume an unread body.
@@ -919,6 +1131,9 @@ module Net
     # A request with no session is the session's only one, and asks the
     # server to close after it, as CRuby's does (write_request).
     def request(req, &blk)
+      if !req.body_stream.nil? && !req.key?("content-length") && !req.chunked?
+        raise ArgumentError, "Content-Length not given and Transfer-Encoding is not `chunked'"
+      end
       started = @started
       start unless started
       @one_shot = !started
@@ -939,17 +1154,19 @@ module Net
     IDEMPOTENT_METHODS = %w[GET HEAD PUT DELETE OPTIONS TRACE].freeze
 
     # CRuby's transport_request: a connection that fails before the response
-    # arrives (the server closed it while it sat idle, or reset it) is opened
-    # again and an idempotent request sent again, max_retries times. A POST
-    # is not: the server may have acted on it.
+    # arrives (the server closed it while it sat idle, reset it, or stopped
+    # reading the request) is opened again and an idempotent request sent
+    # again, max_retries times. A POST is not: the server may have acted on
+    # it. Nor is a request whose body came from body_stream, which was read
+    # as it went and cannot be read again; Go's Transport refuses the same.
     def perform(req)
       count = 0
       begin
         begin_transport(req)
         write_request(req)
         read_response(req.method, req.decode_content)
-      rescue EOFError, IOError, Errno::ECONNRESET, Errno::ECONNABORTED, Errno::EPIPE, ReadTimeout => e
-        raise if count >= @max_retries || !IDEMPOTENT_METHODS.include?(req.method)
+      rescue EOFError, IOError, Errno::ECONNRESET, Errno::ECONNABORTED, Errno::EPIPE, ReadTimeout, WriteTimeout => e
+        raise if count >= @max_retries || !IDEMPOTENT_METHODS.include?(req.method) || !req.body_stream.nil?
         debug "Conn close because of error #{e.message}, and retry"
         close_socket
         count += 1
@@ -1007,11 +1224,25 @@ module Net
 
     # ---- the wire ----
 
+    # Each wait for the socket to take more bytes is bounded by
+    # write_timeout, as CRuby's is: a peer that stops reading raises
+    # WriteTimeout instead of holding the request forever. nil waits without
+    # a limit. The request goes out in slices of at most 64 KB, so a large
+    # body is not copied again after every partial write.
     def wire_write(s)
-      if @tls.nil?
-        @socket.write(s)
-      else
-        @tls.write(s)
+      offset = 0
+      size = s.bytesize
+      while offset < size
+        piece = s.byteslice(offset, 65536)
+        n = @tls.nil? ? @socket.write_nonblock(piece, exception: false) : @tls.syswrite_nonblock(piece, exception: false)
+        if n.is_a?(Integer)
+          offset += n
+        elsif n.nil?
+          raise EOFError, "end of file reached"
+        else
+          ready = n == :wait_readable ? IO.select([@socket], nil, nil, @write_timeout) : IO.select(nil, [@socket], nil, @write_timeout)
+          raise WriteTimeout if ready.nil?
+        end
       end
       nil
     end
@@ -1073,15 +1304,54 @@ module Net
         have_len = true if k.downcase == "content-length"
         out << "#{k}: #{v}\r\n"
       end
+      stream = req.body_stream
       body = req.body.to_s
       # A request that carries a body states its length even when it is
-      # zero, as CRuby's does; some servers answer 411 without it.
-      out << "Content-Length: #{body.bytesize}\r\n" if !have_len && (req.request_body_permitted? || !body.empty?)
+      # zero, as CRuby's does; some servers answer 411 without it. One read
+      # from body_stream states its own (see #request).
+      out << "Content-Length: #{body.bytesize}\r\n" if stream.nil? && !have_len && (req.request_body_permitted? || !body.empty?)
       out << "Connection: close\r\n" if @one_shot && !req.key?("connection")
       out << "\r\n"
       out << body
       debug "<- #{out.dump}"
       wire_write(out)
+      write_body_stream(stream, req.chunked?, req["content-length"].to_i) unless stream.nil?
+      nil
+    end
+
+    # The body read from body_stream in pieces of 16 KB, as CRuby's
+    # copy_stream reads it: each piece a chunk when the request is chunked,
+    # else written as it is. A stream that gives more than Content-Length
+    # stops before the extra bytes, which the server would take for the next
+    # request; one that gives fewer leaves the server waiting. Either is an
+    # ArgumentError and the connection closes, as Go's Transport has it;
+    # CRuby writes whatever the stream gives.
+    def write_body_stream(io, chunked, length)
+      sent = 0
+      while (piece = read_piece(io))
+        next if piece.empty?
+        if chunked
+          wire_write("#{piece.bytesize.to_s(16)}\r\n#{piece}\r\n")
+        else
+          if sent + piece.bytesize > length
+            raise ArgumentError, "body_stream gave more than the #{length} bytes of Content-Length"
+          end
+          wire_write(piece)
+        end
+        sent += piece.bytesize
+      end
+      if chunked
+        wire_write("0\r\n\r\n")
+      elsif sent != length
+        raise ArgumentError, "body_stream gave #{sent} bytes, Content-Length is #{length}"
+      end
+      nil
+    end
+
+    def read_piece(io)
+      io.readpartial(16384)
+    rescue EOFError
+      nil
     end
 
     def read_response(method, decode_content)
@@ -1194,14 +1464,7 @@ module Net
       encoding = headers["content-encoding"].to_s.downcase
       case encoding
       when "gzip", "x-gzip", "deflate"
-        unless body.empty?
-          inflater = Zlib::Inflate.new(32 + Zlib::MAX_WBITS)
-          begin
-            body = inflater.inflate(body)
-          ensure
-            inflater.close
-          end
-        end
+        body = Zlib.raw_inflate(body, 32 + Zlib::MAX_WBITS) unless body.empty?
         headers.delete("content-encoding")
         headers["content-length"] = body.bytesize.to_s if headers.key?("content-length")
       when "identity", "none"

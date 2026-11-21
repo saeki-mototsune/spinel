@@ -39,7 +39,7 @@ static inline sp_bool sp_String_is_immutable(sp_String *s) {
 static inline sp_String*sp_String_freeze(sp_String*s){if(s){if(s->temporarily_locked)sp_raise_locked_str();sp_gc_hdr*h=(sp_gc_hdr*)((char*)s-sizeof(sp_gc_hdr));h->frozen=1;}return s;}
 
 /* A mutable String's payload carries the same length-bearing sp_str_hdr that
-   0xfe/0xfc heap strings use, so an escaped const char* is binary-safe (the
+   inline String views use, so an escaped const char* is binary-safe (the
    reader uses sp_str_byte_len, not strlen). Block layout:
    [sp_str_hdr][0xfd marker][data ...][NUL]. s->data points at `data`. The ctor
    and in-place mutators are also reached with bare C string literals (no marker
@@ -47,10 +47,8 @@ static inline sp_String*sp_String_freeze(sp_String*s){if(s){if(s->temporarily_lo
 #define SP_FD_HDR (sizeof(sp_str_hdr)+1)   /* header + marker byte */
 #define SP_FD_OVH (sizeof(sp_str_hdr)+2)   /* header + marker + NUL terminator */
 static inline char *sp_fd_base(const char *data){return (char*)data-SP_FD_HDR;}
-/* The payload's `next` field carries the owning sp_String rather than a heap
-   link: these blocks are malloc'd and never join the string heap, so nothing
-   walks that list, and a container holding the escaped `const char *` has no
-   other way back to the handle. Without it the mark reaches the bytes and
+/* The payload's `next` field points to the owning sp_String. A container
+   holding the escaped `const char *` uses this link to mark the handle. Without it the mark reaches the bytes and
    stops, the handle goes unreferenced, and sp_String_fin frees the bytes the
    container still points at. sp_fd_own publishes it; every path that lays out
    a payload has to call it. */
@@ -148,6 +146,18 @@ static inline sp_String*sp_String_new_inline_len(const char*s,int64_t len){
   sp_fd_publish(r);
   return r;
 }
+/* Foreign code can lend static bytes or a pointer into a managed String.
+   The inline constructor copies the bytes before allocating in either case. */
+static inline sp_String *sp_String_from_cstr(const char *s) {
+  return s ? sp_String_new_inline_len(s, (int64_t)strlen(s)) : NULL;
+}
+static inline sp_String *sp_String_from_cbinstr(const char *s, int len) {
+  sp_String *value = sp_String_new_inline_len(s ? s : "", s && len > 0 ? len : 0);
+  value->binary = 1;
+  sp_fd_publish(value);
+  return value;
+}
+
 /* Shared append core: `tl` is the operand byte length (strlen for the
    bare-literal-safe entry, sp_str_byte_len for the binary one). */
 /* the operand may be a view of this very payload (`s << s`, `s.replace(s)`):
@@ -194,8 +204,6 @@ static inline void sp_String_append_enc(sp_String*s,const char*t,size_t tl){
 }
 /* the first tl bytes of t: the append form of an interpolation (emit_interp_append) */
 static inline void sp_String_append_n(sp_String*s,const char*t,size_t tl){if (SP_UNLIKELY(!s)) sp_nil_recv("<<"); if (!t)return;if(sp_String_is_immutable(s)){sp_raise_frozen_str(s->data);return;}sp_String_append_enc(s,t,tl);sp_fd_append_len(s,t,(int64_t)tl);}
-/* append_as_bytes preserves the handle's encoding as well as embedded NULs. */
-static inline void sp_String_append_bytes(sp_String*s,const char*t){if (SP_UNLIKELY(!s)) sp_nil_recv("<<"); if (!t)return;if(sp_String_is_immutable(s)){sp_raise_frozen_str(s->data);return;}sp_fd_append_len(s,t,(int64_t)sp_str_byte_len(t));}
 static inline void sp_String_append_bin(sp_String*s,const char*t){
   if (SP_UNLIKELY(!s)) sp_nil_recv("<<"); if (!t)return;
   if(sp_String_is_immutable(s)){sp_raise_frozen_str(s->data);return;}
@@ -209,7 +217,7 @@ static inline void sp_String_append_bin(sp_String*s,const char*t){
    callers pass bare C literals with NO marker -- they must use the plain
    sp_String_new above (reading s[-1] there is OOB and, under clang's rodata
    layout, misreads as frozen; cf. the #282 marker-probe lesson). */
-/* Symbol#to_s and #id2name: the symbol's name, frozen (lib/sp_string.c) */
+/* The frozen spelling for Symbol#name and internal byte readers. */
 const char*sp_sym_to_s_frozen(sp_sym id);
 /* The handle a literal or a live payload already has is found inline,
    and only a String that needs a new handle calls the constructor below:
@@ -253,9 +261,11 @@ static SP_NOINLINE sp_String*sp_String_new_static1(unsigned char c){
   h->next=(sp_str_hdr*)(void*)r;h->len=c!=0;
   data[-1]=(char)0xfd;data[0]=(char)c;
   r->data=data;r->len=c!=0;r->cap=CAP;
-  sp_str_lcache_drop(data);
-  /* (one byte below 0x80, or none, is 7-bit: indexing it is byte indexing) */
-  if(c<0x80)h->size=SP_STR_SIZE_ASCII7;
+  /* Fixed-width reads use the header. Writes that invalidate that fact
+     also drop the cache entry, and collection clears the workers' length
+     caches before releasing slab slots. */
+  if (c < 0x80) h->size = SP_STR_SIZE_ASCII7;
+  else sp_str_lcache_drop(data);
   return r;
 }
 static SP_NOINLINE sp_String*sp_String_new_shared_make(const char*s);
@@ -335,8 +345,7 @@ static inline sp_String*sp_String_new_fresh(const char*s){
   int bin=sp_str_is_binary(s);
   int frozen=sp_str_is_frozen_val(s);
   int mk=((const unsigned char*)s)[-1];
-  /* (one representation: the runtime takes a literal's bytes into an
-     element itself, sp_strelem_of, so its own copy is the literal too) */
+  /* (one representation: a literal's bytes are the literal's own handle) */
   sp_String *lh = sp_String_of_literal(s);
   if (lh) return lh;
   int64_t len=(int64_t)sp_str_byte_len(s);
@@ -372,32 +381,28 @@ static inline const char*sp_String_cstr(sp_String*s){return s->data;}
 static inline const char*sp_String_cstr_nil(sp_String*s){return s?s->data:NULL;}
 static inline int64_t sp_String_length(sp_String*s){return s->len;}
 
-/* A String no other name holds, boxed for something that keeps the box:
-   boxes a mutable heap String as a new handle over its bytes,
-   which sp_String_new_fresh copies before it allocates, so every copy of
-   the box names the one String. So is an unfrozen static one (0xff, a
-   folded interpolation's bytes): it stands for a new String, which a
-   mutation through the box changes (`a = ["#{v}?"]; a[0] << "!"`). A
-   frozen String is boxed as itself, as nothing can change it and its
-   identity is its bytes'; so is any String otherwise (sp_box_str). */
-static inline sp_RbVal sp_box_str_new(const char *v) {
-  if (v) {
-    unsigned char m = ((const unsigned char *)v)[-1];
-    if (m == 0xfe || m == 0xfc || m == 0xff) return sp_box_obj(sp_String_new_fresh(v), SP_BUILTIN_STRBUF);
-    /* the runtime's empty answer is static, but stands for the new empty
-       String the call made (`"" * 2`): nil.to_s's frozen one is not this */
-    if (v == sp_str_empty) return sp_box_obj(sp_String_new_fresh(v), SP_BUILTIN_STRBUF);
-  }
-  return sp_box_str(v);
+/* Borrow the handle in a checked String result when the caller reads bytes. */
+static inline sp_String *sp_obj_to_str_handle(int cls_id, void *object) {
+  int found;
+  sp_RbVal value = sp_obj_to_str_fn(cls_id, object, &found);
+  return value.tag == SP_TAG_NIL ? NULL : (sp_String *)value.v.p;
 }
+
+/* Box a managed String, using the owner of its live payload or the
+   static handle of a frozen literal when it already has one. */
+static inline sp_RbVal sp_box_str_new(const char *v) {
+  return sp_box_nullable_obj(sp_String_new_shared(v), SP_BUILTIN_STRBUF);
+}
+
+/* sp_box_str_new for a String that may be nil (NULL): the nil box, else the new String's handle box */
+static inline sp_RbVal sp_box_nullable_str_new(const char *v) { return v ? sp_box_str_new(v) : sp_box_nil(); }
 
 /* A new String a call answers in bytes it may share with others (Integer#chr
    answers a one-character table's), boxed for something that keeps the box:
    a new handle over a copy of them, which an append through any copy of the
    box changes. */
 static inline sp_RbVal sp_box_str_fresh(const char *v) {
-  if (v) return sp_box_obj(sp_String_new_fresh(v), SP_BUILTIN_STRBUF);
-  return sp_box_str(v);
+  return v ? sp_box_obj(sp_String_new_fresh(v), SP_BUILTIN_STRBUF) : sp_box_nil();
 }
 
 /* encode! on a handle, given the String encode answered for it (lib/sp_cold.c) */
@@ -405,8 +410,9 @@ void sp_String_encode_into(sp_String *h, const char *t);
 /* Cold in-place mutators (compiled once in lib/sp_string.c). */
 void sp_String_prepend(sp_String*s,const char*t);
 void sp_String_insert(sp_String*s,int64_t idx,const char*t);
-void sp_String_splice_chars(sp_String *s, sp_int from, sp_int n, const char *val, int range_form, int keep_enc);
+void sp_String_splice_chars(sp_String *s, sp_int from, sp_int n, const char *val, int single_byte, int keep_enc);
 void sp_String_splice_bytes(sp_String *s, sp_int start, sp_int len, const char *val, sp_int vstart, sp_int vlen, int keep_enc);
+void sp_String_splice_match(sp_String *s, sp_int start, sp_int len, const char *val);
 void sp_String_replace(sp_String*s,const char*t);
 sp_String*sp_String_dup(sp_String*s);
 #endif /* SP_STRING_H */

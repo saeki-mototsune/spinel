@@ -1,6 +1,7 @@
 #include "codegen_internal.h"
 #include "order_plan.h"
 #include "method_table_check.h"
+#include "implicit_calls.h"
 #include "share.h"
 #include "repr.h"
 #include "codegen_poly.h"
@@ -193,9 +194,9 @@ static int ctor_block_fresh(Compiler *c, int id) {
    constructors goes the same way, as a proc. 0 when the class has no such
    clone. */
 int emit_ctor_new_with_proc(Compiler *c, int id, int ci, Buf *b) {
-  if (nt_kind(c->nt, id) == NK_CallNode && call_target(c, id, ci, "new", CT_CMETHOD, NULL) >= 0) return 0;
+  if (nt_kind(c->nt, id) == NK_CallNode && cplan_user_new(c, id, ci) >= 0) return 0;
   int blk = nt_ref(c->nt, id, "block");
-  int initm = cplan_new_initialize(c, id, ci, NULL);
+  int initm = cplan_hook_target(c, id, ci, "initialize", NULL);
   Scope *sblk = blk < 0 && (nt_kind(c->nt, id) == NK_SuperNode || nt_kind(c->nt, id) == NK_ForwardingSuperNode)
                 ? comp_scope_of(c, id) : NULL;
   int by_sblk = sblk && sblk->blk_param && sblk->blk_param[0];
@@ -203,12 +204,12 @@ int emit_ctor_new_with_proc(Compiler *c, int id, int ci, Buf *b) {
   if (!by_sblk && nt_kind(c->nt, blk) != NK_BlockArgumentNode &&
       !(nt_kind(c->nt, blk) == NK_BlockNode && ctor_new_on_cycle(c, id, ci, initm))) return 0;
   /* The clone is the constructor's, of the initialize it runs. A version
-     the plan answers here instead (cplan_new_initialize) that does not
+     the plan answers here instead (cplan_hook_target) that does not
      yield takes the proc as a plain construction does; one that yields
      runs by its own clone on the proc (ctor_alloc_init). */
   if (!ctor_new_runs(c, ci, initm)) {
     if (initm < 0 || !c->scopes[initm].yields) return 0;
-    if (by_sblk || nt_kind(c->nt, blk) != NK_BlockArgumentNode || scope_proc_form_of(c, initm) < 0) initm = cplan_new_initialize(c, -1, ci, NULL);
+    if (by_sblk || nt_kind(c->nt, blk) != NK_BlockArgumentNode || scope_proc_form_of(c, initm) < 0) initm = cplan_hook_target(c, -1, ci, "initialize", NULL);
     else { emit_ctor_alloc_init(c, ci, initm, nt_ref(c->nt, id, "arguments"), id, b); return 1; }
   }
   if (ctor_init_proc_form(c, ci) < 0) return 0;
@@ -238,7 +239,7 @@ int emit_ctor_yield_inline(Compiler *c, int id, int ci, Buf *b) {
   const NodeTable *nt = c->nt;
   /* An ordinary new runs the class method first. Only its Class#new super
      bypasses that method and splices initialize here. */
-  if (nt_kind(nt, id) == NK_CallNode && call_target(c, id, ci, "new", CT_CMETHOD, NULL) >= 0) return 0;
+  if (nt_kind(nt, id) == NK_CallNode && cplan_user_new(c, id, ci) >= 0) return 0;
   int block = nt_ref(nt, id, "block");
   if (block < 0 && (nt_kind(nt, id) == NK_SuperNode || nt_kind(nt, id) == NK_ForwardingSuperNode)) {
     Scope *sblk = comp_scope_of(c, id);
@@ -271,7 +272,7 @@ int emit_ctor_yield_inline(Compiler *c, int id, int ci, Buf *b) {
     else return 0;
   }
   else if (block >= 0 && (nt_kind(nt, block) != NK_BlockNode)) return 0;
-  int mi = cplan_new_initialize(c, id, ci, NULL);
+  int mi = cplan_hook_target(c, id, ci, "initialize", NULL);
   if (mi < 0 || !c->scopes[mi].yields) return 0;
   if (ctor_new_on_cycle(c, id, ci, mi)) return 0;
   Scope *m = &c->scopes[mi];
@@ -503,8 +504,17 @@ int emit_ctor_yield_inline(Compiler *c, int id, int ci, Buf *b) {
       if (krp && krp->type == TY_POLY) buf_printf(b, "sp_box_obj(_t%d, SP_BUILTIN_SYM_POLY_HASH)", krhash);
       else buf_printf(b, "_t%d", krhash);
     }
-    else if (L.from[i] == ARG_REST)
-      emit_rest_pack_kwh(c, i, L.rest_argc - m->npost_rest, argv2, L.rest_kwh, b);
+    else if (L.from[i] == ARG_REST) {
+      /* (a rest parameter whose slot is boxed takes the array boxed, as the kwrest does) */
+      LocalVar *rp = m->pnames[i] ? scope_local(m, m->pnames[i]) : NULL;
+      if (rp && rp->type == TY_POLY) {
+        Buf rb; memset(&rb, 0, sizeof rb);
+        emit_rest_pack_kwh(c, i, L.rest_argc - m->npost_rest, argv2, L.rest_kwh, &rb);
+        emit_boxed_text(c, TY_POLY_ARRAY, rb.p ? rb.p : "sp_PolyArray_new()", b);
+        free(rb.p);
+      }
+      else emit_rest_pack_kwh(c, i, L.rest_argc - m->npost_rest, argv2, L.rest_kwh, b);
+    }
     else if (provided < 0 && ds_tmp >= 0 && callee_has_kwarg(c, m, m->pnames[i])) {
       inline_block_ctx_restore(&callee_bc);   /* may evaluate the keyword's default */
       emit_ds_param_extract(c, m, i, ds_tmp, ds_type, b);
@@ -708,9 +718,29 @@ void emit_bigint_operand(Compiler *c, int node, Buf *b) {
     buf_printf(b, "; _t%d.nil ? NULL : sp_bigint_new_int(_t%d.v); })", tv, tv);
     return;
   }
+  if (emit_bigint_lit(c, node, b)) return;
   buf_puts(b, "sp_bigint_new_int(");
   emit_coerce(c, node, TY_INT, CO_HOLD, "an Integer operand of a Bignum operation", b);
   buf_puts(b, ")");
+}
+/* (bigl_intern_program interned the literal's decimal beside the big ones) */
+int emit_bigint_lit(Compiler *c, int node, Buf *b) {
+  if (node < 0 || nt_kind(c->nt, node) != NK_IntegerNode || nt_str(c->nt, node, "bigval")) return 0;
+  char t[32]; bigl_int_text(c, node, t);
+  int slot = bigl_lookup(t);
+  if (slot < 0) return 0;
+  buf_printf(b, "sp_bigl_get(%d)", slot);
+  return 1;
+}
+/* A literal shift past a word (`1 << 64`): the value the program scan
+   computed and interned (bigl_shift_text) */
+int emit_bigint_shift_lit(Compiler *c, int call, Buf *b) {
+  char txt[400];
+  if (!bigl_shift_text(c, call, txt, sizeof txt)) return 0;
+  int slot = bigl_lookup(txt);
+  if (slot < 0) return 0;
+  buf_printf(b, "sp_bigl_get(%d)", slot);
+  return 1;
 }
 /* Same, reachable from the other emitters (the ivar op-assign). */
 void emit_bigint_operand_ext(Compiler *c, int node, Buf *b) { emit_bigint_operand(c, node, b); }
@@ -1115,7 +1145,8 @@ static void emit_block_arg_check(Compiler *c, int fe, const char *cn, Buf *b) {
                tv, cn[0] ? cn : "FalseClass");
   } else
     buf_printf(b, "; if (_t%d.tag == SP_TAG_INT || _t%d.tag == SP_TAG_FLT || _t%d.tag == SP_TAG_BOOL || "
-                  "_t%d.tag == SP_TAG_STR || _t%d.tag == SP_TAG_BIGINT || (_t%d.tag == SP_TAG_OBJ && "
+                  "sp_rbval_is_string(_t%d) || "
+                  "_t%d.tag == SP_TAG_BIGINT || (_t%d.tag == SP_TAG_OBJ && "
                   "(_t%d.cls_id == SP_BUILTIN_OBJECT || _t%d.cls_id == SP_BUILTIN_BASIC_OBJECT))) "
                   "sp_raise_cls(\"TypeError\", sp_sprintf(\"no implicit conversion of %%s into Proc\", sp_poly_class_name(_t%d))); })",
                tv, tv, tv, tv, tv, tv, tv, tv, tv);
@@ -1283,14 +1314,18 @@ int poly_block_call_needs_dispatch(Compiler *c, int id) {
   return 0;
 }
 
-/* Whether a `&.` call has yet to pass through its nil guard. The guard re-enters the emission with g_sn_skip set on the node, so
-   this answers false on that second pass. */
+/* Whether a `&.` call has yet to pass through its nil guard (the guard on
+   its receiver, or on the chain's source at a lazy terminal:
+   an_lazy_sn_guard_src). The guard re-enters the emission with g_sn_skip set
+   on the node, so this answers false on that second pass. */
 int sn_guard_pending(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   if (g_sn_skip == id) return 0;
   if (!nt_safe_nav(nt, id)) return 0;
-  int recv = nt_ref(nt, id, "receiver");
-  if (recv < 0) return 0;
+  int recv0 = nt_ref(nt, id, "receiver");
+  if (recv0 < 0) return 0;
+  int src = an_lazy_sn_guard_src(c, id);
+  int recv = src >= 0 ? src : recv0;
   Repr rr = repr_of(c, recv);
   if (rr.kind == RK_BOXED) return 1;
   /* every receiver holding a nil of its own C kind -- an Integer's or a
@@ -1302,11 +1337,10 @@ int sn_guard_pending(Compiler *c, int id) {
   TyKind rt = rr.as_ty;
   /* `v&.lazy&.map { }&.first(2)` is a pipeline the lazy emitters fuse from
      its terminal; standing a link of it down here left `lazy` with no
-     emitter of its own */
-  for (int k = id; k >= 0 && nt_kind(nt, k) == NK_CallNode; k = nt_ref(nt, k, "receiver")) {
-    const char *kn = nt_str(nt, k, "name");
-    if (kn && sp_streq(kn, "lazy")) return 0;
-  }
+     emitter of its own (the terminal itself waits for its guard, on the
+     chain's source) */
+  for (int k = id; src < 0 && k >= 0 && nt_kind(nt, k) == NK_CallNode; k = nt_ref(nt, k, "receiver"))
+    if (is_lazy_name(nt_str(nt, k, "name"))) return 0;
   if ((ty_is_object(rt) && rr.kind != RK_VOBJ) || rt == TY_STRING || rt == TY_STRBUF ||
       /* an Integer / Float receiver only when it can be nil (its oint form):
          `3&.fdiv(2)` has no guard and no nil to answer */
@@ -1433,7 +1467,7 @@ int poly_exc_cand(Compiler *c, const char *name) {
 
 static void emit_poly_dispatch_key_pick(Compiler *c, int tv, int key_guard, int prim_cand, int exc_cand,
                                         const char *pick_name, Buf *b);
-static void emit_poly_dispatch_key_top(Compiler *c, int tv, int key_guard, int prim_cand, int exc_cand,
+static void emit_poly_dispatch_key_top(Compiler *c, int id, int tv, int key_guard, int prim_cand, int exc_cand,
                                        const char *pick_name, Buf *b);
 /* `sp_io_pick_class(<handle>, names, idx)` over the reopened IO classes
    that define `name` (public ones only when asked): the one the handle's
@@ -1463,21 +1497,25 @@ void emit_io_pick_public(Compiler *c, int id, const char *qm, const char *pick, 
   int ks[16], n = io_reopen_defs(c, id, qm, 0, ks, 16);
   buf_puts(b, "(0");
   for (int i = 0; i < n; i++)
-    if (comp_method_vis_in_chain(c, ks[i], qm) == SP_VIS_PUBLIC) buf_printf(b, " || %s == %d", pick, ks[i]);
+  {
+    CplanPresence pr;
+    cplan_table_presence(c, ks[i], 0, qm, &pr);
+    if (pr.vis == SP_VIS_PUBLIC) buf_printf(b, " || %s == %d", pick, ks[i]);
+  }
   buf_puts(b, ")");
 }
-void emit_io_reopen_responds(Compiler *c, int tv, const char *qm, int include_all, Buf *b) {
+void emit_io_reopen_responds(Compiler *c, int id, int tv, const char *qm, int include_all, Buf *b) {
   /* the nearest reopening by kind, then its visibility: a public IO#foo
      does not answer for a socket whose nearer IPSocket#foo is private */
   Buf ib; memset(&ib, 0, sizeof ib);
-  if (emit_io_pick(c, -1, tv, qm, 0, &ib)) {
+  if (emit_io_pick(c, id, tv, qm, 0, &ib)) {
     int pt = ++g_tmp;
     buf_printf(b, " || (_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_IO && "
                   "({ int _p%d = %s; _p%d != 0x7fffffff", tv, tv, pt, ib.p, pt);
     if (!include_all) {
       char pn[24]; snprintf(pn, sizeof pn, "_p%d", pt);
       buf_puts(b, " && ");
-      emit_io_pick_public(c, -1, qm, pn, b);
+      emit_io_pick_public(c, id, qm, pn, b);
     }
     buf_puts(b, "; }))");
   }
@@ -1510,7 +1548,7 @@ static char *emit_io_builtin_call(Compiler *c, int id, int recv, int tv, int wan
   TyKind bt = an_builtin_answer(c, id);
   Repr cr = repr_of(c, id);
   TyKind ct = cr.as_ty;
-  if (bt == TY_UNKNOWN || (bt != ct && cr.kind != RK_BOXED)) {
+  if (bt == TY_UNKNOWN || (repr_call_result_storage(bt) != repr_call_result_storage(ct) && cr.kind != RK_BOXED)) {
     g_io_skip_reopen = sv_skip; g_io_skip_node = sv_skip_node;
     return NULL;
   }
@@ -1540,6 +1578,8 @@ static char *emit_io_builtin_call(Compiler *c, int id, int recv, int tv, int wan
   Buf out; memset(&out, 0, sizeof out);
   if (pre) buf_printf(&out, "({ %s ", pb->p);
   if (cr.kind == RK_BOXED && bt != TY_POLY) emit_boxed_text(c, bt, nb->p, &out);
+  else if (bt != ct && cr.kind != RK_BOXED)
+    emit_coerce_text(c, id, bt, ct, CO_HOLD, nb->p, "an IO builtin result", &out);
   else buf_puts(&out, nb->p);
   if (pre) buf_puts(&out, "; })");
   free(nb->p); free(nb); free(pb->p); free(pb);
@@ -1611,7 +1651,7 @@ void emit_io_reopen_call(Compiler *c, int id, int recv, const char *name, Buf *b
       emit_io_vis_msg(vis, name, h, &vb);
       buf_puts(&vb, "), ");
     }
-    if (boxed) emit_boxed_text(c, c->scopes[kmi].ret, cb.p, &vb);
+    if (boxed) emit_boxed_ret_call(c, &c->scopes[kmi], cb.p, &vb);
     else if (want_o && !method_ret_is_oint(&c->scopes[kmi])) buf_printf(&vb, "%s(%s)", oint_of(ot), cb.p);
     else if (!want_o && oint_kind(ot) && method_ret_is_oint(&c->scopes[kmi])) buf_printf(&vb, "%s(%s)", oint_arg(ot), cb.p);
     else buf_puts(&vb, cb.p);
@@ -1640,8 +1680,9 @@ void emit_io_reopen_call(Compiler *c, int id, int recv, const char *name, Buf *b
 }
 /* The dispatch key of a whole dispatch: emit_poly_dispatch_key_pick's, and
    an Array subclass instance, boxed as its Array, keys by the class its
-   scan names (#7449). The pick's own recursions take the pick alone. */
-static void emit_poly_dispatch_key_top(Compiler *c, int tv, int key_guard, int prim_cand, int exc_cand,
+   scan names (#7449), as the plan answers call id (-1 for a key of no one
+   name). The pick's own recursions take the pick alone. */
+static void emit_poly_dispatch_key_top(Compiler *c, int id, int tv, int key_guard, int prim_cand, int exc_cand,
                                        const char *pick_name, Buf *b) {
   if (!program_has_arysub(c)) {
     emit_poly_dispatch_key_pick(c, tv, key_guard, prim_cand, exc_cand, pick_name, b);
@@ -1655,13 +1696,18 @@ static void emit_poly_dispatch_key_top(Compiler *c, int tv, int key_guard, int p
   /* a class that leaves the name to Array keys by its Array's kind, to
      the builtin arms (comp_arysub_name_is_array) */
   for (int k = 0; pick_name && k < c->nclasses; k++)
-    if (comp_arysub_name_is_array(c, -1, k, pick_name)) buf_printf(b, " && _t%d != %d", kt, k);
+    if (comp_arysub_name_is_array(c, id, k, pick_name)) buf_printf(b, " && _t%d != %d", kt, k);
   buf_printf(b, " ? _t%d : ", kt);
   emit_poly_dispatch_key_pick(c, tv, key_guard, prim_cand, exc_cand, pick_name, b);
   buf_puts(b, "; })");
 }
 void emit_poly_dispatch_key(Compiler *c, int tv, int key_guard, int prim_cand, int exc_cand, Buf *b) {
-  emit_poly_dispatch_key_top(c, tv, key_guard, prim_cand, exc_cand, NULL, b);
+  emit_poly_dispatch_key_top(c, -1, tv, key_guard, prim_cand, exc_cand, NULL, b);
+}
+/* See codegen_call_arms.h. */
+void emit_poly_plan_key(Compiler *c, int id, unsigned form, int tv, const char *name, Buf *b) {
+  emit_poly_dispatch_key_top(c, id, tv, (form & (PPF_KEY_CLS0 | PPF_KEY_CLSV)) != 0, (form & PPF_KEY_PRIM) != 0,
+                             (form & PPF_KEY_EXC) != 0, name, b);
 }
 
 /* The reopening of builtin `cls` an OBJ box of it keys to in a dispatch of
@@ -1759,7 +1805,7 @@ static void emit_poly_dispatch_key_pick(Compiler *c, int tv, int key_guard, int 
   }
   static const struct { const char *tag; int cls; } P[] = {
     {"SP_TAG_INT", CORE_INTEGER}, {"SP_TAG_FLT", CORE_FLOAT},
-    {"SP_TAG_STR", CORE_STRING},  {"SP_TAG_SYM", CORE_SYMBOL},
+    {"SP_TAG_SYM", CORE_SYMBOL},
     {"SP_TAG_NIL", CORE_NILCLASS},
   };
   /* a boxed Time / Range is an OBJ box whose cls_id names the builtin, so
@@ -1789,14 +1835,16 @@ static void emit_poly_dispatch_key_pick(Compiler *c, int tv, int key_guard, int 
   }
   buf_printf(b, "(_t%d.tag == SP_TAG_OBJ ? _t%d.cls_id", tv, tv);
   /* an Integer or Float whose own reopening (if any) lacks the name takes
-     the Numeric reopening's arm */
+     the Numeric reopening's arm (the plan's no-site asks: the key picks
+     among the arms the dispatch emits, one per reopening that has the
+     method anywhere, as poly_key_reopen asks) */
   int nmi = comp_builtin_class_named(c, "Numeric");
   if (nmi >= 0 && !(class_is_prim_reopen(c, nmi) &&
-                    (!pick_name || comp_method_in_chain(c, nmi, pick_name, NULL) >= 0))) nmi = -1;
+                    (!pick_name || call_target(c, -1, nmi, pick_name, CT_METHODS, NULL) >= 0))) nmi = -1;
   for (unsigned i = 0; i < sizeof P / sizeof P[0]; i++) {
     int idx = comp_core_class(c, P[i].cls);
     if (nmi >= 0 && (P[i].cls == CORE_INTEGER || P[i].cls == CORE_FLOAT) &&
-        (idx < 0 || (pick_name && comp_method_in_chain(c, idx, pick_name, NULL) < 0))) idx = nmi;
+        (idx < 0 || (pick_name && call_target(c, -1, idx, pick_name, CT_METHODS, NULL) < 0))) idx = nmi;
     if (idx >= 0) buf_printf(b, " : _t%d.tag == %s ? %d", tv, P[i].tag, idx);
   }
   { int ti = comp_core_class(c, CORE_TRUECLASS), fi = comp_core_class(c, CORE_FALSECLASS);
@@ -1914,12 +1962,14 @@ int emit_reopen_arm_test(Compiler *c, int kmi, const char *name, const char *cls
   Buf t; memset(&t, 0, sizeof t);
   buf_printf(&t, "!sp_class_nil_p(%s) && !sp_class_is_module_val(%s) && ((%s).cls_id < 0 || ((%s).cls_id != SP_CLASS_BY_NAME", cls, cls, cls, cls);
   int rc = comp_core_class(c, CORE_CLASS_REOPEN), kdef = c->scopes[kmi].def_node;
+  mtab_enter(c);   /* (the candidate owner of the classes whose class side answers name otherwise: every class is asked by design, no call's question) */
   for (int k = 0; k < c->nclasses; k++) {
     if (k == rc || comp_class_is_module(c, &c->classes[k])) continue;
     int own = comp_cmethod_in_chain(c, k, name, NULL);
     if (own >= 0 && own != kmi && c->scopes[own].def_node != kdef)
       buf_printf(&t, " && (%s).cls_id != %d", cls, k);
   }
+  mtab_leave(c);
   buf_puts(&t, "))");
   if (raise) buf_printf(b, " default: if (!(%s)) { %s; break; } ", t.p, raise);
   else buf_printf(b, "(%s) ? ", t.p);
@@ -2087,6 +2137,18 @@ static int cls_value_answer_raises(const char *t) {
    is a raise, whose message the switch's own default already gives, where
    it would read an argument with a side effect a second time, or where its
    answer does not fit the slot the dispatch assigns. */
+/* Does the program give a class value the name through a method of its own on what every class value is an
+   object of: Object, Module, Class, Kernel or BasicObject (`class Object; private def top`)? Such a method answers
+   for a class value whatever the builtin tables hold (`Integer.send(:top)`). As the plan answers class-value call id
+   for the name: the version live where it runs. */
+static int cls_side_program_answers(Compiler *c, int id, const char *name) {
+  static const int owners[] = { CORE_OBJECT, CORE_MODULE, CORE_CLASS, CORE_KERNEL, CORE_BASIC_OBJECT };
+  for (unsigned i = 0; i < sizeof owners / sizeof *owners; i++) {
+    int k = comp_core_class(c, owners[i]);
+    if (k >= 0 && call_target(c, id, k, name, CT_METHODS, NULL) >= 0) return 1;
+  }
+  return 0;
+}
 static int emit_poly_cls_value_builtin(Compiler *c, int id, const char *name, int argc,
                                        const int *argv, const int *atmp, const TyKind *atmp_ty,
                                        TyKind ret, int tv, int tr, Buf *b) {
@@ -2095,6 +2157,13 @@ static int emit_poly_cls_value_builtin(Compiler *c, int id, const char *name, in
   if (recv < 0 || !name || nt_ref(nt, id, "block") >= 0) return 0;
   if (g_pd_skip == id || g_n_argov + argc + 1 > MAX_ARG_OVERRIDE) return 0;
   if (argc > 0 && (!atmp || !atmp_ty)) return 0;
+  /* only a name the class side answers (Class's and Module's instance
+     methods, Object's): for any other the switch's default raises, as
+     CRuby does. The probe below asks the emitters under the Class face,
+     and the Hash emitter answered `empty?` and `none?` on the class value
+     (its conversion of a Class is NULL, "empty"): `String.send(:empty?)`
+     was true where CRuby raises NoMethodError. */
+  if (!builtin_method_answers("Object", name, 1, 0) && !cls_side_program_answers(c, id, name)) return 0;
   for (int a = 0; a < argc; a++) {
     if (nt_kind(nt, argv[a]) == NK_SplatNode) return 0;
     if (subtree_has_side_effect(c, argv[a]) && repr_of(c, argv[a]).as_ty != atmp_ty[a]) return 0;
@@ -2124,6 +2193,14 @@ static int emit_poly_cls_value_builtin(Compiler *c, int id, const char *name, in
   view_pop(c, va);
   view_unbind(slot);
   const char *t = ok && nb->p ? nb->p : NULL;
+  /* A class reader (Module#name, to_s, inspect: emit_class_reader, the
+     class's name as bytes, NULL for an anonymous class's name) answers
+     bytes under the Class face whatever the call's own type says: the
+     probe asked the call, whose type is the join of every arm's (poly where
+     a class method of the name in the program answers nothing, as a stub
+     that raises does), and the arm handed the bytes to the boxed slot. */
+  if (got == TY_POLY && argc == 0 && (is_class_name_name(name) || is_to_s_name(name) || is_inspect_name(name)))
+    got = TY_STRING;
   /* an answer that can itself raise NoMethodError is the Class emitter's
      own class-method switch (the program's methods of the name, then the
      raise): no better than the default it would replace */
@@ -2175,6 +2252,10 @@ static int cls_value_known_arm(Compiler *c, int id, int k, unsigned unsettled, i
   int argc = 0; const int *argv = call_args(nt, id, &argc);
   if (recv < 0 || nt_ref(nt, id, "block") >= 0 || g_n_argov + 1 > MAX_ARG_OVERRIDE ||
       nt_argv_has(nt, argv, argc, NT_ARG_SPLAT | NT_ARG_BLOCK | NT_ARG_KEYWORDS)) return 0;
+  /* (the plan makes a trial arm only for a Module reflection name
+     (cpoly_cls_value_trials), which every class value answers, so the
+     switch's raise for a name the class side does not answer is not
+     this arm's to keep) */
   /* each argument runs once, in the arm that is taken */
   for (int a = 0; a < argc; a++) if (subtree_has_side_effect(c, argv[a])) return 0;
   int sv_tmp = g_tmp;
@@ -2336,7 +2417,7 @@ int emit_poly_cls_value_prearm(Compiler *c, int id, const char *name, int argc,
        share one (below) */
     Buf ab; memset(&ab, 0, sizeof ab);
     Buf *ob = rarm8 ? b : &ab;
-    TyKind kr = (TyKind)ks->ret;
+    TyKind kr = repr_method_ret_storage(ks);
     Buf cb; memset(&cb, 0, sizeof cb);
     Buf pre; memset(&pre, 0, sizeof pre);
     buf_puts(&cb, mc_method(c, ks));
@@ -2364,7 +2445,7 @@ int emit_poly_cls_value_prearm(Compiler *c, int id, const char *name, int argc,
          its nil (emit_poly_user_box), unwrapped into a plain slot; a plain
          answer is lifted into a slot that holds the oint */
       int ko = oint_kind(kr) && method_ret_is_oint(ks), so = oint_kind(ret) && node_is_oint(c, id);
-      if (ret == TY_POLY && kr != TY_POLY) { emit_poly_user_box(c, id, ks, cb.p ? cb.p : "", ob); pconv = PC_BOX; }
+      if (ret == TY_POLY && kr != TY_POLY) { emit_boxed_ret_call(c, ks, cb.p ? cb.p : "", ob); pconv = PC_BOX; }
       /* a typed Array into the boxed Array the call joined it in
          (an_class_concrete): a module's `def self.split = ["n", s]` beside
          another's mixed one */
@@ -2651,6 +2732,11 @@ int builtin_method_fixed_any(const char *m) {
 int method_scope_arity(Compiler *c, int target, int *out) {
   if (target < 0 || c->scopes[target].def_node < 0) return 0;
   const NodeTable *nt = c->nt;
+  int dn = c->scopes[target].def_node;
+  if (nt_int(nt, dn, "bam_native", 0)) {
+    const char *owner = nt_str(nt, dn, "bam_owner"), *name = nt_str(nt, dn, "bam_sym");
+    if (owner && name && builtin_method_arity(owner, name, out)) return 1;
+  }
   /* A receiverless Kernel wrapper (`method(:String)`) has no receiver class to
      key on, but its one declared parameter IS a real argument, so the wrapper
      shape under-reports the builtin's arity. Read the builtin's real arity off
@@ -2683,7 +2769,7 @@ int method_scope_arity(Compiler *c, int target, int *out) {
     /* ...and one of Enumerable's own, which no class's table lists */
     if (cs && rd != -2 && own && is_enumerable_module_name(own) && builtin_enumerable_arity(cs, out)) return 1;
   }
-  int pn = nt_ref(nt, c->scopes[target].def_node, "parameters");
+  int pn = nt_ref(nt, dn, "parameters");
   int n_req = 0, n_opt = 0, n_post = 0;
   int has_rest = 0, has_forward = 0, kw_block = 0, has_req_kw = 0;
   if (pn >= 0) {
@@ -2852,7 +2938,7 @@ static int class_module_refs(Compiler *c, int ci, const char *kw, int *out, int 
         NodeKind ak = nt_kind(nt, av[j]);
         const char *mn = (ak == NK_ConstantReadNode || ak == NK_ConstantPathNode)
                          ? nt_str(nt, av[j], "name") : NULL;
-        int mi = mn ? comp_class_index(c, mn) : -1;
+        int mi = mn ? const_node_class_index(c, av[j]) : -1;
         if (mi >= 0) out[n++] = mi;
       }
     }
@@ -2928,9 +3014,9 @@ int cls_value_owns_name(Compiler *c, int id, const char *name) {
   return 0;
 }
 
-int diag_user_defines(Compiler *c, const char *name) {
+int diag_user_defines(Compiler *c, int id, const char *name) {
   if (comp_name_is_shadow_copy(c, name, SHADOW_PREP)) return 0;
-  return recv_user_defines(c, name) || comp_method_index(c, name) >= 0;
+  return recv_user_defines(c, name) || call_target(c, id, -1, name, CT_TOP, NULL) >= 0;
 }
 
 /* diag_user_defines for a call with an explicit receiver: a top-level def
@@ -2949,8 +3035,8 @@ int recv_user_defines(Compiler *c, const char *name) {
   if (ni > 0) return 1;
   if (ni == 0) { comp_name_responders(c, name, 1, &nc); if (nc >= 0) return nc > 0; }
   for (int uk = 0; uk < c->nclasses; uk++) {
-    if (comp_method_in_chain(c, uk, name, NULL) >= 0) return 1;
-    if (comp_cmethod_in_chain(c, uk, name, NULL) >= 0) return 1;
+    if (comp_name_responder(c, uk, name, 0) >= 0) return 1;
+    if (comp_name_responder(c, uk, name, CT_CMETHOD) >= 0) return 1;
   }
   return 0;
 }
@@ -2980,12 +3066,6 @@ int poly_ostruct_member_call(Compiler *c, int id) {
          ostruct_member_read(c, id, comp_recv_type(c, recv));
 }
 
-static int poly_name_user_claimed_walk(Compiler *c, const char *name, int argc) {
-  for (int k = 0; k < c->nclasses; k++)
-    if (comp_poly_arm_defines_n(c, k, name, argc) ||
-        (!c->classes[k].is_native_class && comp_reader_in_chain(c, k, name, NULL))) return 1;
-  return 0;
-}
 /* The answer per name and arity, kept as user_defines_or_reads keeps its
    own: while the scope index is frozen and neither the class shape nor the
    counts move. Each ask walked every class, and the poly emitters ask it
@@ -2995,7 +3075,7 @@ static char **pnuc_key; static unsigned char *pnuc_ans; static int pnuc_cap, pnu
 static unsigned pnuc_gen, pnuc_shape; static int pnuc_nscopes = -1, pnuc_nclasses = -1;
 int poly_name_user_claimed(Compiler *c, const char *name, int argc) {
   if (g_poly_builtin_arm) return 0;
-  if (!name || !comp_scope_index_is_frozen()) return poly_name_user_claimed_walk(c, name, argc);
+  if (!name || !comp_scope_index_is_frozen()) return comp_poly_arm_reader_any(c, name, argc);
   if (pnuc_gen != comp_scope_index_gen() || pnuc_shape != comp_class_shape_gen() ||
       pnuc_nscopes != c->nscopes || pnuc_nclasses != c->nclasses) {
     for (int i = 0; i < pnuc_cap; i++) free(pnuc_key ? pnuc_key[i] : NULL);
@@ -3026,7 +3106,7 @@ int poly_name_user_claimed(Compiler *c, const char *name, int argc) {
     if (sp_streq(pnuc_key[j], key)) return pnuc_ans[j];
     j = (j + 1) & (unsigned)(pnuc_cap - 1);
   }
-  int ans = poly_name_user_claimed_walk(c, name, argc);
+  int ans = comp_poly_arm_reader_any(c, name, argc);
   pnuc_key[j] = strdup(key);
   if (!pnuc_key[j]) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   pnuc_ans[j] = (unsigned char)ans; pnuc_n++;
@@ -3037,9 +3117,7 @@ int poly_name_user_claimed(Compiler *c, const char *name, int argc) {
    Module read out of a container answers it through the poly dispatch. */
 int poly_name_cmethod_claimed(Compiler *c, const char *name) {
   if (g_poly_builtin_arm) return 0;
-  for (int k = 0; k < c->nclasses; k++)
-    if (comp_cmethod_in_chain(c, k, name, NULL) >= 0) return 1;
-  return 0;
+  return comp_name_answered(c, name, 1);
 }
 
 /* 1 iff a user class that descends from an exception class defines `name`,
@@ -3053,6 +3131,16 @@ int exc_subclass_defines(Compiler *c, const char *name) {
   return 0;
 }
 
+/* The class-gated readers the poly exception paths answer only for a call
+   exc_user_method_name sends through the boxed dispatch: elsewhere a poly
+   receiver of the name may be no exception at all (Thread#value,
+   Thread#status, File#path, Module#name), whose own arms must keep it. */
+int exc_um_only_acc(const char *name) {
+  static const char *const T[] = {
+    "path", "status", "success?", "reason", "exit_value", "tag", "value", "signo", "signm", "name", NULL };
+  for (int i = 0; T[i]; i++) if (sp_streq(name, T[i])) return 1;
+  return 0;
+}
 /* 1 iff a call of `name` on a TY_EXCEPTION receiver can only be one of the
    program's exception classes' own methods (HTTPStatus::Status#code): some
    user subclass defines it, no builtin exception reopening does (that has
@@ -3063,17 +3151,44 @@ int exc_subclass_defines(Compiler *c, const char *name) {
    poly dispatch keys by its user class (sp_exc_user_cls_id), and anything
    else -- a builtin exception, a subclass without the method -- raises
    NoMethodError there. */
-int exc_user_method_name(Compiler *c, const char *name, int argc) {
+int exc_user_method_name(Compiler *c, int id, const char *name, int argc) {
   static const char *const surface[] = {
     "message", "to_s", "to_str", "inspect", "full_message", "detailed_message", "exception",
-    "backtrace", "backtrace_locations", "set_backtrace", "cause", "result", "class",
+    "backtrace", "backtrace_locations", "set_backtrace", "cause", "class",
     "==", "!=", "===", "=~", "!", "eql?", "equal?", "hash", "object_id", "nil?", "frozen?",
     "freeze", "dup", "clone", "itself", "is_a?", "kind_of?", "instance_of?", "respond_to?",
     "send", "__send__", "public_send", "method", "tap", "then", "instance_variable_get",
     "instance_variable_set", "instance_variables", "<=>", "display", NULL };
   if (!name || !exc_subclass_defines(c, name)) return 0;
   for (int i = 0; surface[i]; i++) if (sp_streq(name, surface[i])) return 0;
-  if (argc == 0 && exc_gated_acc_fn(name)) return 0;
+  /* A class-gated reader (exc_gated_acc_fn) goes through the boxed
+     dispatch too: it takes the program's classes to their own method, and
+     its builtin arm takes every other exception to the runtime's reader
+     through sp_poly_exc_acc, which raises NoMethodError off the reader's
+     class (`rescue => e; e.status` reaches an own attr_reader :status and
+     a SystemExit's #status alike). That arm leaves a block unused, as the
+     builtin readers do. The dispatch does not check visibility, so a name
+     some class of the program's makes private or protected keeps the
+     reader, and so does one whose method calls super to reach the builtin
+     reader, which the boxed dispatch cannot, and so does a name the Object
+     reopening answers: its method takes that dispatch's default arm ahead
+     of the builtin reader. line and column are the
+     exception: before JSON::ParserError
+     answered them they were no reader's, and such a call always reached
+     the program's own method, whatever the visibility. */
+  if (argc == 0 && exc_gated_acc_fn(name) && !sp_streq(name, "line") && !sp_streq(name, "column")) {
+    int obj_cls = comp_core_class(c, CORE_OBJECT);
+    if (obj_cls >= 0 && call_answers(c, -1, obj_cls, name, 0, NULL)) return 0;
+    for (int k = 0; k < c->nclasses; k++)
+      if (class_is_exc_subclass(c, k) && call_answers(c, -1, k, name, 0, NULL) &&
+          cplan_method_vis(c, id, k, name, 0, NULL) != SP_VIS_PUBLIC) return 0;
+    for (int s = 0; s < c->nscopes; s++) {
+      const Scope *sc = &c->scopes[s];
+      if (sc->def_node >= 0 && !sc->is_cmethod && sc->name && sp_streq(sc->name, name) &&
+          sc->class_id >= 0 && class_is_exc_subclass(c, sc->class_id) && scope_calls_super(c, s))
+        return 0;
+    }
+  }
   int xr[1];
   if (exc_reopen_definers(c, name, xr, 1) > 0) return 0;
   return 1;
@@ -3601,6 +3716,8 @@ void emit_int_recv_named(Compiler *c, int recv, const char *name, Buf *b) {
     buf_puts(b, "sp_poly_int_recv("); emit_expr(c, recv, b); buf_printf(b, ", \"%s\")", name);
     return;
   }
+  /* (and so has an Integer that may be nil) */
+  if (comp_ntype(c, recv) == TY_INT && emit_scalar_recv_maybe_nil(c, recv, name, b)) return;
   emit_int_expr(c, recv, b);
 }
 /* the same for upto with a limit node `lim`: a boxed String raises the
@@ -4368,18 +4485,29 @@ int srange_member_hop(Compiler *c, int n) {
 }
 
 /* The String Range row `name` for call id over the Range node r, which a hop
-   (srange_member_hop) stood in front of. The find_index row answers the
-   box of its nullable Integer (sp_box_oint): a slot that holds an Integer
-   takes it unboxed, with its nil. */
+   (srange_member_hop) stood in front of. (The find_index row answers its
+   Integer that may be nil in the call's form, as the Array's does.) */
 int emit_srange_hop_row(Compiler *c, int id, int r, const char *name, Buf *b) {
-  Buf rb; memset(&rb, 0, sizeof rb);
-  if (!emit_builtin_op(c, id, r, TY_STR_RANGE, name, &rb)) { free(rb.p); return 0; }
-  Repr rp = repr_of(c, id);
-  if (is_find_index(name) && rp.kind != RK_BOXED && rp.as_ty == TY_INT)
-    emit_unbox_nilable_text(c, TY_INT, rb.p ? rb.p : "sp_box_nil()", b);
-  else buf_puts(b, rb.p ? rb.p : "");
-  free(rb.p);
-  return 1;
+  return emit_builtin_op(c, id, r, TY_STR_RANGE, name, b);
+}
+
+/* Bind the boxed element using the block's usual argument distribution. */
+static void emit_boxed_item_binds(Compiler *c, int block, const char *value, int indent) {
+  char yielded[256];
+  snprintf(yielded, sizeof yielded, "sp_yielded_args(0, %s)", value);
+  if (emit_boxed_step_binds(c, block, yielded, g_pre, indent, 0)) return;
+  if (emit_iter_autosplat(c, block, TY_POLY_ARRAY, value, indent)) return;
+  const char *name = block_param_name(c, block, 0);
+  Scope *scope = comp_scope_of(c, block);
+  LocalVar *local = scope && name ? scope_local(scope, name) : NULL;
+  if (!local) return;
+  Repr slot = repr_of_slot(c, local);
+  TyKind type = slot.handle ? TY_STRBUF : slot.as_ty;
+  emit_indent(g_pre, indent);
+  buf_printf(g_pre, "lv_%s = ", rename_local(name));
+  if (type == TY_UNKNOWN || type == TY_POLY) buf_puts(g_pre, value);
+  else emit_unbox_text(c, type, value, g_pre);
+  buf_puts(g_pre, ";\n");
 }
 
 static int emit_lazy_pipeline_expr_1(Compiler *c, int id, Buf *b);
@@ -4393,31 +4521,23 @@ int emit_lazy_pipeline_expr(Compiler *c, int id, Buf *b) {
 }
 static int emit_lazy_pipeline_expr_1(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
-  const char *tname = nt_str(nt, id, "name");
-  if (!tname) return 0;
   /* `first(n)` / `to_a` / `force` force the lazy chain; `take(n)` stays lazy in
      CRuby (returns another Lazy) so it is not a forcing terminal here. */
-  int is_first = sp_streq(tname, "first");
+  if (!an_lazy_terminal_fuses(nt, id)) return 0;
+  const char *tname = nt_str(nt, id, "name");
+  int is_first = is_lazy_first(tname);
   int is_toa = is_lazy_force(tname);
-  if (!is_first && !is_toa) return 0;
-  if (nt_ref(nt, id, "block") >= 0) return 0;
   int recv = nt_ref(nt, id, "receiver");
-  if (recv < 0) return 0;
   /* the chain may be held in a variable (`p = src.lazy.select{}; p.first(n)`);
      resolve the alias to its lazy chain and fuse it inline (#2932) */
   recv = lazy_resolve_chain(c, recv);
 
-  int has_count = 0, count_node = -1;
-  {
+  /* bare `first` is first(1) unwrapped to the single element (#2994) */
+  int has_count = is_first, count_node = -1;
+  if (is_first) {
     int ar = nt_ref(nt, id, "arguments");
     int ac = 0; const int *av = ar >= 0 ? nt_arr(nt, ar, "arguments", &ac) : NULL;
-    if (is_first) {
-      if (ac == 1) { has_count = 1; count_node = av[0]; }
-      /* bare `first` is first(1) unwrapped to the single element (#2994) */
-      else if (ac == 0) has_count = 1;
-      else return 0;
-    }
-    else if (ac != 0) return 0;
+    if (ac == 1) count_node = av[0];
   }
 
   /* arg/cnt/lim are used only by the blockless counter stages (take/drop):
@@ -4534,7 +4654,7 @@ static int emit_lazy_pipeline_expr_1(Compiler *c, int id, Buf *b) {
   int src_is_range = (sr.range == TY_INT), src_is_intarr = (sr.elem == TY_INT);
   int src_is_enum = (st == TY_ENUMERATOR);
   /* a boxed source streams as an Enumerator over it (sp_poly_lazy_src) */
-  int src_is_poly = (st == TY_POLY && !diag_user_defines(c, "lazy"));
+  int src_is_poly = (st == TY_POLY && !diag_user_defines(c, id, "lazy"));
   if (src_is_poly) src_is_enum = 1;
   /* a String Range streams the same way once boxed, an endless one by succ */
   int src_is_srange = (st == TY_STR_RANGE);
@@ -4820,21 +4940,11 @@ static int emit_lazy_pipeline_expr_1(Compiler *c, int id, Buf *b) {
       continue;
     }
     int blk = ops[oi].block;
-    const char *bp0 = block_param_name(c, blk, 0);
-    const char *bp = (bp0 && bp0[0]) ? rename_local(bp0) : "_lx";
     if (ops[oi].kind == OP_DROPWHILE) {
-      /* while dropping, evaluate the predicate: true skips the element,
-         false clears the flag and lets everything through untouched */
+      /* Bind and run the predicate until it first accepts an item. */
       emit_indent(g_pre, g_indent + 1);
       buf_printf(g_pre, "if (_t%d) {\n", ops[oi].cnt);
-      Scope *dws = comp_scope_of(c, blk);
-      LocalVar *dwl = (dws && bp0) ? scope_local(dws, bp0) : NULL;
-      TyKind dwt = (dwl && dwl->type != TY_UNKNOWN) ? dwl->type : TY_POLY;
-      emit_indent(g_pre, g_indent + 2);
-      buf_printf(g_pre, "lv_%s = ", bp);
-      if (dwt == TY_POLY) buf_puts(g_pre, vbuf);
-      else { Buf ub; memset(&ub, 0, sizeof ub); emit_unbox_text(c, dwt, vbuf, &ub); buf_puts(g_pre, ub.p ? ub.p : vbuf); free(ub.p); }
-      buf_puts(g_pre, ";\n");
+      emit_boxed_item_binds(c, blk, vbuf, g_indent + 2);
       int dwb = nt_ref(nt, blk, "body");
       int dwn = 0; const int *dwv = dwb >= 0 ? nt_arr(nt, dwb, "body", &dwn) : NULL;
       for (int k = 0; k < dwn - 1; k++) emit_stmt(c, dwv[k], g_pre, g_indent + 2);
@@ -4850,28 +4960,7 @@ static int emit_lazy_pipeline_expr_1(Compiler *c, int id, Buf *b) {
       emit_indent(g_pre, g_indent + 1); buf_puts(g_pre, "}\n");
       continue;
     }
-    /* The running value is boxed (poly); the block param may infer a narrower
-       type, so unbox to match its C type. A |k, v| header destructures a
-       pair element (hash.lazy rides the pair array, #2845). */
-    /* a block of any other shape than plain requireds (a rest, an optional,
-       a post, a keyword) binds the value by the proc distribution: `|*r|`
-       was never bound and read nil */
-    char gvals[256]; snprintf(gvals, sizeof gvals, "sp_yielded_args(0, %s)", vbuf);
-    if (emit_boxed_step_binds(c, blk, gvals, g_pre, g_indent + 1, 0)) {}
-    else if (!emit_iter_autosplat(c, blk, TY_POLY_ARRAY, vbuf, g_indent + 1)) {
-      Scope *bs = comp_scope_of(c, blk);
-      LocalVar *plv = (bs && bp0) ? scope_local(bs, bp0) : NULL;
-      TyKind pt = (plv && plv->type != TY_UNKNOWN) ? plv->type : TY_POLY;
-      /* A param the body never reads has no local at all: binding it would
-         name an undeclared C variable, and there is nothing to bind (#3583) */
-      if (plv) {
-        emit_indent(g_pre, g_indent + 1);
-        buf_printf(g_pre, "lv_%s = ", bp);
-        if (pt == TY_POLY) buf_puts(g_pre, vbuf);
-        else { Buf ub; memset(&ub, 0, sizeof ub); emit_unbox_text(c, pt, vbuf, &ub); buf_puts(g_pre, ub.p ? ub.p : vbuf); free(ub.p); }
-        buf_puts(g_pre, ";\n");
-      }
-    }
+    emit_boxed_item_binds(c, blk, vbuf, g_indent + 1);
     int bbody = nt_ref(nt, blk, "body");
     int bn = 0; const int *bb = bbody >= 0 ? nt_arr(nt, bbody, "body", &bn) : NULL;
     for (int k = 0; k < bn - 1; k++) emit_stmt(c, bb[k], g_pre, g_indent + 1);
@@ -5044,19 +5133,12 @@ static void emit_dynamic_send_arm(Compiler *c, int arm, int t, int mo, int *seen
   /* an arm answering an Integer or Float that may be nil boxes its oint:
      unwrapped first, its nil raised TypeError where the send answers nil */
   int arm_oint = !self_ret && oint_kind(at) && node_may_be_nil(c, arm);
-  /* --share-strings: an arm answering a String the plan gives the handle
-     is boxed as that handle (the one the target holds or publishes), as
-     a direct call of the method is: its bytes boxed were a copy, and a
-     change through the answer missed the target's String. One the plan
-     wraps (a new String, a literal) is boxed as the new handle it is, so
-     the answer's copies name one String. */
-  int arm_form = !self_ret && (at == TY_STRING || at == TY_STRBUF)
-                 ? share_plan_of(c, arm, share_plan_role(c, arm), NULL).form : SPF_BYTES;
-  int arm_str = arm_form == SPF_HANDLE || arm_form == SPF_WRAP;
+  /* The dispatch publishes the selected String answer as a box. */
+  int arm_str = !self_ret && (at == TY_STRING || at == TY_STRBUF);
   if (setjmp(g_unsup_recover) == 0) {
     if (self_ret) emit_strbuf_handle_of(c, arm, &body);
     else if (arm_oint) emit_oint_expr(c, arm, at, &body);
-    else if (arm_str) emit_str_form_box(c, arm, &body);
+    else if (arm_str) emit_boxed(c, arm, &body);
     else emit_expr(c, arm, &body);
     ok = 1;
   }
@@ -5222,12 +5304,7 @@ static int emit_dynamic_send(Compiler *c, int id, Buf *b) {
   buf_puts(b, "default: ");
   if (mo) {
     buf_printf(b, "{ sp_raise_cls(\"NameError\", sp_sprintf(\"undefined method '%%s' for class '%%s'\", sp_sym_to_s(_t%d), sp_poly_class_name(", t);
-    if (recv_held) {
-      /* (the receiver is named in the message only: its bytes are a read) */
-      size_t at = b->len;
-      emit_boxed(c, recv, b);
-    }
-    else emit_str_form_box(c, recv, b);
+    emit_boxed(c, recv, b);
     buf_printf(b, "))); _r%d = sp_box_nil(); } } _r%d; })", t, t);
   }
   /* a name no candidate answers is CRuby's NoMethodError naming the
@@ -5235,12 +5312,7 @@ static int emit_dynamic_send(Compiler *c, int id, Buf *b) {
      a receiver with side effects was read once into its temp above */
   else if (recv >= 0) {
     buf_printf(b, "{ sp_raise_nomethod(sp_nomethod_msg(sp_sym_to_s(_t%d), ", t);
-    if (recv_held) {
-      /* (the receiver is named in the message only: its bytes are a read) */
-      size_t at = b->len;
-      emit_boxed(c, recv, b);
-    }
-    else emit_str_form_box(c, recv, b);
+    emit_boxed(c, recv, b);
     buf_printf(b, ")); _r%d = sp_box_nil(); } } _r%d; })", t, t);
   }
   else buf_printf(b, "{ sp_raise_cls(\"NoMethodError\", sp_sprintf(\"undefined method '%%s'\", sp_sym_to_s(_t%d))); _r%d = sp_box_nil(); } } _r%d; })", t, t, t);
@@ -5502,8 +5574,8 @@ static void emit_sysexit_alloc(Compiler *c, int ci, const char **dim, Buf *b) {
    or a class below it. The status and the message are judged at run time, as
    CRuby's initialize judges them. */
 void emit_sysexit_new(Compiler *c, int id, int ci, int argc, const int *argv, Buf *b) {
-  if (nt_argv_has(c->nt, argv, argc, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_BLOCK | NT_ARG_FORWARDING))
-    unsupported(c, id, "a splat, keyword or block argument to a SystemExit constructor");
+  if (nt_argv_has(c->nt, argv, argc, NT_ARG_BLOCK | NT_ARG_FORWARDING))
+    unsupported(c, id, "a block argument to a SystemExit constructor");
   int te = ++g_tmp;
   Buf alloc; memset(&alloc, 0, sizeof alloc);
   const char *dim = "sp_Exception";
@@ -5628,8 +5700,18 @@ int emit_exc_extra_args(Compiler *c, int id, int ci, int argc, const int *argv, 
    CRuby's initialize judges them. `lead` is empty or ends in ", ". */
 void emit_syserr_call(Compiler *c, int id, const char *fn, const char *lead,
                       int argc, const int *argv, Buf *b) {
-  if (nt_argv_has(c->nt, argv, argc, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_BLOCK | NT_ARG_FORWARDING))
-    unsupported(c, id, "a splat, keyword or block argument to a SystemCallError constructor");
+  if (nt_argv_has(c->nt, argv, argc, NT_ARG_BLOCK | NT_ARG_FORWARDING))
+    unsupported(c, id, "a block argument to a SystemCallError constructor");
+  /* a splat or keywords: the arguments gathered in the prelude, a non-empty
+     keyword Hash as one more (the initialize is written in C and takes no
+     keywords), and the count judged by `fn` at run time */
+  if (nt_argv_has(c->nt, argv, argc, NT_ARG_SPLAT | NT_ARG_KEYWORDS)) {
+    int ta, tk;
+    emit_exc_args_gather(c, id, argc, argv, &ta, &tk);
+    buf_printf(b, "({ if (_t%d.tag == SP_TAG_OBJ && sp_poly_keys(_t%d)->len > 0) sp_PolyArray_push(_t%d, _t%d); "
+                  "%s(%s_t%d->len, _t%d->data); })", tk, tk, ta, tk, fn, lead, ta, ta);
+    return;
+  }
   if (argc == 0) { buf_printf(b, "%s(%s0, NULL)", fn, lead); return; }
   int t0 = g_tmp + 1;
   g_tmp += argc;
@@ -5658,6 +5740,7 @@ const char *exc_gated_acc_fn(const char *name) {
     {"signo", "sp_exc_signo_acc"}, {"signm", "sp_exc_signm_acc"},
     {"errno", "sp_exc_errno_acc"}, {"name", "sp_exc_name_acc"},
     {"error_code", "sp_exc_error_code_acc"}, {"result", "sp_exc_result_acc"},
+    {"line", "sp_exc_parse_line_acc"}, {"column", "sp_exc_parse_column_acc"},
     /* LoadError#path: the feature of a require that loaded nothing, and
        nil for a LoadError raised by hand, as in CRuby */
     {"path", "sp_exc_path_acc"},
@@ -6495,7 +6578,7 @@ static int emit_complex_rational_call(Compiler *c, int id, Buf *b) {
         return 1;
       }
       if (sp_streq(name, "**")) {
-        buf_puts(b, "pow(");
+        buf_puts(b, "sp_float_pow(");
         if (lft_rat) { buf_puts(b, "sp_rational_to_f("); emit_expr(c, recv, b); buf_puts(b, ")"); }
         else emit_float_expr(c, recv, b);
         buf_puts(b, ", ");
@@ -6550,7 +6633,7 @@ static int emit_complex_rational_call(Compiler *c, int id, Buf *b) {
        Rational ** Rational). */
     if (crt == TY_INT && argc == 1 && sp_streq(name, "**") &&
         comp_ntype(c, argv[0]) == TY_RATIONAL) {
-      buf_puts(b, "pow((double)("); emit_expr(c, recv, b);
+      buf_puts(b, "sp_float_pow((sp_float)("); emit_expr(c, recv, b);
       buf_puts(b, "), sp_rational_to_f("); emit_expr(c, argv[0], b); buf_puts(b, "))");
       return 1;
     }
@@ -6815,7 +6898,7 @@ int object_defines_cmp(Compiler *c) {
    builtin type (`rescue => e`) may be one of its instances. */
 int exc_subclass_defines_cmp(Compiler *c) {
   for (int k = 0; k < c->nclasses; k++)
-    if (class_is_exc_subclass(c, k) && comp_method_in_chain(c, k, "<=>", NULL) >= 0) return 1;
+    if (class_is_exc_subclass(c, k) && comp_name_responder(c, k, "<=>", 0) >= 0) return 1;
   return 0;
 }
 
@@ -7002,6 +7085,34 @@ void emit_base_arg(Compiler *c, int arg, int t, char *bv, size_t n, Buf *b) {
   if (ib) emit_int_expr(c, arg, b);
   else emit_boxed(c, arg, b);
 }
+
+/* Evaluate the arguments before trying any candidate. Each conversion may
+   change the held receiver, so borrow its bytes after the conversion. */
+static void emit_poly_string_affix(Compiler *c, const char *name, int recv, const int *argv, int argc, Buf *b) {
+  int prefix = sp_streq(name, "start_with?");
+  const char *fn = prefix ? "sp_str_start_with" : "sp_str_end_with";
+  buf_puts(b, "({ ");
+  int tv = emit_rooted_arg_list(c, &recv, 1, "sp_RbVal", "SP_GC_ROOT_RBVAL", emit_boxed, NULL, b);
+  int first = emit_rooted_arg_list(c, argv, argc, "sp_RbVal", "SP_GC_ROOT_RBVAL", emit_boxed, NULL, b);
+  char subject[112];
+  snprintf(subject, sizeof subject, "_t%d.tag == SP_TAG_SYM ? sp_sym_to_s((sp_sym)_t%d.v.i) : sp_rbval_string_bytes(_t%d)",
+           tv, tv, tv);
+  buf_printf(b, "(sp_rbval_is_string(_t%d) || _t%d.tag == SP_TAG_SYM) ? (", tv, tv);
+  for (int j = 0; j < argc; j++) {
+    int a = first + j, t = ++g_tmp;
+    if (j) buf_puts(b, " || ");
+    if (prefix)
+      buf_printf(b, "(_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_REGEX"
+                    " ? sp_re_start_with((mrb_regexp_pattern *)_t%d.v.p, %s) : ", a, a, a, subject);
+    buf_printf(b, "({ const char *_t%d = sp_strface_b_box(_t%d);"
+                  " if (!_t%d) _t%d = sp_poly_arg_str_chk(_t%d);"
+                  " SP_GC_ROOT_STR(_t%d); %s(%s, _t%d); })",
+               t, a, t, t, a, t, fn, subject, t);
+    if (prefix) buf_puts(b, ")");
+  }
+  buf_printf(b, ") : (sp_bool)(sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), 0); })", name, tv);
+}
+
 static int emit_poly_builtin_method(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   const char *name = nt_str(nt, id, "name");
@@ -7480,29 +7591,7 @@ static int emit_poly_builtin_method(Compiler *c, int id, Buf *b) {
      (any match), the same as the direct-String path (#3211, #3254). A Symbol
      answers them over its name, as a typed Symbol does. */
   if ((sp_streq(name, "start_with?") || sp_streq(name, "end_with?")) && argc >= 1 && argv) {
-    const char *fn = sp_streq(name, "start_with?") ? "sp_str_start_with" : "sp_str_end_with";
-    int tv = ++g_tmp;
-    /* a shared-string handle is a String: deref it into the immediate form the
-       arm reads, or the guard is single-armed and raises for it (#4279) */
-    buf_printf(b, "({ sp_RbVal _t%d = sp_poly_strbuf_deref(", tv); emit_expr(c, recv, b);
-    buf_puts(b, ")");
-    buf_printf(b, "; const char *_s%d = _t%d.tag == SP_TAG_SYM ? sp_sym_to_s((sp_sym)_t%d.v.i) : _t%d.v.s;",
-               tv, tv, tv, tv);
-    buf_printf(b, " (_t%d.tag == SP_TAG_STR || _t%d.tag == SP_TAG_SYM) ? (", tv, tv);
-    for (int j = 0; j < argc; j++) {
-      if (j) buf_puts(b, " || ");
-      /* start_with?(re): a Regexp matches at index 0, as the typed String
-         path answers it */
-      if (sp_streq(name, "start_with?")) {
-        char sv[24]; snprintf(sv, sizeof sv, "_s%d", tv);
-        emit_start_with_arg(c, argv[j], sv, b);
-        continue;
-      }
-      buf_printf(b, "%s(_s%d, ", fn, tv);
-      emit_str_expr(c, argv[j], b);
-      buf_puts(b, ")");
-    }
-    buf_printf(b, ") : (sp_bool)(sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)), 0); })", name, tv);
+    emit_poly_string_affix(c, name, recv, argv, argc, b);
     return 1;
   }
   /* #clear on a poly value (a mixed Array/Hash element via `&:clear`): empty the
@@ -7952,7 +8041,7 @@ void abi_sig_token(TyKind t, char *out) {
    undefined register) unless the body is void-shaped (SP_BM_RET_NIL), a
    float returns in a different register, and a by-value struct is not a
    register value at all. The kinds that DO ride: Integer; a String return
-   is `const char *` (boxed NULL-as-nil); a Bigint is a nullable pointer;
+   is a nullable sp_String *; a Bigint is a nullable pointer;
    bool (the low byte) and Symbol get their own arms so true does not box
    as a garbage Integer nor :sym as its id; a poly return is an sp_RbVal in
    two registers with its own cast; the typed-array and user-object kinds
@@ -7963,7 +8052,7 @@ static int method_bm_ret_kind(Compiler *c, Scope *m, int *out_ret) {
      the thunk, which calls the target as an oint */
   if (m->ret == TY_INT && method_ret_is_oint(m)) return 0;
   if (m->ret == TY_INT) { if (out_ret) *out_ret = 0; /* SP_BM_RET_INT */ }
-  else if (m->ret == TY_STRING) { if (out_ret) *out_ret = 1; /* SP_BM_RET_STR */ }
+  else if (repr_method_ret_storage(m) == TY_STRBUF) { if (out_ret) *out_ret = 11; /* SP_BM_RET_STRBUF */ }
   else if (m->ret == TY_BIGINT) { if (out_ret) *out_ret = 10; /* SP_BM_RET_BIGINT */ }
   else if (method_is_void(m)) { if (out_ret) *out_ret = 4; /* SP_BM_RET_NIL */ }
   else if (m->ret == TY_POLY) { if (out_ret) *out_ret = 5; /* SP_BM_RET_POLY */ }
@@ -8131,15 +8220,41 @@ int method_poly_abi(Compiler *c, int mi, int recv_bound, int *out_fixed, int *ou
    signature binds -- a Float parameter, an omitted optional, a rest, a
    mixed promote signature -- where the two ABI stamps decline. Answers the
    function name, or NULL when the target's shape declines (keywords, a
-   builtin's __bam_ wrapper, a class method taking its class, more than 16
-   parameters), with the count range it binds. */
+   builtin's __bam_ wrapper, more than 16 parameters), with the count range
+   it binds. A class method taking its receiving class
+   (cmethod_takes_self_cls) has one per class it is bound on, self_cls (the
+   class `K.method(:m)` names: method_node_recv_class), `_bmt_<scope>_c<class>`,
+   which passes that class first; with no self_cls it declines. */
 int emit_method_tramp_fn(Compiler *c, Scope *tm, int shift, const char *fname,
                          int boxed_src, int self_cls, int *out_min, int *out_max);
 static char **g_bmt_name = NULL;   /* per (scope * 2 + rb): the thunk's name, "" when declined, NULL untried */
 static int *g_bmt_min = NULL, *g_bmt_max = NULL;
 static int g_bmt_cap = 0;
-const char *emit_method_thunk(Compiler *c, int mi, int recv_bound, int *out_min, int *out_max) {
+const char *emit_method_thunk(Compiler *c, int mi, int recv_bound, int self_cls, int *out_min, int *out_max) {
   if (mi < 0 || mi >= c->nscopes) return NULL;
+  Scope *ts = &c->scopes[mi];
+  if (cmethod_takes_self_cls(c, ts)) {
+    char nm[48];
+    if (self_cls < 0 || ts->body < 0 || !ts->name || ts->cs_synth) return NULL;
+    snprintf(nm, sizeof nm, "_bmt_%d_c%d", mi, self_cls);
+    struct BmtCls *t = NULL;
+    for (int i = 0; i < c->nbmt_cls && !t; i++) if (c->bmt_cls[i].mi == mi && c->bmt_cls[i].cls == self_cls) t = &c->bmt_cls[i];
+    if (!t) {
+      if (!(c->nbmt_cls & (c->nbmt_cls - 1)) &&
+          !(c->bmt_cls = realloc(c->bmt_cls, sizeof *c->bmt_cls * (size_t)(c->nbmt_cls ? 2 * c->nbmt_cls : 1)))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      t = &c->bmt_cls[c->nbmt_cls++];
+      *t = (struct BmtCls){ mi, self_cls, 0, 0, 0, name_dup(nm) };
+      int ok, tmin = 0, tmax = 0, ix = (int)(t - c->bmt_cls);
+      ok = emit_method_tramp_fn(c, ts, 0, nm, 1, self_cls, &tmin, &tmax);   /* (may bind more: t moves) */
+      t = &c->bmt_cls[ix];
+      t->ok = ok; t->tmin = tmin; t->tmax = tmax;
+      if (ok) buf_printf(&g_proc_protos, "static sp_int %s(void *cap, sp_int argc, sp_int *args);\n", nm);
+    }
+    if (!t->ok) return NULL;
+    if (out_min) *out_min = t->tmin;
+    if (out_max) *out_max = t->tmax;
+    return t->name;
+  }
   int key = mi * 2 + (recv_bound ? 1 : 0);
   if (key >= g_bmt_cap) {
     int nc = c->nscopes * 2 + 16;
@@ -8226,9 +8341,7 @@ void emit_bm_abi_args(Buf *b, const char *rb, int abi, const char *sig, int fixe
 int emit_poly_callable_prearm(Compiler *c, const char *name, int argc,
                               const int *atmp, const TyKind *atmp_ty, const char *guard,
                               int tv, int tr, TyKind ret, int kwpos, int tblk, Buf *b) {
-  if (!name ||
-      !is_call_alias(name))
-    return 0;
+  if (!name || !is_call_or_yield(name)) return 0;
   /* A Curry reads its arguments from the one-global _sp_proc_poly_args
      channel, so publish the boxed args as a comma sequence immediately in
      front of the call. It is collected (not emitted as a standalone
@@ -8399,15 +8512,17 @@ int emit_poly_callable_prearm(Compiler *c, const char *name, int argc,
                 " || _t%d.cls_id == SP_BUILTIN_CURRY", guard ? guard : "", tv, tv, tv);
   /* a Method is admitted on its stamped ABI, or on the thunk its bind site
      synthesized for any count the signature binds (#4542) */
-  buf_printf(b, " || (_t%d.cls_id == SP_BUILTIN_METHOD && (", tv);
-  if (method_ok) {
-    if (mabi_poly)
-      buf_printf(b, "(((sp_BoundMethod *)_t%d.v.p)->fn"
-                    " && sp_bm_poly_abi_ok((sp_BoundMethod *)_t%d.v.p, %d))", tv, tv, argc);
-    else emit_bm_legacy_ok(b, tv, argc, method_sig);
-    buf_puts(b, " || ");
+  if (is_call_alias(name)) {
+    buf_printf(b, " || (_t%d.cls_id == SP_BUILTIN_METHOD && (", tv);
+    if (method_ok) {
+      if (mabi_poly)
+        buf_printf(b, "(((sp_BoundMethod *)_t%d.v.p)->fn"
+                      " && sp_bm_poly_abi_ok((sp_BoundMethod *)_t%d.v.p, %d))", tv, tv, argc);
+      else emit_bm_legacy_ok(b, tv, argc, method_sig);
+      buf_puts(b, " || ");
+    }
+    buf_printf(b, "sp_bm_thunk_ok((sp_BoundMethod *)_t%d.v.p, %d)))", tv, argc);
   }
-  buf_printf(b, "sp_bm_thunk_ok((sp_BoundMethod *)_t%d.v.p, %d)))", tv, argc);
   buf_printf(b, ")) { %s_t%d = ", holds.p ? holds.p : "", tr);
   if (ret == TY_POLY) buf_puts(b, eb.p ? eb.p : "");
   else emit_unbox_poly_ret(c, ret, eb.p ? eb.p : "", b);
@@ -8418,16 +8533,14 @@ int emit_poly_callable_prearm(Compiler *c, const char *name, int argc,
 
 int emit_poly_callable_spread_prearm(Compiler *c, const char *name, int sa,
                                             const int *atmp, const TyKind *atmp_ty, int st,
-                                            int tv, int tr, TyKind ret, Buf *b) {
-  if (!name ||
-      !is_call_alias(name))
-    return 0;
+                                            const char *kwpos, int blk, int tv, int tr, TyKind ret, Buf *b) {
+  if (!name || !is_call_or_yield(name)) return 0;
   g_needs_proc_poly_argslot = 1;
   int ta = ++g_tmp;
   buf_printf(b, "if (_t%d.tag == SP_TAG_OBJ && (_t%d.cls_id == SP_BUILTIN_PROC"
-                " || _t%d.cls_id == SP_BUILTIN_CURRY || _t%d.cls_id == SP_BUILTIN_METHOD))"
-                " { sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);",
-             tv, tv, tv, tv, ta, ta);
+                " || _t%d.cls_id == SP_BUILTIN_CURRY", tv, tv, tv);
+  if (is_call_alias(name)) buf_printf(b, " || _t%d.cls_id == SP_BUILTIN_METHOD", tv);
+  buf_printf(b, ")) { sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);", ta, ta);
   for (int k = 0; k < sa; k++) {
     char tn[24]; snprintf(tn, sizeof tn, "_t%d", atmp[k]);
     buf_printf(b, " sp_PolyArray_push(_t%d, ", ta);
@@ -8436,8 +8549,11 @@ int emit_poly_callable_spread_prearm(Compiler *c, const char *name, int sa,
     buf_puts(b, ");");
   }
   buf_printf(b, " sp_PolyArray_append_all(_t%d, _t%d); _t%d = ", ta, st, tr);
-  char call[96];
-  snprintf(call, sizeof call, "sp_poly_callable_spread(_t%d, sp_box_poly_array(_t%d), 0)", tv, ta);
+  char call[128];
+  if (blk >= 0)
+    snprintf(call, sizeof call, "sp_poly_callable_spread_blk(_t%d, sp_box_poly_array(_t%d), %s, _t%d)", tv, ta, kwpos, blk);
+  else
+    snprintf(call, sizeof call, "sp_poly_callable_spread(_t%d, sp_box_poly_array(_t%d), %s)", tv, ta, kwpos);
   if (ret == TY_POLY) buf_puts(b, call);
   else emit_unbox_poly_ret(c, ret, call, b);
   buf_puts(b, "; }\nelse ");
@@ -8552,7 +8668,7 @@ static int emit_poly_str_prearm(Compiler *c, int id, int recv, const char *name,
      arm on the same tag is unreachable, and the one already there is the more
      specific. */
   { char seen[48];
-    snprintf(seen, sizeof seen, "if (_t%d.tag == SP_TAG_STR)", tv);
+    snprintf(seen, sizeof seen, "if (sp_rbval_is_string(_t%d))", tv);
     if (b->p && strstr(b->p, seen)) return 0; }
   int slot = view_bind_temp(recv, tv);
   int pa_kept = 0;
@@ -8590,6 +8706,11 @@ static int emit_poly_str_prearm(Compiler *c, int id, int recv, const char *name,
     else buf_puts(&ib, nb.p);
     free(nb.p);
   }
+  else if (ret == TY_POLY && bt == TY_STRING && cplan_builtin_handle_row(c, id)) {
+    buf_puts(&ib, "SP_STR_BOX(");
+    emit_native_string_handle(c, id, &ib);
+    buf_puts(&ib, ")");
+  }
   else if (ret == TY_POLY && bt != TY_POLY) {
     Buf nb; memset(&nb, 0, sizeof nb);
     emit_expr(c, id, &nb);
@@ -8615,8 +8736,7 @@ static int emit_poly_str_prearm(Compiler *c, int id, int recv, const char *name,
     if (g_plan_check) pa_observe_at(id, PA_TRIAL, PA_KEY_TRIAL + PT_STR, -1, TY_UNKNOWN, pa_kept);
     return 0;
   }
-  /* a shared-mutable string is a builtin OBJ box, not SP_TAG_STR, and is a
-     string: sp_poly_recv_s takes both, so the guard has to as well */
+  /* The guard selects the builtin String arm for eligible handle boxes. */
   buf_puts(b, "if ("); emit_poly_str_guard(c, tv, name, b);
   buf_printf(b, ") { %s _t%d = %s; }\nelse ", arm_pre ? arm_pre : "", tr, ib.p);
   free(ib.p); free(arm_pre);
@@ -8719,8 +8839,8 @@ static int emit_poly_builtin_default_spread(Compiler *c, int id, int recv, const
        the value (re-entered, the emission folds the empty forward) */
     if (n == 0 && (sp_streq(name, "inspect") || sp_streq(name, "to_s")) &&
         (ret == TY_POLY || ret == TY_STRING)) {
-      buf_printf(&arms, " if (_t%d->len == 0) { _t%d = %ssp_poly_%s(_t%d)%s; break; }", atmp[0], tr,
-                 ret == TY_POLY ? "sp_box_str(" : "", name, tv, ret == TY_POLY ? ")" : "");
+      buf_printf(&arms, " if (_t%d->len == 0) { _t%d = sp_poly_%s%s(_t%d); break; }", atmp[0], tr,
+                 name, ret == TY_POLY ? "_box" : "", tv);
       any = 1;
       continue;
     }
@@ -8750,10 +8870,9 @@ static int emit_poly_builtin_default_spread(Compiler *c, int id, int recv, const
   free(arms.p);
   return 1;
 }
-/* Set while a count's arm of a builtin's generic entry is emitted
-   (bi_generic_fn): the answer the analysis recorded for the call is the
-   splatted form's, so each count asks its own. */
-static int g_bi_count_arm = 0;
+/* (g_arm.count_arm, set while a count's arm of a builtin's generic entry
+   is emitted, bi_generic_fn: the answer the analysis recorded for the call
+   is the splatted form's, so each count asks its own.) */
 static int emit_poly_builtin_default_generic(Compiler *c, int id, int recv, const char *name,
                                              int argc, const int *argv, const int *atmp,
                                              const TyKind *atmp_ty, TyKind ret, int tv, int tr,
@@ -8861,6 +8980,7 @@ static int arm_raises_nomethod_for(const char *text, const char *name) {
    bound to _t<tv> (emit_poly_builtin_default_at): the arm's text into nb,
    what it hoists into *arm_pre. 0 when the probe declined. */
 static int poly_default_obj_spreads(Compiler *c, int id, const char *name);
+
 /* Array#at, kept by name where a program class owns it (desugar_array_at:
    an instance method `at`, or a class method `at` a boxed receiver may be a
    Class of): for a receiver that is no Class, the index read that checks
@@ -8899,21 +9019,21 @@ static int kwh_values_held(const NodeTable *nt, int kwh) {
 }
 static int bi_default_probe(Compiler *c, int id, int recv, const char *name, int argc, const int *argv,
                             const int *atmp, const TyKind *atmp_ty, TyKind ret, TyKind bt, int slot_o,
-                            int nil_fwd, int tv, Buf *nb, char **arm_pre, int *box_o) {
+                            int omit_block, int gathered, int tv, Buf *nb, char **arm_pre, int *box_o) {
   const NodeTable *nt = c->nt;
-  int slot = view_bind_temp(recv, tv);
+  int mark = view_mark();
+  view_bind_temp(recv, tv);
   /* a splat into Object's own method (poly_default_obj_spreads) spreads the
      list the dispatch already flattened into its temp, a boxed Array: its
      operand is not read a second time */
-  int sviews[POLY_OBJ_SPREAD_MAX], nsv = 0;
-  int obj_spread = poly_default_obj_spreads(c, id, name);
-  int last_splat = obj_spread ? poly_last_splat(nt, argc, argv) : -1;
+  int spread = gathered || poly_default_obj_spreads(c, id, name);
+  int last_splat = spread ? poly_last_splat(nt, argc, argv) : -1;
   for (int a = 0; a < argc; a++) {
-    if (nt_kind(nt, argv[a]) == NK_SplatNode && obj_spread && nsv < POLY_OBJ_SPREAD_MAX) {
+    if (nt_kind(nt, argv[a]) == NK_SplatNode && spread) {
       int ex = nt_ref(nt, argv[a], "expression");
       if (ex >= 0) {
         view_bind_temp(ex, atmp[a]);
-        sviews[nsv++] = view_push(c, ex, TY_POLY_ARRAY);
+        view_push(c, ex, TY_POLY_ARRAY);
       }
       continue;
     }
@@ -8921,8 +9041,10 @@ static int bi_default_probe(Compiler *c, int id, int recv, const char *name, int
        before the splat's operand ran, held in its temp: a splat operand
        that writes what the argument reads (`w(@x, *side)`) does not
        change it (poly_default_arg_held) */
-    if (a < last_splat && nt_kind(nt, argv[a]) != NK_KeywordHashNode) {
-      bind_poly_arg_temp(c, argv[a], atmp_ty[a], atmp[a]);
+    if ((a < last_splat || gathered) && nt_kind(nt, argv[a]) != NK_KeywordHashNode) {
+      if (gathered && atmp_ty[a] == TY_STRBUF)
+        ran_first_bind_read(argv[a], atmp[a]);
+      else bind_poly_arg_temp(c, argv[a], atmp_ty[a], atmp[a]);
       continue;
     }
     /* (a held handle is the argument's value, which a writer arm takes:
@@ -8955,7 +9077,7 @@ static int bi_default_probe(Compiler *c, int id, int recv, const char *name, int
   /* a forwarded `&b` the builtin leaves unused is left out of its arm, whose
      emitters take the call without one (an_builtin_answer asks the same) */
   int dblk = nt_ref(nt, id, "block");
-  int drop_blk = dblk >= 0 && nt_kind(nt, dblk) == NK_BlockArgumentNode && (builtin_read_ignores_block(name) || nil_fwd);
+  int drop_blk = omit_block || (dblk >= 0 && nt_kind(nt, dblk) == NK_BlockArgumentNode && builtin_read_ignores_block(name));
   if (drop_blk) nt_node_set_ref((NodeTable *)nt, id, "block", -1);
   /* Array#at, kept by name where a program class owns it */
   char *sv_nm = NULL;
@@ -8966,8 +9088,7 @@ static int bi_default_probe(Compiler *c, int id, int recv, const char *name, int
   *box_o = pr.box_o;
   view_pop(c, vw);
   view_pop(c, va);
-  while (nsv > 0) view_pop(c, sviews[--nsv]);
-  view_unbind(slot);
+  view_unwind(mark);
   return ok;
 }
 /* Does the re-entered emission of call id land on a method the program
@@ -8991,10 +9112,18 @@ static int emit_poly_builtin_default_at(Compiler *c, int id, int recv, const cha
      (resolve_forwarded_block, and no real proc the inline was handed): the
      call is blockless here, and its builtin answers as one (a Hash's
      each_pair its Enumerator) */
-  int nil_fwd = 0;
+  /* The builtin text method accepts a block and leaves it unused. Its
+     Ruby override has already received the block through the dispatch.
+     So do JSON::ParserError#line and #column, json's attr_readers, which
+     a block call on a rescued exception reaches through this arm when a
+     class of the program's defines the name (exc_user_method_name). */
+  int omit_block = 0;
   { int fb0 = nt_ref(nt, id, "block");
-    nil_fwd = fb0 >= 0 && nt_kind(nt, fb0) == NK_BlockArgumentNode &&
-              resolve_forwarded_block(c, fb0) < 0 && !forwarded_real_proc(fb0, -1); }
+    omit_block = fb0 >= 0 && (is_exception_message(name) ||
+                sp_streq(name, "line") || sp_streq(name, "column") ||
+                (exc_um_reentered(id) && exc_gated_acc_fn(name)) ||
+                (nt_kind(nt, fb0) == NK_BlockArgumentNode &&
+                 resolve_forwarded_block(c, fb0) < 0 && !forwarded_real_proc(fb0, -1))); }
   /* a block call without arguments takes the builtin's arm only for the
      in-place mutators, which answer the receiver (or nil), into a call
      answering a box, or run for its effect alone (a statement's, whose
@@ -9003,14 +9132,15 @@ static int emit_poly_builtin_default_at(Compiler *c, int id, int recv, const cha
      the builtin, and their arm did not build. Every value's methods that
      hand the block the receiver (iter_hands_recv: tap, then) answer it or
      the block's value, the type the analysis records, checked below. */
-  if (nt_ref(nt, id, "block") >= 0 && argc == 0 && !nil_fwd && !iter_hands_recv(name) &&
+  const BuiltinOp *row = cplan_builtin_op_row(c, id, BOP_BOXED_FALLBACK, name, 0, NULL);
+  int gathered = row && (row->flags & BOPF_ARGV);
+  if (nt_ref(nt, id, "block") >= 0 && argc == 0 && !omit_block && !gathered && !iter_hands_recv(name) &&
       !(poly_block_mutator_name(name) && (ret == TY_POLY || comp_value_dropped(c, id))) &&
       !(is_step_call(name) && ret == TY_POLY)) return 0;
   if (g_pd_skip == id || g_n_argov + argc + 1 > MAX_ARG_OVERRIDE) return 0;
   if (argc > 0 && (!atmp || !atmp_ty)) return 0;
-  /* a splat's temp is the flattened list, which no builtin emitter reads
-     as its arguments. The key-list readers below, and the line readers
-     (gets, readline: the boxed IO arm gathers their separator, limit and
+  /* A variadic operand row uses the splat's held list directly. The key-list
+     and line readers (gets, readline: the boxed IO arm gathers separator, limit and
      `chomp:` from the list at run time), spread a splatted operand
      themselves, so their arm spreads it again, as the ordinary call would
      (#7051); that is sound only where reading the operand twice reads the
@@ -9023,7 +9153,7 @@ static int emit_poly_builtin_default_at(Compiler *c, int id, int recv, const cha
     for (int a = 0; a < argc; a++) ns_obj += nt_kind(nt, argv[a]) == NK_SplatNode;
     if (ns_obj > POLY_OBJ_SPREAD_MAX) obj_spread = 0;
   }
-  int splat_ok = poly_splat_keyed(name) || obj_spread;
+  int splat_ok = poly_splat_keyed(name) || obj_spread || gathered;
   for (int a = 0; a < argc; a++) {
     int is_splat = nt_kind(nt, argv[a]) == NK_SplatNode;
     if (is_splat && !splat_ok) return 0;
@@ -9034,8 +9164,8 @@ static int emit_poly_builtin_default_at(Compiler *c, int id, int recv, const cha
     }
     /* (--share-strings: an assignment's right-hand side held as the handle
        its arms store, which the re-entry reads as that handle) */
-    int held_h = argc == 1 && call_is_setter_assign(nt, id) && atmp_ty[a] == TY_STRBUF &&
-                 repr_of(c, argv[a]).as_ty == TY_STRING;
+    int held_h = atmp_ty[a] == TY_STRBUF && (gathered || (argc == 1 && call_is_setter_assign(nt, id) &&
+                                                          repr_of(c, argv[a]).as_ty == TY_STRING));
     /* a line reader handed a splat walks the keywords beside it again
        (`**kw` would run twice), so they count as the splat does */
     int rereads = is_splat || (splat_ok && is_line_read(name) && nt_kind(nt, argv[a]) == NK_KeywordHashNode);
@@ -9044,7 +9174,7 @@ static int emit_poly_builtin_default_at(Compiler *c, int id, int recv, const cha
     /* (a splat into Object's own method reads the list its temp holds:
        bi_default_probe; another argument with a side effect beside it
        would be read again, and declines) */
-    if (is_splat && obj_spread) continue;
+    if (is_splat && (obj_spread || gathered)) continue;
     if (obj_spread && ns_obj > 0 && subtree_has_side_effect(c, argv[a])) return 0;
     /* (one ahead of the last splat is read from its temp, bi_default_probe:
        a temp of another type than the argument is no value it can read) */
@@ -9056,7 +9186,7 @@ static int emit_poly_builtin_default_at(Compiler *c, int id, int recv, const cha
                      !poly_arg_held_oint(c, argv[a], atmp_ty[a]))))
       return 0;
   }
-  TyKind bt = (c->poly_builtin_ty && id < c->node_cap && !g_bi_count_arm && !nil_fwd)
+  TyKind bt = (c->poly_builtin_ty && id < c->node_cap && !g_arm.count_arm && !omit_block)
                 ? c->poly_builtin_ty[id] : TY_UNKNOWN;
   /* `to_s` / `inspect` answer a String on every builtin receiver, with or
      without an argument (Integer#to_s(base)); the analysis types them by the
@@ -9066,7 +9196,7 @@ static int emit_poly_builtin_default_at(Compiler *c, int id, int recv, const cha
   /* respond_to? is every value's: a class overriding it gets an arm, and
      any other value the answer the program would give without the override */
   if (bt == TY_UNKNOWN && argc >= 1 && argc <= 2 && sp_streq(name, "respond_to?")) bt = TY_BOOL;
-  if (bt == TY_UNKNOWN && nil_fwd) {
+  if (bt == TY_UNKNOWN && omit_block) {
     int fb1 = nt_ref(nt, id, "block");
     nt_node_set_ref((NodeTable *)nt, id, "block", -1);
     bt = an_builtin_answer(c, id);
@@ -9116,7 +9246,7 @@ static int emit_poly_builtin_default_at(Compiler *c, int id, int recv, const cha
   Buf *nb = calloc(1, sizeof *nb);
   char *arm_pre = NULL;
   int box_o = 0;
-  int ok = bi_default_probe(c, id, recv, name, argc, argv, atmp, atmp_ty, ret, bt, slot_o, nil_fwd, tv, nb, &arm_pre, &box_o);
+  int ok = bi_default_probe(c, id, recv, name, argc, argv, atmp, atmp_ty, ret, bt, slot_o, omit_block, gathered, tv, nb, &arm_pre, &box_o);
   Buf ib; memset(&ib, 0, sizeof ib);
   if (ok && nb->p) {
     /* a raise token is no value to box: the test below reads it bare */
@@ -9147,8 +9277,11 @@ static int emit_poly_builtin_default_at(Compiler *c, int id, int recv, const cha
       buf_printf(&ib, " : sp_String_new_shared(%s))", nb->p);
     }
     else if (wrap_h && !is_raise) buf_printf(&ib, "SP_STR_HDL(%s)", nb->p);
-    /* a generic entry's arm typed boxed: boxed by the C type it has */
-    else if (g_bi_count_arm && ret == TY_POLY && bt == TY_POLY && !is_raise) buf_printf(&ib, "SP_BI_BOX(%s)", nb->p);
+    /* an arm typed boxed (a generic entry's, or the builtin arm of a send
+       split, whose call joins the top-level def's answer) is boxed by the C
+       type it has (a boxed IO's puts or print already answers nil) */
+    else if ((g_arm.count_arm || g_arm.send_split == id) && ret == TY_POLY && bt == TY_POLY && !is_raise)
+      buf_printf(&ib, "SP_BI_BOX(%s)", nb->p);
     else buf_puts(&ib, nb->p);
   }
   free(nb->p); free(nb);
@@ -9164,7 +9297,7 @@ static int emit_poly_builtin_default_at(Compiler *c, int id, int recv, const cha
       Buf *nb2 = calloc(1, sizeof *nb2);
       char *pre2 = NULL;
       int box2 = 0;
-      int ok2 = bi_default_probe(c, id, recv, name, argc, argv, atmp, atmp_ty, ret, bt, slot_o, nil_fwd, tv,
+      int ok2 = bi_default_probe(c, id, recv, name, argc, argv, atmp, atmp_ty, ret, bt, slot_o, omit_block, gathered, tv,
                                  nb2, &pre2, &box2);
       nt_node_set_ref((NodeTable *)nt, blk, "body", body);
       if (ok2 && nb2->p && !arm_raises_nomethod_for(nb2->p, name)) own_raise = 0;
@@ -9445,9 +9578,6 @@ static int pd_region_temps(const char *r, size_t rn, int line_ok, int **tnum_out
 /* the hoisted function's result type when the dispatch's slot is an sp_oint /
    sp_ofloat (nil out of band): set by the dispatcher around its pd_hoist */
 static const char *g_pd_ret_ctype = NULL;
-/* ...and the temp a String dispatch keeps a user arm's publication in, put
-   back in the return channel as the hoisted switch closes (0: none) */
-static int g_pd_pub_keep = 0;
 static int pd_hoist(Compiler *c, int id, const char *name, Buf *b, size_t from, int tr, TyKind rct,
                     const int *pid, const TyKind *pty, int np) {
   if (pd_disabled() || !b->p || b->len <= from) return 0;
@@ -9475,9 +9605,8 @@ static int pd_hoist(Compiler *c, int id, const char *name, Buf *b, size_t from, 
     for (int a = 0; a < np; a++) if (pid[a] == tnum[k]) canon[k] = a;
     if (canon[k] < 0) canon[k] = next++;
   }
-  int tr_canon = -1, pk_canon = -1;
+  int tr_canon = -1;
   for (int k = 0; k < nt; k++) if (tnum[k] == tr) tr_canon = canon[k];
-  for (int k = 0; k < nt; k++) if (g_pd_pub_keep && tnum[k] == g_pd_pub_keep) pk_canon = canon[k];
   if (tr_canon < 0 || !decide_node(c->nt, id, "pd-hoist", name)) { free(tnum); free(tdecl); free(canon); return 0; }
   Buf body; memset(&body, 0, sizeof body);
   for (size_t i = 0; i < rn; ) {
@@ -9546,7 +9675,6 @@ static int pd_hoist(Compiler *c, int id, const char *name, Buf *b, size_t from, 
     buf_puts(&db, "static ");
     buf_printf(&db, sig.p, pd_fn_name(fn));
     buf_printf(&db, " { %s }", body.p ? body.p : "");
-    if (pk_canon >= 0) buf_printf(&db, " _sp_ret_strbuf = _t%d;", pk_canon);
     buf_printf(&db, " return _t%d; }\n", tr_canon);
     pd_proto[fn] = pb.p; pd_def[fn] = db.p;
   }
@@ -9589,7 +9717,7 @@ static void bi_generic_arity_raise(Compiler *c, const char *name, int rep, int t
    answers (File's rows stand for IO's methods too). */
 #define BI_GENERIC_OWNERS 64
 static void bi_generic_owner_test(const char *cls, const char *name, int tv, Buf *b) {
-  if (sp_streq(cls, "String")) buf_printf(b, "_t%d.tag == SP_TAG_STR || sp_poly_is_strbuf(_t%d)", tv, tv);
+  if (sp_streq(cls, "String")) buf_printf(b, "sp_rbval_is_string(_t%d) || sp_poly_is_strbuf(_t%d)", tv, tv);
   else if (sp_streq(cls, "Integer")) buf_printf(b, "_t%d.tag == SP_TAG_INT || _t%d.tag == SP_TAG_BIGINT", tv, tv);
   else if (sp_streq(cls, "Float")) buf_printf(b, "_t%d.tag == SP_TAG_FLT", tv);
   else if (sp_streq(cls, "Symbol")) buf_printf(b, "_t%d.tag == SP_TAG_SYM", tv);
@@ -9653,11 +9781,11 @@ static int bi_generic_fn(Compiler *c, int id, const char *name) {
     TyKind ety[BI_GENERIC_MAX];
     for (int k = 0; k < BI_GENERIC_MAX; k++) { eatmp[k] = tv; ety[k] = TY_POLY; }
     Buf one; memset(&one, 0, sizeof one);
-    int sv = g_bi_count_arm;
-    g_bi_count_arm = 1;
+    int sv = g_arm.count_arm;
+    g_arm.count_arm = 1;
     int ok = emit_poly_builtin_default_at(c, call, self, name, n, n ? el : NULL, n ? eatmp : NULL,
                                           n ? ety : NULL, TY_POLY, tv, tr, 0, &one);
-    g_bi_count_arm = sv;
+    g_arm.count_arm = sv;
     view_unbind(slot);
     /* an arm that reads anything of the site's function cannot move here */
     int self_contained = 0;
@@ -9812,7 +9940,7 @@ static void emit_poly_route_arg(Compiler *c, int node, TyKind ty, int th, int tn
   if (pre.p) buf_puts(b, pre.p);
   buf_printf(b, "sp_String *_t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d); ", th, val.p ? val.p : "NULL", th);
   emit_ctype(c, ty, b);
-  buf_printf(b, " _t%d = sp_strbuf_read_pub(_t%d); ", tn, th);
+  buf_printf(b, " _t%d = sp_strbuf_read(_t%d); ", tn, th);
   free(pre.p); free(val.p);
 }
 /* The box an `equal?` operand of a boxed receiver is held in
@@ -9842,11 +9970,8 @@ static int emit_poly_arg_temp(Compiler *c, int node, TyKind ty, int boxed, int t
      the handle in the box: it is taken out, not wrapped */
   int poly_src = as_handle && infer_type(c, node) == TY_POLY;
   if (as_handle) buf_puts(&val, poly_src ? "sp_poly_as_strbuf(" : "SP_AS_STRING_HANDLE(");
-  /* (a value whose handle is formed apart from its String,
-     repr_handle_apart, is held as the String, the mark asking for its
-     handle) */
   Repr nr = repr_of(c, node);
-  if (!boxed && ty == TY_STRBUF && nr.strbuf_src == RS_HANDLE && !repr_handle_apart(c, node, nr))
+  if (!boxed && ty == TY_STRBUF && nr.strbuf_src == RS_HANDLE)
     emit_strbuf_handle_of(c, node, &val);
   else if (boxed == 2) emit_identity_operand_box(c, node, &val);
   else if (boxed) emit_boxed(c, node, &val);
@@ -9879,6 +10004,26 @@ static int emit_poly_arg_temp(Compiler *c, int node, TyKind ty, int boxed, int t
 static int poly_identity_operand(Compiler *c, const char *name, int pos_argc, int v, TyKind at) {
   return pos_argc == 1 && at == TY_STRING && is_equal_name(name) &&
          strbuf_arg_carries(c, v);
+}
+
+/* The kind the dispatch's temp holds positional argument v of a call of
+   `name` in: boxed where the value has no concrete C storage (nil, void,
+   unresolved), keeps a handle's identity only boxed (poly_identity_operand;
+   *ident), or is an Integer or a Float that can be nil, which the arm
+   converts; its storage kind otherwise. The argument loop of
+   emit_poly_method_dispatch and the writer gate on both sides
+   (poly_writer_attr_arms: the plan's cpoly_user_arms_n, the emitter) read
+   this one answer: asked the storage's kind on one side and the temp's on
+   the other, the gate took the attr-writer arms for the plan alone, and a
+   subclass whose attr_accessor overrides an inherited writer was left with
+   no arm for an Integer that can be nil. */
+TyKind poly_arg_temp_ty(Compiler *c, const char *name, int pos_argc, int v, int *ident) {
+  TyKind at = cplan_poly_arg_storage(c, v);
+  int id_op = poly_identity_operand(c, name, pos_argc, v, at);
+  if (ident) *ident = id_op;
+  if (at == TY_NIL || at == TY_VOID || at == TY_UNKNOWN || id_op || (oint_kind(at) && node_has_oint_form(c, v)))
+    return TY_POLY;
+  return at;
 }
 
 /* `sp_raise_cls("ArgumentError", msg);` with msg a C string literal: a
@@ -9983,7 +10128,7 @@ static void emit_poly_temp_as(Compiler *c, TyKind pt, const LocalVar *pv, int tm
      an earlier-parameter default's binding supplies its own root. */
   else if (at == TY_STRBUF && pt == TY_STRING) {
     int t = ++g_tmp;
-    buf_printf(g_pre, "const char *_t%d = sp_strbuf_read_pub(%s); ", t, tn);
+    buf_printf(g_pre, "const char *_t%d = sp_strbuf_read(%s); ", t, tn);
     if (root) { emit_gc_root_tmp(c, TY_STRING, t, g_pre); buf_puts(g_pre, " "); }
     buf_printf(pa, "_t%d", t);
   }
@@ -10688,7 +10833,10 @@ int poly_native_arm_fits(Compiler *c, int k, const char *name, int n, const int 
           (aw == TY_FLOAT && atmp_ty[ai] == TY_INT)))
       return -1;
   }
-  *mret = comp_native_ret_ty(c, nmi, k);
+  int keeps = nmet->kind == 0 && (nmet->share & NSH_KEEPS) && nmet->share_csym &&
+              nmet->nargs == 1 && !nmet->rest && n == 1 &&
+              (atmp_ty[0] == TY_STRBUF || atmp_ty[0] == TY_POLY);
+  *mret = keeps ? TY_STRBUF : comp_native_ret_ty(c, nmi, k);
   return nmi;
 }
 
@@ -10704,13 +10852,11 @@ int poly_native_arm_call(Compiler *c, int k, const char *name, int n, const int 
      one, keeps that handle through its handle form; its plain form would
      keep the handle's bytes, which move as the String grows */
   const char *cs = c->classes[nmet->class_id].c_struct, *hs = nmet->share_csym;
-  if (nmet->kind == 0 && (nmet->share & NSH_KEEPS) && hs && nmet->nargs == 1 && !nmet->rest &&
-      n == 1 && (atmp_ty[0] == TY_STRBUF || atmp_ty[0] == TY_POLY)) {
+  if (*mret == TY_STRBUF && (nmet->share & NSH_KEEPS)) {
     int a = atmp[0];
-    if (atmp_ty[0] == TY_STRBUF) buf_printf(cb, "sp_strbuf_read(%s((%s *)_t%d.v.p, _t%d))", hs, cs, tv, a);
-    else buf_printf(cb, "(sp_poly_is_strbuf(_t%d) ? sp_strbuf_read(%s((%s *)_t%d.v.p, (sp_String *)_t%d.v.p)) : "
-                        "%s((%s *)_t%d.v.p, sp_poly_arg_str_chk(_t%d)))", a, hs, cs, tv, a, nmet->csym, cs, tv, a);
-    *mret = TY_STRING;
+    buf_printf(cb, "%s((%s *)_t%d.v.p, ", hs, cs, tv);
+    if (atmp_ty[0] == TY_STRBUF) buf_printf(cb, "_t%d)", a);
+    else buf_printf(cb, "sp_poly_arg_str_handle(_t%d))", a);
     return 1;
   }
   buf_printf(cb, "%s((%s *)_t%d.v.p", nmet->csym, cs, tv);
@@ -10793,11 +10939,10 @@ int emit_poly_native_arm_stmt(Compiler *c, const char *call, TyKind mret, TyKind
       emit_unbox_text(c, is_scalar_ret(ret) ? ret : TY_INT, call, b);
       conv = PC_UNBOX;
     }
+    else if (ret == TY_STRBUF && mret == TY_STRING) buf_printf(b, "SP_STR_HDL(%s)", call);
+    else if (ret == TY_STRING && mret == TY_STRBUF) buf_printf(b, "sp_strbuf_read(%s)", call);
     else if (so) buf_printf(b, "%s(%s)", oint_of(ret), call ? call : "");
     else buf_puts(b, call ? call : "");
-    /* (a binding answering its object's handle publishes it, kept as a
-       user arm's is: g_poly_pub_keep) */
-    if (g_poly_pub_keep) buf_printf(b, "; _t%d = _sp_ret_strbuf", g_poly_pub_keep);
   }
   buf_puts(b, ";");
   return conv;
@@ -10955,13 +11100,8 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
          it for its effect. The slot was an sp_int dummy the arms assigned
          their Strings and pointers into. */
       if (!is_scalar_ret(ret)) ret = TY_POLY;
-      /* (one representation: a String answer of either face is collected in
-         a bytes slot, the arms answering bytes (a user arm's published
-         handle as its view, emit_strbuf_pickup), and taken as the handle
-         once at the end (SP_STR_HDL): a handle keeps its identity, fresh
-         bytes get one) */
-      int one_ret_h = ret == TY_STRBUF;
-      if (one_ret_h) { ret = TY_STRING; g_one_arm_bytes_node = id; }
+      int string_result = repr_call_result_storage(ret) == TY_STRBUF;
+      ret = repr_poly_result_slot(ret);
       /* an OpenStruct member is a boxed value; but when analyze typed the
          call concretely (a user method OR reader/alias resolves the name --
          e.g. alias required? -> attr_reader :required, which
@@ -10982,11 +11122,12 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
       const PolyPlan pform = cplan_poly_arms(c, id);
       unsigned form = pform.flags & ~PPF_SEEN;
       if (g_plan_check) cplan_served("poly-form0");
-      int root_recv = (form & PPF_ROOT) != 0, reads_value = (form & PPF_DEREF) != 0;
+      int root_recv = (form & PPF_ROOT) != 0;
       buf_printf(b, "({ sp_RbVal _t%d = ", tv);
-      if (reads_value) emit_poly_recv_deref(c, recv, name, b); else emit_expr(c, recv, b);
+      emit_expr(c, recv, b);
       buf_puts(b, "; ");
       if (root_recv) buf_printf(b, "SP_GC_ROOT_RBVAL(_t%d); ", tv);
+      int blk_tmp0 = emit_poly_dispatch_block0(c, id, name, b);
       emit_poly_vis_precheck(c, id, tv, b);
       size_t pd_from = b->len;   /* the region pd_hoist may move out of line */
       /* the result slot: an Integer / Float dispatch whose answer can be nil
@@ -11000,12 +11141,11 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
       int pa_frame0 = g_plan_check ? pa_begin(id) : -1;
       int sv_csd0 = g_cls_tag_skip;
       emit_poly_prearms0(c, id, name, &ps, ret, tv, tr, b);
-      int blk_tmp0 = emit_poly_prearms0_blk(c, id, name, &ps, ret, tv, tr, b);
+      emit_poly_prearms0_blk(c, id, name, &ps, ret, tv, tr, blk_tmp0, b);
       /* a genuine String in a slot whose name a user class owns (#4816) */
       emit_poly_str_prearm(c, id, recv, name, 0, NULL, NULL, NULL, ret, tv, tr, b);
       buf_puts(b, "switch (");
-      emit_poly_dispatch_key_top(c, tv, (form & (PPF_KEY_CLS0 | PPF_KEY_CLSV)) != 0, (form & PPF_KEY_PRIM) != 0,
-                                  (form & PPF_KEY_EXC) != 0, name, b);
+      emit_poly_plan_key(c, id, form, tv, name, b);
       buf_puts(b, ") {");
       if (g_plan_check) pa_resume(pa_frame0);
       if (g_plan_check) pa_flags(form);
@@ -11033,9 +11173,10 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
         g_pd_ret_ctype = tr_o ? oint_ctype(ret) : NULL;
         int hoisted0 = pd_hoist(c, id, name, b, pd_from, tr, is_scalar_ret(ret) ? ret : TY_INT, pid0, pty0, blk_tmp0 >= 0 ? 2 : 1);
         g_pd_ret_ctype = NULL;
-        if (hoisted0) buf_printf(b, one_ret_h ? " SP_STR_HDL(_t%d); })" : " _t%d; })", tr);
-        else buf_printf(b, one_ret_h ? " } SP_STR_HDL(_t%d); })" : " } _t%d; })", tr); }
-      if (one_ret_h) g_one_arm_bytes_node = -1;
+        if (!hoisted0) buf_puts(b, " }");
+        if (string_result) buf_printf(b, " %s(_t%d); })", repr_of(c, id).as_ty == TY_STRBUF || repr_native_call_handle(c, id)
+                                    ? "sp_poly_as_strbuf" : "sp_poly_unbox_s", tr);
+        else buf_printf(b, " _t%d; })", tr); }
       return 1;
     }
   }
@@ -11108,13 +11249,8 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
       TyKind ret = rr.as_ty;
       /* a call typed as no value answers boxed (as the zero-argument dispatch) */
       if (!is_scalar_ret(ret)) ret = TY_POLY;
-      /* (one representation: a String answer of either face is collected in
-         a bytes slot, the arms answering bytes (a user arm's published
-         handle as its view, emit_strbuf_pickup), and taken as the handle
-         once at the end (SP_STR_HDL): a handle keeps its identity, fresh
-         bytes get one) */
-      int one_ret_h = ret == TY_STRBUF;
-      if (one_ret_h) { ret = TY_STRING; g_one_arm_bytes_node = id; }
+      int string_result = repr_call_result_storage(ret) == TY_STRBUF;
+      ret = repr_poly_result_slot(ret);
       int tv = ++g_tmp, tr = ++g_tmp;
       /* `x = v` through a writer: the value is v as written, so the arms call
          the writer for effect and the argument's temp is the result (the
@@ -11131,7 +11267,10 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
       /* what runs after an argument temp is made, judged once per call:
          the last positional that is not inert, and the keyword hash */
       int pos_live = poly_last_live(c, argv, pos_argc);
-      int kw_runs = poly_kw_runs(c, kwh);
+      int block = nt_ref(nt, id, "block");
+      int block_pass = block >= 0 && nt_kind(nt, block) == NK_BlockArgumentNode &&
+                       nt_ref(nt, block, "expression") >= 0;
+      int later_runs = block_pass || poly_kw_runs(c, kwh);
       /* Root the receiver temp across the arms, as the zero-arg dispatch does:
          an arm's callee may allocate and collect the otherwise-unreferenced
          receiver out from under itself (#3476). */
@@ -11146,7 +11285,7 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
       /* --share-strings: a setter read as a String, where a writer changes
          the String it is handed (`(o.a = +"ef").size`): the argument's
          handle too, in its htmp, read once the arm ran */
-      int setter_late = is_setter_val && !setter_handle && ret == TY_STRING &&
+      int setter_late = is_setter_val && !setter_handle && rr.as_ty == TY_STRING &&
                         user_assign_handle(c, id) && writers_change_param(c, id);
       for (int a = 0; a < pos_argc; a++) {
         atmp[a] = ++g_tmp;
@@ -11185,9 +11324,9 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
            identity only boxed (poly_identity_operand), and an Integer or a
            Float that can be nil: the arm converts it, a TypeError for nil,
            once the dispatch has found the receiver takes the method. */
-        int ident = poly_identity_operand(c, name, pos_argc, argv[a], at);
-        if (at == TY_NIL || at == TY_VOID || at == TY_UNKNOWN || ident ||
-            (oint_kind(at) && node_has_oint_form(c, argv[a]))) {
+        int ident;
+        TyKind tt = poly_arg_temp_ty(c, name, pos_argc, argv[a], &ident);
+        if (tt == TY_POLY && (at != TY_POLY || ident)) {
           atmp_ty[a] = TY_POLY;
           atmp[a] = emit_poly_arg_temp(c, argv[a], TY_POLY, ident ? 2 : 1, atmp[a], ran, b);
         }
@@ -11202,13 +11341,13 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
           NodeKind ak = nt_kind(nt, argv[a]);
           if ((at == TY_STRING || at == TY_STRBUF) &&
               (ak == NK_LocalVariableReadNode || ak == NK_InstanceVariableReadNode) &&
-              poly_other_arg_runs(c, argv, pos_argc, kwh, a) &&
+              (block_pass || poly_other_arg_runs(c, argv, pos_argc, kwh, a)) &&
               (takes_handle >= 0 ? takes_handle : (takes_handle = poly_name_takes_handle(c, name))) &&
               strbuf_slot_text(c, argv[a], &sref)) {
             htmp[a] = ++g_tmp;
             buf_printf(b, "sp_String *_t%d = SP_STR_HDL(%s); ", htmp[a], sref.p);
             free(sref.p);
-            if (at != TY_STRBUF || (held != 2 && (a < pos_live || kw_runs ||
+            if (at != TY_STRBUF || (held != 2 && (a < pos_live || later_runs ||
                 (arm_runs >= 0 ? arm_runs : (arm_runs = poly_arm_runs_code(c, name, pos_argc, has_splat_arg, kwh)))))) {
               emit_gc_root_tmp(c, TY_STRBUF, htmp[a], b); buf_puts(b, " ");
             }
@@ -11249,7 +11388,7 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
            runs before the callee binds it that could write the variable --
            an argument after it that is not inert (`o.m(s, (s = nil; f))`,
            or an interpolation's #to_s; pos_live), the keyword hash's values,
-           keys and `**` merges (kw_runs), or a default the arm fills in
+           keys and `**` merges, a block pass, or a default the arm fills in
            (poly_arm_runs_code).
            Unrooted, the arm handed the callee a freed object whose slot a
            later allocation had reused. An argument a hoist around the call
@@ -11262,7 +11401,7 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
            collector into freed memory. */
         if (held != 2 && ty_gc_holds_refs(c, atmp_ty[a]) && atmp[a] != htmp[a] && atmp[a] != head_held_temp(c, argv[a]) &&
             !(htmp[a] > 0 && atmp_ty[a] == TY_STRING) &&
-            (!held || a < pos_live || kw_runs ||
+            (!held || a < pos_live || later_runs ||
              (arm_runs >= 0 ? arm_runs : (arm_runs = poly_arm_runs_code(c, name, pos_argc, has_splat_arg, kwh))))) {
           emit_gc_root_tmp_refs(c, atmp_ty[a], atmp[a], b); buf_puts(b, " ");
         }
@@ -11379,6 +11518,7 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
          supplied default, so a receiver whose runtime variant matches no switch
          arm (e.g. an empty `{}` that boxed as PolyPolyHash) still yields the
          default rather than a bare default_value_from_compiler(c, ) (an empty string). */
+      int blk_tmp2 = emit_poly_dispatch_block_n(c, id, name, !has_splat_arg || splat_last, b);
       size_t pd_from = b->len;   /* the region pd_hoist may move out of line */
       /* an Integer / Float answer that can be nil (node_is_oint) is held as
          the oint, as the zero-argument seed does; the arms assign that form */
@@ -11396,7 +11536,7 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
              to box again */
           TyKind dt = atmp_ty[1] == TY_STRBUF ? TY_STRBUF
                     : atmp_ty[1] == TY_POLY ? TY_POLY : repr_of(c, argv[1]).as_ty;
-          if (rr.kind == RK_BOXED) emit_boxed_text(c, dt, dn, b);
+          if (ret == TY_POLY) emit_boxed_text(c, dt, dn, b);
           else if (trn_o && dt == TY_NIL) buf_puts(b, oint_nil(ret));
           else if (trn_o && dt == TY_POLY) buf_printf(b, "%s(%s)", oint_unbox(ret), dn);
           else if (trn_o && !node_is_oint(c, argv[1])) buf_printf(b, "%s(%s)", oint_of(ret), dn);
@@ -11404,20 +11544,6 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
         }
         else buf_puts(b, trn_o ? oint_nil(ret) : is_scalar_ret(ret) ? default_value_from_compiler(c, ret) : "0");
         buf_puts(b, "; ");
-      }
-      /* A String the call's targets publish is picked up from the return
-         channel after the dispatch (repr_call_returns_handle). A builtin
-         arm answers a new String and publishes nothing of its own, but a
-         read of a String argument on the way to it (sp_strbuf_read_pub)
-         left that argument's handle there, and the pickup took the
-         argument for the answer (`text = time.strftime(pattern)` over a
-         Time beside a Date answered the pattern). The channel the dispatch
-         leaves is what a user arm published, kept aside as the arm runs
-         (g_poly_pub_keep), else nothing. */
-      int pub_keep = 0;
-      if (!is_setter_val && ret == TY_STRING && repr_call_returns_handle(c, id)) {
-        pub_keep = ++g_tmp;
-        buf_printf(b, "void *_t%d = NULL; ", pub_keep);
       }
       /* The builtin index/bit-ref arms use the index as a raw sp_int; unbox it
          when the index temp widened to poly (promote mode). */
@@ -11430,7 +11556,7 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
          read them */
       for (int a = 0; a < pos_argc; a++)
         if (htmp[a] > 0 && atmp[a] != htmp[a] && atmp_ty[a] == TY_STRING)
-          buf_printf(b, "_t%d = sp_strbuf_read_pub(_t%d); ", atmp[a], htmp[a]);
+          buf_printf(b, "_t%d = sp_strbuf_read(_t%d); ", atmp[a], htmp[a]);
       PolyTemps ptemps = { argc, pos_argc, argv, atmp, atmp_ty, kwall, kwn, kwels, kwtmp, kwty, ret, tv, tr,
                            idxref, id, 0 };
       int pa_frame = g_plan_check ? pa_begin(id) : -1;
@@ -11438,34 +11564,85 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
          (ran_first_handle): an arm that re-emits it, the synthesized
          writers' default, stores that handle (unbound with kwmark) */
       if (setter_late && htmp[0]) ran_first_bind(argv[0], atmp[0], htmp[0]);
+      /* (ahead of the pre-arms, which end in `else ` before the switch) */
+      /* A writer's name called as a method (`o.send(:x=, v)`, a computed
+         send's arm) where some class defines it: an attr_writer of another
+         class answers too, storing the value it answers with (the method
+         arms answer their own values over it) */
+      char wbase[256];
+      /* (keywords alone, `o.send(:x=, **h)`, hand the writer their Hash) */
+      int wr_kw = argc == 1 && pos_argc == 0 && kwh >= 0;
+      int attr_wr = poly_writer_attr_arms(c, id, name, argc, pos_argc, kwh, splat_a, ret,
+                                          pos_argc == 1 ? poly_arg_temp_ty(c, name, pos_argc, argv[0], NULL) : TY_POLY,
+                                          is_setter_val, wbase, sizeof wbase);
+      int wr_src = attr_wr ? (wr_kw ? ++g_tmp : atmp[0]) : -1;
+      TyKind wr_ty = wr_kw ? TY_POLY : attr_wr ? atmp_ty[0] : TY_UNKNOWN;
+      if (attr_wr && wr_kw) {
+        buf_printf(b, "sp_RbVal _t%d = ", wr_src); emit_kwh_pos_hash(c, &kw, 1, b);
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); ", wr_src);
+      }
+      if (attr_wr) {
+        /* the result is the value: boxed into a boxed result, the value
+           itself where the call is typed as the value's scalar kind, or the
+           boxed temp read into the oint result (an Integer that can be nil) */
+        char an[32]; snprintf(an, sizeof an, "_t%d", wr_src);
+        buf_printf(b, "_t%d = ", tr);
+        if (wr_ty == TY_POLY && ret != TY_POLY && oint_kind(ret)) buf_printf(b, "%s(%s)", oint_unbox(ret), an);
+        else if (wr_ty == TY_POLY || ret != TY_POLY) buf_puts(b, an);
+        else emit_boxed_text(c, wr_ty, an, b);
+        buf_puts(b, "; ");
+      }
       ptemps.kwh_tmp = emit_poly_callable_kwh_decl(c, name, &ps, &ptemps, &kw, b);
       emit_poly_prearms_n(c, name, &ps, &ptemps, b);
       int sv_csd2 = g_cls_tag_skip;
-      int blk_tmp2 = emit_poly_prearms_n_blk(c, id, name, &ps, &ptemps, atmp, atmp_ty, &kw, htmp,
-                                             is_setter_val, splat_a, splat_last, stk, b);
+      emit_poly_prearms_n_blk(c, id, name, &ps, &ptemps, atmp, atmp_ty, &kw, htmp,
+                              is_setter_val, splat_a, splat_last, stk, blk_tmp2, b);
       /* The plan supplies the switch key form. */
       const PolyPlan pform = cplan_poly_arms(c, id);
       unsigned form = pform.flags & ~PPF_SEEN;
       if (g_plan_check) cplan_served("poly-form-n");
       /* a genuine String in a slot whose name a user class owns (#4816) */
       if (kw_pos) emit_poly_str_aset_prearm(c, recv, &ps, &ptemps, b);
-      if (kw_pos && !has_splat_arg)
-        emit_poly_str_prearm(c, id, recv, name, argc, argv, atmp, atmp_ty, ret, tv, tr, b);
+      if (kw_pos && !has_splat_arg && ps.str_arm == CP_STR_BUILTIN) {
+        /* The switch form omits builtin families. Ask for the planned
+           set operation before adding a general String fallback. */
+        const PolyPlan prearms = ps.strsetop_n ? cplan_poly(c, id) : (PolyPlan){0};
+        if (!cplan_poly_has_family(&prearms, PB_STR_SETOP))
+          emit_poly_str_prearm(c, id, recv, name, argc, argv, atmp, atmp_ty, ret, tv, tr, b);
+      }
       buf_puts(b, "switch (");
       /* where this switch starts, so its end can tell whether any arm below
          wrote the `default:` label (see the builtin default at the close) */
       size_t sw_start = b->len;
-      emit_poly_dispatch_key_top(c, tv, (form & (PPF_KEY_CLS0 | PPF_KEY_CLSV)) != 0, (form & PPF_KEY_PRIM) != 0,
-                                  (form & PPF_KEY_EXC) != 0, name, b);
+      emit_poly_plan_key(c, id, form, tv, name, b);
       buf_puts(b, ") {");
       if (g_plan_check) pa_resume(pa_frame);
       if (g_plan_check) pa_flags(form);
       { PolyUserArgs U = { argc, pos_argc, kwh, kwall, kwall_any, kw_pos, has_splat_arg, splat_a, stk,
                            is_setter_val, blk_tmp2, tv, tr, ret, argv, atmp, htmp, atmp_ty, &kw, &pform };
-        int pk = g_poly_pub_keep;
-        g_poly_pub_keep = pub_keep;
+        /* The classes whose writer is an attr writer take the attr arms
+           below: no user arm for them. The plan gave such a class the def
+           an ancestor has (`attr_accessor :logger` in a subclass of a class
+           with `def logger=`), and the switch held its id twice. */
+        unsigned char *skip = NULL;
+        const unsigned char *skip_outer = g_poly_user_arm_skip;   /* (an enclosing dispatch's, put back after) */
+        if (attr_wr) {
+          skip = calloc((size_t)(c->nclasses > 0 ? c->nclasses : 1), 1);
+          if (!skip) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+          for (int k = 0; k < c->nclasses; k++) skip[k] = (unsigned char)boxed_writer_attr_wins(c, k, wbase);
+        }
+        g_poly_user_arm_skip = skip;
         emit_poly_user_arms_n(c, id, name, &U, b);
-        g_poly_pub_keep = pk; }
+        g_poly_user_arm_skip = skip_outer;
+        free(skip);
+      }
+      if (attr_wr) {
+        char an[32], objp[32];
+        snprintf(an, sizeof an, "_t%d", wr_src); snprintf(objp, sizeof objp, "_t%d.v.p", tv);
+        g_writer_arms_attr_only = 1;
+        emit_boxed_writer_arms(c, wbase, name, objp, an, wr_ty, wr_kw ? -1 : argv[0], tv, wr_src, 0, b);
+        g_writer_arms_attr_only = 0;
+      }
       int is_aref = sp_streq(name, "[]") && argc == 1 && splat_a < 0;
       int is_aref2 = sp_streq(name, "[]") && argc == 2 && splat_a < 0;
       /* fetch with a block answers the block for a missing key: the
@@ -11503,21 +11680,17 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
         if (stk >= 0) { pid[n] = stk; pty[n++] = TY_POLY_ARRAY; }
         if (blk_tmp2 >= 0) { pid[n] = blk_tmp2; pty[n++] = TY_PROC; }   /* the block's proc */
         g_pd_ret_ctype = trn_o && !is_setter_val ? oint_ctype(ret) : NULL;
-        g_pd_pub_keep = pub_keep;
         pd_done = pd_hoist(c, id, name, b, pd_from, tr, is_scalar_ret(ret) ? ret : TY_INT, pid, pty, n);
         g_pd_ret_ctype = NULL;
-        g_pd_pub_keep = 0;
         free(pid); free(pty);
       }
       if (!pd_done) buf_puts(b, " }");
-      if (!pd_done && pub_keep) buf_printf(b, " _sp_ret_strbuf = _t%d;", pub_keep);
-      if (kw_pos) emit_poly_str_aset_writeback(c, recv, &ps, &ptemps, b);
       /* A handle the call is typed a String for answers its bytes, as the
          static receiver's setter does: the handle itself put an sp_String *
          where a const char * is read (a safe-navigation nil arm's NULL). */
       Repr svr = repr_of(c, id);
       if (!pd_done && setter_late && htmp[0]) buf_printf(b, " sp_strbuf_read(_t%d); })", htmp[0]);
-      else if (!pd_done && is_setter_val && atmp_ty[0] == TY_STRBUF && ret == TY_STRING &&
+      else if (!pd_done && is_setter_val && atmp_ty[0] == TY_STRBUF && rr.as_ty == TY_STRING &&
           !((svr.demand || (svr.handle && repr_write_share(c, id))))) {
         char sref[32]; snprintf(sref, sizeof sref, "_t%d", atmp[0]);
         buf_puts(b, " ");
@@ -11541,9 +11714,9 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
         emit_boxed_text(c, atmp_ty[0], sref, b);
         buf_puts(b, "; })");
       }
-      else if (one_ret_h && (pd_done || !is_setter_val)) buf_printf(b, " SP_STR_HDL(_t%d); })", tr);
+      else if (string_result && !is_setter_val)
+        buf_printf(b, " %s(_t%d); })", rr.as_ty == TY_STRBUF || repr_native_call_handle(c, id) ? "sp_poly_as_strbuf" : "sp_poly_unbox_s", tr);
       else buf_printf(b, " _t%d; })", pd_done || !is_setter_val ? tr : atmp[0]);
-      if (one_ret_h) g_one_arm_bytes_node = -1;
       free(atmp);
       free(atmp_ty);
       free(htmp);
@@ -11619,7 +11792,7 @@ void native_arg_check(Compiler *c, int id, const char *what, NativeMethod *m,
        could only ever raise, and naming the position beats a run-time
        TypeError the author has to reach first. */
     if (bad && (want == TY_STRING || want == TY_INT) &&
-        obj_conv_method(c, got, want == TY_STRING ? "to_str" : "to_int",
+        obj_conv_method(c, argv[ai], got, want == TY_STRING ? "to_str" : "to_int",
                         want, NULL) >= 0) bad = 0;
     if (!bad) continue;
     char msg[256];
@@ -11744,7 +11917,7 @@ int emit_native_ctor(Compiler *c, int id, int ci, int argc, const int *argv, Buf
 }
 
 /* Positional-arity bounds initialize initm accepts (the one a `new` runs,
-   cplan_new_initialize), for the `.new` arity check. Returns 1 and fills
+   cplan_hook_target), for the `.new` arity check. Returns 1 and fills
    [*pmin,*pmax] only when the arity is a fixed positional window we can
    enforce: no `initialize` (initm -1: Object#initialize, arity 0), or an
    `initialize` with only required/optional positionals. Returns 0 --
@@ -11893,9 +12066,9 @@ int emit_time_civil_ctor(Compiler *c, int id, int is_utc, int is_new, Buf *b) {
      other value read as the year */
   if (is_new && argc == 1 && nt_kind(nt, argv[0]) != NK_SplatNode && repr_of(c, argv[0]).kind == RK_BOXED) {
     int tv = ++g_tmp;
-    buf_printf(b, "({ sp_RbVal _t%d = sp_poly_strbuf_deref(", tv);
+    buf_printf(b, "({ sp_RbVal _t%d = ", tv);
     emit_boxed(c, argv[0], b);
-    buf_printf(b, "); _t%d.tag == SP_TAG_STR ? sp_time_parse(_t%d.v.s) : sp_time_new(sp_poly_time_field(_t%d, 0), 1, 1, 0, 0, 0); })", tv, tv, tv);
+    buf_printf(b, "; sp_rbval_is_string(_t%d) ? sp_time_parse(sp_rbval_string_bytes(_t%d)) : sp_time_new(sp_poly_time_field(_t%d, 0), 1, 1, 0, 0, 0); })", tv, tv, tv);
     return 1;
   }
   /* a splat leaves the count, and so the form, to run time */
@@ -12056,7 +12229,8 @@ static int emit_new_arity_check(Compiler *c, int initm, int argc,
 /* Does this initialize's parameter `idx` default to an expression that reads
    the object being constructed -- self, an ivar, or an implicit-self call the
    class answers? Such a default cannot be emitted at the call site: there is no
-   instance there yet. */
+   instance there yet. (A reader asks the plan with no site: the default runs at
+   every construction, the ones after an attr_reader of the name has run too.) */
 static int ctor_default_reads_self(Compiler *c, Scope *m, int node, int depth) {
   if (node < 0 || depth > 60) return 0;
   const NodeTable *nt = c->nt;
@@ -12067,7 +12241,7 @@ static int ctor_default_reads_self(Compiler *c, Scope *m, int node, int depth) {
   if (k == NK_CallNode && nt_ref(nt, node, "receiver") < 0 && m->class_id >= 0) {
     const char *cn = nt_str(nt, node, "name");
     if (cn && (call_target(c, node, m->class_id, cn, 0, NULL) >= 0 ||
-               comp_reader_in_chain(c, m->class_id, cn, NULL) ||
+               call_attr_target(c, -1, m->class_id, cn, CT_ATTR, NULL) ||
                builtin_instance_method_known(c->classes[m->class_id].name, cn))) return 1;
   }
   const SpNode *nd = &nt->nodes[node];
@@ -12500,7 +12674,9 @@ void emit_reopen_self_arg(Compiler *c, int id, int mi, Buf *b) {
   Scope *s = comp_scope_of(c, id);
   int from = s && repr_self_handle(c, (int)(s - c->scopes));
   int to = repr_self_handle(c, mi);
-  if (from && !to) buf_printf(b, "sp_strbuf_read_pub(%s)", g_self);
+  if (from && !to) buf_printf(b, "sp_strbuf_read(%s)", g_self);
+  else if (to && !from && s && repr_self_string_object(c, s->idx))
+    buf_printf(b, "(sp_String *)(%s)", g_self);
   else if (to && !from) buf_printf(b, "SP_STR_HDL(%s)", g_self);
   else buf_puts(b, g_self);
 }
@@ -12627,6 +12803,18 @@ int ctor_arm_incompat(Compiler *c, Scope *is, const ArgLayout *L, const int *arg
        the extra arms admitted by the sharing representation. */
     if (((ptc == TY_STRBUF && atc == TY_STRING) ||
                             (ptc == TY_STRING && atc == TY_STRBUF))) continue;
+    /* A nil fits a parameter whose slot holds a nil of its own: an Integer
+       or Float the nil marking made an oint (RK_OPT; emit_ctor_arm_param
+       unboxes the box with its nil), a String, Array or Hash whose NULL is
+       its nil (RK_PTR, RK_STRBUF), or an object the marking made nilable
+       (obj_nilable: the calls on it test for nil; an unmarked one's
+       methods would run on NULL). `self.new(nil)` in a class method and
+       `self.class.new(nil, ...)` with subclasses dispatch here, and the
+       class lost its arm to the NoMethodError default. */
+    if (atc == TY_NIL && cp) {
+      ReprKind pk = repr_of_slot(c, cp).kind;
+      if (pk == RK_OPT || pk == RK_STRBUF || (pk == RK_PTR && (!ty_is_object(ptc) || cp->obj_nilable))) continue;
+    }
     if (ptc != TY_POLY && ptc != TY_UNKNOWN && atc != TY_POLY && atc != TY_UNKNOWN && ptc != atc)
       return 1;
   }
@@ -12679,7 +12867,7 @@ static void ctor_init_call(Compiler *c, int cid, int initm, int t, const char *a
    the method table's; a `new` the plan answers another version for
    allocates the object and runs that one (emit_ctor_alloc_init) */
 int ctor_new_runs(Compiler *c, int cid, int initm) {
-  return initm == cplan_new_initialize(c, -1, cid, NULL);
+  return initm == cplan_hook_target(c, -1, cid, "initialize", NULL);
 }
 
 /* The `case` of a `k.new(...)` dispatch arm for class `ci`: construct with
@@ -12848,23 +13036,14 @@ int ctor_needs_self_defaults_argv(Compiler *c, int initm, const int *argv, int a
   return ctor_needs_self_defaults(c, initm, nt_argv_has_splat(c->nt, argv, argc) ? 0 : pos_argc);
 }
 
-/* Does any class define `name` as a class method? A boxed Class or Module
-   reaches that method through the general dispatch, so an IO name only the
-   poly-IO arm answers must not claim the call. */
-int class_method_named(Compiler *c, const char *name) {
-  for (int k = 0; k < c->nclasses; k++)
-    if (comp_cmethod_in_chain(c, k, name, NULL) >= 0) return 1;
-  return 0;
-}
-
 /* Does any class have an attribute writer for `name` (`pos=` from
    `attr_accessor :pos`, a Struct member)? Writers are kept under the base
    name, which the arm's method and reader test does not ask. */
-int attr_writer_named(Compiler *c, int cls, const char *name) {
+int attr_writer_named(Compiler *c, int id, int cls, const char *name) {
   char base[256];
   if (!setter_base_name(name, base, sizeof base)) return 0;
   for (int k = 0; k < c->nclasses; k++)
-    if ((cls < 0 || k == cls) && comp_writer_in_chain(c, k, base, NULL)) return 1;
+    if ((cls < 0 || k == cls) && call_attr_target(c, id, k, base, CT_ATTR | CT_WRITER, NULL)) return 1;
   return 0;
 }
 
@@ -13416,7 +13595,7 @@ void emit_ctor_block_slot(Compiler *c, int id, int initm, const char *lead, Buf 
    or is not the site's (an arm no value reaches) */
 int emit_ctor_splice_arm(Compiler *c, int id, int ci, int rt2, Buf *b) {
   int initm = cplan_new_arm_initialize(c, id, ci);
-  if (initm < 0 || initm != cplan_new_initialize(c, id, ci, NULL) || !c->scopes[initm].yields || c->classes[ci].is_struct ||
+  if (initm < 0 || initm != cplan_hook_target(c, id, ci, "initialize", NULL) || !c->scopes[initm].yields || c->classes[ci].is_struct ||
       comp_class_is_module(c, &c->classes[ci])) return 0;
   /* a proc known only at run time (`k.new(x, &pr)`, the `&` a `...`
      forward passes) goes to the initialize's proc form, as at a static site */
@@ -13582,8 +13761,10 @@ void ctor_arity_emit(CtorArityArms *g, Buf *b) {
    are laid out from the call's own argument list (keywords, a splat). */
 int emit_user_new_arm(Compiler *c, int id, int ci, int argc, const int *atmp,
                              int hoisted, int rt2, Buf *b) {
-  int kmi = comp_cmethod_in_chain(c, ci, "new", NULL);
-  if (kmi < 0 || call_target(c, id, ci, "new", CT_CMETHOD, NULL) < 0) return 0;
+  int kmi = cplan_user_new(c, id, ci);
+  if (kmi < 0) return 0;
+  /* (a class the call cannot reach has no arm of its own `new`) */
+  if (cls_fact_excludes_class_value(c, nt_ref(c->nt, id, "receiver"), ci) || !dynamic_new_may_reach(c, id, ci)) return 1;
   Scope *ks = &c->scopes[kmi];
   if (!scope_has_callable_symbol(c, kmi)) return 1;   /* no symbol: the default raises */
   /* A `self.new` that YIELDS has no proc parameter to hand the block to --
@@ -13749,12 +13930,8 @@ static void emit_builtin_new_arms_text(Compiler *c, const char *pre, const char 
     for (int ci = 0; ci < c->nclasses; ci++)
       if (is_builtin_reopen(c->classes[ci].name) && sp_streq(c->classes[ci].name, bnew[k].name))
         buf_printf(b, "case %d: ", ci);
-    if (bnew[k].kind == 'S')
-      buf_printf(b, "{ %s_t%d = (%s == 0 ? sp_box_str(sp_str_empty_binary()) : sp_builtin_class_new('S', %s, %s, %s)); } break; ",
-                 pre, rt2, argc_txt, argc_txt, argv_txt, blk);
-    else
-      buf_printf(b, "{ %s_t%d = sp_builtin_class_new('%c', %s, %s, %s); } break; ",
-                 pre, rt2, bnew[k].kind, argc_txt, argv_txt, blk);
+    buf_printf(b, "{ %s_t%d = sp_builtin_class_new('%c', %s, %s, %s); } break; ",
+               pre, rt2, bnew[k].kind, argc_txt, argv_txt, blk);
   }
   if (boxed)
     buf_printf(b, "default: { %s_t%d = sp_class_value_new_fallback(_t%d, _t%d.tag == SP_TAG_CLASS ? "
@@ -13805,7 +13982,7 @@ static int exc_sub_new_arm_text(Compiler *c, int id, int ci, int argc, const cha
     buf_printf(b, "case %d: { %ssp_dyn_new_arity(%s, 1); const char *_m = ", ci, pre, argc_txt);
     if (argc != 0)
       buf_printf(b, "%s.tag == SP_TAG_NIL ? (&(\"\\xff\")[1]) : sp_exc_msg_given("
-                    "%s.tag == SP_TAG_STR ? %s.v.s : sp_poly_to_s(%s)); ", a0, a0, a0, a0);
+                    "sp_rbval_is_string(%s) ? sp_rbval_string_bytes(%s) : sp_poly_to_s(%s)); ", a0, a0, a0, a0);
     else buf_puts(b, "(&(\"\\xff\")[1]); ");
   }
   if (comp_inst_ivar_count(&c->classes[ci]) > 0)
@@ -13842,7 +14019,7 @@ int emit_exc_sub_new_arm_splat(Compiler *c, int id, int ci, int tsa, const char 
    as the constant form is: a user exception class with an initialize of its
    own is constructed through it, so its `super("...")` sets the message. The
    runtime helper, which only has the class name, takes every other value. */
-void emit_raise_class_value(Compiler *c, int kn, int mn, Buf *b) {
+void emit_raise_class_value(Compiler *c, int id, int kn, int mn, Buf *b) {
   int argc = mn >= 0 ? 1 : 0;
   int kt = ++g_tmp, mt = ++g_tmp, rt = ++g_tmp;
   buf_puts(b, "({ "); kt = hold_operand(c, kn, TY_POLY, 1, kt, 1, " ", b);
@@ -13855,7 +14032,7 @@ void emit_raise_class_value(Compiler *c, int kn, int mn, Buf *b) {
   for (int ci = 0; ci < c->nclasses; ci++) {
     if (is_builtin_reopen(c->classes[ci].name) || c->classes[ci].is_native_class) continue;
     if (!class_is_exc_subclass(c, ci) || !class_has_ctor(&c->classes[ci])) continue;
-    int initm = comp_method_in_chain(c, ci, "initialize", NULL);
+    int initm = cplan_new_arm_initialize(c, id, ci);
     if (initm < 0 || !c->scopes[initm].reachable) continue;
     Scope *is = &c->scopes[initm];
     char am[256];
@@ -13884,11 +14061,11 @@ void emit_raise_class_value(Compiler *c, int kn, int mn, Buf *b) {
     free(pdpre.p); free(ab.p);
   }
   ctor_arity_emit(&aerr, b);
-  buf_printf(b, "default: break; } if (_t%d.tag == SP_TAG_OBJ) sp_raise_exc((sp_Exception *)_t%d.v.p); ",
-             rt, rt);
+  buf_printf(b, "default: break; } if (_t%d.tag == SP_TAG_OBJ) %s(sp_Exception *)_t%d.v.p); ",
+             rt, raise_fn("sp_raise_exc"), rt);
   /* (a String message is kept as its handle, sp_raise_poly_msg_h) */
-  if (mn >= 0) buf_printf(b, "sp_raise_poly_msg_h(_t%d, _t%d); })", kt, mt);
-  else buf_printf(b, "sp_raise_poly(_t%d); })", kt);
+  if (mn >= 0) buf_printf(b, "%s_t%d, _t%d); })", raise_fn("sp_raise_poly_msg_h"), kt, mt);
+  else buf_printf(b, "%s_t%d); })", raise_fn("sp_raise_poly"), kt);
 }
 
 /* The same, for arguments hoisted into the boxed temps `atmp`. */
@@ -14037,7 +14214,7 @@ void emit_class_value_new_kw(Compiler *c, int id, int recv, int boxed, Buf *b) {
     }
     /* a class below KeyError and its like reads the keywords itself */
     if (initm < 0 && class_takes_exc_attrs(c, ci)) {
-      if (comp_cmethod_in_chain(c, ci, "new", NULL) >= 0) continue;
+      if (cplan_user_new(c, id, ci) >= 0) continue;
       Buf val; memset(&val, 0, sizeof val);
       Buf apre; memset(&apre, 0, sizeof apre);
       Buf *sv_pre = g_pre; g_pre = &apre;
@@ -14072,7 +14249,7 @@ void emit_class_value_new_kw(Compiler *c, int id, int recv, int boxed, Buf *b) {
       if ((spl >= 0 ? !splat_operand_ok(c, spl)
                     : !plain || argc == 0 || !dynamic_new_may_reach(c, id, ci) ||
                       !ctor_arity_error(c, ci, -1, exc ? 2 : 1, am, sizeof am)) ||
-          comp_class_is_module(c, &c->classes[ci]) || comp_cmethod_in_chain(c, ci, "new", NULL) >= 0) continue;
+          comp_class_is_module(c, &c->classes[ci]) || cplan_user_new(c, id, ci) >= 0) continue;
       /* an exception class takes the array's first element as its message,
          as Exception#initialize(msg = nil) does; a non-empty `**h` after the
          positionals is one more, a Hash (one spread only, and no literal
@@ -14371,9 +14548,11 @@ static void emit_super_new_forward(Compiler *c, int id, int ci, Scope *s,
 static void emit_super_new_ctor(Compiler *c, int id, int ci, Buf *b) {
   const NodeTable *nt = c->nt;
   ClassInfo *k = &c->classes[ci];
-  if (k->is_struct || k->is_native_class || class_is_exc_subclass(c, ci))
+  /* (a reopened builtin exception has no struct of its own: its `self.new`
+     typed an `sp_NoMethodError` the C side never declared, K-056) */
+  if (k->is_struct || k->is_native_class || class_is_exc_subclass(c, ci) || class_is_exc_reopen(c, ci))
     unsupported(c, id, "super in `self.new` of a Struct, Data, exception or native class");
-  int initm = comp_method_in_chain(c, ci, "initialize", NULL);
+  int initm = cplan_hook_target(c, -1, ci, "initialize", NULL);
   int argsn = nt_ref(nt, id, "arguments");
   int argc = 0; if (argsn >= 0) nt_arr(nt, argsn, "arguments", &argc);
   if (nt_kind(nt, id) == NK_ForwardingSuperNode) {
@@ -14558,11 +14737,7 @@ static int emit_struct_member_temp(Compiler *c, ClassInfo *cls, int a, int vnode
   emit_ctype(c, mt, g_pre);
   buf_printf(g_pre, " _t%d = %s;", t, lv.p ? lv.p : default_value_from_compiler(c, mt));
   if (mt == TY_POLY) buf_printf(g_pre, " SP_GC_ROOT_RBVAL(_t%d);", t);
-  else if (mt == TY_STR_RANGE) {   /* two GC strings by value, as a String range local */
-    buf_printf(g_pre, " SP_GC_ROOT_STR(_t%d.first); SP_GC_ROOT_STR(_t%d.last);", t, t);
-    char ref[32]; snprintf(ref, sizeof ref, "_t%d", t);
-    emit_srange_handle_roots(c, ref, g_pre);
-  }
+  else if (mt == TY_STR_RANGE) buf_printf(g_pre, " SP_GC_ROOT_SRANGE(_t%d);", t);
   else if (comp_ty_value_obj(c, mt)) { buf_puts(g_pre, " "); emit_gc_root_tmp_refs(c, mt, t, g_pre); }
   else if (needs_root(mt)) buf_printf(g_pre, " SP_GC_ROOT(_t%d);", t);
   buf_puts(g_pre, "\n");
@@ -15027,7 +15202,7 @@ static int emit_struct_new_call_members(Compiler *c, int id, int ci, int argc, c
 int emit_struct_new_call(Compiler *c, int id, int ci, int argc, const int *argv, Buf *b) {
   const NodeTable *nt = c->nt;
   ClassInfo *cls = &c->classes[ci];
-  int scust = cplan_new_initialize(c, id, ci, NULL);
+  int scust = cplan_hook_target(c, id, ci, "initialize", NULL);
   if (scust >= 0 && c->scopes[scust].reachable) return emit_struct_new_call_members(c, id, ci, argc, argv, b);
   int kwh = (argc == 1 && nt_kind(nt, argv[0]) == NK_KeywordHashNode && cls->kw_init != -1) ? argv[0] : -1;
   int ok_plain = 1;
@@ -15150,7 +15325,7 @@ static int emit_struct_new_call_members(Compiler *c, int id, int ci, int argc, c
     /* A struct with a custom `initialize` override delegates to it: the
        .new args are that initialize's params (not one-per-member), so call
        the constructor with the args filled to its signature. */
-    int scust = cplan_new_initialize(c, id, ci, NULL);
+    int scust = cplan_hook_target(c, id, ci, "initialize", NULL);
     if (scust >= 0 && c->scopes[scust].reachable && c->scopes[scust].yields) {
       /* a yielding custom initialize (yield / block_given? / a called &blk)
          runs its body inlined at the .new site -- the body drives the block
@@ -15419,11 +15594,92 @@ static int array_new_block_needs_fresh_locals(Compiler *c, int blk) {
 
 /* The reopening of builtin exception class ci (`class KeyError; def
    initialize(msg = "no key") super("wrapped: " + msg) end`) defining its
-   own initialize: the index of that method, or -1. */
-int exc_reopen_initialize(Compiler *c, int ci) {
+   own initialize that call id runs: the index of that method, or -1. */
+int exc_reopen_initialize(Compiler *c, int id, int ci) {
   if (!class_is_exc_reopen(c, ci)) return -1;
-  int mi = comp_method_in_chain(c, ci, "initialize", NULL);
+  int mi = cplan_hook_target(c, id, ci, "initialize", NULL);
   return (mi >= 0 && c->scopes[mi].class_id == ci && c->scopes[mi].reachable) ? mi : -1;
+}
+
+/* The initialize a program's reopening gives an exception built as the
+   builtin class named cn: its own reopening's, else the nearest one above it
+   (ArgumentError.new under a reopened StandardError#initialize), or -1. */
+int exc_builtin_reopen_initialize(Compiler *c, int id, const char *cn, int argc, const int *argv) {
+  int rci = comp_builtin_class_named(c, cn);
+  int rim = rci >= 0 ? exc_reopen_initialize(c, id, rci) : -1;
+  if (rim >= 0) return rim;
+  /* the SystemCallError family builds its errno message first and runs the
+     reopening above on that (syserr_reinit_initialize) */
+  if (is_syserr_family_name(cn)) return -1;
+  /* The reopening above gets the arguments as its own initialize takes them,
+     which is the message alone. A class whose own initialize takes more
+     (NameError's name, KeyError's key: and receiver:, SystemExit's status)
+     reads them natively and then calls super with the message: with more than
+     a message, or a splat or keywords, the native arms keep the call and the
+     reopening is left out, as before it was looked for. */
+  const NodeTable *nt = c->nt;
+  if (argc > 1 || exc_init_takes_own_args(cn)) return -1;
+  for (int i = 0; i < argc; i++) {
+    NodeKind k = nt_kind(nt, argv[i]);
+    if (k == NK_KeywordHashNode || k == NK_SplatNode) return -1;
+  }
+  int mi = exc_reopen_initialize_above(c, cn, 0, -1);
+  /* a yielding initialize has no function of its own: emit_exc_reopen_construct_as
+     calls its proc-form clone. One without a clone would name a function that
+     is not emitted: such a call keeps the native construction, as before the
+     reopening was looked for */
+  return mi >= 0 && (!c->scopes[mi].yields || scope_proc_form_of(c, mi) >= 0) ? mi : -1;
+}
+
+/* See codegen_call_arms.h. A reopening of the class itself or of a class of the
+   SystemCallError family (SystemCallError, Errno::*) reads the arguments as the
+   call wrote them, so those keep their construction as before (-1). */
+int syserr_reinit_initialize(Compiler *c, int id, const char *cn) {
+  if (!cn || !is_syserr_family_name(cn)) return -1;
+  int rci = comp_builtin_class_named(c, cn);
+  if (rci >= 0 && exc_reopen_initialize(c, id, rci) >= 0) return -1;
+  int mi = exc_reopen_initialize_above(c, cn, 0, -1);
+  if (mi < 0) return -1;
+  int oc = c->scopes[mi].class_id;
+  if (oc < 0 || is_syserr_family_name(c->classes[oc].name)) return -1;
+  /* the version this call runs, as a program's own `.new` does */
+  int sv = cplan_hook_target(c, id, oc, "initialize", NULL);
+  if (sv >= 0 && c->scopes[sv].class_id == oc && c->scopes[sv].reachable) mi = sv;
+  if (c->scopes[mi].yields) {
+    int pf = scope_proc_form_of(c, mi);
+    if (pf < 0) return -1;
+    mi = pf;
+  }
+  Buf probe = {0};
+  int ok = emit_reinit_init_text(c, mi, "_p", "_m", &probe);
+  free(probe.p);
+  return ok ? mi : -1;
+}
+void syserr_reinit_open(int *t, Buf *b) {
+  *t = ++g_tmp;
+  buf_printf(b, "({ sp_Exception *_t%d = (sp_Exception *)(", *t);
+}
+void syserr_reinit_close(Compiler *c, int initm, int t, Buf *b) {
+  char self[32], msg[32];
+  snprintf(self, sizeof self, "_t%d", t);
+  snprintf(msg, sizeof msg, "_m%d", t);
+  Buf arm = {0};
+  emit_reinit_init_text(c, initm, self, msg, &arm);
+  /* the runtime built the errno message: it is the one argument, and the
+     initialize's super sets the one the exception keeps */
+  buf_printf(b, "); SP_GC_ROOT(_t%d); const char *_m%d = sp_msg_heapify(sp_exc_message(_t%d)); SP_GC_ROOT_STR(_m%d); "
+                "_t%d->msg_h = NULL; _t%d->msg = NULL;%s _t%d; })",
+             t, t, t, t, t, t, arm.p ? arm.p : "", t);
+  free(arm.p);
+}
+
+/* emit_syserr_family_new, then a reopening above SystemCallError run on the message it built */
+int emit_syserr_family_new_reopened(Compiler *c, int id, const char *cn, int argc, const int *argv, Buf *b) {
+  int sri = syserr_reinit_initialize(c, id, cn), srt = 0;
+  if (sri >= 0) syserr_reinit_open(&srt, b);
+  if (!emit_syserr_family_new(c, id, cn, argc, argv, b)) return 0;
+  if (sri >= 0) syserr_reinit_close(c, sri, srt, b);
+  return 1;
 }
 
 /* Build the runtime's exception of the reopened class ci and run the
@@ -15439,11 +15695,20 @@ int exc_reopen_initialize(Compiler *c, int ci) {
    the first slot with the message and the rest with their defaults ran
    the body with the message in the wrong slot, or with a required
    parameter it was never given.
-   An explicit `cause:` the raise staged (sp_explicit_cause) is held aside
-   while the initialize runs: a raise the initialize rescues would take
-   that cause as its own and clear it, and the exception raised after it
-   would have none. */
+   An explicit `cause:` is not staged while the initialize runs: the
+   raise's own call stages it once the exception is built (raise_fn). */
 void emit_exc_reopen_construct(Compiler *c, int ci, int initm, int args, int msg_node, Buf *b) {
+  emit_exc_reopen_construct_as(c, c->classes[ci].name, initm, args, msg_node, -1, b);
+}
+/* The same for the builtin exception class named cname, whose initialize is
+   the one of a reopening above it (cname's own reopening, or a builtin's it
+   descends from: ArgumentError.new under a reopened StandardError#initialize). */
+void emit_exc_reopen_construct_as(Compiler *c, const char *cname, int initm, int args, int msg_node, int call_id, Buf *b) {
+  /* a yielding initialize has no function of its own: its proc-form clone
+     runs it, on the call's block or on none (the same choice ctor_alloc_init
+     makes for a program's exception class) */
+  int pf = c->scopes[initm].yields ? scope_proc_form_of(c, initm) : -1;
+  if (pf >= 0) initm = pf;
   Scope *im = &c->scopes[initm];
   int lo, hi, argc = msg_node >= 0;
   if (args < 0 && class_new_pos_arity(c, initm, &lo, &hi) && (argc < lo || argc > hi)) {
@@ -15454,15 +15719,36 @@ void emit_exc_reopen_construct(Compiler *c, int ci, int initm, int args, int msg
     buf_printf(b, "sp_raise_cls(\"ArgumentError\", \"%s\"); (sp_Exception *)0; })", am);
     return;
   }
-  int te = ++g_tmp, tc = ++g_tmp, ts = ++g_tmp;
-  buf_printf(b, "({ sp_Exception *_t%d = sp_exc_new(\"%s\", (&(\"\\xff\")[1])); SP_GC_ROOT(_t%d); ", te, c->classes[ci].name, te);
-  buf_printf(b, "void *_t%d = sp_explicit_cause; int _t%d = sp_explicit_cause_set; SP_GC_ROOT(_t%d); "
-                "sp_explicit_cause = NULL; sp_explicit_cause_set = 0; ", tc, ts, tc);
-  buf_printf(b, "%s(_t%d", mc_method(c, im), te);
-  if (args >= 0) emit_args_filled(c, initm, args, ", ", b);
-  else emit_args_filled_argv(c, initm, argc ? &msg_node : NULL, argc, -1, ", ", b);
-  if (ctor_init_takes_block(c, initm)) buf_puts(b, ", NULL");
-  buf_printf(b, "); sp_explicit_cause = _t%d; sp_explicit_cause_set = _t%d; _t%d; })", tc, ts, te);
+  int te = ++g_tmp;
+  buf_printf(b, "({ sp_Exception *_t%d = sp_exc_new(\"%s\", (&(\"\\xff\")[1])); SP_GC_ROOT(_t%d); ", te, cname, te);
+  /* sp_exc_new marks a receiver and a key as recorded: the native arms clear
+     them, so `.key` / `.receiver` raise until an initialize records one */
+  if (sp_streq(cname, "KeyError") || sp_streq(cname, "NameError") || sp_streq(cname, "NoMethodError") ||
+      sp_streq(cname, "FrozenError"))
+    buf_printf(b, "_t%d->has_recv = 0; ", te);
+  if (sp_streq(cname, "KeyError")) buf_printf(b, "_t%d->has_key = 0; ", te);
+  /* a default that reads `self` (`msg = self.class.name`) reads the exception
+     being built, not the caller's self; a statement it has to hoist goes inside
+     this statement expression, as ctor_alloc_init puts it, since the enclosing
+     prelude runs before the exception exists */
+  char selfb[32];
+  snprintf(selfb, sizeof selfb, "_t%d", te);
+  const char *sv_cs = g_ctor_self, *sv_csd = g_ctor_self_deref;
+  g_ctor_self = selfb; g_ctor_self_deref = "->";
+  Buf apre, abuf;
+  memset(&apre, 0, sizeof apre); memset(&abuf, 0, sizeof abuf);
+  Buf *sv_pre = g_pre; int sv_ind = g_indent;
+  g_pre = &apre; g_indent = 0;
+  if (args >= 0) emit_args_filled(c, initm, args, ", ", &abuf);
+  else emit_args_filled_argv(c, initm, argc ? &msg_node : NULL, argc, -1, ", ", &abuf);
+  /* the call's own block goes to the initialize's `&blk`; a raise form has none */
+  if (call_id >= 0) emit_ctor_block_slot(c, call_id, initm, ", ", &abuf);
+  else if (ctor_init_takes_block(c, initm)) buf_puts(&abuf, ", NULL");
+  g_pre = sv_pre; g_indent = sv_ind;
+  g_ctor_self = sv_cs; g_ctor_self_deref = sv_csd;
+  if (apre.p) buf_puts(b, apre.p);
+  buf_printf(b, "%s(_t%d%s); _t%d; })", mc_method(c, im), te, abuf.p ? abuf.p : "", te);
+  free(apre.p); free(abuf.p);
 }
 
 /* Klass.try_convert(x) on a boxed x: whether x already is one of the
@@ -15476,51 +15762,6 @@ static int try_convert_arysub(Compiler *c, int arg, int emb, Buf *b) {
   TyKind at = comp_ntype(c, arg);
   if (comp_ty_ary_root(c, at) < 0 || comp_arysub_emb(c, ty_object_class(at)) != emb) return 0;
   emit_boxed(c, arg, b);
-  return 1;
-}
-
-/* String.try_convert(x) on an object typed x: CRuby's rb_check_string_type
-   calls x's #to_str (private or not) and checks its answer. nil and a String
-   are the answer; any other answer is a TypeError naming the class and what
-   it gave (sp_str_cmp_conv). The conversion bridge carries only a #to_str
-   typed String, so a #to_str of another type (an Integer) answered nil.
-   0 leaves the call to the bridge. */
-static int emit_try_convert_obj_to_str(Compiler *c, int arg, TyKind at, Buf *b) {
-  int cid = ty_object_class(at), def = -1;
-  if (cid < 0 || cid >= c->nclasses || c->classes[cid].is_native_class) return 0;
-  int mi = comp_method_in_chain(c, cid, "to_str", &def);
-  if (mi >= 0 && comp_is_undeffed_in_chain(c, cid, "to_str")) return 0;
-  if (mi < 0) return 0;
-  Scope *m = &c->scopes[mi];
-  /* a String #to_str is the bridge's (sp_poly_check_str); an alias or a
-     #to_str with parameters keeps the old path (class_has_to_str_shape). A
-     poly one is called here too: the bridge answered nil for its Integer */
-  if (m->ret == TY_STRING || !sp_streq(m->name, "to_str") ||
-      m->nparams != 0 || m->rest_idx >= 0 || m->kwrest_idx >= 0 || m->blk_param || m->yields ||
-      m->is_cmethod || def < 0) return 0;
-  /* only a method emitted under its own C name (a block-taking #to_str is
-     emitted as a proc-form clone) */
-  if (scope_proc_form_of(c, mi) >= 0 || !scope_has_callable_symbol(c, mi)) return 0;
-  /* x may hold a subclass instance: a subclass that answers #to_str from
-     another definition keeps the old path */
-  for (int k = 0; k < c->nclasses; k++) {
-    int up = c->classes[k].parent;
-    while (up >= 0 && up != cid) up = c->classes[up].parent;
-    if (up != cid) continue;
-    int kd = -1;
-    if (comp_method_in_chain(c, k, "to_str", &kd) != mi || kd != def) return 0;
-  }
-  if (comp_ty_value_obj(c, ty_object(def))) return 0;
-  int to = ++g_tmp, tr = ++g_tmp, ts = ++g_tmp;
-  buf_printf(b, "({ sp_RbVal _t%d = ", to);
-  emit_boxed(c, arg, b);
-  buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_RbVal _t%d = sp_box_nil(); if (_t%d.tag == SP_TAG_OBJ) { _t%d = ",
-             to, tr, to, tr);
-  char call[256];
-  snprintf(call, sizeof call, "%s((sp_%s *)_t%d.v.p)", mc_method(c, m), c->classes[def].c_name, to);
-  emit_boxed_ret_call(c, m, call, b);
-  buf_printf(b, "; } SP_GC_ROOT_RBVAL(_t%d); const char *_t%d = sp_str_cmp_conv(_t%d, _t%d); "
-                "_t%d ? sp_box_str(_t%d) : sp_box_nil(); })", tr, ts, tr, to, ts, ts);
   return 1;
 }
 
@@ -15792,6 +16033,161 @@ void emit_regexp_new(Compiler *c, int argc, const int *argv, Buf *b) {
   buf_printf(b, "_t%d", tp);
 }
 
+/* Array.new(n, v)'s size n, written into g_pre ahead of the fill v, as
+   CRuby evaluates it first. CRuby converts it (#to_int, a boxed value's
+   check, nil's TypeError) only after v ran, so a size that is no plain
+   Integer, beside a fill that can run code, is held as it is in _t<*ts>,
+   and array_new_size_convert converts it after the fill: answers 1, or 2
+   for a nilable Integer (`s.index(x)`), held as its oint, as read as a
+   plain value its nil raised ahead of the fill. Any other size goes into
+   the sp_int _t<tn> converted (answers 0). */
+/* (A fill with no effect of its own is still read before the conversion
+   when the size's #to_int, asked at the size it converts, may change what
+   it reads, a global or an ivar the method writes; only a literal reads the
+   same either way.) */
+static int array_fill_reads_same_after(Compiler *c, int size, int fill) {
+  if (subtree_has_side_effect(c, fill)) return 0;
+  NodeKind k = nt_kind(c->nt, fill);
+  if (k == NK_IntegerNode || k == NK_FloatNode || k == NK_StringNode || k == NK_SymbolNode ||
+      k == NK_NilNode || k == NK_TrueNode || k == NK_FalseNode)
+    return 1;
+  return !prog_has_conv_method(c, size, "to_int", TY_INT);
+}
+static int array_new_size_hold(Compiler *c, int size, int fill, int tn, int *ts) {
+  Repr sr = repr_of(c, size);
+  int late = !array_fill_reads_same_after(c, size, fill) && nt_kind(c->nt, size) != NK_SplatNode &&
+             g_n_argov < MAX_ARG_OVERRIDE &&
+             (sr.kind == RK_BOXED || sr.big || repr_opt_kind(c, size) == TY_INT ||
+              comp_ntype(c, size) != TY_INT);
+  if (!late) {
+    Buf nb; memset(&nb, 0, sizeof nb); emit_int_expr(c, size, &nb);
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "sp_int _t%d = %s;\n", tn, nb.p ? nb.p : "");
+    free(nb.p);
+    return 0;
+  }
+  if (sr.kind != RK_BOXED && repr_opt_kind(c, size) == TY_INT) {
+    *ts = ++g_tmp;
+    Buf ob; memset(&ob, 0, sizeof ob); emit_oint_expr(c, size, TY_INT, &ob);
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "%s _t%d = %s;\n", oint_ctype(TY_INT), *ts, ob.p ? ob.p : oint_nil(TY_INT));
+    free(ob.p);
+    return 2;
+  }
+  *ts = hold_operand_pre(c, size, sr.as_ty, sr.kind == RK_BOXED, ++g_tmp, 1);
+  return 1;
+}
+/* The size array_new_size_hold held in _t<ts> (form 1, or 2 for its oint),
+   converted into the sp_int _t<tn> where CRuby converts it; then the
+   indent of the line after it. */
+static void array_new_size_convert(Compiler *c, int size, int form, int ts, int tn) {
+  int slot = form == 2 ? view_bind_temp_o(size, ts) : view_bind_temp(size, ts);
+  Buf nb; memset(&nb, 0, sizeof nb); emit_int_expr(c, size, &nb);
+  view_unbind(slot);
+  buf_printf(g_pre, "sp_int _t%d = %s;\n", tn, nb.p ? nb.p : "0");
+  free(nb.p);
+  emit_indent(g_pre, g_indent);
+}
+
+static void emit_raise_placeholder(Compiler *c, int id, Buf *b);
+/* Whether `Cls.new(...)` on the builtin exception cn has its arguments read by the run time, as initialize
+   reads them: a splat's count is the run time's (the classes whose initialize takes arguments of its own
+   keep their arms), and so is a `**h` keyword hash of the classes that take key: and receiver: (K-061: the
+   arm that reads literal keywords recorded neither the key nor the receiver of a `**h`). */
+static int exc_new_args_at_run_time(const NodeTable *nt, const char *cn, int argc, const int *argv) {
+  return (nt_argv_has_splat(nt, argv, argc) && !exc_init_takes_own_args(cn)) ||
+         (nt_argv_has_kwsplat(nt, argv, argc) && exc_attrs_family_name(cn));
+}
+/* Array.new(n) with a block filling a fresh result (_tr, of kind k): the
+   walk over i in [0, n) runs inside an outer loop of runs of up to
+   SP_FRESH_CAP, each run's slots made ahead of it (sp_<k>Array_fresh_to);
+   opens both loops (the caller closes both) and leaves g_indent inside the
+   inner one's body less one, as the plain walk's header does. */
+static void array_new_fresh_runs(const char *k, int tr, int tn, int ti, int trun, int tend) {
+  buf_printf(g_pre, "for (sp_int _t%d = 0, _t%d; _t%d < _t%d; _t%d = _t%d) {\n", trun, tend, trun, tn, trun, tend);
+  g_indent++;
+  emit_indent(g_pre, g_indent);
+  buf_printf(g_pre, "_t%d = _t%d - _t%d > SP_FRESH_CAP ? _t%d + SP_FRESH_CAP : _t%d;\n", tend, tn, trun, trun, tn);
+  emit_indent(g_pre, g_indent);
+  buf_printf(g_pre, "if (_t%d > _t%d->len) sp_%sArray_fresh_to(_t%d, _t%d, _t%d);\n", tend, tr, k, tr, tend, tn);
+  emit_indent(g_pre, g_indent);
+  buf_printf(g_pre, "for (sp_int _t%d = _t%d; _t%d < _t%d; _t%d++) {\n", ti, trun, ti, tend, ti);
+}
+
+/* The block's result waits through ensure before the Array takes it. Its
+   carrier uses the element storage representation, including String handles. */
+static TyKind array_new_next_slot(Compiler *c, const char *k, TyKind at, TyKind elem, int nilable, int tmp) {
+  TyKind et = sp_streq(k, "Poly") ? TY_POLY : elem;
+  TyKind held = typed_elem_held(at);
+  if (held != TY_UNKNOWN) et = held;
+  emit_indent(g_pre, g_indent);
+  if (sp_streq(k, "Ptr")) { et = TY_UNKNOWN; buf_printf(g_pre, "void *_t%d = NULL; SP_GC_ROOT(_t%d);\n", tmp, tmp); }
+  else if (et == TY_POLY) buf_printf(g_pre, "sp_RbVal _t%d = sp_box_nil();\n", tmp);
+  else if (nilable) buf_printf(g_pre, "%s _t%d = %s;\n", oint_ctype(et), tmp, oint_nil(et));
+  else { emit_ctype(c, et, g_pre); buf_printf(g_pre, " _t%d = %s;\n", tmp, default_value_from_compiler(c, et)); }
+  if (ty_gc_rootable(c, et)) { emit_indent(g_pre, g_indent); emit_gc_root_tmp(c, et, tmp, g_pre); buf_puts(g_pre, "\n"); }
+  return et;
+}
+
+static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, int *out);
+
+/* A builtin exception whose own initialize reads more than the message (NameError's name, NoMethodError's
+   args, KeyError's and FrozenError's key: and receiver:, SystemExit's status ...) is built by a native arm.
+   CRuby's initialize of those reads its arguments and then calls super with the message alone, so a
+   reopening of StandardError#initialize (or Exception's) runs on that message. The initialize it would
+   run, or -1: a reopening between the class and StandardError (NameError's under NoMethodError) is handed
+   other arguments, so those keep the construction they had. */
+static int native_exc_reinit_initialize(Compiler *c, int id, const char *cn) {
+  if (!(exc_init_takes_own_args(cn) || sp_streq(cn, "NameError") || sp_streq(cn, "NoMethodError") ||
+        sp_streq(cn, "KeyError") || sp_streq(cn, "FrozenError"))) return -1;
+  int rci = comp_builtin_class_named(c, cn);
+  if (rci >= 0 && exc_reopen_initialize(c, id, rci) >= 0) return -1;
+  int mi = exc_reopen_initialize_above(c, cn, 0, -1);
+  if (mi < 0) return -1;
+  int oc = c->scopes[mi].class_id;
+  if (oc < 0 || !(sp_streq(c->classes[oc].name, "StandardError") || sp_streq(c->classes[oc].name, "Exception"))) return -1;
+  int sv = cplan_hook_target(c, id, oc, "initialize", NULL);
+  if (sv >= 0 && c->scopes[sv].class_id == oc && c->scopes[sv].reachable) mi = sv;
+  if (c->scopes[mi].yields) {
+    int pf = scope_proc_form_of(c, mi);
+    if (pf < 0) return -1;
+    mi = pf;
+  }
+  Buf probe = {0};
+  int ok = emit_reinit_init_text(c, mi, "_p", "_m", &probe);
+  free(probe.p);
+  return ok ? mi : -1;
+}
+/* the call whose native construction the reopening wraps (its arms are asked again inside) */
+static int g_native_reinit_id = -1;
+
+/* `Cls.new(...)` on the builtin exception cn: a reopening's own initialize runs on the runtime's exception
+   (not for the error a dispatcher's no-method arm builds, builtin_new); else a native arm builds it and a
+   reopening above runs on its message (native_exc_reinit_initialize). 1 = the call is emitted into b. */
+static int emit_builtin_exc_new_reopened(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name,
+                                         int recv, const char *cn, int argc, const int *argv, int *out) {
+  if (nt_int(nt, id, "builtin_new", 0)) return 0;
+  int rim = exc_builtin_reopen_initialize(c, id, cn, argc, argv);
+  if (rim >= 0) { emit_exc_reopen_construct_as(c, cn, rim, nt_ref(nt, id, "arguments"), -1, id, b); *out = 1; return 1; }
+  if (g_native_reinit_id == id) return 0;
+  int sri = native_exc_reinit_initialize(c, id, cn);
+  if (sri < 0) return 0;
+  /* the native arms run again for this call, into a buffer of their own: their text is wrapped only if
+     one of them took the call */
+  Buf in; memset(&in, 0, sizeof in);
+  g_native_reinit_id = id;
+  int r = emit_new_call_arms(c, id, &in, nt, name, recv, argc, argv, out);
+  g_native_reinit_id = -1;
+  if (r && in.p) {
+    int t = 0;
+    syserr_reinit_open(&t, b);
+    buf_puts(b, in.p);
+    syserr_reinit_close(c, sri, t, b);
+  }
+  free(in.p);
+  return r;
+}
+
 static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, int *out) {
   if (!(recv >= 0 && (is_hash_constructor(name)))) return 0;
   NodeKind rk = nt_kind(nt, recv);
@@ -15804,7 +16200,7 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       /* the .new result is typed poly (a class-var receiver dispatches
          dynamically), so box the concrete constructor result to match (#2653) */
       int is_val = comp_ty_value_obj(c, ty_object(ci));
-      int initm = cplan_new_initialize(c, id, ci, NULL);
+      int initm = cplan_hook_target(c, id, ci, "initialize", NULL);
       if (!ctor_new_runs(c, ci, initm) || ctor_needs_self_defaults_argv(c, initm, argv, argc)) {
         buf_printf(b, is_val ? "sp_box_vobj_%s(" : "sp_box_obj(", c->classes[ci].c_name);
         emit_ctor_alloc_init(c, ci, initm, nt_ref(nt, id, "arguments"), id, b);
@@ -15830,9 +16226,13 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     /* a reopened builtin (`class String; def ...`) with no user-defined
        self.new keeps its builtin constructor: fall past the user-ctor logic
        to the builtin cn handler below (#3109) */
-    int reopen_builtin_new = ci >= 0 && rk == NK_ConstantReadNode &&
+    /* (the error a dispatcher's no-method arm builds, builtin_new, names
+       the class as ::NoMethodError / ::NameError where a nested definition
+       shadows the name: that path is the builtin's too) */
+    int reopen_builtin_new = ci >= 0 &&
+                             (rk == NK_ConstantReadNode || nt_int(nt, id, "builtin_new", 0)) &&
                              is_builtin_reopen(key_name(c, recv)) &&
-                             comp_cmethod_in_chain(c, ci, "new", NULL) < 0;
+                             cplan_user_new(c, id, ci) < 0;
     /* native (C-backed) class: the declared constructor (see emit_native_ctor) */
     if (!reopen_builtin_new && emit_native_ctor(c, id, ci, argc, argv, b)) { *out = 1; return 1; }
     if (ci >= 0 && c->classes[ci].is_struct) refuse_from_plan(c, id, CRF_RECORD_NEW, "refuse-record-new");
@@ -15840,7 +16240,7 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     if (ci >= 0 && !reopen_builtin_new) {
       /* user exception subclass: use the generated constructor */
       if (class_is_exc_subclass(c, ci)) {
-        int initm = cplan_new_initialize(c, id, ci, NULL);
+        int initm = cplan_hook_target(c, id, ci, "initialize", NULL);
         /* a yielding initialize takes this site's block the way any class's does */
         if (initm >= 0 && c->scopes[initm].yields && nt_ref(nt, id, "block") >= 0 &&
             (emit_ctor_yield_inline(c, id, ci, b) || emit_ctor_new_with_proc(c, id, ci, b))) { *out = 1; return 1; }
@@ -15880,7 +16280,7 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       /* a subclass of a native class with no initialize of the program's
          (#9269): allocated, then set up by the in-place twin of the native
          constructor the arguments select */
-      int initm = cplan_new_initialize(c, id, ci, NULL);
+      int initm = cplan_hook_target(c, id, ci, "initialize", NULL);
       if (c->classes[ci].nsub_root > 0 && initm < 0) {
         int t = ++g_tmp;
         char tn[32]; snprintf(tn, sizeof tn, "_t%d", t);
@@ -15896,6 +16296,25 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
           { *out = 1; return 1; }
         }
         free(ib.p);
+      }
+      /* A module has no `new`: `M.new(v)` is CRuby's NoMethodError, once
+         the arguments have run. The constructor the path below names,
+         sp_<Module>_new, raises the same error itself, but a module nothing
+         constructs has none emitted -- a computed-name send names `new` as
+         one arm among a Class's methods ahead of any construction -- and
+         the arity check ahead of it raised ArgumentError for a method the
+         module does not have. */
+      if (comp_class_is_module(c, &c->classes[ci])) {
+        /* the arguments run first, in source order and whatever their form
+           (a splat, a keyword, an Array literal whose build hoists), as the
+           arity error's do: run inside this expression, one that hoisted
+           ran ahead of an earlier one, and a keyword or a splat ran none */
+        emit_args_run(c, argv, argc);
+        buf_puts(b, "(");
+        buf_printf(b, "sp_raise_cls(\"NoMethodError\", \"undefined method 'new' for module %s\")",
+                   class_ruby_name(c, ci) ? class_ruby_name(c, ci) : c->classes[ci].name);
+        emit_raise_placeholder(c, id, b);
+        { *out = 1; return 1; }
       }
       /* Extra/missing positional args to a fixed-arity initialize raise
          ArgumentError at the .new site, as in MRI; the check emits the raise
@@ -15919,18 +16338,17 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     const char *cn = superclass_builtin_exc_name(c, nt, recv);
     if (!cn) cn = nt_str(nt, recv, "name");
     if (cn && is_exc_name(cn)) {
-      /* a reopening's own initialize runs on the runtime's exception */
-      { int rci = comp_builtin_class_named(c, cn);
-        int rim = rci >= 0 ? exc_reopen_initialize(c, rci) : -1;
-        if (rim >= 0) { emit_exc_reopen_construct(c, rci, rim, nt_ref(nt, id, "arguments"), -1, b); { *out = 1; return 1; } } }
+      /* a reopening's own initialize runs on the runtime's exception, but
+         not for the error a dispatcher's no-method arm builds (builtin_new) */
+      if (emit_builtin_exc_new_reopened(c, id, b, nt, name, recv, cn, argc, argv, out)) return 1;
       /* SystemCallError#initialize builds the message from the errno:
          Errno::ENOENT.new("x") is "No such file or directory - x", and
          SystemCallError.new("x", 2) an Errno::ENOENT */
-      if (emit_syserr_family_new(c, id, cn, argc, argv, b)) { *out = 1; return 1; }
+      if (emit_syserr_family_new_reopened(c, id, cn, argc, argv, b)) { *out = 1; return 1; }
       /* `.new(*a)`: how many arguments the splat gives is the run time's,
          which reads them as initialize does. The classes whose initialize
          takes arguments of its own keep their arms below. */
-      if (nt_argv_has_splat(nt, argv, argc) && !exc_init_takes_own_args(cn)) {
+      if (exc_new_args_at_run_time(nt, cn, argc, argv)) {
         emit_exc_new_runtime_args(c, id, -1, cn, argc, argv, b);
         { *out = 1; return 1; }
       }
@@ -16443,11 +16861,29 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       emit_indent(g_pre, g_indent);
       buf_printf(g_pre, "if (_t%d < 0) sp_raise_cls(\"ArgumentError\", \"negative array size\");\n", tn);
       free(nb.p);
+      /* an Integer or Float result whose values each go in through the
+         plain store of its kind (not one that can be nil) is made at its
+         full length and each value stored into its slot, as a while loop's
+         `r[i] = v` stores, where a push wrote the length per element and
+         grew the buffer from 16 (sp_<k>Array_new_fresh, _store_fresh); an
+         object or boxed result, whose store keeps the write barrier, gains
+         nothing by it and appends as before.
+         The slots are made a run of up to SP_FRESH_CAP at a time
+         (_fresh_to), an outer loop around the walk: a block that throws or
+         raises early pays for one run, not for n slots it never fills. A
+         `break` of the block is no C break (it would leave the inner loop
+         only), so a block with one appends as before */
+      int fresh = bn > 0 && bb && is_numeric_literal_tag(k) && !*nil_store_sfx(c, k, bb[bn - 1]) &&
+                  !(subtree_has_own_next(nt, bbody) && block_next_may_be_nil(c, bbody)) &&
+                  !subtree_has_loop_break(c, bbody);
       emit_indent(g_pre, g_indent);
-      buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new();\n", k, tr, k);
+      int trun = fresh ? ++g_tmp : -1, tend = fresh ? ++g_tmp : -1;
+      if (fresh) buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new_fresh(_t%d < SP_FRESH_CAP ? _t%d : SP_FRESH_CAP);\n", k, tr, k, tn, tn);
+      else buf_printf(g_pre, "sp_%sArray *_t%d = sp_%sArray_new();\n", k, tr, k);
       emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", tr);
       emit_indent(g_pre, g_indent);
-      buf_printf(g_pre, "for (sp_int _t%d = 0; _t%d < _t%d; _t%d++) {\n", ti, ti, tn, ti);
+      if (fresh) array_new_fresh_runs(k, tr, tn, ti, trun, tend);
+      else buf_printf(g_pre, "for (sp_int _t%d = 0; _t%d < _t%d; _t%d++) {\n", ti, ti, tn, ti);
       g_indent++;
       if (irn) { emit_indent(g_pre, g_indent); buf_printf(g_pre, "sp_int lv_%s = _t%d;\n", irn, ti); }
       /* Fresh block-locals per run, as every other inlined iterator gets
@@ -16466,6 +16902,8 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
          is a `void *`, which every element pointer and a nil converts to) */
       int an_next = bn > 0 && bb && subtree_has_own_next(nt, bbody);
       const char *sv_anx = g_ie_next_var; int sv_anp = g_ie_res_poly; TyKind sv_ant = g_ie_next_ty; int sv_ano = g_ie_next_oint;
+      int sv_acloop = g_c_loop_depth, sv_alexc = g_loop_exc_base;
+      int sv_alres = g_loop_rescue_base, sv_alens = g_loop_ensure_base;
       char anbuf[32]; int anv = 0;
       /* an Integer or Float tail that can be nil is pushed with its nil: the
          slot (and the `next` slot) is its oint */
@@ -16474,17 +16912,14 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       if (an_next) {
         anv = ++g_tmp;
         snprintf(anbuf, sizeof anbuf, "_t%d", anv);
-        TyKind et = sp_streq(k, "Poly") ? TY_POLY : ar.elem;
-        emit_indent(g_pre, g_indent);
-        if (sp_streq(k, "Ptr")) { et = TY_UNKNOWN; buf_printf(g_pre, "void *_t%d = NULL;\n", anv); }
-        else if (et == TY_POLY) buf_printf(g_pre, "sp_RbVal _t%d = sp_box_nil();\n", anv);
-        else if (tail_o) buf_printf(g_pre, "%s _t%d = %s;\n", oint_ctype(et), anv, oint_nil(et));
-        else { emit_ctype(c, et, g_pre); buf_printf(g_pre, " _t%d = %s;\n", anv, default_value_from_compiler(c, et)); }
+        TyKind et = array_new_next_slot(c, k, at, ar.elem, tail_o, anv);
         emit_indent(g_pre, g_indent); buf_puts(g_pre, "do {\n");
         g_indent++;
         g_ie_next_var = anbuf; g_ie_res_poly = et == TY_POLY;
-        g_ie_next_ty = (et == TY_INT || et == TY_FLOAT) ? et : TY_UNKNOWN;
+        g_ie_next_ty = et;
         g_ie_next_oint = tail_o && oint_kind(et);   /* the slot is the oint: `next` stores that form */
+        g_c_loop_depth++; g_loop_exc_base = g_exc_frame_depth; g_loop_rescue_base = g_rescue_save_depth;
+        g_loop_ensure_base = g_ensure_depth;
       }
       if (bn > 0 && bb) {
         TyKind elem_t = ty_array_elem(at);
@@ -16496,7 +16931,7 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         int tail_strbuf = sp_streq(k, "Poly") && repr_of(c, bb[bn - 1]).as_ty == TY_STRBUF;
         /* (one representation: a String Array holds the String the tail
            answers, its handle, where its bytes became a new one) */
-        int tail_hdl = sp_streq(k, "Str") && !tail_o && !an_next && !nil_store_sfx(c, k, bb[bn - 1])[0];
+        int tail_hdl = typed_elem_held(at) == TY_STRBUF && !tail_o && !nil_store_sfx(c, k, bb[bn - 1])[0];
         if (tail_strbuf) emit_boxed(c, bb[bn - 1], &vb);
         else if (tail_o) emit_oint_expr(c, bb[bn - 1], elem_t, &vb);
         else if (tail_hdl) emit_strbuf_handle_of(c, bb[bn - 1], &vb);
@@ -16515,6 +16950,7 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
           g_indent--;
           emit_indent(g_pre, g_indent); buf_puts(g_pre, "} while (0);\n");
           g_ie_next_var = sv_anx; g_ie_res_poly = sv_anp; g_ie_next_ty = sv_ant; g_ie_next_oint = sv_ano;
+          g_c_loop_depth = sv_acloop; g_loop_exc_base = sv_alexc; g_loop_rescue_base = sv_alres; g_loop_ensure_base = sv_alens;
         }
         emit_indent(g_pre, g_indent);
         if (sp_streq(k, "Poly")) {
@@ -16537,17 +16973,17 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         }
         else if (sp_streq(k, "Ptr"))
           buf_printf(g_pre, "sp_PtrArray_push(_t%d, (void *)(%s));\n", tr, vb.p ? vb.p : "0");
-        /* (one representation: the tail may be the handle; a String Array
-           takes the bytes) */
-        else if (tail_hdl)
-          buf_printf(g_pre, "sp_StrArray_push_e(_t%d, SP_STR_HDL(%s));\n", tr, vb.p ? vb.p : "NULL");
-        else if (sp_streq(k, "Str") && !tail_o && !nil_store_sfx(c, k, bb[bn - 1])[0])
-          buf_printf(g_pre, "sp_StrArray_push(_t%d, SP_STR_B(%s));\n", tr, vb.p ? vb.p : "NULL");
+        /* (one representation: the tail may be the handle or its bytes; a String Array holds the handle) */
+        else if (tail_hdl || (typed_elem_held(at) == TY_STRBUF && !tail_o && !nil_store_sfx(c, k, bb[bn - 1])[0])) {
+          emit_kind_push(c, g_pre, k, tr, vb.p ? vb.p : "NULL"); buf_puts(g_pre, ";\n");
+        }
+        else if (fresh) buf_printf(g_pre, "sp_%sArray_store_fresh(_t%d, _t%d, %s);\n", k, tr, ti, vb.p ? vb.p : "");
         else { buf_printf(g_pre, "sp_%sArray_push%s(_t%d, %s);\n", k, tail_o ? "_nilable" : nil_store_sfx(c, k, bb[bn - 1]), tr, vb.p ? vb.p : ""); }
         free(vb.p);
       }
       g_indent--;
       emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n");
+      if (fresh) { g_indent--; emit_indent(g_pre, g_indent); buf_puts(g_pre, "}\n"); }
       buf_printf(b, "_t%d", tr);
       { *out = 1; return 1; }
     }
@@ -16563,12 +16999,10 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         /* The size goes into an `sp_int` temp; coerce a poly size expression
            (e.g. `nrows * ncols` where a factor widened to poly -> sp_poly_mul,
            which returns sp_RbVal) through sp_poly_to_i. spinel-dev#24. */
-        Buf nb; memset(&nb, 0, sizeof nb); emit_int_expr(c, argv[0], &nb);
         /* (the size is held before the fill emits what it puts ahead of
            itself, an Array or Hash literal's elements: CRuby evaluates the
-           size first) */
-        emit_indent(g_pre, g_indent);
-        buf_printf(g_pre, "sp_int _t%d = ", tn); buf_puts(g_pre, nb.p ? nb.p : ""); buf_puts(g_pre, ";\n");
+           size first; array_new_size_hold) */
+        int ts = -1, size_form = array_new_size_hold(c, argv[0], argv[1], tn, &ts);
         /* --share-strings: a fill stored as the shared handle is boxed as
            its handle, one object in every slot, as a literal's element is */
         int fh = array_fill_boxes_handle(c, id, argv[1]);
@@ -16610,12 +17044,17 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
           emit_ctype(c, ar.elem, g_pre);
           buf_printf(g_pre, " _t%d = ", tv); buf_puts(g_pre, vb.p ? vb.p : "");
         }
-        int str_fill_h = ar.elem == TY_STRING && sp_streq(k, "Str");
+        int str_fill_h = ar.elem == TY_STRING && typed_elem_held(at) == TY_STRBUF;
         buf_puts(g_pre, ";\n");
         emit_indent(g_pre, g_indent);
-        if (array_fill_held_only_here(c, argv[1], fh, k)) { emit_gc_root_tmp(c, fh || ar.elem == TY_POLY ? TY_POLY : str_fill_h ? TY_STRBUF : ar.elem, tv, g_pre); buf_puts(g_pre, "\n"); emit_indent(g_pre, g_indent); }
+        /* (a size converted after the fill runs #to_int, which can drop the
+           fill's other holder and collect: the fill is rooted across it) */
+        int fill_ref = !fo && !is_numeric_literal_tag(k) &&
+                       (fh || ar.elem == TY_POLY || str_fill_h || ty_gc_rootable(c, ar.elem));
+        if (array_fill_held_only_here(c, argv[1], fh, k) || (size_form && fill_ref)) { emit_gc_root_tmp(c, fh || ar.elem == TY_POLY ? TY_POLY : str_fill_h ? TY_STRBUF : ar.elem, tv, g_pre); buf_puts(g_pre, "\n"); emit_indent(g_pre, g_indent); }
         /* the size is checked after the fill ran, as CRuby evaluates both
            arguments before Array.new looks at them (CodeRabbit on #10019) */
+        if (size_form) array_new_size_convert(c, argv[0], size_form, ts, tn);
         buf_printf(g_pre, "if (_t%d < 0) sp_raise_cls(\"ArgumentError\", \"negative array size\");\n", tn);
         emit_indent(g_pre, g_indent);
         if (fo) {
@@ -16632,9 +17071,9 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
           emit_indent(g_pre, g_indent); buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", tr);
           emit_indent(g_pre, g_indent);
           buf_printf(g_pre, "for (sp_int _t%d = 0; _t%d < _t%d; _t%d++) sp_%sArray_push%s(_t%d, _t%d);\n",
-                     ti, ti, tn, ti, k, str_fill_h ? "_e" : "", tr, tv);
+                     ti, ti, tn, ti, k, str_fill_h ? typed_elem_store_sfx(at) : "", tr, tv);
         }
-        free(nb.p); free(vb.p);
+        free(vb.p);
         buf_printf(b, "_t%d", tr);
         { *out = 1; return 1; }
       }
@@ -16904,13 +17343,10 @@ int emit_class_new_call(Compiler *c, int id, Buf *b) {
     int ok = want_str ? (at == TY_STRING || at == TY_STRBUF) : (at == TY_IO);
     if (ok) { emit_boxed(c, argv[0], b); return 1; }
     if (want_str && try_convert_arysub(c, argv[0], 2, b)) return 1;
-    if (want_str && ty_is_object(at) && repr_of(c, argv[0]).kind != RK_BOXED &&
-        emit_try_convert_obj_to_str(c, argv[0], at, b)) return 1;
     if (want_str && (ty_is_object(at) || repr_of(c, argv[0]).kind == RK_BOXED)) {
-      int t = ++g_tmp;
-      buf_printf(b, "({ const char *_t%d = sp_poly_check_str(", t);
+      buf_puts(b, "sp_poly_check_str_box(");
       emit_boxed(c, argv[0], b);
-      buf_printf(b, "); _t%d ? sp_box_str(_t%d) : sp_box_nil(); })", t, t);
+      buf_puts(b, ")");
       return 1;
     }
     if (emit_try_convert_boxed(c, nt_str(nt, recv, "name"), argv[0], b)) return 1;
@@ -16931,9 +17367,8 @@ int emit_class_new_call(Compiler *c, int id, Buf *b) {
    `<op> 0` path. Value-type classes take the checked path too when their
    `<=>` can return nil: the direct `<op> 0` emit would compare an sp_RbVal
    (invalid C), and sp_box_vobj / the cmp hook's by-value deref handle them. */
-int user_cmp_needs_check(Compiler *c, int cid) {
-  int def = -1;
-  int mi = comp_method_in_chain(c, cid, "<=>", &def);
+int user_cmp_needs_check(Compiler *c, int id, int op, int cid) {
+  int mi = cplan_implied_target(c, id, op, cid, "<=>", 0, NULL);
   if (mi < 0) return 0;   /* no user <=> reachable: keep the inline path */
   TyKind ret = (TyKind)c->scopes[mi].ret;
   /* an Integer or Float `<=>` that also answers nil keeps its scalar slot
@@ -16942,8 +17377,7 @@ int user_cmp_needs_check(Compiler *c, int cid) {
   int nullable = c->scopes[mi].ret_nullable_int;
   for (int k = 0; k < c->nclasses; k++) {
     if (!is_descendant(c, k, cid)) continue;
-    int kd = -1;
-    int kmi = comp_method_in_chain(c, k, "<=>", &kd);
+    int kmi = cplan_implied_target(c, id, op, k, "<=>", 0, NULL);
     if (kmi >= 0 && (TyKind)c->scopes[kmi].ret != TY_UNKNOWN)
       ret = ty_unify(ret, (TyKind)c->scopes[kmi].ret);
     if (kmi >= 0 && c->scopes[kmi].ret_nullable_int) nullable = 1;
@@ -16973,15 +17407,13 @@ int obj_member_shadows(Compiler *c, TyKind rt, const char *nm) {
 /* The unified `<=>` return type across a Comparable class and its descendants,
    or TY_UNKNOWN if none. Backs both user_cmp_needs_check and the protocol check
    below (a statically non-{Integer,Float,nil} result is a compile-time error). */
-static TyKind user_cmp_ret_type(Compiler *c, int cid) {
-  int def = -1;
-  int mi = comp_method_in_chain(c, cid, "<=>", &def);
+static TyKind user_cmp_ret_type(Compiler *c, int id, int op, int cid) {
+  int mi = cplan_implied_target(c, id, op, cid, "<=>", 0, NULL);
   if (mi < 0) return TY_UNKNOWN;
   TyKind ret = (TyKind)c->scopes[mi].ret;
   for (int k = 0; k < c->nclasses; k++) {
     if (!is_descendant(c, k, cid)) continue;
-    int kd = -1;
-    int kmi = comp_method_in_chain(c, k, "<=>", &kd);
+    int kmi = cplan_implied_target(c, id, op, k, "<=>", 0, NULL);
     if (kmi >= 0 && (TyKind)c->scopes[kmi].ret != TY_UNKNOWN)
       ret = ty_unify(ret, (TyKind)c->scopes[kmi].ret);
   }
@@ -16993,8 +17425,8 @@ static TyKind user_cmp_ret_type(Compiler *c, int cid) {
    violation spinel catches at compile time; poly/unknown stay a runtime check
    (they may be Integer at run time). Returns the offending type, else
    TY_UNKNOWN. (#2961) */
-TyKind user_cmp_invalid_ret(Compiler *c, int cid) {
-  TyKind ret = user_cmp_ret_type(c, cid);
+TyKind user_cmp_invalid_ret(Compiler *c, int id, int op, int cid) {
+  TyKind ret = user_cmp_ret_type(c, id, op, cid);
   if (ret == TY_STRING || ret == TY_SYMBOL || ret == TY_BOOL ||
       ty_is_array(ret) || ty_is_hash(ret))
     return ret;
@@ -17085,7 +17517,7 @@ static void emit_cmp_derived_eq(Compiler *c, int id, int recv, int arg, int ecid
   int same_ok = !comp_ty_value_obj(c, rt) &&
                 ((ty_is_object(at) && !comp_ty_value_obj(c, at)) || at == TY_POLY);
   Buf selfb = emit_cmp_self(c, recv, rt, NULL);
-  int cmi = comp_method_in_chain(c, ecid, "<=>", NULL);
+  int cmi = cplan_implied_target(c, id, recv, ecid, "<=>", CIT_TABLE, NULL);
   /* a Bignum answer is a pointer, which `== 0` would read as NULL */
   int big = cmi >= 0 && c->scopes[cmi].ret == TY_BIGINT;
   if (!same_ok) {
@@ -17147,12 +17579,12 @@ static void emit_cmp_derived_eq(Compiler *c, int id, int recv, int arg, int ecid
 /* `x == nil` (or `!=`) on a boxed x: an object of a program class that
    defines `==` (or `!=`) answers by it, which need not be a Boolean
    (`def ==(o) = nil`). */
-static int poly_nil_eq_is_users(Compiler *c, int eq) {
+static int poly_nil_eq_is_users(Compiler *c, int id, int eq) {
   for (int k = 0; k < c->nclasses; k++) {
     ClassInfo *ci = &c->classes[k];
     if (ci->is_native_class || !ci->instantiated || comp_class_is_module(c, ci)) continue;
-    if (comp_method_in_chain(c, k, "==", NULL) >= 0) return 1;
-    if (!eq && comp_method_in_chain(c, k, "!=", NULL) >= 0) return 1;
+    if (cplan_implied_target(c, id, -1, k, "==", 0, NULL) >= 0) return 1;
+    if (!eq && cplan_implied_target(c, id, -1, k, "!=", 0, NULL) >= 0) return 1;
   }
   return 0;
 }
@@ -17176,12 +17608,13 @@ static void emit_poly_nil_eq_user(Compiler *c, int id, int recv, int eq, Buf *b)
 }
 /* Does the program give nil an `==` or a `!=` of its own: on NilClass, on a
    class every object has, or at the top level? */
-static int nil_eq_is_the_programs(Compiler *c) {
+static int nil_eq_is_the_programs(Compiler *c, int id) {
   static const int owners[] = { CORE_NILCLASS, CORE_OBJECT, CORE_KERNEL, CORE_BASIC_OBJECT, -1 };
-  if (comp_method_index(c, "==") >= 0 || comp_method_index(c, "!=") >= 0) return 1;
+  /* (the top-level `==` or `!=` as the table holds it: call_target's CT_TOP at a node asks main's own singleton first) */
+  if (cplan_implied_target(c, id, -1, -1, "==", CT_TOP | CIT_TABLE, NULL) >= 0 || cplan_implied_target(c, id, -1, -1, "!=", CT_TOP | CIT_TABLE, NULL) >= 0) return 1;
   for (int i = 0; owners[i] >= 0; i++) {
     int k = comp_core_class(c, owners[i]);
-    if (k >= 0 && (comp_method_in_chain(c, k, "==", NULL) >= 0 || comp_method_in_chain(c, k, "!=", NULL) >= 0))
+    if (k >= 0 && (call_target(c, id, k, "==", 0, NULL) >= 0 || call_target(c, id, k, "!=", 0, NULL) >= 0))
       return 1;
   }
   return 0;
@@ -17209,7 +17642,7 @@ static int emit_eq_on_nil_slot(Compiler *c, int id, int recv, int arg, int ecid,
   int scalar = (ar.kind == RK_SCALAR || ar.kind == RK_OPT) &&
                (at == TY_INT || at == TY_FLOAT || at == TY_BOOL || at == TY_SYMBOL);
   if (!lit_nil && ar.kind != RK_PTR && ar.kind != RK_BOXED && !scalar) return 0;
-  if (nil_eq_is_the_programs(c)) return 0;
+  if (nil_eq_is_the_programs(c, id)) return 0;
   int st;
   Buf selfb = emit_cmp_self(c, recv, rt, &st);
   int mark = -1;
@@ -17284,12 +17717,12 @@ int emit_delegated_equality(Compiler *c, int id, int negate, Buf *b) {
 
 /* Does a Time subclass of the program's define its own == (not a reopened
    Time's, which the Time arms below take)? */
-static int program_timesub_defines_eq(Compiler *c) {
+static int program_timesub_defines_eq(Compiler *c, int id) {
   for (int k = 0; k < c->nclasses; k++) {
-    int defcls = -1;
+    MethodLookup ml = { .def_class = -1 };
     if (comp_ary_is_time(c, k) && !is_builtin_reopen(c->classes[k].name) &&
-        comp_method_in_chain(c, k, "==", &defcls) >= 0 && defcls >= 0 &&
-        !is_builtin_reopen(c->classes[defcls].name)) return 1;
+        cplan_implied_target(c, id, -1, k, "==", 0, &ml) >= 0 && ml.def_class >= 0 &&
+        !is_builtin_reopen(c->classes[ml.def_class].name)) return 1;
   }
   return 0;
 }
@@ -17351,10 +17784,10 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
         (rt == TY_BIGINT || a0 == TY_BIGINT)) {
       buf_puts(b, "(sp_bigint_cmp(");
       if (rt == TY_BIGINT) emit_expr(c, recv, b);
-      else { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, recv, b); buf_puts(b, ")"); }
+      else if (!emit_bigint_lit(c, recv, b)) { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, recv, b); buf_puts(b, ")"); }
       buf_puts(b, ", ");
       if (a0 == TY_BIGINT) emit_expr(c, argv[0], b);
-      else { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
+      else if (!emit_bigint_lit(c, argv[0], b)) { buf_puts(b, "sp_bigint_new_int("); emit_expr(c, argv[0], b); buf_puts(b, ")"); }
       buf_puts(b, ") == 0)");
       return 1;
     }
@@ -17415,7 +17848,7 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
                        c->classes[ty_object_class(rt)].is_struct &&
                        /* an eql? written in the Struct.new block answers
                           for itself, as a struct's own == does below */
-                       comp_method_in_chain(c, ty_object_class(rt), "eql?", NULL) < 0))))) {
+                       call_target(c, id, ty_object_class(rt), "eql?", 0, NULL) < 0))))) {
     /* Array#eql? is structural like == but class-strict per element
        (1 is not eql? to 1.0): box both sides through the strict poly
        comparator. Scalar eql? is handled by the per-type emitters. */
@@ -17465,7 +17898,7 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
     int r_niltyped = !r_nil && rt == TY_NIL && a0 != TY_NIL;
     /* `x == nil` / `x != nil` for any receiver */
     /* (`t != nil` on a Time subclass with its own ==: that == decides) */
-    if (!eq && (a_nil || a_niltyped) && rt == TY_TIME && recv >= 0 && program_timesub_defines_eq(c)) {
+    if (!eq && (a_nil || a_niltyped) && rt == TY_TIME && recv >= 0 && program_timesub_defines_eq(c, id)) {
       emit_timesub_ne(c, recv, argv[0], b);
       return 1;
     }
@@ -17481,7 +17914,7 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
       /* The nil-typed operand's evaluation. As the RECEIVER it runs before the
          test, which a comma expresses; as the ARGUMENT it runs after the
          receiver, which needs the test's value held while it runs. */
-      if (a_nil && ot == TY_POLY && poly_nil_eq_is_users(c, eq)) {
+      if (a_nil && ot == TY_POLY && poly_nil_eq_is_users(c, id, eq)) {
         emit_poly_nil_eq_user(c, id, recv, eq, b);
         return 1;
       }
@@ -17506,7 +17939,7 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
       }
       else if (ty_null_is_nil(ot) ||
                (ty_is_object(ot) && repr_of(c, other).kind == RK_PTR && repr_of(c, other).may_nil &&
-                !nil_eq_is_the_programs(c))) {
+                !nil_eq_is_the_programs(c, id))) {
         /* nullable heap pointer: a NULL pointer encodes nil (a `@h = {}` slot is
            still NULL until assigned, so `@h == nil` must be a NULL test, not the
            always-false fallback below). So does an object slot that may be nil
@@ -17529,7 +17962,7 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
     if (ty_is_object(rt) && rt == a0) {
       int scid = ty_object_class(rt);
       if (scid >= 0 && scid < c->nclasses && c->classes[scid].is_struct &&
-          comp_method_in_chain(c, scid, "==", NULL) < 0) {
+          call_target(c, id, scid, "==", 0, NULL) < 0) {
         ClassInfo *sci = &c->classes[scid];
         const char *peq = name && sp_streq(name, "eql?") ? "sp_poly_eql" : "sp_poly_eq";
         int ta = ++g_tmp, tb2 = ++g_tmp;
@@ -17561,16 +17994,15 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
             buf_printf(b, " && %s(_t%d->iv_%s, _t%d->iv_%s)", peq, ta, ivn, tb2, ivn); break;
           default: {
             /* boxed comparison covers arrays/hashes/objects uniformly */
-            Buf ba; memset(&ba, 0, sizeof ba);
+            Buf ba = {0}, bb = {0};
             char lx[128], rx[128];
             snprintf(lx, sizeof lx, "_t%d->iv_%s", ta, ivn);
             snprintf(rx, sizeof rx, "_t%d->iv_%s", tb2, ivn);
-            buf_printf(b, " && %s(", peq);
-            emit_boxed_text(c, ivt, lx, b);
-            buf_puts(b, ", ");
-            emit_boxed_text(c, ivt, rx, b);
-            buf_puts(b, ")");
-            free(ba.p);
+            emit_boxed_text(c, ivt, lx, &ba);
+            emit_boxed_text(c, ivt, rx, &bb);
+            buf_puts(b, " && ");
+            emit_member_cmp_text(c, sci, j, peq, ba.p, bb.p, b);
+            free(ba.p); free(bb.p);
             break;
           }
           }
@@ -17720,8 +18152,8 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
        user-method call; != (derived from == in Ruby) negates it here. */
     if (rr.kind == RK_BOXED || a0r.kind == RK_BOXED) {
       if (ty_is_object(rt) && !comp_ty_value_obj(c, rt)) {
-        int ueq_def = -1;
-        int ueq_mi = comp_method_in_chain(c, ty_object_class(rt), "==", &ueq_def);
+        MethodLookup ueq_ml = { .def_class = -1 };
+        int ueq_mi = call_target(c, id, ty_object_class(rt), "==", 0, &ueq_ml), ueq_def = ueq_ml.def_class;
         if (ueq_mi >= 0) {
           if (emit_eq_on_nil_slot(c, id, recv, argv[0], ty_object_class(rt), "==", eq, b)) return 1;
           if (eq) return 0;
@@ -17859,14 +18291,15 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
       /* no direct == : use <=> == 0 when the class supports Comparable */
       /* A synthesized != follows == before Comparable's fallback. */
       const CallPlan ep = cplan_user(c, id);
+      if (emit_delegate_undef_arm(c, id, recv, argc, argv, b)) return 1;
       if (ep.mi >= 0 && ep.delegate && !is_equality_name(ep.delegate)) {
         /* a `<=>` statically returning a non-{Integer,Float,nil} value is a
            protocol violation, caught at compile time (#2961) */
-        if (user_cmp_invalid_ret(c, ecid) != TY_UNKNOWN)
+        if (user_cmp_invalid_ret(c, id, recv, ecid) != TY_UNKNOWN)
           unsupported_feature(c, id, "Comparable operator on an object whose #<=> returns a non-Integer (protocol requires Integer or nil)");
         /* a `<=>` that can return nil: Comparable#== semantics -- identity is
            equal, an incomparable pair is false (never an error) */
-        if (user_cmp_needs_check(c, ecid)) {
+        if (user_cmp_needs_check(c, id, recv, ecid)) {
           int ta = hoist_boxed_rooted(c, recv), tb2 = hoist_boxed_rooted(c, argv[0]);
           buf_printf(b, "(%ssp_poly_cmp_eq(_t%d, _t%d))", eq ? "" : "!", ta, tb2);
           return 1;
@@ -17876,7 +18309,7 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
       }
       /* obj.!= synthesized from obj.== when != is not explicitly defined */
       if (!eq) {
-        int eqm2 = comp_method_in_chain(c, ecid, "==", NULL);
+        int eqm2 = cplan_implied_target(c, id, recv, ecid, "==", CIT_TABLE, NULL);
         if (eqm2 >= 0) {
           if (emit_eq_on_nil_slot(c, id, recv, argv[0], ecid, "==", 0, b)) return 1;
           Buf selfb = emit_cmp_self(c, recv, rt, NULL);
@@ -17893,7 +18326,7 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
        CRuby's BasicObject#!= calls ==. The receiver reads as its Time here,
        so the boxed value's class (sp_poly_bsub_obj) picks the method at run
        time. */
-    if (!eq && rt == TY_TIME && recv >= 0 && program_timesub_defines_eq(c)) {
+    if (!eq && rt == TY_TIME && recv >= 0 && program_timesub_defines_eq(c, id)) {
       emit_timesub_ne(c, recv, argv[0], b);
       return 1;
     }
@@ -17950,7 +18383,7 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
       TyKind prim_t = ty_is_object(a0) ? rt : a0;
       int    prim_n = ty_is_object(a0) ? recv : argv[0];
       int    obj_cid = ty_object_class(obj_t);
-      int    eqm = comp_method_in_chain(c, obj_cid, "==", NULL);
+      int    eqm = cplan_implied_target(c, id, obj_n, obj_cid, "==", CIT_TABLE, NULL);
       /* Numeric types delegate == to other.==(self) when types mismatch */
       if (ty_is_numeric(prim_t) && eqm >= 0) {
         Scope *ms = &c->scopes[eqm];
@@ -18096,6 +18529,18 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
       buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_printf(b, "), %d)", eq ? 0 : 1);
       return 1;
     }
+    /* A String, a Symbol, an Integer or a Float against an Array: never
+       equal. String#== asks only an operand with to_str, Symbol#== is
+       identity, and a number hands the question to the Array's ==, which
+       answers false for a number unless the program gives Array its own. */
+    if (recv >= 0 && (rt == TY_STRING || rt == TY_STRBUF || rt == TY_SYMBOL || rt == TY_INT || rt == TY_FLOAT) &&
+        (ty_is_array(a0) || ty_is_obj_array(a0))) {
+      int ac_ = comp_core_class(c, CORE_ARRAY);
+      if (rt == TY_STRING || rt == TY_STRBUF || rt == TY_SYMBOL || ac_ < 0 || call_target(c, -1, ac_, "==", 0, NULL) < 0) {
+        emit_voided_operands(c, recv, argv[0], eq ? 0 : 1, b);
+        return 1;
+      }
+    }
     unsupported(c, id, "equality");
   }
   return 0;
@@ -18137,20 +18582,21 @@ static void emit_splice_bounds(Compiler *c, int ta, int tg,
 /* Scope index of an array-returning `to_ary` in rhs_ty's class chain, else -1.
    CRuby coerces a non-array splice source through to_ary (rb_ary_to_ary); the
    object itself remains the expression value. Value-type classes are excluded
-   (their instances are not boxed). */
-int splice_to_ary_mi(Compiler *c, TyKind rhs_ty) {
+   (their instances are not boxed). The plan answers it at the call op is an
+   argument of. */
+int splice_to_ary_mi(Compiler *c, int op, TyKind rhs_ty) {
   if (!ty_is_object(rhs_ty)) return -1;
   int cid = ty_object_class(rhs_ty);
   if (c->classes[cid].is_value_type) return -1;
-  int mi = comp_implicit_to_ary_mi(c, cid);
+  int mi = cplan_to_ary_method(c, ic_operand_host(c, op), op, cid);
   if (mi < 0) return -1;
   return ty_is_array((TyKind)c->scopes[mi].ret) ? mi : -1;
 }
 
 /* The to_ary call text on a class cid object the caller holds (rooted) in
    selfptr, into out: the class's own conversion, as call id makes it */
-void emit_to_ary_dispatch(Compiler *c, int id, int cid, const char *selfptr, Buf *out) {
-  CallPlan conversion = cplan_conversion(c, cid, "to_ary");
+void emit_to_ary_dispatch(Compiler *c, int id, int op, int cid, const char *selfptr, Buf *out) {
+  CallPlan conversion = cplan_conversion(c, id, op, cid, "to_ary");
   int cv = view_push_conversion(c, id, &conversion);
   emit_dispatch(c, cid, "to_ary", selfptr, -1, -1, out);
   view_pop(c, cv);
@@ -18264,7 +18710,7 @@ TyKind emit_splice_to_ary_src(Compiler *c, int id, int rhs_node, TyKind rhs_ty,
   buf_printf(b, "sp_%s *_tq%d = ", c->classes[cid].c_name, ta);
   emit_expr(c, rhs_node, b);
   buf_printf(b, "; SP_GC_ROOT(_tq%d); ", ta);
-  emit_to_ary_dispatch(c, id, cid, selfptr, out);
+  emit_to_ary_dispatch(c, id, rhs_node, cid, selfptr, out);
   return (TyKind)c->scopes[mi].ret;
 }
 
@@ -18291,10 +18737,12 @@ void emit_array_splice(Compiler *c, int id, int recv, TyKind rt,
     }
   }
   int ta = ++g_tmp, ts = ++g_tmp, tg = ++g_tmp;  /* recv, src, range temps */
-  int tam = splice_to_ary_mi(c, rhs_ty);
+  int tam = splice_to_ary_mi(c, rhs_node, rhs_ty);
+  const int splice_ops[4] = { start_node, len_node, range_node, rhs_node };   /* (what can drop the receiver) */
 
   if (rt == TY_POLY_ARRAY) {
     buf_printf(b, "({ sp_PolyArray *_t%d = ", ta); emit_expr(c, recv, b); buf_puts(b, "; ");
+    emit_index_recv_root(c, rt, id, recv, splice_ops, 4, ta, 1, b);
     if (tam >= 0) {
       /* object RHS with to_ary: splice the coercion, yield the object */
       Buf call; memset(&call, 0, sizeof call);
@@ -18337,6 +18785,7 @@ void emit_array_splice(Compiler *c, int id, int recv, TyKind rt,
   int poly_so = 0;   /* the boxed-RHS branch tracks its array source in _soN */
   int voint = 0;     /* the value is the oint _t<ts>, answered as the consumer takes it */
   buf_printf(b, "({ sp_%sArray *_t%d = ", k, ta); emit_expr(c, recv, b); buf_puts(b, "; ");
+  emit_index_recv_root(c, rt, id, recv, splice_ops, 4, ta, 1, b);
   buf_printf(b, "%s_src%d; sp_int _srcn%d; ", srcty, ta, ta);
 
   if (rhs_empty) {
@@ -18502,12 +18951,106 @@ void emit_array_splice(Compiler *c, int id, int recv, TyKind rt,
   else buf_printf(b, "%s; })", valtmp);
 }
 
+/* Is arg of call id an object whose class has no #coerce (the call plan's
+   answer, which inference asks too)? A number's arithmetic with it raises
+   TypeError. */
+static int num_arg_cannot_coerce(Compiler *c, int id, int arg) {
+  TyKind t = comp_ntype(c, arg);
+  return ty_is_object(t) && cplan_implied_target(c, id, arg, ty_object_class(t), "coerce", CIT_TABLE, NULL) < 0;
+}
+/* `recv <op> arg` raising CRuby's "<arg> can't be coerced into <into>" after
+   both operands ran, as an expression of the number's C type ctype */
+static void emit_coerce_type_error(Compiler *c, int recv, int arg, const char *into, const char *ctype, Buf *b) {
+  int ta = ++g_tmp;
+  buf_puts(b, "({ (void)("); emit_expr_for_effect(c, recv, b);
+  buf_printf(b, "); sp_RbVal _t%d = ", ta); emit_boxed(c, arg, b);
+  buf_printf(b, "; sp_raise_cls(\"TypeError\", sp_sprintf(\"%%s can't be coerced into %s\", sp_cmperr_desc(_t%d))); (%s)0; })",
+             into, ta, ctype);
+}
 /* Float repeat counts use NUM2LONG, including its range errors. The Array
    offset converter's nonempty form also rejects nil rather than defaulting
    it to zero. Other counts retain their existing conversion path. */
 static void emit_array_repeat_count(Compiler *c, int node, Buf *b) {
   if (comp_ntype(c, node) != TY_FLOAT) { emit_int_expr(c, node, b); return; }
   buf_puts(b, "sp_poly_ary_offset("); emit_boxed(c, node, b); buf_puts(b, ", 1)");
+}
+
+static void emit_string_add_bytes(Compiler *c, int recv, int arg, Buf *b) {
+  const NodeTable *nt = c->nt;
+  /* `str + <non-string>` is a TypeError in CRuby (no implicit conversion);
+     a statically non-string, non-poly argument raises rather than emitting
+     an invalid sp_str_plus(str, int) C call (#2306) */
+  {
+    TyKind at9 = comp_ntype(c, arg);
+    const char *acn9 =
+      at9 == TY_INT || at9 == TY_BIGINT ? "Integer" :
+      at9 == TY_FLOAT ? "Float" : at9 == TY_SYMBOL ? "Symbol" :
+      at9 == TY_NIL ? "nil" :   /* CRuby names the value, not NilClass */
+      ty_is_array(at9) ? "Array" : ty_is_hash(at9) ? "Hash" :
+      at9 == TY_RANGE ? "Range" : NULL;
+    if (at9 == TY_BOOL) {
+      /* true/false name the value at run time */
+      buf_puts(b, "({ (void)("); emit_expr_for_effect(c, recv, b);
+      buf_puts(b, "); sp_raise_cls(\"TypeError\", sp_sprintf(\"no implicit conversion of %s into String\", (");
+      emit_expr(c, arg, b);
+      buf_puts(b, ") ? \"true\" : \"false\")); (&(\"\\xff\")[1]); })");
+      return;
+    }
+    if (acn9) {
+      buf_puts(b, "({ (void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "); (void)(");
+      emit_expr_for_effect(c, arg, b);
+      buf_printf(b, "); sp_raise_cls(\"TypeError\", \"no implicit conversion of %s into String\"); (&(\"\\xff\")[1]); })", acn9);
+      return;
+    }
+  }
+  /* Root both operands when either may allocate: `a + b` evaluates both,
+     and a fresh heap string from one can be swept while the other
+     allocates or forces a GC (chained `a + b + c` with side-effecting
+     operands -- concat_chain_operand_gc_root). Recurses naturally: a
+     chain's left operand is itself a `+` and gets its own rooted block.
+     Pure literal / bare-read operands need no rooting. */
+  /* A poly operand (statically typed string here, holds a string at
+     runtime) must be coerced to a C string for sp_str_concat. */
+  /* emit_str_expr coerces both a TY_POLY operand (sp_poly_to_s) and the
+     unresolved-call gate's sp_raise_nomethod(...) (which is sp_RbVal, not a
+     const char*) to a C string, so a raise-all operand type-checks (#2457). */
+  /* `str + "lit"`: the literal cannot allocate and its byte length is
+     known here, so only the receiver needs evaluating (sp_str_plus_lit
+     roots it across its own allocation). */
+  {
+    NodeKind lk = nt_kind(nt, arg);
+    if (lk == NK_StringNode) {
+      const char *sc = nt_str(nt, arg, "content");
+      buf_puts(b, "sp_str_plus_lit(");
+      emit_str_expr(c, recv, b); buf_puts(b, ", ");
+      emit_expr(c, arg, b);
+      buf_printf(b, ", %zu)", sc ? nt_str_len(nt, arg, "content") : (size_t)0);
+      return;
+    }
+  }
+  /* (one-String mode: an operand that changes the left String in place,
+     `(o.a = s) + (s << "3")`, runs before the left's bytes are read; the
+     left is held as its handle) */
+  if (operand_may_change_string(c, arg)) {
+    int ta = ++g_tmp, tb = ++g_tmp;
+    buf_printf(b, "({ sp_String *_t%d = SP_STR_HDL(", ta); emit_str_expr(c, recv, b);
+    buf_printf(b, "); SP_GC_ROOT(_t%d); const char *_t%d = ", ta, tb);
+    emit_str_expr(c, arg, b);
+    buf_printf(b, "; SP_GC_ROOT(_t%d); sp_str_plus(SP_STR_B(_t%d), _t%d); })", tb, ta, tb);
+  }
+  else if (subtree_may_allocate(c, recv) || subtree_may_allocate(c, arg)) {
+    int ta = ++g_tmp, tb = ++g_tmp;
+    buf_printf(b, "({ const char *_t%d = ", ta); emit_str_expr(c, recv, b);
+    buf_printf(b, "; SP_GC_ROOT(_t%d); const char *_t%d = ", ta, tb);
+    emit_str_expr(c, arg, b);
+    buf_printf(b, "; SP_GC_ROOT(_t%d); sp_str_plus(_t%d, _t%d); })", tb, ta, tb);
+  }
+  else {
+    buf_puts(b, "sp_str_plus(");
+    emit_str_expr(c, recv, b); buf_puts(b, ", ");
+    emit_str_expr(c, arg, b);
+    buf_puts(b, ")");
+  }
 }
 
 static int emit_array_arith_call(Compiler *c, int id, Buf *b) {
@@ -18591,7 +19134,7 @@ static int emit_array_arith_call(Compiler *c, int id, Buf *b) {
                    tn, k, tr, k, tr,
                    ti, ti, tn, ti,
                    tj, tj, ta, tj,
-                   k, ONE_SA_KE(k), tr, ta, tj, nf, tr);
+                   k, typed_elem_store_sfx(rt), tr, ta, tj, nf, tr);
       }
     }
     return 1;
@@ -18621,8 +19164,8 @@ static int emit_array_arith_call(Compiler *c, int id, Buf *b) {
       ty_is_object(a0) && is_arith_op(name)) {
     int acls = ty_object_class(a0);
     MethodLookup ml = { .def_class = -1 };
-    int coerce_def = -1;
-    int coerce_mi = comp_method_in_chain(c, acls, "coerce", &coerce_def);
+    MethodLookup coerce_ml = { .def_class = -1 };
+    int coerce_mi = cplan_implied_target(c, id, argv[0], acls, "coerce", CIT_TABLE, &coerce_ml), coerce_def = coerce_ml.def_class;
     int op_mi = call_target(c, id, acls, name, 0, &ml);
     if (coerce_mi >= 0 && op_mi >= 0) {
       int tp = ++g_tmp;
@@ -18703,6 +19246,10 @@ static int emit_array_arith_call(Compiler *c, int id, Buf *b) {
         buf_printf(b, "); sp_raise_cls(\"TypeError\", \"%s can't be coerced into Integer\"); (sp_int)0; })", cn9);
         return 1;
       }
+      /* an object of a class with no #coerce (the call plan's answer, as
+         inference asks it): named by its class, as CRuby's rb_num_coerce
+         names it */
+      if (num_arg_cannot_coerce(c, id, argv[0])) { emit_coerce_type_error(c, recv, argv[0], "Integer", "sp_int", b); return 1; }
     }
     /* the same coercion rule on the Float side, which had no guard at all:
        `1.5 + nil` evaluated to nil and `1.5 + "s"` emitted double + char *
@@ -18733,82 +19280,13 @@ static int emit_array_arith_call(Compiler *c, int id, Buf *b) {
         buf_printf(b, "); sp_raise_cls(\"TypeError\", \"%s can't be coerced into Float\"); (sp_float)0; })", cn8);
         return 1;
       }
+      if (num_arg_cannot_coerce(c, id, argv[0])) { emit_coerce_type_error(c, recv, argv[0], "Float", "sp_float", b); return 1; }
     }
     if (rt == TY_STRING && sp_streq(name, "+")) {
-      /* `str + <non-string>` is a TypeError in CRuby (no implicit conversion);
-         a statically non-string, non-poly argument raises rather than emitting
-         an invalid sp_str_plus(str, int) C call (#2306) */
-      {
-        TyKind at9 = comp_ntype(c, argv[0]);
-        const char *acn9 =
-          at9 == TY_INT || at9 == TY_BIGINT ? "Integer" :
-          at9 == TY_FLOAT ? "Float" : at9 == TY_SYMBOL ? "Symbol" :
-          at9 == TY_NIL ? "nil" :   /* CRuby names the value, not NilClass */
-          ty_is_array(at9) ? "Array" : ty_is_hash(at9) ? "Hash" :
-          at9 == TY_RANGE ? "Range" : NULL;
-        if (at9 == TY_BOOL) {
-          /* true/false name the value at run time */
-          buf_puts(b, "({ (void)("); emit_expr_for_effect(c, recv, b);
-          buf_puts(b, "); sp_raise_cls(\"TypeError\", sp_sprintf(\"no implicit conversion of %s into String\", (");
-          emit_expr(c, argv[0], b);
-          buf_puts(b, ") ? \"true\" : \"false\")); (&(\"\\xff\")[1]); })");
-          return 1;
-        }
-        if (acn9) {
-          buf_puts(b, "({ (void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "); (void)(");
-          emit_expr_for_effect(c, argv[0], b);
-          buf_printf(b, "); sp_raise_cls(\"TypeError\", \"no implicit conversion of %s into String\"); (&(\"\\xff\")[1]); })", acn9);
-          return 1;
-        }
-      }
-      /* Root both operands when either may allocate: `a + b` evaluates both,
-         and a fresh heap string from one can be swept while the other
-         allocates or forces a GC (chained `a + b + c` with side-effecting
-         operands -- concat_chain_operand_gc_root). Recurses naturally: a
-         chain's left operand is itself a `+` and gets its own rooted block.
-         Pure literal / bare-read operands need no rooting. */
-      /* A poly operand (statically typed string here, holds a string at
-         runtime) must be coerced to a C string for sp_str_concat. */
-      /* emit_str_expr coerces both a TY_POLY operand (sp_poly_to_s) and the
-         unresolved-call gate's sp_raise_nomethod(...) (which is sp_RbVal, not a
-         const char*) to a C string, so a raise-all operand type-checks (#2457). */
-      /* `str + "lit"`: the literal cannot allocate and its byte length is
-         known here, so only the receiver needs evaluating (sp_str_plus_lit
-         roots it across its own allocation). */
-      {
-        NodeKind lk = nt_kind(nt, argv[0]);
-        if (lk == NK_StringNode) {
-          const char *sc = nt_str(nt, argv[0], "content");
-          buf_puts(b, "sp_str_plus_lit(");
-          emit_str_expr(c, recv, b); buf_puts(b, ", ");
-          emit_expr(c, argv[0], b);
-          buf_printf(b, ", %zu)", sc ? nt_str_len(nt, argv[0], "content") : (size_t)0);
-          return 1;
-        }
-      }
-      /* (one-String mode: an operand that changes the left String in place,
-         `(o.a = s) + (s << "3")`, runs before the left's bytes are read; the
-         left is held as its handle) */
-      if (operand_may_change_string(c, argv[0])) {
-        int ta = ++g_tmp, tb = ++g_tmp;
-        buf_printf(b, "({ sp_String *_t%d = SP_STR_HDL(", ta); emit_str_expr(c, recv, b);
-        buf_printf(b, "); SP_GC_ROOT(_t%d); const char *_t%d = ", ta, tb);
-        emit_str_expr(c, argv[0], b);
-        buf_printf(b, "; SP_GC_ROOT(_t%d); sp_str_plus(SP_STR_B(_t%d), _t%d); })", tb, ta, tb);
-      }
-      else if (subtree_may_allocate(c, recv) || subtree_may_allocate(c, argv[0])) {
-        int ta = ++g_tmp, tb = ++g_tmp;
-        buf_printf(b, "({ const char *_t%d = ", ta); emit_str_expr(c, recv, b);
-        buf_printf(b, "; SP_GC_ROOT(_t%d); const char *_t%d = ", ta, tb);
-        emit_str_expr(c, argv[0], b);
-        buf_printf(b, "; SP_GC_ROOT(_t%d); sp_str_plus(_t%d, _t%d); })", tb, ta, tb);
-      }
-      else {
-        buf_puts(b, "sp_str_plus(");
-        emit_str_expr(c, recv, b); buf_puts(b, ", ");
-        emit_str_expr(c, argv[0], b);
-        buf_puts(b, ")");
-      }
+      int boxed = repr_of(c, id).kind == RK_BOXED;
+      if (boxed) str_box_open(b, 0);
+      emit_string_add_bytes(c, recv, argv[0], b);
+      if (boxed) str_box_close(b);
       return 1;
     }
     if (rt == TY_STRING && sp_streq(name, "*")) {
@@ -19173,6 +19651,14 @@ static int emit_array_arith_call(Compiler *c, int id, Buf *b) {
         nt_kind(nt, recv) == NK_LocalVariableReadNode &&
         nt_kind(nt, argv[0]) == NK_LocalVariableReadNode &&
         nt_ref(nt, id, "block") < 0 && !nt_safe_nav(nt, id)) return 0;
+    /* a nil receiver (`nil + 1`, an ivar nothing sets: held as nil) whose
+       call the plan proves raises is the general call's, whose
+       missing-method gate raises CRuby's NoMethodError after the operands,
+       as for `nil.foo`; refusing made such a program a build failure */
+    if (recv >= 0 && repr_of(c, recv).as_ty == TY_NIL) {
+      char own[128];
+      if (cplan_unrouted(c, id, own, sizeof own, NULL) == CU_RAISES) return 0;
+    }
     unsupported(c, id, "arithmetic");
   }
   return 0;
@@ -19396,23 +19882,6 @@ void emit_brk_wrapped_call(Compiler *c, int id, Buf *b) {
   else if (inner.p && inner.p[0] && !stmt_form && !enum_walk && oint_kind(normal_ty) && node_is_oint(c, id))
     buf_printf(&boxed, "%s(%s)", oint_box(normal_ty), inner.p);
   else if (inner.p && inner.p[0]) emit_boxed_text(c, normal_ty, inner.p, &boxed);
-  /* --share-strings: a String method given a block that answers its
-     receiver (scan, each_char) answers, when no break is taken, the
-     receiver's own String: where the receiver holds the shared handle or a
-     box, the result is that box, not the bytes, so a change through the
-     result reaches every name of the receiver. The call's own text still
-     runs first (a boxed receiver's walk is inside it). */
-  if (!enum_walk && !stmt_form && spill < 0 && inner.p && inner.p[0] &&
-      brk_recv_is_pure(c, wrecv) && bop_share_self_answer(wname, 1) && wname[strlen(wname) - 1] != '!' &&
-      cplan_targets(c, id, NULL, 0) == 0 &&
-      (repr_of(c, wrecv).kind == RK_STRBUF ||
-       (repr_of(c, wrecv).kind == RK_BOXED && share_node_carries_handle(c, wrecv)))) {
-    Buf rb; memset(&rb, 0, sizeof rb);
-    emit_boxed(c, wrecv, &rb);
-    free(boxed.p); memset(&boxed, 0, sizeof boxed);
-    buf_printf(&boxed, "((void)(%s), %s)", inner.p, rb.p ? rb.p : "sp_box_nil()");
-    free(rb.p);
-  }
   if (!enum_walk) {
     emit_indent(g_pre, g_indent);
     buf_printf(g_pre, "_t%d = %s;\n", tR, boxed.p && boxed.p[0] ? boxed.p : "sp_box_nil()");
@@ -19572,35 +20041,6 @@ int class_struct_kind(Compiler *c, int cid) {
   return 0;
 }
 
-const char *const struct_names[] = {
-    "to_a", "values", "values_at", "dig", "each", "each_pair", "size",
-    "length", "[]", "[]=", NULL };
-/* The names an instance answers respond_to? for without an entry in its
-   class's method table: Enumerable's once the class includes the module
-   and has the `each` it serves (the synthesized __enum_to_a marks any
-   yielding `each`, include or not; a Struct is Enumerable without the
-   line), Comparable's once it includes that module and defines `<=>`, the
-   names a Struct and a Data carry from their core class. The typed fold
-   and the run-time check for a boxed receiver read this one list. The
-   Struct-only names are a Struct's, not a Data's, which answers none of
-   them in CRuby. */
-int class_implicit_responds(Compiler *c, int cid, const char *qm) {
-  if (comp_method_in_chain(c, cid, "__enum_to_a", NULL) >= 0 &&
-      name_is_enumerable_module_method(qm) &&
-      (class_struct_kind(c, cid) == 1 || class_mixes_in(c, cid, elab_module_named(c, "Enumerable"), 0))) return 1;
-  if (comp_method_in_chain(c, cid, "<=>", NULL) >= 0 &&
-      is_comparable_module_method(qm) &&
-      class_is_comparable(c, cid)) return 1;
-  int sk = class_struct_kind(c, cid);
-  if (!sk) return 0;
-  if (sp_streq(qm, "members") || sp_streq(qm, "to_h") ||
-      sp_streq(qm, "deconstruct") || sp_streq(qm, "deconstruct_keys")) return 1;
-  if (sk == 2) return sp_streq(qm, "with");
-  for (int i = 0; struct_names[i]; i++) if (sp_streq(qm, struct_names[i])) return 1;
-  return 0;
-}
-
-
 /* A method in `cid`'s chain that reflection must not report: a
    compiler-synthesized helper, or a generated Struct iterator on a Data
    class. */
@@ -19614,7 +20054,7 @@ int method_hidden_from_reflection(Compiler *c, int cid, const char *m) {
 /* ReflNames: codegen_call_arms.h */
 
 /* (1 where m is new to r) */
-static int refl_note(ReflNames *r, const char *m, int show) {
+int refl_note(ReflNames *r, const char *m, int show) {
   for (int i = 0; i < r->n; i++) if (sp_streq(r->v[i], m)) return 0;
   if (r->n >= r->cap) {
     r->cap = r->cap ? r->cap * 2 : 32;
@@ -19681,6 +20121,7 @@ static void refl_cand_note(void *ud, const char *nm, int vis) {
 void refl_own_instance_methods(Compiler *c, int ci, int pub, int prot, int priv,
                                       int with_modules, ReflNames *r) {
   ReflCand n = { c, r, pub, prot, priv };
+  r->vis_mask = (!!pub) | ((!!prot) << 1) | ((!!priv) << 2);
   mtab_build_enter(c);
   cplan_list_candidates(c, ci, with_modules ? 0 : CT_OWN, refl_cand_note, &n);
   mtab_build_leave(c);
@@ -19791,8 +20232,7 @@ void refl_class_singleton_methods(Compiler *c, int ci, int all, ReflNames *r) {
   mtab_build_leave(c);
 }
 
-static int cells_testable(Compiler *c, const CplanCells *cs);
-static int emit_cells_test(Compiler *c, const CplanCells *cs, Buf *b);
+static int emit_cells_test(Compiler *c, const CplanCells *cs, int tail, Buf *b);
 /* Emit the listed names of `r` as a PolyArray of symbols. Interned at run
    time: a name the source never spells is not in the generated symbol
    table. A name of the program's is left out where the call plan proves
@@ -19803,15 +20243,31 @@ void refl_emit_sym_array(Compiler *c, int cid, ReflNames *r, Buf *b) {
   int ta = ++g_tmp;
   buf_printf(b, "({ sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d); ", ta, ta);
   for (int i = 0; i < r->n; i++) {
-    if (!(r->show[i] & REFL_SHOWN)) continue;
-    if (cplan_undefined(c, cid, 0, r->v[i])) continue;
-    /* a class-side name whose versions the record cannot order against the list: listed where one of its
-       cells says it is live (cplan_cmethod_presence), as a respond_to? there answers; public versions only */
     CplanCells cs;
-    if (r->at && (r->at_side & CT_CMETHOD) && !(r->show[i] & REFL_ROW) &&
-        cplan_list_cells(c, r->at - 1, r->at_cls, r->v[i], (r->at_side & CT_OWN) != 0, &cs) && cells_testable(c, &cs)) {
+    int guarded = r->at && r->vis_mask && !(r->at_side & CT_CMETHOD) &&
+                  cplan_guarded_presence(c, r->at_cls, r->v[i], (r->at_side & CT_OWN) != 0, &cs);
+    /* a name whose versions the record cannot order against the list: listed where one of its cells says it is
+       live (cplan_list_cells), as a respond_to? there answers, of the visibilities the list shows, of a class-side
+       list or of a list of a class's own instance methods; the cells answer its visibility, so the table's,
+       which the list shows the name by otherwise, is not asked */
+    int cells = r->at && !guarded && (r->at_side & (CT_CMETHOD | CT_OWN)) && !(r->show[i] & REFL_ROW) &&
+                cplan_list_cells(c, r->at - 1, r->at_cls, r->at_side, r->v[i], r->vis_mask ? r->vis_mask : 3, &cs) &&
+                cplan_cells_testable(c, &cs);
+    if (guarded) {
       buf_puts(b, "if (");
-      int open = emit_cells_test(c, &cs, b);
+      emit_guarded_presence(c, &cs, b);
+      buf_printf(b, " & %d) ", r->vis_mask);
+    } else if (!cells) {
+      if (!(r->show[i] & REFL_SHOWN)) continue;
+      if (cplan_undefined(c, cid, 0, r->v[i])) continue;
+    }
+    if (cells) {
+      /* (where no version has run the list leaves the name out, its else: where no version answers for the
+         visibilities the list shows, the plan fixes that answer and the name is not listed) */
+      cs.els = 0;
+      if (cplan_cells_fixed(&cs)) continue;
+      buf_puts(b, "if (");
+      int open = emit_cells_test(c, &cs, 0, b);
       buf_puts(b, "0");
       while (open-- > 0) buf_puts(b, ")");
       buf_printf(b, ") sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", ta);
@@ -19819,7 +20275,7 @@ void refl_emit_sym_array(Compiler *c, int cid, ReflNames *r, Buf *b) {
       buf_puts(b, "))); ");
       continue;
     }
-    if (r->at && !(r->show[i] & REFL_ROW) && cplan_list_omits(c, r->at - 1, r->at_cls, r->at_side, r->v[i])) continue;
+    if (!guarded && r->at && !(r->show[i] & REFL_ROW) && cplan_list_omits(c, r->at - 1, r->at_cls, r->at_side, r->v[i])) continue;
     buf_printf(b, "sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(", ta);
     emit_str_literal(b, r->v[i]);
     buf_puts(b, "))); ");
@@ -20145,13 +20601,17 @@ int emit_value_methods_reflection(Compiler *c, int id, Buf *b) {
   return 1;
 }
 
-/* Does any user class answer respond_to?(qm) at run time, through a method of
-   its own or a name it carries implicitly? Decides whether a boxed receiver
+/* Does any user class answer respond_to?(qm) at run time, through a method or
+   an alias of its own (the call plan's table answer) or a name it carries
+   implicitly? Decides whether a boxed receiver
    asks the per-class check or only the builtin surface. */
 int any_class_responds(Compiler *c, const char *qm) {
   if (any_class_defines(c, qm)) return 1;
-  for (int k = 0; k < c->nclasses; k++)
-    if (class_implicit_responds(c, k, qm)) return 1;
+  for (int k = 0; k < c->nclasses; k++) {
+    CplanPresence pr;
+    cplan_table_presence(c, k, 0, qm, &pr);
+    if (pr.table || pr.implied) return 1;
+  }
   return 0;
 }
 const char *builtin_class_of_type(TyKind t);
@@ -20202,8 +20662,11 @@ static int mixes_in_builtin_module(Compiler *c, int k, int depth) {
   }
   return 0;
 }
-static int rt_probe_unfounded(Compiler *c, TyKind rt, const char *qm) {
+static int rt_probe_unfounded(Compiler *c, int id, TyKind rt, const char *qm) {
   const char *const *anc = builtin_value_ancestry(rt);
+  /* an undef_method of the name the value's own class's reopening has run where the call runs (the call plan) */
+  int own = anc && qm ? comp_builtin_class_named(c, anc[0]) : -1;
+  if (own >= 0 && cplan_undef_at(c, id, own, qm) == 1) return 1;
   if (!anc || !qm || builtin_instance_method_known(anc[0], qm) ||
       builtin_instance_method_known("Object", qm)) return 0;
   int foreign = 0;
@@ -20214,8 +20677,8 @@ static int rt_probe_unfounded(Compiler *c, TyKind rt, const char *qm) {
        a run-time call could tell. A Boolean then keeps the answer it had
        before it had a row here (the probe's); the kinds that had one keep
        theirs. */
-    int owns = comp_method_in_chain(c, k, qm, NULL) >= 0;
-    if (!owns && (rt != TY_BOOL || comp_method_in_chain(c, k, "respond_to_missing?", NULL) < 0)) continue;
+    int owns = call_target(c, id, k, qm, CT_REACH, NULL) >= 0;
+    if (!owns && (rt != TY_BOOL || call_target(c, -1, k, RESPOND_TO_MISSING_NAME, CT_METHODS, NULL) < 0)) continue;
     for (int a = 0; anc[a]; a++) if (sp_streq(anc[a], kn)) return 0;
     if (!owns) continue;
     if (is_builtin_reopen(kn)) foreign = 1;
@@ -20244,31 +20707,10 @@ static int rt_probe_unfounded(Compiler *c, TyKind rt, const char *qm) {
     int a = 0;
     while (kn && anc[a] && !sp_streq(anc[a], kn)) a++;
     if (!kn || !anc[a]) continue;
-    if (comp_method_in_chain(c, k, "respond_to_missing?", NULL) >= 0) return 0;
+    if (call_target(c, -1, k, RESPOND_TO_MISSING_NAME, CT_METHODS, NULL) >= 0) return 0;
     const char *al = comp_resolve_alias(c, k, qm);
     if (al && !sp_streq(al, qm)) return 0;
     if (mixes_in_builtin_module(c, k, 0)) return 0;
-  }
-  return 1;
-}
-/* Read the analyze-time `recv.<qm>` probes stashed on a respond_to? node: a
-   recognized method infers a concrete type, an unrecognized one stays UNKNOWN.
-   Reading the cached type is side-effect free (unlike emitting, which mutates
-   g_pre/g_tmp), so it is safe inside a live fold. Returns 0 when no probe was
-   synthesized (a non-literal method name). */
-int rt_probe_answer(Compiler *c, int id, int *yes) {
-  int pn = 0; const int *probes = nt_arr(c->nt, id, "rt_probes", &pn);
-  if (!probes || pn <= 0) return 0;
-  *yes = 0;
-  for (int p = 0; p < pn; p++) {
-    if (!repr_of(c, probes[p]).untyped) { *yes = 1; break; }
-    /* the probe itself never got the per-call-site rewrite that would
-       type it (K-026 cause A, enum_builtin_responds's comment): ask the
-       same receiver-type question that rewrite's gate would have. */
-    int precv = nt_ref(c->nt, probes[p], "receiver");
-    if (precv >= 0 && enum_builtin_responds(c, nt_str(c->nt, probes[p], "name"), infer_type(c, precv))) {
-      *yes = 1; break;
-    }
   }
   return 1;
 }
@@ -20281,7 +20723,7 @@ int rt_probe_answer(Compiler *c, int id, int *yes) {
 int respond_to_user_defined(Compiler *c, int id, int recv) {
   int any = 0;
   for (int k = 0; k < c->nclasses && !any; k++)
-    if (comp_method_in_class(c, k, "respond_to?") >= 0) any = 1;
+    if (call_target(c, -1, k, RESPOND_TO_NAME, CT_OWN, NULL) >= 0) any = 1;
   if (!any) return 0;
   /* the dispatch's default arm re-enters for a boxed value that is not an
      overriding class's, which answers by the fold */
@@ -20298,11 +20740,11 @@ int respond_to_user_defined(Compiler *c, int id, int recv) {
     if (ty_is_object(t)) k = ty_object_class(t);
     else if (tr.kind == RK_BOXED) {
       for (int j = 0; j < c->nclasses; j++)
-        if (c->classes[j].instantiated && comp_method_in_chain(c, j, "respond_to?", NULL) >= 0) return 1;
+        if (c->classes[j].instantiated && call_target(c, id, j, RESPOND_TO_NAME, CT_METHODS, NULL) >= 0) return 1;
       return 0;
     }
   }
-  return k >= 0 && comp_method_in_chain(c, k, "respond_to?", NULL) >= 0;
+  return k >= 0 && call_target(c, id, k, RESPOND_TO_NAME, CT_METHODS, NULL) >= 0;
 }
 
 /* Name `nm` of class k into the list its visibility answers by: `pub` for
@@ -20311,130 +20753,73 @@ void emit_responds_name(Compiler *c, int k, const char *nm, Buf *pub, Buf *priv)
   if (name_is_synth_method(c, nm) || comp_method_is_private_helper(c, k, nm) || is_initialize_family(nm)) return;
   /* a name class k or a class between it and the definer undefines
      (`undef_method :x` in a subclass) is answered by none of k's objects */
-  if (k >= 0 && comp_is_undeffed_in_chain(c, k, nm)) return;
-  Buf *b = comp_method_vis_in_chain(c, k, nm) == SP_VIS_PUBLIC ? pub : priv;
+  CplanPresence pr;
+  cplan_table_presence(c, k, 0, nm, &pr);
+  if (k >= 0 && pr.undef) return;
+  Buf *b = pr.vis == SP_VIS_PUBLIC ? pub : priv;
   buf_puts(b, "\"");
   emit_c_escaped(b, nm);
   buf_puts(b, "\", ");
 }
 
-/* The Class/Module surface every class object carries, `new` included (a
-   MODULE object answers everything here except `new`, which its callers gate).
-   One list, so a core class object and a user one answer alike (#3494). */
-/* Class's public instance methods beyond Object's, from ruby 4.0.1 */
-static const char *const cls_uni[] = {
-  "new", "allocate", "attached_object", "subclasses", "superclass",
-  "<", "<=", ">", ">=", "alias_method", "ancestors", "attr", "attr_accessor",
-  "attr_reader", "attr_writer", "autoload", "autoload?", "class_eval", "class_exec",
-  "class_variable_defined?", "class_variable_get", "class_variable_set",
-  "class_variables", "const_defined?", "const_get", "const_missing", "const_set",
-  "const_source_location", "constants", "define_method", "deprecate_constant",
-  "include", "include?", "included_modules", "instance_method", "instance_methods",
-  "method_defined?", "module_eval", "module_exec", "name", "prepend",
-  "private_class_method", "private_constant", "private_instance_methods",
-  "private_method_defined?", "protected_instance_methods", "protected_method_defined?",
-  "public_class_method", "public_constant", "public_instance_method",
-  "public_instance_methods", "public_method_defined?", "refinements",
-  "remove_class_variable", "remove_method", "set_temporary_name", "singleton_class?",
-  "undef_method", "undefined_instance_methods", NULL };
-static int class_object_universal_method(const char *qm) {
-  for (int u = 0; cls_uni[u]; u++) if (sp_streq(qm, cls_uni[u])) return 1;
-  return 0;
-}
-/* The ones a module object does not have: they are Class's own. */
-static int class_only_method(const char *qm) {
-  return sp_streq(qm, "new") || sp_streq(qm, "allocate") || sp_streq(qm, "attached_object") ||
-         sp_streq(qm, "subclasses") || sp_streq(qm, "superclass");
-}
-/* Class's or Module's private instance methods beyond Object's, which a
-   class object answers only to respond_to?(name, true). Not
-   ruby2_keywords, which spinel refuses (docs/limitations.md): code guarded
-   by respond_to?(:ruby2_keywords, true) skips it. */
-static int class_object_private_method(const char *qm, int is_module) {
-  static const char *const both[] = {
-    "const_added", "extended", "included", "method_added", "method_removed",
-    "method_undefined", "prepended", "private", "protected", "public", "remove_const",
-    "using", NULL };
-  static const char *const module_only[] = {
-    "append_features", "extend_object", "module_function", "prepend_features", "refine", NULL };
-  for (int u = 0; both[u]; u++) if (sp_streq(qm, both[u])) return 1;
-  if (!is_module) return sp_streq(qm, "inherited");
-  for (int u = 0; module_only[u]; u++) if (sp_streq(qm, module_only[u])) return 1;
-  return 0;
-}
-/* Does a class object (a module's when is_module) answer `qm` with one of
-   Class's or Module's own methods, public or private: what a bare call in
-   its body or in one of its class methods reaches? */
-int class_object_answers_builtin(const char *qm, int is_module) {
-  if (class_object_universal_method(qm)) return !(is_module && class_only_method(qm));
-  return class_object_private_method(qm, is_module);
-}
-
-/* Does class object ci answer `qm`, asked at call id: its own class
-   methods and singleton attrs only once one is defined where id runs, as
-   the plan says (cplan_cmethod_later), and every builtin one; -1 for no
-   call, the program's answer anywhere. */
-static int class_responds_builtin(Compiler *c, int ci, const char *qm);
-static int class_responds_to(Compiler *c, int ci, const char *qm, int id) {
-  if (!cplan_cmethod_later(c, id, ci, qm)) {
-    if (comp_cmethod_in_chain(c, ci, qm, NULL) >= 0) return 1;
-    /* singleton attr_accessor/reader/writer via class << self */
-    char base[256];
-    if (name_is_plain_setter(qm)) {
-      if (setter_base_name(qm, base, sizeof base) && comp_is_sg_writer(&c->classes[ci], base)) return 1;
-    }
-    else if (comp_is_sg_reader(&c->classes[ci], qm)) return 1;
+/* (the global of cell `cell` a test reads, which the C declares: a reader keeps each cell it reads
+   (ver_cells_settle), and one it did not keep is the plan's internal error, not C that fails to compile) */
+static LocalVar *cells_test_cell(Compiler *c, const char *cell) {
+  LocalVar *g = comp_gvar(c, cell + 1);
+  if (!g || cplan_cell_dropped(c, g)) {
+    fprintf(stderr, "spinel: internal error: a presence test reads the version cell %s, which no reader kept\n", cell);
+    exit(1);
   }
-  return class_responds_builtin(c, ci, qm);
+  return g;
 }
-/* ...with none of its program's class methods: the builtin ones */
-static int class_responds_builtin(Compiler *c, int ci, const char *qm) {
-  int is_module = comp_class_is_module(c, &c->classes[ci]);
-  /* A module's `module_function` methods are recorded class-level and were
-     already matched above. Its plain `def m` are instance methods, which the
-     module object itself does NOT respond to -- answering true for those made
-     `Greeter.respond_to?(:greet)` disagree with CRuby (#3467). */
-  /* builtin Class/Module methods every class object inherits; a module
-     lacks Class's own (`new`, `superclass`, ...) */
-  if (class_object_universal_method(qm)) return !(is_module && class_only_method(qm));
-  /* Exception's class-level `exception` */
-  if (is_exception_ctor_name(qm) && class_is_exc_subclass(c, ci)) return 1;
-  /* A Struct or Data CLASS object answers its record class's own builtins
-     (is_record_class_cmethod: `members`, a Struct's `keyword_init?`, ...)
-     the way its instances answer theirs (#3482), before a program's def of
-     one as after it, an anonymous `Struct.new(...)` too */
-  int sk = class_struct_kind(c, ci);
-  return sk && is_record_class_cmethod(qm, sk == 2);
+static void emit_cell_match(Compiler *c, const char *cell, int value, Buf *b) {
+  buf_printf(b, repr_slot_kind(c, cells_test_cell(c, cell)) == RK_BOXED ? "sp_poly_eq(gv_%s, sp_box_int(%dLL))" : "gv_%s == %d",
+             cell + 1, value);
+}
+/* ...the test that visibility cell vis holds a visibility mask counts (core_bit_of_vis; 0, a producer's that sets
+   none, counts the public one): the one it counts, or each but the one it leaves out */
+static void emit_vis_match(Compiler *c, const char *vis, int mask, Buf *b) {
+  const int order[3] = { SP_VIS_PUBLIC, SP_VIS_PROTECTED, SP_VIS_PRIVATE };
+  int in = 0, one = SP_VIS_PUBLIC, out = SP_VIS_PUBLIC;
+  if (!mask) mask = core_bit_of_vis(SP_VIS_PUBLIC);
+  for (int k = 0; k < 3; k++)
+    if (core_bit_of_vis(order[k]) & mask) in++, one = order[k];
+    else out = order[k];
+  if (in == 1) { emit_cell_match(c, vis, one, b); return; }
+  buf_puts(b, "!(");
+  emit_cell_match(c, vis, out, b);
+  buf_puts(b, ")");
 }
 /* See codegen_call_arms.h. */
-/* Do the cells hold values the run-time test compares (an Integer global: an sp_int, or an sp_RbVal under
-   --int-overflow=promote, compared as the entry's arms compare it)? */
-static int cells_testable(Compiler *c, const CplanCells *cs) {
+void emit_guarded_presence(Compiler *c, const CplanCells *cs, Buf *b) {
+  buf_puts(b, "(");
   for (int i = 0; i < cs->n; i++) {
-    LocalVar *g = comp_gvar(c, cs->cell[i] + 1);
-    ReprKind k = g ? repr_slot_kind(c, g) : RK_NONE;
-    if (k != RK_SCALAR && k != RK_BOXED) return 0;
-    LocalVar *v = cs->vis[i][0] ? comp_gvar(c, cs->vis[i] + 1) : NULL;
-    if (cs->vis[i][0] && (!v || (repr_slot_kind(c, v) != RK_SCALAR && repr_slot_kind(c, v) != RK_BOXED) || cplan_cell_dropped(c, v))) return 0;
+    emit_cell_match(c, cs->cell[i], cs->val[i], b);
+    if (cs->vis[i][0]) {
+      buf_puts(b, " ? (");
+      emit_cell_match(c, cs->vis[i], SP_VIS_PRIVATE, b);
+      buf_printf(b, " ? %d : ", core_bit_of_vis(SP_VIS_PRIVATE));
+      emit_cell_match(c, cs->vis[i], SP_VIS_PROTECTED, b);
+      buf_printf(b, " ? %d : %d) : ", core_bit_of_vis(SP_VIS_PROTECTED), core_bit_of_vis(SP_VIS_PUBLIC));
+    } else buf_printf(b, " ? %d : ", cs->ans[i]);
   }
-  return 1;
+  buf_printf(b, "%d)", cs->els);
 }
 /* ...the test that some version is live, ahead of the caller's last operand: each cell up to the last one that
    answers 0 (an undef's, a private version's, or a version's whose visibility cell tells) answers its own
    (`c == v ? ans : (`: the def's 1, the undef's 0, or `vis == public`), so a live version ahead of one is not
-   swallowed by its test; the cells after it are ored. How many parentheses the caller closes after its last
-   operand. */
-static int emit_cells_test(Compiler *c, const CplanCells *cs, Buf *b) {
-  int open = 0, last = -1;
-  for (int i = 0; i < cs->n; i++) if (!cs->ans[i] || cs->vis[i][0]) last = i;
-  for (int i = 0; i < cs->n; i++) {
-    buf_printf(b, repr_slot_kind(c, comp_gvar(c, cs->cell[i] + 1)) == RK_BOXED ? "sp_poly_eq(gv_%s, sp_box_int(%dLL))" : "gv_%s == %d",
-               cs->cell[i] + 1, cs->val[i]);
+   swallowed by its test; the cells after it are ored. tail is the value of that last operand: the versions at the
+   end that answer as it does need no test. How many parentheses the caller closes after its last operand. */
+static int emit_cells_test(Compiler *c, const CplanCells *cs, int tail, Buf *b) {
+  int open = 0, last = -1, n = cs->n;
+  while (n > 0 && !cs->vis[n - 1][0] && cs->ans[n - 1] == tail) n--;
+  for (int i = 0; i < n; i++) if (!cs->ans[i] || cs->vis[i][0]) last = i;
+  for (int i = 0; i < n; i++) {
+    emit_cell_match(c, cs->cell[i], cs->val[i], b);
     if (i > last) buf_puts(b, " || ");
     else if (cs->vis[i][0]) {
       buf_puts(b, " ? (");
-      buf_printf(b, repr_slot_kind(c, comp_gvar(c, cs->vis[i] + 1)) == RK_BOXED ? "sp_poly_eq(gv_%s, sp_box_int(%dLL))" : "gv_%s == %d",
-                 cs->vis[i] + 1, SP_VIS_PUBLIC);
+      emit_vis_match(c, cs->vis[i], cs->mask, b);
       buf_puts(b, ") : (");
       open++;
     }
@@ -20445,39 +20830,181 @@ static int emit_cells_test(Compiler *c, const CplanCells *cs, Buf *b) {
   }
   return open;
 }
-/* See codegen_call_arms.h. Each cell holds an Integer as the entries' arms
-   read it (emit_cells_test) */
-int emit_vis_cell_write(Compiler *c, int id, Buf *b) {
-  const LocalVar *g;
-  int v = 0, n = 0;
-  for (int k = 0; cplan_vis_cell_after(c, id, k, &g, &v); k++) {
-    if (!g) continue;
-    if (n++) buf_puts(b, ", ");
-    buf_printf(b, repr_slot_kind(c, g) == RK_BOXED ? "gv_%s = sp_box_int(%dLL)" : "gv_%s = %dLL", g->name, v);
+int emit_implied_entry_test(Compiler *c, int mi, int undefined, Buf *b) {
+  const char *selector = undefined ? NULL : cplan_conditional_entry_selector(c, mi);
+  if (selector) {
+    const char *name = selector + 1;
+    const LocalVar *g = comp_gvar(c, name);
+    if (repr_slot_kind(c, g) == RK_BOXED)
+      buf_printf(b, "({ sp_RbVal _sel = gv_%s; _sel.tag == SP_TAG_INT && _sel.v.i > 0; })", name);
+    else if (gvar_is_oint(c, g))
+      buf_printf(b, "({ sp_oint _sel = gv_%s; !_sel.nil && _sel.v > 0; })", name);
+    else buf_printf(b, "(gv_%s > 0)", name);
+    return 1;
   }
-  return n > 0;
-}
-int emit_respond_to_cells(Compiler *c, int id, const char *qm, int argc, const int *argv, Buf *b) {
-  int all = argc >= 2 && nt_kind(c->nt, argv[1]) == NK_TrueNode, ci = cplan_presence_class(c, id);
-  CplanCells cs;
-  if (ci < 0 || !cplan_cmethod_presence(c, id, ci, qm, all, 0, &cs) || !cells_testable(c, &cs)) return 0;
-  if (!b) return 1;
-  buf_puts(b, repr_of(c, id).kind == RK_BOXED ? "sp_box_bool(" : "(");
-  int open = emit_cells_test(c, &cs, b);
-  buf_printf(b, "%d", cs.els || class_responds_builtin(c, ci, qm) || (all && class_object_private_method(qm, comp_class_is_module(c, &c->classes[ci]))));
-  while (open-- >= 0) buf_puts(b, ")");
+  CplanCells cells;
+  if (!cplan_implied_entry_cells(c, mi, undefined, &cells) || !cplan_cells_testable(c, &cells)) return 0;
+  int open = emit_cells_test(c, &cells, 0, b);
+  buf_puts(b, "0");
+  while (open-- > 0) buf_puts(b, ")");
   return 1;
 }
 
-int class_value_responds(Compiler *c, int tv, const char *qm, Buf *b) {
-  int any = (class_reopen_cmethod(c, -1, -1, qm) >= 0);
-  for (int k = 0; k < c->nclasses && !class_object_universal_method(qm); k++) any |= class_responds_to(c, k, qm, -1);
-  if (!any || !b) return any;
-  buf_printf(b, " || (_t%d.tag == SP_TAG_CLASS && (_t%d.cls_id < 0 || _t%d.cls_id == SP_CLASS_BY_NAME ? %d : (0", tv, tv, tv,
-             class_object_universal_method(qm) || (class_reopen_cmethod(c, -1, -1, qm) >= 0));
-  for (int k = 0; k < c->nclasses; k++) if (class_responds_to(c, k, qm, -1)) buf_printf(b, " || _t%d.cls_id == %d", tv, k);
-  buf_puts(b, ")))");
+/* See codegen_call_arms.h. */
+int emit_cells_answer(Compiler *c, const CplanCells *cs, Buf *b) {
+  int fixed = cplan_cells_fixed(cs);
+  if (!fixed && !cplan_cells_testable(c, cs)) return 0;
+  if (!b) return 1;
+  /* (every version answers as none live: no cell to read) */
+  if (fixed) { buf_printf(b, "%d", cs->els); return 1; }
+  buf_puts(b, "(");
+  int open = emit_cells_test(c, cs, cs->els, b);
+  buf_printf(b, "%d", cs->els);
+  while (open-- >= 0) buf_puts(b, ")");
   return 1;
+}
+/* Does an instance of class cid have m as a builtin method of any visibility: one the lookup from its builtin
+   root finds (Kernel's through Object), or one a builtin module it includes or prepends has, directly or through
+   a program module (class_mixes_in)? */
+static int class_builtin_has_method(Compiler *c, int cid, const char *m) {
+  if (builtin_id_has_instance_method(class_builtin_parent(c, cid), m)) return 1;
+  for (int i = 0, mod; builtin_class_at(i); i++)
+    if ((mod = builtin_mixin_module_id(builtin_class_at(i)->name)) && class_mixes_in(c, cid, mod, 0) &&
+        builtin_id_has_instance_method(mod, m))
+      return 1;
+  return 0;
+}
+/* See codegen_call_arms.h. Each cell holds an Integer as the entries' arms
+   read it (emit_cells_test) */
+/* See codegen_call_arms.h. */
+int emit_vis_word_absent(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  if (visibility_of_name(nt_str(nt, id, "name")) <= BVIS_MODULE_FUNCTION) return 0;
+  int vcid = g_class_body_id >= 0 ? g_class_body_id : (comp_scope_of(c, id) ? comp_scope_of(c, id)->class_id : -1);
+  int vargs = vcid >= 0 ? nt_ref(nt, id, "arguments") : -1, van = 0;
+  const int *vav = vargs >= 0 ? nt_arr(nt, vargs, "arguments", &van) : NULL;
+  /* (one Array's names in its place, `private [:a, :b]`) */
+  int arr = van == 1 && nt_kind(nt, vav[0]) == NK_ArrayNode;
+  if (arr) vav = nt_arr(nt, vav[0], "elements", &van);
+  for (int vi = 0; vi < van; vi++) {
+    NodeKind vak = nt_kind(nt, vav[vi]);
+    const char *mn = NULL;
+    if (vak == NK_SymbolNode) mn = nt_str(nt, vav[vi], "value");
+    else if (vak == NK_StringNode) mn = nt_str(nt, vav[vi], "unescaped");
+    else if (vak == NK_DefNode && nt_ref(nt, vav[vi], "receiver") >= 0) mn = nt_str(nt, vav[vi], "name");
+    if (!mn) continue;
+    char wb[256]; wb[0] = '\0';
+    setter_base_name(mn, wb, sizeof wb);
+    /* the name is defined where the word runs: a def, or a reader or
+       writer whose attr_* has run by this call, as the call plan
+       answers at it, or, in a class body, whose form applies a word on
+       one, a builtin method the class has (Kernel's puts, Comparable's
+       between?). A method body's word has no form that applies it to a
+       builtin method yet: a name it takes raises, as it did, and an
+       Array's, which it read none of, still does not */
+    int found = call_target(c, id, vcid, mn, CT_NOFACE, NULL) >= 0 ||
+                call_attr_target(c, id, vcid, mn, CT_ATTR, NULL) ||
+                (wb[0] && call_attr_target(c, id, vcid, wb, CT_ATTR | CT_WRITER, NULL)) ||
+                ((g_class_body_id >= 0 || arr) && class_builtin_has_method(c, vcid, mn));
+    if (!found) {
+      const char *cn = class_ruby_name(c, vcid) ? class_ruby_name(c, vcid) : c->classes[vcid].name;
+      buf_puts(b, "sp_raise_cls(\"NameError\", \"undefined method '");
+      emit_c_escaped(b, mn);
+      buf_puts(b, comp_class_is_module(c, &c->classes[vcid]) ? "' for module '" : "' for class '");
+      emit_c_escaped(b, cn);
+      buf_puts(b, "'\")");
+      return 1;
+    }
+  }
+  return 0;
+}
+int emit_vis_cell_write(Compiler *c, int id, Buf *b) {
+  const LocalVar *g;
+  int v = 0, n = 0, only;
+  for (int k = 0; cplan_vis_cell_after(c, id, k, &g, &v, &only); k++) {
+    if (!g) continue;
+    if (n++) buf_puts(b, ", ");
+    if (only >= 0) buf_printf(b, "_sp_cls.cls_id == %d ? (void)(", only);   /* (the class the include ran on) */
+    buf_printf(b, repr_slot_kind(c, g) == RK_BOXED ? "gv_%s = sp_box_int(%dLL)" : "gv_%s = %dLL", g->name, v);
+    if (only >= 0) buf_puts(b, ") : (void)0");
+  }
+  return n > 0;
+}
+/* See codegen_call_arms.h. */
+void emit_presence_answer(Compiler *c, const CplanPresArm *a, Buf *b) {
+  if (a->ans == PRA_CELLS) emit_cells_answer(c, &a->cells, b);
+  else buf_printf(b, "%d", a->ans);
+}
+/* See codegen_call_arms.h. */
+void emit_presence_arms(Compiler *c, const CplanPresList *l, const char *key, Buf *b) {
+  for (int i = 0; i < l->n; i++) {
+    buf_printf(b, "%s%d ? ", key, l->arm[i].cls);
+    emit_presence_answer(c, &l->arm[i], b);
+    buf_puts(b, " : ");
+  }
+}
+/* See codegen_call_arms.h. */
+void emit_presence_object(Compiler *c, const CplanPresList *l, int recv, Buf *b) {
+  int t = ++g_tmp;
+  char key[24];
+  snprintf(key, sizeof key, "_k%d == ", t);
+  buf_printf(b, "({ void *_p%d = (void *)(", t);
+  if (recv >= 0) emit_expr(c, recv, b);
+  else buf_puts(b, g_self);
+  buf_printf(b, "); sp_int _k%d = _p%d ? sp_obj_cls_id_of(_p%d) : -1; ", t, t, t);
+  if (l->nil >= 0) buf_printf(b, "_p%d == NULL ? %d : ", t, l->nil);
+  emit_presence_arms(c, l, key, b);
+  buf_puts(b, "0; })");
+}
+/* (what the version cells *cs answer at the run, els where none of their versions is live: a parenthesized C
+   truth value) */
+static void emit_class_cells_answer(Compiler *c, const CplanCells *cs, int els, Buf *b) {
+  buf_puts(b, "(");
+  int open = emit_cells_test(c, cs, els, b);
+  buf_printf(b, "%d", els);
+  while (open-- >= 0) buf_puts(b, ")");
+}
+int emit_respond_to_cells(Compiler *c, int id, int recv, TyKind rt, const char *qm, int argc, const int *argv, Buf *b) {
+  int all = argc >= 2 && nt_kind(c->nt, argv[1]) == NK_TrueNode, ci = cplan_presence_class(c, id);
+  CplanCells cs;
+  /* an instance's, or self's in an instance method: the plan's list (cplan_presence_list) */
+  CplanPresList l;
+  if (cplan_presence_list(c, id, rt, &l) && l.form == PRL_OBJECT) {
+    int boxed = repr_of(c, id).kind == RK_BOXED;
+    if (b && boxed) buf_puts(b, "sp_box_bool(");
+    if (b) emit_presence_object(c, &l, recv, b);
+    if (b && boxed) buf_puts(b, ")");
+    cplan_presence_list_free(&l);
+    return 1;
+  }
+  cplan_presence_list_free(&l);
+  if (ci < 0 || !cplan_cmethod_presence(c, id, ci, qm, all ? 7 : 1, 0, &cs) || !cplan_cells_testable(c, &cs)) return 0;
+  if (!b) return 1;
+  int els = cs.els || cplan_class_builtin_responds(c, ci, qm) || (all && class_object_private_method(qm, comp_class_is_module(c, &c->classes[ci])));
+  buf_puts(b, repr_of(c, id).kind == RK_BOXED ? "sp_box_bool" : "");
+  emit_class_cells_answer(c, &cs, els, b);
+  return 1;
+}
+/* The plan's arms for a class value's respond_to?(qm) at call id (cplan_class_value_presence), asked once a site:
+   *asked is -1 until they are, then their answer; the caller frees l where it is 1 */
+int class_value_arms(Compiler *c, int id, const char *qm, CplanPresList *l, int *asked) {
+  if (*asked < 0) *asked = cplan_class_value_presence(c, id, qm, l);
+  return *asked;
+}
+/* A class value's respond_to? held in _t<tv>, after the builtin's answer: the arms l (class_value_arms), each
+   class's own answer */
+void class_value_responds(Compiler *c, const CplanPresList *l, int tv, Buf *b) {
+  buf_printf(b, " || (_t%d.tag == SP_TAG_CLASS && (_t%d.cls_id < 0 || _t%d.cls_id == SP_CLASS_BY_NAME ? %d : (0", tv, tv, tv, l->other);
+  for (int i = 0; i < l->n; i++) {
+    const CplanPresArm *a = &l->arm[i];
+    if (a->ans == PRA_NO) continue;
+    buf_printf(b, " || %s_t%d.cls_id == %d", a->ans == PRA_CELLS ? "(" : "", tv, a->cls);
+    if (a->ans != PRA_CELLS) continue;
+    buf_puts(b, " && ");
+    emit_class_cells_answer(c, &a->cells, a->cells.els, b);
+    buf_puts(b, ")");
+  }
+  buf_puts(b, ")))");
 }
 
 /* The same for a name known only at run time: a class value answers the
@@ -20494,6 +21021,13 @@ static void class_value_name_once(Buf *b, Buf *seen, const char *nm) {
   buf_putn(seen, nm, n + 1);
   buf_puts(b, "\""); emit_c_escaped(b, nm); buf_puts(b, "\", ");
 }
+typedef struct { Compiler *c; Buf *b, *seen; } ClassValueNames;
+/* one class-side name of the call plan's list that a respond_to? answers: a public one (the helper has no include_all),
+   and not the compiler's own */
+static void class_value_name(void *ud, const char *name, int vis) {
+  const ClassValueNames *o = ud;
+  if (vis == SP_VIS_PUBLIC && !name_is_synth_method(o->c, name)) class_value_name_once(o->b, o->seen, name);
+}
 void class_value_responds_runtime(int tv, Buf *b) {
   buf_printf(b, " || sp_class_value_responds(_t%d, _n%d)", tv, tv);
 }
@@ -20506,10 +21040,11 @@ void emit_class_value_responds_helper(Compiler *c, const char *const *texts, int
   Buf uni, cls_only, reopen;
   memset(&uni, 0, sizeof uni); memset(&cls_only, 0, sizeof cls_only); memset(&reopen, 0, sizeof reopen);
   /* the Class/Module surface, split by what a module object lacks */
-  for (int u = 0; cls_uni[u]; u++) {
-    buf_puts(class_only_method(cls_uni[u]) ? &cls_only : &uni, "\"");
-    emit_c_escaped(class_only_method(cls_uni[u]) ? &cls_only : &uni, cls_uni[u]);
-    buf_puts(class_only_method(cls_uni[u]) ? &cls_only : &uni, "\", ");
+  for (int u = 0; class_object_universal_name(u); u++) {
+    const char *nm = class_object_universal_name(u);
+    buf_puts(class_only_method(nm) ? &cls_only : &uni, "\"");
+    emit_c_escaped(class_only_method(nm) ? &cls_only : &uni, nm);
+    buf_puts(class_only_method(nm) ? &cls_only : &uni, "\", ");
   }
   /* a `class Class` reopening's methods, every class's */
   Buf seen;
@@ -20522,30 +21057,15 @@ void emit_class_value_responds_helper(Compiler *c, const char *const *texts, int
   }
   free(seen.p);
   buf_printf(b, "static sp_bool sp_class_value_responds(sp_RbVal v, const char *n) {\n  if (v.tag != SP_TAG_CLASS) return 0;\n  if (sp_str_in_list(n, (const char *const[]){%sNULL})) return 1;\n  sp_bool r = 0;\n  switch (v.cls_id) {", uni.p ? uni.p : "");
-  /* the class methods of the program, asked of each class's chain */
-  int ncm = 0, *cms = malloc(sizeof(int) * (size_t)(c->nscopes > 0 ? c->nscopes : 1));
-  for (int s = 0; s < c->nscopes; s++) {
-    const Scope *sc = &c->scopes[s];
-    /* (one the program compiles: an uncompiled one no dispatch arm calls) */
-    if (sc->name && sc->is_cmethod && sc->reachable && !sc->is_proc_form && !name_is_synth_method(c, sc->name)) cms[ncm++] = s;
-  }
+  /* the class methods of the program, asked of each class's chain: the names the call plan lists for the class's side */
   for (int k = 0; k < c->nclasses; k++) {
     if (k == comp_core_class(c, CORE_CLASS_REOPEN)) continue;
     int is_module = comp_class_is_module(c, &c->classes[k]);
     Buf nb;
     memset(&nb, 0, sizeof nb);
     memset(&seen, 0, sizeof seen);
-    for (int i = 0; i < ncm; i++)
-      if (comp_cmethod_in_chain(c, k, c->scopes[cms[i]].name, NULL) == cms[i])
-        class_value_name_once(&nb, &seen, c->scopes[cms[i]].name);
-    for (int p = k; p >= 0; p = c->classes[p].parent) {
-      ClassInfo *ci = &c->classes[p];
-      for (int r = 0; r < ci->nsg_readers; r++) class_value_name_once(&nb, &seen, ci->sg_readers[r]);
-      for (int w = 0; w < ci->nsg_writers; w++) {
-        char wn[260];
-        if (snprintf(wn, sizeof wn, "%s=", ci->sg_writers[w]) < (int)sizeof wn) class_value_name_once(&nb, &seen, wn);
-      }
-    }
+    ClassValueNames cvn = { c, &nb, &seen };
+    cplan_list_candidates(c, k, CT_CMETHOD, class_value_name, &cvn);
     free(seen.p);
     /* a class with no names of its own answers by the default's; a module
        answers neither Class's own methods nor the reopening's */
@@ -20565,7 +21085,6 @@ void emit_class_value_responds_helper(Compiler *c, const char *const *texts, int
   if (cls_only.len) buf_printf(b, "sp_str_in_list(n, (const char *const[]){%sNULL}) || ", cls_only.p);
   if (reopen.len) buf_printf(b, "sp_str_in_list(n, (const char *const[]){%sNULL}) || ", reopen.p);
   buf_puts(b, "0; break; }\n  return r;\n}\n");
-  free(cms);
   free(uni.p); free(cls_only.p); free(reopen.p);
 }
 
@@ -20577,9 +21096,10 @@ void emit_class_value_responds_helper(Compiler *c, const char *const *texts, int
    otherwise the call's literal block (if any) is lowered here. */
 void emit_cmethod_block_arg(Compiler *c, int id, Scope *cm, int blk_tmp, Buf *b) {
   if (!cm->blk_param || !cm->blk_param[0] || cm->yields) return;
+  if (cm->nparams > 0 || cmethod_takes_self_cls(c, cm)) buf_puts(b, ", ");
+  if (blk_tmp >= 0) { buf_printf(b, "_t%d", blk_tmp); return; }
   int blk0 = nt_ref(c->nt, id, "block");
   int blk_node = resolve_forwarded_block(c, blk0);
-  if (cm->nparams > 0 || cmethod_takes_self_cls(c, cm)) buf_puts(b, ", ");
   /* a forwarded block inside a body inlined for a caller that handed it a
      real proc (`fw(&pr)`) is that proc (forwarded_real_proc) */
   const char *fwd = forwarded_real_proc(blk0, blk_node);
@@ -20599,19 +21119,7 @@ void emit_cmethod_block_arg(Compiler *c, int id, Scope *cm, int blk_tmp, Buf *b)
     }
     buf_puts(b, "NULL"); return;
   }
-  if (blk_tmp < 0) {
-    blk_tmp = ++g_tmp;
-    Buf pb; memset(&pb, 0, sizeof pb);
-    emit_proc_literal(c, blk_node, &pb);
-    emit_indent(g_pre, g_indent);
-    buf_printf(g_pre, "sp_Proc *_t%d = %s;\n", blk_tmp, pb.p ? pb.p : "NULL");
-    /* Root the proc box: an allocating argument evaluated after this hoist
-       (or the callee prologue) may GC before the callee roots lv_blk. */
-    emit_indent(g_pre, g_indent);
-    buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", blk_tmp);
-    free(pb.p);
-  }
-  buf_printf(b, "_t%d", blk_tmp);
+  buf_printf(b, "_t%d", hoist_block_proc(c, blk_node));
 }
 
 /* Emit a compile-time trampoline that lets a compiled Ruby method be passed as
@@ -20692,14 +21200,31 @@ static const char *emit_ffi_cb_trampoline(Compiler *c, int cbidx, int mi) {
   }
   else {
     const char *rc = ffi_c_type(k->ret_spec);
-    TyKind rt = method_is_void(ts) ? TY_NIL : ts->ret;
+    TyKind rt = method_is_void(ts) ? TY_NIL : repr_method_ret_storage(ts);
     /* A C integer or double return takes no nil: the ffi gem's NUM2INT /
        NUM2DBL raise TypeError for it, where the trampoline handed C the 0
        under a boxed nil's tag, or the slot's nil as a number. */
     int dbl = sp_streq(k->ret_spec, "float") || sp_streq(k->ret_spec, "double");
-    int num = dbl || (!sp_streq(k->ret_spec, "ptr") && !sp_streq(k->ret_spec, "bool"));
+    int string = ffi_spec_is_str(k->ret_spec);
+    int num = !string && !sp_streq(k->ret_spec, "ptr") && !sp_streq(k->ret_spec, "bool");
     Buf val; memset(&val, 0, sizeof val);   /* the value C gets */
-    if (rt == TY_POLY || rt == TY_UNKNOWN) {
+    if (string) {
+      if (rt == TY_NIL) buf_printf(&val, "(%s, (const char *)NULL)", call.p);
+      else if (rt == TY_STRBUF || (ty_is_object(rt) && comp_ary_is_str(c, ty_object_class(rt))))
+        buf_printf(&val, "sp_strbuf_read((sp_String *)%s)", call.p);
+      else {
+        buf_puts(&val, "({ sp_RbVal v = ");
+        emit_boxed_ret_call(c, ts, call.p, &val);
+        buf_puts(&val, "; sp_poly_nil_p(v) ? NULL : sp_poly_arg_str_chk(v); })");
+      }
+      if (sp_streq(k->ret_spec, "binstr")) {
+        buf_printf(pb, "const char *s = %s; size_t len = s ? sp_str_byte_len(s) : 0; "
+                       "if (len > INT_MAX) sp_raise_cls(\"RangeError\", \"binary callback result too large\"); "
+                       "sp_ffi_bin_len = (int)len; %sreturn s;\n}\n", val.p, out);
+        free(val.p); val.p = NULL;
+      }
+    }
+    else if (rt == TY_POLY || rt == TY_UNKNOWN) {
       if (sp_streq(k->ret_spec, "ptr"))                             buf_printf(&val, "(%s)(%s).v.p", rc, call.p);
       else if (dbl) buf_printf(&val, "(%s)sp_ffi_dbl_of(%s)", rc, call.p);
       else if (num) buf_printf(&val, "(%s)sp_ffi_int_of(%s)", rc, call.p);
@@ -20816,12 +21341,12 @@ int class_includes_module(Compiler *c, int cid, int mod) {
    not one of them -- only a reopen of that builtin could be. */
 static int json_user_to_json_any(Compiler *c) {
   for (int k = 0; k < c->nclasses; k++) {
-    int mi = comp_method_in_chain(c, k, "to_json", NULL);
+    int mi = comp_name_responder(c, k, "to_json", 0);
     if (mi >= 0 && !c->scopes[mi].is_cmethod) return 1;
   }
   return 0;
 }
-int json_to_json_is_builtin(Compiler *c, int recv) {
+int json_to_json_is_builtin(Compiler *c, int id, int recv) {
   Repr rr = repr_of(c, recv);
   TyKind rt = rr.as_ty;
   /* A BOXED receiver goes through the generator too. It used to be declined
@@ -20850,7 +21375,7 @@ int json_to_json_is_builtin(Compiler *c, int recv) {
      unresolved, where CRuby answers "#<struct S x=1>" (#4387). */
   if (ty_is_object(rt)) {
     int oc = ty_object_class(rt);
-    return oc >= 0 && comp_method_in_chain(c, oc, "to_json", NULL) < 0;
+    return oc >= 0 && call_target(c, id, oc, "to_json", 0, NULL) < 0;
   }
   const char *bn = ty_is_hash(rt) ? "Hash"
                  : ty_is_array(rt) ? "Array"
@@ -20860,7 +21385,7 @@ int json_to_json_is_builtin(Compiler *c, int recv) {
                  : rt == TY_SYMBOL ? "Symbol" : NULL;
   if (bn) {
     int bc = comp_builtin_class_named(c, bn);
-    if (bc >= 0 && comp_method_in_chain(c, bc, "to_json", NULL) >= 0) return 0;
+    if (bc >= 0 && call_target(c, id, bc, "to_json", 0, NULL) >= 0) return 0;
   }
   return 1;
 }
@@ -21169,6 +21694,13 @@ const char *builtin_method_params(const char *owner, const char *m, int *in_c) {
     }
   return NULL;
 }
+/* See builtin_names.h: a "key" or "keyrest" entry among the parameters; a method the facts do not list takes none known. */
+int builtin_method_takes_keywords(const char *owner, const char *m) {
+  const char *ps = builtin_method_params(owner, m, NULL);
+  for (const char *e = ps; e && *e; e = strchr(e, ' ') ? strchr(e, ' ') + 1 : NULL)
+    if (!strncmp(e, "key", 3)) return 1;   /* (key:name, keyrest:name) */
+  return 0;
+}
 /* Does any builtin class or module have a class method `m` (Integer.sqrt)? */
 int builtin_cmethod_name_known(const char *m) {
   for (int i = 0; m && sp_builtin_cmeth_arity_spec_tbl[i].cls; i++)
@@ -21236,10 +21768,19 @@ int builtin_cmethod_known(const char *cls, const char *name) {
 }
 
 /* Does any builtin class or module have a class method of this name? */
+static int cmeth_name_cmp(const void *a, const void *b) { return strcmp(*(const char *const *)a, *(const char *const *)b); }
+/* (the names sorted at the first ask and searched, not the rows read in turn: it is asked of every call on a class value) */
 int builtin_cmethod_known_any(const char *name) {
-  for (int i = 0; name && sp_builtin_cmeth_arity_spec_tbl[i].cls; i++)
-    if (sp_streq(sp_builtin_cmeth_arity_spec_tbl[i].m, name)) return 1;
-  return 0;
+  enum { N = sizeof sp_builtin_cmeth_arity_spec_tbl / sizeof sp_builtin_cmeth_arity_spec_tbl[0] - 1 };
+  static const char *names[N];
+  static int sorted;
+  if (!name) return 0;
+  if (!sorted) {
+    for (int i = 0; i < N; i++) names[i] = sp_builtin_cmeth_arity_spec_tbl[i].m;
+    qsort(names, N, sizeof names[0], cmeth_name_cmp);
+    sorted = 1;
+  }
+  return bsearch(&name, names, N, sizeof names[0], cmeth_name_cmp) != NULL;
 }
 
 static void refl_builtin_cls_rows(const char *k, const char *skip, ReflNames *r) {
@@ -21311,6 +21852,7 @@ static const char *const bop_arity_kw_rows[][2] = {
   {"Rational", "round"}, {"Rational", "floor"}, {"Rational", "ceil"}, {"Rational", "truncate"},  /* half: */
   {"Proc", "parameters"},   /* lambda: */
   {"String", "unpack"},     /* offset: */
+  {"String", "lines"}, {"String", "each_line"},  /* chomp: */
   {"Array", "pack"},        /* buffer: */
   {"Queue", "pop"}, {"Queue", "shift"}, {"Queue", "deq"},    /* timeout: */
   {"Queue", "push"}, {"Queue", "<<"}, {"Queue", "enq"},      /* timeout: (SizedQueue's) */
@@ -21649,7 +22191,7 @@ static int class_arity_spec_row(Compiler *c, int id, const char *cls, const char
   for (int i = 0; a; a = builtin_ancestor_at(cls, ++i)) {
     if (i > 0 && is_builtin_module_name(a)) continue;
     int ci = i > 0 ? comp_class_index(c, a) : -1;
-    if (ci >= 0 && cplan_cmethod_target(c, id, ci, name) >= 0) return 0;
+    if (ci >= 0 && cplan_cmethod_target(c, id, ci, name, 0) >= 0) return 0;
     if (arity_spec_find(sp_builtin_cmeth_arity_spec_tbl, a, name, 0)) {
       if (kwh && !hash_counted(c, id, a, name, 1, argc)) return 0;
       return arity_spec_row(sp_builtin_cmeth_arity_spec_tbl, a, name, with_block, *argc, exp, n);
@@ -21768,7 +22310,8 @@ static int arity_violation(Compiler *c, int id, int non_nil, char *exp, size_t n
       int ocid = ty_object_class(rt);
       if (ocid >= 0 && ocid < c->nclasses &&
           !call_answers(c, id, ocid, name, 0, NULL) &&
-          !comp_writer_in_chain(c, ocid, name, NULL))
+          /* (the plan's answer for a writer of the name, read through call_target) */
+          !call_attr_target(c, id, ocid, name, CT_ATTR | CT_WRITER, NULL))
         bcn = c->classes[ocid].is_native_class ? c->classes[ocid].name
             : c->classes[ocid].is_struct ? "Struct"
             : c->classes[ocid].is_data ? "Data" : "Object";
@@ -22086,7 +22629,7 @@ static int poly_arity_plan(Compiler *c, int id, int non_nil, int mm_aside, const
      the classes were walked at every boxed dispatch, #10546) */
   if (comp_any_class_accessor(c, name)) return 0;
   for (int k = 0; nmm < 0 && k < c->nclasses; k++)
-    if (comp_method_in_chain(c, k, "method_missing", NULL) >= 0) return 0;
+    if (call_target(c, id, k, METHOD_MISSING_NAME, CT_METHODS, NULL) >= 0) return 0;
   return poly_arity_rows(c, id, name, with_block, argc, kwh, 0, tests, exps);
 }
 
@@ -22101,7 +22644,7 @@ static int poly_arity_rows(Compiler *c, int id, const char *name, int with_block
     "String", "Integer", "Float", "Symbol", "Array", "Hash", "Range",
     "NilClass", "TrueClass", "Object" };
   static const char *const TST[POLY_ARITY_BUILTINS] = {
-    "_t%d.tag == SP_TAG_STR || sp_poly_is_strbuf(_t%d)",
+    "sp_rbval_is_string(_t%d) || sp_poly_is_strbuf(_t%d)",
     "_t%d.tag == SP_TAG_INT || _t%d.tag == SP_TAG_BIGINT",
     "_t%d.tag == SP_TAG_FLT && _t%d.tag == SP_TAG_FLT",
     "_t%d.tag == SP_TAG_SYM && _t%d.tag == SP_TAG_SYM",
@@ -22360,6 +22903,7 @@ int bam_binop_wrapper(const Scope *tm) {
 }
 
 static void emit_call_unwrapped(Compiler *c, int id, Buf *b);
+static int array_hash_reopen_mi(Compiler *c, int id, TyKind rt, const char *nm, int *aci_out);
 /* A copy of the receiver carries its instance variables (BOPF_COPY_CLASS:
    dup, clone, Hash#merge and #compact; Kernel's dup and clone on any other
    value, is_object_copy). An Array's, a Hash's, a Random's or an
@@ -22388,6 +22932,12 @@ static int emit_bivar_copy_wrap(Compiler *c, int id, Buf *b) {
      when only the Hash's copies (bop_boxed_answers_copy) */
   int boxed_copy = rt == TY_POLY && rr.kind == RK_BOXED ? bop_boxed_answers_copy(nm, argc) : 0;
   if (!(bop_answers_self(rt, nm, argc, 0) & BOPF_COPY_CLASS) && !is_object_copy(nm) && !boxed_copy) return 0;
+  /* (not a reopened Array's or Hash's own method of the name: it answers
+     what it returns, which need be no copy of the receiver's type; one
+     that calls super hands on the builtin's copy, which the wrap keeps
+     the receiver's ivars on) */
+  { int rmi = array_hash_reopen_mi(c, id, rt, nm, NULL);
+    if (rmi >= 0 && !scope_calls_super(c, rmi)) return 0; }
   int t = ++g_tmp;
   char rn[24], dn[24];
   snprintf(rn, sizeof rn, "_t%d", t); snprintf(dn, sizeof dn, "_d%d", t);
@@ -22415,9 +22965,18 @@ static int emit_bivar_copy_wrap(Compiler *c, int id, Buf *b) {
   g_ivar_nil_guarded_id = sv_ng;
   if (pre.p) buf_puts(b, pre.p);
   if (guard.p) buf_puts(b, guard.p);
+  /* Not the call's own type when the receiver is held as a concrete Hash or
+     Array and the call is boxed: a poly receiver viewed as its Hash face
+     (`[h, Klass][i].merge`) re-enters here under that view, and the arm it
+     makes answers the receiver's own copy, not a boxed value. */
+  int dboxed = ret_repr.kind == RK_BOXED;
+  if (ret == TY_POLY && rr.kind != RK_BOXED && rt != TY_POLY && (bop_answers_self(rt, nm, argc, 0) & BOPF_COPY_CLASS)) {
+    ret = rt;
+    dboxed = 0;
+  }
   emit_ctype(c, ret, b); buf_printf(b, " %s = %s", dn, call.p ? call.p : "");
   free(pre.p); free(guard.p); free(call.p);
-  buf_printf(b, ret_repr.kind == RK_BOXED ? "; SP_GC_ROOT_RBVAL(%s); " : "; SP_GC_ROOT(%s); ", dn);
+  buf_printf(b, dboxed ? "; SP_GC_ROOT_RBVAL(%s); " : "; SP_GC_ROOT(%s); ", dn);
   if (boxed_copy == 2 && !is_object_copy(nm))
     buf_printf(b, "if (%s.tag == SP_TAG_OBJ && sp_poly_is_hash_kind(%s.cls_id)) ", rn, rn);
   buf_puts(b, "sp_bivar_copy(");
@@ -22807,36 +23366,18 @@ int emit_arg_type_guards(Compiler *c, int id, Buf *b) {
         buf_puts(b, "({ (void)("); emit_expr_for_effect(c, rr2, b); buf_puts(b, "); FALSE; })");
         return 1;
       }
-      /* A membership test against an integer Range answers for whatever it is
-         handed: an Integer or Float by comparison, anything else false. Only a
-         statically integral argument keeps the direct path; the rest go through
-         the boxed case-equality, which is the same rule the `when` arm uses and
-         needs no static class at all (#3838, #3917). */
+      /* A native integer Range can use the same numeric comparisons as
+         boxed case equality without allocating a box for the receiver. */
       if (pred) {
         Repr arg_repr = repr_of(c, rv2[0]);
         TyKind at3 = arg_repr.as_ty;
-        /* cover? of a boxed value that is a Range at run time: containment,
-           as for a typed one, where the case-equality read the Range as a
-           member and answered false */
-        if (is_cover_name(rn2) && arg_repr.kind == RK_BOXED) {
-          int tR = ++g_tmp, tA = ++g_tmp;
-          buf_printf(b, "({ sp_Range _t%d = ", tR); emit_expr(c, rr2, b);
-          buf_printf(b, "; sp_RbVal _t%d = ", tA); emit_boxed(c, rv2[0], b);
-          buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); "
-                        "(_t%d.tag == SP_TAG_OBJ && _t%d.v.p && _t%d.cls_id == SP_BUILTIN_RANGE)"
-                        " ? sp_range_cover_rng(_t%d, *(sp_Range *)_t%d.v.p)"
-                        " : (_t%d.tag == SP_TAG_OBJ && _t%d.v.p && _t%d.cls_id == SP_BUILTIN_FLOAT_RANGE)"
-                        " ? sp_range_cover_frange(_t%d, *(sp_FloatRange *)_t%d.v.p)"
-                        " : (_t%d.tag == SP_TAG_OBJ && _t%d.v.p && _t%d.cls_id == SP_BUILTIN_STR_RANGE)"
-                        " ? sp_range_cover_srange(_t%d, SP_SRANGE_OF(_t%d.v.p))"
-                        " : sp_poly_case_eq(sp_box_range(_t%d), _t%d); })",
-                     tA, tA, tA, tA, tR, tA, tA, tA, tA, tR, tA, tA, tA, tA, tR, tA, tR, tA);
-          return 1;
-        }
-        if (at3 != TY_INT && at3 != TY_FLOAT && at3 != TY_BIGINT) {
-          buf_puts(b, "sp_poly_case_eq(sp_box_range(");
-          emit_expr(c, rr2, b); buf_puts(b, "), ");
-          emit_boxed(c, rv2[0], b); buf_puts(b, ")");
+        int cover = is_cover_name(rn2) && arg_repr.kind == RK_BOXED;
+        if (cover || (at3 != TY_INT && at3 != TY_FLOAT && at3 != TY_BIGINT)) {
+          buf_puts(b, "({ ");
+          int tR = hold_operand(c, rr2, TY_RANGE, 0, ++g_tmp, 0, " ", b);
+          buf_printf(b, "%s(&_t%d, ", cover ? "sp_range_cover_val" : "sp_range_cover_poly", tR);
+          emit_boxed(c, rv2[0], b);
+          buf_puts(b, "); })");
           return 1;
         }
       }
@@ -23084,11 +23625,6 @@ int str_each_enum_keeps(Compiler *c, int id) {
   return str_each_enum_call(c, id) && str_each_recv_shares(c, nt_ref(c->nt, id, "receiver")) &&
          enum_outlives_expr(c, id);
 }
-/* ...and one walked where it is made reads its receiver's String as it is
-   there: a copy of it is no other String than the walk sees */
-int str_each_enum_walked_here(Compiler *c, int id) {
-  return str_each_enum_call(c, id) && !enum_outlives_expr(c, id);
-}
 /* Is call id a blockless String iterator on a boxed receiver answering an
    Enumerator (poly_str_iter_enum), which is over the handle for a box of a
    shared String's (sp_poly_str_each_enum)? */
@@ -23110,6 +23646,87 @@ int str_enum_h_made(Compiler *c) {
   }
   return c->str_enum_h == 2;
 }
+/* Keep the Ruby operands in source order. In particular a separator
+   conversion can rebind the receiver or run code that collects it. */
+int emit_string_line_operands(Compiler *c, int recv, int argc, const int *argv,
+                             int *receiver, int *separator, int *keywords, int *count, Buf *b) {
+  int kw = nt_argv_kwh(c->nt, argv, argc);
+  int positional = argc - (kw >= 0);
+  int sep = positional > 0 ? argv[0] : -1;
+  int chomp = kw >= 0 ? struct_kwarg_value(c, kw, "chomp") : -1;
+  int tr = *receiver = ++g_tmp;
+  int ts = *separator = ++g_tmp;
+  int tc = *keywords = ++g_tmp;
+  int n = *count = ++g_tmp;
+  Buf capture = {0};
+  Buf *saved_pre = g_pre;
+  g_pre = &capture;
+  buf_puts(&capture, "({\n");
+  buf_printf(&capture, "sp_RbVal _t%d = ", tr);
+  emit_boxed(c, recv, &capture);
+  buf_printf(&capture, "; SP_GC_ROOT_RBVAL(_t%d);\n", tr);
+  int splat = nt_kind(c->nt, sep) == NK_SplatNode;
+  int gathered = splat ? ++g_tmp : ts;
+  buf_printf(&capture, "sp_RbVal _t%d = ", gathered);
+  if (sep >= 0) emit_boxed(c, sep, &capture);
+  else buf_puts(&capture, "sp_box_nil()");
+  buf_printf(&capture, "; SP_GC_ROOT_RBVAL(_t%d);\n", gathered);
+  if (splat) {
+    buf_printf(&capture, "sp_int _t%d = sp_poly_arr_len(_t%d); "
+               "sp_RbVal _t%d = _t%d ? sp_poly_arr_get(_t%d, 0) : sp_box_nil(); "
+               "SP_GC_ROOT_RBVAL(_t%d);\n", n, gathered, ts, n, gathered, ts);
+  }
+  else {
+    buf_printf(&capture, "sp_int _t%d = %d;\n", n, positional);
+    for (int i = 1; i < positional; i++) {
+      buf_puts(&capture, "(void)(");
+      emit_into_pre_line(c, emit_expr_for_effect, argv[i]);
+      buf_puts(&capture, ");\n");
+    }
+  }
+  int nk = 0;
+  if (kw >= 0) nt_arr(c->nt, kw, "elements", &nk);
+  buf_printf(&capture, "sp_RbVal _t%d = ", tc);
+  if (nk == 1 && chomp >= 0) {
+    buf_puts(&capture, "sp_box_bool(");
+    emit_into_pre_line(c, emit_cond, chomp);
+    buf_puts(&capture, ")");
+  }
+  else if (kw >= 0) emit_boxed(c, kw, &capture);
+  else buf_puts(&capture, "sp_box_nil()");
+  buf_printf(&capture, "; SP_GC_ROOT_RBVAL(_t%d); ", tc);
+  g_pre = saved_pre;
+  buf_puts(b, capture.p);
+  free(capture.p);
+  return sep < 0 && chomp >= 0;
+}
+
+/* Open a loop and bind its rooted native String element. A mixed dispatch
+   with no arguments supplies the already-bound receiver alone. */
+int emit_string_line_loop_start(int receiver, int separator, int keywords, int count,
+                                const char *method, Buf *b) {
+  int walk = ++g_tmp, line = ++g_tmp;
+  buf_printf(b, "sp_StringLineWalk _t%d = {0}; SP_GC_ROOT_STR(_t%d.text); "
+                "SP_GC_ROOT_STR(_t%d.separator); SP_GC_ROOT(_t%d.whole); ",
+             walk, walk, walk, walk);
+  buf_printf(b, "sp_string_line_begin(&_t%d, _t%d, ", walk, receiver);
+  if (separator) buf_printf(b, "_t%d, _t%d, _t%d, ", separator, keywords, count);
+  else buf_puts(b, "sp_box_nil(), sp_box_nil(), 0, ");
+  buf_printf(b, "\"%s\"); sp_String *_t%d; while ((_t%d = sp_string_line_step(&_t%d))) { SP_GC_ROOT(_t%d); ",
+             method, line, line, walk, line);
+  return line;
+}
+
+void emit_string_line_enum(Compiler *c, int id, int recv, int argc, const int *argv, Buf *b) {
+  int tr, ts, tc, n;
+  int chomp_given = emit_string_line_operands(c, recv, argc, argv, &tr, &ts, &tc, &n, b);
+  int boxed = repr_of(c, id).kind == RK_BOXED;
+  if (boxed) buf_puts(b, "sp_box_obj(");
+  buf_printf(b, "sp_poly_string_line_enum(_t%d, _t%d, _t%d, _t%d, %d)", tr, ts, tc, n, chomp_given);
+  if (boxed) buf_puts(b, ", SP_BUILTIN_ENUMERATOR)");
+  buf_puts(b, "; })");
+}
+
 /* A blockless iterator answers an external Enumerator rather than iterating:
    the wrappers for each, reverse_each, each_with_index, each_index, each_char,
    each_line, each_slice, each_cons, cycle, slice_before/after, the two hash
@@ -23226,10 +23843,14 @@ int emit_blockless_enumerator(Compiler *c, int id, Buf *b) {
     }
     return 1;
   }
-  /* str.each_char / each_line with no block -> an Enumerator over the string's
-     characters / lines. */
+  if (recv >= 0 && comp_ntype(c, recv) == TY_STRING && sp_streq(name, "each_line") &&
+      nt_ref(nt, id, "block") < 0 && string_line_args(c, argc, argv)) {
+    emit_string_line_enum(c, id, recv, argc, argv, b);
+    return 1;
+  }
+  /* The other String walks over characters, codepoints and bytes. */
   if (recv >= 0 && comp_ntype(c, recv) == TY_STRING && argc == 0 &&
-      nt_ref(nt, id, "block") < 0 && is_str_each_iter(name)) {
+      nt_ref(nt, id, "block") < 0 && is_str_each_iter(name) && !sp_streq(name, "each_line")) {
     /* --share-strings: over a String the rule shares, the Enumerator holds
        its handle and reads it as it is walked (sp_enum_str_each_h), as
        CRuby's holds the String: one made from a copy of the bytes missed a
@@ -23242,74 +23863,22 @@ int emit_blockless_enumerator(Compiler *c, int id, Buf *b) {
     }
     /* spill the receiver once: it feeds both the snapshot and the
        inspect-visible source stamp */
-    int tsrc = ++g_tmp;
+    int tsrc = ++g_tmp, tbox = ++g_tmp;
     buf_printf(b, "({ const char *_t%d = ", tsrc);
     emit_expr(c, recv, b);
     buf_printf(b, "; SP_GC_ROOT(_t%d); ", tsrc);
     /* the item reads raise a nil receiver under chars' or bytes' name, or
        read it as "": it raises under the iterator's own */
     if (!recv_never_nil(c, recv)) { nil_recv_check(name, tsrc, b); buf_puts(b, " "); }
+    buf_printf(b, "sp_RbVal _t%d = sp_box_str_new(_t%d); SP_GC_ROOT_RBVAL(_t%d); ", tbox, tsrc, tbox);
     if (is_byte_codepoint_each(name)) {
       const char *fn = sp_streq(name, "each_byte") ? "sp_str_bytes" : "sp_str_codepoints";
       buf_printf(b, "sp_enum_with_src(sp_Enumerator_new_from(sp_box_int_array(%s(_t%d))), "
-                    "sp_box_str(_t%d), SPL(\"%s\")); })", fn, tsrc, tsrc, name);
+                    "_t%d, SPL(\"%s\")); })", fn, tsrc, tbox, name);
       return 1;
     }
-    const char *itemfn = sp_streq(name, "each_char") ? "sp_str_chars_poly" : "sp_str_lines_poly";
-    buf_printf(b, "sp_enum_with_src(sp_Enumerator_new_from_items(%s(_t%d)), "
-                  "sp_box_str(_t%d), SPL(\"%s\")); })", itemfn, tsrc, tsrc, name);
-    return 1;
-  }
-  /* str.each_line(sep) with no block -> an Enumerator over the sep-kept
-     segments. */
-  int sep_kw = argc == 2 && nt_kind(nt, argv[1]) == NK_KeywordHashNode
-             ? struct_kwarg_value(c, argv[1], "chomp") : -1;
-  if (recv >= 0 && comp_ntype(c, recv) == TY_STRING && (argc == 1 || (argc == 2 && sep_kw >= 0)) &&
-      nt_ref(nt, id, "block") < 0 && sp_streq(name, "each_line") &&
-      lines_sep_ty(c, argv[0])) {
-    int tsrc3 = ++g_tmp;
-    buf_printf(b, "({ const char *_t%d = ", tsrc3);
-    emit_expr(c, recv, b);
-    buf_printf(b, "; SP_GC_ROOT(_t%d); ", tsrc3);
-    /* (as above, once the separator and chomp: have run, in their order:
-       CRuby runs the arguments ahead of the missing method) */
-    int tsep = 0, tkw = 0, nn = !recv_never_nil(c, recv);
-    if (nn && ((subtree_has_side_effect(c, argv[0]) && !arg_ran_first(argv[0], 0)) ||
-               (sep_kw >= 0 && subtree_has_side_effect(c, sep_kw) && !arg_ran_first(sep_kw, 0)))) {
-      tsep = ++g_tmp;
-      buf_printf(b, "const char *_t%d = ", tsep); emit_lines_sep(c, argv[0], b);
-      buf_printf(b, "; SP_GC_ROOT_STR(_t%d); ", tsep);
-      if (sep_kw >= 0) { tkw = ++g_tmp; buf_printf(b, "int _t%d = ", tkw); emit_cond(c, sep_kw, b); buf_puts(b, "; "); }
-    }
-    if (nn) { nil_recv_check("each_line", tsrc3, b); buf_puts(b, " "); }
-    buf_puts(b, "sp_enum_with_src(sp_Enumerator_new_from(sp_box_str_array(");
-    if (tkw) buf_printf(b, "(_t%d ? sp_str_lines_sep_chomp : sp_str_lines_sep)", tkw);
-    else if (sep_kw >= 0) { buf_puts(b, "("); emit_cond(c, sep_kw, b); buf_puts(b, " ? sp_str_lines_sep_chomp : sp_str_lines_sep)"); }
-    else buf_puts(b, "sp_str_lines_sep");
-    buf_printf(b, "(_t%d, ", tsrc3);
-    if (tsep) buf_printf(b, "_t%d", tsep); else emit_lines_sep(c, argv[0], b);
-    buf_printf(b, "))), sp_box_str(_t%d), SPL(\"each_line\")); })", tsrc3);
-    return 1;
-  }
-  /* str.each_line(chomp: ...) with no block -> an Enumerator over the
-     (possibly chomped) lines. */
-  if (recv >= 0 && comp_ntype(c, recv) == TY_STRING && argc == 1 &&
-      nt_ref(nt, id, "block") < 0 && sp_streq(name, "each_line") &&
-      nt_kind(nt, argv[0]) == NK_KeywordHashNode) {
-    int chomp_v = struct_kwarg_value(c, argv[0], "chomp");
-    int is_chomp = kw_flag_static(c, chomp_v);
-    int tsrc2 = ++g_tmp, tch = ++g_tmp;
-    buf_printf(b, "({ const char *_t%d = ", tsrc2);
-    emit_expr(c, recv, b);
-    buf_printf(b, "; SP_GC_ROOT(_t%d); ", tsrc2);
-    buf_printf(b, "int _t%d = ", tch);
-    if (is_chomp < 0) emit_cond(c, chomp_v, b);
-    else buf_printf(b, "%d", is_chomp);
-    buf_puts(b, "; ");
-    if (!recv_never_nil(c, recv)) { nil_recv_check("each_line", tsrc2, b); buf_puts(b, " "); }   /* as above, once chomp: has run */
-    buf_printf(b, "sp_enum_with_src(sp_Enumerator_new_from(sp_box_str_array(_t%d ? sp_str_lines_chomp(_t%d) : sp_str_lines(_t%d))), "
-                  "sp_box_str(_t%d), _t%d ? SPL(\"each_line(chomp: true)\") : SPL(\"each_line(chomp: false)\")); })",
-               tch, tsrc2, tsrc2, tsrc2, tch);
+    buf_printf(b, "sp_enum_with_src(sp_Enumerator_new_from_items(sp_str_chars_poly(_t%d)), "
+                  "_t%d, SPL(\"%s\")); })", tsrc, tbox, name);
     return 1;
   }
   /* e.each_slice(n) / e.each_cons(n) with no block on an Enumerator, which
@@ -23526,8 +24095,6 @@ static void emit_vis_msg_boxed(int vis, const char *vnm, int tv, const char *arg
   else buf_printf(b, "_t%d; })", tm);
 }
 static int emit_vis_refusal_x(Compiler *c, int id, Buf *b, int guard);
-static void emit_raise_operands(Compiler *c, int m, int staged, int t0, Buf *b);
-static void emit_missing_operand(Compiler *c, int op, int t, Buf *b);
 static void emit_raise_placeholder(Compiler *c, int id, Buf *b);
 /* Does a reopened builtin class or module (`class Proc; def top`, `module
    Comparable; def top`) other than own (the closed method's) answer vnm?
@@ -23538,7 +24105,7 @@ static int object_reopen_builtin_owns(Compiler *c, int id, int own, const char *
   for (int k = 0; k < c->nclasses; k++) {
     if (k == own || !c->classes[k].name) continue;
     if (!class_is_builtin_reopen(c, k) && builtin_class_id(c->classes[k].name) == 0) continue;
-    if (call_target(c, id, k, vnm, CT_OWN, NULL) >= 0 || comp_reader_in_chain(c, k, vnm, NULL)) return 1;
+    if (call_target(c, id, k, vnm, CT_OWN, NULL) >= 0 || call_attr_target(c, id, k, vnm, CT_ATTR, NULL)) return 1;
   }
   return 0;
 }
@@ -23677,7 +24244,7 @@ static int emit_object_reopen_vis_refusal(Compiler *c, int id, int vrecv, TyKind
     int bid = bn ? builtin_class_id(bn) : 0;
     if (bid && comp_builtin_class_named(c, bn) < 0) {
       int mod = is_builtin_module_name(bn);
-      if (cplan_class_value_answers(c, vrecv, vnm) || class_value_builtin_answers(c, vnm, !mod) ||
+      if (cplan_class_value_answers(c, id, vrecv, vnm) || class_value_builtin_answers(c, vnm, !mod) ||
           object_reopen_class_value_owns(c, id, oci, vnm, 0, mod ? -3 : -2)) return 0;
       snprintf(cvname, sizeof cvname, "%s %s", mod ? "module" : "class", bn);
       cname = cvname; named = 1;
@@ -23687,7 +24254,7 @@ static int emit_object_reopen_vis_refusal(Compiler *c, int id, int vrecv, TyKind
        methods ahead of Object's: `class Time; def foo; end` leaves Time.now
        Time's, beside a top-level `def now`) */
     else if (call_target(c, id, ci, vnm, CT_CMETHOD, NULL) >= 0 || object_reopen_class_value_owns(c, id, oci, vnm, 0, ci) ||
-             module_ffi_or_native_owns(c, ci, vnm) || (c->classes[ci].is_builtin_const && cplan_class_value_answers(c, vrecv, vnm)))
+             module_ffi_or_native_owns(c, ci, vnm) || (c->classes[ci].is_builtin_const && cplan_class_value_answers(c, id, vrecv, vnm)))
       return 0;
     else {
     /* a class value answers Class's and Module's public methods (K.name)
@@ -23775,15 +24342,6 @@ static int emit_object_reopen_vis_refusal(Compiler *c, int id, int vrecv, TyKind
   emit_raise_placeholder(c, id, b);
   return 1;
 }
-/* Does class k or an ancestor include module mod (directly or through an
-   included module)? */
-static int caller_includes_module(Compiler *c, int k, int mod) {
-  for (int g = 0; k >= 0 && k < c->nclasses && g <= c->nclasses; k = c->classes[k].parent, g++)
-    for (int m = 0; m < c->classes[k].nincluded_mods; m++)
-      if (comp_module_includes(c, c->classes[k].included_mods[m], mod, 0)) return 1;
-  return 0;
-}
-
 /* The class whose instance is self in scope s when s is a top-level copy
    of an Integer, Float or Comparable reopening's method (`__int_cmp__0`,
    self its `__self` parameter, desugar_builtin_scalar_defs), else -1. */
@@ -23820,23 +24378,26 @@ int method_vis_for_caller(Compiler *c, int id, int vcid, const char *vnm) {
       !nt_str(c->nt, id, "vis_enforce")) return SP_VIS_PUBLIC;
   if (vis == SP_VIS_PROTECTED) {
     /* the caller's self must be an instance of the declaring class: that
-       class itself or a descendant */
+       class itself or a descendant; in a block that may run with another
+       self, that self (cplan_protected_caller). Where nothing tells, the
+       visibility is the plan's at no point, the declared one, read with the
+       scope's self, as where the record holds no body versions */
     Scope *cs = comp_scope_of(c, id);
-    int caller = (cs && !cs->is_cmethod) ? cs->class_id : -1;
-    if (caller < 0 && cs && !cs->is_cmethod) caller = scalar_copy_self_class(c, cs);
-    if (caller >= 0 && owner >= 0 && is_descendant(c, caller, owner)) vis = SP_VIS_PUBLIC;
-    /* a module's protected method: the caller is an instance of the module
-       when its class or an ancestor includes it, whatever the caller's own
-       method of that name is, or when its class took the method from it (a
-       prepend, which records no include) */
-    /* a class method's self is the class, an instance of a module its
-       class (or a superclass) extends */
-    if (cs && cs->is_cmethod && cs->class_id >= 0 && owner >= 0 &&
-        comp_class_singleton_has_module(c, cs->class_id, owner)) vis = SP_VIS_PUBLIC;
+    int scope = (cs && !cs->is_cmethod) ? cs->class_id : -1;
+    if (scope < 0 && cs && !cs->is_cmethod) scope = scalar_copy_self_class(c, cs);
+    int caller = cplan_protected_caller(c, id, scope);
+    if (caller == CPLAN_SELF_UNKNOWN) {
+      caller = scope;
+      vis = cplan_method_vis(c, -1, vcid, vnm, 0, &owner);
+    }
+    int singleton = caller == scope && cs && cs->is_cmethod;
+    if (cplan_protected_owner_open(c, singleton ? cs->class_id : caller, singleton, owner))
+      vis = SP_VIS_PUBLIC;
+    /* A prepend can supply the caller's copy without an include edge. */
     if (vis == SP_VIS_PROTECTED && caller >= 0 && owner >= 0) {
       int cmi = call_target(c, id, caller, vnm, 0, NULL);
-      if (caller_includes_module(c, caller, owner) ||
-          (cmi >= 0 && cmi < c->nscopes && c->scopes[cmi].origin_module_ci == owner + 1)) vis = SP_VIS_PUBLIC;
+      if (cmi >= 0 && cmi < c->nscopes && c->scopes[cmi].origin_module_ci == owner + 1)
+        vis = SP_VIS_PUBLIC;
     }
     /* a call in a module's own method (or a block in it): self there is an
        instance of a class that includes the module, so the module's
@@ -23846,7 +24407,7 @@ int method_vis_for_caller(Compiler *c, int id, int vcid, const char *vnm) {
       int rmi = call_target(c, id, vcid, vnm, 0, NULL);
       int from_caller = owner == caller ||
                         (rmi >= 0 && rmi < c->nscopes && c->scopes[rmi].origin_module_ci == caller + 1);
-      if (from_caller && (vcid == caller || caller_includes_module(c, vcid, caller))) vis = SP_VIS_PUBLIC;
+      if (from_caller && (vcid == caller || cplan_caller_includes_module(c, vcid, caller))) vis = SP_VIS_PUBLIC;
     }
   }
   return vis;
@@ -23873,13 +24434,13 @@ int emit_vis_refusal_guard(Compiler *c, int id, Buf *b) {
    `Array.foo`; this lets the instance form (`[1].foo`) and the plain
    direct-call check below share it too. For call id the visibility is the
    one the call meets (cplan_method_vis); id -1, a reflection's question,
-   asks the table's. */
+   the table's. */
 static int builtin_reopen_vis_class(Compiler *c, int id, TyKind rt, const char *name) {
   if (!name || ty_is_object(rt)) return -1;
   int bcls = builtin_class_of_type(rt) ? core_of_type(rt) : -1;
   int bci = bcls >= 0 ? comp_core_class(c, bcls) : -1;
   if (bci < 0) return -1;
-  int vis = id >= 0 ? cplan_method_vis(c, id, bci, name, 0, NULL) : comp_method_vis_declared(c, bci, name, NULL);
+  int vis = cplan_method_vis(c, id, bci, name, 0, NULL);
   return vis == SP_VIS_PUBLIC ? -1 : bci;
 }
 static int emit_vis_refusal_x(Compiler *c, int id, Buf *b, int guard) {
@@ -23926,6 +24487,7 @@ static int emit_vis_refusal_x(Compiler *c, int id, Buf *b, int guard) {
           : plain ? method_vis_for_caller(c, id, vcid, vnm)
                   : cplan_method_vis(c, id, vcid, vnm, 0, NULL);
   if (vis == SP_VIS_PUBLIC) return 0;
+  if (!at_main && cplan_guarded_call_visibility(c, id, vcid, vnm)) return 0;
   const char *vrn = at_main ? "main" : class_ruby_name(c, vcid) ? class_ruby_name(c, vcid) : c->classes[vcid].name;
   buf_puts(b, "(");
   /* the receiver rides the error as NoMethodError#receiver */
@@ -24132,7 +24694,13 @@ void emit_poly_vis_precheck(Compiler *c, int id, int tv, Buf *b) {
       /* a generated reader has no method entry, but the switch has its arm
          (`[lobby].first.members`), so its visibility and an `undef` of it
          are checked here, as a method's are */
-      if (!comp_reader_in_chain(c, k, vnm, NULL)) continue;
+      /* (and a generated writer, `x=`, by its attribute's name, which a
+         send's writer arms store through: emit_boxed_writer_arms) */
+      char wbase[256];
+      if (name_is_plain_setter(vnm) && setter_base_name(vnm, wbase, sizeof wbase)) {
+        if (!call_attr_target(c, id, k, wbase, CT_ATTR | CT_WRITER, NULL)) continue;
+      }
+      else if (!call_attr_target(c, id, k, vnm, CT_ATTR, NULL)) continue;
       /* undefined unless a class below the `undef` declares the reader
          again, or an alias of that name (comp_is_undeffed_in_chain stops
          only at a method; a reader is not inherited past an `undef`, so a
@@ -24156,7 +24724,7 @@ void emit_poly_vis_precheck(Compiler *c, int id, int tv, Buf *b) {
        typed receiver's call (method_vis_for_caller): a descendant, a class
        including the declaring module, a call inside that module */
     int vis = plain ? method_vis_for_caller(c, id, k, vnm) : cplan_method_vis(c, id, k, vnm, 0, NULL);
-    if (vis == SP_VIS_PUBLIC) continue;
+    if (vis == SP_VIS_PUBLIC || cplan_guarded_call_visibility(c, id, k, vnm)) continue;
     const char *vrn = class_ruby_name(c, k) ? class_ruby_name(c, k) : c->classes[k].name;
     {
       char head[200]; snprintf(head, sizeof head, "%s method '%s' called for an instance of ",
@@ -24177,7 +24745,7 @@ void emit_poly_vis_precheck(Compiler *c, int id, int tv, Buf *b) {
       if (k == comp_core_class(c, CORE_OBJECT) || !class_is_builtin_reopen(c, k) ||
           comp_class_is_module(c, &c->classes[k]) || cplan_has_method_missing(c, id, k, 0)) continue;
       int vis = plain ? method_vis_for_caller(c, id, k, vnm) : cplan_method_vis(c, id, k, vnm, 0, NULL);
-      if (vis == SP_VIS_PUBLIC) continue;
+      if (vis == SP_VIS_PUBLIC || cplan_guarded_call_visibility(c, id, k, vnm)) continue;
       if (tk < 0) {
         tk = ++g_tmp;
         buf_printf(b, "{ int _t%d = ", tk);
@@ -24608,16 +25176,15 @@ static void emit_gate_msg(Compiler *c, const char *gmsg, int recv, int recv_run,
 }
 /* A face entry's arm for a version closed to the call that bound the entry
    (cplan_pinned_vis): the NoMethodError CRuby raises for a private (or
-   protected) method called with an explicit receiver. The entry is a root's
-   method, whose self is a boxed value, so the raise names its receiver at
-   run time and stages it for #receiver, with the arguments the entry was
-   handed for #args (emit_object_reopen_vis_refusal's boxed form). 1 when it
-   emitted. */
+   protected) method called with an explicit receiver. Box the entry's
+   receiver for the message and #receiver, and stage the arguments the
+   entry was handed for #args. 1 when it emitted. */
 static int emit_pinned_vis_raise(Compiler *c, int id, Buf *b) {
   int vis = cplan_pinned_vis(c, id);
   if (!vis) return 0;
   const NodeTable *nt = c->nt;
-  const char *vnm = nt_str(nt, id, "name");
+  Scope *entry = comp_scope_of(c, id);
+  const char *vnm = comp_scope_user_name(entry);
   int vac = 0; const int *vav = call_args(nt, id, &vac);
   /* the entry's own `*rest, **kw` (a splat entry's arms forward them): the
      list is built here, the rest and the keywords when there are any */
@@ -24626,7 +25193,9 @@ static int emit_pinned_vis_raise(Compiler *c, int id, Buf *b) {
   int tv = ++g_tmp, ta = ++g_tmp;
   Buf args, ops; memset(&args, 0, sizeof args); memset(&ops, 0, sizeof ops);
   if (staged) emit_staged_args(c, vac, vav, 0, -1, 0, &ops, &args);
-  buf_printf(b, "(sp_raise_cls(\"NoMethodError\", ({ sp_RbVal _t%d = self; ", tv);
+  buf_printf(b, "(sp_raise_cls(\"NoMethodError\", ({ sp_RbVal _t%d = ", tv);
+  emit_reopen_self_boxed(c, entry, b);
+  buf_puts(b, "; ");
   if (ops.p) buf_puts(b, ops.p);
   if (spread)
     buf_printf(b, "sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d); "
@@ -24644,7 +25213,7 @@ static int emit_pinned_vis_raise(Compiler *c, int id, Buf *b) {
    its own prelude: its boxed value into temp t, rooted unless the box
    proves it holds no heap pointer (repr_box_holds_heap), for t > 0, else
    run for its effect */
-static void emit_missing_operand(Compiler *c, int op, int t, Buf *b) {
+void emit_missing_operand(Compiler *c, int op, int t, Buf *b) {
   Buf ap, ae; memset(&ap, 0, sizeof ap); memset(&ae, 0, sizeof ae);
   Buf *sv = g_pre; g_pre = &ap;
   if (t > 0) emit_boxed(c, op, &ae); else emit_expr(c, op, &ae);
@@ -24699,7 +25268,7 @@ static void emit_block_arg_operand(Compiler *c, int id, int fe, Buf *b) {
    hands on the method's own block (resolve_forwarded_block) runs nothing
    and is a Proc or nil already, and an inlined copy of the method binds no
    C variable for it, so it is left out. */
-static void emit_raise_operands(Compiler *c, int m, int staged, int t0, Buf *b) {
+void emit_raise_operands(Compiler *c, int m, int staged, int t0, Buf *b) {
   const NodeTable *nt = c->nt;
   int argc = 0; const int *argv = call_args(nt, m, &argc);
   for (int k = 0; k < argc; k++) emit_missing_operand(c, argv[k], staged ? t0 + k : 0, b);
@@ -24953,7 +25522,7 @@ int emit_unresolved_call(Compiler *c, int id, Buf *b) {
     if (utf8 || bytes) {
       int tvC = ++g_tmp;
       buf_printf(b, "({ sp_RbVal _t%d = ", tvC); emit_boxed(c, recv, b);
-      buf_printf(b, "; sp_box_str(%s(sp_poly_recv_i(\"chr\", _t%d))); })", utf8 ? "sp_int_chr_utf8" : "sp_int_chr", tvC);
+      buf_printf(b, "; sp_box_str_fresh(%s(sp_poly_recv_i(\"chr\", _t%d))); })", utf8 ? "sp_int_chr_utf8" : "sp_int_chr", tvC);
       return 1;
     }
   }
@@ -25012,13 +25581,13 @@ int emit_unresolved_call(Compiler *c, int id, Buf *b) {
      inside a block that runs with another self (instance_eval, class_exec,
      define_method, a class builder's): there self is not the class. */
   if (recv < 0 && is_name_reader(name) && nt_ref(nt, id, "block") < 0 &&
-      class_name_reader_argc_raises(c, name, argc, argv)) {
+      class_name_reader_argc_raises(c, id, name, argc, argv)) {
     Scope *ms = comp_scope_of(c, id);
     if (ms && ms->is_cmethod && ms->class_id >= 0 && ms->def_node >= 0 &&
         call_target(c, id, ms->class_id, name, CT_CMETHOD, NULL) < 0 &&
         node_self_kept(c, ms->def_node, id, 0) == 1) {
       char am[96];
-      class_name_reader_arity_msg(c, name, argc, argv, am, sizeof am);
+      class_name_reader_arity_msg(c, id, name, argc, argv, am, sizeof am);
       buf_puts(b, "(");
       for (int k = 0; k < argc; k++) { buf_puts(b, "(void)("); emit_expr_for_effect(c, argv[k], b); buf_puts(b, "), "); }
       buf_printf(b, "sp_raise_cls(\"ArgumentError\", \"%s\")", am);
@@ -25073,8 +25642,11 @@ int emit_unresolved_call(Compiler *c, int id, Buf *b) {
      that never runs it builds -- refused, it also cost a boxed receiver's
      arm around it (`n.times { send(:undo, nil) }` on an Integer n raised
      NoMethodError for times). */
+  /* (an attribute a class declares is the program's too: a send from a
+     base class's method reaches a subclass's attr_reader) */
+  int attr_named = name && comp_any_class_accessor(c, name);
   if ((recv < 0 || nt_kind(nt, recv) == NK_SelfNode) && g_gate_raise && !nt_vcall(nt, id) &&
-      nt_ref(nt, id, "block") < 0 && !an_user_defines_method(c, name) &&
+      nt_ref(nt, id, "block") < 0 && !an_user_defines_method(c, name) && !attr_named &&
       !builtin_object_method_known(name) &&
       (call_rescued_as_missing(nt, id) || nt_str(nt, id, "send_blind") || nt_str(nt, id, "vis_enforce"))) {
     int plain = !nt_argv_has(nt, argv, argc, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_BLOCK);
@@ -25483,7 +26055,7 @@ int emit_unresolved_call(Compiler *c, int id, Buf *b) {
             TyKind mret = (TyKind)c->scopes[ksym].ret;
             if (apre.p && apre.p[0]) { buf_puts(b, "({ "); buf_puts(b, apre.p); }
             if (mret == TY_POLY) buf_puts(b, cb.p ? cb.p : "sp_box_nil()");
-            else emit_poly_user_box(c, id, &c->scopes[ksym], cb.p ? cb.p : "0", b);
+            else emit_boxed_ret_call(c, &c->scopes[ksym], cb.p ? cb.p : "0", b);
             if (g_plan_check) {
               pa_resume(pa_frame);
               pa_observe(cpf[k] >= 0 ? PA_PROC_FORM : PA_USER, ccls[k], cmi[k], mret,
@@ -25523,7 +26095,7 @@ int emit_unresolved_call(Compiler *c, int id, Buf *b) {
           /* a Class value without a method of the name: Module#name, to_s
              and inspect take no argument, so CRuby raises ArgumentError */
           char cls_raise[256], am[96];
-          if (is_name_reader(nm) && class_name_reader_arity_msg(c, nm, argc, argv, am, sizeof am))
+          if (is_name_reader(nm) && class_name_reader_arity_msg(c, id, nm, argc, argv, am, sizeof am))
             snprintf(cls_raise, sizeof cls_raise, "(sp_raise_cls(\"ArgumentError\", \"%s\"), sp_box_nil())", am);
           else snprintf(cls_raise, sizeof cls_raise, "%s", raise);
           buf_printf(b, "%s) : %s; })", cls_raise,
@@ -25664,7 +26236,7 @@ if (recv >= 0 && nm && (grt == TY_RATIONAL || grt == TY_COMPLEX)) {
          constant), its `lazy` reached no method at run time, where CRuby's
          collection answers one: refused here, naming the line (#9160). */
       if (nm && sp_streq(nm, "lazy") && recv >= 0 && nt_ref(nt, id, "block") < 0 &&
-          nt_ref(nt, id, "arguments") < 0 && !diag_user_defines(c, "lazy") &&
+          nt_ref(nt, id, "arguments") < 0 && !diag_user_defines(c, id, "lazy") &&
           (ty_is_array(grt) || ty_is_hash(grt) || grt == TY_RANGE || grt == TY_FLOAT_RANGE ||
            grt == TY_STR_RANGE || grt == TY_ENUMERATOR))
         unsupported(c, id, "a lazy chain held in an instance, class or global variable or a "
@@ -25902,8 +26474,11 @@ int emit_poly_isa_test(Compiler *c, const char *cn, const char *v, int exact, Bu
      migration, reproduces with zero migration mechanism involved:
      `def wrap(v)=v; wrap(2**80).is_a?(Integer)` answered false). */
   if (is_integer_class_name(cn)) buf_printf(b, "(%s.tag == SP_TAG_INT || %s.tag == SP_TAG_BIGINT)", v, v);
-  else if (sp_streq(cn, "String"))
-    buf_printf(b, "(%s.tag == SP_TAG_STR || (%s.tag == SP_TAG_OBJ && %s.cls_id == SP_BUILTIN_STRBUF))", v, v, v);
+  else if (sp_streq(cn, "String")) {
+    buf_printf(b, "(sp_rbval_is_string(%s)", v);
+    if (exact && program_has_strsub(c)) buf_printf(b, " && !sp_poly_is_str_subclass(%s)", v);
+    buf_puts(b, ")");
+  }
   else if (sp_streq(cn, "Float"))    buf_printf(b, "%s.tag == SP_TAG_FLT", v);
   else if (sp_streq(cn, "Symbol"))   buf_printf(b, "%s.tag == SP_TAG_SYM", v);
   else if (sp_streq(cn, "NilClass")) buf_printf(b, "%s.tag == SP_TAG_NIL", v);
@@ -26037,7 +26612,7 @@ void ffi_check_buffer_bounds(Compiler *c, int id, int arg,
 
 /* Does `txt` mention the temp `_t<n>` -- as that temp, not as a prefix of a
    longer number (`_t5` must not match inside `_t50`)? */
-static int text_uses_tmp(const char *txt, int n) {
+int text_uses_tmp(const char *txt, int n) {
   if (!txt) return 0;
   char want[24];
   int wl = snprintf(want, sizeof want, "_t%d", n);
@@ -26596,6 +27171,48 @@ int subtree_may_reassign_state(Compiler *c, int id) {
   return 0;
 }
 
+/* Does the receiver of an element write (`a[i] = v`, `a[i] ||= v`, `a[i, n] = v`; `node` the write) need a root of
+   its own while its operands (the index, the length, the value) run? Its temp is the container's only holder once
+   an operand drops it (an assignment of the variable that held it, a delete).
+   Held without one:
+   - a temp the binder ran first and rooted (view_held, view_ran_first, Repr head_held), and `self`;
+   - a local that is not a closure cell, unless an operand writes it (read_rebound_by): the frame roots it;
+   - a constant the record holds bound once (elab_const_name_final), likewise;
+   Every other receiver (an ivar, a global, a class variable, a constant that may be rebound, a cell local, a call's answer) needs one when an operand
+   can store into state or run code of the program's, named or not (order_may_drop_state, and the write's own implicit
+   calls on its operands: ic_node_may_call_program, an index's to_int), or writes a local the receiver reads
+   (read_rebound_by: `bx.a[i] = (bx = nil; v)`). A receiver that builds a new object has no
+   holder but its temp: it needs one when an operand can allocate (operand_allocates_beside). An operand the binder
+   ran first is already done. With held_ok 0 the receiver is asked the older rule, any operand with a side effect,
+   which the Hash arms keep. */
+int store_recv_needs_root(Compiler *c, int node, int recv, const int *ops, int nops, int held_ok) {
+  const NodeTable *nt = c->nt;
+  int runs = held_ok && ic_node_may_call_program(c, node);
+  if (held_ok) {
+    NodeKind rk = nt_kind(nt, recv);
+    if (repr_of(c, recv).head_held || view_held(recv) || view_ran_first(recv) || rk == NK_SelfNode) return 0;
+    LocalVar *lv = rk == NK_LocalVariableReadNode ? scope_local(comp_scope_of(c, recv), nt_str(nt, recv, "name")) : NULL;
+    /* (a constant the record holds bound once, elab_const_name_final, is held by its table) */
+    const char *cn = rk == NK_ConstantReadNode || rk == NK_ConstantPathNode ? nt_str(nt, recv, "name") : NULL;
+    if ((lv && !lv->is_cell) || (cn && elab_const_name_final(c, cn))) {
+      for (int i = 0; i < nops; i++) if (ops[i] >= 0 && read_rebound_by(c, recv, ops[i])) return 1;
+      return 0;
+    }
+  }
+  for (int i = 0; i < nops && !runs; i++)
+    runs = ops[i] >= 0 && !(held_ok && view_ran_first(ops[i])) &&
+           (held_ok ? order_may_drop_state(c, ops[i]) || read_rebound_by(c, recv, ops[i]) : subtree_has_side_effect(c, ops[i]));
+  if (runs || !(held_ok ? operand_allocates_beside(c, recv) : subtree_may_allocate(c, recv))) return runs;
+  for (int i = 0; i < nops; i++)
+    if (ops[i] >= 0 && (!held_ok ? 1 : !view_ran_first(ops[i]) && operand_may_allocate(c, ops[i]))) return 1;
+  return 0;
+}
+/* The receiver temp of an element write, rooted where store_recv_needs_root says it needs it (the value forms'
+   `({ T _t = recv; ... })`). */
+void emit_index_recv_root(Compiler *c, TyKind irt, int node, int ir, const int *ops, int nops, int ta, int held_ok, Buf *b) {
+  if (store_recv_needs_root(c, node, ir, ops, nops, held_ok)) { emit_gc_root_tmp(c, irt, ta, b); buf_puts(b, " "); }
+}
+
 /* A value of a kind whose builtin methods run no Ruby code of the
    program's: numbers, Strings, Symbols, their ranges and typed Arrays. A
    Proc, an object, a boxed value or a container of them may call back into
@@ -26708,17 +27325,10 @@ static int emit_operands_before_unbound(Compiler *c, int id, const int *operand,
   return 1;
 }
 
-/* Is argument `node` a String value stored where a shared handle is wanted,
-   whose handle the store forms apart from its String (repr_handle_apart):
-   a fresh one it wraps around it (repr_of's RS_FRESH: `+"x"` in
-   `@a << +"x"` whose element is appended to later), or the one a String
-   Range keeps for its endpoint? The store reads it as a String with the
-   handle mark lifted (emit_boxed_strbuf), so its temp is rendered and
-   declared that way; its stored type, the handle, declared an sp_String *
-   for the String. A receiver is read by its own call, as the handle it
-   renders (`s << a << b`). */
+/* A fresh String is held in the form its emitter produces. The store
+   applies the handle demand when it consumes the value. */
 static int operand_fresh_str(Compiler *c, int node) {
-  return repr_handle_apart(c, node, repr_of(c, node));
+  return repr_handle_apart(repr_of(c, node));
 }
 /* One operand of emit_operands_in_order rendered into `out`, with the
    statements its emission hoists caught in `pre` rather than the enclosing
@@ -26789,6 +27399,19 @@ static int operand_hoists_effect(Compiler *c, int node) {
   int a = nt_ref(nt, node, "arguments"), ac = 0;
   const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &ac) : NULL;
   for (int i = 0; i < ac; i++) if (!subtree_is_pure_read(c, av[i])) return 1;
+  /* a call of the program's method that leaves out an optional argument:
+     the default is emitted at the call, so a default that runs code
+     (`def nxt(step = set(6))`) is code the operand hoists */
+  const char *nm = nt_str(nt, node, "name");
+  Scope *in = comp_scope_of(c, node);
+  int cls = recv < 0 || nt_kind(nt, recv) == NK_SelfNode ? (in ? in->class_id : -1) : -1;
+  int mi = nm && (recv < 0 || cls >= 0) ? call_target(c, node, cls, nm, 0, NULL) : -1;
+  int dn = mi >= 0 ? c->scopes[mi].def_node : -1, ps = dn >= 0 ? nt_ref(nt, dn, "parameters") : -1, on = 0;
+  const int *ov = ps >= 0 ? nt_arr(nt, ps, "optionals", &on) : NULL;
+  int rn = 0;
+  if (ps >= 0) (void)nt_arr(nt, ps, "requireds", &rn);
+  for (int i = ac - rn; i < on; i++)
+    if (i >= 0 && !subtree_is_pure_read(c, nt_ref(nt, ov[i], "value"))) return 1;
   return 0;
 }
 
@@ -27120,7 +27743,31 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
      which is a worse order than the one C picked. Only a local read ahead of
      it that it can rebind runs first, with the operands before it
      (emit_operands_before_unbound). */
-  int nmax = 1 + argc;
+  /* `outer[k][start, len] = v` through a box: the splice stores into outer's
+     slot k after v, so outer and k are the operands, in place of the
+     receiver they make: each runs once, before v, as Ruby reads the
+     receiver first. Where a class's `[]=` may take the store, the element
+     `outer[k]` is one too, read through them: the dispatch calls the method
+     on the element Ruby selected, though v put another in outer's slot. */
+  int recv_outer = -1, recv_key = -1, recv_elem = 0;
+  if (recv >= 0 && argc == 3 && !nt_safe_nav(nt, id) && nt_str(nt, id, "name") &&
+      sp_streq(nt_str(nt, id, "name"), "[]=") && comp_ntype(c, recv) == TY_POLY &&
+      nt_kind(nt, recv) == NK_CallNode && nt_str(nt, recv, "name") &&
+      sp_streq(nt_str(nt, recv, "name"), "[]") && nt_ref(nt, recv, "block") < 0 &&
+      nt_ref(nt, recv, "receiver") >= 0 && !nt_safe_nav(nt, recv)) {
+    int ra = 0;
+    const int *rav = call_args(nt, recv, &ra);
+    if (ra == 1 && nt_kind(nt, rav[0]) != NK_SplatNode && nt_kind(nt, rav[0]) != NK_KeywordHashNode) {
+      recv_outer = nt_ref(nt, recv, "receiver");
+      recv_key = rav[0];
+      for (int k = 0; k < c->nclasses && !recv_elem; k++)
+        recv_elem = comp_poly_arm_defines_n(c, k, "[]=", 3);
+    }
+  }
+  /* the receiver's operands: none, the receiver, or its outer and key (and
+     the element) */
+  int nrecv = recv < 0 ? 0 : recv_outer >= 0 ? 2 + recv_elem : 1;
+  int nmax = nrecv + argc;
   for (int i = 0; i < argc; i++) {
     if (nt_kind(nt, argv[i]) == NK_KeywordHashNode) { int nk = 0; nt_arr(nt, argv[i], "elements", &nk); nmax += nk; }
     else if (range_lit_ends_ordered(c, argv[i], i == argc - 1)) nmax++;
@@ -27128,7 +27775,11 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
   int node[nmax], fresh[nmax], oo[nmax], copy[nmax], sh[nmax], fb[nmax], nb = 0;
   TyKind ty[nmax];
   int operand[nmax], nop = 0;
-  if (recv >= 0) operand[nop++] = recv;
+  if (recv_outer >= 0) {
+    operand[nop++] = recv_outer; operand[nop++] = recv_key;
+    if (recv_elem) operand[nop++] = recv;
+  }
+  else if (recv >= 0) operand[nop++] = recv;
   for (int i = 0; i < argc; i++) {
     /* keyword arguments are operands one value at a time, in the order
        written: `new(a: r.int, b: f(r.int))` runs a's call first, however
@@ -27176,7 +27827,7 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
      argument is bound and rooted ahead of the call like an observable one
      (operand_held_for_later). */
   int held[nmax], nheld = 0;
-  operands_held_for_later(c, operand, nop, recv >= 0, held);
+  operands_held_for_later(c, operand, nop, nrecv, held);
   /* A push or an append of several arguments pushes each before the next
      is read, so where a later argument can see an earlier push
      (push_args_read_before_pushes) every argument is bound first, in
@@ -27187,7 +27838,7 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
      push had grown, and `a.push(5, last(a))` ran last on it. */
   int push_reads = push_args_read_before_pushes(c, id);
   if (push_reads)
-    for (int i = recv >= 0; i < nop; i++) {
+    for (int i = nrecv; i < nop; i++) {
       /* (but a value with no C value of its own -- a literal nil -- which
          nothing can change, and a shared String slot, which its copy path
          reads last) */
@@ -27232,7 +27883,7 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
     if (ot == TY_POLY || (ty_is_object(ot) && ty_object_class(ot) >= 0 &&
                           ty_object_class(ot) < c->nclasses &&
                           !c->classes[ty_object_class(ot)].is_native_class &&
-                          !(recv >= 0 && i == 0)))
+                          !(i < nrecv)))
       converts = 1;
     /* an operand the nil arm's head ran (VR_HEAD_HELD) reads as its temp:
        it runs nothing here, and bound again it was copied into a second
@@ -27305,12 +27956,9 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
     }
     if (!bindable && unb < 0) unb = i;
     int fr = operand[i] != harg && operand[i] != recv && operand_fresh_str(c, operand[i]);
-    /* (a mutator's receiver that is a boxed receiver's call whose arms answer
-       a String, or a sequence ending in one, is bound as its box's handle:
-       strbuf_poly_user_base. An argument is read as its bytes) */
-    /* (...and so is an argument whose box the plan wants as that handle,
-       a container's element: bound as its bytes, the box was asked of a
-       const char * temp, #9758) */
+    /* A native String argument keeps the result handle of its call.
+       A mutator can also take the handle from a boxed receiver's call or
+       from an ivar it reads through boxed self. */
     int bsh = operand[i] != harg &&
               (operand_binds_self_handle(c, operand[i]) || operand_binds_boxed_to_s(c, id, operand[i]) ||
                operand_binds_exc_msg(c, id, operand[i]) ||
@@ -27320,10 +27968,8 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
                   the mutator changes: its box's handle, strbuf_poly_ivar_get) */
                (operand[i] == recv && !arg_ran_first(operand[i], 0) &&
                 strbuf_poly_ivar_get(c, operand[i]) && strbuf_poly_ivar_mutated(c, operand[i])) ||
-               (operand[i] != recv && comp_ntype(c, operand[i]) == TY_STRING &&
-                nt_kind(c->nt, operand[i]) == NK_CallNode && !arg_ran_first(operand[i], 0) &&
-                share_plan_of(c, operand[i], SPR_BOX, NULL).form == SPF_HANDLE &&
-                share_plan_of(c, operand[i], SPR_BOX, NULL).kind == SPK_POLY_ARMS));
+               (operand[i] != recv && repr_of(c, operand[i]).as_ty == TY_STRING &&
+                !arg_ran_first(operand[i], 0) && repr_native_call_handle(c, operand[i])));
     int bfb = bsh || operand[i] == harg ? 0
             : operand_binds_face_box(c, operand[i]) ? 1
             : operand_binds_identity_box(c, id, operand[i]) ? 3
@@ -27380,7 +28026,7 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
        it as a held String read does, in order; a class read held only for its
        effect goes on to that binding when the ordering declines) */
     if (!ncand && !nheld_value) {
-      int done = emit_operands_before_unbound(c, id, operand, nop, recv >= 0, unb, b);
+      int done = emit_operands_before_unbound(c, id, operand, nop, nrecv, unb, b);
       if (done || !nheld) return done;
     }
     if (unb_lit) return 0;
@@ -27430,10 +28076,16 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
      with nothing naming it when it does not. A held String read is rendered
      with its binding. */
   int operands_last = (observable < 2 && !nheld) || held_for_group;
+  /* the element of a two-index store's receiver (recv_elem) reads its outer
+     and key: it is rendered as it is bound, after them, so it reads their
+     temps rather than running them again */
+  int elem_at = -1;
+  for (int i = 0; i < nb && recv_elem; i++)
+    if (node[i] == recv && !copy[i]) elem_at = i;
   for (int i = 0; i < nb; i++)
-    if (copy[i]) { memset(&opb[i], 0, sizeof opb[i]); memset(&opp[i], 0, sizeof opp[i]); }
+    if (copy[i] || i == elem_at) { memset(&opb[i], 0, sizeof opb[i]); memset(&opp[i], 0, sizeof opp[i]); }
   for (; !operands_last && rendered < nb && ok; rendered++) {
-    if (copy[rendered]) continue;
+    if (copy[rendered] || rendered == elem_at) continue;
     render_bound_operand(c, node[rendered], fresh[rendered],
                          operand_binds_handle(c, node[rendered], harg) || hdl[rendered] || sh[rendered],
                          oo[rendered], fb[rendered], &opb[rendered], &opp[rendered]);
@@ -27451,6 +28103,11 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
         snprintf(g_argov_text[g_n_argov - 1], ARGOV_TEXT_LEN, "SP_STR_B(_t%d)", tmp[i]);
         continue;
       }
+      if (i == elem_at) {
+        render_bound_operand(c, node[i], fresh[i], operand_binds_handle(c, node[i], harg) || hdl[i] || sh[i],
+                             oo[i], fb[i], &opb[i], &opp[i]);
+        if (text_is_raise_token(opb[i].p)) ok = 0;
+      }
       tmp[i] = ++g_tmp;
       if (sh[i]) {
         ran_first_bind_read(node[i], tmp[i]);
@@ -27461,7 +28118,7 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
         held[nh++] = view_push(c, node[i], TY_POLY);
         continue;
       }
-      if (operand_binds_handle(c, node[i], harg)) {
+      if (hdl[i] || operand_binds_handle(c, node[i], harg)) {
         ran_first_bind(node[i], tmp[i], tmp[i]);
         /* (one representation: the temp holds the handle; a value read of it is bytes) */
         if (ty[i] == TY_STRING)
@@ -27506,7 +28163,7 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
        #to_int renders inline and IO#write holds per operand. */
     if (observable < 2 && !nheld && g_conv_emitted == conv_mark) ok = 0;
     for (; operands_last && rendered < nb && ok; rendered++) {
-      if (copy[rendered]) continue;
+      if (copy[rendered] || rendered == elem_at) continue;
       render_bound_operand(c, node[rendered], fresh[rendered],
                            operand_binds_handle(c, node[rendered], harg) || hdl[rendered] || sh[rendered],
                            oo[rendered], fb[rendered], &opb[rendered], &opp[rendered]);
@@ -27515,7 +28172,7 @@ static int emit_operands_in_order(Compiler *c, int id, Buf *b) {
   }
   if (!ok) {
     for (int i = 0; i < nb; i++)
-      if (!copy[i] && i < rendered) { free(opb[i].p); free(opp[i].p); }
+      if (!copy[i] && (i < rendered || i == elem_at)) { free(opb[i].p); free(opp[i].p); }
     free(ob.p);
     g_pre->len = pre_mark;
     if (g_pre->p) g_pre->p[pre_mark] = '\0';
@@ -28177,12 +28834,10 @@ static int nil_target_operand(Compiler *c, int v, int a, int boxed, NilOperands 
   if (k == NK_SplatNode) return nil_target_operand(c, nt_ref(nt, v, "expression"), a, boxed, o);
   Repr tr = repr_of(c, v);
   TyKind t = tr.as_ty;
-  /* a String the store wraps in a handle of its own (`+"x"` pushed where the
-     element is a handle, a Range's endpoint: repr_handle_apart) renders as
-     its bytes where its stored type is the handle, so no temp of that type
-     holds it: it runs in the call */
+  /* A fresh byte result that the store wraps in a handle runs in
+     the call, where its destination can consume it. */
   if ((!read && !nil_target_bindable(k, boxed)) || tr.untyped || t == TY_VOID || comp_ty_value_obj(c, t) ||
-      repr_handle_apart(c, v, tr))
+      repr_handle_apart(tr))
     return 0;
   nil_operands_add(o, v, t);
   return 1;
@@ -28263,7 +28918,7 @@ static int emit_nil_target_route(Compiler *c, int r, int handle, Buf *b, const c
     buf_puts(b, lead);
     buf_printf(b, "sp_String * _t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d);", th, hb.p, th);
     buf_printf(b, " const char * _t%d = ", t);
-    str_read_handle_tmp(b, th, 1);
+    str_read_handle_tmp(b, th);
     buf_printf(b, "; SP_GC_ROOT(_t%d);", t);
     buf_puts(b, *lead ? "\n" : " ");
     ran_first_bind(r, t, th);
@@ -28694,8 +29349,11 @@ static const char *nil_answer_text(Compiler *c, int id, char *buf, size_t cap) {
   const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
   if (!nm) return NULL;
   /* nil.to_s is its one frozen empty String (equal? across calls) */
-  if ((sp_streq(nm, "to_s") || sp_streq(nm, "inspect")) && t == TY_STRING && an == 0)
-    return sp_streq(nm, "to_s") ? "sp_str_frozen_empty" : "(&(\"\\xff\" \"nil\")[1])";
+  if ((is_to_s_name(nm) || is_inspect_name(nm)) && repr_call_result_storage(t) == TY_STRBUF && an == 0) {
+    if (tr.as_ty == TY_STRBUF || repr_native_call_handle(c, id))
+      return is_to_s_name(nm) ? "SP_STR_HDL(sp_str_frozen_empty)" : "sp_poly_as_strbuf(sp_poly_inspect_box(sp_box_nil()))";
+    return is_to_s_name(nm) ? "sp_str_frozen_empty" : "(&(\"\\xff\" \"nil\")[1])";
+  }
   if (sp_streq(nm, "to_i") && t == TY_INT && an == 0) return "0LL";
   if (sp_streq(nm, "hash") && t == TY_INT && an == 0) return "sp_rbval_hash_key(sp_box_nil())";
   if (sp_streq(nm, "to_f") && t == TY_FLOAT && an == 0) return "0.0";
@@ -28750,7 +29408,7 @@ int cplan_nil_answer_served(Compiler *c, int id) {
   int a = nt_ref(nt, id, "arguments"), an = 0;
   const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
   if (!nm) return 0;
-  if ((sp_streq(nm, "to_s") || sp_streq(nm, "inspect")) && an == 0) return t == TY_STRING;
+  if ((is_to_s_name(nm) || is_inspect_name(nm)) && an == 0) return repr_call_result_storage(t) == TY_STRBUF;
   if ((is_to_i_name(nm) || is_hash_name(nm)) && an == 0) return t == TY_INT || tr.kind == RK_BOXED;
   if (is_to_f_name(nm) && an == 0) return t == TY_FLOAT || tr.kind == RK_BOXED;
   if (sp_streq(nm, "to_a") && an == 0)
@@ -28840,6 +29498,14 @@ static int emit_nil_answer_call(Compiler *c, int id, Buf *b) {
   return 1;
 }
 
+/* NilClass and the receiver's class meet at the same result slot. A
+   String method can fill either a handle or a read of its bytes. */
+static int nil_method_result_fits(Scope *s, Repr want) {
+  if (method_is_void(s) || s->ret == TY_NIL)
+    return want.kind == RK_PTR || want.kind == RK_STRBUF || want.as_ty == TY_NIL;
+  return repr_method_ret_storage(s) == repr_call_result_storage(want.as_ty);
+}
+
 /* Has the answer of nil's method for call id (cplan_nil_program_method)
    the call's type: its own, or a boxed slot's, or nil where the call's
    slot holds a nil (a pointer, or a nil)? An Object method's arm converts
@@ -28865,10 +29531,15 @@ int cplan_nil_program_served(Compiler *c, int id) {
      the name) has no type of its own, and is rendered boxed as the raise
      is: nil's answer goes boxed beside it */
   if (want.as_ty == TY_UNKNOWN) return 1;
-  Scope *s = &c->scopes[mi];
-  TyKind t = want.as_ty;
-  if (!method_is_void(s) && (TyKind)s->ret != TY_NIL) return (TyKind)s->ret == t;
-  return want.kind == RK_PTR || t == TY_NIL;
+  return nil_method_result_fits(&c->scopes[mi], want);
+}
+
+/* A nil arm ending in a comma expression still needs the pointer type of
+   the String arm. A void pointer would erase its handle before boxing. */
+static const char *nil_method_zero(Compiler *c, int id, Repr want) {
+  if (want.kind == RK_BOXED) return "sp_box_nil()";
+  if (want.as_ty == TY_STRBUF || repr_native_call_handle(c, id)) return "(sp_String *)NULL";
+  return default_value_from_compiler(c, want.as_ty);
 }
 
 /* Call id where the program gives nil a method of its name, other than
@@ -28928,11 +29599,11 @@ static int emit_nil_program_call(Compiler *c, int id, Buf *b, int stmt) {
   }
   if (stmt) buf_printf(&nv, "(void)(%s)", nb.p ? nb.p : "0");
   else if (nil_private) buf_puts(&nv, nb.p);
-  else if (nilcls && boxed && !(method_is_void(s) || (TyKind)s->ret == TY_NIL)) emit_boxed_text(c, (TyKind)s->ret, nb.p ? nb.p : "0", &nv);
+  else if (nilcls && boxed && !(method_is_void(s) || (TyKind)s->ret == TY_NIL)) emit_boxed_ret_call(c, s, nb.p ? nb.p : "0", &nv);
   else if (nilcls && (method_is_void(s) || (TyKind)s->ret == TY_NIL))
     buf_printf(&nv, "((void)(%s), %s)", nb.p ? nb.p : "0",
-               want.kind == RK_BOXED ? "sp_box_nil()" : default_value_from_compiler(c, want.as_ty));
-  else if (nilcls && want.kind == RK_BOXED) emit_boxed_text(c, (TyKind)s->ret, nb.p ? nb.p : "0", &nv);
+               nil_method_zero(c, id, want));
+  else if (nilcls && want.kind == RK_BOXED) emit_boxed_ret_call(c, s, nb.p ? nb.p : "0", &nv);
   else buf_puts(&nv, nb.p ? nb.p : "0");
   Buf rb; memset(&rb, 0, sizeof rb);
   nil_target_recv_text(c, r, rtext, &rb);
@@ -29005,11 +29676,7 @@ static int onum_nil_program_method(Compiler *c, int id, int *rn, const char **nm
   /* nil's answer has a place in the call's slot (as cplan_nil_program_served) */
   if (*nilcls) {
     Repr want = repr_of(c, id);
-    Scope *s = &c->scopes[nmi];
-    if (want.kind != RK_BOXED &&
-        (!method_is_void(s) && (TyKind)s->ret != TY_NIL ? (TyKind)s->ret != want.as_ty
-                                                        : !(want.kind == RK_PTR || want.as_ty == TY_NIL)))
-      return -1;
+    if (want.kind != RK_BOXED && !nil_method_result_fits(&c->scopes[nmi], want)) return -1;
   }
   *rn = r; *nm = name;
   return nmi;
@@ -29031,10 +29698,9 @@ static int emit_onum_nil_program_call(Compiler *c, int id, Buf *b, int stmt) {
   if (stmt) buf_printf(&nv, "(void)(%s)", nb.p);
   else if (method_is_void(s) || (nilcls && (TyKind)s->ret == TY_NIL))
     buf_printf(&nv, "((void)(%s), %s)", nb.p,
-               want.kind == RK_BOXED ? "sp_box_nil()" : default_value_from_compiler(c, want.as_ty));
-  else if (nilcls && want.kind == RK_BOXED) emit_boxed_text(c, (TyKind)s->ret, nb.p, &nv);
-  else if (nilcls) buf_puts(&nv, nb.p);
-  else emit_coerce_text(c, id, (TyKind)s->ret, want.kind == RK_BOXED ? TY_POLY : want.as_ty,
+               nil_method_zero(c, id, want));
+  else if (want.kind == RK_BOXED) emit_boxed_ret_call(c, s, nb.p, &nv);
+  else emit_coerce_text(c, id, repr_method_ret_storage(s), want.as_ty,
                         CO_HOLD, nb.p, "an Object method result", &nv);
   Buf rb; memset(&rb, 0, sizeof rb);
   if (boxed) emit_expr(c, r, &rb);
@@ -29178,7 +29844,8 @@ int nil_recv_guard(Compiler *c, int id, int *recv_out) {
    arms read the temp through the override table. divmod is one of them: its
    arm renders the receiver after the operand's temp, and
    `u.divmod((u = 0; 5))` answered [0, 0]. Operators that mutate their
-   receiver are left out. */
+   receiver are left out. A direct user call asks the order record whether
+   to retain its receiver while the arguments run. */
 static int g_recv_snapshot_node = -1;
 static int emit_recv_snapshot(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
@@ -29210,18 +29877,24 @@ static int emit_recv_snapshot(Compiler *c, int id, Buf *b) {
     return 1;
   }
   free(ref.p);
-  if (recv < 0 || args < 0 || nt_kind(nt, recv) != NK_LocalVariableReadNode) return 0;
-  const char *nm = nt_str(nt, id, "name");
-  static const char *const ops[] = {
-    "+", "-", "*", "/", "%", "**", "&", "|", "^", ">>", "==", "!=", "<", ">",
-    "<=", ">=", "<=>", "===", "=~", "[]", "divmod", NULL };
-  int op = 0;
-  for (int i = 0; nm && ops[i] && !op; i++) op = sp_streq(nm, ops[i]);
-  if (!op || !read_rebound_by(c, recv, args)) return 0;
+  if (recv < 0 || args < 0) return 0;
   Repr tr = repr_of(c, recv);
   TyKind t = tr.as_ty;
+  const OpSlot *slot = op_slot_of(c, id, recv);
+  int direct_hold = slot && slot->at == OPA_HOLD && !arg_ran_first(recv, 0) && ty_is_object(t) &&
+                    cplan_user(c, id).dispatch == CP_DIRECT;
+  if (!direct_hold) {
+    if (nt_kind(nt, recv) != NK_LocalVariableReadNode) return 0;
+    const char *nm = nt_str(nt, id, "name");
+    static const char *const ops[] = {
+      "+", "-", "*", "/", "%", "**", "&", "|", "^", ">>", "==", "!=", "<", ">",
+      "<=", ">=", "<=>", "===", "=~", "[]", "divmod", NULL };
+    int op = 0;
+    for (int i = 0; nm && ops[i] && !op; i++) op = sp_streq(nm, ops[i]);
+    if (!op || !read_rebound_by(c, recv, args)) return 0;
+  }
   if (t == TY_UNKNOWN || t == TY_VOID || t == TY_NIL ||
-      tr.kind == RK_STRUCT || tr.kind == RK_VOBJ) return 0;
+      tr.kind == RK_STRUCT || (!direct_hold && tr.kind == RK_VOBJ)) return 0;
   /* (a String is held as its handle, its bytes taken in the call: an
      argument that changes it in place before it rebinds the local is
      seen, as in CRuby) */
@@ -29238,7 +29911,7 @@ static int emit_recv_snapshot(Compiler *c, int id, Buf *b) {
     emit_indent(g_pre, g_indent);
     emit_ctype(c, t, g_pre);
     buf_printf(g_pre, " _t%d = %s; ", tn, rb.p ? rb.p : default_value_from_compiler(c, t));
-    emit_gc_root_tmp(c, t, tn, g_pre);
+    emit_gc_root_tmp_refs(c, t, tn, g_pre);
     buf_puts(g_pre, "\n");
     free(rb.p);
     view_bind_temp(recv, tn);
@@ -29289,7 +29962,13 @@ static const char *strvar_arg(Compiler *c, int a, int *shared) {
   }
   if (at != TY_STRING && at != TY_STRBUF) return NULL;
   if (k == NK_SelfNode) { *shared = repr_self_shared(c, a); return "String self"; }
-  if (k == NK_InstanceVariableReadNode) return "an instance variable";
+  if (k == NK_InstanceVariableReadNode) {
+    Scope *is = comp_scope_of(c, a);
+    const char *in = nt_str(nt, a, "name");
+    int iv = is && is->class_id >= 0 && !is->is_cmethod && in ? comp_ivar_index(&c->classes[is->class_id], in) : -1;
+    *shared = iv >= 0 && repr_of_ivar(c, is->class_id, iv).handle;
+    return "an instance variable";
+  }
   if (k == NK_GlobalVariableReadNode) return "a global variable";
   if (k == NK_ClassVariableReadNode) return "a class variable";
   return NULL;
@@ -30205,12 +30884,12 @@ static int refuse_fwd_target(Compiler *c, int id, const char *name) {
   int cls = -1;
   if (sp_streq(name, "new") && (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode)) {
     TyKind ct = comp_ntype(c, id);
-    return ty_is_object(ct) ? cplan_new_initialize(c, id, ty_object_class(ct), NULL) : -1;
+    return ty_is_object(ct) ? cplan_hook_target(c, id, ty_object_class(ct), "initialize", NULL) : -1;
   }
   if (rk == NK_SelfNode) {
     Scope *encl = comp_scope_of(c, id);
     if (encl && encl->is_cmethod && encl->class_id >= 0 && sp_streq(name, "new"))
-      return comp_method_in_chain(c, encl->class_id, "initialize", NULL);
+      return cplan_hook_target(c, -1, encl->class_id, "initialize", NULL);
     cls = encl && !encl->is_cmethod ? encl->class_id : -1;
   }
   else {
@@ -30499,18 +31178,10 @@ static void refuse_string_copies(Compiler *c, int id) {
       nt_ref(nt, id, "block") >= 0)
     unsupported_feature(c, id, "String#scrub! with a block is not yet supported: the block would be ignored");
   int blk = nt_ref(nt, id, "block");
-  if (recv >= 0 && blk >= 0 && dyn_block_appends(c, blk, 0)) {
+  if (recv >= 0 && blk >= 0 && sp_streq(name, "tap") && dyn_block_appends(c, blk, 0)) {
     TyKind rt = comp_ntype(c, recv);
     NodeKind rk = nt_kind(nt, recv);
-    if ((sp_streq(name, "each") || sp_streq(name, "each_with_index") || sp_streq(name, "reverse_each") ||
-         sp_streq(name, "map") || sp_streq(name, "collect")) &&
-        (rt == TY_STR_ARRAY || rt == TY_POLY_ARRAY)) {
-      const char *pn = block_param_name(c, blk, 0);
-      LocalVar *pv = pn ? scope_local(comp_scope_of(c, blk), pn) : NULL;
-      if (rk == NK_ArrayNode && pv && (pv->type == TY_STRING || pv->type == TY_STRBUF) && !pv->str_shared)
-        unsupported_feature(c, id, "a String is not yet shared by reference through a fresh Array literal into an appending iterator block");
-    }
-    if (sp_streq(name, "tap") && (rt == TY_STRING || rt == TY_STRBUF) &&
+    if ((rt == TY_STRING || rt == TY_STRBUF) &&
         rk != NK_LocalVariableReadNode && rk != NK_StringNode && rk != NK_InterpolatedStringNode) {
       /* --share-strings: a block parameter the rule made the handle takes
          the receiver as one (emit_tap_then_expr) */
@@ -30811,10 +31482,13 @@ static void refuse_string_copies(Compiler *c, int id) {
 void emit_poly_enum_for(Compiler *c, const char *val, Buf *b) {
   int t = ++g_tmp;
   buf_printf(b, "({ sp_RbVal _e%d = %s; (_e%d.tag == SP_TAG_OBJ && (0", t, val, t);
+  /* (the arm for every class a boxed value may be, and the compiler's own `__to_enum_each`: no call's question) */
+  mtab_enter(c);
   for (int k = 0; k < c->nclasses; k++)
-    if (c->classes[k].instantiated && comp_method_in_chain(c, k, "each", NULL) >= 0 &&
-        comp_method_in_chain(c, k, "__to_enum_each", NULL) < 0)
+    if (c->classes[k].instantiated && call_target(c, -1, k, "each", CT_METHODS | CT_SHARED, NULL) >= 0 &&
+        call_target(c, -1, k, "__to_enum_each", CT_METHODS | CT_SHARED, NULL) < 0)
       buf_printf(b, " || _e%d.cls_id == %d", t, k);
+  mtab_leave(c);
   buf_printf(b, ")) ? sp_Enumerator_new_from(_e%d) : sp_poly_enum_for_each(_e%d); })", t, t);
 }
 /* ENV's synthetic receiver is a snapshot taken by the call, after its
@@ -30881,7 +31555,10 @@ static void emit_bool_side(Compiler *c, int id, int recv, int tb, int mi, int bo
   if (mi >= 0 && c->scopes[mi].yields) {
     int slot = view_bind_temp(recv, tb);
     ucall_arm_push();   /* (one arm of the plan's CP_SWITCH) */
+    /* The proc form fills the switch's result before the join is read. */
+    int view = boxed ? view_push(c, id, TY_POLY) : -1;
     int done = emit_reopen_block_call(c, id, recv, mi, NULL, &nb);
+    if (view >= 0) view_pop(c, view);
     ucall_arm_pop();
     view_unbind(slot);
     /* (emit_reopen_pf_call has boxed or unboxed the answer for the call's
@@ -30907,7 +31584,7 @@ static void emit_bool_side(Compiler *c, int id, int recv, int tb, int mi, int bo
     /* (boxed, the method's answer is boxed as its own return is: an
        Integer or Float that can be nil keeps its nil) */
     if (boxed) {
-      emit_poly_user_box(c, id, &c->scopes[mi], nb.p ? nb.p : "0", b);
+      emit_boxed_ret_call(c, &c->scopes[mi], nb.p ? nb.p : "0", b);
       free(nb.p);
       return;
     }
@@ -30959,7 +31636,9 @@ static int emit_call_bool_sides(Compiler *c, int id, Buf *b) {
   }
   const CallPlan pl = cplan_user(c, id);
   if (pl.via != UC_REOPEN || pl.dispatch != CP_SWITCH || !cplan_bool_sides(c, id, &tmi, &fmi)) return 0;
-  int boxed = repr_of(c, id).kind == RK_BOXED;
+  Repr result = repr_of(c, id);
+  int handle = result.kind != RK_BOXED && repr_call_result_storage(result.as_ty) == TY_STRBUF;
+  int boxed = result.kind == RK_BOXED || handle;
   int ow = !boxed && node_is_oint(c, id);
   int tb = ++g_tmp;
   Buf pre; memset(&pre, 0, sizeof pre);
@@ -30971,10 +31650,12 @@ static int emit_call_bool_sides(Compiler *c, int id, Buf *b) {
   emit_bool_side(c, id, recv, tb, fmi, boxed, ow, &fv);
   g_pre = sv;
   /* each side's own hoisted lines run inside its branch */
+  if (handle) buf_puts(b, "sp_poly_as_strbuf(");
   buf_printf(b, "({ int _t%d = ", tb);
   emit_expr(c, recv, b);
   buf_printf(b, "; _t%d ? ({ %s%s; }) : ({ %s%s; }); })", tb,
              pre.p ? pre.p : "", tv.p ? tv.p : "0", fpre.p ? fpre.p : "", fv.p ? fv.p : "0");
+  if (handle) buf_puts(b, ")");
   free(pre.p); free(fpre.p); free(tv.p); free(fv.p);
   return 1;
 }
@@ -30995,7 +31676,100 @@ static int emit_call_on_missing_builtin_path(Compiler *c, int id, Buf *b) {
   buf_printf(b, "), %s)", default_value_from_compiler(c, repr_of(c, id).as_ty));
   return 1;
 }
+/* A call on a boxed value that may be ENV (env_value_flows) reads it
+   through the environment's String Hash taken at the call: the receiver
+   reads as sp_env_box_read makes it (ENV's box turned into that Hash, any
+   other value itself), and the call is the one it was on that value. A
+   receiver that is a plain read is read so wherever the call reads it (a
+   second read is a second Hash of the same environment, whose stores reach
+   it all the same); one that runs code is held once, in the call's own
+   expression, not the prelude, which would run it ahead of an `&&` or an
+   `if` around the call. The names that ask the object itself keep it. */
+static int g_env_read_skip = -1;
+static int env_box_keeps_name(const char *n) {
+  static const char *const K[] = { "equal?", "eql?", "==", "!=", "===", "object_id", "__id__", "class",
+                                   "frozen?", "nil?", "is_a?", "kind_of?", "instance_of?", "to_s", "hash",
+                                   "itself", "respond_to?",
+                                   /* (clear takes its receiver back: sp_poly_clear answers ENV's itself) */
+                                   "clear", NULL };
+  for (int i = 0; K[i]; i++) if (sp_streq(n, K[i])) return 1;
+  return 0;
+}
+/* (one arm of the read: the call emitted with its own prelude caught in the expression, and the receiver, when bound,
+   reading as text) */
+static void env_box_arm(Compiler *c, int id, int rv, const char *bound, Buf *b) {
+  Buf tpre, tval;
+  memset(&tpre, 0, sizeof tpre); memset(&tval, 0, sizeof tval);
+  Buf *sv_pre = g_pre; int sv_ind = g_indent;
+  g_pre = &tpre; g_indent = 0;
+  int mk = bound ? view_bind(rv, "%s", bound) : -1;
+  emit_call(c, id, &tval);
+  if (bound) view_unbind(mk);
+  g_pre = sv_pre; g_indent = sv_ind;
+  /* (an arm with no prelude is its text as it stands: a raise the callers
+     read by its text, emitted_nomethod_token, stays readable) */
+  if (!tpre.p || !*tpre.p) buf_puts(b, tval.p ? tval.p : "0");
+  else buf_printf(b, "({ %s%s; })", tpre.p, tval.p ? tval.p : "0");
+  free(tpre.p); free(tval.p);
+}
+static int emit_call_env_box_read(Compiler *c, int id, Buf *b) {
+  int rv = nt_ref(c->nt, id, "receiver");
+  const char *nm = nt_str(c->nt, id, "name");
+  if (!c->env_value_flows || g_env_read_skip == id || rv < 0 || !nm || env_box_keeps_name(nm) || !env_answers_name(nm) ||
+      repr_of(c, rv).kind != RK_BOXED || g_n_argov + 2 >= MAX_ARG_OVERRIDE) return 0;
+  /* Two arms on whether the receiver is ENV's box: ENV's reads the call on
+     a String Hash of the environment taken there (held in a temp, which a
+     call that takes its receiver back writes, harmlessly); the other is the
+     call as it was, writing back where it always did. A receiver that is a
+     plain read is read in each arm; one that runs code is held first. */
+  Buf rb; memset(&rb, 0, sizeof rb);
+  emit_expr(c, rv, &rb);
+  NodeKind rk = nt_kind(c->nt, nt_paren_single(c->nt, rv));
+  int plain = rk == NK_LocalVariableReadNode || rk == NK_InstanceVariableReadNode || rk == NK_ClassVariableReadNode ||
+              rk == NK_GlobalVariableReadNode || rk == NK_ConstantReadNode || rk == NK_SelfNode;
+  int sv = g_env_read_skip;
+  g_env_read_skip = id;
+  /* The call as it was, on a plain read: a call that no class of the
+     receiver answers is the raise alone, ENV's arm the same raise, and the
+     raise is emitted as it is, unwrapped. The text its callers read
+     (emitted_nomethod_token, the slot coercion that follows a raise) stays
+     at the front, as it was before the read through ENV existed. */
+  if (plain) {
+    Buf ob; memset(&ob, 0, sizeof ob);
+    Buf *sv_pre = g_pre; Buf opre; memset(&opre, 0, sizeof opre);
+    int sv_ind = g_indent;
+    g_pre = &opre; g_indent = 0;
+    emit_call(c, id, &ob);
+    g_pre = sv_pre; g_indent = sv_ind;
+    int raise_only = (!opre.p || !*opre.p) && ob.p && strncmp(past_open_parens(ob.p), "sp_raise", 8) == 0;
+    if (raise_only) {
+      buf_puts(b, ob.p);
+      free(ob.p); free(opre.p); free(rb.p);
+      g_env_read_skip = sv;
+      return 1;
+    }
+    free(ob.p); free(opre.p);
+  }
+  int tr = plain ? 0 : ++g_tmp, te = ++g_tmp;
+  char rtext[64], etext[48];
+  if (plain) snprintf(rtext, sizeof rtext, "%s", "");
+  else snprintf(rtext, sizeof rtext, "_t%d", tr);
+  snprintf(etext, sizeof etext, "_t%d", te);
+  buf_puts(b, "({ ");
+  if (!plain) buf_printf(b, "sp_RbVal _t%d = %s; SP_GC_ROOT_RBVAL(_t%d); ", tr, rb.p ? rb.p : "sp_box_nil()", tr);
+  const char *rref = plain ? (rb.p ? rb.p : "sp_box_nil()") : rtext;
+  buf_printf(b, "sp_RbVal _t%d = sp_env_box_read(%s); SP_GC_ROOT_RBVAL(_t%d); (_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_STR_STR_HASH && !(%s.tag == SP_TAG_OBJ && %s.cls_id == SP_BUILTIN_STR_STR_HASH)) ? ",
+             te, rref, te, te, te, rref, rref);
+  env_box_arm(c, id, rv, etext, b);
+  buf_puts(b, " : ");
+  env_box_arm(c, id, rv, plain ? NULL : rtext, b);
+  buf_puts(b, "; })");
+  g_env_read_skip = sv;
+  free(rb.p);
+  return 1;
+}
 void emit_call(Compiler *c, int id, Buf *b) {
+  if (emit_call_env_box_read(c, id, b)) return;
   if (sp_streq(nt_str(c->nt, id, "name"), "===") &&
       emit_undefined_const_test(c, nt_ref(c->nt, id, "receiver"), repr_of(c, id).as_ty, b)) return;
   /* a String, Integer or Float that may be nil, for a name the program's
@@ -31058,9 +31832,18 @@ static void emit_call_lifted(Compiler *c, int id, Buf *b) {
   int held = g_one_held;
   if (nt_ref(c->nt, id, "block") >= 0) g_one_held = 1;
   int nk = call_ret_narrow_cls(c, id);
+  int reads_string = repr_of(c, id).as_ty == TY_STRING && repr_native_call_handle(c, id);
+  if (reads_string) buf_puts(b, "SP_STR_B(");
   if (nk >= 0) buf_printf(b, "((%s *)(", class_ctype(c, nk));
+  /* A subclass's builtin view can re-enter the call. Pass the native
+     result through that view and read its bytes at this boundary. */
+  int native = reads_string && (cplan_builtin_handle_row(c, id) || repr_native_string_reader(c, id) ||
+                                repr_string_iterator_handle(c, id))
+               ? view_push(c, id, TY_STRBUF) : -1;
   emit_reading_no_value(c, id, emit_call_inner, b);
+  if (native >= 0) view_pop(c, native);
   if (nk >= 0) buf_puts(b, "))");
+  if (reads_string) buf_puts(b, ")");
   g_one_held = held;
 }
 /* One-String mode: a builtin String method's argument that can change a
@@ -31731,6 +32514,12 @@ int bare_call_class_owned(Compiler *c, int id) {
   if (bk >= 0 && bk < c->nclasses) return call_target(c, id, bk, name, CT_CMETHOD, NULL) >= 0;
   int cid = (g_ie_class_id >= 0) ? g_ie_class_id
           : (g_emitting_class_id >= 0) ? g_emitting_class_id : sc->class_id;
+  /* (on main's chain, a module main extends or Object prepends or includes, where the call meets it: the main-chain
+     fact) */
+  if (g_ie_class_id < 0 && !sc->is_cmethod) {
+    int st = cplan_main_chain_step(c, id, name);
+    if (st > EMC_CORE && st != EMC_OWN && st != EMC_KERNEL) return 1;
+  }
   if (cid < 0 || cid >= c->nclasses) return 0;
   if (sc->is_cmethod) return call_target(c, id, cid, name, CT_CMETHOD, NULL) >= 0;
   return call_answers(c, id, cid, name, 0, NULL);
@@ -31988,7 +32777,7 @@ int emit_implicit_self_member(Compiler *c, int id, Buf *b) {
 static int coercing_object_arg(Compiler *c, int node) {
   TyKind t = comp_ntype(c, node);
   if (!ty_is_object(t)) return 0;
-  return class_has_coerce_shape(c, ty_object_class(t));
+  return class_has_coerce_shape(c, ic_operand_host(c, node), node, ty_object_class(t));
 }
 
 /* The boxed `**` for a receiver of static type rt: a receiver typed a number
@@ -32185,7 +32974,7 @@ static void emit_callee_local_decls(Compiler *c, Scope *tm, Buf *b) {
     /* The method prologue normalizes an untyped block param to a boxed slot;
        this frame may be emitted before that prologue runs, and declare_local
        rejects TY_UNKNOWN. */
-    if (blv->type == TY_UNKNOWN) lv_set_type(blv, TY_POLY);
+    if (blv->type == TY_UNKNOWN) lv_set_storage_type(blv, TY_POLY);
     if (!blv->is_cell) { declare_local_named(c, b, blv, blv->name, 0); continue; }
     /* A celled local: emit_inlined_local_decl declares the plain shadow slot
        the inline iterator binds, then the heap cell the closure reads. */
@@ -32323,7 +33112,7 @@ int declare_default_locals(Compiler *c, Scope *m, int dnode) {
         unsupported_feature(c, dnode, "a parameter default that assigns a local the method body reads "
                                       "(the default is evaluated at the call site)");
     if (!uid) uid = ++g_tmp;
-    if (lv->type == TY_UNKNOWN) lv_set_type(lv, TY_POLY);
+    if (lv->type == TY_UNKNOWN) lv_set_storage_type(lv, TY_POLY);
     /* past the table's last entry the local is declared as the default
        spells it, unrenamed */
     if (g_nren >= MAX_RENAME) {
@@ -32432,10 +33221,9 @@ void emit_adapter_arg_static(Compiler *c, int node, char kind, Buf *out) {
 /* Emit a boxed runtime value as one typed-array adapter argument. */
 void emit_adapter_arg_boxed(const char *v, char kind, Buf *out) {
   if (kind == 's') {
-    /* (one-String mode: a String arrives as its handle's box, and the
-       adapter takes the handle its bytes face names) */
-    buf_printf(out, "({ sp_RbVal _ade = sp_poly_strbuf_deref(%s); if (_ade.tag != SP_TAG_STR)"
-                    " sp_raise_typed_elem(_ade, \"String\"); (sp_int)(uintptr_t)SP_STR_HDL(_ade.v.s); })", v);
+    buf_printf(out, "({ sp_RbVal _ade = %s; if (!sp_rbval_is_string(_ade))"
+                    " sp_raise_typed_elem(_ade, \"String\"); (sp_int)(uintptr_t)"
+                    "(sp_poly_is_strbuf(_ade) ? (sp_String *)_ade.v.p : SP_STR_HDL(sp_rbval_string_bytes(_ade))); })", v);
   }
   else if (kind == 'v') {
     buf_printf(out, "({ sp_RbVal _ade = %s; if (_ade.tag != SP_TAG_INT)"
@@ -32551,11 +33339,18 @@ int emit_method_tramp_fn(Compiler *c, Scope *tm, int shift, const char *fname,
      bound builtin's wrapper of a fixed count keeps the plain positional
      binding. An argument past the channel's slots is read from the call's
      wide store (sp_proc_arg), so any count binds. */
-  int bind = !tm->cs_synth && (!bam_wrapper(tm) || tm->rest_idx >= 0);
+  /* A boxed Method with String capture arms can also carry its original
+     wrapper for a different receiver. Give that wrapper the same boxed
+     call path as the captured String methods. */
+  int site = (int)nt_int(nt, tm->def_node, "bam_site", 0) - 1;
+  int fixed_boxed_wrapper = boxed_src && nt_int(nt, tm->def_node, "bam_poly", 0) &&
+                           cplan_bam_string_guard(c, site, (int)(tm - c->scopes)) >= 0;
+  int bind = !tm->cs_synth && (!bam_wrapper(tm) || tm->rest_idx >= 0 || fixed_boxed_wrapper);
   int nreq = 0, nfixed = 0;
   for (int k = shift; k < np && bind; k++) {
     if (k == tm->rest_idx || k == tm->kwrest_idx) continue;
-    if (!tm->pnames[k] || (tm->pnames[k][0] == '_' && tm->pnames[k][1] == '_')) { bind = 0; break; }
+    if (!tm->pnames[k] ||
+        (!fixed_boxed_wrapper && tm->pnames[k][0] == '_' && tm->pnames[k][1] == '_')) { bind = 0; break; }
     if (callee_has_kwarg(c, tm, tm->pnames[k])) {
       /* A declared keyword param is not positional: it binds from the
          call's keyword hash and does not count against the positional
@@ -32608,6 +33403,10 @@ int emit_method_tramp_fn(Compiler *c, Scope *tm, int shift, const char *fname,
   Buf mtp_body; memset(&mtp_body, 0, sizeof mtp_body);
   Buf *pb = &mtp_body;
   buf_printf(pb, "static sp_int %s(void *cap, sp_int argc, sp_int *args) {\n", fname);
+  /* the class the call passes first, named before any default is spelled: a default of the method that reads
+     its receiving class (`v = new`) spells the class this names (cmethod_cls_token) */
+  Buf clsarg = {0};
+  const char *clslead = emit_cmethod_self_cls_arg(c, (int)(tm - c->scopes), self_cls, &clsarg);
   if (bind && tm->rest_idx >= 0) buf_puts(pb, "  SP_GC_SAVE();\n");
   buf_puts(pb, "  sp_BoundMethod *_m = (sp_BoundMethod *)cap; (void)_m; (void)argc; (void)args;\n");
   /* the block a `.call { }` or `.call(&b)` gave this call (_sp_proc_blk),
@@ -32929,10 +33728,8 @@ int emit_method_tramp_fn(Compiler *c, Scope *tm, int shift, const char *fname,
   }
   if (takes_blk) buf_puts(&args, np > shift ? ", _blk" : "_blk");
   Buf selfc = {0}, selfless = {0};
-  int ret_o = is_scalar_ret(tret) && oint_kind(tret) && method_ret_is_oint(tm);
   buf_puts(&selfc, "((");
-  if (ret_o) buf_puts(&selfc, oint_ctype(tret));
-  else if (is_scalar_ret(tret)) emit_ctype(c, tret, &selfc);
+  if (is_scalar_ret(tret)) emit_method_ret_ctype(c, tm, &selfc);
   else buf_puts(&selfc, "void");
   { const char *sct = bm_self_ctype(c, tm, shift);
     buf_printf(&selfc, " (*)(%s", sct);
@@ -32949,15 +33746,12 @@ int emit_method_tramp_fn(Compiler *c, Scope *tm, int shift, const char *fname,
   buf_puts(&selfc, args.p ? args.p : "");
   buf_puts(&selfc, ")");
   buf_puts(&selfless, "((");
-  if (ret_o) buf_puts(&selfless, oint_ctype(tret));
-  else if (is_scalar_ret(tret)) emit_ctype(c, tret, &selfless);
+  if (is_scalar_ret(tret)) emit_method_ret_ctype(c, tm, &selfless);
   else buf_puts(&selfless, "void");
   buf_puts(&selfless, " (*)(");
   /* an inherited class method reading its class runs on the one the
      Method was taken from (`Sub.method(:make).to_proc`): passed first, where
      it had been left out and every argument read one slot off */
-  Buf clsarg = {0};
-  const char *clslead = emit_cmethod_self_cls_arg(c, (int)(tm - c->scopes), self_cls, &clsarg);
   if (clsarg.len) buf_puts(&selfless, np > shift || takes_blk ? "sp_Class, " : "sp_Class");
   if (np > shift || takes_blk) {
     for (int k = shift; k < np; k++) {
@@ -32982,10 +33776,10 @@ int emit_method_tramp_fn(Compiler *c, Scope *tm, int shift, const char *fname,
   free(args.p); free(selfc.p); free(selfless.p);
   if (is_scalar_ret(tret)) {
     buf_puts(pb, "  ");
-    if (ret_o) buf_puts(pb, oint_ctype(tret)); else emit_ctype(c, tret, pb);
+    emit_method_ret_ctype(c, tm, pb);
     buf_printf(pb, " _r = %s;\n", cb.p ? cb.p : "");
     buf_puts(pb, "  _sp_proc_poly_ret = ");
-    if (ret_o) buf_printf(pb, "%s(_r)", oint_box(tret)); else emit_boxed_text(c, tret, "_r", pb);
+    emit_boxed_ret_call(c, tm, "_r", pb);
     buf_puts(pb, ";\n");
   }
   else {
@@ -33127,7 +33921,9 @@ int ie_body_ivar_write(const NodeTable *nt, int node) {
 /* Does the body still make a receiverless call that one of the candidate
    classes answers? A literal block's calls were given a `self` receiver
    (desugar_instance_eval_builtin); a forwarded block's were not, and only a
-   class that answers them can run it. */
+   class that answers them can run it. (A reader asks the plan with no site:
+   the block runs whenever the instance_eval does, after an attr_reader of
+   the name has run too.) */
 static int ie_body_bare_call(Compiler *c, int node, const int *cand, int nc) {
   const NodeTable *nt = c->nt;
   if (node < 0) return 0;
@@ -33136,7 +33932,7 @@ static int ie_body_bare_call(Compiler *c, int node, const int *cand, int nc) {
   if (k == NK_CallNode && nt_ref(nt, node, "receiver") < 0) {
     const char *nm = nt_str(nt, node, "name");
     for (int i = 0; nm && i < nc; i++)
-      if (call_target(c, node, cand[i], nm, 0, NULL) >= 0 || comp_reader_in_chain(c, cand[i], nm, NULL))
+      if (call_target(c, node, cand[i], nm, 0, NULL) >= 0 || call_attr_target(c, -1, cand[i], nm, CT_ATTR, NULL))
         return 1;
   }
   int nr = nt_num_refs(nt, node);
@@ -33726,13 +34522,15 @@ void emit_bm_spread_call(Compiler *c, int id, int recv, const int *argv, int arg
 
 /* The class a class method bound by the Method `recv` runs on: the
    constant its `K.method(:m)` names, which for an inherited one is the
-   subclass (`Sub.method(:make).call` constructs a Sub), else `dflt`, the
-   defining class. */
+   subclass (`Sub.method(:make).call` constructs a Sub), also through a
+   `super_method`, else `dflt`, the defining class. */
 int method_node_recv_class(Compiler *c, int recv, int dflt) {
   const NodeTable *nt = c->nt;
   int mn = method_recv_node(c, recv);
   const char *nm = mn >= 0 ? nt_str(nt, mn, "name") : NULL;
-  if (!nm || !sp_streq(nm, "method")) return dflt;
+  /* (a super_method keeps its Method's receiver: the same class) */
+  while (is_super_method_name(nm) && (mn = method_recv_node(c, nt_ref(nt, mn, "receiver"))) >= 0) nm = nt_str(nt, mn, "name");
+  if (mn < 0 || !is_method_ref_name(nm)) return dflt;
   int mr = nt_ref(nt, mn, "receiver");
   if (mr < 0 || (nt_kind(nt, mr) != NK_ConstantReadNode && nt_kind(nt, mr) != NK_ConstantPathNode))
     return dflt;
@@ -33758,7 +34556,7 @@ void emit_bound_method_call(Compiler *c, int id, int recv, int target, Buf *b) {
   emit_indent(g_pre, g_indent);
   buf_printf(g_pre, "sp_BoundMethod *_t%d = %s; SP_GC_ROOT(_t%d);\n", tr, rb.p ? rb.p : "NULL", tr);
   free(rb.p);
-  TyKind tret = (TyKind)tm->ret;
+  TyKind tret = repr_method_ret_storage(tm);
   int is_void = method_is_void(tm);
   /* A default that WRITES a method-scope local the body READS cannot be
      answered from the call site (default_writes_body_local), nor one reading
@@ -33794,8 +34592,7 @@ void emit_bound_method_call(Compiler *c, int id, int recv, int target, Buf *b) {
      the call answers it (node_is_oint answers the target's form here) */
   int ret_o = !is_void && oint_kind(tret) && method_ret_is_oint(tm);
   if (is_void) buf_puts(&cast, "void");
-  else if (ret_o) buf_puts(&cast, oint_ctype(tret));
-  else emit_ctype(c, tret, &cast);
+  else emit_method_ret_ctype(c, tm, &cast);
   buf_puts(&cast, " (*)(");
   int np = 0;
   if (self_ful) { buf_puts(&cast, boxed_self ? "sp_RbVal" : "void *"); np++; }
@@ -33948,14 +34745,14 @@ static void emit_bind_call_arm(Compiler *c, int id, int target, const int *argv,
   g_arm_self = sv_arm_self; g_arm_scope = sv_arm_scope; g_arm_depth = sv_arm_depth;
   buf_puts(&call, ")");
   if (apre.p && apre.p[0]) buf_puts(b, apre.p);
-  TyKind kr = (TyKind)tm->ret;
+  TyKind kr = repr_method_ret_storage(tm);
   if (method_is_void(tm))
     buf_printf(b, "%s; _t%d = %s;", call.p, tr, slot == TY_POLY ? "sp_box_nil()" : default_value_from_compiler(c, slot));
   else {
     buf_printf(b, "_t%d = ", tr);
-    if (slot == TY_POLY && kr != TY_POLY) emit_boxed_text(c, kr, call.p, b);
+    if (slot == TY_POLY && kr != TY_POLY) emit_boxed_ret_call(c, tm, call.p, b);
     else if (slot != TY_POLY && kr == TY_POLY) emit_unbox_text(c, slot, call.p, b);
-    else buf_puts(b, call.p);
+    else emit_coerce_text(c, id, kr, slot, CO_HOLD, call.p, "a bound method result", b);
     buf_puts(b, ";");
   }
   free(apre.p); free(call.p);
@@ -33977,6 +34774,7 @@ static void emit_bind_call_arm(Compiler *c, int id, int target, const int *argv,
 void emit_bind_call_boxed(Compiler *c, int id, int target, int kn, const char *sym,
                                  const int *argv, int argc, Buf *b) {
   TyKind slot = repr_of(c, id).as_ty;
+  if (repr_native_call_handle(c, id)) slot = repr_call_result_storage(slot);
   if (slot == TY_VOID || slot == TY_UNKNOWN) slot = TY_POLY;
   int tk = ++g_tmp, to = ++g_tmp, tr = ++g_tmp;
   buf_puts(b, "({ ");
@@ -33996,7 +34794,8 @@ void emit_bind_call_boxed(Compiler *c, int id, int target, int kn, const char *s
     free(kb.p);
     buf_printf(b, "switch (_t%d.cls_id) {", tk);
     for (int k = 0; k < c->nclasses; k++)
-      if (class_value_bind_call_target(c, k, sym, NULL) >= 0) buf_printf(b, " case %d:", k);
+      if (class_value_bind_call_target(c, nt_ref(c->nt, id, "receiver"), k, sym, NULL) >= 0)
+        buf_printf(b, " case %d:", k);
     buf_printf(b, " break; default: sp_raise_cls(\"NameError\", sp_sprintf(\"undefined method '%s' for %%s '%%s'\", "
                   "sp_class_is_module_fn && sp_class_is_module_fn(_t%d) ? \"module\" : \"class\", "
                   "sp_class_to_s(_t%d))); } ", sym, tk, tk);
@@ -34018,7 +34817,7 @@ void emit_bind_call_boxed(Compiler *c, int id, int target, int kn, const char *s
   else {
     buf_printf(b, "switch (_t%d.cls_id) {", tk);
     for (int k = 0; k < c->nclasses; k++) {
-      int tmi = class_value_bind_call_target(c, k, sym, NULL);
+      int tmi = class_value_bind_call_target(c, nt_ref(c->nt, id, "receiver"), k, sym, NULL);
       if (tmi < 0) continue;
       buf_printf(b, " case %d: { ", k);
       emit_bind_call_arm(c, id, tmi, argv, argc, to, tr, slot, b);
@@ -34167,98 +34966,6 @@ int object_private_method_name(const char *qm) {
   return 0;
 }
 
-/* The visibility of method qm that a program's reopening of Object, Kernel
-   or BasicObject gives an instance of class cid (-1: a value of no program
-   class), in the order CRuby looks them up, or -1 when none defines it.
-   A blank slate (BasicObject's subclass) reaches only BasicObject's. The
-   class table keeps these roots apart from cid's own chain. */
-/* Whether root reopening k itself defines qm: a def, or an attr_reader or
-   attr_writer (`x=`) its body declared. */
-int root_reopen_defines_own(Compiler *c, int k, const char *qm) {
-  ClassInfo *ci = &c->classes[k];
-  /* (a module function of Kernel's own is its instance method too; a copy
-     an include made is the root's, as the module stands in front of the
-     roots after it, but not Object's copy of a Kernel method: that is
-     Kernel's) */
-  int dk = -1, mi = comp_self_method_in_chain(c, k, qm, &dk), om = mi >= 0 ? c->scopes[mi].origin_module_ci - 1 : -1;
-  if (mi >= 0 && dk == k && (om < 0 || !is_object_root(c->classes[om].name))) return 1;
-  if (comp_is_reader(ci, qm)) return 1;
-  if (!name_is_plain_setter(qm)) return 0;
-  char base[260];
-  size_t ln = strlen(qm);
-  if (ln - 1 >= sizeof base) return 0;
-  memcpy(base, qm, ln - 1); base[ln - 1] = 0;
-  return comp_is_writer(ci, base);
-}
-
-int root_reopen_method_vis(Compiler *c, int cid, const char *qm) {
-  static const int roots[] = { CORE_OBJECT, CORE_KERNEL, CORE_BASIC_OBJECT, -1 };
-  int blank = cid >= 0 && class_is_blank_slate(c, cid);
-  for (int u = 0; roots[u] >= 0; u++) {
-    if (blank && roots[u] != CORE_BASIC_OBJECT) continue;
-    int k = comp_core_class(c, roots[u]);
-    if (k < 0 || k == cid) continue;
-    /* an undef here hides a lower root's method of that name; it is
-       checked first, as comp_is_undeffed_in_chain does, since a Kernel
-       reopening's defs land in Object's table */
-    if (name_list_has(c->classes[k].undefs, c->classes[k].nundefs, qm)) return -1;
-    if (root_reopen_defines_own(c, k, qm)) return comp_method_vis_declared(c, k, qm, NULL);
-  }
-  return -1;
-}
-
-/* What an instance of user class cid answers to Object#respond_to?(qm): 2 =
-   true, 1 = only with include_all (a private or protected match), 0 = false.
-   The method-table reading of respond_to_static_answer's object branch,
-   without its deferral to the class's own respond_to? -- this is what that
-   override's `super` asks. */
-static int obj_responds_answer(Compiler *c, int cid, const char *qm) {
-  if (name_is_synth_method(c, qm) || comp_method_is_private_helper(c, cid, qm)) return 0;
-  if (sp_streq(qm, "initialize_copy")) return 1;
-  /* BasicObject#initialize is private too, unless the class made it public:
-     a `public :initialize` counts whether or not the chain defines it */
-  if (sp_streq(qm, "initialize")) {
-    int at = -1, vis = comp_method_vis_declared(c, cid, qm, &at);
-    if (at >= 0) return vis == SP_VIS_PUBLIC ? 2 : 1;
-    return comp_method_in_chain(c, cid, qm, NULL) >= 0 && vis == SP_VIS_PUBLIC ? 2 : 1;
-  }
-  for (int u = 0; respond_universal[u]; u++) if (sp_streq(qm, respond_universal[u])) return 2;
-  char wbase[256]; wbase[0] = '\0';
-  int is_wr = setter_base_name(qm, wbase, sizeof wbase);
-  if (comp_is_undeffed_in_chain(c, cid, qm)) return 0;
-  /* a singleton alias names a class method, not one of the instance's */
-  if (comp_name_is_sg_alias_only(c, cid, qm)) return 0;
-  /* an alias that captured an Object / Kernel method answers as that one */
-  { int bi = 0; const char *bn = comp_resolve_alias_ex(c, cid, qm, NULL, &bi);
-    if (bi == 3 && !sp_streq(bn, qm)) return 2; }
-  int found = (comp_method_in_chain(c, cid, qm, NULL) >= 0 &&
-               !method_hidden_from_reflection(c, cid, qm)) ||
-              comp_reader_in_chain(c, cid, qm, NULL) ||
-              (is_wr && comp_writer_in_chain(c, cid, wbase, NULL));
-  /* an Array (Hash) subclass instance answers Array's (Hash's) names (#7449) */
-  if (!found && comp_ty_ary_root(c, ty_object(cid)) >= 0 && comp_arysub_builtin_name(c, -1, cid, qm)) return 2;
-  /* Both a native class and its subclasses answer the public bindings.
-     A source visibility declaration applies just as it does to a def. */
-  int nk = comp_native_binding_class(c, cid, qm);
-  if (!found && nk >= 0 && comp_native_method_find(c, nk, qm, 0, 0) >= 0)
-    return comp_method_vis_in_chain(c, cid, qm) == SP_VIS_PUBLIC ? 2 : 1;
-  /* the names the class answers without a method-table entry: an
-     Enumerable includer's, a Comparable's, a Struct's or a Data's
-     core names (#2663) */
-  if (!found && class_implicit_responds(c, cid, qm)) return 2;
-  /* a method of a program's Object, Kernel or BasicObject reopening that
-     the chain does not reach (the class table keeps them apart): the
-     root's, by its visibility there */
-  if (!found) {
-    int rv = root_reopen_method_vis(c, cid, qm);
-    if (rv >= 0) return rv == SP_VIS_PUBLIC ? 2 : 1;
-  }
-  /* Object's private methods (exit, puts, raise) answer to include_all;
-     one an Object reopening redefines is left as the chain reads it */
-  if (!found) return object_private_method_name(qm) && !class_is_blank_slate(c, cid) &&
-                     !root_reopen_defines(c, qm) ? 1 : 0;
-  return comp_method_vis_in_chain(c, cid, qm) == SP_VIS_PUBLIC ? 2 : 1;
-}
 
 /* `super` inside a user-defined respond_to?(m, include_all = false) that no
    ancestor defines is Object#respond_to? for this object: a switch over the
@@ -34370,7 +35077,7 @@ int emit_super_respond_to(Compiler *c, int id, Scope *s, Buf *b) {
       }
       int ans[256], same = 1, any = 0;
       for (int k = 0; k < ncls; k++) {
-        ans[k] = obj_responds_answer(c, cls[k], qm);
+        ans[k] = cplan_obj_responds(c, cls[k], qm, id);
         if (ans[k]) any = 1;
         if (ans[k] != ans[0]) same = 0;
       }
@@ -34416,7 +35123,7 @@ int g_rto_exc = 0;
    value (emit_respond_to_flag_split asks both); -1: as the call writes it */
 int g_rto_force_ia = -1;
 static int rto_exact_class_answer(Compiler *c, int cid, const char *qm,
-                                  int include_all, int foldable);
+                                  int include_all, int foldable, int id);
 /* Does an exception class of the program define qm, public or not, which
    no builtin exception has? Then a receiver typed as the base exception
    answers by the class it holds. Not when one of them answers only at run
@@ -34426,8 +35133,8 @@ static int rto_exc_by_cls(Compiler *c, const char *qm, int include_all, int fold
   int any = 0;
   for (int k = 0; k < c->nclasses; k++) {
     if (!class_is_exc_subclass(c, k)) continue;
-    if (rto_exact_class_answer(c, k, qm, include_all, foldable) < 0) return 0;
-    any |= obj_responds_answer(c, k, qm) != 0;
+    if (rto_exact_class_answer(c, k, qm, include_all, foldable, -1) < 0) return 0;
+    any |= cplan_obj_responds(c, k, qm, -1) != 0;
   }
   return any;
 }
@@ -34436,13 +35143,20 @@ static int rto_exc_by_cls(Compiler *c, const char *qm, int include_all, int fold
 int emit_respond_to_exc_cls(Compiler *c, int recv, const char *qm, int argc,
                             const int *argv, Buf *b) {
   int include_all = argc >= 2 && nt_kind(c->nt, argv[1]) == NK_TrueNode;
-  int t = ++g_tmp;
+  int t = ++g_tmp, own = 0;
+  for (int k = 0; k < c->nclasses && !own; k++)
+    own = class_is_exc_subclass(c, k) && rto_exact_class_answer(c, k, qm, include_all, 1, -1) == 1;
   char xv[32]; snprintf(xv, sizeof xv, "_t%d", t);
   buf_printf(b, "({ sp_Exception *_t%d = (sp_Exception *)(", t);
   emit_expr(c, recv, b);
-  buf_printf(b, "); int _k%d = _t%d ? sp_exc_user_cls_id(sp_box_obj((void *)_t%d, SP_BUILTIN_EXCEPTION)) : 0x7fffffff; (", t, t, t);
-  for (int k = 0; k < c->nclasses; k++)
-    if (class_is_exc_subclass(c, k) && rto_exact_class_answer(c, k, qm, include_all, 1) == 1)
+  buf_puts(b, "); ");
+  /* the class id is read only where a class of the program answers (a
+     class-gated accessor's name may have none, and then the program has
+     no sp_exc_user_cls_id) */
+  if (own) buf_printf(b, "int _k%d = _t%d ? sp_exc_user_cls_id(sp_box_obj((void *)_t%d, SP_BUILTIN_EXCEPTION)) : 0x7fffffff; ", t, t, t);
+  buf_puts(b, "(");
+  for (int k = 0; own && k < c->nclasses; k++)
+    if (class_is_exc_subclass(c, k) && rto_exact_class_answer(c, k, qm, include_all, 1, -1) == 1)
       buf_printf(b, "_k%d == %d || ", t, k);
   buf_printf(b, "(_t%d ? sp_poly_responds_builtin(", t);
   emit_boxed_text(c, TY_EXCEPTION, xv, b);
@@ -34455,22 +35169,12 @@ int emit_respond_to_exc_cls(Compiler *c, int recv, const char *qm, int argc,
    (qm): 1 / 0, or -1 when only the runtime can tell (its class defines
    respond_to?, or a private match under a runtime include_all). */
 static int rto_exact_class_answer(Compiler *c, int cid, const char *qm,
-                                  int include_all, int foldable) {
+                                  int include_all, int foldable, int id) {
   /* the class's own respond_to? answers, not the method table */
-  if (comp_method_in_chain(c, cid, "respond_to?", NULL) >= 0) return -1;
-  int a = obj_responds_answer(c, cid, qm);
+  if (call_target(c, id, cid, RESPOND_TO_NAME, CT_METHODS, NULL) >= 0) return -1;
+  int a = cplan_obj_responds(c, cid, qm, id);
   if (a != 1) return a == 2;
   return foldable ? include_all : -1;
-}
-/* Whether a slot typed as class cid may hold an instance of class k: cid's
-   own subclasses, and for a singleton class the classes above it its object
-   carries until its `def obj.m` runs, or after #dup drops it (the links up
-   to the class Ruby sees). */
-static int rto_slot_may_hold(Compiler *c, int k, int cid) {
-  if (is_descendant(c, k, cid)) return 1;
-  for (int p = cid; p >= 0 && c->classes[p].is_singleton_of; )
-    if ((p = c->classes[p].parent) == k) return 1;
-  return 0;
 }
 /* The answer for a receiver typed as class cid, which holds an instance of
    cid or of any subclass: a method the base class runs on self
@@ -34479,14 +35183,14 @@ static int rto_slot_may_hold(Compiler *c, int k, int cid) {
    instance may have disagree, g_rto_by_cls names cid and the answer is -1,
    for the emitter to ask the object's class id. */
 static int rto_subtree_answer(Compiler *c, int cid, const char *qm,
-                              int include_all, int foldable) {
-  int a = rto_exact_class_answer(c, cid, qm, include_all, foldable);
+                              int include_all, int foldable, int id) {
+  int a = rto_exact_class_answer(c, cid, qm, include_all, foldable, id);
   if (a < 0 || c->classes[cid].is_value_type) return a;
   int mixed = 0;
   for (int k = 0; k < c->nclasses; k++) {
-    if (k == cid || !rto_slot_may_hold(c, k, cid) ||
+    if (k == cid || !cplan_slot_may_hold(c, k, cid) ||
         (!c->classes[k].instantiated && is_descendant(c, k, cid))) continue;
-    int ak = rto_exact_class_answer(c, k, qm, include_all, foldable);
+    int ak = rto_exact_class_answer(c, k, qm, include_all, foldable, id);
     if (ak < 0) return -1;
     if (ak != a) mixed = 1;
   }
@@ -34499,7 +35203,7 @@ static int rto_subtree_answer(Compiler *c, int cid, const char *qm,
    off the object (self when recv < 0), true for the classes under the
    receiver's class that answer qm. A nil slot answers nil's own surface.
    Answers 1 when it emitted. */
-int emit_respond_to_by_cls(Compiler *c, int recv, const char *qm, int argc,
+int emit_respond_to_by_cls(Compiler *c, int id, int recv, const char *qm, int argc,
                            const int *argv, Buf *b) {
   int cid = g_rto_by_cls;
   if (cid < 0) return 0;
@@ -34513,8 +35217,8 @@ int emit_respond_to_by_cls(Compiler *c, int recv, const char *qm, int argc,
   buf_puts(b, "(");
   int any = 0;
   for (int k = 0; k < c->nclasses; k++) {
-    if (!rto_slot_may_hold(c, k, cid)) continue;
-    if (rto_exact_class_answer(c, k, qm, include_all, 1) != 1) continue;
+    if (!cplan_slot_may_hold(c, k, cid)) continue;
+    if (rto_exact_class_answer(c, k, qm, include_all, 1, id) != 1) continue;
     buf_printf(b, "%s_t%d == %d", any ? " || " : "", t, k);
     any = 1;
   }
@@ -34523,23 +35227,6 @@ int emit_respond_to_by_cls(Compiler *c, int recv, const char *qm, int argc,
   if (nil_slot) buf_printf(b, " : %d", nil_answers_name(qm) || sp_streq(qm, "rationalize"));
   buf_puts(b, "; })");
   return 1;
-}
-/* Does a reopening of Object, Kernel or BasicObject define or undefine qm?
-   Then the name is left to the class chain, as it was read before Object's
-   private methods were answered. */
-int root_reopen_defines(Compiler *c, const char *qm) {
-  static const NodeTable *memo_nt = NULL; static int memo_ncl = -1, roots[8], nroots = 0;
-  if (memo_nt != c->nt || memo_ncl != c->nclasses) {
-    memo_nt = c->nt; memo_ncl = c->nclasses; nroots = 0;
-    for (int k = 0; k < c->nclasses && nroots < 8; k++)
-      if (c->classes[k].name && is_object_root(c->classes[k].name)) roots[nroots++] = k;
-  }
-  for (int i = 0; i < nroots; i++) {
-    ClassInfo *kc = &c->classes[roots[i]];
-    if (call_target(c, -1, roots[i], qm, CT_OWN | CT_SHARED, NULL) >= 0 || comp_is_reader(kc, qm)) return 1;
-    for (int u = 0; u < kc->nundefs; u++) if (sp_streq(kc->undefs[u], qm)) return 1;
-  }
-  return 0;
 }
 /* Could some class answer respond_to?(qm, true) for one of Object's private
    methods other than true? A BasicObject one has none of them, a class that
@@ -34553,11 +35240,17 @@ int private_answer_overridden(Compiler *c, const char *qm, TyKind rt) {
     int builtin = kn && (is_builtin_class_name(kn) || is_builtin_module_const_name(kn) ||
                          is_object_root(kn));
     if (!boxed && !builtin) continue;
-    if (class_is_blank_slate(c, k) || comp_is_undeffed_in_chain(c, k, qm) ||
-        comp_method_in_class(c, k, "respond_to?") >= 0 ||
-        comp_cmethod_in_chain(c, k, "respond_to?", NULL) >= 0) return 1;
+    if (class_is_blank_slate(c, k) || cplan_undefined(c, k, 0, qm) ||
+        call_target(c, -1, k, RESPOND_TO_NAME, CT_OWN, NULL) >= 0 ||
+        call_target(c, -1, k, RESPOND_TO_NAME, CT_CMETHOD, NULL) >= 0) return 1;
   }
   return 0;
+}
+/* The method class k itself defines under `name`, where the load record has it live at call id: -1 where the record
+   proves the call runs before the def (the tables' own entry stands for the def, the plan asks the point) */
+static int reopen_own_live(Compiler *c, int id, int k, const char *name) {
+  int own = call_target(c, -1, k, name, CT_OWN, NULL);
+  return own >= 0 && call_target(c, id, k, name, CT_REACH, NULL) >= 0 ? own : -1;
 }
 /* true or false asked respond_to?(qm) where TrueClass or FalseClass
    defines qm itself: each value answers by its own class, as Ruby's lookup
@@ -34568,23 +35261,23 @@ int private_answer_overridden(Compiler *c, const char *qm, TyKind rt) {
    paths: a name a root reopening or an included module defines, a
    respond_to_missing? some class could run, or Object's private methods to
    include_all. */
-int bool_side_responds(Compiler *c, const char *qm, int include_all, int foldable, int *ta, int *fa) {
+int bool_side_responds(Compiler *c, int id, const char *qm, int include_all, int foldable, int *ta, int *fa) {
   int ks[2] = { comp_core_class(c, CORE_TRUECLASS), comp_core_class(c, CORE_FALSECLASS) };
   int own[2], any = 0;
   for (int i = 0; i < 2; i++) {
-    own[i] = ks[i] >= 0 ? comp_method_in_class(c, ks[i], qm) : -1;
+    own[i] = ks[i] >= 0 ? reopen_own_live(c, id, ks[i], qm) : -1;
     /* (an alias of the class's own method is its own too) */
     if (own[i] < 0 && ks[i] >= 0) {
       const char *al = comp_resolve_alias(c, ks[i], qm);
-      if (al && !sp_streq(al, qm)) own[i] = comp_method_in_class(c, ks[i], al);
+      if (al && !sp_streq(al, qm)) own[i] = reopen_own_live(c, id, ks[i], al);
     }
     if (own[i] >= 0) any = 1;
   }
-  if (!any || root_reopen_defines(c, qm)) return 0;
+  if (!any || root_reopen_defines(c, id, qm)) return 0;
   /* (a respond_to_missing? answers too: left to the other paths) */
-  if (root_reopen_defines(c, "respond_to_missing?")) return 0;
+  if (root_reopen_defines(c, id, RESPOND_TO_MISSING_NAME)) return 0;
   for (int i = 0; i < 2; i++)
-    if (ks[i] >= 0 && comp_method_in_chain(c, ks[i], "respond_to_missing?", NULL) >= 0) return 0;
+    if (ks[i] >= 0 && call_target(c, -1, ks[i], RESPOND_TO_MISSING_NAME, CT_METHODS, NULL) >= 0) return 0;
   if (include_all || !foldable) {
     if (object_private_method_name(qm)) return 0;
     for (int si = 0; si < c->nscopes; si++) {
@@ -34595,16 +35288,24 @@ int bool_side_responds(Compiler *c, const char *qm, int include_all, int foldabl
   }
   int ans[2];
   for (int i = 0; i < 2; i++) {
-    if (ks[i] >= 0 && (comp_is_undeffed_in_chain(c, ks[i], qm) || comp_is_reader(&c->classes[ks[i]], qm)))
+    CplanPresence pr = { 0 };
+    if (ks[i] >= 0) cplan_presence(c, id, ks[i], 0, qm, &pr);
+    if (ks[i] >= 0 && (pr.undef || call_attr_target(c, -1, ks[i], qm, CT_ATTR, NULL)))
       return 0;
     if (own[i] >= 0)
-      ans[i] = comp_method_vis_declared(c, ks[i], qm, NULL) == SP_VIS_PUBLIC ? 1 : foldable ? include_all : 2;
+      ans[i] = pr.vis == SP_VIS_PUBLIC ? 1 : foldable ? include_all : 2;
     /* (a method an included module gives the class) */
-    else if (ks[i] >= 0 && comp_method_in_chain(c, ks[i], qm, NULL) >= 0) return 0;
+    else if (ks[i] >= 0 && call_target(c, id, ks[i], qm, CT_METHODS | CT_REACH, NULL) >= 0) return 0;
     else ans[i] = -1;
   }
   *ta = ans[0]; *fa = ans[1];
   return 1;
+}
+/* The names an Enumerator answers that a chain and a product do not */
+int is_enum_cursor_name(const char *n) {
+  static const char *const iterm[] = { "next", "peek", "next_values", "peek_values", "feed", NULL };
+  for (int u = 0; n && iterm[u]; u++) if (sp_streq(n, iterm[u])) return 1;
+  return 0;
 }
 int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const char *qm,
                                     int argc, const int *argv) {
@@ -34612,6 +35313,7 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
   g_rto_nil_obj = 0;
   g_rto_by_cls = -1;
   g_rto_exc = 0;
+  if (recv >= 0 && respond_to_guard_reaches(c, rt, qm)) return -1;
   /* respond_to?(sym, include_all=false): by default only public methods
      answer true; a literal `true` 2nd arg includes private+protected. A
      non-literal 2nd arg can't be folded, so a private/protected match is
@@ -34630,7 +35332,7 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
      literal's own side answers; any other is asked at run time
      (emit_respond_to_bool_sides) */
   { int ta, fa;
-    if (recv >= 0 && rt == TY_BOOL && bool_side_responds(c, qm, include_all, foldable, &ta, &fa)) {
+    if (recv >= 0 && rt == TY_BOOL && bool_side_responds(c, id, qm, include_all, foldable, &ta, &fa)) {
       int lr = nt_paren_single(nt, recv);
       NodeKind lk = lr >= 0 ? nt_kind(nt, lr) : NK_NilNode;
       if (lk == NK_TrueNode && (ta == 0 || ta == 1)) return ta;
@@ -34638,7 +35340,7 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
       return -1;
     } }
   /* a class's own class method whose answer the version cells hold */
-  if (emit_respond_to_cells(c, id, qm, argc, argv, NULL)) return -1;
+  if (emit_respond_to_cells(c, id, recv, rt, qm, argc, argv, NULL)) return -1;
   /* a compiler-synthesized helper (__enum_to_a) is not a real method: CRuby
      answers false, so never let the class-chain lookup below report it */
   if (name_is_synth_method(c, qm)) { resolved = 1; yes = 0; }
@@ -34650,7 +35352,7 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
   int init_pub = 0;
   if ((is_initialize_family(qm)) && recv >= 0 && ty_is_object(rt)) {
     int at = -1;
-    init_pub = comp_method_vis_declared(c, ty_object_class(rt), qm, &at) == SP_VIS_PUBLIC && at >= 0;
+    init_pub = cplan_method_vis(c, -1, ty_object_class(rt), qm, 0, &at) == SP_VIS_PUBLIC && at >= 0;
   }
   if (!resolved && init_pub && foldable) {
     /* made public on the class, but nil's own stays private: a heap object
@@ -34685,21 +35387,17 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
      `5.respond_to?(:foo, true)` read false. A receiver whose class has its
      own respond_to? keeps the answer below. */
   if (!resolved && foldable && include_all && recv >= 0 &&
-      !(ty_is_object(rt) && comp_method_in_chain(c, ty_object_class(rt), "respond_to?", NULL) >= 0)) {
-    for (int si = 0; si < c->nscopes; si++) {
-      const Scope *ts = &c->scopes[si];
-      if (ts->name && ts->def_node >= 0 && ts->class_id < 0 && !ts->is_cmethod &&
-          !ts->is_proc_form && sp_streq(ts->name, qm)) { resolved = yes = 1; break; }
-    }
+      !(ty_is_object(rt) && call_target(c, id, ty_object_class(rt), RESPOND_TO_NAME, CT_METHODS, NULL) >= 0)) {
+    if (call_target(c, -1, -1, qm, CT_TOP, NULL) >= 0 && !cplan_top_def_absent(c, id, qm)) resolved = yes = 1;
   }
   /* Object's private methods (exit, puts, raise) are every object's, so a
      builtin value, a class value or a boxed one answers them to include_all,
      whatever public method of the name its own class adds (IO#puts). Only
      while no class could answer otherwise: a BasicObject one, one that
      undefines the name, one with its own respond_to?. A user object answers
-     through its class chain below (obj_responds_answer). */
+     through its class chain below (cplan_obj_responds). */
   if (!resolved && foldable && include_all && recv >= 0 && !ty_is_object(rt) && rt != TY_CLASS &&
-      object_private_method_name(qm) && !root_reopen_defines(c, qm)) {
+      object_private_method_name(qm) && !root_reopen_defines(c, id, qm)) {
     if (!private_answer_overridden(c, qm, rt)) resolved = yes = 1;
     /* the value's class picks, at run time (emit_call_reflection_arms) */
     else if (respond_to_runtime_reaches(c, rt)) return -1;
@@ -34712,13 +35410,13 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
       rt != TY_POLY && rt != TY_UNKNOWN) {
     int bv = rt == TY_BOOL, rv = -1;
     const int cores[2] = { bv ? CORE_TRUECLASS : builtin_class_of_type(rt) ? core_of_type(rt) : -1, bv ? CORE_FALSECLASS : -1 };
-    if (cores[0] >= 0) rv = root_reopen_method_vis(c, -1, qm);
+    if (cores[0] >= 0) rv = root_reopen_method_vis(c, id, -1, qm);
     /* ...or by the top level's def, Object's method from where it runs */
     if (cores[0] >= 0 && rv < 0 && !builtin_method_known(core_class_name(cores[0]), qm)) rv = cplan_top_def_vis(c, id, qm);
     for (int i = 0; i < 2 && rv >= 0 && cores[i] >= 0; i++) {
       int bci = comp_core_class(c, cores[i]);
       if (builtin_method_known(core_class_name(cores[i]), qm) ||
-          (bci >= 0 && !is_object_root(c->classes[bci].name) && comp_method_in_chain(c, bci, qm, NULL) >= 0)) rv = -1;
+          (bci >= 0 && !is_object_root(c->classes[bci].name) && call_target(c, -1, bci, qm, CT_METHODS, NULL) >= 0)) rv = -1;
     }
     if (rv >= 0) {
       if (rv == SP_VIS_PUBLIC) resolved = yes = 1;
@@ -34748,17 +35446,19 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
        below) */
     if (bn && (bci < 0 || !builtin_ancestor_accessor(c, bci, qm)) && !builtin_method_known(bn, qm) && core_method_vis(bn, qm, 1, NULL) <= 0 &&
         !core_method_undefined(bn, qm) &&
-        (bci < 0 || (comp_method_in_chain(c, bci, qm, NULL) < 0 && !comp_is_undeffed_in_chain(c, bci, qm)))) {
+        (bci < 0 || (call_target(c, -1, bci, qm, CT_METHODS, NULL) < 0 && !cplan_undefined(c, bci, 0, qm)))) {
       for (int a = 1; anc[a] && !sp_streq(anc[a], "Object"); a++) {
         int k = comp_class_index(c, anc[a]);
         if (k < 0) continue;
-        if (comp_is_undeffed_in_chain(c, k, qm) || builtin_ancestor_accessor(c, k, qm)) break;
-        if (comp_method_in_chain(c, k, qm, NULL) < 0) continue;
+        if (cplan_undefined(c, k, 0, qm) || builtin_ancestor_accessor(c, k, qm)) break;
+        if (call_target(c, -1, k, qm, CT_METHODS, NULL) < 0) continue;
         /* the def must have run where the call runs (`"s".respond_to?(:m)`
            ahead of `module Comparable; def m`); else the paths below
            answer */
         if (!builtin_ancestor_def_ran(c, id, k, qm)) break;
-        int v = comp_method_vis_in_chain(c, k, qm);
+        CplanPresence apr;
+        cplan_table_presence(c, k, 0, qm, &apr);
+        int v = apr.vis;
         /* (a private or protected one with a second argument only the run
            time knows is left to the paths below, as before) */
         if (v == SP_VIS_PUBLIC) resolved = yes = 1;
@@ -34779,8 +35479,10 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
     static const int roots[] = { CORE_BASIC_OBJECT, CORE_OBJECT, CORE_KERNEL, -1 };
     for (int u = 0; roots[u] >= 0; u++) {
       int k = comp_core_class(c, roots[u]);
-      if (k < 0 || comp_method_in_chain(c, k, qm, NULL) < 0) continue;
-      if (comp_method_vis_in_chain(c, k, qm) == SP_VIS_PUBLIC) return 1;
+      if (k < 0 || call_target(c, -1, k, qm, CT_METHODS, NULL) < 0) continue;
+      CplanPresence rpr;
+      cplan_table_presence(c, k, 0, qm, &rpr);
+      if (rpr.vis == SP_VIS_PUBLIC) return 1;
       return foldable ? include_all : -1;
     }
     return -1;
@@ -34799,6 +35501,10 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
      range does; the probe below has no reading for them (#3619) */
   if (!resolved && recv >= 0 &&
       (rt == TY_RANGE || rt == TY_FLOAT_RANGE || rt == TY_STR_RANGE)) return -1;
+  /* an Enumerator slot may hold a chain or a product, which CRuby makes
+     without next, peek, next_values, peek_values and feed: the site reads
+     which one it holds (emit_respond_to's Enumerator arm) */
+  if (!resolved && recv >= 0 && rt == TY_ENUMERATOR && is_enum_cursor_name(qm)) return -1;
   if (!resolved && recv >= 0 && rt == TY_PROC) {
     static const char *const procm[] = {
       "call", "()", "[]", "yield", "arity", "lambda?", "curry",
@@ -34836,9 +35542,9 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
          very constructor the same program calls (#3482). */
       /* A CORE class object answers the Class/Module surface every class
          has -- `new`, `instance_method`, `ancestors` -- but it has no user
-         entry, so class_responds_to was never consulted and the probe
+         entry, so cplan_class_responds was never consulted and the probe
          cannot type a bare `Range.new` (#3494). Answer those here. A
-         module is excluded from `new` the same way class_responds_to
+         module is excluded from `new` the same way cplan_class_responds
          excludes it. */
       if (!resolved && rcn && ci < 0 && builtin_class_id(rcn) != 0 &&
           class_object_universal_method(qm) &&
@@ -34854,13 +35560,13 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
                sp_streq(qm, "define")) { resolved = 1; yes = 1; }
       else if (ci >= 0) {
         resolved = 1;
-        yes = class_responds_to(c, ci, qm, id);
+        yes = cplan_class_responds(c, ci, qm, id);
         /* A reopening retains the builtin methods its own table does not list. */
         if (!yes && (is_builtin_class_name(rcn) || is_builtin_module_const_name(rcn)) &&
             !(comp_class_is_module(c, &c->classes[ci]) && class_only_method(qm)))
           rt_probe_answer(c, id, &yes);
         /* a private/protected class method answers only to include_all */
-        if (yes && foldable && comp_cmethod_vis_declared(c, ci, qm, NULL) != SP_VIS_PUBLIC)
+        if (yes && foldable && cplan_method_vis(c, -1, ci, qm, CPV_CMETHOD, NULL) != SP_VIS_PUBLIC)
           yes = include_all;
         /* as do Class's and Module's private ones (private, inherited, ...) */
         if (!yes && foldable && include_all && class_object_private_method(qm, comp_class_is_module(c, &c->classes[ci])))
@@ -34891,10 +35597,10 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
       const char *rcn = c->classes[ci].name;
       int mod = comp_class_is_module(c, &c->classes[ci]);
       resolved = 1;
-      yes = class_responds_to(c, ci, qm, id);
+      yes = cplan_class_responds(c, ci, qm, id);
       if (!yes && (is_builtin_class_name(rcn) || is_builtin_module_const_name(rcn)) && !(mod && class_only_method(qm)))
         rt_probe_answer(c, id, &yes);
-      if (yes && foldable && comp_cmethod_vis_declared(c, ci, qm, NULL) != SP_VIS_PUBLIC) yes = include_all;
+      if (yes && foldable && cplan_method_vis(c, -1, ci, qm, CPV_CMETHOD, NULL) != SP_VIS_PUBLIC) yes = include_all;
       if (!yes && foldable && include_all && class_object_private_method(qm, mod)) yes = 1;
     }
     else if (recv >= 0 && ty_is_object(rt)) {
@@ -34912,7 +35618,7 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
         resolved = 1; yes = 0;
       }
       else {
-        int a = rto_subtree_answer(c, cid, qm, include_all, foldable);
+        int a = rto_subtree_answer(c, cid, qm, include_all, foldable, id);
         if (a < 0) return -1;
         resolved = 1; yes = a;
       }
@@ -34927,14 +35633,14 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
       Scope *ss = comp_scope_of(c, id);
       if (ss && ss->class_id >= 0) {
         int cid = ss->class_id;
-        if (!ss->is_cmethod && comp_method_in_chain(c, cid, "respond_to?", NULL) >= 0) return -1;
+        if (!ss->is_cmethod && call_target(c, id, cid, RESPOND_TO_NAME, CT_METHODS, NULL) >= 0) return -1;
         if (ss->is_cmethod) {
           /* implicit self is the class object itself: same answer as
              the explicit `Const.respond_to?` fold, including the
              builtin Class/Module capabilities (:new, :name, ...). */
           resolved = 1;
-          yes = class_responds_to(c, cid, qm, id);
-          if (yes && foldable && comp_cmethod_vis_declared(c, cid, qm, NULL) != SP_VIS_PUBLIC)
+          yes = cplan_class_responds(c, cid, qm, id);
+          if (yes && foldable && cplan_method_vis(c, -1, cid, qm, CPV_CMETHOD, NULL) != SP_VIS_PUBLIC)
             yes = include_all;
           if (!yes && foldable && include_all && class_object_private_method(qm, comp_class_is_module(c, &c->classes[cid])))
             yes = 1;
@@ -34942,7 +35648,7 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
         else {
           /* receiverless respond_to? still answers false for a private
              or protected match unless include_all folded true. */
-          int a = rto_subtree_answer(c, cid, qm, include_all, foldable);
+          int a = rto_subtree_answer(c, cid, qm, include_all, foldable, id);
           if (a < 0) return -1;
           resolved = 1; yes = a;
         }
@@ -34958,8 +35664,8 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
       else if (ss && c->node_cbody && id < c->node_cap && c->node_cbody[id] >= 0) {
         int cid = c->node_cbody[id];
         resolved = 1;
-        yes = class_responds_to(c, cid, qm, id);
-        if (yes && foldable && comp_cmethod_vis_declared(c, cid, qm, NULL) != SP_VIS_PUBLIC)
+        yes = cplan_class_responds(c, cid, qm, id);
+        if (yes && foldable && cplan_method_vis(c, -1, cid, qm, CPV_CMETHOD, NULL) != SP_VIS_PUBLIC)
           yes = include_all;
         if (!yes && foldable && include_all && class_object_private_method(qm, comp_class_is_module(c, &c->classes[cid])))
           yes = 1;
@@ -34985,12 +35691,20 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
       /* an exception answers a name the program's exception classes define
          by the class it holds, where the probe typed `e.label` through
          whichever class has it */
-      if (rt == TY_EXCEPTION && recv >= 0 && rto_exc_by_cls(c, qm, include_all, foldable)) {
+      /* ...and a class-gated accessor (KeyError#key, NoMethodError#args,
+         SystemExit#status, ...) answers by the class it holds, as the
+         runtime gates it (sp_poly_responds_builtin): the probe types
+         `e.args` for any exception, so it would answer true for all. Not
+         where the program's Object answers the name: every exception
+         answers it then, as the probe says */
+      int oc = comp_core_class(c, CORE_OBJECT);
+      int gated = is_gated_exception_accessor(qm) && !(oc >= 0 && cplan_obj_responds(c, oc, qm, -1) != 0);
+      if (rt == TY_EXCEPTION && recv >= 0 && (gated || rto_exc_by_cls(c, qm, include_all, foldable))) {
         g_rto_exc = 1;
         return -1;
       }
       if (rt_probe_answer(c, id, &yes)) {
-        if (yes && recv >= 0 && rt_probe_unfounded(c, rt, qm)) yes = 0;
+        if (yes && recv >= 0 && rt_probe_unfounded(c, id, rt, qm)) yes = 0;
         /* a class value that answers yes is the site's to emit: nil responds
            to nothing, so the answer is the value's non-nilness, not a fold */
         if (yes && rt == TY_CLASS && recv >= 0) return -1;
@@ -35299,7 +36013,14 @@ void emit_reopen_pf_call(Compiler *c, int id, int pf, int cblk, const char *recv
   /* no block at the call: the clone's block parameter is NULL, which its
      block_given? reads as false */
   int tp = -1;
-  if (cblk >= 0) {
+  /* a `&`/`&blk`/`...` in an inlined forwarder whose block is a real proc (a proc form's parameter) passes that proc */
+  const char *fwd = cblk < 0 ? forwarded_real_proc(nt_ref(nt, id, "block"), cblk) : NULL;
+  if (fwd) {
+    tp = ++g_tmp;
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "sp_Proc *_t%d = %s; SP_GC_ROOT(_t%d);\n", tp, fwd, tp);
+  }
+  else if (cblk >= 0) {
     Buf pb; memset(&pb, 0, sizeof pb);
     if (!emit_forwarded_proc_arg(c, cblk, &pb)) emit_proc_literal(c, cblk, &pb);
     tp = ++g_tmp;
@@ -35446,14 +36167,21 @@ int emit_reopen_block_call(Compiler *c, int id, int recv, int mi, const char *bo
    answered 1. Only a method the reopen defines itself under this very name,
    as the analyzer types it; a yielding one has no function of its own and
    goes through its proc form. Answers whether it emitted the call. */
-static int emit_array_hash_reopen_call(Compiler *c, int id, int recv, TyKind rt, const char *nm, Buf *b) {
-  if (!ty_is_array(rt) && !ty_is_obj_array(rt) && !ty_is_hash(rt)) return 0;
+/* The method of a reopened Array or Hash that answers call id, or -1 */
+static int array_hash_reopen_mi(Compiler *c, int id, TyKind rt, const char *nm, int *aci_out) {
+  if (!ty_is_array(rt) && !ty_is_obj_array(rt) && !ty_is_hash(rt)) return -1;
   const char *acn = ty_is_hash(rt) ? "Hash" : "Array";
   int aci = comp_builtin_class_named(c, acn);
   MethodLookup ml = { .def_class = -1 };
   int ami = aci >= 0 ? call_target(c, id, aci, nm, 0, &ml) : -1;
-  if (ami < 0 || ml.def_class != aci || !c->scopes[ami].name || !sp_streq(c->scopes[ami].name, nm)) return 0;
-  if (cplan_reopen_runs_builtin(c, id, ami)) return 0;
+  if (ami < 0 || ml.def_class != aci || !c->scopes[ami].name || !sp_streq(c->scopes[ami].name, nm)) return -1;
+  if (cplan_reopen_runs_builtin(c, id, ami)) return -1;
+  if (aci_out) *aci_out = aci;
+  return ami;
+}
+static int emit_array_hash_reopen_call(Compiler *c, int id, int recv, TyKind rt, const char *nm, Buf *b) {
+  int aci = -1, ami = array_hash_reopen_mi(c, id, rt, nm, &aci);
+  if (ami < 0) return 0;
   if (c->scopes[ami].yields && emit_reopen_block_call(c, id, recv, ami, NULL, b)) return 1;
   if (g_plan_check) ucall_observe(c, id, ami, aci, 0);
   size_t at = b->len;
@@ -35481,18 +36209,6 @@ void emit_handle_inspect(Compiler *c, int recv, TyKind rt, Buf *b) {
   const char *hn = rt == TY_MUTEX ? "Thread::Mutex" : "Thread::ConditionVariable";
   buf_printf(b, "sp_sprintf(\"#<%s:0x%%016llx>\", (unsigned long long)(uintptr_t)(", hn);
   emit_expr(c, recv, b); buf_puts(b, "))");
-}
-/* --share-strings: can the deep-return pickup `id` answer nil? A target
-   the plan cannot list may be such a method; a call that reaches none (a
-   builtin's, `String.new`) has no tail to answer nil through
-   (an_tail_answers_nil). A tail the pickup admits can still read a nil,
-   which the method's nil fact says (ret_obj_may_nil: `def rec(s) = s`
-   called with nil); without the test the pickup wrapped it in a new empty
-   String. */
-int strbuf_pickup_answers_nil(Compiler *c, int id) {
-  int t[8], n = cplan_targets(c, id, t, 8), nil = n < 0;
-  for (int i = 0; i < n && !nil; i++) nil = an_tail_answers_nil(c, t[i]) || c->scopes[t[i]].ret_obj_may_nil;
-  return nil;
 }
 /* --share-strings: is String call id a mutator (or a `<<` chain) on a local
    an is_a? guard narrows out of its box, which the call body routes
@@ -35536,84 +36252,7 @@ void emit_narrowed_box_mutator(Compiler *c, int id, Buf *b) {
   free(lv.p);
 }
 
-/* Does call id take the deep-return pickup (#3227 P6, emit_deep_return_pickup):
-   a marked receiverless call to a method (no attr reader's implicit-self
-   read), or one on a class, with no block? It hands on the handle its
-   method's tail read publishes. (The seal asks it too: strbuf_flow_carries.) */
-int strbuf_call_picks_up(Compiler *c, int id) {
-  /* (the call answers its String as a const char *: a method whose value
-     widened past a String after the pickup was marked answers a box) */
-  if (!(comp_strbuf_box_stored(c, id) && nt_ref(c->nt, id, "block") < 0 && comp_ntype(c, id) != TY_POLY)) return 0;
-  int r = nt_ref(c->nt, id, "receiver");
-  if (r < 0) return implicit_self_reader_cid(c, id) < 0;
-  if (comp_ntype(c, r) != TY_CLASS) return 0;
-  /* (one-String mode: a class method of the program's publishes; a
-     builtin's, `File.join`, does not, and a String an argument read
-     published was taken for its answer) */
-  int k = class_recv_static_ci(c, r);
-  const char *nm = nt_str(c->nt, id, "name");
-  if (k < 0) {
-    const char *cn = nt_kind(c->nt, r) == NK_ConstantReadNode ? nt_str(c->nt, r, "name") : NULL;
-    return !cn || const_node_class_index(c, r) >= 0;
-  }
-  return !nm || comp_cmethod_in_chain(c, k, nm, NULL) >= 0;
-}
-/* deep-return pickup (#3227 P6): a marked receiverless call to a method
-   whose every return path yields a shared handle -- reset the side
-   channel, run the ordinary call (its shared-slot tail read publishes),
-   then take the handle (falling back to a fresh wrap of the returned
-   copy if a path did not publish). An attr reader has no body to publish
-   from; its implicit-self read hands out the slot itself
-   (emit_implicit_self_member). Answers 1 when it emitted the call. */
-static int g_pickup_route = -1;   /* the call emit_deep_return_pickup routes */
-static int emit_deep_return_pickup(Compiler *c, int id, Buf *b) {
-  /* (an attribute assignment is its own route: emit_strbuf_write_handle) */
-  if (strbuf_assign_leaf(c, id)) return 0;
-  /* A boxed reader's identity demand takes its field handle too. */
-  if (repr_of(c, id).demand && repr_boxed_reader_handle(c, id) && repr_of(c, id).ty == TY_STRING)
-    return emit_strbuf_route(c, id, b);
-  /* An identity read demands the handle without changing String dispatch.
-     The return route lifts that demand while it runs the ordinary call. */
-  /* A boxed conversion carries each arm directly under that demand. */
-  /* (a route that runs the call under the demand again, an implicit-self
-     reader's, reaches here once more: the ordinary call takes it then) */
-  if (repr_of(c, id).demand && repr_call_returns_handle(c, id) &&
-      repr_boxed_to_s_operand(c, id) < 0 && g_pickup_route != id) {
-    int sv = g_pickup_route;
-    g_pickup_route = id;
-    int r = emit_strbuf_route(c, id, b);
-    g_pickup_route = sv;
-    return r;
-  }
-  if (!strbuf_call_picks_up(c, id)) return 0;
-  emit_published_pickup(c, id, b);
-  return 1;
-}
-/* The call id run with its return channel cleared, then the handle its
-   target published, or a new one over the bytes it answered where none
-   did. */
-void emit_published_pickup(Compiler *c, int id, Buf *b) {
-  int tvD = ++g_tmp;
-  /* (one representation: the call may answer the handle itself; held by face) */
-  buf_printf(b, "({ _sp_ret_strbuf = NULL; __auto_type _v%d = (", tvD);
-  int vs = view_push_repr(c, id, VR_STRBUF_BOX, 0);
-  emit_call(c, id, b);
-  view_pop(c, vs);
-  buf_puts(b, "); ");
-  /* --share-strings: a tail answering nil publishes nothing, and an
-     earlier read may have published (an_tail_is_shared_handle): the
-     call's nil is nil. A target the plan cannot list may be such a
-     method; a call that reaches none (a builtin's, `String.new`) has no
-     tail to answer nil through. */
-  if (strbuf_pickup_answers_nil(c, id)) buf_printf(b, "!_v%d ? NULL : ", tvD);
-  if (g_repr_check) repr_channel_pickup(c, id, strbuf_pickup_answers_nil(c, id));
-  buf_puts(b, "_sp_ret_strbuf ? (sp_String *)_sp_ret_strbuf : ");
-  str_new_handle_open(b);
-  buf_printf(b, "_v%d", tvD);
-  str_new_handle_close(b);
-  buf_puts(b, "; })");
-}
-
+/* Emit a selected user call on a constant receiver. */
 static int emit_const_user_call(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   int recv = nt_ref(nt, id, "receiver");
@@ -35719,7 +36358,8 @@ static int emit_reopen_call_first(Compiler *c, int id, int recv, TyKind rt, cons
   if ((rt != TY_STRING && rt != TY_INT && rt != TY_FLOAT) || !sn_guard_pending(c, id)) return 0;
   Repr rr = repr_of(c, id);
   TyKind ret = rr.as_ty, nat = rr.kind == RK_BOXED ? cg_natural_type(c, id) : ret;
-  if (nat != c->scopes[mi].ret || repr_of(c, recv).kind == RK_BOXED || g_n_argov >= MAX_ARG_OVERRIDE) return 0;
+  if (repr_call_result_storage(nat) != repr_method_ret_storage(&c->scopes[mi]) ||
+      repr_of(c, recv).kind == RK_BOXED || g_n_argov >= MAX_ARG_OVERRIDE) return 0;
   int an = nt_ref(c->nt, id, "arguments"), argc = 0;
   const int *argv = an >= 0 ? nt_arr(c->nt, an, "arguments", &argc) : NULL;
   Scope *m = &c->scopes[mi];
@@ -35833,7 +36473,7 @@ static int emit_cext_call(Compiler *c, int id, Buf *b) {
     }
     if (cn && sp_streq(cn, "__cext_share_new_array")) {
       if (argc != 1) unsupported_feature(c, id, "invalid fresh C extension array");
-      buf_puts(b, "sp_cext_share_new_array(");emit_expr(c, argv[0], b);buf_puts(b, ")");return 1;
+      emit_expr(c, argv[0], b); return 1;
     }
     if (cn && sp_streq(cn, "__cext_constant_value")) {
       int ext = argc == 2 ? nt_int(c->nt, argv[0], "value", -1) : -1;
@@ -35865,7 +36505,7 @@ void emit_call_body(Compiler *c, int id, Buf *b) {
   emit_trace_node(c, id, 'c');
 #endif
   if (emit_cext_call(c, id, b) || emit_missing_call(c, id, b)) return;
-  emit_call_body_ordinary(c, id, b);
+  if (!emit_builtin_handle_call(c, id, b)) emit_call_body_ordinary(c, id, b);
 }
 
 static void emit_call_body_ordinary(Compiler *c, int id, Buf *b) {
@@ -35910,7 +36550,8 @@ static void emit_call_body_ordinary(Compiler *c, int id, Buf *b) {
       }
     }
   }
-  if (emit_deep_return_pickup(c, id, b)) return;
+  if (repr_of(c, id).demand && repr_boxed_reader_handle(c, id) &&
+      repr_of(c, id).ty == TY_STRING && emit_strbuf_route(c, id, b)) return;
 
   /* A program's own reopen of a builtin primitive owns the name, as it does
      in CRuby: `class Integer; def abs; 999; end; end` makes `(-5).abs` answer
@@ -35996,7 +36637,7 @@ static void emit_call_body_ordinary(Compiler *c, int id, Buf *b) {
      block parameter). */
   {
     const char *bn0 = nt_str(c->nt, id, "name");
-    int bmi0 = bn0 && !cplan_builtin_call(c, id) ? call_target(c, id, -1, bn0, CT_TOP, NULL) : -1;
+    int bmi0 = bn0 ? call_target(c, id, -1, bn0, CT_TOP, NULL) : -1;
     if (bmi0 >= 0 && nt_ref(c->nt, id, "receiver") < 0 &&
         nt_ref(c->nt, id, "block") < 0 &&
         !(bmi0 < c->nscopes && c->scopes[bmi0].yields)) {
@@ -36044,7 +36685,7 @@ static void emit_call_body_ordinary(Compiler *c, int id, Buf *b) {
     int erecv = nt_ref(c->nt, id, "receiver");
     TyKind ert = erecv >= 0 ? comp_ntype(c, erecv) : TY_VOID;
     if (erecv >= 0 && (ert == TY_RANGE || ert == TY_TIME || ert == TY_IO || ert == TY_CLASS) &&
-        nt_ref(c->nt, id, "block") < 0 && !cplan_builtin_call(c, id)) {
+        nt_ref(c->nt, id, "block") < 0) {
       const char *ename = nt_str(c->nt, id, "name");
       int eci = ert == TY_IO ? io_reopen_class(c, id, ename)
               : comp_core_class(c, ert == TY_RANGE ? CORE_RANGE : ert == TY_TIME ? CORE_TIME : CORE_CLASS);
@@ -36309,7 +36950,7 @@ static void emit_call_body_ordinary(Compiler *c, int id, Buf *b) {
     int cruby_known = 0;
     for (int ki = 0; tcn && CRUBY_KNOWN[ki]; ki++)
       if (sp_streq(tcn, CRUBY_KNOWN[ki])) { cruby_known = 1; break; }
-    if (tcn && !cruby_known && comp_class_index(c, tcn) < 0 &&
+    if (tcn && !cruby_known && const_node_class_index(c, argv[0]) < 0 &&
         !is_builtin_class_name(tcn) && !is_builtin_exception_name(tcn) &&
         !comp_const(c, tcn)) {
       buf_puts(b, "((void)(");
@@ -36450,6 +37091,7 @@ static void emit_call_body_ordinary(Compiler *c, int id, Buf *b) {
 
   if (emit_call_compare_arms(c, id, b, nt, name, recv, argc, argv, rt)) return;
   if (rt == TY_TMS && emit_builtin_op(c, id, recv, rt, name, b)) return;
+  if (rt == TY_ENV && emit_builtin_op(c, id, recv, rt, name, b)) return;
   if (emit_call_symbol_misc_arms(c, b, name, recv, argc, argv, rt)) return;
   if (emit_call_display_ivar_arms(c, id, b, nt, name, recv, argc, argv, rt)) return;
 

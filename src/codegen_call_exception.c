@@ -26,34 +26,78 @@ static void emit_exc_own_render_raw(Compiler *c, int id, int recv, int xcm, cons
     int tested = view_push_repr(c, recv, VR_NIL_TESTED, 1);
     emit_exc_own_render_raw(c, id, recv, xcm, plan, b);
     view_pop(c, tested); view_unbind(mark);
-    buf_puts(b, " : sp_str_frozen_empty; })");
+    buf_puts(b, " : SP_STR_BOX(sp_str_frozen_empty); })");
     return;
   }
   int defc = plan->owner_ci;
   int cv = plan->delegate ? view_push_conversion(c, id, plan) : -1;
   if (g_plan_check) ucall_observe(c, id, own, defc, 0);
   if (cv >= 0) view_pop(c, cv);
-  if (expr_is_held_ref(c, recv)) {
-    buf_printf(b, "%s((sp_%s *)(", mc_method(c, &c->scopes[own]), c->classes[defc].c_name);
-    emit_expr(c, recv, b); buf_puts(b, "))");
-  }
-  else {
-    /* rooted: a fresh exception (`E.new.to_s`) held by nothing else
-       while its own #to_s allocates */
-    int tex = ++g_tmp;
-    buf_printf(b, "({ sp_%s *_t%d = (sp_%s *)(", c->classes[defc].c_name, tex, c->classes[defc].c_name);
-    emit_expr(c, recv, b);
-    buf_printf(b, "); SP_GC_ROOT(_t%d); %s(_t%d); })", tex, mc_method(c, &c->scopes[own]), tex);
-  }
+  int t = ++g_tmp;
+  char self[48]; snprintf(self, sizeof self, "_t%d", t);
+  buf_printf(b, "({ sp_%s *%s = (sp_%s *)(", c->classes[defc].c_name, self, c->classes[defc].c_name);
+  emit_expr(c, recv, b);
+  buf_printf(b, "); SP_GC_ROOT(%s); ", self);
+  emit_zero_arg_boxed_call(c, own, self, b);
+  buf_puts(b, "; })");
 }
 
 static void emit_exc_own_render(Compiler *c, int id, int recv, int xcm, const CallPlan *plan, Buf *b) {
-  int own = plan->mi;
   Buf call = {0};
   emit_exc_own_render_raw(c, id, recv, xcm, plan, &call);
   Repr r = repr_of(c, id);
-  emit_coerce_text(c, id, (TyKind)c->scopes[own].ret, r.kind == RK_BOXED ? TY_POLY : r.as_ty,
-                   CO_HOLD, call.p, "an exception renderer result", b);
+  if (r.kind == RK_BOXED) buf_puts(b, call.p);
+  else {
+    TyKind t = repr_native_call_handle(c, id) ? TY_STRBUF : r.as_ty;
+    emit_unbox_text(c, t, call.p, b);
+  }
+  free(call.p);
+}
+
+/* Read the Ruby result in the representation selected for this call. */
+static void emit_exc_answer(Compiler *c, int id, const char *box, Buf *b) {
+  Repr r = repr_of(c, id);
+  TyKind t = repr_native_call_handle(c, id) ? TY_STRBUF : r.as_ty;
+  if (r.kind == RK_BOXED) buf_puts(b, box);
+  else if (oint_kind(t) && node_is_oint(c, id)) buf_printf(b, "%s(%s)", oint_unbox(t), box);
+  else emit_unbox_text(c, t, box, b);
+}
+
+/* A written send can pass arguments and a block to a Ruby override.
+   The ordinary dispatch binds them to the selected exception class.
+   Its setup follows the receiver, inside the call's evaluation site. */
+static int emit_exc_bound_send(Compiler *c, int id, int recv, Buf *b) {
+  int tv = ++g_tmp;
+  Buf call = {0}, pre = {0};
+  Buf *saved = g_pre;
+  g_pre = &pre;
+  int mark = view_bind_temp(recv, tv);
+  int rv = view_push(c, recv, TY_POLY);
+  int result = view_push(c, id, TY_POLY);
+  int ok = emit_poly_method_dispatch(c, id, &call);
+  view_pop(c, result);
+  view_pop(c, rv);
+  view_unbind(mark);
+  g_pre = saved;
+  if (ok) {
+    buf_printf(b, "({ sp_RbVal _t%d = ", tv);
+    emit_boxed(c, recv, b);
+    buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); %s", tv, pre.p ? pre.p : "");
+    emit_exc_answer(c, id, call.p, b);
+    buf_puts(b, "; })");
+  }
+  free(call.p); free(pre.p);
+  return ok;
+}
+
+/* Ruby accessors return the override's box, its original String handle, or
+   a bytes view at a reader. Report formatting has a separate adapter. */
+static void emit_exc_result(Compiler *c, int id, const char *name, const char *e, Buf *b) {
+  const char *fn = !exc_has_user_msg_override(c) ? "sp_exc_message_idbox"
+                 : is_message_name(name) ? "sp_user_exc_message_v" : "sp_user_exc_to_s_v";
+  Buf call = {0};
+  buf_printf(&call, "%s((sp_Exception *)(%s))", fn, e);
+  emit_exc_answer(c, id, call.p, b);
   free(call.p);
 }
 
@@ -79,11 +123,11 @@ static int emit_exception_object_accessor(Compiler *c, int id, int recv, const c
     buf_puts(&ob, ")");
     Repr rp = repr_of(c, id);
     TyKind slot = rp.kind == RK_BOXED ? TY_POLY : rp.as_ty;
-    TyKind omr = (TyKind)c->scopes[xom].ret;
+    TyKind omr = repr_method_ret_storage(&c->scopes[xom]);
     buf_printf(b, "({ sp_Exception *_t%d = ", xt);
     emit_coerce(c, recv, TY_EXCEPTION, CO_HOLD, "an exception accessor receiver", b);
     buf_printf(b, "; SP_GC_ROOT(_t%d); sp_exc_has_acc(_t%d, \"%s\") ? ", xt, xt, name);
-    emit_coerce_text(c, id, bop_result(op, TY_EXCEPTION), slot, CO_HOLD, ab.p,
+    emit_coerce_text(c, id, bop_native_result(op, TY_EXCEPTION), slot, CO_HOLD, ab.p,
                      "an exception accessor result", b);
     buf_puts(b, " : ");
     if (method_is_void(&c->scopes[xom])) buf_printf(b, "(%s, sp_box_nil())", ob.p);
@@ -148,7 +192,7 @@ static int emit_exc_detailed_options(Compiler *c, int id, int recv, int argc, co
   buf_printf(b, "const char *_msg%d = %s(_e%d); ", te,
              exc_has_user_msg_override(c) ? "sp_user_exc_message" : "sp_exc_message", te);
   int boxed = repr_of(c, id).kind == RK_BOXED;
-  if (boxed) buf_puts(b, "sp_box_str(");
+  if (boxed) buf_puts(b, "sp_box_str_new(");
   buf_printf(b, "_h%d ? sp_exc_detailed_highlight(_e%d, _msg%d) : "
                 "sp_exc_detailed_text(_e%d, _msg%d)", th, te, te, te, te);
   buf_puts(b, boxed ? "); })" : "; })");
@@ -169,15 +213,20 @@ static int emit_exc_detailed_options(Compiler *c, int id, int recv, int argc, co
 const char *isa_exc_class_name(Compiler *c, int arg, char *buf, size_t bufsz) {
   const char *qn = isa_const_qualname(c->nt, arg, buf, bufsz);
   if (!qn) return NULL;
-  int qi = comp_class_index(c, qn);
-  if (qi < 0) qi = const_node_class_index(c, arg);
+  int qi = const_node_class_index(c, arg);
   const char *rn = qi >= 0 ? class_ruby_name(c, qi) : NULL;
   if (!rn) return qn;
   snprintf(buf, bufsz, "%s", rn);
   return buf;
 }
 
+/* the call emit_call_exception_arms re-enters on the boxed exception
+   (exc_user_method_name), -1 outside it */
+static int exc_um_skip = -1;
+int exc_um_reentered(int id) { return id >= 0 && id == exc_um_skip; }
 int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
+  if (recv >= 0 && is_exception_message(name) && (argc || nt_ref(nt, id, "block") >= 0) &&
+      repr_of(c, recv).exc && exc_has_user_msg_override(c) && emit_exc_bound_send(c, id, recv, b)) return 1;
   if (sp_streq(name, "detailed_message") && emit_exc_detailed_options(c, id, recv, argc, argv, b)) return 1;
   /* A marked message read takes the existing exception handle route,
      including a rescued variable specialized to an exception subclass. */
@@ -205,7 +254,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     /* #inspect on an exception subclass is "#<Class: message>"; the generic
        object renderer had no idea and printed "#<Object>" (#3713) */
     if (sp_streq(name, "inspect") && argc == 0 &&
-        comp_method_in_chain(c, ty_object_class(comp_ntype(c, recv)), "inspect", NULL) < 0) {
+        call_target(c, id, ty_object_class(comp_ntype(c, recv)), name, 0, NULL) < 0) {
       buf_puts(b, "sp_exc_inspect((void *)("); emit_expr(c, recv, b); buf_puts(b, "))");
       return 1;
     }
@@ -267,7 +316,8 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       { int tfm = ++g_tmp;
         Buf rbm = expr_buf(c, recv);
         emit_indent(g_pre, g_indent);
-        buf_printf(g_pre, "sp_Exception *_t%d = (sp_Exception *)(%s);\n", tfm, rbm.p ? rbm.p : "");
+        buf_printf(g_pre, "sp_Exception *_t%d = (sp_Exception *)(%s); SP_GC_ROOT(_t%d);\n",
+                   tfm, rbm.p ? rbm.p : "", tfm);
         free(rbm.p);
         const char *mfn = exc_has_user_msg_override(c) ? "sp_user_exc_message" : "sp_exc_message";
         if (sp_streq(name, "full_message"))
@@ -290,23 +340,9 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
         emit_exc_own_render(c, id, recv, xcm, &render, b);
         return 1;
       }
-      /* The helpers answer text. A call the inference typed boxed takes it
-         as a boxed String -- `message =~ re` in a base exception class whose
-         subclasses override message, one of them answering no String, is
-         poly -- and where such an override exists, #message is the value
-         itself (sp_user_exc_message_v), as the boxed receiver's arm reads it.
-         Left as text, the C did not compile. */
-      int boxed = repr_of(c, id).kind == RK_BOXED;
-      if (sp_streq(name, "message") && exc_has_nonstring_msg_override(c)) {
-        buf_puts(b, boxed ? "sp_user_exc_message_v((sp_Exception *)(" : "sp_poly_to_s(sp_user_exc_message_v((sp_Exception *)(");
-        emit_expr(c, recv, b); buf_puts(b, boxed ? "))" : ")))");
-        return 1;
-      }
-      const char *fn = exc_has_user_msg_override(c)
-        ? (sp_streq(name, "message") ? "sp_user_exc_message" : "sp_user_exc_to_s")
-        : "sp_exc_message";
-      if (boxed) buf_puts(b, "sp_box_str(");
-      buf_printf(b, "%s((sp_Exception *)(", fn); emit_expr(c, recv, b); buf_puts(b, boxed ? ")))" : "))");
+      Buf e = {0}; emit_expr(c, recv, &e);
+      emit_exc_result(c, id, name, e.p, b);
+      free(e.p);
       return 1;
     }
   }
@@ -408,7 +444,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     int pu = 0;
     for (int k = 0; k < c->nclasses && !pu; k++)
       if (call_target(c, id, k, name, CT_OWN, NULL) >= 0 ||
-          comp_reader_in_chain(c, k, name, NULL)) pu = 1;
+          call_attr_target(c, id, k, name, CT_ATTR, NULL)) pu = 1;
     if (!pu || g_poly_builtin_arm) {
       int t = ++g_tmp, ta = ++g_tmp;
       buf_printf(b, "({ sp_RbVal _t%d = ", t);
@@ -452,10 +488,12 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
       nt_ref(nt, id, "block") < 0 &&
       (sp_streq(name, "message") || sp_streq(name, "result") ||
        sp_streq(name, "errno") || sp_streq(name, "error_code") ||
+       sp_streq(name, "line") || sp_streq(name, "column") ||
        sp_streq(name, "key") || sp_streq(name, "receiver") ||
        sp_streq(name, "args") || sp_streq(name, "private_call?") ||
        sp_streq(name, "backtrace") || sp_streq(name, "cause") ||
-       is_exception_full_message(name)) &&
+       is_exception_full_message(name) ||
+       (exc_um_skip == id && exc_um_only_acc(name))) &&
       repr_of(c, recv).as_ty == TY_POLY) {
     int pu = user_defines_or_reads(c, name) || cls_value_owns_name(c, id, name);
     if (!pu || g_poly_builtin_arm) {
@@ -467,24 +505,11 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
         int t = ++g_tmp;
         buf_printf(b, "({ sp_RbVal _t%d = ", t);
         emit_expr(c, recv, b);
-        buf_printf(b, "; (_t%d.tag == SP_TAG_OBJ && _t%d.v.p && (_t%d.cls_id == SP_BUILTIN_EXCEPTION"
-                   " || sp_is_exc_subclass_cls(_t%d.cls_id))) ? ", t, t, t, t);
-        int boxed = repr_of(c, id).kind == RK_BOXED;
-        /* a dispatch whose call reads the handle its arms publish: an
-           exception no override owns publishes the handle it holds too, so
-           each read of it answers the same String */
-        int pub = g_poly_builtin_arm && !boxed && !exc_has_nonstring_msg_override(c) &&
-                  repr_call_returns_handle(c, id);
-        if (pub) c->uses_exc_text_handle |= 2;
-        const char *arm = exc_has_nonstring_msg_override(c)
-          ? (boxed ? "sp_user_exc_message_v(%s)" : "sp_poly_to_s(sp_user_exc_message_v(%s))")
-          : (boxed ? "sp_box_str(sp_user_exc_message(%s))"
-                   : pub ? "sp_user_exc_message_shared(%s)" : "sp_user_exc_message(%s)");
-        char ep[64];
-        snprintf(ep, sizeof ep, "(sp_Exception *)_t%d.v.p", t);
-        buf_printf(b, arm, ep);
-        if (boxed) buf_printf(b, " : sp_poly_exc_acc_m(_t%d, \"message\"); })", t);
-        else buf_printf(b, " : sp_poly_to_s(sp_poly_exc_acc_m(_t%d, \"message\")); })", t);
+        buf_printf(b, "; if (!(_t%d.tag == SP_TAG_OBJ && _t%d.v.p && (_t%d.cls_id == SP_BUILTIN_EXCEPTION"
+                     " || sp_is_exc_subclass_cls(_t%d.cls_id)))) (void)sp_poly_exc_acc_m(_t%d, \"message\"); ", t, t, t, t, t);
+        char ep[64]; snprintf(ep, sizeof ep, "_t%d.v.p", t);
+        emit_exc_result(c, id, name, ep, b);
+        buf_puts(b, "; })");
         return 1;
       }
       /* the renderings read the overridden #message, as the typed receiver's do */
@@ -493,9 +518,9 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
         int t = ++g_tmp;
         buf_printf(b, "({ sp_RbVal _t%d = ", t);
         emit_expr(c, recv, b);
-        buf_printf(b, "; sp_Exception *_e%d = (_t%d.tag == SP_TAG_OBJ && _t%d.v.p && "
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_Exception *_e%d = (_t%d.tag == SP_TAG_OBJ && _t%d.v.p && "
                       "(_t%d.cls_id == SP_BUILTIN_EXCEPTION || sp_is_exc_subclass_cls(_t%d.cls_id)))"
-                      " ? (sp_Exception *)_t%d.v.p : NULL; ", t, t, t, t, t, t);
+                      " ? (sp_Exception *)_t%d.v.p : NULL; ", t, t, t, t, t, t, t);
         if (sp_streq(name, "full_message"))
           buf_printf(b, "_e%d ? sp_exc_full_text(_e%d, sp_user_exc_message(_e%d))",
                      t, t, t);
@@ -531,8 +556,7 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
      parameter it is passed to): the call re-enters with the receiver boxed
      as the exception it is, and the poly dispatch keys it by its user class,
      raising NoMethodError for any exception whose class lacks the method */
-  static int exc_um_skip = -1;   /* the call being re-entered below */
-  if (recv >= 0 && exc_um_skip != id && comp_ntype(c, recv) == TY_EXCEPTION && exc_user_method_name(c, name, argc)) {
+  if (recv >= 0 && exc_um_skip != id && comp_ntype(c, recv) == TY_EXCEPTION && exc_user_method_name(c, id, name, argc)) {
     int tv = ++g_tmp;
     buf_printf(b, "({ sp_RbVal _t%d = sp_box_nullable_obj((void *)(", tv);
     emit_expr(c, recv, b);
@@ -682,18 +706,16 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     if (sp_streq(name, "message") || sp_streq(name, "to_s") || sp_streq(name, "to_str")) {
       /* NULL-guard: a nil $! (outside any rescue) has no message. */
       int t = hoist_exc_recv(c, recv);
-      /* An override answering something other than a String cannot ride the
-         const char * dispatcher; the boxed pair carries it, and the call types
-         poly to match (#3868). */
-      if (exc_has_nonstring_msg_override(c) && repr_of(c, id).kind == RK_BOXED) {
-        buf_printf(b, "(_t%d ? %s(_t%d) : sp_box_str(sp_str_empty))", t,
-                   sp_streq(name, "message") ? "sp_user_exc_message_v" : "sp_user_exc_to_s_v", t);
-        return 1;
-      }
-      const char *fn = exc_has_user_msg_override(c)
-        ? (sp_streq(name, "message") ? "sp_user_exc_message" : "sp_user_exc_to_s")
-        : "sp_exc_message";
-      buf_printf(b, "(_t%d ? %s(_t%d) : sp_str_empty)", t, fn, t);
+      char e[48]; snprintf(e, sizeof e, "_t%d", t);
+      buf_printf(b, "(_t%d ? ", t);
+      emit_exc_result(c, id, name, e, b);
+      Repr r = repr_of(c, id);
+      if (r.kind == RK_BOXED) buf_puts(b, " : SP_STR_BOX(sp_str_frozen_empty))");
+      else if (r.as_ty == TY_STRBUF || repr_native_call_handle(c, id))
+        buf_puts(b, " : SP_STR_HDL(sp_str_frozen_empty))");
+      else if (r.as_ty == TY_STRING) buf_puts(b, " : sp_str_frozen_empty)");
+      else buf_printf(b, " : %s)", oint_kind(r.as_ty) && node_is_oint(c, id)
+                                    ? oint_nil(r.as_ty) : default_value_from_compiler(c, r.as_ty));
       return 1;
     }
     if (sp_streq(name, "cause")) {
@@ -707,13 +729,19 @@ int emit_call_exception_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, c
     }
     if (sp_streq(name, "full_message")) {
       int t = hoist_exc_recv(c, recv);
-      buf_printf(b, "sp_exc_full_text(_t%d, sp_exc_message(_t%d))", t, t);
+      emit_indent(g_pre, g_indent);
+      buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", t);
+      const char *mfn = exc_has_user_msg_override(c) ? "sp_user_exc_message" : "sp_exc_message";
+      buf_printf(b, "sp_exc_full_text(_t%d, %s(_t%d))", t, mfn, t);
       return 1;
     }
     /* detailed_message without keywords -> "message (ClassName)" */
     if (sp_streq(name, "detailed_message")) {
       int t = hoist_exc_recv(c, recv);
-      buf_printf(b, "sp_exc_detailed_text(_t%d, sp_exc_message(_t%d))", t, t);
+      emit_indent(g_pre, g_indent);
+      buf_printf(g_pre, "SP_GC_ROOT(_t%d);\n", t);
+      const char *mfn = exc_has_user_msg_override(c) ? "sp_user_exc_message" : "sp_exc_message";
+      buf_printf(b, "sp_exc_detailed_text(_t%d, %s(_t%d))", t, mfn, t);
       return 1;
     }
     if (sp_streq(name, "inspect")) {
@@ -821,7 +849,33 @@ static const char *exc_const_class_name(Compiler *c, int node) {
   const char *n = const_node_match_class_name(c, node);
   return n ? n : nt_str(c->nt, node, "name");
 }
+/* The temp holding the explicit `cause:` of the raise being emitted, 0
+   when it has none. The raise's own call takes it (raise_fn); a raise
+   inside one of its operands sets its own (emit_call_raise_arms). */
+int g_raise_cz = 0;
+/* The opening of a call to the runtime raise entry fn ("sp_raise_exc"):
+   "fn(", or, under a raise with an explicit cause, "fn_cz(_tN, ", which
+   stages the cause once the call's arguments ran. */
+const char *raise_fn(const char *fn) {
+  static char bufs[4][96];
+  static int k;
+  char *o = bufs[k++ & 3];
+  /* a program with a reopened builtin exception initialize (sp_user_exc_reinit)
+     raises what it writes by the variants that leave the runtime's hook out */
+  if (g_exc_reinit_hook && (sp_streq(fn, "sp_raise_cls") || sp_streq(fn, "sp_raise"))) fn = sp_streq(fn, "sp_raise") ? "sp_raise_u" : "sp_raise_cls_u";
+  if (g_raise_cz) snprintf(o, sizeof bufs[0], "%s_cz(_t%d, ", fn, g_raise_cz);
+  else snprintf(o, sizeof bufs[0], "%s(", fn);
+  return o;
+}
+static int emit_call_raise_arms_in(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv);
 int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv) {
+  int sv = g_raise_cz;
+  g_raise_cz = 0;
+  int r = emit_call_raise_arms_in(c, id, b, nt, name, recv);
+  g_raise_cz = sv;
+  return r;
+}
+static int emit_call_raise_arms_in(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv) {
   /* raise */
   /* `fail` is an exact alias of `Kernel#raise`. */
   if (recv < 0 && !bare_call_class_owned(c, id) && (is_raise_alias(name))) {
@@ -891,7 +945,7 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
                         (nt_kind(nt, av[0]) == NK_ConstantReadNode || nt_kind(nt, av[0]) == NK_ConstantPathNode) &&
                         !raise_const_read_early(c, av[0]);
       const char *first_cn = first_const ? exc_const_class_name(c, av[0]) : NULL;
-      int first_xc = first_cn ? comp_class_index(c, first_cn) : -1;
+      int first_xc = first_cn ? const_node_match_class_or_named(c, av[0]) : -1;
       TyKind first_ty = ac > 0 && !first_const ? comp_ntype(c, av[0]) : TY_UNKNOWN;
       /* a class of the program with its own initialize is built before the
          cause is judged, which this path does not do: it keeps the old one.
@@ -900,7 +954,7 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
          the operands ran, and only for a cause that cannot hold nil. */
       int first_exc_val = !first_const && ac > 0 && repr_of(c, av[0]).exc;
       int first_ok = first_const ? (first_xc >= 0 ? (class_is_exc_subclass(c, first_xc) &&
-                                                       cplan_new_initialize(c, id, first_xc, NULL) < 0)
+                                                       cplan_hook_target(c, id, first_xc, "initialize", NULL) < 0)
                                                   : (first_cn && is_exc_name(first_cn)))
                    : (ac == 1 && first_ty == TY_STRING) || (first_exc_val && cause_never_nil);
       int cause_bad = !cause_exc && first_ok;
@@ -922,16 +976,22 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
         buf_puts(b, "sp_raise_cls(\"TypeError\", \"exception object expected\"))");
         return 1;
       }
-      buf_puts(b, "(");
+      /* The cause is held in a rooted temp and staged by the raise's own
+         call (sp_raise_cls_cz and its kin, raise_fn) once the operands
+         ran: staged here, a raise inside an operand took it as its own
+         cause, an operand's rescued raise cleared it, and the TypeError
+         raise makes for a wrong operand carried it too. */
+      buf_puts(b, "({ ");
       if (cause_bad) {
         int tc = ++g_tmp;
-        buf_printf(b, "({ sp_RbVal _t%d = ", tc); emit_boxed(c, cause_node, b);
-        buf_printf(b, "; if (_t%d.tag != SP_TAG_NIL) sp_raise_cls(\"TypeError\", \"exception object expected\"); }), ", tc);
+        buf_printf(b, "sp_RbVal _t%d = ", tc); emit_boxed(c, cause_node, b);
+        buf_printf(b, "; if (_t%d.tag != SP_TAG_NIL) sp_raise_cls(\"TypeError\", \"exception object expected\"); ", tc);
       }
       else if (!cause_exc) {
-        buf_puts(b, "(void)("); emit_boxed(c, cause_node, b); buf_puts(b, "), ");
+        buf_puts(b, "(void)("); emit_boxed(c, cause_node, b); buf_puts(b, "); ");
       }
-      buf_puts(b, "sp_explicit_cause_set = 1, sp_explicit_cause = (void *)(");
+      int tcz = ++g_tmp;
+      buf_printf(b, "void *_t%d = (void *)(", tcz);
       if (cause_is_nil || !cause_exc) buf_puts(b, "0");
       /* a boxed cause is the exception it holds, nil no cause, and
          anything else CRuby's TypeError */
@@ -943,7 +1003,8 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
                       " _t%d.tag == SP_TAG_NIL ? (void *)0 : _t%d.v.p; })", tc, tc, tc, tc);
       }
       else emit_expr(c, cause_node, b);
-      buf_puts(b, "), ");
+      buf_printf(b, "); SP_GC_ROOT(_t%d); ", tcz);
+      g_raise_cz = tcz;
     }
     if (ac == 0) {
       /* a bare re-raise keeps the handled exception's own cause (#3745) */
@@ -969,31 +1030,31 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
          any `super`/message run. Without a custom initialize the message
          defaults to the class name, so the (cls, "") fast path is correct. */
       const char *cn = exc_const_class_name(c, av[0]);
-      int xc = cn ? comp_class_index(c, cn) : -1;
+      int xc = cn ? const_node_match_class_or_named(c, av[0]) : -1;
       /* a reopened builtin exception is still the builtin: raised by name,
          through the reopening's own initialize when it has one */
-      if (xc >= 0 && cn && is_exc_name(cn) && is_builtin_reopen(cn)) {
-        int rim = exc_reopen_initialize(c, xc);
+      if (cn && is_exc_name(cn) && (xc < 0 || is_builtin_reopen(cn))) {
+        int rim = exc_builtin_reopen_initialize(c, id, cn, 0, NULL);
         if (rim >= 0) {
-          buf_puts(b, "sp_raise_exc(");
-          emit_exc_reopen_construct(c, xc, rim, -1, -1, b);
+          buf_puts(b, raise_fn("sp_raise_exc"));
+          emit_exc_reopen_construct_as(c, cn, rim, -1, -1, -1, b);
           buf_puts(b, ")");
-          if (cause_node >= 0) buf_puts(b, ")");
+          if (cause_node >= 0) buf_puts(b, "; })");
           return 1;
         }
         xc = -1;
       }
-      int ic = (xc >= 0 && class_is_exc_subclass(c, xc)) ? cplan_new_initialize(c, id, xc, NULL) : -1;
+      int ic = (xc >= 0 && class_is_exc_subclass(c, xc)) ? cplan_hook_target(c, id, xc, "initialize", NULL) : -1;
       if (xc >= 0 && ic >= 0 && c->scopes[ic].reachable && (!ctor_new_runs(c, xc, ic) || ctor_needs_self_defaults(c, ic, 0))) {
         /* a default reading the instance runs on the allocated object, as
            the same `.new` does (emit_ctor_alloc_init), and a version the
            constructor does not run on it too */
-        buf_puts(b, "sp_raise_exc((sp_Exception *)");
+        buf_puts(b, raise_fn("sp_raise_exc")); buf_puts(b, "(sp_Exception *)");
         emit_ctor_alloc_init(c, xc, ic, -1, -1, b);
         buf_puts(b, ")");
       }
       else if (xc >= 0 && ic >= 0 && c->scopes[ic].reachable) {
-        buf_printf(b, "sp_raise_exc((sp_Exception *)sp_%s_new(", c->classes[xc].c_name);
+        buf_printf(b, "%s(sp_Exception *)sp_%s_new(", raise_fn("sp_raise_exc"), c->classes[xc].c_name);
         emit_args_filled(c, ic, -1, "", b);
         if (ctor_init_takes_block(c, ic)) buf_puts(b, c->scopes[ic].nparams > 0 ? ", NULL" : "NULL");
         buf_puts(b, "))");
@@ -1013,12 +1074,22 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
            initialize builds the errno text (SystemCallError.new itself
            wants a message and raises ArgumentError) */
         if ((xc >= 0 && class_is_syserr(c, xc)) || (xc < 0 && is_syserr_family_name(effn))) {
-          if (sp_streq(effn, "SystemCallError"))
-            buf_puts(b, "sp_raise_exc(sp_syserr_new_v(0, NULL))");
+          int sri = xc < 0 ? syserr_reinit_initialize(c, id, effn) : -1, srt = 0;
+          if (sri >= 0) {
+            /* a reopening above SystemCallError runs on the built message */
+            buf_puts(b, raise_fn("sp_raise_exc"));
+            syserr_reinit_open(&srt, b);
+            if (sp_streq(effn, "SystemCallError")) buf_puts(b, "sp_syserr_new_v(0, NULL)");
+            else buf_printf(b, "sp_exc_new(\"%s\", sp_syserr_msg_a(\"%s\", 0, NULL))", effn, effn);
+            syserr_reinit_close(c, sri, srt, b);
+            buf_puts(b, ")");
+          }
+          else if (sp_streq(effn, "SystemCallError"))
+            buf_printf(b, "%ssp_syserr_new_v(0, NULL))", raise_fn("sp_raise_exc"));
           else
-            buf_printf(b, "sp_raise_cls(\"%s\", sp_syserr_msg_a(\"%s\", 0, NULL))", effn, effn);
+            buf_printf(b, "%s\"%s\", sp_syserr_msg_a(\"%s\", 0, NULL))", raise_fn("sp_raise_cls"), effn, effn);
         }
-        else buf_printf(b, "sp_raise_cls(\"%s\", (&(\"\\xff\")[1]))", effn);
+        else buf_printf(b, "%s\"%s\", (&(\"\\xff\")[1]))", raise_fn("sp_raise_cls"), effn);
       }
     }
     else if (ac >= 2 && nt_type(nt, av[0]) &&
@@ -1030,33 +1101,33 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
          the message comes from the class's initialize/super, then carry it.
          A bare-string/builtin exception keeps the (cls, msg) fast path. */
       const char *cn = exc_const_class_name(c, av[0]);
-      int xc = cn ? comp_class_index(c, cn) : -1;
+      int xc = cn ? const_node_match_class_or_named(c, av[0]) : -1;
       /* a reopened builtin exception is still the builtin: raised by name,
          through the reopening's own initialize when it has one */
-      if (xc >= 0 && cn && is_exc_name(cn) && is_builtin_reopen(cn)) {
-        int rim = exc_reopen_initialize(c, xc);
+      if (cn && is_exc_name(cn) && (xc < 0 || is_builtin_reopen(cn))) {
+        int rim = exc_builtin_reopen_initialize(c, id, cn, 1, &av[1]);
         if (rim >= 0) {
-          buf_puts(b, "sp_raise_exc(");
-          emit_exc_reopen_construct(c, xc, rim, -1, av[1], b);
+          buf_puts(b, raise_fn("sp_raise_exc"));
+          emit_exc_reopen_construct_as(c, cn, rim, -1, av[1], -1, b);
           buf_puts(b, ")");
-          if (cause_node >= 0) buf_puts(b, ")");
+          if (cause_node >= 0) buf_puts(b, "; })");
           return 1;
         }
         xc = -1;
       }
       int ic = -1;
       if (xc >= 0 && class_is_exc_subclass(c, xc))
-        ic = cplan_new_initialize(c, id, xc, NULL);
+        ic = cplan_hook_target(c, id, xc, "initialize", NULL);
       if (xc >= 0 && ic >= 0 && c->scopes[ic].reachable && (!ctor_new_runs(c, xc, ic) || ctor_needs_self_defaults(c, ic, 1))) {
         /* a default the message leaves reading the instance runs on the
            allocated object, as for `Cls.new(msg)`, and a version the
            constructor does not run on it too */
-        buf_puts(b, "sp_raise_exc((sp_Exception *)");
+        buf_puts(b, raise_fn("sp_raise_exc")); buf_puts(b, "(sp_Exception *)");
         emit_ctor_alloc_init_argv(c, xc, ic, &av[1], 1, args, b);
         buf_puts(b, ")");
       }
       else if (xc >= 0 && ic >= 0 && c->scopes[ic].reachable) {
-        buf_printf(b, "sp_raise_exc((sp_Exception *)sp_%s_new(", c->classes[xc].c_name);
+        buf_printf(b, "%s(sp_Exception *)sp_%s_new(", raise_fn("sp_raise_exc"), c->classes[xc].c_name);
         /* `raise Cls, msg` is `raise Cls.new(msg)`: the message binds as the
            one argument of that call does (a rest takes it as its element, a
            **kwrest is empty, a default reads an earlier parameter), and an
@@ -1085,48 +1156,54 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
         /* `raise SignalException, "INT"` resolves the signal name so #signo and
            the "SIG<name>" message are carried, matching SignalException.new (#3074) */
         if (effn && sp_streq(effn, "SignalException")) {
-          buf_puts(b, "sp_raise_exc(sp_signal_exc_new(");
+          buf_puts(b, raise_fn("sp_raise_exc")); buf_puts(b, "sp_signal_exc_new(");
           emit_boxed(c, av[1], b);
           buf_puts(b, "))");
         }
         /* `raise SystemExit, 3` is SystemExit.new(3): a number is the status */
         else if (xc >= 0 ? class_is_sysexit(c, xc) : (effn && sp_streq(effn, "SystemExit"))) {
-          buf_puts(b, "sp_raise_exc((sp_Exception *)");
+          buf_puts(b, raise_fn("sp_raise_exc")); buf_puts(b, "(sp_Exception *)");
           emit_sysexit_new(c, id, xc, 1, &av[1], b);
           buf_puts(b, ")");
         }
         /* `raise Errno::ENOENT, "x"` is Errno::ENOENT.new("x"): the errno
            text, " - x" (SystemCallError.new("x") an unknown error) */
         else if ((xc >= 0 && class_is_syserr(c, xc)) || (xc < 0 && is_syserr_family_name(effn))) {
+          int sri = xc < 0 ? syserr_reinit_initialize(c, id, effn) : -1, srt = 0;
           if (sp_streq(effn, "SystemCallError")) {
-            buf_puts(b, "sp_raise_exc(");
+            buf_puts(b, raise_fn("sp_raise_exc"));
+            if (sri >= 0) syserr_reinit_open(&srt, b);
             emit_syserr_call(c, id, "sp_syserr_new_v", "", 1, &av[1], b);
+            if (sri >= 0) syserr_reinit_close(c, sri, srt, b);
             buf_puts(b, ")");
           }
           else {
             char lead[192]; snprintf(lead, sizeof lead, "\"%s\", ", effn);
-            buf_printf(b, "sp_raise_cls(\"%s\", ", effn);
-            emit_syserr_call(c, id, "sp_syserr_msg_a", lead, 1, &av[1], b);
+            if (sri >= 0) {
+              buf_puts(b, raise_fn("sp_raise_exc"));
+              syserr_reinit_open(&srt, b);
+              buf_printf(b, "sp_exc_new(\"%s\", ", effn);
+              emit_syserr_call(c, id, "sp_syserr_msg_a", lead, 1, &av[1], b);
+              buf_puts(b, ")");
+              syserr_reinit_close(c, sri, srt, b);
+            }
+            else {
+              buf_printf(b, "%s\"%s\", ", raise_fn("sp_raise_cls"), effn);
+              emit_syserr_call(c, id, "sp_syserr_msg_a", lead, 1, &av[1], b);
+            }
             buf_puts(b, ")");
           }
         }
         else {
           /* an explicitly given message is kept even when empty, unlike the
              class-only form, which falls back to the class name (#3711) */
-          Buf mh; memset(&mh, 0, sizeof mh);
-          int mk;
-          if (comp_ntype(c, av[1]) == TY_STRING && exc_msg_hold(c, av[1], b, &mh, &mk)) {
-            /* the exception is built here, holding the handle, as the
-               rescue would build it (sp_exc_new_for_catch) */
-            buf_printf(b, "sp_raise_exc((sp_Exception *)sp_exc_attach_msg(sp_exc_new_for_catch(\"%s\", "
-                          "sp_exc_msg_given(%s", effn, "SP_STR_B(");
-            emit_expr(c, av[1], b);
-            buf_printf(b, "%s)), %s))", ")", mh.p);
-            exc_msg_release(b, mk);
-            free(mh.p);
+          if (comp_ntype(c, av[1]) == TY_STRING && exc_msg_holds(c, av[1])) {
+            buf_printf(b, "%s\"%s\", ", raise_fn("sp_raise_cls_handle"), effn);
+            emit_str_form_handle(c, av[1], b);
+            buf_puts(b, ")");
           }
           else if (comp_ntype(c, av[1]) == TY_STRING) {
-            buf_printf(b, "sp_raise_cls(\"%s\", sp_exc_msg_given(%s", effn, "SP_STR_B(");
+            buf_printf(b, "%s\"%s\", sp_exc_msg_given(%s", raise_fn("sp_raise_cls"), effn, "SP_STR_B(");
             emit_expr(c, av[1], b);
             buf_puts(b, ")))");
           }
@@ -1134,8 +1211,8 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
             /* nil is not a message, so the class name answers (#3812) */
             int rt2 = ++g_tmp;
             buf_printf(b, "({ sp_RbVal _t%d = ", rt2); emit_boxed(c, av[1], b);
-            buf_printf(b, "; sp_raise_cls(\"%s\", _t%d.tag == SP_TAG_NIL ? (&(\"\\xff\")[1])"
-                          " : sp_exc_msg_given(sp_poly_to_s(_t%d))); })", effn, rt2, rt2);
+            buf_printf(b, "; %s\"%s\", _t%d.tag == SP_TAG_NIL ? (&(\"\\xff\")[1])"
+                          " : sp_exc_msg_given(sp_poly_to_s(_t%d))); })", raise_fn("sp_raise_cls"), effn, rt2, rt2);
           }
         }
       }
@@ -1145,7 +1222,7 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
       TyKind at = ar.as_ty;
       if (ac == 1 && emit_raise_nomethod_new(c, av[0], b)) { }
       else if (ac >= 2 && (at == TY_POLY || at == TY_CLASS))
-        emit_raise_class_value(c, av[0], av[1], b);
+        emit_raise_class_value(c, id, av[0], av[1], b);
       else if (ac >= 2 && ar.exc) {
         /* `raise e, msg` with an exception object in a variable: the message
            was dropped and the class name answered */
@@ -1154,14 +1231,14 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
         /* (the exception is held by nothing else once the expression that made it
            ends, and building the message's box and the raised copy allocate) */
         buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_RbVal _t%d = ", rk, rm); emit_boxed(c, av[1], b);
-        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); %s(_t%d, _t%d); })",
-                   rm, "sp_raise_poly_msg_h", rk, rm);
+        buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); %s_t%d, _t%d); })",
+                   rm, raise_fn("sp_raise_poly_msg_h"), rk, rm);
       }
       else if (at == TY_EXCEPTION)
-        { buf_puts(b, "sp_raise_exc((sp_Exception *)("); emit_expr(c, av[0], b); buf_puts(b, "))"); }
+        { buf_puts(b, raise_fn("sp_raise_exc")); buf_puts(b, "(sp_Exception *)("); emit_expr(c, av[0], b); buf_puts(b, "))"); }
       else if (ar.exc)
         /* an exception-subclass INSTANCE in a variable raises as itself */
-        { buf_puts(b, "sp_raise_exc((sp_Exception *)("); emit_expr(c, av[0], b); buf_puts(b, "))"); }
+        { buf_puts(b, raise_fn("sp_raise_exc")); buf_puts(b, "(sp_Exception *)("); emit_expr(c, av[0], b); buf_puts(b, "))"); }
       else if (ty_is_object(at)) {
         /* CRuby: raising a non-exception object is TypeError, not a
            pointer smuggled into the message slot (which emitted a C
@@ -1180,32 +1257,26 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
       else if (at == TY_STRING) {
         /* `raise "msg"` raises RuntimeError with the message, holding a
            shared String's handle (exc_msg_handle) */
-        Buf mh; memset(&mh, 0, sizeof mh);
-        int mk;
         /* `raise "msg"` is `raise RuntimeError, "msg"`: a RuntimeError
            reopening's own initialize runs on it, as that form's does
            (emit_exc_reopen_construct). Raised by name, it skipped the
            initialize, so its ivars and side effects were missing. */
-        int rxc = comp_builtin_class_named(c, "RuntimeError");
-        int rim = rxc >= 0 ? exc_reopen_initialize(c, rxc) : -1;
+        int rim = exc_builtin_reopen_initialize(c, id, "RuntimeError", 1, &av[0]);
         if (rim >= 0) {
-          buf_puts(b, "sp_raise_exc(");
-          emit_exc_reopen_construct(c, rxc, rim, -1, av[0], b);
+          buf_puts(b, raise_fn("sp_raise_exc"));
+          emit_exc_reopen_construct_as(c, "RuntimeError", rim, -1, av[0], -1, b);
           buf_puts(b, ")");
         }
         else if (strbuf_route_reader(c, av[0])) {
           /* A reader's box keeps its shared field as the message. */
-          buf_puts(b, "sp_raise_poly("); emit_boxed(c, av[0], b); buf_puts(b, ")");
+          buf_puts(b, raise_fn("sp_raise_poly")); emit_boxed(c, av[0], b); buf_puts(b, ")");
         }
-        else if (exc_msg_hold(c, av[0], b, &mh, &mk)) {
-          buf_printf(b, "sp_raise_exc((sp_Exception *)sp_exc_attach_msg(sp_exc_new_for_catch(\"RuntimeError\", "
-                      "sp_exc_msg_given(%s", "SP_STR_B(");
-          emit_expr(c, av[0], b);
-          buf_printf(b, "%s)), %s))", ")", mh.p);
-          exc_msg_release(b, mk);
-          free(mh.p);
+        else if (exc_msg_holds(c, av[0])) {
+          buf_printf(b, "%s\"RuntimeError\", ", raise_fn("sp_raise_cls_handle"));
+          emit_str_form_handle(c, av[0], b);
+          buf_puts(b, ")");
         }
-        else { buf_puts(b, "sp_raise(sp_exc_msg_given(SP_STR_B("); emit_expr(c, av[0], b); buf_puts(b, ")))"); }
+        else { buf_puts(b, raise_fn("sp_raise")); buf_puts(b, "sp_exc_msg_given(SP_STR_B("); emit_expr(c, av[0], b); buf_puts(b, ")))"); }
       }
       else if (at == TY_POLY || at == TY_CLASS) {
         /* the runtime value may be a string, an exception object, an exception
@@ -1215,7 +1286,7 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
            by the codegen when their static type is known (see the
            ty_is_object branch above). Reading parent_cls_name on an
            arbitrary poly-tagged object is a wrong-offset read (segfault). */
-        emit_raise_class_value(c, av[0], -1, b);
+        emit_raise_class_value(c, id, av[0], -1, b);
       }
       else {
         /* Integer/nil/Array/Symbol/Float/...: valid Ruby, TypeError at
@@ -1225,7 +1296,7 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
         buf_puts(b, "), sp_raise_cls(\"TypeError\", \"exception class/object expected\"))");
       }
     }
-    if (cause_node >= 0) buf_puts(b, ")");
+    if (cause_node >= 0) buf_puts(b, "; })");
     #undef RAISE_EXC_NAME
     return 1;
   }
@@ -1240,16 +1311,12 @@ int emit_call_raise_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const
 int exc_msg_handle(Compiler *c, int arg, Buf *b) {
   return arg >= 0 && strbuf_var_handle(c, arg, b);
 }
-/* ...and so does a message that is any other String value the plan hands
-   over as its handle (a reader's or a method's answer, a conversion, a
-   conditional): exc_msg_handle for a variable, else the handle held in a
-   temp the statement expression opened in b binds, which the message's
-   bytes read and the exception holds, so the value is evaluated once. 1
-   with *mh the handle's text, and *mark the bound node's mark when b was
-   opened (-1 otherwise); exc_msg_release closes it after the exception. */
+/* A String message uses its object. Keep the value rooted until the
+   constructor records it, and bind its bytes only where they are read. */
 int exc_msg_holds(Compiler *c, int arg) {
-  return arg >= 0 && comp_ntype(c, arg) == TY_STRING &&
-         share_plan_of(c, arg, SPR_TAKE, NULL).form == SPF_HANDLE;
+  if (arg < 0) return 0;
+  Repr r = repr_of(c, arg);
+  return r.as_ty == TY_STRING || r.kind == RK_STRBUF;
 }
 int exc_msg_hold(Compiler *c, int arg, Buf *b, Buf *mh, int *mark) {
   *mark = -1;
@@ -1259,7 +1326,7 @@ int exc_msg_hold(Compiler *c, int arg, Buf *b, Buf *mh, int *mark) {
   buf_printf(b, "({ sp_String *_t%d = ", t);
   emit_str_form_handle(c, arg, b);
   buf_printf(b, "; SP_GC_ROOT(_t%d); ", t);
-  *mark = view_bind(arg, "sp_strbuf_read_pub(_t%d)", t);
+  *mark = view_bind(arg, "sp_strbuf_read(_t%d)", t);
   buf_printf(mh, "_t%d", t);
   return 1;
 }
@@ -1329,7 +1396,7 @@ int emit_raise_nomethod_new(Compiler *c, int call, Buf *b) {
   int self, n = 0, rest = -1, kw = -1, argc = 0;
   if (!nomethod_out_of_line(c, call, &self, &el, &n, &rest, &kw)) return 0;
   const int *argv = call_args(nt, call, &argc);
-  buf_puts(b, rest >= 0 ? "sp_raise_nomethod_call_rest(" : "sp_raise_nomethod_call(");
+  buf_puts(b, raise_fn(rest >= 0 ? "sp_raise_nomethod_call_rest" : "sp_raise_nomethod_call"));
   emit_exc_msg_arg(c, argv[0], b); buf_puts(b, ", ");
   emit_boxed(c, argv[1], b); buf_puts(b, ", ");
   emit_boxed(c, self, b);

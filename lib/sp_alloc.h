@@ -1,19 +1,10 @@
 #ifndef SP_ALLOC_H
 #define SP_ALLOC_H
-/* Shared GC-string allocation.
-
-   The string-heap state below is `extern` -- defined once in sp_alloc.c and
-   linked from libspinel_rt.a -- so the generated program's single translation
-   unit and every standalone lib C file share ONE string heap. A cold runtime C file
-   (marshal, pack, json, ...) can therefore allocate GC-tracked strings directly
-   without #including spinel_rt.h and inheriting its per-TU `static` heap state
-   (which would otherwise create a second, never-swept string heap and leak).
-
-   The hot allocators stay `static inline` here so each including TU still
-   inlines them over the shared extern state -- the same shape sp_gc_alloc
-   already uses for the extern sp_gc_heap / sp_gc_bytes object heap. */
+/* Object allocation and String byte views shared by generated code and the
+   runtime. Allocator and collector state is defined in sp_alloc.c and
+   sp_gc.c. */
 #include "sp_types.h"   /* sp_str_hdr, sp_int, sp_float */
-#include "sp_gc.h"      /* sp_gc_collect, sp_oom_die, sp_gc_str_sweep_hook */
+#include "sp_gc.h"      /* sp_gc_collect, sp_oom_die */
 #include "sp_time.h"    /* sp_Time for sp_box_timev */
 #include <stdlib.h>
 #include <string.h>
@@ -22,19 +13,8 @@
 
 const char *sp_sprintf(const char *fmt, ...) SP_PRINTF_FORMAT(1, 2);  /* defined in the generated TU */
 
-/* Global heap lock (Phase 1, design 6.1). Under SP_THREADS one mutex serializes
-   the object- and string-heap mutations -- the trigger+collect, the calloc/
-   malloc, and the list link -- so N>1 workers cannot corrupt the shared heap
-   lists or byte counters. It wraps the hot allocators here (sp_str_alloc, in
-   this header so the generated TU's inlined copy locks too) and in sp_alloc.c
-   (sp_gc_alloc). The internal collect/sweep run under the held lock and never
-   re-acquire it (no allocator re-enters from a scan/finalize callback). A single
-   non-recursive mutex covers both heaps since a collection from either path
-   sweeps the other under the same held lock. No-op (and no pthread dependency)
-   in the single-threaded build, so that path is byte-identical.
-   NOTE: at N>1 this alone is not sufficient -- a worker doing pure computation
-   never reaches the lock, so stop-the-world via safepoints (added with the
-   workers) is still required before the collector may run. */
+/* Serialize shared heap bookkeeping across workers. The collector also
+   parks workers at safepoints so it can read their roots. */
 #ifdef SP_THREADS
 #include <pthread.h>
 extern pthread_mutex_t sp_heap_lock;
@@ -45,71 +25,6 @@ extern pthread_mutex_t sp_heap_lock;
 #define SP_HEAP_UNLOCK() ((void)0)
 #endif
 
-/* ---- shared string-heap state (defined in sp_alloc.c) ----
-   Threaded build: the string heap is per-worker (one singly-linked list + live-
-   byte counter per OS worker), so sp_str_alloc pushes lock-free onto its own
-   worker's list -- the shared sp_heap_lock serialized every string allocation
-   and made allocation-heavy parallel workloads scale NEGATIVELY. A started green
-   thread is pinned to its worker (home_wid), so only that worker's M ever pushes
-   onto its list, and it pumps one green thread at a time: no concurrent push.
-   The collector reaches every list under stop-the-world (all workers parked).
-   The single-threaded build keeps one global list and stays byte-identical. */
-/* Generations. Allocation always pushes onto the YOUNG list; a string still
-   live at a sweep moves to the OLD list, which ordinary (minor) sweeps then
-   skip. Without this every sweep walks the entire live set, so a program
-   holding a large one -- a Merkle tree of hex digests, a parsed document --
-   pays that walk again on each collection no matter how little of it changed.
-   Strings have no outgoing references, so there is nothing here of the write
-   barrier and forwarding a generational OBJECT heap would need: the split is
-   two list heads and a byte counter.
-   Reclamation of old strings is deferred to a major sweep, which runs when the
-   old generation has itself grown past a threshold. */
-#ifdef SP_THREADS
-/* sp_worker_id / sp_active_workers / SP_MAX_WORKERS: sp_types.h */
-/* One cache-line-padded slot per worker. The list head is written on EVERY
-   string allocation and the byte counter read on every one, so as four bare
-   [SP_MAX_WORKERS] arrays the per-worker slots sat 8 bytes apart: eight
-   workers shared a single line per array, and every allocation invalidated it
-   for all of them. The object heap already learned this -- sp_gc_wslot_t
-   exists for exactly this reason and its comment calls the padding essential
-   -- and the string heap never got the same treatment, which left it the
-   dominant cost of allocation-heavy parallel work. */
-/* The young list is SP_STR_YSUB lists, filled round-robin. A sweep task is
-   one list, so a worker that allocated most of a cycle's strings (a busy
-   request handler among idle workers) has its sweep split across the parked
-   workers instead of being the one slot everyone waits on: the longest slot
-   was the whole parallel phase, four milliseconds of thirty workers idle. */
-#define SP_STR_YSUB 4
-typedef struct {
-  sp_str_hdr *young[SP_STR_YSUB];   /* per-worker young list heads */
-  unsigned    rr;                   /* which young list the next allocation joins */
-  size_t      young_bytes;  /* live bytes on those lists */
-  sp_str_hdr *old;          /* per-worker old list head (swept on a major) */
-  size_t      old_bytes;
-  /* The byte count at which this worker may next ASK for a collection. The
-     trigger below fires on this worker's own bytes against the threshold,
-     while sp_stw_collect's early-out wants the AGGREGATE over N * threshold --
-     so a worker that crosses first is refused, its bytes are not reset by any
-     sweep, and it asks again on the very next allocation. Each ask takes the
-     global scheduler lock: measured at 7.2 MILLION asks for 941 collections,
-     99.99% of them refused, which is uncontended and free at one worker and a
-     futex storm at eight (#4334). Raising the mark by one threshold on every
-     ask bounds it to one per threshold's worth of allocation. */
-  size_t      ask_at;
-  char _pad[2 * SP_CACHELINE - (SP_STR_YSUB + 1) * sizeof(sp_str_hdr *) - sizeof(unsigned) - 3 * sizeof(size_t)];
-} sp_str_wslot_t;
-extern sp_str_wslot_t sp_str_wslot[SP_MAX_WORKERS];
-#else
-extern sp_str_hdr *sp_str_heap;          /* young list head */
-extern size_t sp_str_heap_bytes;         /* young string-heap bytes */
-extern sp_str_hdr *sp_str_old;           /* old list head */
-extern size_t sp_str_old_bytes;          /* old string-heap bytes */
-#endif
-extern size_t sp_str_old_threshold;      /* old bytes that trigger a major sweep */
-extern size_t sp_str_old_threshold_init; /* recompute floor for the above */
-extern size_t sp_str_threshold;          /* string-GC trigger (own heuristic) */
-extern size_t sp_str_threshold_init;     /* recompute floor */
-extern int    sp_str_stress_checked;     /* one-shot SPINEL_GC_STRESS check */
 extern int    sp_gc_stress_pin;          /* stress caps the retunes at the 2048 base (#3513) */
 #ifdef SP_THREADS
 void sp_alloc_stress_init(void);         /* race-free one-shot stress check (pre-helpers) */
@@ -123,7 +38,7 @@ extern const char sp_str_empty_data[];
 extern const char *const sp_str_frozen_empty;
 extern const char *const sp_str_frozen_true;
 extern const char *const sp_str_frozen_false;
-/* Symbol#to_s's String (sp_sym_to_s_frozen): frozen static storage with a
+/* The cached Symbol spelling (sp_sym_to_s_frozen): frozen static storage with a
    header, 0xf1, whose `next` link names sp_sym_str_tag. The link is free to
    carry the mark: the String is on no sweep list and is no literal (an
    even link names no literal's handle). A Hash compared by identity asks
@@ -151,10 +66,7 @@ static inline size_t sp_file_path_root_len(const char *p) {
 }
 #endif
 
-/* UTF-8 char-length cache. Shared (extern) so sp_str_sweep flushes the same
-   table the length helpers in spinel_rt.h populate: a per-TU split would leave
-   the generated TU's cache pointing at strings the archive-side sweep already
-   freed. */
+/* UTF-8 char-length cache shared by the runtime and the generated unit. */
 /* Two ways per bucket: a scan loop reading one string while measuring another
    (a CSV parser walking the input and its field buffer) collided on every
    character with a direct-mapped table and rescanned both strings each time. */
@@ -171,7 +83,7 @@ struct sp_str_lcache_entry {
    hot path), so a shared copy would be a data race across workers -- a torn read
    yields a wrong length and sp_str_concat's memcpy overruns. Each worker keeps
    its own; it is cleared at every safepoint park (before a sweep can recycle a
-   cached string's address) and by the string sweep on the collector. */
+   cached String's address) and before the collector sweeps. */
 extern SP_TLS struct sp_str_lcache_entry sp_str_lcache[SP_STR_LCACHE_SIZE];
 static inline unsigned sp_str_lcache_slot(const char *s) {
   uintptr_t k = (uintptr_t)s;
@@ -185,24 +97,17 @@ static inline unsigned sp_str_lcache_slot(const char *s) {
    and never freed; 0xff already says that, but it says it by having no header
    at all, which leaves nowhere to put the BINARY tag or a NUL-safe length.
    0xfb is 0xff plus a header: it joins the "has a header" group below and
-   stays OUT of the "is a mutable heap string" group (sp_gc's sweep,
-   setbyte's in-place write, append_grow), so every static-safety property of
-   0xff is kept by not being added anywhere. */
-static inline int sp_str_has_hdr(const char *s) {
-  unsigned char m = ((const unsigned char *)s)[-1];
-  return m == 0xfe || m == 0xfc || m == 0xfd || m == 0xf1 || m == 0xfb || m == 0xfa || m == 0xf8;
+   stays OUT of the "is a mutable heap string" group used by setbyte and append_grow. */
+static inline int sp_str_marker_has_hdr(unsigned char m) {
+  return m == 0xfe || m == 0xfd || m == 0xf1 || m == 0xfb || m == 0xfa || m == 0xf9;
 }
-/* "This string indexes at fixed width", verified once and remembered: every
-   byte is below 0x80, or the length walk counted it as bytes, which an
-   invalid byte makes it do (sp_str_length). Then #length is its byte length
-   and `s[i]` is the byte at i -- no walk, and no probe of the pointer-keyed
-   length cache either, which is what the walk had already been folded into.
-   The bit is a HINT: set only after a scan proved it, cleared when the bytes
-   change unless the change cannot alter how any other byte decodes (setbyte
-   of an ASCII byte on a 7-bit string, sp_String_splice_in with ASCII on both
-   sides), and every reader falls back to the cache when it is off. It says
-   nothing about the string's encoding -- US-ASCII and UTF-8 are compatible and
-   spinel does not distinguish them (docs/limitations.md). */
+static inline int sp_str_has_hdr(const char *s) {
+  return sp_str_marker_has_hdr(((const unsigned char *)s)[-1]);
+}
+/* Every byte is ASCII. A scan can remember this proof so #length and
+   indexing can use the byte length directly. A mutation clears it unless
+   the result is still known to contain only ASCII. The flag is independent
+   of the String's encoding, and malformed UTF-8 never sets it. */
 #define SP_STR_SIZE_ASCII7 0x40000000u
 static inline void sp_str_ascii7_clear(const char *s) {
   if (!s || !sp_str_has_hdr(s)) return;
@@ -217,36 +122,7 @@ static inline void sp_str_lcache_drop(const char *s) {
   for (unsigned w = 0; w < SP_STR_LCACHE_WAYS; w++)
     if (sp_str_lcache[h + w].s == s) sp_str_lcache[h + w].s = NULL;
 }
-/* Deep-return side channel (#3227): a method whose every return path yields
-   a shared-mutable string publishes the sp_String* handle here as the copy
-   is read out; a demand-marked call site picks it up right after the call
-   (resetting it to NULL first). Never read unless the analysis marked the
-   site, so ordinary callers are untouched. */
-extern SP_TLS void *_sp_ret_strbuf;
-
-/* Cold; single definitions in sp_alloc.c. sp_str_sweep is wired to the GC via a
-   constructor so it runs from sp_gc_collect regardless of which TU triggered
-   the collection. */
-void sp_str_sweep(void);
-/* The string-sweep gate, split so the scheduler can run the middle on the
-   workers that own the slots (see sp_alloc.c). */
-int  sp_str_sweep_begin(int *major);
-void sp_str_sweep_end(int major, size_t promoted);
-void sp_str_sweep_end_excluding(int major, size_t promoted, size_t young_exclude);   /* the concurrent sweep's deferred end */
-#ifdef SP_THREADS
-void sp_str_sweep_old_one(int wid);
-void sp_str_sweep_young_list(sp_str_hdr **head, sp_str_hdr **keep, sp_str_hdr **tail, size_t *moved, size_t *held);
-size_t sp_str_sweep_old_list(sp_str_hdr **head);
-size_t sp_str_bytes_total(void);   /* every worker's young string bytes */
-void sp_str_sweep_young_one(int wid, int sub, sp_str_hdr **keep, sp_str_hdr **tail,
-                            size_t *moved, size_t *held);
-void sp_str_sweep_young_done(int wid, sp_str_hdr *keep, sp_str_hdr *tail, size_t moved, size_t held,
-                             size_t *promoted);
-extern int sp_str_par_done;
-#endif
 void sp_str_lcache_clear(void);
-/* Collect + retune (see sp_alloc.c); sp_stw_collect (threaded) runs _all under STW. */
-void sp_gc_collect_retune_all(void);
 int  sp_gc_collection_wanted(void);
 void sp_stw_collect(void);   /* lib/sp_sched.c: stop-the-world collect (threaded) */
 void sp_gc_collect_request(void);   /* explicit GC.start: same barrier, forced */
@@ -273,15 +149,10 @@ void sp_alloc_report_tag(void *scan, const char *name);
 void sp_alloc_report_count(void *scan, size_t bytes);
 void sp_alloc_report_str(size_t bytes);
 
-/* Binary (ASCII-8BIT) strings. spinel keeps no per-string encoding tag:
-   String#length counts UTF-8 code points while the bytes stay valid UTF-8 and
-   falls back to the byte count once an invalid byte shows up, which lands on
-   Ruby's answer for text and for almost all binary data. "Almost" is the gap:
-   a short draw of random bytes is valid UTF-8 by chance about 1.5% of the
-   time, and Random.urandom(4).length then answered 3 (#3474). One bit says
-   "these bytes are data, count them as bytes" for the few producers that know
-   it. It rides in the top bit of the header's `size` (the allocation total,
-   far below 2GB), so no string grows by a byte. */
+/* A binary (ASCII-8BIT) String indexes and counts each byte separately.
+   UTF-8 text counts valid sequences as single characters and malformed
+   bytes individually. The binary marker occupies the top bit of the
+   payload allocation size. */
 #define SP_STR_SIZE_BINARY 0x80000000u
 /* bit 30 is SP_STR_SIZE_ASCII7 (declared above, with the length cache it
    short-circuits); the allocation total keeps the low 30, so a single string
@@ -309,7 +180,8 @@ static SP_ALWAYS_INLINE inline char *sp_str_alloc_born(size_t len, int nogc) {
   char *body = (char *)(h + 1);
   body[0] = (char)0xfe;
   body[1 + len] = 0;
-  r->data = body + 1; r->len = (int64_t)len; r->cap = (int64_t)len; r->binary = 0; r->temporarily_locked = 0;
+  r->data = body + 1; r->len = (int64_t)len; r->cap = (int64_t)len; r->binary = 0;
+  r->temporarily_locked = 0; r->copy_on_intern = 0;
   if (sp_alloc_report_on) sp_alloc_report_str(len);
   return body + 1;
 }
@@ -343,7 +215,7 @@ static inline char *sp_str_alloc_nogc(size_t len) {
   return sp_str_alloc_born(len, 1);
 }
 
-/* Copy a message onto the string heap so it can be held by a string root.
+/* Copy a message into a String object so it can be held by a string root.
    The source is a bare literal (every raise the runtime and the generated
    code issue passes one) or an unrooted heap string; neither can be rooted
    across an allocation, so the copy runs with no collection in between.
@@ -404,21 +276,24 @@ static inline void sp_str_mark_binary(char *s) {
   if (!s || !sp_str_has_hdr(s)) return;
   (((sp_str_hdr *)(s - 1)) - 1)->size |= SP_STR_SIZE_BINARY;
 }
-/* Fixed-width in ONE header decode: answers the byte length through *out and
-   returns 1 when indexing this string is byte indexing (BINARY, or a scan has
-   proved it 7-bit). Asking is_binary, then is_ascii7, then byte_len re-read the
-   marker and the header three times over -- 66 instructions where the answer is
-   two loads. */
-static inline int sp_str_fixed_width(const char *s, size_t *out) {
-  if (!s) { *out = 0; return 0; }
-  unsigned char m = ((const unsigned char *)s)[-1];
-  if (m == 0xfe || m == 0xfc || m == 0xfd || m == 0xf1 || m == 0xfb || m == 0xfa || m == 0xf8) {
+/* For a fixed-width String, read the byte length and the flags from
+   one header. The encoding flag tells a character slice which bytes to
+   return, even when both encodings index one byte at a time. */
+static inline uint32_t sp_str_fixed_width_flags(const char *s, size_t *out) {
+  if (s && sp_str_has_hdr(s)) {
     const sp_str_hdr *h = ((const sp_str_hdr *)(s - 1)) - 1;
-    if (h->len != SP_STR_LEN_UNSET &&
-        (h->size & (SP_STR_SIZE_BINARY | SP_STR_SIZE_ASCII7))) { *out = h->len; return 1; }
+    uint32_t flags = h->size & (SP_STR_SIZE_BINARY | SP_STR_SIZE_ASCII7);
+    if (flags && h->len != SP_STR_LEN_UNSET) {
+      *out = h->len;
+      return flags;
+    }
   }
   *out = 0;
   return 0;
+}
+
+static inline int sp_str_fixed_width(const char *s, size_t *out) {
+  return sp_str_fixed_width_flags(s, out) != 0;
 }
 /* Mark and hand back, so an emitter can wrap an expression in it. */
 static inline const char *sp_str_as_binary(const char *s) {
@@ -439,8 +314,7 @@ static inline void sp_str_mark_ascii7(const char *s) {
   sp_str_hdr *h = ((sp_str_hdr *)(s - 1)) - 1;
   if (h->size & SP_STR_SIZE_ASCII7) return;
   /* a frozen literal's header is read-only (fzl_emit_defs): a 7-bit one has
-     the bit from the start, and one that only counts as many characters as
-     bytes (invalid UTF-8, sp_str_length) is left unmarked. The test, the
+     the bit from the start. Non-ASCII literals are left unmarked. The test, the
      marker and the link sp_String_of_literal reads, also passes over a
      frozen slab String whose stale link is odd: that one is walked again. */
   if (((const unsigned char *)s)[-1] == 0xf1 && ((uintptr_t)h->next & 1)) return;
@@ -449,11 +323,8 @@ static inline void sp_str_mark_ascii7(const char *s) {
 
 static inline size_t sp_str_byte_len(const char *s) {
   if (!s) return 0;
-  unsigned char marker = ((const unsigned char *)s)[-1];
-  /* 0xf1 (frozen heap string / frozen literal) also carries a real sp_str_hdr
-     whose len is the true byte length, so an embedded NUL survives freezing
-     (#2462 dedup, .freeze). */
-  if (marker == 0xfe || marker == 0xfc || marker == 0xfd || marker == 0xf1 || marker == 0xfb || marker == 0xfa || marker == 0xf8) {
+  /* Frozen literals and retired views retain their recorded byte length. */
+  if (sp_str_has_hdr(s)) {
     uint32_t l = (((const sp_str_hdr *)(s - 1)) - 1)->len;
     if (l != SP_STR_LEN_UNSET) return l;
   }
@@ -463,7 +334,7 @@ static inline size_t sp_str_byte_len(const char *s) {
 static inline void sp_str_set_len(char *s, size_t len) {
   if (!s) return;
   unsigned char marker = ((unsigned char *)s)[-1];
-  if (marker == 0xfe || marker == 0xfc || marker == 0xfd || marker == 0xf1 || marker == 0xfb || marker == 0xfa || marker == 0xf8) {
+  if (marker == 0xfe || marker == 0xfd || marker == 0xf1 || marker == 0xfb || marker == 0xfa) {
     sp_str_hdr *hd = ((sp_str_hdr *)(s - 1)) - 1;
     hd->len = (uint32_t)len;
     hd->hash = 0;  /* length change implies content change: invalidate cached hash */
@@ -531,7 +402,7 @@ static inline const char *sp_env_str(const char *s) {
   return r;
 }
 
-/* Integer / Float -> decimal string. Shared here (over the string heap) so cold
+/* Integer / Float -> decimal string. Shared here so cold
    readers such as lib/sp_json.c can format numbers without spinel_rt.h. */
 /* Interpolation writers: append one part into a caller-provided buffer and
    return the new tail. emit_interp sizes the buffer from static bounds
@@ -604,7 +475,7 @@ static inline char *sp_w_bool(char *p, sp_bool v) {
    `j.to_s` in a loop -- and it went through snprintf: __printf_buffer and its
    friends were a fifth of an allocating benchmark's profile. Writing the digits
    by hand also lets the string be allocated at its real length instead of a
-   fixed 32, which is less string-heap pressure per call and so fewer
+   fixed 32, which means fewer allocated bytes per call and fewer
    collections. */
 static inline const char *sp_int_to_s(sp_int n) {
   uint64_t u;
@@ -650,7 +521,7 @@ void *sp_pl_realloc(void *p, size_t newn);   /* lib/sp_slab.c: a slab block know
    state. SP_BUILTIN_FOREIGN_PTR/COMPLEX/RATIONAL are in sp_gc.h. */
 #define SP_BUILTIN_ARRAY_OF(tag) (-(tag) - 1)
 #define SP_BUILTIN_INT_ARRAY SP_BUILTIN_ARRAY_OF(SP_TAG_INT) /* -1 */
-#define SP_BUILTIN_STR_ARRAY SP_BUILTIN_ARRAY_OF(SP_TAG_STR) /* -2 */
+#define SP_BUILTIN_STR_ARRAY (-2)
 #define SP_BUILTIN_FLT_ARRAY SP_BUILTIN_ARRAY_OF(SP_TAG_FLT) /* -3 */
 #define SP_BUILTIN_PTR_ARRAY SP_BUILTIN_ARRAY_OF(SP_TAG_OBJ) /* -6 */
 #define SP_BUILTIN_SYM_ARRAY SP_BUILTIN_ARRAY_OF(SP_TAG_SYM) /* -7 */
@@ -723,6 +594,7 @@ void *sp_pl_realloc(void *p, size_t newn);   /* lib/sp_slab.c: a slab block know
                                            generator in an Array or a poly slot
                                            keeps its identity; it read as nil */
 /* SP_BUILTIN_ARGF (-51) is in sp_gc.h: the collector must not trace it */
+/* SP_BUILTIN_ENV (-54) too */
 #define SP_BUILTIN_TIME_RANGE    (-52)  /* a Range of Times (sp_TimeRange *) */
 #define SP_BUILTIN_OBJ_RANGE     (-53)  /* a Range of the program's objects (sp_ObjRange *) */
 #define SP_BUILTIN_YIELDER       (-49)  /* Enumerator::Yielder: the generator's
@@ -733,27 +605,23 @@ void *sp_pl_realloc(void *p, size_t newn);   /* lib/sp_slab.c: a slab block know
                                           proc runs on that fiber). */
 
 static inline sp_RbVal sp_box_int(sp_int v)    { sp_RbVal r; r.tag = SP_TAG_INT;  r.cls_id = 0; r.v.i = v; return r; }
-/* A NULL char* IS Ruby nil throughout the string paths (the nullable-string
-   invariant); preserve that across the boxing boundary, or a boxed nil-string
-   carries SP_TAG_STR and fails tag-keyed comparisons -- `defined?(x).should
-   == nil` compared STR(NULL) against NIL and answered false. */
-static inline sp_RbVal sp_box_str(const char *v){ sp_RbVal r; if (!v) { r.tag = SP_TAG_NIL; r.cls_id = 0; r.v.s = NULL; return r; } r.tag = SP_TAG_STR;  r.cls_id = 0; r.v.s = v; return r; }
-/* A boxed value as the String it holds, for a reader that takes a String
-   by its tag: a shared String's handle (SP_BUILTIN_STRBUF) reads as a box
-   of its bytes, the handle's first field (sp_String.data); any other value
-   is itself. */
-static inline sp_RbVal sp_rbval_str(sp_RbVal v) {
-  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF && v.v.p) {
-    v.tag = SP_TAG_STR;
-    v.cls_id = 0;
-    v.v.s = *(const char **)v.v.p;
-  }
-  return v;
+/* A String value is boxed as its handle. Borrow its payload for byte reads. */
+static inline sp_bool sp_rbval_is_string(sp_RbVal v) {
+  return v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF && v.v.p;
 }
+
+static inline const char *sp_rbval_string_bytes(sp_RbVal v) {
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF && v.v.p) {
+    const struct sp_String_s *s = v.v.p;
+    return s->data;
+  }
+  return NULL;
+}
+
 /* A String mutator's value from a poly arm, which answers the box or the
    unboxed String by mutator: boxed either way (a NULL String is nil). */
 static inline sp_RbVal sp_box_same(sp_RbVal v){ return v; }
-#define SP_BOX_STR_OR_POLY(x) _Generic((x), sp_RbVal: sp_box_same, default: sp_box_str)(x)
+#define SP_BOX_STR_OR_POLY(x) _Generic((x), sp_RbVal: sp_box_same, default: sp_box_str_new)(x)
 static inline sp_RbVal sp_box_float(sp_float v){ sp_RbVal r; r.tag = SP_TAG_FLT;  r.cls_id = 0; r.v.f = v; return r; }
 /* Write the full union word, not just the narrow `b` member: hash keys and
    poly equality compare bool values through `v.i`, so bytes left
@@ -784,9 +652,8 @@ static inline sp_RbVal sp_box_ofloat(sp_ofloat o) { return o.nil ? sp_box_nil() 
    by the C type the arm's value has. Expanded only in a program's own C,
    after every type it names is declared. */
 static inline sp_RbVal sp_bi_box_id(sp_RbVal v) { return v; }
-static inline sp_RbVal sp_bi_box_mstr(char *v) { return sp_box_str(v); }
 #define SP_BI_BOX(x) _Generic((x), sp_RbVal: sp_bi_box_id, sp_int: sp_box_int, sp_float: sp_box_float, \
-  sp_bool: sp_box_bool, const char *: sp_box_str, char *: sp_bi_box_mstr, sp_oint: sp_box_oint, \
+  sp_bool: sp_box_bool, const char *: sp_box_str_new, char *: sp_box_str_new, sp_oint: sp_box_oint, \
   sp_ofloat: sp_box_ofloat, sp_PolyArray *: sp_box_poly_array, \
   sp_FloatArray *: sp_box_float_array, sp_StrArray *: sp_box_str_array)(x)
 /* The value of a nullable slot used where CRuby's nil would raise. The three
@@ -840,16 +707,11 @@ static inline char *sp_w_oint(char *p, sp_oint o) { return o.nil ? p : sp_w_int(
    sp_gc_alloc itself is an external function (defined in sp_alloc.c) so the
    cold lib C files that already link it (sp_fiber.c, sp_io.c, sp_bigint.c)
    keep resolving the same symbol. */
-/* SPINEL_GC_OBJ_BUDGET=walk: the object budget is priced off the whole set a
-   mark walks, not the object heap alone. Opt-in; see sp_gc_retune_object. */
+/* The object-budget diagnostics can report the mark share as measured or
+   pinned to either endpoint. */
 extern int sp_gc_obj_budget_mode;
 extern size_t sp_gc_obj_alpha1024;
-extern int sp_gc_str_major_fixed;
-extern int sp_gc_str_major_sched;
-extern size_t sp_gc_str_majors;
 extern int sp_gc_obj_budget_fixed;
-extern int sp_gc_str_budget_fixed;
-extern int sp_gc_str_budget_mode;
 extern size_t sp_gc_threshold;
 extern size_t sp_gc_threshold_init;
 extern int sp_gc_stress_checked;
@@ -896,6 +758,8 @@ static inline void *sp_gc_alloc_sized(size_t sz, void (*scn)(void *)) {
 void *sp_gc_alloc_nogc(size_t sz, void (*fin)(void *), void (*scn)(void *));
 
 SP_NORETURN void sp_raise_cls(const char *cls, const char *msg);  /* lib/sp_core.c */
+/* ...with the line and column its #line / #column answer (lib/sp_exc.c) */
+SP_NORETURN void sp_raise_parse_error(const char *cls, const char *msg, sp_int line, sp_int column);
 SP_NORETURN void sp_raise_frozen_str(const char *s);              /* lib/sp_str.c */
 /* The message carries the rodata marker byte: an in-flight exception's msg is
    marked by the GC (sp_mark_string reads s[-1]), so a bare literal -- whose
@@ -919,6 +783,8 @@ void sp_exc_stage_key(sp_RbVal v);
 /* the raise itself, in lib/sp_cold.c: the message carries the receiver's
    inspect, as CRuby's does ("can't modify frozen Array: [1, 2]") */
 SP_NORETURN void sp_raise_frozen_array_rv(sp_RbVal v);
+/* the prefix naming a frozen value's class, a program's subclass of Array, Hash or String by its own name (lib/sp_cold.c) */
+const char *sp_frozen_what(sp_RbVal v, const char *what);
 static SP_NOINLINE SP_COLD void sp_raise_frozen_array_at(void *a, int cls_id) {
   sp_raise_frozen_array_rv(sp_box_obj(a, cls_id));
 }
@@ -927,9 +793,9 @@ static SP_NOINLINE SP_COLD void sp_raise_frozen_array_v(sp_RbVal v) {
   sp_raise_frozen_array_rv(v);
 }
 
-/* Top-level self, the main object (#4926): a bare Object allocated on first
-   use, whose to_s / inspect answer "main". sp_main_obj is its pointer, a GC
-   root marked with the runtime globals; lib/sp_cold.c. */
+/* Top-level self (#4926): an Object allocated on first use whose to_s and
+   inspect answer "main". The runtime global roots mark sp_main_obj, and
+   the ordinary Object scan marks its instance variable table. */
 extern void *sp_main_obj;
 sp_RbVal sp_main_self(void);
 
@@ -1050,16 +916,13 @@ static inline struct sp_String_s *sp_str_fd_owner(const char *s) {
    so sp_str_freeze_val can set it.  The frozen? predicate and mutation
    guards check for 0xf1; plain rodata 0xff literals are NOT reported
    as frozen (they behave as immutable value-semantics objects).
-   0xfa is a frozen heap string that is collected like any other where 0xf1
-   is kept for good; 0xf8 is its marked state on a malloc'd string, as 0xfc
-   is 0xfe's (a slab string's mark is a bit in its chunk). */
+   0xfa is a frozen view inside a collectible String object. */
 static inline sp_bool sp_str_is_frozen_val(const char *s) {
   if (!s) return TRUE;
   unsigned char m = ((const unsigned char *)s)[-1];
-  /* one test of the frozen marks and 0xfd at once (bits 0, 7, 9 and 12 of
-     m - 0xf1): an unfrozen string pays nothing for the handle's payload */
+  /* One test for 0xf1, 0xfa and 0xfd, using bits of m - 0xf1. */
   unsigned d = (unsigned)m - 0xf1u;
-  if (d > 12u || !((0x1281u >> d) & 1u)) return FALSE;
+  if (d > 12u || !((0x1201u >> d) & 1u)) return FALSE;
   if (SP_UNLIKELY(m == 0xfd)) return sp_str_fd_owner_frozen(s);
   return TRUE;
 }
@@ -1081,8 +944,8 @@ const char *sp_str_keep_copy(const char *s);
 static inline const char *sp_str_keep(const char *s) {
   return s && ((const unsigned char *)s)[-1] == 0xfd && !sp_str_fd_owner_frozen(s) ? sp_str_keep_copy(s) : sp_str_retained(s);
 }
-/* A String key as a Hash stores it: a mutable string is copied into a frozen
-   0xfa, so a later `<<` or setbyte on the caller's string cannot move the key
+/* A String key as a Hash stores it: an unfrozen String is copied into a frozen
+   handle, so a later `<<` or setbyte on the caller's string cannot move the key
    (CRuby's rb_hash_key_str). A frozen or literal key is stored as is, and so
    is the payload of a frozen String handle (0xfd, whose header's `next` is
    the owning handle, sp_fd_own): nothing can change or move it any more,
@@ -1096,9 +959,9 @@ static inline const char *sp_str_keep(const char *s) {
    so the key's handle, sp_String_key_handle, is that one String each time) */
 const char *sp_hash_key_from_bytes(const char *data, size_t len, int bin);
 static inline const char *sp_hash_key_str(const char *s) {
-  unsigned char m = ((const unsigned char *)s)[-1];
-  if (m != 0xfe && m != 0xfc && m != 0xfd) return s;
-  if (m == 0xfd && sp_str_fd_owner_frozen(s)) return s;
+  /* Static byte results are unfrozen too; storage that cannot be modified
+     is not itself the frozen String object a Hash key must be. */
+  if (sp_str_is_frozen_val(s)) return s;
   return sp_hash_key_from_bytes(s, sp_str_byte_len(s), sp_str_is_binary(s));
 }
 

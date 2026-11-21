@@ -9,6 +9,7 @@
 #include "codegen_internal.h"
 #include "builtin_ops.h"
 #include "codegen_call_arms.h"
+#include "order_plan.h"
 #include "repr.h"
 
 /* ---- nil out of band: an emitter whose C result is an sp_oint / sp_ofloat
@@ -89,27 +90,32 @@ int emit_op_hash_pattern_all(Compiler *c, const BopCtx *x, Buf *b) {
 int emit_op_hash_default_proc(Compiler *c, const BopCtx *x, Buf *b) {
   int recv = x->recv;
   TyKind rt = x->rt;
+  if (rt == TY_STR_POLY_HASH) {
+    /* String-keyed storage retains the Proc assigned by default_proc=.
+       An explicit Proc call is free to pass a key of any Ruby class. */
+    int temp = ++g_tmp;
+    buf_printf(b, "({ sp_StrPolyHash *_t%d = ", temp);
+    emit_expr(c, recv, b);
+    buf_printf(b, "; (_t%d && _t%d->dproc) ? (sp_Proc *)_t%d->dproc_self : NULL; })",
+               temp, temp, temp);
+    return 1;
+  }
   const char *hnn = ty_hash_cname(rt);
-  int hdp_v = !hnn ? -1
-            : sp_streq(hnn, "SymPoly") ? 0
-            : sp_streq(hnn, "StrPoly") ? 1
-            : sp_streq(hnn, "PolyPoly") ? 2 : -1;
+  int hdp_v = rt == TY_SYM_POLY_HASH ? 0 : rt == TY_POLY_POLY_HASH ? 1 : -1;
   if (hdp_v < 0) {
     buf_puts(b, "((void)(");
     emit_expr_for_effect(c, recv, b);
     buf_puts(b, "), (sp_Proc *)NULL)");
     return 1;
   }
-  static char hdp_done[3];
-  if (!hdp_done[hdp_v]) {
-    hdp_done[hdp_v] = 1;
+  char key[64];
+  snprintf(key, sizeof key, " _hdp_tramp_%s(", hnn);
+  if (!g_procs.p || !strstr(g_procs.p, key)) {
     if (!g_needs_proc_poly_argslot) {
       g_needs_proc_poly_argslot = 1;
       buf_puts(&g_proc_protos, "extern SP_TLS sp_RbVal _sp_proc_poly_args[SP_PROC_ARG_SLOTS];\n");
     }
-    const char *kexpr = hdp_v == 0 ? "(sp_sym)sp_poly_to_i(_sp_proc_poly_args[1])"
-                      : hdp_v == 1 ? "_sp_proc_poly_args[1].v.s"
-                      : "_sp_proc_poly_args[1]";
+    const char *kexpr = hdp_v == 0 ? "(sp_sym)sp_poly_to_i(_sp_proc_poly_args[1])" : "_sp_proc_poly_args[1]";
     buf_printf(&g_procs,
       "static sp_int _hdp_tramp_%s(void *cap, sp_int argc, sp_int *args) {\n"
       "  sp_%sHash *src = (sp_%sHash *)cap; (void)args;\n"
@@ -120,6 +126,7 @@ int emit_op_hash_default_proc(Compiler *c, const BopCtx *x, Buf *b) {
       "  return 0;\n}\n"
       "static sp_Proc *_hdp_%s(sp_%sHash *h) {\n"
       "  if (!h || !h->dproc) return NULL;\n"
+      "  SP_GC_ROOT(h);\n"
       "  return sp_proc_new_meta((void *)_hdp_tramp_%s, h, sp_bm_cap_scan, 2, FALSE, 0, NULL, NULL);\n}\n",
       hnn, hnn, hnn, hnn, hnn, kexpr, hnn, hnn, hnn);
   }
@@ -145,12 +152,12 @@ int emit_op_hash_to_proc(Compiler *c, const BopCtx *x, Buf *b) {
      Float 1.0 on an Integer-keyed one, which is not eql? to 1) is a miss
      answering the Hash's default, as `h[key]` answers it. */
   const char *keyexpr = (kt == TY_SYMBOL) ? "(sp_sym)_k.v.i"
-                      : (kt == TY_STRING) ? "_k.v.s"
+                      : (kt == TY_STRING) ? "sp_rbval_string_bytes(_k)"
                       : (kt == TY_INT) ? "_k.v.i"
                       : "_k";
-  const char *keytag = (kt == TY_SYMBOL) ? "SP_TAG_SYM"
-                     : (kt == TY_STRING) ? "SP_TAG_STR"
-                     : (kt == TY_INT) ? "SP_TAG_INT" : NULL;
+  const char *foreign_key = (kt == TY_SYMBOL) ? "_k.tag != SP_TAG_SYM"
+                          : (kt == TY_STRING) ? "!sp_rbval_is_string(_k)"
+                          : (kt == TY_INT) ? "_k.tag != SP_TAG_INT" : NULL;
   g_needs_proc_poly_argslot = 1;
   buf_printf(&g_proc_protos, "static sp_int _hashproc_%s(void *cap, sp_int argc, sp_int *args);\n", pn);
   buf_printf(&g_procs, "static sp_int _hashproc_%s(void *cap, sp_int argc, sp_int *args) {\n", pn);
@@ -161,11 +168,8 @@ int emit_op_hash_to_proc(Compiler *c, const BopCtx *x, Buf *b) {
              " sp_sprintf(\"wrong number of arguments (given %%lld, expected 1)\", (long long)argc));\n");
   buf_printf(&g_procs, "  sp_%sHash *_h = (sp_%sHash *)cap; (void)args;\n", hn, hn);
   buf_puts(&g_procs, "  sp_RbVal _k = _sp_proc_poly_args[0];\n");
-  /* a mutable String key looks its contents up */
-  if (kt == TY_STRING)
-    buf_puts(&g_procs, "  if (sp_poly_is_strbuf(_k)) _k = sp_poly_strbuf_deref(_k);\n");
-  if (keytag) {
-    buf_printf(&g_procs, "  if (_k.tag != %s) { _sp_proc_poly_ret = sp_poly_hash_foreign_miss(", keytag);
+  if (foreign_key) {
+    buf_printf(&g_procs, "  if (%s) { _sp_proc_poly_ret = sp_poly_hash_foreign_miss(", foreign_key);
     emit_boxed_text(c, rt, "_h", &g_procs);
     buf_puts(&g_procs, ", _k); return 0; }\n");
   }
@@ -207,6 +211,7 @@ int emit_op_hash_aref(Compiler *c, const BopCtx *x, Buf *b) {
   if (hash_kt != TY_POLY && hash_kt != TY_UNKNOWN &&
       arg_ktr.kind != RK_BOXED && arg_kt != TY_UNKNOWN && arg_kt != hash_kt &&
       !(hash_kt == TY_STRING && arg_kt == TY_STRBUF) &&
+      !hash_bigint_key(c, argv[0], hash_kt) &&
       !hash_nil_key_stored(c, argv[0], hash_kt)) {
     TyKind vt = ty_hash_val(rt);
     int t = ++g_tmp;
@@ -256,6 +261,11 @@ int emit_op_hash_has_key(Compiler *c, const BopCtx *x, Buf *b) {
     buf_puts(b, "); 0; })");
     return 1;
   }
+  if (hash_bigint_key(c, argv[0], hash_kt)) {
+    buf_printf(b, "sp_%sHash_has_key_okey(", hn);
+    emit_expr(c, recv, b); buf_puts(b, ", "); emit_hash_key_o(c, argv[0], hash_kt, b); buf_puts(b, ")");
+    return 1;
+  }
   buf_printf(b, "sp_%sHash_has_key(", hn);
   emit_expr(c, recv, b); buf_puts(b, ", "); emit_hash_key(c, argv[0], hash_kt, b); buf_puts(b, ")");
   return 1;
@@ -301,24 +311,28 @@ int emit_op_hash_default(Compiler *c, const BopCtx *x, Buf *b) {
     /* default(key): a hash built with a block calls its default_proc with
        (self, key); default() (or a hash with no proc) returns default_v
        (#2464). Only the poly-value variants carry a dproc. */
-    /* The proc takes the key in the hash's own key representation, so an
-       argument of another type cannot be handed to it -- passing an
-       Integer where a `const char *` key is expected did not even
-       typecheck. Such a key can never be in this hash, so answer the
-       plain default. */
+    /* A key the typed table cannot hold goes to its foreign-key miss path. */
     TyKind dkt = argc == 1 ? comp_ntype(c, argv[0]) : TY_UNKNOWN;
     int dkey_ok = rt == TY_POLY_POLY_HASH ||
                   (rt == TY_SYM_POLY_HASH && dkt == TY_SYMBOL) ||
                   (rt == TY_STR_POLY_HASH && (dkt == TY_STRING || dkt == TY_STRBUF));
+    if (argc == 1) buf_printf(b, "; SP_GC_ROOT(_t%d)", t);
     if (argc == 1 && dkey_ok) {
-      buf_printf(b, "; (_t%d && _t%d->dproc) ? _t%d->dproc(_t%d, ", t, t, t, t);
+      int k = ++g_tmp;
+      const char *key_type = rt == TY_POLY_POLY_HASH ? "sp_RbVal"
+                           : rt == TY_SYM_POLY_HASH ? "sp_sym" : "const char *";
+      buf_printf(b, "; %s _t%d = ", key_type, k);
       if (rt == TY_POLY_POLY_HASH) emit_boxed(c, argv[0], b);
       else emit_expr(c, argv[0], b);
-      buf_printf(b, ", _t%d->dproc_self) : (_t%d ? _t%d->default_v : sp_box_nil()); })", t, t, t);
+      buf_printf(b, "; (_t%d && _t%d->dproc) ? _t%d->dproc(_t%d, _t%d,"
+                    " _t%d->dproc_self) : (_t%d ? _t%d->default_v : sp_box_nil()); })",
+                 t, t, t, t, k, t, t, t);
     }
     else if (argc == 1) {
-      buf_printf(b, "; (void)("); emit_expr_for_effect(c, argv[0], b);
-      buf_printf(b, "); _t%d ? _t%d->default_v : sp_box_nil(); })", t, t);
+      int k = ++g_tmp;
+      buf_printf(b, "; sp_RbVal _t%d = ", k); emit_boxed(c, argv[0], b);
+      buf_printf(b, "; sp_poly_hash_foreign_miss(sp_box_nullable_obj(_t%d, %s), _t%d); })",
+                 t, hash_box_cls(rt), k);
     }
     else {
       buf_printf(b, "; _t%d ? _t%d->default_v : sp_box_nil(); })", t, t);
@@ -398,14 +412,14 @@ int emit_op_hash_fetch(Compiler *c, const BopCtx *x, Buf *b) {
     tb = ++g_tmp;
     buf_printf(b, "; sp_RbVal _t%d = ", tb); emit_boxed(c, argv[0], b);
     buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); %s _t%d = ({ sp_RbVal _hk = _t%d; ", tb, c_type_name(kt), tk, tb);
-    if (kt == TY_STRING) buf_puts(b, "_hk = sp_poly_strbuf_deref(_hk); _hk.tag == SP_TAG_STR ? _hk.v.s : (const char *)0; })");
+    if (kt == TY_STRING) buf_puts(b, "sp_rbval_string_bytes(_hk); })");
     else buf_puts(b, "_hk.tag == SP_TAG_SYM ? (sp_sym)_hk.v.i : (sp_sym)-1; })");
   }
   /* ...and on an Integer-keyed table, a key that may be nil or another
      class goes through the _okey ops (hash_okey_form), where it misses as
      CRuby's lookup does: converted, a nil key raised TypeError where
      CRuby's KeyError names it */
-  else if (hash_okey_form(c, argv[0], kt) && repr_of(c, argv[0]).kind == RK_BOXED) {
+  else if (hash_okey_form(c, argv[0], kt) && (repr_of(c, argv[0]).kind == RK_BOXED || hash_bigint_key(c, argv[0], kt))) {
     tb = ++g_tmp;
     buf_printf(b, "; sp_RbVal _t%d = ", tb); emit_boxed(c, argv[0], b);
     buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_oint _t%d = ", tb, tk);
@@ -665,7 +679,7 @@ int emit_op_hash_set_default(Compiler *c, const BopCtx *x, Buf *b) {
     else buf_printf(b, "; sp_gc_wb((void *)_t%d); }", t);
   }
   buf_puts(b, " ");
-  if (shared_default && !repr_of(c, x->id).demand) buf_printf(b, "sp_strbuf_read_pub(%s)", av);
+  if (shared_default && !repr_of(c, x->id).demand) buf_printf(b, "sp_strbuf_read(%s)", av);
   else if (held || is_nil) buf_puts(b, av); else emit_expr(c, argv[0], b);
   free(dref.p);
   buf_puts(b, "; })"); return 1;
@@ -724,7 +738,7 @@ int emit_op_hash_shift(Compiler *c, const BopCtx *x, Buf *b) {
   buf_printf(b, " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);", tp, tp);
   if (rt == TY_POLY_POLY_HASH) buf_printf(b, " sp_PolyArray_push(_t%d, _t%d);", tp, tk);
   else if (kt == TY_SYMBOL) buf_printf(b, " sp_PolyArray_push(_t%d, sp_box_sym(_t%d));", tp, tk);
-  else if (kt == TY_STRING) buf_printf(b, " sp_PolyArray_push(_t%d, sp_box_str(_t%d));", tp, tk);
+  else if (kt == TY_STRING) buf_printf(b, " sp_PolyArray_push(_t%d, SP_SEBOX(sp_String_key_handle(_t%d)));", tp, tk);
   else buf_printf(b, " sp_PolyArray_push(_t%d, sp_box_int(_t%d));", tp, tk);
   if (rt == TY_POLY_POLY_HASH) buf_printf(b, " sp_PolyArray_push(_t%d, _t%d->vals[_t%d->order[0]]);", tp, th, th);
   else if (vt == TY_POLY) buf_printf(b, " sp_PolyArray_push(_t%d, sp_%sHash_get(_t%d, _t%d));", tp, hn, th, tk);
@@ -817,7 +831,7 @@ int emit_op_hash_invert(Compiler *c, const BopCtx *x, Buf *b) {
     if (kt == TY_SYMBOL)
       buf_printf(b, " sp_RbVal _k%d = sp_box_sym(_t%d->order[_t%d]);", ti, th, ti);
     else if (kt == TY_STRING)
-      buf_printf(b, " sp_RbVal _k%d = sp_box_str(_t%d->order[_t%d]);", ti, th, ti);
+      buf_printf(b, " sp_RbVal _k%d = SP_SEBOX(sp_String_key_handle(_t%d->order[_t%d])); SP_GC_ROOT_RBVAL(_k%d);", ti, th, ti, ti);
     else if (kt == TY_INT)
       buf_printf(b, " sp_RbVal _k%d = sp_box_int(_t%d->order[_t%d]);", ti, th, ti);
     else
@@ -909,27 +923,48 @@ int emit_op_hash_nil_recv(Compiler *c, const BopCtx *x, Buf *b) {
   return 1;
 }
 
-/* Hash#value? and has_value?: the function names value?, so has_value? on a
-   receiver that can be nil must raise under its own name, once the argument
-   has run (#9347); value? takes the same block, which names the call as
-   written. A receiver the nil fact says is never nil keeps the plain call. */
+/* A value search retains its receiver across the needle's evaluation.
+   The nil check follows that evaluation and reports the name used by
+   the call (#9347). */
 int emit_hash_has_value(Compiler *c, int recv, int arg, TyKind rt, const char *hn, int poly,
                         const char *name, Buf *b) {
-  if (!recv_never_nil(c, recv)) {
+  int guard = !recv_never_nil(c, recv);
+  int string_values = !poly && typed_elem_held(rt) == TY_STRBUF;
+  int root = operand_may_allocate(c, arg);
+  if (guard || (string_values && (root || order_runs_code(c, recv) || order_runs_code(c, arg)))) {
     Buf rx = expr_buf(c, recv);
     char ct[48]; snprintf(ct, sizeof ct, "sp_%sHash *", hn);
-    int t = nil_recv_open(c, recv, rx.p ? rx.p : "", ct, NULL, subtree_may_allocate(c, arg), b);
+    int t = nil_recv_open(c, recv, rx.p ? rx.p : "", ct, NULL, root, b);
     free(rx.p);
+    Repr needle = repr_of(c, arg);
+    int nil_needle = string_values && (needle.ty == TY_NIL || needle.ty == TY_VOID ||
+                                       needle.as_ty == TY_NIL || needle.as_ty == TY_VOID);
+    Buf pre = {0}, value = {0};
+    emit_split_pre(c, arg, nil_needle ? emit_expr_for_effect : poly ? emit_boxed : emit_expr,
+                   &pre, &value);
+    if (pre.p) buf_puts(b, pre.p);
     int ta = ++g_tmp;
-    buf_printf(b, "%s _t%d = ", poly ? "sp_RbVal" : c_type_name(ty_hash_val(rt)), ta);
-    if (poly) emit_boxed(c, arg, b); else emit_expr(c, arg, b);
-    buf_puts(b, "; "); nil_recv_check(name, t, b);
-    buf_printf(b, " sp_%sHash_has_value(_t%d, _t%d); })", hn, t, ta);
+    if (nil_needle)
+      buf_printf(b, "const char *_t%d = ((void)(%s), (const char *)NULL); ",
+                 ta, value.p && value.p[0] ? value.p : "0");
+    else {
+      /* The element conversion accepts either String form. Preserve the
+         form that the needle's emitter wrote across the receiver check. */
+      const char *type = poly ? "sp_RbVal" : string_values ? "__auto_type" : c_type_name(ty_hash_val(rt));
+      buf_printf(b, "%s _t%d = %s; ", type, ta, value.p ? value.p : poly ? "sp_box_nil()" : "0");
+    }
+    free(pre.p); free(value.p);
+    if (guard) nil_recv_check(name, t, b);
+    char nd[24]; snprintf(nd, sizeof nd, "_t%d", ta);
+    buf_puts(b, " "); emit_hash_entry(b, rt, "has_value"); buf_printf(b, "(_t%d, ", t);
+    emit_typed_elem_hold(c, arg, rt, nd, b);
+    buf_puts(b, "); })");
     return 1;
   }
-  buf_printf(b, "sp_%sHash_has_value(", hn);
+  emit_hash_entry(b, rt, "has_value"); buf_puts(b, "(");
   emit_expr(c, recv, b); buf_puts(b, ", ");
-  if (poly) emit_boxed(c, arg, b); else emit_expr(c, arg, b);
+  if (poly) emit_boxed(c, arg, b);
+  else { Buf ab = expr_buf(c, arg); emit_typed_elem_hold(c, arg, rt, ab.p ? ab.p : "NULL", b); free(ab.p); }
   buf_puts(b, ")");
   return 1;
 }
@@ -1089,7 +1124,7 @@ int emit_op_hash_assoc(Compiler *c, const BopCtx *x, Buf *b) {
   if (one_k)
     buf_printf(b, " SP_GC_ROOT(_t%d); sp_PolyArray_push(_t%d, SP_STR_BOX(_t%d));", tr, tr, tk);
   else if (env) {
-    buf_printf(b, " SP_GC_ROOT(_t%d); sp_PolyArray_push(_t%d, sp_box_str(", tr, tr);
+    buf_printf(b, " SP_GC_ROOT(_t%d); sp_PolyArray_push(_t%d, sp_box_str_new(", tr, tr);
     if (is_rassoc) buf_printf(b, "sp_str_dup_external(_t%d->order[_t%d])", th, ti);
     else buf_printf(b, "_t%d", ta);
     buf_puts(b, "));");

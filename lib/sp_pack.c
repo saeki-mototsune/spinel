@@ -299,9 +299,9 @@ static const char *pk_val_name(sp_RbVal v) {
   switch (v.tag) {
     case SP_TAG_NIL:  return "nil";
     case SP_TAG_BOOL: return v.v.b ? "true" : "false";
-    case SP_TAG_STR:  return "String";
     case SP_TAG_SYM:  return "Symbol";
     case SP_TAG_OBJ:
+      if (v.cls_id == SP_BUILTIN_STRBUF) return "String";
       if (v.cls_id >= 0 && sp_obj_cls_name_fn) return sp_obj_cls_name_fn((int)v.cls_id);
       return "Object";
     default:          return "Object";
@@ -438,12 +438,14 @@ static void pk_ber_poly(sp_RbVal v, char **buf, size_t *len, size_t *cap) {
 
 /* Keep the ordinary loop's inlined conversion with a second packing entry. */
 static inline double pk_poly_to_flt(sp_RbVal v) {
-  v = sp_rbval_str(v);
+  if (sp_rbval_is_string(v)) {
+    const char *s = sp_rbval_string_bytes(v);
+    return s ? strtod(s, NULL) : 0.0;
+  }
   switch (v.tag) {
     case SP_TAG_FLT:  return v.v.f;
     case SP_TAG_INT:  return (double)v.v.i;
     case SP_TAG_BOOL: return v.v.b ? 1.0 : 0.0;
-    case SP_TAG_STR:  return v.v.s ? strtod(v.v.s, NULL) : 0.0;
     default:          return 0.0;
   }
 }
@@ -468,7 +470,6 @@ static const char *pk_conv_name(sp_RbVal v) {
    Array is its live bytes; it too read as none. */
 static const char *pk_str_elem_bytes(char spec, sp_RbVal v, size_t *n) {
   *n = 0;
-  if (v.tag == SP_TAG_STR && v.v.s) { *n = sp_str_byte_len(v.v.s); return v.v.s; }
   if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF && v.v.p) {
     sp_String *h = (sp_String *)v.v.p;
     if (!h->data) return "";
@@ -486,7 +487,7 @@ static const char *pk_str_elem_bytes(char spec, sp_RbVal v, size_t *n) {
   if (v.tag == SP_TAG_NIL && spec != 'm' && spec != 'u') return "";
   if (v.tag == SP_TAG_OBJ && v.cls_id >= 0 && v.v.p && sp_obj_to_str_fn) {
     SP_GC_ROOT_RBVAL(v);   /* across the user #to_str */
-    const char *r = sp_obj_to_str_fn((int)v.cls_id, v.v.p);
+    const char *r = sp_String_cstr_nil(sp_obj_to_str_handle((int)v.cls_id, v.v.p));
     if (r) { *n = sp_str_byte_len(r); return r; }
   }
   sp_raise_cls("TypeError", sp_sprintf("no implicit conversion of %s into String", pk_conv_name(v)));
@@ -846,14 +847,11 @@ static void pk_ptr_poly(char spec, int64_t count, sp_PolyArray *arr, sp_int *idx
   for (int64_t k = 0; k < n; k++) {
     if (*idx >= arr->len) pk_too_few(*buf);
     sp_RbVal e = arr->data[(*idx)++];
-    const char *s = NULL;
-    if (e.tag == SP_TAG_STR) s = e.v.s;
-    else if (e.tag == SP_TAG_OBJ && e.cls_id == SP_BUILTIN_STRBUF && e.v.p) s = ((sp_String *)e.v.p)->data;
-    else if (e.tag != SP_TAG_NIL) {
+    if (!sp_rbval_is_string(e) && e.tag != SP_TAG_NIL) {
       free(*buf);
       sp_raise_cls("TypeError", sp_sprintf("no implicit conversion of %s into String", pk_conv_name(e)));
     }
-    pk_int_directive('J', (int64_t)(intptr_t)s, 0, buf, len, cap);
+    pk_int_directive('J', (int64_t)(intptr_t)sp_rbval_string_bytes(e), 0, buf, len, cap);
   }
 }
 
@@ -1064,11 +1062,39 @@ static int uk_b64val(unsigned char ch) {
   if (ch == '/') return 63;
   return -1;
 }
+/* `m0`: strict RFC 4648, as CRuby's pack.c and the base64 package's
+   b64_dec_strict: a length that is a multiple of 4, `=` only as the padding
+   of the last block, and zero in the bits the padding drops */
+static char *uk_b64_decode_rfc4648(const char *src, size_t n) {
+  if (n % 4 != 0) sp_raise_cls("ArgumentError", "invalid base64");
+  char *out = sp_str_alloc(n);
+  size_t o = 0;
+  for (size_t i = 0; i < n; i += 4) {
+    int q[4], npad = 0;
+    for (int k = 0; k < 4; k++) {
+      unsigned char ch = (unsigned char)src[i + k];
+      if (ch == '=') {
+        if (i + 4 != n || k < 2) sp_raise_cls("ArgumentError", "invalid base64");
+        npad++; q[k] = 0;
+      }
+      else {
+        int val = uk_b64val(ch);
+        if (npad || val < 0) sp_raise_cls("ArgumentError", "invalid base64");
+        q[k] = val;
+      }
+    }
+    if ((npad == 2 && (q[1] & 0xF)) || (npad == 1 && (q[2] & 0x3)))
+      sp_raise_cls("ArgumentError", "invalid base64");
+    out[o++] = (char)((q[0] << 2) | (q[1] >> 4));
+    if (npad < 2) out[o++] = (char)((q[1] << 4) | (q[2] >> 2));
+    if (npad < 1) out[o++] = (char)((q[2] << 6) | q[3]);
+  }
+  out[o] = 0; sp_str_set_len(out, o);
+  return out;
+}
 /* Decode `n` base64 bytes from `src` into a fresh GC string (the `m` directive).
-   Non-alphabet bytes (whitespace, newlines) are skipped; `=` ends the data. In
-   `strict` mode (the `m0` count) any non-alphabet byte is an ArgumentError, as
-   RFC 4648 requires. */
-static char *uk_b64_decode_strict(const char *src, size_t n, int strict) {
+   Non-alphabet bytes (whitespace, newlines) are skipped; `=` ends the data. */
+static char *uk_b64_decode(const char *src, size_t n) {
   char *out = sp_str_alloc(n);   /* decoded size <= input size */
   size_t o = 0;
   int quad[4], qi = 0;
@@ -1076,7 +1102,7 @@ static char *uk_b64_decode_strict(const char *src, size_t n, int strict) {
     unsigned char ch = (unsigned char)src[i];
     if (ch == '=') break;
     int val = uk_b64val(ch);
-    if (val < 0) { if (strict) sp_raise_cls("ArgumentError", "invalid base64"); continue; }
+    if (val < 0) continue;
     quad[qi++] = val;
     if (qi == 4) {
       out[o++] = (char)((quad[0] << 2) | (quad[1] >> 4));
@@ -1092,7 +1118,6 @@ static char *uk_b64_decode_strict(const char *src, size_t n, int strict) {
   out[o] = 0; sp_str_set_len(out, o);
   return out;
 }
-static char *uk_b64_decode(const char *src, size_t n) { return uk_b64_decode_strict(src, n, 0); }
 /* Decode `n` quoted-printable bytes into a fresh GC string (the `M` directive):
    `=XX` is a hex byte, `=\n` (soft line break) is dropped, everything else is
    literal. */
@@ -1278,7 +1303,7 @@ else {
         char *s = sp_str_alloc(z);
         memcpy(s, src, z); s[z] = 0; sp_str_set_len(s, z);
         sp_str_mark_binary(s);   /* unpack answers BYTES here: ASCII-8BIT, as CRuby (the b/B/h/H arms build ASCII TEXT and stay on the text side) */
-        sp_PolyArray_push(out, sp_box_str(s));
+        sp_PolyArray_push(out, sp_box_str_new(s));
         off += z;
         if (off < slen && str[off] == 0) off++;
       }
@@ -1298,7 +1323,7 @@ else if (spec == 'Z') {
         }
         sp_str_set_len(s, real);
         sp_str_mark_binary(s);   /* unpack answers BYTES here: ASCII-8BIT, as CRuby (the b/B/h/H arms build ASCII TEXT and stay on the text side) */
-        sp_PolyArray_push(out, sp_box_str(s));
+        sp_PolyArray_push(out, sp_box_str_new(s));
         off += take;
       }
       continue;
@@ -1317,7 +1342,7 @@ else if (spec == 'Z') {
         s[i] = "0123456789abcdef"[nib];
       }
       s[n] = 0; sp_str_set_len(s, n);
-      sp_PolyArray_push(out, sp_box_str(s));
+      sp_PolyArray_push(out, sp_box_str_new(s));
       off += (n + 1) / 2;
       continue;
     }
@@ -1333,7 +1358,7 @@ else if (spec == 'Z') {
         s[i] = (char)('0' + bit);
       }
       s[n] = 0; sp_str_set_len(s, n);
-      sp_PolyArray_push(out, sp_box_str(s));
+      sp_PolyArray_push(out, sp_box_str_new(s));
       off += (n + 7) / 8;
       continue;
     }
@@ -1341,11 +1366,11 @@ else if (spec == 'Z') {
        one string (the count/`0` modifier only tweaks strictness, not framing). */
     if (spec == 'm' || spec == 'M') {
       size_t avail = slen - off;
-      /* `m0` is strict RFC 4648: reject any non-alphabet byte. */
-      char *s = (spec == 'm') ? uk_b64_decode_strict(str + off, avail, count == 0)
-                              : uk_qp_decode(str + off, avail);
+      char *s = (spec == 'M') ? uk_qp_decode(str + off, avail)
+              : (count == 0) ? uk_b64_decode_rfc4648(str + off, avail)
+                             : uk_b64_decode(str + off, avail);
       sp_str_mark_binary(s);   /* unpack answers BYTES here: ASCII-8BIT, as CRuby (the b/B/h/H arms build ASCII TEXT and stay on the text side) */
-      sp_PolyArray_push(out, sp_box_str(s));
+      sp_PolyArray_push(out, sp_box_str_new(s));
       off = slen;
       continue;
     }
@@ -1371,7 +1396,7 @@ else if (spec == 'Z') {
       }
       s[o] = 0; sp_str_set_len(s, o);
       sp_str_mark_binary(s);   /* unpack answers BYTES here: ASCII-8BIT, as CRuby (the b/B/h/H arms build ASCII TEXT and stay on the text side) */
-      sp_PolyArray_push(out, sp_box_str(s));
+      sp_PolyArray_push(out, sp_box_str_new(s));
       off = slen;
       continue;
     }

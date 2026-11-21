@@ -2,9 +2,45 @@
 # host calls by name with each count of arguments they take
 # (methods_opt_host.c): a method the named class inherits, a singleton
 # method, a method the named class defines again with fixed parameters, a
-# method made private after its def, and methods with a keyword or a block
-# parameter, which the table leaves out.
+# method made private after its def, and a method with a keyword
+# parameter, which the table leaves out. A module that the named class
+# includes, and a module that module includes, are not in the list: their
+# methods with an optional parameter have their rows too. So have the
+# methods of a module that the top level mixes in with the class as the
+# receiver (Extra). Alt::Deep and Deep have one leaf name and Alt::Deep
+# includes Deep: the search for the classes that include them ends.
+# methods_blk.rb has the methods with a block.
 module ExtOpt
+  module Deep
+    def deep(n = 1)
+      "deep #{n}"
+    end
+  end
+
+  module Alt
+    module Deep
+      include ExtOpt::Deep
+
+      def alt(n = 1)
+        "alt #{n}"
+      end
+    end
+  end
+
+  module Extra
+    def extra(n = 5)
+      "extra #{n}"
+    end
+  end
+
+  module Tags
+    include Deep
+
+    def tag(t = 7, u = 8)
+      "tag #{t} #{u}"
+    end
+  end
+
   class Base
     def initialize
       @log = []
@@ -36,6 +72,8 @@ module ExtOpt
   end
 
   class Rel < Base
+    include Tags
+
     def order(*args)
       @log << "order(#{args.size})"
       self
@@ -49,10 +87,6 @@ module ExtOpt
     def kw(a = 1, k: 2)
       a + k
     end
-
-    def blk(a = 1, &b)
-      a
-    end
   end
 
   #: () -> untyped
@@ -60,3 +94,5 @@ module ExtOpt
     Rel.new
   end
 end
+
+ExtOpt::Rel.include(ExtOpt::Extra)

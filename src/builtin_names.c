@@ -201,6 +201,11 @@ int is_async_code_entry(const char *recv, const char *n) {
   return sp_streq(recv, "Fiber") && sp_streq(n, "new");
 }
 
+/* at_exit: its block runs once the load phase is over, when the program exits */
+int is_at_exit_name(const char *n) {
+  return n && sp_streq(n, "at_exit");
+}
+
 /* A call whose block the program keeps to run later, not before the call
    answers: a Proc or lambda made of it (`proc`, `lambda`, `Proc.new`), a
    method body (`define_method`, `define_singleton_method`), code run on its
@@ -210,7 +215,7 @@ int is_async_code_entry(const char *recv, const char *n) {
 int is_deferred_block_call(const char *recv, const char *n) {
   if (!n) return 0;
   if (is_proc_constructor(n) || is_define_method_name(n) || is_define_singleton_method_name(n) ||
-      sp_streq(n, "at_exit") || is_async_code_entry(recv, n)) return 1;
+      is_at_exit_name(n) || is_async_code_entry(recv, n)) return 1;
   if (!recv) return 0;
   return ((sp_streq(recv, "Proc") || sp_streq(recv, "Enumerator")) && sp_streq(n, "new")) ||
          (sp_streq(recv, "ObjectSpace") && sp_streq(n, "define_finalizer"));
@@ -255,10 +260,6 @@ int is_name_error_class(const char *n) {
 
 int is_no_method_error_class(const char *n) {
   return n && sp_streq(n, "NoMethodError");
-}
-/* ...NameError itself, which a variable-like call that finds no method raises */
-int is_name_error_root_class(const char *n) {
-  return n && sp_streq(n, "NameError");
 }
 
 int is_set_op(const char *n) {
@@ -329,14 +330,37 @@ int is_int_step(const char *n) {
   return sp_streq(n, "times") || sp_streq(n, "upto") || sp_streq(n, "downto");
 }
 
-/* The builtin protocol's next method when the receiver has no override. */
+/* The builtin protocol's next method when the receiver has no override, and
+   what CRuby answers before it calls that method (BuiltinCut): the same object
+   answers true for Comparable#== and Kernel#===, `!=` negates the `==` it
+   calls so the same object answers false once that `==` goes on to `<=>` (a
+   `==` that is itself undefined raises: `when` names the one delegate the
+   shortcut is defined for), and clamp checks its bounds first. */
+static const struct { const char *name, *delegate; int cut; const char *cut_when_gone; } k_operator_rows[] = {
+  { "!=",       "==",  BCUT_SAME_FALSE, "<=>" },
+  { "===",      "==",  BCUT_SAME_TRUE,  NULL },
+  { "==",       "<=>", BCUT_SAME_TRUE,  NULL },
+  { "<",        "<=>", BCUT_NONE,       NULL },
+  { "<=",       "<=>", BCUT_NONE,       NULL },
+  { ">",        "<=>", BCUT_NONE,       NULL },
+  { ">=",       "<=>", BCUT_NONE,       NULL },
+  { "between?", "<=>", BCUT_NONE,       NULL },
+  { "clamp",    "<=>", BCUT_CLAMP,      NULL },
+};
 const char *builtin_operator_delegate(const char *name) {
-  if (sp_streq(name, "!=") || sp_streq(name, "===")) return "==";
-  if (sp_streq(name, "==") || sp_streq(name, "<") || sp_streq(name, "<=") ||
-      sp_streq(name, ">") || sp_streq(name, ">=") || sp_streq(name, "between?") ||
-      sp_streq(name, "clamp")) return "<=>";
+  for (size_t i = 0; i < sizeof k_operator_rows / sizeof k_operator_rows[0]; i++)
+    if (sp_streq(name, k_operator_rows[i].name)) return k_operator_rows[i].delegate;
   return NULL;
 }
+int builtin_operator_cut(const char *name, const char *gone) {
+  if (sp_streq(name, gone)) return BCUT_NONE;   /* the operator itself is undefined: no shortcut runs */
+  for (size_t i = 0; i < sizeof k_operator_rows / sizeof k_operator_rows[0]; i++)
+    if (sp_streq(name, k_operator_rows[i].name))
+      return !k_operator_rows[i].cut_when_gone || sp_streq(gone, k_operator_rows[i].cut_when_gone) ? k_operator_rows[i].cut : BCUT_NONE;
+  return BCUT_NONE;
+}
+
+int is_rindex_name(const char *n) { return n && sp_streq(n, "rindex"); }
 
 int is_equality_name(const char *n) {
   return sp_streq(n, "equal?") || sp_streq(n, "eql?") || sp_streq(n, "==");
@@ -447,10 +471,27 @@ int is_load_path_write(const char *n) {
   return is_array_push_family(n) || is_concat_name(n);
 }
 
+/* The names whose call on a boxed receiver is written as Object's own
+   builtin (the receiver's identity, hash key or instance variables)
+   rather than as a dispatch over the classes that define the name
+   (emit_call_identity_arms, emit_poly_ivar_list). */
+int is_poly_object_surface_name(const char *n) {
+  return sp_streq(n, "hash") || sp_streq(n, "object_id") || sp_streq(n, "__id__") || sp_streq(n, "instance_variables");
+}
 /* A call whose answer tells an object from a copy of it: its identity, or
    whether it is frozen (a copy of a String later frozen is not). */
 int is_identity_query(const char *n) {
   return sp_streq(n, "equal?") || sp_streq(n, "object_id") || sp_streq(n, "__id__") || sp_streq(n, "frozen?");
+}
+
+/* Fixed arity of a boxed String reader's builtin fallback in a general send. */
+int string_boxed_reader_arity(const char *n) {
+  if (is_len_alias(n) || sp_streq(n, "empty?")) return 0;
+  if (is_spaceship_name(n) || sp_streq(n, "unpack1")) return 1;
+  return -1;
+}
+int is_string_boxed_reader(const char *n) {
+  return string_boxed_reader_arity(n) >= 0;
 }
 
 int is_len_alias(const char *n) {
@@ -484,6 +525,9 @@ int is_str_each_iter(const char *n) {
 
 int is_freeze_name(const char *n) { return sp_streq(n, "freeze"); }
 
+int is_str_line_method(const char *name) {
+  return sp_streq(name, "lines") || sp_streq(name, "each_line");
+}
 int is_str_string_yield(const char *n) {
   return sp_streq(n, "each_char") || sp_streq(n, "each_line") || sp_streq(n, "upto") ||
          sp_streq(n, "chars") || sp_streq(n, "lines") || sp_streq(n, "split") || sp_streq(n, "scrub");
@@ -543,6 +587,16 @@ int is_reflective_access(const char *n) {
          sp_streq(n, "const_get") || sp_streq(n, "const_set") || sp_streq(n, "remove_instance_variable") ||
          sp_streq(n, "remove_class_variable") || sp_streq(n, "remove_const");
 }
+/* The names that let a program set an instance variable it does not spell,
+   or one of an object it does not name: instance_variable_set, a block run
+   with another self (instance_eval, instance_exec, define_singleton_method),
+   and Marshal, YAML and Psych, which load objects with their ivars set
+   (ivar_never_set_in) */
+int is_unspelled_ivar_writer(const char *n) {
+  return n && (sp_streq(n, "instance_variable_set") || is_instance_eval_family(n) ||
+               sp_streq(n, "define_singleton_method") || sp_streq(n, "Marshal") ||
+               sp_streq(n, "YAML") || sp_streq(n, "Psych"));
+}
 /* The methods whose CRuby answer turns on the name they are given: a
    NameError for one not allowed as a name of its kind, or for one that is
    not there. The reflective accesses of a variable or constant by name and
@@ -593,7 +647,11 @@ int is_lambda_constructor(const char *n) {
    forces a Lazy at all, for the record's reading of where a chain runs, is
    is_lazy_forcing_name's question; these are a subset of its names. */
 int is_lazy_force(const char *n) {
-  return sp_streq(n, "to_a") || sp_streq(n, "force");
+  return n && (sp_streq(n, "to_a") || sp_streq(n, "force"));
+}
+/* first: the terminal of a lazy chain that takes a count (bare, the element) */
+int is_lazy_first(const char *n) {
+  return n && sp_streq(n, "first");
 }
 
 int is_with_object_alias(const char *n) {
@@ -803,6 +861,10 @@ int is_constant_or_object_reflection(const char *n) {
          sp_streq(n, "binding");
 }
 
+int is_const_reaching_name(const char *n) {
+  return n && (is_constant_or_object_reflection(n) || is_constants_list_name(n) || is_const_table_def_name(n) || is_remove_const_name(n));
+}
+
 int is_const_set_name(const char *n) {
   return sp_streq(n, "const_set");
 }
@@ -867,6 +929,7 @@ int definition_form_hooks(const char *form, int sg, const char **out) {
 }
 
 const char METHOD_MISSING_NAME[] = "method_missing";
+int is_method_missing_method(const char *n) { return n && sp_streq(n, METHOD_MISSING_NAME); }
 const char RESPOND_TO_MISSING_NAME[] = "respond_to_missing?";
 int is_method_missing_name(const char *n) {
   return n && (sp_streq(n, METHOD_MISSING_NAME) || sp_streq(n, RESPOND_TO_MISSING_NAME));
@@ -1082,8 +1145,12 @@ int is_io_wait(const char *n) {
   return sp_streq(n, "wait_readable") || sp_streq(n, "wait_writable") || sp_streq(n, "wait_priority");
 }
 
+int is_io_syswrite(const char *n) {
+  return sp_streq(n, "syswrite");
+}
+
 int is_io_write(const char *n) {
-  return sp_streq(n, "write") || sp_streq(n, "syswrite");
+  return sp_streq(n, "write") || is_io_syswrite(n);
 }
 
 int is_path_reader(const char *n) {
@@ -1139,8 +1206,12 @@ int is_select_reject(const char *n) {
   return sp_streq(n, "select") || sp_streq(n, "reject") || sp_streq(n, "filter");
 }
 
+int is_casecmp_predicate(const char *n) {
+  return sp_streq(n, "casecmp?");
+}
+
 int is_casecmp_family(const char *n) {
-  return sp_streq(n, "casecmp") || sp_streq(n, "casecmp?");
+  return sp_streq(n, "casecmp") || is_casecmp_predicate(n);
 }
 
 int str_int_promotes(const char *n, int argc) {
@@ -1355,12 +1426,15 @@ int is_check_funcall_name(const char *n) {
 /* The methods CRuby makes private wherever they are defined:
    initialize, its copy forms, and respond_to_missing? */
 int is_implicitly_private_name(const char *n) {
-  return n && (is_initialize_family(n) || sp_streq(n, "initialize_clone") || sp_streq(n, "initialize_dup") ||
-               sp_streq(n, "respond_to_missing?"));
+  return n && (is_initialize_hook_name(n) || sp_streq(n, "respond_to_missing?"));
 }
 
+int is_initialize_copy_name(const char *n) { return sp_streq(n, "initialize_copy"); }
 int is_initialize_family(const char *n) {
-  return sp_streq(n, "initialize_copy") || sp_streq(n, "initialize");
+  return is_initialize_copy_name(n) || is_initialize_name(n);
+}
+int is_initialize_hook_name(const char *n) {
+  return is_initialize_family(n) || sp_streq(n, "initialize_clone") || sp_streq(n, "initialize_dup");
 }
 
 int is_intersection_alias(const char *n) {
@@ -1783,14 +1857,30 @@ int builtin_numeric_owns(const char *cls, const char *m) {
   return is_numeric_class_name(cls) && builtin_name_in(m, num);
 }
 
-int is_gated_exception_accessor(const char *n) {
-  static const char *const names[] = {
-    "key", "receiver", "args", "private_call?", "reason", "exit_value", "tag",
-    "value", "status", "success?", "signo", "signm", "name", "errno", "error_code", "result", NULL };
-  if (!n) return 0;
-  for (int i = 0; names[i]; i++) if (sp_streq(n, names[i])) return 1;
-  return 0;
+/* The builtin exception classes that define each class-gated accessor, one
+   row per name (receiver has three owners). is_gated_exception_accessor and
+   gated_exception_accessor_owners read this one table; the runtime's own
+   gate (sp_exc_has_acc in lib/sp_exc.c) restates it, and
+   test/exception_respond_to_gated_accessor*.rb compare every name against
+   CRuby for every class, which is what keeps the two in step. */
+static const struct { const char *name; const char *owners[4]; } gated_exc_acc[] = {
+  {"key", {"KeyError"}}, {"receiver", {"NameError", "KeyError", "FrozenError"}},
+  {"args", {"NoMethodError"}}, {"private_call?", {"NoMethodError"}},
+  {"reason", {"LocalJumpError"}}, {"exit_value", {"LocalJumpError"}},
+  {"tag", {"UncaughtThrowError"}}, {"value", {"UncaughtThrowError"}},
+  {"status", {"SystemExit"}}, {"success?", {"SystemExit"}},
+  {"signo", {"SignalException"}}, {"signm", {"SignalException"}},
+  {"name", {"NameError"}}, {"errno", {"SystemCallError"}},
+  {"error_code", {"Socket::ResolutionError"}}, {"result", {"StopIteration"}},
+  {"line", {"JSON::ParserError"}}, {"column", {"JSON::ParserError"}},
+};
+const char *const *gated_exception_accessor_owners(const char *n) {
+  if (!n) return NULL;
+  for (size_t i = 0; i < sizeof gated_exc_acc / sizeof gated_exc_acc[0]; i++)
+    if (sp_streq(n, gated_exc_acc[i].name)) return gated_exc_acc[i].owners;
+  return NULL;
 }
+int is_gated_exception_accessor(const char *n) { return gated_exception_accessor_owners(n) != NULL; }
 
 int is_symbol_exception_accessor(const char *n) {
   return sp_streq(n, "reason") || sp_streq(n, "tag") || sp_streq(n, "key") || sp_streq(n, "name");
@@ -1860,6 +1950,13 @@ int is_nil_method(const char *n) {
 }
 
 int is_io_read(const char *n) { return n && sp_streq(n, "read"); }
+int is_io_sysread(const char *n) { return sp_streq(n, "sysread"); }
+int io_output_buffer_pos(const char *n) {
+  if (!n) return -1;
+  if (sp_streq(n, "pread")) return 2;
+  if (is_io_read(n) || is_io_sysread(n) || sp_streq(n, "readpartial") || sp_streq(n, "read_nonblock")) return 1;
+  return -1;
+}
 int is_positional_io(const char *n) {
   return sp_streq(n, "pread") || sp_streq(n, "pwrite");
 }
@@ -1937,6 +2034,8 @@ int is_array_constructor(const char *recv, const char *meth) {
 int is_pow_name(const char *n) { return sp_streq(n, "pow"); }
 /* `new`: a class's constructor (a native binding's "new" names them) */
 int is_new_name(const char *n) { return n && sp_streq(n, "new"); }
+/* `capacity:`: Hash.new's and String.new's keyword, converted as an Integer is (#to_int) */
+int is_capacity_keyword(const char *n) { return n && sp_streq(n, "capacity"); }
 /* `native_share`: a package's declaration of what a native binding does
    with the String its object keeps (--share-strings) */
 int is_native_share_decl(const char *n) { return n && sp_streq(n, "native_share"); }
@@ -1999,6 +2098,14 @@ int is_dir_blockless_iter(const char *n) {
 }
 
 int is_kernel_module_name(const char *n) { return n && sp_streq(n, "Kernel"); }
+
+/* Kernel functions that read the calling frame (the method's name, the block, the locals, the stack): the bare call
+   answers the frame it is made in, which a super lowered into a method's body is not CRuby's. */
+int is_frame_reading_function(const char *n) {
+  static const char *const NAMES[] = { "__method__", "__callee__", "__dir__", "binding", "block_given?", "caller",
+                                       "caller_locations", "local_variables", NULL };
+  return n && builtin_name_in(n, NAMES);
+}
 
 /* Kernel's module functions, by name. A whitelist rather than "anything with
    the Kernel receiver": Kernel is also a VALUE, so `Kernel === 5` asks whether
@@ -2089,6 +2196,17 @@ const char *builtin_function_owner(const char *m) {
    with include_all any */
 const char RESPOND_TO_NAME[] = "respond_to?";
 int is_respond_to_name(const char *n) { return n && sp_streq(n, RESPOND_TO_NAME); }
+/* The names a Struct's instance answers from Struct itself. Data answers none of them: its own are the members and
+   `with`, beside the names both have. */
+const char *const struct_names[] = {
+    "to_a", "values", "values_at", "dig", "each", "each_pair", "size",
+    "length", "[]", "[]=", NULL };
+const char *const struct_core_names[] = { "members", "to_h", "deconstruct", "deconstruct_keys", "with", NULL };
+int is_struct_core_name(const char *n, int kind) {
+  if (!n || !kind) return 0;
+  if (sp_streq(n, "with")) return kind == 2;
+  return builtin_name_in(n, struct_core_names) || (kind == 1 && builtin_name_in(n, struct_names));
+}
 /* A question whether a receiver has a method: of one by name (1), or a
    list of its methods: one that answers the whole program (2), or one a
    receiver's own chain decides (3) */
@@ -2160,7 +2278,8 @@ int builtin_every_object_answers(const char *m, int cmeth) {
    Class's or Module's (core_singleton_methods.inc, written by
    tools/gen_method_names.rb) */
 #define CSM(k, m) { k, m },
-static const struct { const char *cls, *m; } core_singleton_methods[] = {
+typedef struct { const char *cls, *m; } CoreSingletonRow;
+static const CoreSingletonRow core_singleton_methods[] = {
 #include "core_singleton_methods.inc"
   { NULL, NULL }
 };
@@ -2168,10 +2287,24 @@ static const struct { const char *cls, *m; } core_singleton_methods[] = {
 /* Does the core class or module cls answer m as a value (File.join,
    Kernel.trap) with a public method of CRuby's? cls "Class#" or "Module#"
    asks about every class or module (class_eval, attr_reader). */
+static int csm_cmp(const void *a, const void *b) {
+  const CoreSingletonRow *x = a, *y = b;
+  int d = strcmp(x->cls, y->cls);
+  return d ? d : strcmp(x->m, y->m);
+}
+/* (a binary search over the rows, sorted at the first ask: a call on a class value asked it of every row, a twentieth of a large program's compile) */
 int core_class_value_answers(const char *cls, const char *m) {
-  for (int i = 0; cls && m && core_singleton_methods[i].cls; i++)
-    if (!strcmp(core_singleton_methods[i].cls, cls) && !strcmp(core_singleton_methods[i].m, m)) return 1;
-  return 0;
+  enum { N = sizeof core_singleton_methods / sizeof core_singleton_methods[0] - 1 };
+  static CoreSingletonRow rows[N];
+  static int sorted;
+  if (!cls || !m) return 0;
+  if (!sorted) {
+    memcpy(rows, core_singleton_methods, sizeof rows);
+    qsort(rows, N, sizeof rows[0], csm_cmp);
+    sorted = 1;
+  }
+  CoreSingletonRow key = { cls, m };
+  return bsearch(&key, rows, N, sizeof rows[0], csm_cmp) != NULL;
 }
 /* Does the builtin class of cls_id id (class_builtin_parent's answer), or
    a builtin class above it, answer m with a method of its own (with
@@ -2399,6 +2532,40 @@ int builtin_answers_ahead_of(const char *cls, const char *m, const char *root) {
   for (int i = 0; !below && i < t->nanc; i++) below = !strcmp(t->ancestors[i], root);
   return below && bmt_ancestors_have(t, m, 0, must, 0, root, NULL) != 0;
 }
+/* The class or module of CRuby's tables whose instance method m a `super` reaches from a program class under
+   builtin class root: the first ancestor of root's table with m (any visibility, in a library the program has),
+   by its table name; NULL for none, and where an ancestor with no table of its own lies ahead (StringIO's
+   IO::generic_writable: what it answers is not known, nor what is behind it) or one that undefines m does. after_root:
+   the super's own place is root's (a reopening's method, or a module included into it), so root's own methods are
+   ahead of it. Names only: where the program's classes and includes put the super is the caller's
+   (comp_super_bowner). */
+const char *builtin_super_owner(const char *root, const char *m, int after_root) {
+  const BuiltinMethodTable *t = bmt_find(root);
+  unsigned must = bmt_loaded();
+  if (!t || !m || !(t->flags & must)) return NULL;
+  for (int i = after_root ? 1 : 0; i < t->nanc; i++) {
+    if (!(t->aflags[i] & must)) continue;   /* (a library the program has not required) */
+    const BuiltinMethodTable *a = bmt_find(t->ancestors[i]);
+    if (!a) return NULL;
+    if (!(a->flags & must)) continue;
+    if (bmt_has(a->inst, a->iflags, a->ninst, m, must, 0)) return a->name;
+    if (bmt_undefines(a, m, 0)) return NULL;
+  }
+  return NULL;
+}
+/* See builtin_names.h. */
+BownKind builtin_owner_kind(const char *owner) {
+  if (!owner) return BOWN_NONE;
+  if (is_kernel_module_name(owner)) return BOWN_KERNEL;
+  int slot = builtin_core_class_slot(owner);
+  if (slot == CORE_STRUCT || slot == CORE_DATA) return BOWN_STRUCT;
+  return BOWN_OTHER;
+}
+/* Does CRuby's method tables hold class or module name, in a library the program has? */
+int builtin_table_known(const char *name) {
+  const BuiltinMethodTable *t = bmt_find(name);
+  return t && (t->flags & bmt_loaded());
+}
 /* The i-th ancestor of builtin class or module cls in CRuby's lookup order (0: cls itself), counting only those a
    library the program has defines; NULL past the last, and for a name with no table. The walk of a mixin's `super`
    steps through these, asking each for the name it looks up (builtin_owns_instance_method). */
@@ -2434,6 +2601,16 @@ int builtin_id_below_object_answers(int id, const char *m) {
   const BuiltinClass *r = NULL;
   for (int i = 0; id && (r = builtin_class_at(i)) && r->id != id; i++) {}
   return r && builtin_answers_ahead_of(r->name, m, "Object");
+}
+/* does the lookup from the builtin class with run-time id `id` (-116 for Object) find instance method m, of any
+   visibility, in a library the program has: one a visibility word in a program class under it names
+   (`private :puts`, Kernel's)? An undefine on the way (Complex#floor) ends the lookup with none */
+int builtin_id_has_instance_method(int id, const char *m) {
+  const BuiltinClass *r = NULL;
+  for (int i = 0; id && (r = builtin_class_at(i)) && r->id != id; i++) {}
+  const BuiltinMethodTable *t = r && m ? bmt_find(r->name) : NULL;
+  unsigned must = bmt_loaded();
+  return t && (t->flags & must) && bmt_ancestors_have(t, m, 0, must, 0, NULL, NULL) > 0;
 }
 
 /* See builtin_names.h. The ancestors are the tables' (the class's own methods' owners ahead of Object and the
@@ -2693,8 +2870,20 @@ int is_ffi_decl_name(const char *n) {
 }
 /* Module#method_defined? and its visibility kin */
 int is_method_defined_query(const char *n) {
-  return n && (sp_streq(n, "method_defined?") || sp_streq(n, "public_method_defined?") ||
-               sp_streq(n, "private_method_defined?") || sp_streq(n, "protected_method_defined?"));
+  return method_defined_vis_mask(n) != 0;
+}
+/* The visibilities a *method_defined? query counts (bit 1 public, 2 protected, 4 private), 0 for any other name:
+   method_defined? is public and protected, each prefixed form its own */
+int method_defined_vis_mask(const char *n) {
+  if (!n) return 0;
+  if (sp_streq(n, "method_defined?")) return 1 | 2;
+  if (sp_streq(n, "public_method_defined?")) return 1;
+  if (sp_streq(n, "protected_method_defined?")) return 2;
+  return sp_streq(n, "private_method_defined?") ? 4 : 0;
+}
+/* respond_to? or a *method_defined? query: whether one method by name is there */
+int is_method_presence_name_query(const char *n) {
+  return is_respond_to_name(n) || is_method_defined_query(n);
 }
 int is_undef_method_name(const char *n) { return n && sp_streq(n, "undef_method"); }
 int is_remove_method_name(const char *n) { return n && sp_streq(n, "remove_method"); }
@@ -2977,6 +3166,26 @@ int builtin_singleton_at_boot(int slot) {
   const BuiltinClass *r = builtin_class_at(slot);
   return r && (r->flags & BC_SG_BOOT);
 }
+int builtin_empty_new(const char *name) {
+  const BuiltinClass *r = builtin_class_at(builtin_core_class_slot(name));
+  return r && (r->flags & BC_EMPTY_NEW);
+}
+int builtin_new_keywords(const char *name) {
+  const BuiltinClass *r = builtin_class_at(builtin_core_class_slot(name));
+  return r && (r->flags & BC_NEW_KEYWORDS);
+}
+int builtin_init_no_keywords(const char *name) {
+  const BuiltinClass *r = builtin_class_at(builtin_core_class_slot(name));
+  return r && (r->flags & BC_INIT_NO_KEYWORDS);
+}
+int builtin_keywords_new_own(const char *name) {
+  const BuiltinClass *r = builtin_class_at(builtin_core_class_slot(name));
+  return r && (r->flags & BC_KEYWORDS_NEW_OWN);
+}
+int builtin_boxed_by_tag(int slot) {
+  const BuiltinClass *r = builtin_class_at(slot);
+  return r && (r->flags & BC_TAGGED);
+}
 /* Is a yielding method a program's reopening of builtin class `core`
    (CORE_*) defines called through its proc form, with the call's block as a
    proc, since it has no function of its own? (The Array, Hash, NilClass,
@@ -3105,11 +3314,19 @@ int is_method_naming_call(const char *n) {
 }
 /* The attribute declarations (`attribute`/`attributes` are Spinel's own
    compile-time class-body declarations, accessors as attr_accessor's) */
+int is_attr_name(const char *n) {
+  return n && (sp_streq(n, "attr") || is_attr_reader_family(n) || is_attr_writer_family(n));
+}
 int is_attr_decl_reader(const char *n) {
   return n && (sp_streq(n, "attr") || is_attr_reader_family(n) || sp_streq(n, "attribute") || sp_streq(n, "attributes"));
 }
 int is_attr_decl_writer(const char *n) {
   return n && (is_attr_writer_family(n) || sp_streq(n, "attribute") || sp_streq(n, "attributes"));
+}
+/* A call that may declare a writer: the writer declarations, and `attr`
+   (whose `attr :x, true` form is one) */
+int is_attr_may_write(const char *n) {
+  return n && (is_attr_decl_writer(n) || sp_streq(n, "attr"));
 }
 /* The class-body declarations that run no code of the class's own: a
    visibility change (of instance methods, class methods or constants), an
@@ -3279,4 +3496,78 @@ int kernel_private_method(const char *name) {
 int is_block_value_dropped_iter(const char *n) {
   return is_block_loop_method(n) || is_each_walk(n) || is_each_window(n) || is_str_each_iter(n) ||
          is_hash_key_value_each(n) || sp_streq(n, "each_pair") || sp_streq(n, "each_with_object");
+}
+
+/* The Class/Module surface every class object carries, `new` included (a
+   MODULE object answers everything here except `new`, which its callers gate).
+   One list, so a core class object and a user one answer alike (#3494). */
+/* Class's public instance methods beyond Object's, from ruby 4.0.1 */
+static const char *const cls_uni[] = {
+  "new", "allocate", "attached_object", "subclasses", "superclass",
+  "<", "<=", ">", ">=", "alias_method", "ancestors", "attr", "attr_accessor",
+  "attr_reader", "attr_writer", "autoload", "autoload?", "class_eval", "class_exec",
+  "class_variable_defined?", "class_variable_get", "class_variable_set",
+  "class_variables", "const_defined?", "const_get", "const_missing", "const_set",
+  "const_source_location", "constants", "define_method", "deprecate_constant",
+  "include", "include?", "included_modules", "instance_method", "instance_methods",
+  "method_defined?", "module_eval", "module_exec", "name", "prepend",
+  "private_class_method", "private_constant", "private_instance_methods",
+  "private_method_defined?", "protected_instance_methods", "protected_method_defined?",
+  "public_class_method", "public_constant", "public_instance_method",
+  "public_instance_methods", "public_method_defined?", "refinements",
+  "remove_class_variable", "remove_method", "set_temporary_name", "singleton_class?",
+  "undef_method", "undefined_instance_methods", NULL };
+int class_object_universal_method(const char *qm) {
+  for (int u = 0; cls_uni[u]; u++) if (sp_streq(qm, cls_uni[u])) return 1;
+  return 0;
+}
+/* ...the i-th of them, NULL past the last (the run-time helper's list, emit_class_value_responds_helper) */
+const char *class_object_universal_name(int i) {
+  return cls_uni[i];
+}
+/* The ones a module object does not have: they are Class's own. */
+int class_only_method(const char *qm) {
+  return sp_streq(qm, "new") || sp_streq(qm, "allocate") || sp_streq(qm, "attached_object") ||
+         sp_streq(qm, "subclasses") || sp_streq(qm, "superclass");
+}
+/* Class's or Module's private instance methods beyond Object's, which a
+   class object answers only to respond_to?(name, true). Not
+   ruby2_keywords, which spinel refuses (docs/limitations.md): code guarded
+   by respond_to?(:ruby2_keywords, true) skips it. */
+int class_object_private_method(const char *qm, int is_module) {
+  static const char *const both[] = {
+    "const_added", "extended", "included", "method_added", "method_removed",
+    "method_undefined", "prepended", "private", "protected", "public", "remove_const",
+    "using", NULL };
+  static const char *const module_only[] = {
+    "append_features", "extend_object", "module_function", "prepend_features", "refine", NULL };
+  for (int u = 0; both[u]; u++) if (sp_streq(qm, both[u])) return 1;
+  if (!is_module) return sp_streq(qm, "inherited");
+  for (int u = 0; module_only[u]; u++) if (sp_streq(qm, module_only[u])) return 1;
+  return 0;
+}
+/* Does a class object (a module's when is_module) answer `qm` with one of
+   Class's or Module's own methods, public or private: what a bare call in
+   its body or in one of its class methods reaches? */
+int class_object_answers_builtin(const char *qm, int is_module) {
+  if (class_object_universal_method(qm)) return !(is_module && class_only_method(qm));
+  return class_object_private_method(qm, is_module);
+}
+/* Does a class object (a module's when is_module; an Exception class's when exc; a Struct's or Data's
+   class when record is 1 or 2) answer respond_to?(qm) with one of its builtin class methods? */
+int class_object_builtin_responds(const char *qm, int is_module, int exc, int record) {
+  /* A module's `module_function` methods are recorded class-level, the
+     program's (cplan_class_responds). Its plain `def m` are instance methods,
+     which the module object itself does NOT respond to -- answering true for
+     those made `Greeter.respond_to?(:greet)` disagree with CRuby (#3467). */
+  /* builtin Class/Module methods every class object inherits; a module
+     lacks Class's own (`new`, `superclass`, ...) */
+  if (class_object_universal_method(qm)) return !(is_module && class_only_method(qm));
+  /* Exception's class-level `exception` */
+  if (is_exception_ctor_name(qm) && exc) return 1;
+  /* A Struct or Data CLASS object answers its record class's own builtins
+     (is_record_class_cmethod: `members`, a Struct's `keyword_init?`, ...)
+     the way its instances answer theirs (#3482), before a program's def of
+     one as after it, an anonymous `Struct.new(...)` too */
+  return record && is_record_class_cmethod(qm, record == 2);
 }

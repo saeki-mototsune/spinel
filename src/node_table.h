@@ -87,12 +87,16 @@ typedef struct {
      keyed on node identity or name can revalidate against it. */
   unsigned version;
   /* The parts of version that a local variable read appended by
-     nt_new_local_read, a call renamed by nt_node_swap_str or
-     nt_node_restore_str (nt_stamp_holds), and a subtree appended by
-     nt_clone_subtree bumped: a clone touches no node below the count it
-     found, so an index of the nodes by name extends over the clones when
-     every bump since its build was one (an_calls_named_first). */
-  unsigned read_version, rename_version, clone_version;
+     nt_new_local_read and a call renamed by nt_node_swap_str or
+     nt_node_restore_str bumped (nt_stamp_holds). */
+  unsigned read_version, rename_version;
+  /* The count an index of the nodes by name was built over (low_mark, set
+     by nt_low_watch), and whether an edit since changed the type or a
+     string field of a node below it (low_touched). An edit of the nodes
+     appended since leaves it clear, so the index extends over them instead
+     of being rebuilt (an_calls_named_first). */
+  int low_mark;
+  unsigned char low_touched;
   /* The last NT_RENAME_LOG of the renames rename_version counts, by that
      count: the name each replaced and the one it set (nt_renames_spare). */
   NtRename rename_log[NT_RENAME_LOG];
@@ -137,6 +141,19 @@ typedef struct {
   /* the class builder each constant write holds (class_def_builder), asked
      node by node; NULL until the first */
   struct NtBuilders *builders;
+  /* how many times a call was marked to bind the builtin's own method
+     (nt_mark_builtin_call): none, and no call is marked, which an ask can
+     tell without a node read (a clone copies a marked node's mark) */
+  int builtin_marks;
+  /* Each node's parent, as an_parent_map answers it, kept up by the edits
+     that move a child (nt_parents): par[ch] is the highest id that holds ch,
+     and nref[ch] how many ref and array slots hold it. par_old holds the
+     maps a growth replaced, which a caller may still be reading, until the
+     next ask. par is NULL until the first ask and after an edit it cannot
+     follow. par_ahead is the lowest id past the count a slot names (0:
+     none), which the map counts once the node is made. */
+  int *par, *par_nref, par_cap, par_ahead;
+  int **par_old, npar_old, cpar_old;
 } NodeTable;
 
 /* An index of the tree kept on the table it was made of: for each node, the
@@ -359,11 +376,25 @@ void nt_node_set_arr(NodeTable *nt, int id, const char *key, const int *ids, int
 /* Point parent's references to child old, in its ref fields and its array
    fields, at with instead. */
 void nt_replace_child(NodeTable *nt, int parent, int old, int with);
+/* Each node's parent (-1 for a root and for a node no slot holds), the same
+   map an_parent_map makes, kept on the table and updated by its edits
+   rather than rebuilt after each. Borrowed: it changes under a caller that
+   edits. A node added, nt_swap_nodes, nt_renumber, nt_truncate, and a node
+   the highest of two holders lets go of replace it (the last four rebuild
+   it at the next ask), and the next ask frees the one replaced. */
+const int *nt_parents(NodeTable *nt);
+/* Drop the nodes from `count` on, which nothing may hold. */
+void nt_truncate(NodeTable *nt, int count);
+/* A slot of `parent` that held `old` holds `with` now, written without the
+   table's setters (nt_parents follows it). */
+void nt_parents_moved(NodeTable *nt, int parent, int old, int with);
 int  nt_new_int(NodeTable *nt, long long v);                     /* a new IntegerNode */
 /* Are the nodes appended at or after id `from` all local variable reads?
    Such a read is a leaf, so a whole-tree index built before it was appended
    (one that reads no local variable read) is still the index of the table. */
 int  nt_appended_only_local_reads(const NodeTable *nt, int from);
+/* Start watching the nodes below the count for edits (low_mark, low_touched). */
+void nt_low_watch(NodeTable *nt);
 /* A new local variable read of name, counted in read_version. */
 int  nt_new_local_read(NodeTable *nt, const char *name);
 /* The table's version when an index was built, with its two counted parts.
@@ -556,6 +587,11 @@ static inline void nt_set_attr_write(NodeTable *nt, int id, int on) {
    record stays on the node, so a clone of the subtree carries it. */
 static inline void nt_mark_builtin_call(NodeTable *nt, int id) {
   nt_node_set_int(nt, id, "builtin_only", 1);
+  nt->builtin_marks++;
+}
+/* Is some call marked (nt_mark_builtin_call)? 0 says none is. */
+static inline int nt_any_builtin_call(const NodeTable *nt) {
+  return nt->builtin_marks != 0;
 }
 static inline void nt_clear_builtin_call(NodeTable *nt, int id) {
   nt_node_set_int(nt, id, "builtin_only", 0);

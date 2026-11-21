@@ -8,6 +8,9 @@
 # same as in a run that passed. The reasoning, and what is deliberately out of
 # scope, is in the Makefile's comment above RUN_ONE_TEST.
 #
+#   pch-key CC VERSION INCLUDE_DIR FLAG...
+#       Hash the compiler command, version, any managed include directory
+#       and ordered arguments of a PCH build.
 #   fp FILE... [-- STRING...]
 #       The fingerprint of a configuration: the content of each FILE (a
 #       missing one counts as missing), every header under lib/ and packages/,
@@ -21,6 +24,9 @@
 #       fingerprint and its compile line), the C text, the Ruby source, and
 #       each SIDECAR's content (an absent sidecar is recorded as absent, so
 #       adding one changes the key).
+#   lookup KEY_OUT RESULT_OUT SRC CFILE IDENT [SIDECAR...]
+#       Write an eligible key to KEY_OUT. On a cached PASS, also write its
+#       payload to RESULT_OUT and succeed. A miss exits 1.
 #   nocache SRC
 #       Exit 0 when SRC must always run: it carries `# spinel: no-cache`, or
 #       it or a file it requires reaches the clock, the environment, the
@@ -43,6 +49,15 @@ rc_sha() {
   if command -v sha256sum >/dev/null 2>&1; then sha256sum "$@"; else shasum -a 256 "$@"; fi
 }
 
+# Hash a sorted NUL-delimited file list without launching a hasher per path.
+rc_sha_paths() {
+  if command -v sha256sum >/dev/null 2>&1; then
+    xargs -0 sha256sum
+  else
+    xargs -0 shasum -a 256
+  fi
+}
+
 # Identifiers whose use makes a program's outcome depend on something outside
 # its key, or on chance: the clock, the environment, randomness, concurrency
 # and other processes, the file system (a fixture a commit edits would not
@@ -57,8 +72,9 @@ NC_OTHER='(^|[^.[:alnum:]_])(load|open)[ (]|\$\$|`|%x|_nonblock'
 # nocache_one FILE: 0 when FILE itself opts out
 nocache_one() {
   grep -q '^# spinel: no-cache' "$1" && return 0
-  grep -v '^[[:space:]]*#' "$1" | grep -qwE "$NC_WORDS" && return 0
-  grep -v '^[[:space:]]*#' "$1" | grep -qE "$NC_OTHER" && return 0
+  # Drain the pipe so the comment filter can finish writing large sources.
+  grep -v '^[[:space:]]*#' "$1" | grep -wE "$NC_WORDS" >/dev/null && return 0
+  grep -v '^[[:space:]]*#' "$1" | grep -E "$NC_OTHER" >/dev/null && return 0
   return 1
 }
 
@@ -91,7 +107,77 @@ nocache() {
   return 1
 }
 
+rc_key_file_hash() {
+  case "$1" in
+    *'
+'*)
+      # Some sha256sum implementations print these names on multiple
+      # lines. Keep the prior per-line key input.
+      file_hash=$(rc_sha "$1" && printf .) || return 1
+      printf '%s' "${file_hash%.}" | cut -c1-64;;
+    *)
+      file_hash=$(rc_sha "$1") || return 1
+      printf '%.64s\n' "$file_hash";;
+  esac
+}
+
+rc_key() {
+  [ "${GATE_CACHE:-1}" = 0 ] && return 1
+  src=$1; cfile=$2; ident=$3; shift 3
+  [ -f "$src" ] && [ -f "$cfile" ] || return 1
+  # IDENT starts with the fingerprint; a fingerprint that failed to compute
+  # would key every program on the C alone, so no key at all then
+  fp=${ident%%|*}
+  case "$fp" in *[!0-9a-f]*) return 1;; esac
+  [ ${#fp} -eq 64 ] || return 1
+  nocache "$src" && return 1
+  # Send the producer's success marker around the pipe. The digest alone
+  # cannot distinguish a complete input from a failed component hash.
+  digest=$(
+    {
+      {
+        echo "format $RC_FORMAT"
+        echo "$ident"
+        for f in "$cfile" "$src"; do
+          rc_key_file_hash "$f" || exit 1
+        done
+        for s in "$@"; do
+          if [ -f "$s" ]; then rc_sha "$s" || exit 1; else echo "absent $s"; fi
+        done
+        printf 'ok\n' >&3
+      } | rc_sha
+    } 3>&1
+  ) || return 1
+  case "$digest" in
+    'ok
+'*) printf '%.64s\n' "${digest#*'
+'}";;
+    *) return 1;;
+  esac
+}
+
+rc_get() {
+  [ -f "$RC_DIR/$1" ] || return 1
+  touch "$RC_DIR/$1" 2>/dev/null
+  cat "$RC_DIR/$1"
+}
+
 case "${1:-}" in
+pch-key)
+  shift
+  include_files=
+  if [ -n "$3" ]; then
+    if command -v sha256sum >/dev/null 2>&1; then
+      include_files=$(find -L "$3" -type f -exec sha256sum {} +) || exit 1
+    else
+      include_files=$(find -L "$3" -type f -exec shasum -a 256 {} +) || exit 1
+    fi
+  fi
+  {
+    printf '%s\0' "$@"
+    if [ -n "$include_files" ]; then printf '%s\n' "$include_files" | sort; fi
+  } | rc_sha | cut -c1-64
+  ;;
 fp)
   shift
   files=; strs=
@@ -99,47 +185,53 @@ fp)
     if [ "$1" = "--" ]; then shift; strs="$*"; break; fi
     files="$files $1"; shift
   done
+  fp_dir=$(mktemp -d "${TMPDIR:-/tmp}/spinel-result-fp.XXXXXX") || exit 1
+  trap 'rm -rf "$fp_dir"' EXIT
+  # A partial manifest must not become a valid key when a tool fails.
+  find lib packages -type f \( -name '*.h' -o -name '*.inc' -o -name '*.def' \) -print0 > "$fp_dir/paths" 2>/dev/null || exit 1
+  perl -0e 'binmode STDIN; binmode STDOUT; print sort <STDIN>; close STDOUT or die $!' < "$fp_dir/paths" > "$fp_dir/sorted" || exit 1
+  if [ -s "$fp_dir/sorted" ]; then
+    rc_sha_paths < "$fp_dir/sorted" > "$fp_dir/headers" || exit 1
+  else
+    : > "$fp_dir/headers" || exit 1
+  fi
   {
-    echo "format $RC_FORMAT"
+    echo "format $RC_FORMAT" || exit 1
     for f in $files; do
-      if [ -f "$f" ]; then rc_sha "$f"; else echo "absent $f"; fi
+      if [ -f "$f" ]; then rc_sha "$f" || exit 1; else echo "absent $f" || exit 1; fi
     done
-    find lib packages -type f \( -name '*.h' -o -name '*.inc' -o -name '*.def' \) 2>/dev/null | sort | while read -r h; do rc_sha "$h"; done
+    cat "$fp_dir/headers" || exit 1
     cc=${RC_CC:-cc}
-    $cc --version 2>&1
-    $cc -dumpmachine 2>&1
-    uname -sm
-    echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-} LIBRARY_PATH=${LIBRARY_PATH:-}"
+    $cc --version 2>&1 || exit 1
+    $cc -dumpmachine 2>&1 || exit 1
+    uname -sm || exit 1
+    echo "LD_LIBRARY_PATH=${LD_LIBRARY_PATH:-} LIBRARY_PATH=${LIBRARY_PATH:-}" || exit 1
     echo "$strs"
-  } | rc_sha | cut -c1-64
+  } > "$fp_dir/input" || exit 1
+  fp_sum=$(rc_sha < "$fp_dir/input") || exit 1
+  printf '%.64s\n' "$fp_sum"
   ;;
 key)
-  [ "${GATE_CACHE:-1}" = 0 ] && exit 1
-  src=$2; cfile=$3; ident=$4; shift 4
-  [ -f "$src" ] && [ -f "$cfile" ] || exit 1
-  # IDENT starts with the fingerprint; a fingerprint that failed to compute
-  # would key every program on the C alone, so no key at all then
-  fp=${ident%%|*}
-  case "$fp" in *[!0-9a-f]*) exit 1;; esac
-  [ ${#fp} -eq 64 ] || exit 1
-  nocache "$src" && exit 1
-  {
-    echo "format $RC_FORMAT"
-    echo "$ident"
-    rc_sha "$cfile" | cut -c1-64
-    rc_sha "$src" | cut -c1-64
-    for s in "$@"; do
-      if [ -f "$s" ]; then rc_sha "$s"; else echo "absent $s"; fi
-    done
-  } | rc_sha | cut -c1-64
+  shift
+  rc_key "$@"
   ;;
 nocache)
   nocache "$2"
   ;;
 get)
-  [ -f "$RC_DIR/$2" ] || exit 1
-  touch "$RC_DIR/$2" 2>/dev/null
-  cat "$RC_DIR/$2"
+  rc_get "$2"
+  ;;
+lookup)
+  key_out=$2; result_out=$3; shift 3
+  key=$(rc_key "$@") && [ -n "$key" ] || exit 1
+  printf '%s\n' "$key" > "$key_out" || exit 1
+  hit=$(rc_get "$key") || exit 1
+  case "$hit" in
+    *'
+'*) exit 1;;
+    PASS|PASS"	"?*) printf '%s\n' "$hit" > "$result_out";;
+    *) exit 1;;
+  esac
   ;;
 put)
   mkdir -p "$RC_DIR"
@@ -166,6 +258,6 @@ prune)
   exit 0
   ;;
 *)
-  echo "usage: $0 fp|key|nocache|get|put|prune ..." >&2; exit 2
+  echo "usage: $0 fp|key|lookup|nocache|get|put|prune ..." >&2; exit 2
   ;;
 esac

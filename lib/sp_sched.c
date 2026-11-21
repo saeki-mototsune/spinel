@@ -9,7 +9,9 @@
 #include "sp_cext.h"
 #endif
 #include "sp_alloc.h"   /* sp_box_nil / sp_box_obj */
+#include "sp_string.h"  /* sp_box_str_fresh */
 #include "sp_exc.h"     /* sp_exc_cls_display / sp_exc_cls_unnamed (the thread report) */
+#include "sp_re.h"      /* sp_re_switch: the match registers of a thread */
 #include <stdlib.h>
 #include <string.h>
 #include <stdio.h>
@@ -175,32 +177,14 @@ static pthread_cond_t g_sweep_cv = PTHREAD_COND_INITIALIZER;
 static sp_gc_hdr     *g_sw_head[SP_MAX_WORKERS];
 static sp_gc_hdr     *g_sw_tail[SP_MAX_WORKERS];
 static size_t         g_sw_bytes[SP_MAX_WORKERS];
-/* Decided once per collection by sp_sched_par_sweep, read by every worker. */
-static int    g_str_sweep = 0;
-static int    g_str_major = 0;
-static size_t g_str_promoted[SP_MAX_WORKERS];
-/* The sweep is a list of TASKS, not a slot per worker. One busy worker's
-   young lists are the bulk of most cycles on a server (a request handler
-   allocates; the others idle), and with a slot per worker that one worker
-   swept alone while the rest waited: the longest slot WAS the phase, four
-   milliseconds of thirty workers idle. So a slot is several tasks -- its
-   object list, its old string list on a major, and each of its SP_STR_YSUB
-   young string lists -- and every parked worker claims tasks off a counter
-   until none is left. The tasks of one slot touch distinct lists; what they
-   share (the slot's old string head and byte counters) is settled by the
-   collector afterwards from the per-task results. */
-enum { SW_OBJ, SW_STR_OLD, SW_STR_YOUNG, SW_CHUNKS };
-typedef struct { short kind, wid, sub; } sp_sw_task;
-#define SW_TASK_MAX (SP_MAX_WORKERS * (3 + SP_STR_YSUB))
+/* Parked workers claim each live slot's young-list and slab tasks. */
+enum { SW_OBJ, SW_CHUNKS };
+typedef struct { short kind, wid; } sp_sw_task;
+#define SW_TASK_MAX (2 * SP_MAX_WORKERS)
 static sp_sw_task     g_sw_tasks[SW_TASK_MAX];
 static int            g_sw_ntasks = 0;
 static int            g_sw_next = 0;    /* claimed by fetch-add, off the lock */
 static int            g_sw_done = 0;    /* completed, under the lock */
-/* per (slot, young list): the sweep's local results, spliced in by the collector */
-static sp_str_hdr    *g_sy_keep[SP_MAX_WORKERS][SP_STR_YSUB];
-static sp_str_hdr    *g_sy_tail[SP_MAX_WORKERS][SP_STR_YSUB];
-static size_t         g_sy_moved[SP_MAX_WORKERS][SP_STR_YSUB];
-static size_t         g_sy_held[SP_MAX_WORKERS][SP_STR_YSUB];
 /* SPINEL_GC_PHASES: the longest single task of each sweep, summed, beside
    the phase's wall. The gap between the two is the cost of driving the
    parallel phase itself (waking the parked workers and collecting their
@@ -208,17 +192,14 @@ static size_t         g_sy_held[SP_MAX_WORKERS][SP_STR_YSUB];
    are not. */
 static unsigned long g_sw_slot_max_us = 0;
 static unsigned long g_sw_task_sum_us = 0;   /* every task's time added: the work the phase spread */
-static unsigned long g_sw_task_max_kind[4];  /* the kind of the longest task, for the report */
+static unsigned long g_sw_task_max_kind[2];  /* summed work by task kind */
 void sp_gc_sweep_chunks_slot(int wid);   /* lib/sp_gc.c: the slab bitmaps of one slot, this cycle */
 static void sp_sweep_task(const sp_sw_task *t) {
   double t0 = sp_gc_ph_on ? sp_monotonic_now() : 0;
-  switch (t->kind) {
-    case SW_OBJ: sp_gc_sweep_slot(t->wid, &g_sw_head[t->wid], &g_sw_tail[t->wid], &g_sw_bytes[t->wid]); break;
-    case SW_CHUNKS: sp_gc_sweep_chunks_slot(t->wid); break;
-    case SW_STR_OLD: sp_str_sweep_old_one(t->wid); break;
-    default: sp_str_sweep_young_one(t->wid, t->sub, &g_sy_keep[t->wid][t->sub], &g_sy_tail[t->wid][t->sub],
-                                    &g_sy_moved[t->wid][t->sub], &g_sy_held[t->wid][t->sub]); break;
-  }
+  if (t->kind == SW_OBJ)
+    sp_gc_sweep_slot(t->wid, &g_sw_head[t->wid], &g_sw_tail[t->wid], &g_sw_bytes[t->wid]);
+  else
+    sp_gc_sweep_chunks_slot(t->wid);
   if (sp_gc_ph_on) {
     /* microseconds in an integer, so the max is one atomic */
     unsigned long d = (unsigned long)((sp_monotonic_now() - t0) * 1e6), m;
@@ -1072,6 +1053,7 @@ void sp_stw_collect(void) { sp_stw_collect_impl(0); }
    any threaded program calling GC.start hung (#3781). Forced: an explicit
    request collects even when neither heap is over its trigger. */
 void sp_gc_collect_request(void) {
+  sp_gc_full_next = 1;   /* GC.start: a full collection (sp_gc_collect) */
 #ifdef SP_THREADS
   sp_stw_collect_impl(1);
 #else
@@ -1141,7 +1123,7 @@ static void sp_stw_collect_impl(int force) {
   SCHED_UNLOCK();
   /* exclusive: every other worker is parked at a safepoint with roots published */
   g_collector_active = 1;
-  sp_gc_collect_retune_all();   /* sweeps both heaps; marks parked fibers via sp_sched_globals_mark */
+  sp_gc_collect_retune();   /* marks parked fibers via sp_sched_globals_mark */
   /* an explicit GC.start answers once everything unreachable is gone: the
      concurrent sweep it started is finished here, still under the barrier */
   if (force && sp_gc_conc_wait_hook) sp_gc_conc_wait_hook();
@@ -1188,7 +1170,7 @@ static SP_TLS sp_thread *g_current = NULL;   /* per-worker: the green thread thi
    lock itself would mean reworking the off-cpu handshake (deferred, see git log).
    The runnable count (RUNNABLE_INC) is the total parked-runnable count across
    every queue, for the quiescence/deadlock predicate. */
-SP_TLS int sp_worker_id = 0;       /* exported: sp_alloc.h indexes the per-worker string heaps */       /* this worker's run-queue slot (0 = main); both builds */
+SP_TLS int sp_worker_id = 0;       /* this worker's run-queue slot (0 = main); both builds */
 /* a line each, as each worker's queue is now pushed and popped without
    the scheduler lock, concurrently with its neighbours'. */
 typedef struct { sp_thread *head, *tail;
@@ -1576,11 +1558,12 @@ static int sp_ev_backend_wait(int set, sp_ev_ready *out, int max, int tmo_ms) {
   int n = kevent(set, NULL, 0, evs, max, &ts);
   for (int i = 0; i < n; i++) {
     out[i].fd = (int)evs[i].ident;
-    /* EV_EOF is a peer that closed: readable (and writable, for a socket whose
-       other end is gone) exactly as POLLHUP is. EV_ERROR answers both so the
-       waiter's own read or write reports the error, which is what poll did. */
+    /* EV_EOF is a peer that closed its side of this filter's direction, so it
+       answers that direction only, as epoll's EPOLLIN does for a peer that
+       stopped sending. EV_ERROR answers both so the waiter's own read or
+       write reports the error, which is what poll did. */
     short r = (evs[i].filter == EVFILT_WRITE) ? POLLOUT : POLLIN;
-    if (evs[i].flags & (EV_EOF | EV_ERROR)) r = POLLIN | POLLOUT;
+    if (evs[i].flags & EV_ERROR) r = POLLIN | POLLOUT;
     out[i].rev = r;
   }
   return n;
@@ -2196,7 +2179,12 @@ static void reg_add(sp_thread *t) {
 int sp_sched_other_threads_live(void) {
   int other = 0;
   SCHED_LOCK();
-  if (g_current != &g_main_thread) other = 1;
+  /* (no green thread yet: the scheduler never started, and the caller, main
+     or a Fiber it resumed, is all there is. NULL read as another thread sent
+     a child wait inside a Fiber to sp_Thread_pass, which switched out to no
+     thread, #12024) */
+  if (!g_current) other = 0;
+  else if (g_current != &g_main_thread) other = 1;
   else { REG_LOCK(); sp_thread *t = g_all;
     while (t) { if (t != g_current) { other = 1; break; } t = t->all_next; }
     REG_UNLOCK(); }
@@ -2212,24 +2200,40 @@ int sp_sched_other_threads_live(void) {
    thread and several fibers.
 
    Poll and hand the scheduler back between attempts, but only while another
-   thread is alive -- a program with one thread keeps the blocking wait and its
-   exact wake-up. sp_Thread_pass runs a runnable sibling immediately; the sleep
+   thread is alive or a trap is set -- a program with one thread and no trap
+   keeps the blocking wait and its exact wake-up. sp_Thread_pass runs a runnable sibling immediately; the sleep
    only keeps a busy loop from burning the core while the child works, and it
    caps at 5ms, which is nothing against a wait long enough to matter. */
 int sp_sched_wait_child(int pid, int *status) { return sp_sched_wait_child_flags(pid, status, 0); }
 /* The same with the flags of waitpid(2): WNOHANG asks once and answers 0 for
    a child still running, with no wait and no poll; WUNTRACED takes a stopped
    child too. The poll keeps the caller's flags beside its own WNOHANG. */
+static inline void sp_sig_run_if_pending(void);   /* (below, beside the trap thread) */
+int sp_sig_trap_set(void);                        /* lib/sp_cold.c */
 int sp_sched_wait_child_flags(int pid, int *status, int flags) {
   int r;
-  if ((flags & WNOHANG) || !sp_sched_other_threads_live()) {
+  if (flags & WNOHANG) {
     do { r = (int)waitpid((pid_t)pid, status, flags); } while (r < 0 && errno == EINTR);
     return r;
   }
+  /* One thread and no trap: the blocking wait, inside SP_SIG_BLOCKING so the
+     default SIGINT / SIGTERM raises in it, as it does in a read or a sleep.
+     Outside it the handler recorded the signal for a safe point, the wait
+     went on (EINTR, retried), and the Interrupt came after the child if at
+     all: a program whose end follows the wait has no safe point left. */
+  if (!sp_sched_other_threads_live() && !sp_sig_trap_set()) {
+    do { r = (int)SP_SIG_BLOCKING(waitpid((pid_t)pid, status, flags)); } while (r < 0 && errno == EINTR);
+    return r;
+  }
+  /* A program with a trap set polls with one thread too: the trap handler
+     only records the delivery, and its SA_RESTART keeps waitpid from
+     returning, so the proc ran neither in the wait nor after it. Here it
+     runs between two asks, as it does in a sleep. */
   { double back = 0.0002;
     for (;;) {
       do { r = (int)waitpid((pid_t)pid, status, WNOHANG | flags); } while (r < 0 && errno == EINTR);
       if (r != 0) return r;   /* reaped, or an error for the caller to report */
+      sp_sig_run_if_pending();
       sp_Thread_pass();
 #ifdef SP_THREADS
       sp_sched_sleep(back);
@@ -2356,9 +2360,9 @@ void sp_sched_init(void) {
    wake that is not a release puts them back to sleep. */
 /* ---- The concurrent sweep ----
    The mark runs under the barrier and the sweep does not. At the end of the
-   mark the collector detaches every worker's young lists (objects; the
-   SP_STR_YSUB string lists) and, on a full cycle, the old lists, replaces
-   them with empty ones, and makes the detached lists a task list; the world
+   mark the collector detaches every worker's young list and, on a full
+   cycle, the old list. It replaces the lists with empty ones and makes
+   them a task list; the world
    resumes while it is swept. Who sweeps what: a worker's own young lists are
    swept by that worker, right after it is released and before it runs any
    program (sp_cs_owner_run), so the slots it frees are the ones it allocates
@@ -2370,7 +2374,7 @@ void sp_sched_init(void) {
    parked (sp_sched_conc_wait, the first thing sp_gc_collect does), so the
    apply that follows sees a complete sweep. What is applied under the
    barrier is only what the mutators must not see half-done: the survivors
-   spliced onto the old lists and the string budget retune. The pooled dead
+   spliced onto the old lists. The pooled dead
    are pushed onto their pools by the sweep itself (see sp_gc_sweep_list);
    done at the barrier they cost it more than the sweep had shed.
 
@@ -2378,17 +2382,14 @@ void sp_sched_init(void) {
    GC list link; the mark promoted every survivor before the world resumed
    (sp_gc_conc_promote), so the write barrier records stores into them and
    the sweeper never writes the flag word the barrier writes; a dead object is
-   unreachable, so its finalizer races nothing; a string's mark byte is reset
-   with a compare-and-swap (a freeze can land on the same byte); freed slab
+   unreachable, so its finalizer races nothing; freed slab
    slots are pushed in per-chunk batches with a compare-and-swap that the
    owner's pop also uses; and the length caches were cleared when the workers
    parked, so no cache names a string the sweep frees. */
 #define CS_OBJ 0
 #define CS_OBJ_OLD 1
-#define CS_STR_YOUNG 2
-#define CS_STR_OLD 3
-#define CS_CHUNKS 4     /* a slot's slab chunks, by their bitmaps (objects and strings, both generations) */
-#define CS_TASK_MAX (SP_MAX_WORKERS * (3 + SP_STR_YSUB) + 1)
+#define CS_CHUNKS 2     /* a slot's slab chunks, by their bitmaps */
+#define CS_TASK_MAX (2 * SP_MAX_WORKERS + 1)
 #define CS_SWEEPER_MAX 32
 static pthread_mutex_t g_cs_lock = PTHREAD_MUTEX_INITIALIZER;
 static pthread_cond_t  g_cs_go = PTHREAD_COND_INITIALIZER;
@@ -2396,17 +2397,11 @@ static pthread_cond_t  g_cs_done = PTHREAD_COND_INITIALIZER;
 static int      g_cs_nsweepers = 0;
 static unsigned g_cs_gen = 0;        /* bumped per sweep started; sweepers wait for a new one */
 static int      g_cs_pending = 0;    /* a sweep is in flight */
-static int      g_cs_str_sweep = 0, g_cs_str_major = 0;
 static sp_sw_task g_cs_tasks[CS_TASK_MAX];
 /* the detached lists (inputs) and the per-slot results */
 static sp_gc_hdr  *g_cs_obj[SP_MAX_WORKERS];
 static sp_gc_hdr  *g_cs_obj_old = NULL, *g_cs_obj_old_tail = NULL;
-static sp_str_hdr *g_cs_str_young[SP_MAX_WORKERS][SP_STR_YSUB];
-static sp_str_hdr *g_cs_str_old[SP_MAX_WORKERS];
 static sp_gc_hdr  *g_cs_pro_head[SP_MAX_WORKERS], *g_cs_pro_tail[SP_MAX_WORKERS];
-static sp_str_hdr *g_cs_sy_keep[SP_MAX_WORKERS][SP_STR_YSUB], *g_cs_sy_tail[SP_MAX_WORKERS][SP_STR_YSUB];
-static size_t      g_cs_sy_moved[SP_MAX_WORKERS][SP_STR_YSUB];
-static size_t      g_cs_so_freed[SP_MAX_WORKERS];
 static unsigned long g_cs_task_us = 0;   /* SPINEL_GC_PHASES: sweeper time, summed */
 static int      g_cs_hi = 1;         /* slots in use, plus the sweepers' own */
 #define CS_SWEEPER_WID (SP_MAX_WORKERS - 1)   /* a sweeper's worker id: its own slot, should a finalizer allocate */
@@ -2426,14 +2421,6 @@ static void sp_cs_run_task(const sp_sw_task *t) {
     case CS_CHUNKS:
       sp_gc_sweep_chunks(t->wid, g_cs_full);
       break;
-    case CS_STR_YOUNG: {
-      size_t held = 0;
-      sp_str_sweep_young_list(&g_cs_str_young[t->wid][t->sub], &g_cs_sy_keep[t->wid][t->sub],
-                              &g_cs_sy_tail[t->wid][t->sub], &g_cs_sy_moved[t->wid][t->sub], &held);
-      break; }
-    default:
-      g_cs_so_freed[t->wid] = sp_str_sweep_old_list(&g_cs_str_old[t->wid]);
-      break;
   }
   if (sp_gc_ph_on) {
     unsigned long d = (unsigned long)((sp_monotonic_now() - t0) * 1e6), m;
@@ -2441,7 +2428,7 @@ static void sp_cs_run_task(const sp_sw_task *t) {
     while (!SP_ATOMIC_CAS(&g_cs_task_max_us, &m, d, 0, __ATOMIC_RELAXED, __ATOMIC_RELAXED));
   }
 }
-/* Who takes a task: a worker's own young lists (CS_OBJ, CS_STR_YOUNG of a
+/* Who takes a task: a worker's own young lists (CS_OBJ, CS_CHUNKS of a
    live slot) are the owner's, so the freed slots come back warm to the core
    that allocates from them; the old lists and the sweepers' own slot are
    the sweeper threads'; under the barrier anyone takes what is left. */
@@ -2452,7 +2439,7 @@ static unsigned char g_cs_claimed[CS_TASK_MAX];
    sweeper thread takes its lists, or the next barrier would be spent
    finishing them. */
 static int sp_cs_task_is_owned(const sp_sw_task *t) {
-  return (t->kind == CS_OBJ || t->kind == CS_STR_YOUNG || t->kind == CS_CHUNKS) && t->wid != CS_SWEEPER_WID &&
+  return (t->kind == CS_OBJ || t->kind == CS_CHUNKS) && t->wid != CS_SWEEPER_WID &&
          !(t->wid >= 0 && t->wid < SP_MAX_WORKERS && SP_ATOMIC_LOAD(&g_native_out[t->wid], __ATOMIC_RELAXED) == SP_OUT_NATIVE);
 }
 #define CS_RUN_SWEEPER 0
@@ -2568,11 +2555,11 @@ static void *sp_cs_sweeper_main(void *arg) {
   return NULL;
 }
 /* Under the barrier, at the end of the mark: detach and hand off. */
-static void sp_sched_conc_start(int full, int str_sweep, int str_major) {
+static void sp_sched_conc_start(int full) {
   int n = sp_active_workers; if (n < 1) n = 1; if (n > SP_MAX_WORKERS - 1) n = SP_MAX_WORKERS - 1;
   if (n > g_cs_hi) g_cs_hi = n;
   int nt = 0;
-  g_cs_full = full; g_cs_str_sweep = str_sweep; g_cs_str_major = str_major;
+  g_cs_full = full;
   /* The collector's own length cache: every parked worker cleared its own at
      the park; this thread did not park, and it may name strings the sweep
      is about to free, whose addresses a later allocation reuses. */
@@ -2586,31 +2573,12 @@ static void sp_sched_conc_start(int full, int str_sweep, int str_major) {
     int i = slots[k];
     g_cs_pro_head[i] = g_cs_pro_tail[i] = NULL;
     g_cs_obj[i] = sp_gc_wslot[i].young; sp_gc_wslot[i].young = NULL;
-    if (g_cs_obj[i]) g_cs_tasks[nt++] = (sp_sw_task){ CS_OBJ, (short)i, 0 };
-    /* the slot's chunks: the young slab generation every cycle, the old one
-       at a full, strings with objects -- the string gate below governs only
-       the lists of the strings too large for the slab (and their retune) */
-    g_cs_tasks[nt++] = (sp_sw_task){ CS_CHUNKS, (short)i, 0 };
-    if (str_sweep) {
-      g_cs_so_freed[i] = 0;
-      if (str_major) {
-        g_cs_str_old[i] = sp_str_wslot[i].old; sp_str_wslot[i].old = NULL;
-        if (g_cs_str_old[i]) g_cs_tasks[nt++] = (sp_sw_task){ CS_STR_OLD, (short)i, 0 };
-      }
-      for (int sub = 0; sub < SP_STR_YSUB; sub++) {
-        g_cs_sy_keep[i][sub] = g_cs_sy_tail[i][sub] = NULL; g_cs_sy_moved[i][sub] = 0;
-        g_cs_str_young[i][sub] = sp_str_wslot[i].young[sub]; sp_str_wslot[i].young[sub] = NULL;
-        if (g_cs_str_young[i][sub]) g_cs_tasks[nt++] = (sp_sw_task){ CS_STR_YOUNG, (short)i, (short)sub };
-      }
-      /* the young generation left with its lists; the trigger counts what
-         the slot holds from here */
-      SP_GC_CTR_SET(sp_str_wslot[i].young_bytes, 0);
-      sp_str_wslot[i].ask_at = 0;
-    }
+    if (g_cs_obj[i]) g_cs_tasks[nt++] = (sp_sw_task){ CS_OBJ, (short)i };
+    g_cs_tasks[nt++] = (sp_sw_task){ CS_CHUNKS, (short)i };
   }
   if (full) {
     g_cs_obj_old = sp_gc_old_detach();
-    if (g_cs_obj_old) g_cs_tasks[nt++] = (sp_sw_task){ CS_OBJ_OLD, 0, 0 };
+    if (g_cs_obj_old) g_cs_tasks[nt++] = (sp_sw_task){ CS_OBJ_OLD, 0 };
   }
   pthread_mutex_lock(&g_cs_lock);
   if (sp_gc_ph_on) g_cs_t0 = sp_monotonic_now();
@@ -2659,23 +2627,6 @@ static void sp_sched_conc_wait(void) {
     g_cs_pro_head[i] = g_cs_pro_tail[i] = NULL;
   }
   if (sp_gc_ph_on) { double t = sp_monotonic_now(); sp_gc_ph_apply_obj += t - at0; at0 = t; }
-  if (g_cs_str_sweep) {
-    size_t promoted = 0;
-    size_t young_now = sp_str_bytes_total();
-    for (int k = 0; k < ns; k++) {
-      int i = slots[k];
-      if (g_cs_str_major) {
-        /* the old list was detached whole; what the sweep left of it is
-           the old list again, and the young survivors go in front */
-        sp_str_wslot[i].old = g_cs_str_old[i]; g_cs_str_old[i] = NULL;
-        sp_str_wslot[i].old_bytes = sp_str_wslot[i].old_bytes > g_cs_so_freed[i] ? sp_str_wslot[i].old_bytes - g_cs_so_freed[i] : 0;
-      }
-      for (int sub = 0; sub < SP_STR_YSUB; sub++)
-        sp_str_sweep_young_done(i, g_cs_sy_keep[i][sub], g_cs_sy_tail[i][sub], g_cs_sy_moved[i][sub], 0, &promoted);
-    }
-    sp_str_sweep_end_excluding(g_cs_str_major, promoted, young_now);
-  }
-  if (sp_gc_ph_on) { double t = sp_monotonic_now(); sp_gc_ph_apply_str += t - at0; at0 = t; }
   /* the owners released their own chunks beside the program (sp_stw_park_locked's
      exit); what is left for the barrier is the slots no active worker owns */
   if (g_cs_full) sp_slab_release_from(sp_active_workers);
@@ -2743,48 +2694,19 @@ static void sp_sched_par_sweep(void) {
      g_sw_hi is the largest pool ever seen, which bounds the orphan scan below
      without walking 256 empty slots each time. */
   if (n > g_sw_hi) g_sw_hi = n;
-  /* The string gate is one decision over the whole heap, so make it here --
-     once, before anyone starts -- and let each worker apply it to its own
-     slot. Taking it per worker would let them disagree about `major`. */
-  g_str_major = 0;
-  g_str_sweep = sp_str_sweep_begin(&g_str_major);
-  /* Same gate the serial sweep applies: on a minor cycle the old string list
-     holds exactly the strings the mark could not reach, so sweeping it frees
-     live ones. Without this a threaded program corrupted a Hash the moment a
-     minor cycle landed on a string-heap trigger. */
-  if (sp_gc_str_minor_only) g_str_major = 0;
-  sp_str_par_done = 1;   /* the collector's serial pass must not repeat this */
-  /* Every slot up to the largest pool seen is on the list: a slot no live
-     worker owns -- past the current pool, or a worker that exited -- still
-     has to be swept or its lists leak, and its string lists count too. The
-     heavy tasks go first so the tail of the phase is short ones. */
-  memset(g_str_promoted, 0, (size_t)g_sw_hi * sizeof g_str_promoted[0]);
+  /* Sweep orphan slots too. Put the heavy tasks first. */
   memset(g_sw_head, 0, (size_t)g_sw_hi * sizeof g_sw_head[0]);
   memset(g_sw_tail, 0, (size_t)g_sw_hi * sizeof g_sw_tail[0]);
   memset(g_sw_bytes, 0, (size_t)g_sw_hi * sizeof g_sw_bytes[0]);
   int nt = 0;
-  if (g_str_sweep) {
-    if (g_str_major)
-      for (int i = 0; i < g_sw_hi; i++)
-        if (sp_str_wslot[i].old) g_sw_tasks[nt++] = (sp_sw_task){ SW_STR_OLD, (short)i, 0 };
-    for (int i = 0; i < g_sw_hi; i++)
-      for (int sub = 0; sub < SP_STR_YSUB; sub++) {
-        g_sy_keep[i][sub] = g_sy_tail[i][sub] = NULL; g_sy_moved[i][sub] = g_sy_held[i][sub] = 0;
-        if (sp_str_wslot[i].young[sub]) g_sw_tasks[nt++] = (sp_sw_task){ SW_STR_YOUNG, (short)i, (short)sub };
-      }
-  }
   for (int i = 0; i < g_sw_hi; i++)
-    if (sp_gc_wslot[i].young) g_sw_tasks[nt++] = (sp_sw_task){ SW_OBJ, (short)i, 0 };
+    if (sp_gc_wslot[i].young) g_sw_tasks[nt++] = (sp_sw_task){ SW_OBJ, (short)i };
   /* every slot's slab chunks, the slots no worker runs included: a chunk is
      swept exactly once a cycle, and a second pass over one at a full cycle
      would read its cleared marks as "nothing reached" */
   for (int i = 0; i < SP_MAX_WORKERS; i++)
-    g_sw_tasks[nt++] = (sp_sw_task){ SW_CHUNKS, (short)i, 0 };
-  /* The collector's own length cache: every parked worker cleared its own
-     at the park, and until now the collector dropped its entries one by one
-     as it swept its own strings. Its strings may now be swept by any worker,
-     which drops them from THAT worker's (empty) cache, so the collector's
-     entries would name freed strings. Clear it whole, like a park does. */
+    g_sw_tasks[nt++] = (sp_sw_task){ SW_CHUNKS, (short)i };
+  /* The coordinator did not park. Invalidate its byte-view cache too. */
   sp_str_lcache_clear();
   SCHED_LOCK();
   g_sw_ntasks = nt;
@@ -2806,17 +2728,7 @@ static void sp_sched_par_sweep(void) {
     sp_gc_ph_slot_max += (double)g_sw_slot_max_us * 1e-6;
     sp_gc_ph_task_sum += (double)g_sw_task_sum_us * 1e-6;
     sp_gc_ph_task_obj += (double)g_sw_task_max_kind[SW_OBJ] * 1e-6;
-    sp_gc_ph_task_sold += (double)g_sw_task_max_kind[SW_STR_OLD] * 1e-6;
-    sp_gc_ph_task_syoung += (double)g_sw_task_max_kind[SW_STR_YOUNG] * 1e-6;
     g_sw_task_sum_us = 0; memset(g_sw_task_max_kind, 0, sizeof g_sw_task_max_kind);
-  }
-  if (g_str_sweep) {
-    size_t promoted = 0;
-    for (int i = 0; i < g_sw_hi; i++)
-      for (int sub = 0; sub < SP_STR_YSUB; sub++)
-        sp_str_sweep_young_done(i, g_sy_keep[i][sub], g_sy_tail[i][sub], g_sy_moved[i][sub], g_sy_held[i][sub], &promoted);
-    sp_str_sweep_end(g_str_major, promoted);
-    g_str_sweep = 0;
   }
 }
 
@@ -2962,6 +2874,14 @@ static void sp_sched_signal_if_quiescent(void) {
    caller_ctx rather than its own, so a switch to it lands on a context that
    was never saved. run_thread_once never nests on a worker, so it sets the
    home and clears it after. */
+/* The match registers (`$~`) are per thread in Ruby and per worker in the
+   runtime. A green thread that stops and gives its worker to another one
+   saves its own on its stack and puts them back when it runs again, and so
+   does the side that runs it (run_thread_once), so the threads of one worker
+   do not read each other's. The trap thread (lib/sp_cold.c) takes no part:
+   CRuby runs a trap in the main thread, with the `$~` of that thread, and
+   the trap thread reads and writes the registers of the side that runs it. */
+static int sp_thread_own_match(const sp_thread *t) { return t && !t->internal; }
 static SP_TLS sp_Fiber *g_sched_home = NULL;
 static sp_Fiber *sp_sched_home(void) { return g_sched_home ? g_sched_home : sp_fiber_worker_root(); }
 sp_Fiber *sp_sched_home_fiber(void) { return sp_sched_home(); }
@@ -2971,7 +2891,11 @@ sp_Fiber *sp_sched_home_fiber(void) { return sp_sched_home(); }
 static void sp_sched_switch_out(void) {
   sp_thread *self = g_current;
   if (self && sp_fiber_current != self->fiber) self->at = sp_fiber_current;
+  int own = sp_thread_own_match(self);
+  sp_re_switch match;
+  if (own) sp_re_switch_out(&match);
   sp_fiber_sched_switch(sp_sched_home());
+  if (own) sp_re_switch_in(&match);
 }
 
 static void run_thread_once(sp_thread *t) { sp_gc_wb((void*)t);   /* PRE/POST: sched lock held, or not held from the worker's fast path */
@@ -3034,9 +2958,17 @@ static void run_thread_once(sp_thread *t) { sp_gc_wb((void*)t);   /* PRE/POST: s
   g_sched_home = sp_fiber_current;
   sp_Fiber *at = t->at;   /* it stopped inside a Fiber it resumed */
   t->at = NULL;
+  /* the thread runs with its own `$~`; a new one starts with none */
+  int own = sp_thread_own_match(t);
+  sp_re_switch match;
+  if (own) {
+    sp_re_switch_out(&match);
+    if (t->fiber->state == 0) sp_re_thread_begin();
+  }
   if (locked) SCHED_UNLOCK();
   sp_Fiber_transfer_catch(t->fiber, at, in, &raised, &ec, &em, &eo);
   if (locked) SCHED_LOCK();
+  if (own) sp_re_switch_in(&match);
   g_sched_home = NULL;
   g_current = saved;
 #ifdef SP_THREADS
@@ -3208,7 +3140,14 @@ static void sp_sched_pump(sp_thread *target, int may_wait) {
        no wait list here, so nothing marks it RUNNABLE for it) */
     if (target && sp_thread_inject_pending(&g_main_thread)) return;
 #ifdef SP_EV_BACKEND
-    if (g_wslot[0].evfd > 0) sp_ev_worker_wait(0, 0);   /* see sp_worker_main */
+    /* A look at the set before each thread was a syscall that, when nothing
+       is ready, leaves the CPU on Darwin (about 12 us). With threads queued
+       it is taken when the helpers take theirs (sp_ev_drain_due); with none,
+       the wait below, or the look before returning, takes it. */
+    if (g_wslot[0].evfd > 0 &&
+        (SP_ATOMIC_LOAD(&g_lrq[0].head, __ATOMIC_ACQUIRE) || SP_ATOMIC_LOAD(&g_grq.head, __ATOMIC_ACQUIRE)) &&
+        sp_ev_drain_due(0))
+      sp_ev_worker_wait(0, 0);   /* see sp_worker_main */
 #endif
     /* main blocked on a Queue/Mutex and a runnable thread just woke it */
     if (g_main_thread.state == SP_TH_RUNNABLE) { SP_TH_SET_STATE(&g_main_thread, SP_TH_RUNNING); return; }
@@ -3271,6 +3210,9 @@ static void sp_sched_pump(sp_thread *target, int may_wait) {
     }
 #else
     (void)may_wait;
+#endif
+#ifdef SP_EV_BACKEND
+    if (g_wslot[0].evfd > 0 && sp_ev_worker_wait(0, 0) > 0) continue;
 #endif
     return;
   }
@@ -3367,6 +3309,9 @@ static void sp_thread_scan(void *p) {
   sp_mark_rbval(t->retval);
   sp_mark_rbval(t->name);
   if (t->exc_obj) sp_gc_mark(t->exc_obj);
+  /* the message beside it is the copy a raise put on the exception stack,
+     not the object's own: a root until a join or value re-raises it */
+  if (t->exc_msg) sp_mark_string(t->exc_msg);
   if (t->tls) sp_gc_mark(t->tls);
 }
 
@@ -3384,7 +3329,9 @@ sp_thread *sp_Thread_spawn_fiber_at(sp_Fiber *f, sp_RbVal arg, const char *file,
   t->birth_line = line;
   return t;
 }
-sp_thread *sp_Thread_spawn_fiber(sp_Fiber *f, sp_RbVal arg) {
+/* `internal` marks the runtime's own thread. It is set before the thread
+   goes on a run queue, so the worker that runs the thread first reads it. */
+static sp_thread *thread_spawn(sp_Fiber *f, sp_RbVal arg, int internal) {
 #ifdef SP_THREADS
   if (!g_workers_started) {
     if (!sp_sched_ensure_workers())
@@ -3399,6 +3346,7 @@ sp_thread *sp_Thread_spawn_fiber(sp_Fiber *f, sp_RbVal arg) {
   sp_thread *volatile t = (sp_thread *)sp_gc_alloc(sizeof(sp_thread), NULL, sp_thread_scan);
   memset(t, 0, sizeof *t);
   t->home_wid = -1;              /* not yet started: any worker may pick it up */
+  t->internal = internal ? 1 : 0;
   t->fiber = f;
   t->arg = arg;
   t->retval = sp_box_nil();
@@ -3428,6 +3376,8 @@ sp_thread *sp_Thread_spawn_fiber(sp_Fiber *f, sp_RbVal arg) {
   SCHED_UNLOCK();
   return t;
 }
+sp_thread *sp_Thread_spawn_fiber(sp_Fiber *f, sp_RbVal arg) { return thread_spawn(f, arg, 0); }
+sp_thread *sp_Thread_spawn_internal(sp_Fiber *f) { return thread_spawn(f, sp_box_nil(), 1); }
 
 /* Joining the current thread can never finish. Reject it before attempting to
    park, including on the main thread before the timer monitor has started. */
@@ -3560,6 +3510,9 @@ void sp_Thread_pass(void) {
   if (SP_ATOMIC_LOAD(&sp_sig_pending_flag, __ATOMIC_ACQUIRE)) sp_sig_run_pending();
   SCHED_LOCK();
   sp_thread *self = g_current;
+  /* (no green thread yet: there is no one to pass to, and a switch out from
+     a Fiber of main's would go to no thread, #12024) */
+  if (!self) { SCHED_UNLOCK(); return; }
   if (self == &g_main_thread) {
     sp_sched_pass();   /* one round-robin sweep, then main resumes (not a drain) */
     SCHED_UNLOCK();
@@ -3597,7 +3550,7 @@ sp_bool sp_Thread_get_report(sp_thread *t) { return t->report_on_exception; }
 sp_thread *sp_Thread_main(void) { return &g_main_thread; }
 
 sp_RbVal sp_Thread_get_name(sp_thread *t) { return t->name; }
-sp_RbVal sp_Thread_set_name(sp_thread *t, sp_RbVal v) { if (v.tag == SP_TAG_STR) sp_str_retained(v.v.s); sp_gc_wb((void*)t); t->name = v; return v; }
+sp_RbVal sp_Thread_set_name(sp_thread *t, sp_RbVal v) { sp_gc_wb((void*)t); t->name = v; return v; }
 /* #priority= as CRuby's rb_thread_priority_set: the Integer value (a Float
    truncates, nil is a TypeError: the generated call converts), clamped to
    -3..3. CRuby treats it as a
@@ -3632,14 +3585,13 @@ sp_thread *sp_Thread_list_at(sp_int i) {
   REG_UNLOCK();
   return t ? t : &g_main_thread;
 }
-void sp_thread_set_internal(sp_thread *t) { t->internal = 1; }
 
 /* #status: "run" while runnable/running, "sleep" while blocked, false when it
    finished normally, nil when it died with an unhandled exception. */
 sp_RbVal sp_Thread_status(sp_thread *t) {
   switch (SP_TH_STATE(t)) {
-    case SP_TH_RUNNING: case SP_TH_RUNNABLE: return sp_box_str(&("\xff" "run")[1]);
-    case SP_TH_BLOCKED:                       return sp_box_str(&("\xff" "sleep")[1]);
+    case SP_TH_RUNNING: case SP_TH_RUNNABLE: return sp_box_str_fresh(&("\xff" "run")[1]);
+    case SP_TH_BLOCKED:                       return sp_box_str_fresh(&("\xff" "sleep")[1]);
     default:                                  return t->has_exc ? sp_box_nil() : sp_box_bool(0);
   }
 }
@@ -3766,7 +3718,7 @@ static int sp_available_cpus(void) {
   return n;
 }
 
-/* min(available CPUs, SPINEL_WORKERS); the env var overrides the autodetect. */
+/* The configured worker limit, or the detected CPU count by default. */
 static int sp_worker_count(void) {
   const char *e = getenv("SPINEL_WORKERS");
   int n;

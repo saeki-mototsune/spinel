@@ -82,6 +82,35 @@ static int prog_load_by(const Compiler *c, int f) {
   return r >= 0 ? (int)nt_int(nt, r, "load_by", -1) : -1;
 }
 
+/* Was file f loaded from a require that may not run where it stands (the
+   parser's sp_req_always_runs says no: the LoadNode's req_deferred), at any
+   level of the requires that run it, or is it a file no require places? The
+   one stamp prog_stamp_deferred writes on each file's root once the files
+   have their places (prog_settle_files); the inline splice stamps the
+   statements of a file spliced from such a require instead (req_deferred).
+   0 for a file with no root: the inline model's. */
+int prog_load_deferred(const Compiler *c, int f) {
+  const NodeTable *nt = c->nt;
+  int r = f > 0 && f < nt->nfile_roots ? nt_root(nt, f) : -1;
+  return r >= 0 && nt_int(nt, r, "load_deferred", 0);
+}
+/* File f's stamp, from the LoadNode that runs it and the file that holds
+   that LoadNode (state: 0 unknown, 1 being decided, 2 not deferred, 3
+   deferred). A file in a cycle of requires, or run by no require, has no
+   proof that it runs: deferred. */
+static int prog_stamp_deferred(Compiler *c, int f, unsigned char *state) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  if (f <= 0) return 0;
+  if (state[f] == 1) return 1;
+  if (state[f]) return state[f] == 3;
+  state[f] = 1;
+  int by = prog_load_by(c, f), d = 1;
+  if (by >= 0) d = nt_int(nt, by, "req_deferred", 0) || prog_stamp_deferred(c, (int)nt_int(nt, by, "node_file", 0), state);
+  state[f] = d ? 3 : 2;
+  if (d) nt_node_set_int(nt, nt_root(nt, f), "load_deferred", 1);
+  return d;
+}
+
 /* The file a load at the top level runs: the target of the LoadNode that
    first runs it (prog_load_by), else -1. Its file's statements come next in
    load order. */
@@ -1393,6 +1422,14 @@ static void prog_warn_missing(Compiler *c, const unsigned char *seen) {
         prog_rescue_runs(nt, nt_ref(nt, b, "rescue_clause")) == 1) continue;
     int r = prog_root_of(c, parent, id);
     const char *file = r >= 0 ? nt_str(nt, r, "file_path") : nt_file_path(nt, (int)nt_int(nt, id, "node_file", 0));
+    /* --strict-require (spin build): a require no file answers is a
+       compile-time refusal, as the inline model's resolve makes it */
+    if (g_strict_require) {
+      fprintf(stderr, "spinel: %s:%lld: cannot load such file -- %s (%s \"%s\")\n",
+              file ? file : "-", nt_int(nt, id, "node_line", 0), nt_str(nt, id, "path"), nt_str(nt, id, "method"),
+              nt_str(nt, id, "path"));
+      exit(1);
+    }
     fprintf(stderr, "warning: %s:%lld: cannot load such file -- %s (the %s raises LoadError when it runs)\n",
             file ? file : "-", nt_int(nt, id, "node_line", 0), nt_str(nt, id, "path"), nt_str(nt, id, "method"));
   }
@@ -1435,6 +1472,17 @@ static void prog_unplace_candidates(Compiler *c, const unsigned char *seen, cons
   free(parent); free(pos);
 }
 
+/* See analyze.h. */
+int prog_node_in_dropped_file(Compiler *c, int node) {
+  const NodeTable *nt = c->nt;
+  if (node < 0 || !prog_graph(c)) return 0;
+  long long fid = nt_int(nt, node, "node_file", -1);
+  if (fid < 0) return 0;
+  for (int f = 1; f < nt_nroots(nt); f++)
+    if (nt_int(nt, nt_root(nt, f), "node_file", -2) == fid) return nt_int(nt, nt_root(nt, f), "file_dropped", 0) != 0;
+  return 0;
+}
+
 void prog_settle_files(Compiler *c) {
   NodeTable *nt = (NodeTable *)c->nt;
   int n = nt_nroots(nt);
@@ -1460,12 +1508,16 @@ void prog_settle_files(Compiler *c) {
   prog_unplace_candidates(c, seen, live);
   for (int f = 1; f < n; f++) {
     int st = live[f] ? -1 : prog_root_stmts(c, f);
-    if (st >= 0) nt_node_set_arr(nt, st, "body", NULL, 0);
+    if (st >= 0) { nt_node_set_arr(nt, st, "body", NULL, 0); nt_node_set_int(nt, nt_root(nt, f), "file_dropped", 1); }
     else if (live[f] && prog_load_by(c, f) < 0 && nsite[f] == 1 && ok[f]) {
       nt_node_set_int(nt, nt_root(nt, f), "load_by", site[f]);
       nt_node_set_int(nt, nt_root(nt, f), "load_stmt", at[f]);
     }
   }
+  unsigned char *state = calloc((size_t)n, 1);
+  if (!state) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int f = 1; f < n; f++) prog_stamp_deferred(c, f, state);
+  free(state);
   free(seen); free(live); free(ok); free(nsite); free(site); free(at);
 }
 

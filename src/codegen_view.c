@@ -72,7 +72,7 @@ static int view_sp;
 static int view_nodes;   /* the entries that view a node (all but VK_ARM) */
 static unsigned view_epoch_n;
 
-ArmCtx g_arm = { -1, -1, 0, -1, -1, -1, -1, NULL, NULL, NULL };
+ArmCtx g_arm = { -1, -1, 0, -1, -1, -1, -1, NULL, NULL, NULL, 0 };
 
 /* Argument-hoist overrides: emit_args_filled pre-evaluates GC-hazardous
    call arguments into rooted temps; emit_expr then substitutes the temp
@@ -153,7 +153,10 @@ int view_bind_temp_read(int node, const char *reader, int t) {
   return view_ran(view_bind(node, "%s(_t%d)", reader, t));
 }
 
-void view_unbind(int n) { g_n_argov = n; }
+void view_unbind(int n) {
+  ran_first_unbind(n);
+  g_n_argov = n;
+}
 
 /* See codegen_internal.h. A parked binding keeps its slot and its text; its
    node reads as none any lookup asks for (-1 is one they do ask for: a call
@@ -491,7 +494,7 @@ void view_unwind(int mark) {
     view_sp--;
     view_close(view_sp);
   }
-  if (g_n_argov > (mark & 0xffff)) g_n_argov = mark & 0xffff;
+  if (g_n_argov > (mark & 0xffff)) view_unbind(mark & 0xffff);
 }
 
 /* ---- per-arm facts (#7483) ---- */

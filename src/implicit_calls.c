@@ -137,9 +137,30 @@ static int ic_calls(Compiler *c, int id, IcSink *s, IcMode mode) {
     if (row[i].operand >= 0) ic_builtin_callbacks(s, row[i].name, NULL, row[i].operand, BCR_ELEM | BCR_SELF, 1);
   }
   free(big);
-  if (mode != IC_ROWS && nt_kind(nt, id) == NK_CallNode) {
-    const char *name = nt_str(nt, id, "name");
+  /* an index-and/or-write is a call of `[]=` on its receiver with its index as the argument: the index's
+     to_int is as much its callback as a call's */
+  NodeKind nk = nt_kind(nt, id);
+  if (mode != IC_ROWS && (nk == NK_CallNode || nk == NK_IndexAndWriteNode || nk == NK_IndexOrWriteNode || nk == NK_IndexOperatorWriteNode)) {
+    const char *name = nk == NK_CallNode ? nt_str(nt, id, "name") : "[]=";
     if (!name) return s->n;
+    /* the count a copy of builtins/enumerable.rb converts (__enum_count_int,
+       as min_by(n) and max_by(n) do): CRuby's rb_num2long asks it for to_int,
+       as it asks a native count */
+    if (nk == NK_CallNode && sp_streq(name, "__enum_count_int") && nt_ref(nt, id, "receiver") < 0) {
+      if (s->roles & BCR_ARG) ic_push(s, "to_int", id, BCR_ARG, 0, NULL);
+      return s->n;
+    }
+    /* ENV writes convert their two arguments through to_str. ENV is a
+       singleton value, so the core class callback rows have no row for it. */
+    if (nk == NK_CallNode && is_store_alias(name) && call_plain_argc(c, id) == 2) {
+      int recv = nt_ref(nt, id, "receiver");
+      int env = c->ic && c->ic->typed ? env_value_recv(c, recv, comp_ntype(c, recv))
+                : nt_kind(nt, recv) == NK_ConstantReadNode && is_env_const(nt_str(nt, recv, "name"));
+      if (env) {
+        if (s->roles & BCR_ARG) ic_push(s, "to_str", id, BCR_ARG, 0, NULL);
+        return s->n;
+      }
+    }
     /* a method a C extension defines receives values the extension's C code
        calls CRuby's protocol methods on (rb_num2long asks for to_int, and so
        on) and sends names it computes: any callback name, as for a core name
@@ -174,6 +195,17 @@ int ic_node_calls_name(Compiler *c, int id, const char *name, int class_side) {
   IcSink s = { NULL, 0, 0, name, BCR_ALL };
   int n = ic_calls(c, id, &s, IC_ALL);
   return n == IC_ANY ? ic_core_callback(name, class_side) : n > 0;
+}
+
+int ic_operand_host(Compiler *c, int op) {
+  const NodeTable *nt = c->nt;
+  const int *par = op >= 0 ? comp_parent_map(c) : NULL;
+  for (int up = par ? par[op] : -1; up >= 0; up = par[up]) {
+    NodeKind k = nt_kind(nt, up);
+    if (k == NK_CallNode || k == NK_SuperNode || k == NK_ForwardingSuperNode || k == NK_YieldNode || k == NK_WhenNode) return up;
+    if (k != NK_ArgumentsNode && k != NK_ParenthesesNode && k != NK_StatementsNode && k != NK_KeywordHashNode && k != NK_AssocNode) break;
+  }
+  return op;
 }
 
 int ic_held_rows_name(Compiler *c, int id, const char *name) {
@@ -350,7 +382,12 @@ int ic_operand_may_hold(Compiler *c, const IcCall *k) {
   switch (k->role) {
   case BCR_ARG:
   case BCR_CLASS:
-    for (int i = 0; i < an; i++) if (ic_may_be_object(c, av[i], k->name)) return 1;
+    for (int i = 0; i < an; i++) {
+      int arg = av[i];
+      if (nt_kind(nt, arg) == NK_SplatNode) {
+        if (ic_may_hold_elems(c, nt_ref(nt, arg, "expression"), k->name)) return 1;
+      } else if (ic_may_be_object(c, arg, k->name)) return 1;
+    }
     return 0;
   case BCR_ELEM:
     if (recv < 0 || ic_may_hold_elems(c, recv, k->name)) return 1;

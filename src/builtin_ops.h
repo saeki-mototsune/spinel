@@ -190,6 +190,7 @@ typedef enum {
   BOPE_ARRAY_SLICE_GROUPS, /* Array#slice_before / slice_after without a block (stage 3) */
   BOPE_ARRAY_JOIN_STR,    /* Array#* with a String (stage 4) */
   BOPE_ARRAY_PRED_CLASS,  /* Array#any? / all? / none? / one? with a Class (stage 5) */
+  BOPE_KERNEL_STRING,     /* Kernel.String with its to_str / to_s protocol */
   BOPE_CONV_USER_OK,      /* a receiverless implicit conversion, arg(boxed x, user_ok): __kw_hash, __blk_conv (user_ok: a program class may answer by method_missing) */
   /* Method and Proc (codegen_call_method.c) */
   BOPE_METHOD_UNBIND,     /* Method#unbind */
@@ -214,8 +215,11 @@ typedef enum {
   BOPE_STRING_CLEAR,
   BOPE_STRING_SLICE,
   BOPE_STRING_BYTESPLICE,
+  BOPE_STRING_APPEND_AS_BYTES,
   BOPE_STRING_DEDUP,     /* String#dedup: -@ under the name a nil receiver is raised with */
   BOPE_STRING_SCRUB_BLOCK, /* String#scrub with a block */
+  BOPE_STRING_LINES,       /* String#lines without a block */
+  BOPE_STRING_CASECMP,
   BOPE_BOXED_ARRAY_COUNT, /* a count-taking Enumerable read through a box */
   BOPE_BOXED_ARRAY_ONLY,  /* a boxed Array read that requires an Array */
   BOPE_BOXED_ARRAY_OR_RANGE, /* a boxed read that accepts Array and Range */
@@ -231,15 +235,15 @@ typedef enum {
 /* A set of argument kinds, one bit per TyKind: BOP_K(TY_INT) | BOP_K(TY_FLOAT) */
 typedef unsigned long long BopKinds;
 #define BOP_K(k) (1ULL << (k))
-_Static_assert(TY_OBJ_RANGE < 64, "a BopKinds set holds a bit per TyKind");
+_Static_assert(TY_ENV < 64, "a BopKinds set holds a bit per TyKind");
 
 typedef struct BuiltinOp {
   TyKind recv;            /* receiver kind the row applies to */
   const char *name;
   signed char argc_min, argc_max;
   BopBlock block;
-  TyKind result;          /* what the call answers; TY_UNKNOWN: inference
-                             leaves the call to the rules after it */
+  TyKind result;          /* the native result kind or a BOPR_* derivation;
+                             TY_UNKNOWN leaves inference to other rules */
   BopEmit emit;
   const char *arg;        /* BOPE_TEMPLATE's C text */
   BopKinds arg0, arg1;    /* the kinds the first and second argument may
@@ -377,6 +381,9 @@ typedef struct BuiltinOp {
    build, so the row answers for its own class only and the lookup does not
    hand it down the singleton chain. */
 #define BOPF_OWN_CLASS 16384
+/* The emitter accepts the full Ruby operand list, including a spread or
+   a fixed count beyond BOP_ARGC_ANY. A boxed arm can reuse held operands. */
+#define BOPF_ARGV 32768
 
 /* A row's recv may name a family of kinds rather than one; a caller looks
    the family up with the family's value. Not a TyKind any value has. */
@@ -398,9 +405,9 @@ typedef struct BuiltinOp {
                                            kind; a String array's is boxed (it only
                                            raises, or answers 0 when empty). Float results are
                                            boxed too; Integer results defer to mode-aware inference. */
-#define BOPR_ARRAY_INDEX ((TyKind)-18)  /* Array#index/find_index/rindex(v): an Int,
-                                           Str or Float array's boxed (nil on a miss),
-                                           any other's an Integer */
+#define BOPR_ARRAY_INDEX ((TyKind)-18)  /* Array#index/find_index/rindex(v), and a String
+                                           Range's find_index(v): an Integer, nil on a
+                                           miss (an oint), whatever the receiver */
 #define BOPR_ARRAY_TUPLES ((TyKind)-19) /* blockless combination & co.: a poly array
                                            whose position keeps the tuples (BOPX_KEPT)
                                            materializes them, any other call answers an
@@ -469,6 +476,13 @@ int bop_flags(TyKind rt, const char *name);
 int bop_name_kwless(const char *name);
 /* Is there a row of `name` that takes keywords (BOPF_KEYWORDS)? */
 int bop_name_keywords(const char *name);
+/* Does a builtin class below Object have a row of `name`, a method it
+   defines as the compiler implements it (StopIteration#result, IO#write),
+   in a library the program has (builtin_library_fact_holds)?
+   A row of one of Object's own methods (itself, class, !=) says how a call
+   on that kind is emitted, not that the class defines it, and does not
+   count. */
+int bop_below_object_answers(const char *name);
 /* Does the builtin answer `name` on a class (or module) itself, taking argc
    arguments and a block when has_block, where no method of the program's
    of the name runs yet: Module's own, as its builtin-op rows (TY_CLASS)
@@ -536,23 +550,34 @@ int bop_covers(TyKind rt);
 TyKind bop_family_of(TyKind rt);
 int bop_row_takes(TyKind rt, const char *name, int argc, int has_block);
 
-/* What the call answers on a receiver of kind rt: the row's result, with a
-   derived result (BOPR_*) worked out from rt. */
-TyKind bop_result(const BuiltinOp *op, TyKind rt);
-/* bop_result for the rows whose answer also turns on the call's operands'
+/* The native result on a receiver of kind rt, with a derived result
+   (BOPR_*) worked out from rt. TY_STRBUF declares an sp_String * result. */
+TyKind bop_native_result(const BuiltinOp *op, TyKind rt);
+/* bop_native_result for the rows whose answer also turns on the call's operands'
    kinds (BOPR_ARRAY_PLUS, BOPR_ARRAY_SETOP, BOPR_ARG0, BOPR_ARG1, BOPR_ARG_LAST,
-   BOPR_HASH_REPLACE, BOPR_HASH_STORE); any other row answers as bop_result
+   BOPR_HASH_REPLACE, BOPR_HASH_STORE); any other row answers as bop_native_result
    does. arg_of(ud, i) answers argument i's kind, as for
    bop_find_arg, and is called only for those rows. TY_UNKNOWN where the row
    states no kind for these operands. It reads no node: the caller brings
    the kinds. BOPR_ARRAY_SUM_SEED reads the seed through fold_seed_kind at
    the caller and takes the integer overflow mode, and BOPR_ARRAY_TUPLES
-   whether the call keeps its tuples, through facts (BOPX_*). */
+   whether the call keeps its tuples, through facts (BOPX_*).
+   BOPR_ARRAY_INDEX can keep the boxed nil result under BOPX_BOXED_USE. */
+TyKind bop_native_result_args(const BuiltinOp *op, TyKind rt, int argc, BopArgKind arg_of, const void *ud, int facts);
+/* The Ruby type of the result. A row declaring a String handle answers
+   TY_STRING to inference. Derived kinds keep the type supplied by their
+   receiver or operands, including any existing type refinement. */
+TyKind bop_result(const BuiltinOp *op, TyKind rt);
 TyKind bop_result_args(const BuiltinOp *op, TyKind rt, int argc, BopArgKind arg_of, const void *ud, int facts);
 /* Facts about the call that no operand's kind carries, for bop_result_args */
 #define BOPX_PROMOTE 1  /* --int-overflow=promote */
 #define BOPX_KEPT    2  /* a blockless combination & co. whose position keeps
                            the tuples as an Array (an_blockless_tuples_kept) */
+#define BOPX_BOXED_USE 4 /* an index query of a typed Array or a String Range in a program
+                           that reads an Integer with a call nil answers
+                           otherwise -- `& | ^`, `method`, ...
+                           (an_int_nil_sensitive_use): it answers boxed, as it
+                           did before it answered the oint */
 
 /* The BOPF_BOXED row of kind rt for `name`, or NULL. */
 const BuiltinOp *bop_find_boxed(TyKind rt, const char *name, int argc, int has_block);
@@ -755,6 +780,18 @@ typedef enum {
 #define IRF_SHAPE_BOXED  16   /* the block-shape desugar reads the row on a
                                  boxed receiver too (of the Array and Hash
                                  rows, only these) */
+/* How often an iterator runs its block (IterRow.runs): IR_ELEMS, the
+   default, is read off the values a step yields (iter_row_runs): at most once
+   per element, and not at all for some (uniq and sort_by! skip it for a short
+   receiver, slice_before and slice_after return an enumerator that runs it
+   when forced); the others are stated by their row. */
+typedef enum {
+  IR_ELEMS,      /* at most once per element of the receiver, when each value a step yields is one element's */
+  IR_EACH,       /* exactly once per element of the receiver (each, map, each_with_index): a non-empty receiver runs it */
+  IR_ONCE,       /* once, whatever the receiver is (tap, then, catch) */
+  IR_COUNT_RECV, /* as many times as the receiver's value (Integer#times) */
+  IR_MANY        /* a number of times the receiver's size does not tell (cycle, loop) */
+} IterRuns;
 typedef struct IterRow {
   TyKind fam;
   const char *name;
@@ -763,6 +800,7 @@ typedef struct IterRow {
   unsigned char yield[3];   /* IterYield per position */
   unsigned char answer;     /* IterAnswer */
   unsigned char flags;      /* IRF_* */
+  unsigned char runs;       /* IterRuns */
 } IterRow;
 
 /* The first row of family fam for `name` that takes argc arguments (any
@@ -778,8 +816,14 @@ int iter_row_named(const char *name);
 int object_iter_runs_now(const char *name);
 /* The iterator row a call with a block reads on a receiver of kind rt:
    any receiver's (tap, then, each_with_object), else its family's (an
-   Array's, a Hash's, a Range's, ...), or NULL. */
+   Array's, a Hash's, a Range's, ...), or NULL. A call with no receiver is
+   asked as kind BOP_KERNEL: Kernel's rows (catch, loop). */
 const IterRow *iter_row_of(TyKind rt, const char *name, int argc);
+/* What the row of `name` on a receiver of kind rt says of how often it runs
+   its block: IR_EACH, IR_ONCE, IR_COUNT_RECV, IR_ELEMS for a row that steps
+   at most once per element of its receiver (the record counts a literal's
+   elements), else IR_MANY (also for a name with no row). */
+IterRuns iter_row_runs(TyKind rt, const char *name, int argc);
 /* The kind the value at position k of a step has, on a receiver of kind rt
    (TY_POLY: a boxed receiver, whose elements are boxed). */
 TyKind iter_yield_kind(const IterRow *r, int k, TyKind rt);

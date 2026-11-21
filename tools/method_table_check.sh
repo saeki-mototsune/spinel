@@ -17,10 +17,15 @@
 # (<synthesized> for a node no source line made, - for none), not the
 # compiler's.
 #
-# Each step of #10866's second stage converts one family to ask call_target,
-# and then lists the family in FAIL_FAMILIES (names from the list above): the
-# run fails when a listed family has any site left. The run also fails when a
-# program compiles without the flag and fails or crashes with it.
+# Every family is listed in FAIL_FAMILIES (names from the list above): a read
+# of the method tables outside call_target fails the run, in whatever family it
+# is classed, so a pass or an emitter that needs a method asks the call plan
+# (call_target, call_answers, call_attr_target, cplan_implied_target). The
+# plan's own reads and the surveys and dispatchers that no call stands behind
+# stand in a bracket and are not counted; the `table <why>` lines count the
+# answers of call_target that are the table's last definition (ML_TABLE), which
+# stay until the plan proves the cell. The run also fails when a program
+# compiles without the flag and fails or crashes with it.
 #
 # A read under a call or a super of a name other than the node's own (a
 # super's own, its shadow's or its clone's) is implied only for one of the
@@ -29,7 +34,10 @@
 # method_missing, which any call may reach. A respond_to? that supers is
 # presence. A node with no names of its own is implied for a row of a node it
 # holds directly (an interpolation's to_s on its part, a case's === on its
-# when), and other otherwise.
+# when), for an implied call of the call it is an operand of, and for a row
+# of its direct parent where that is no call (the receiver of `a[i] += 1`
+# and its [] and []=); it is a call where the name is the host call's own
+# (the Range a clamp is given), and other otherwise.
 #
 # A read under a send, a Method maker or an &:sym is the send family's where
 # it asks of the name the node sends or captures. Its own name (`send`,
@@ -54,7 +62,7 @@
 set -u
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 cd "$ROOT" || exit 2
-FAIL_FAMILIES="super send lists"
+FAIL_FAMILIES="super send lists presence implied call other pass"
 # the run's last line when it stops early: why, and its exit status
 stop() { echo "method-table-check: FAIL ($2)"; exit "$1"; }
 FAMILIES="call implied presence super send lists other pass"
@@ -77,6 +85,12 @@ if [ "$QUIET" = 1 ]; then
   lr=$("$ROOT/tools/lists_readers_check.sh" 2>&1) || { printf "%s\n" "$lr"; stop 1 "tools/lists_readers_check.sh"; }
 else
   "$ROOT/tools/lists_readers_check.sh" || stop 1 "tools/lists_readers_check.sh"
+fi
+# the presence family keeps its static rule too: the readers of respond_to? and method_defined? read no table themselves
+if [ "$QUIET" = 1 ]; then
+  pr=$("$ROOT/tools/presence_readers_check.sh" 2>&1) || { printf "%s\n" "$pr"; stop 1 "tools/presence_readers_check.sh"; }
+else
+  "$ROOT/tools/presence_readers_check.sh" || stop 1 "tools/presence_readers_check.sh"
 fi
 # and the siteless readers: the dispatchers and surveys no call stands behind ask the plan with no site, naming no primitive
 if [ "$QUIET" = 1 ]; then

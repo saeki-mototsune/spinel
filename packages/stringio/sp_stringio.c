@@ -72,29 +72,38 @@ static void sio_grow(sp_StringIO *sio, int64_t need) {SP_GC_ROOT(sio);
     return;
   }
   sio_own(sio); int64_t req = sio->pos + need; if (req <= sio->cap) return; int64_t nc = sio->cap ? sio->cap : 64; while (nc < req) nc *= 2; char *nb = (char *)realloc(sio->buf, nc + 1); if (!nb) sp_oom_die(); sio->buf = nb; sio->cap = nc; }
-static int64_t sio_write(sp_StringIO *sio, const char *d, int64_t dl) { sio_sync(sio); sio_grow(sio, dl); if (sio->pos > sio->len) memset(sio->buf + sio->len, 0, sio->pos - sio->len); memcpy(sio->buf + sio->pos, d, dl); sio->pos += dl; if (sio->pos > sio->len) sio->len = sio->pos; sio->buf[sio->len] = '\0'; sio_publish(sio); return dl; }
+static int64_t sio_write(sp_StringIO *sio, const char *d, int64_t dl) {
+  sio_sync(sio);
+  /* A to_s result can be the stream's own String. Growth can move it,
+     and writes can overlap it even when its capacity is sufficient. */
+  uintptr_t offset = (uintptr_t)d - (uintptr_t)sio->buf;
+  sp_bool aliases = dl > 0 && offset < (uintptr_t)sio->len;
+  sio_grow(sio, dl);
+  if (aliases) d = sio->buf + offset;
+  if (sio->pos > sio->len) memset(sio->buf + sio->len, 0, sio->pos - sio->len);
+  memmove(sio->buf + sio->pos, d, (size_t)dl);
+  sio->pos += dl;
+  if (sio->pos > sio->len) sio->len = sio->pos;
+  sio->buf[sio->len] = '\0';
+  sio_publish(sio);
+  return dl;
+}
 
 /* the bytes of a shared handle (s->str) are the handle's: it keeps them
    alive and frees them */
 void sp_StringIO_free(void *p) { sp_StringIO *s = (sp_StringIO *)p; if (!s->borrowed && !s->str) free(s->buf); s->buf = NULL; }
 void sp_StringIO_scan_gc(void *p) { sp_StringIO *s = (sp_StringIO *)p; if (s->borrowed && s->buf) sp_mark_string(s->buf); if (s->str) sp_gc_mark((void *)s->str); }
-sp_StringIO *sp_StringIO_new(sp_int cls_id) { sp_StringIO *s = (sp_StringIO *)sp_gc_alloc(sizeof(sp_StringIO), sp_StringIO_free, sp_StringIO_scan_gc); memset(s, 0, sizeof *s); s->cls_id = cls_id; s->buf = (char *)calloc(1, 64); if (!s->buf) sp_oom_die(); s->cap = 63; return s; }
-/* Adopt the incoming GC string without copying so #string keeps identity
-   with the constructor argument; the first mutation copies (sio_own). */
-sp_StringIO *sp_StringIO_new_s(sp_int cls_id, const char *init) {SP_GC_ROOT_STR(init); if (!init) sp_raise_cls("TypeError", "no implicit conversion of nil into String"); sp_StringIO *s = (sp_StringIO *)sp_gc_alloc(sizeof(sp_StringIO), sp_StringIO_free, sp_StringIO_scan_gc); memset(s, 0, sizeof *s); s->cls_id = cls_id; int64_t l = (int64_t)sp_str_byte_len(init); s->buf = (char *)init; s->len = l; s->cap = l; s->borrowed = 1; s->ro = sp_str_is_frozen_val(init); return s; }
-/* StringIO.new(str, mode): the mode's first char selects the initial
-   content/position. "w"/"w+" truncate to empty; "a"/"a+" keep the content and
-   seek to the end; "r"/"r+" and anything else keep the content at position 0.
-   The mode also closes the side it does not open (sio_mode_sides). */
-sp_StringIO *sp_StringIO_new_sm(sp_int cls_id, const char *init, const char *mode) {SP_GC_ROOT_STR(init);SP_GC_ROOT_STR(mode);
-  if (!init) sp_raise_cls("TypeError", "no implicit conversion of nil into String");
-  if (!mode || !mode[0]) return sp_StringIO_new_s(cls_id, init);
-  sio_mode_check(sp_str_is_frozen_val(init), mode);
-  char m0 = mode[0];
-  sp_StringIO *s = m0 == 'w' ? sp_StringIO_new(cls_id) : sp_StringIO_new_s(cls_id, init);
-  if (m0 == 'a') s->pos = s->len;
-  s->closed = sio_mode_sides(mode);
-  return s;
+sp_StringIO *sp_StringIO_new(sp_int cls_id) {
+  return sp_StringIO_new_hn(cls_id);
+}
+sp_StringIO *sp_StringIO_new_s(sp_int cls_id, const char *init) {
+  SP_GC_ROOT_STR(init);
+  return sp_StringIO_new_h(cls_id, sp_String_new_shared(init));
+}
+sp_StringIO *sp_StringIO_new_sm(sp_int cls_id, const char *init, const char *mode) {
+  SP_GC_ROOT_STR(init);
+  SP_GC_ROOT_STR(mode);
+  return sp_StringIO_new_hm(cls_id, sp_String_new_shared(init), mode);
 }
 /* The in-place twins of the constructors (`_new` -> `_init`), for a
    subclass of StringIO (`class Buffer < StringIO`), whose instance the
@@ -108,35 +117,22 @@ static void sio_init_clear(sp_StringIO *s, sp_int cls_id) {
   s->cls_id = cls_id;
 }
 void sp_StringIO_init(sp_StringIO *s, sp_int cls_id) {
-  sio_init_clear(s, cls_id);
-  s->buf = (char *)calloc(1, 64); if (!s->buf) sp_oom_die(); s->cap = 63;
+  sp_StringIO_init_hn(s, cls_id);
 }
-void sp_StringIO_init_s(sp_StringIO *s, sp_int cls_id, const char *init) {SP_GC_ROOT(s);SP_GC_ROOT_STR(init);
-  if (!init) sp_raise_cls("TypeError", "no implicit conversion of nil into String");
-  sio_init_clear(s, cls_id);
-  int64_t l = (int64_t)sp_str_byte_len(init);
-  s->buf = (char *)init; s->len = l; s->cap = l; s->borrowed = 1; s->ro = sp_str_is_frozen_val(init);
-  sp_gc_wb(s);
+void sp_StringIO_init_s(sp_StringIO *s, sp_int cls_id, const char *init) {
+  SP_GC_ROOT(s);
+  SP_GC_ROOT_STR(init);
+  sp_StringIO_init_h(s, cls_id, sp_String_new_shared(init));
 }
-void sp_StringIO_init_sm(sp_StringIO *s, sp_int cls_id, const char *init, const char *mode) {SP_GC_ROOT(s);SP_GC_ROOT_STR(init);SP_GC_ROOT_STR(mode);
-  if (!init) sp_raise_cls("TypeError", "no implicit conversion of nil into String");
-  if (!mode || !mode[0]) { sp_StringIO_init_s(s, cls_id, init); return; }
-  sio_mode_check(sp_str_is_frozen_val(init), mode);
-  if (mode[0] == 'w') sp_StringIO_init(s, cls_id);
-  else sp_StringIO_init_s(s, cls_id, init);
-  if (mode[0] == 'a') s->pos = s->len;
-  s->closed = sio_mode_sides(mode);
+void sp_StringIO_init_sm(sp_StringIO *s, sp_int cls_id, const char *init, const char *mode) {
+  SP_GC_ROOT(s);
+  SP_GC_ROOT_STR(init);
+  SP_GC_ROOT_STR(mode);
+  sp_StringIO_init_hm(s, cls_id, sp_String_new_shared(init), mode);
 }
-/* #string returns the buffer as a spinel String. A borrowed buffer already IS
-   a spinel string (a valid sp_str_hdr precedes it), so it can be handed back
-   directly and keeps identity. A written buffer is a raw malloc block with no
-   header, so it must be copied into a proper String -- returning it raw let
-   callers read the sp_str_hdr one block before the allocation (a String method
-   or the GC string-heap walk), corrupting the heap (#3152). */
-const char *sp_StringIO_string(sp_StringIO *s) {SP_GC_ROOT(s);
-  /* the shared handle's bytes, as a String of their own (sp_StringIO_string_h
-     answers the handle) */
-  if (s->str) return sp_str_from_bytes(s->str->data, (size_t)s->str->len);
+const char *sp_StringIO_string(sp_StringIO *s) {
+  SP_GC_ROOT(s);
+  if (s->str) return sp_String_cstr(s->str);
   if (!s->buf) return sp_str_empty;
   if (s->borrowed) return s->buf;
   return sp_str_from_bytes(s->buf, (size_t)s->len);
@@ -160,16 +156,47 @@ static char *sio_take(const char *p, int64_t n, int bin) {
   if (bin) sp_str_mark_binary(r);
   return r;
 }
-const char *sp_StringIO_read(sp_StringIO *s) {SP_GC_ROOT(s); sio_check_read(s); sio_sync(s); int bin = sio_is_binary(s);
-  if (s->pos >= s->len) return bin ? sio_take("", 0, 1) : sp_str_empty;
-  int64_t rem = s->len - s->pos; char *r = sio_take(s->buf + s->pos, rem, bin); s->pos = s->len; return r; }
-/* read(n): nil at the end for a positive n, "" for read(0), and an
-   ArgumentError for a negative n (CRuby) */
-const char *sp_StringIO_read_n(sp_StringIO *s, sp_int n) {SP_GC_ROOT(s);
+/* The stream has already passed its readability check. Conversion can
+   change the backing String or the position before this operation runs. */
+static const char *sio_read_chunk(sp_StringIO *s, sp_int count, int rest, sp_String *out) {
+  sio_sync(s);
+  int64_t available = s->pos < s->len ? s->len - s->pos : 0;
+  int64_t length = rest || count > available ? available : count;
+  int binary = rest ? sio_is_binary(s) : 1;
+  if (!out) {
+    if (!rest && count > 0 && !available) return NULL;
+    const char *result = sio_take(length ? s->buf + s->pos : "", length, binary);
+    s->pos += length;
+    return result;
+  }
+
+  /* The length conversion could have frozen the destination. Resize it
+     before copying. If it is the backing object, the new terminator is
+     visible to the current read. */
+  if (sp_String_is_immutable(out)) sp_raise_frozen_str(out->data);
+  if (!sp_fd_grow(out, length)) sp_oom_die();
+  const char *source = s->str == out ? out->data : s->buf;
+  out->len = length;
+  out->data[length] = '\0';
+  if (length) memmove(out->data, source + s->pos, (size_t)length);
+  if (rest) sp_String_force_encoding(out, binary);
+  sp_fd_publish(out);
+  sio_sync(s);
+  s->pos += length;
+  if (!rest && !available) return count ? NULL : sio_take("", 0, 1);
+  return sp_String_cstr(out);
+}
+const char *sp_StringIO_read(sp_StringIO *s) {
+  SP_GC_ROOT(s);
+  sio_check_read(s);
+  return sio_read_chunk(s, 0, 1, NULL);
+}
+const char *sp_StringIO_read_n(sp_StringIO *s, sp_int n) {
+  SP_GC_ROOT(s);
   sio_check_read(s);
   if (n < 0) sp_raise_cls("ArgumentError", sp_sprintf("negative length %lld given", (long long)n));
-  sio_sync(s);
-  if (s->pos >= s->len) return n > 0 ? NULL : sio_take("", 0, 1); int64_t rem = s->len - s->pos; if (n > rem) n = rem; char *r = sio_take(s->buf + s->pos, n, 1); s->pos += n; return r; }
+  return sio_read_chunk(s, n, 0, NULL);
+}
 const char *sp_StringIO_gets(sp_StringIO *s) {SP_GC_ROOT(s); sio_check_read(s); sio_sync(s); if (s->pos >= s->len) return NULL; const char *st = s->buf + s->pos; const char *nl = memchr(st, '\n', s->len - s->pos); int64_t ll = nl ? (nl - st) + 1 : s->len - s->pos; char *r = sio_take(st, ll, sio_is_binary(s)); s->pos += ll; s->lineno++; return r; }
 /* The byte length of the character at p, n bytes available: a whole UTF-8
    sequence, or one byte where the sequence is malformed or cut short (CRuby
@@ -300,18 +327,16 @@ const char *sp_StringIO_gets_sep(sp_StringIO *s, const char *sep) {SP_GC_ROOT(s)
    of the program, an Array and a Hash theirs, and any other builtin class
    "Object". */
 static const char *sio_src_name(sp_RbVal v) {
+  if (sp_rbval_is_string(v)) return "String";
   switch (v.tag) {
     case SP_TAG_NIL: return "nil";
     case SP_TAG_BOOL: return v.v.b ? "true" : "false";
     case SP_TAG_INT: return "Integer";
     case SP_TAG_FLT: return "Float";
-    case SP_TAG_STR: return "String";
     case SP_TAG_SYM: return "Symbol";
     default: break;
   }
   if (v.tag == SP_TAG_OBJ) {
-    /* a String's handle box is a String */
-    if (v.cls_id == SP_BUILTIN_STRBUF) return "String";
     if (v.cls_id >= 0 && sp_obj_cls_name_fn) {
       const char *cn = sp_obj_cls_name_fn((int)v.cls_id);
       if (cn) return cn;
@@ -340,13 +365,6 @@ static sp_int sio_limit_arg(sp_RbVal v) {
   return -1;
 }
 
-/* A shared-mutable String held in a container is boxed as a handle; it reads
-   as its live text. */
-static sp_RbVal sio_arg_value(sp_RbVal v) {
-  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_STRBUF) return sp_box_str(sp_String_cstr((sp_String *)v.v.p));
-  return v;
-}
-
 /* putc(Integer), the [:int] binding: its low byte, but one past a C int is
    CRuby's RangeError (NUM2CHR), raised after the stream's own write check */
 sp_int sp_StringIO_putc_i(sp_StringIO *s, sp_int ch) {
@@ -363,9 +381,11 @@ sp_int sp_StringIO_putc_i(sp_StringIO *s, sp_int ch) {
    CRuby's errors). It answers its argument, not what it wrote. */
 sp_RbVal sp_StringIO_putc_v(sp_StringIO *s, sp_RbVal v) {SP_GC_ROOT(s);SP_GC_ROOT_RBVAL(v);
   sio_check_write(s);
-  sp_RbVal a = sio_arg_value(v);
-  if (a.tag == SP_TAG_STR) { sp_StringIO_putc_s(s, a.v.s); return v; }
-  sp_StringIO_putc_i(s, sp_poly_arg_int(a));
+  if (sp_rbval_is_string(v)) {
+    sp_StringIO_putc_s(s, sp_rbval_string_bytes(v));
+    return v;
+  }
+  sp_StringIO_putc_i(s, sp_poly_arg_int(v));
   return v;
 }
 
@@ -374,13 +394,11 @@ sp_RbVal sp_StringIO_putc_v(sp_StringIO *s, sp_RbVal v) {SP_GC_ROOT(s);SP_GC_ROO
    anything else is the limit. With two, the first is the separator and the
    second the limit (nil for none). A trailing Hash is the keywords; `chomp:`
    is the one this reader takes. */
-static void sio_line_args(const sp_RbVal *a0, int n0, const char **sep, sp_int *limit, sp_bool *chomp) {
+static void sio_line_args(const sp_RbVal *a, int n0, const char **sep, sp_int *limit, sp_bool *chomp) {
   *sep = SPL("\n"); *limit = -1; *chomp = 0;
-  sp_RbVal sv[8];
-  int n = 0, given = n0;
-  for (int j = 0; j < n0 && j < 8; j++) sv[n++] = sio_arg_value(a0[j]);
-  const sp_RbVal *a = sv;
-  if (n > 0 && a[n - 1].tag == SP_TAG_OBJ && sp_json_kind_fn && sp_json_kind_fn(a[n - 1]) == 2) {
+  int n = n0 < 8 ? n0 : 8, given = n0;
+  if (n > 0 && a[n - 1].tag == SP_TAG_OBJ && !sp_rbval_is_string(a[n - 1]) &&
+      sp_json_kind_fn && sp_json_kind_fn(a[n - 1]) == 2) {
     sp_RbVal h = a[n - 1];
     sp_int hn = sp_json_len_fn(h);
     char unk[160]; int nunk = 0; size_t ul = 0;
@@ -410,13 +428,19 @@ static void sio_line_args(const sp_RbVal *a0, int n0, const char **sep, sp_int *
   }
   if (n == 1) {
     if (a[0].tag == SP_TAG_NIL) *sep = NULL;
-    else if (a[0].tag == SP_TAG_STR) *sep = a[0].v.s ? a[0].v.s : SPL("");
+    else if (sp_rbval_is_string(a[0])) {
+      const char *bytes = sp_rbval_string_bytes(a[0]);
+      *sep = bytes ? bytes : SPL("");
+    }
     else *limit = sio_limit_arg(a[0]);
     return;
   }
   if (n == 2) {
     if (a[0].tag == SP_TAG_NIL) *sep = NULL;
-    else if (a[0].tag == SP_TAG_STR) *sep = a[0].v.s ? a[0].v.s : SPL("");
+    else if (sp_rbval_is_string(a[0])) {
+      const char *bytes = sp_rbval_string_bytes(a[0]);
+      *sep = bytes ? bytes : SPL("");
+    }
     else sio_type_error(a[0], "String");
     *limit = sio_limit_arg(a[1]);
   }
@@ -451,7 +475,7 @@ static sp_RbVal sio_readlines_n(sp_StringIO *s, const sp_RbVal *a, int n) {SP_GC
   sp_PolyArray *r = sp_PolyArray_new();
   SP_GC_ROOT(r);
   const char *l;
-  while ((l = sio_getline(s, sep, limit, chomp)) != NULL) sp_PolyArray_push(r, sp_box_str(l));
+  while ((l = sio_getline(s, sep, limit, chomp)) != NULL) sp_PolyArray_push(r, sp_box_str_new(l));
   return sp_box_poly_array(r);
 }
 sp_RbVal sp_StringIO_readlines_a1(sp_StringIO *s, sp_RbVal a) {SP_GC_ROOT(s);SP_GC_ROOT_RBVAL(a); return sio_readlines_n(s, &a, 1); }
@@ -479,7 +503,7 @@ sp_RbVal sp_StringIO_readlines(sp_StringIO *s) {SP_GC_ROOT(s);
   sp_PolyArray *a = sp_PolyArray_new();
   SP_GC_ROOT(a);
   const char *l;
-  while ((l = sp_StringIO_gets(s)) != NULL) sp_PolyArray_push(a, sp_box_str(l));
+  while ((l = sp_StringIO_gets(s)) != NULL) sp_PolyArray_push(a, sp_box_str_new(l));
   return sp_box_poly_array(a);
 }
 
@@ -488,10 +512,12 @@ sp_RbVal sp_StringIO_readlines(sp_StringIO *s) {SP_GC_ROOT(s);
    line, via the generic container hooks) and terminates lines. A value kind
    this in-memory stream can't render raises rather than writing garbage. */
 static int64_t sio_write_val(sp_StringIO *s, sp_RbVal v, int is_puts) {SP_GC_ROOT(s);SP_GC_ROOT_RBVAL(v);
-  v = sp_rbval_str(v);
   int64_t p0 = s->pos, w = 0;
-  switch (v.tag) {
-    case SP_TAG_STR: { const char *t = v.v.s ? v.v.s : ""; w += sio_write(s, t, (int64_t)sp_str_byte_len(t)); break; }
+  if (sp_rbval_is_string(v)) {
+    const char *t = sp_rbval_string_bytes(v);
+    if (t) w += sio_write(s, t, (int64_t)sp_str_byte_len(t));
+  }
+  else switch (v.tag) {
     case SP_TAG_INT: { const char *t = sp_int_to_s(v.v.i); w += sio_write(s, t, (int64_t)strlen(t)); break; }
     case SP_TAG_FLT: { const char *t = sp_float_to_s(v.v.f); w += sio_write(s, t, (int64_t)strlen(t)); break; }
     case SP_TAG_BOOL: { const char *t = v.v.b ? "true" : "false"; w += sio_write(s, t, (int64_t)strlen(t)); break; }
@@ -502,19 +528,13 @@ static int64_t sio_write_val(sp_StringIO *s, sp_RbVal v, int is_puts) {SP_GC_ROO
         for (sp_int i = 0; i < n; i++) w += sio_write_val(s, sp_json_aref_fn(v, i), 1);
         return w;  /* elements each terminated their own line */
       }
-      /* anything else writes its #to_s, as IO#write and Kernel#print do. A
-         user #to_s answers a Ruby String, measured by its recorded length so
-         an embedded NUL survives; the generic renderer may answer a static
-         class or symbol name with no length in front of it. */
-      if (v.tag == SP_TAG_OBJ && v.cls_id >= 0 && v.v.p && sp_obj_to_s_fn) {
-        const char *t = sp_obj_to_s_fn((int)v.cls_id, v.v.p);
-        if (t) { w += sio_write(s, t, (int64_t)sp_str_byte_len(t)); break; }
+      /* Write the selected display result and its byte length. */
+      {
+        size_t n;
+        const char *t = sp_poly_to_s_bytes(v, &n);
+        w += sio_write(s, t, (int64_t)n);
+        break;
       }
-      if (sp_poly_to_s_fn) {
-        const char *t = sp_poly_to_s_fn(v);
-        w += sio_write(s, t, (int64_t)strlen(t)); break;
-      }
-      sp_raise_cls("TypeError", "can't write value to StringIO");
   }
   /* terminate the line unless THIS value's bytes already ended with one */
   if (is_puts && (s->pos == p0 || s->buf[s->pos - 1] != '\n')) w += sio_write(s, "\n", 1);
@@ -541,33 +561,29 @@ static int64_t sio_write_vals(sp_StringIO *s, sp_int n, sp_RbVal *v, int is_puts
 void sp_StringIO_print_va(sp_StringIO *s, sp_int n, sp_RbVal *v) { sio_check_write(s); sio_write_vals(s, n, v, 0); }
 void sp_StringIO_puts_va(sp_StringIO *s, sp_int n, sp_RbVal *v) { sio_write_vals(s, n, v, 1); }
 sp_int sp_StringIO_write_va(sp_StringIO *s, sp_int n, sp_RbVal *v) { if (n > 0) sio_check_write(s); return sio_write_vals(s, n, v, 0); }  /* write(nil) writes nothing, but asks first */
-/* read(*args), when the count is only known at run time: read, read(nil)
-   and read(len). A buffer to read into is not supported here. */
+/* read(len, buffer) and argument lists use the same read operation. */
 const char *sp_StringIO_read_va(sp_StringIO *s, sp_int n, sp_RbVal *v) {
+  SP_GC_ROOT(s);
   sio_check_read(s);
   if (n > 2) {
-    char msg[80];
-    snprintf(msg, sizeof msg, "wrong number of arguments (given %lld, expected 0..2)", (long long)n);
-    sp_raise_cls("ArgumentError", msg);
+    char message[80];
+    snprintf(message, sizeof message, "wrong number of arguments (given %lld, expected 0..2)", (long long)n);
+    sp_raise_cls("ArgumentError", message);
   }
-  if (n == 2) sp_raise_cls("NotImplementedError", "StringIO#read into a buffer");
-  if (n == 0 || v[0].tag == SP_TAG_NIL) return sp_StringIO_read(s);
-  if (v[0].tag == SP_TAG_INT) return sp_StringIO_read_n(s, v[0].v.i);
-  if (v[0].tag == SP_TAG_FLT) {
-    double f = v[0].v.f;
-    /* a Float out of Integer's range raises as CRuby's does, not cast */
-    if (!(f > -9223372036854775808.0 && f < 9223372036854775808.0)) {
-      char msg[96];
-      if (f != f) snprintf(msg, sizeof msg, "float NaN out of range of integer");
-      else if (f == 1.0 / 0.0) snprintf(msg, sizeof msg, "float Inf out of range of integer");
-      else if (f == -1.0 / 0.0) snprintf(msg, sizeof msg, "float -Inf out of range of integer");
-      else snprintf(msg, sizeof msg, "float %-.10g out of range of integer", f);
-      sp_raise_cls("RangeError", msg);
-    }
-    return sp_StringIO_read_n(s, (sp_int)f);
-  }
-  sio_type_error(v[0], "Integer");
-  return NULL;
+
+  sp_RbVal length = n ? v[0] : sp_box_nil();
+  sp_RbVal buffer = n == 2 ? v[1] : sp_box_nil();
+  SP_GC_ROOT_RBVAL(length);
+  SP_GC_ROOT_RBVAL(buffer);
+  sp_String *out = buffer.tag == SP_TAG_NIL ? NULL : sp_poly_arg_string(buffer);
+  SP_GC_ROOT(out);
+  if (out && sp_String_is_immutable(out)) sp_raise_frozen_str(out->data);
+
+  int rest = length.tag == SP_TAG_NIL;
+  sp_int count = rest ? 0 : sp_poly_arg_int(length);
+  if (count < 0)
+    sp_raise_cls("ArgumentError", sp_sprintf("negative length %lld given", (long long)count));
+  return sio_read_chunk(s, count, rest, out);
 }
 
 /* --share-strings: a StringIO over the String it is opened on, as CRuby's:
@@ -629,11 +645,7 @@ static void sio_reopen(sp_StringIO *s) {
   sp_gc_wb(s);
 }
 const char *sp_StringIO_set_string(sp_StringIO *s, const char *str) {SP_GC_ROOT(s);SP_GC_ROOT_STR(str);
-  if (!str) sp_raise_cls("TypeError", "no implicit conversion of nil into String");
-  sio_reopen(s);
-  s->str = NULL; s->buf = (char *)str; s->len = s->cap = (int64_t)sp_str_byte_len(str); s->borrowed = 1;
-  s->ro = (s->ro & 1) | (sp_str_is_frozen_val(str) ? 2 : 0);
-  return str;
+  return sp_String_cstr(sp_StringIO_set_string_h(s, sp_String_new_shared(str)));
 }
 sp_String *sp_StringIO_set_string_h(sp_StringIO *s, sp_String *str) {SP_GC_ROOT(s);SP_GC_ROOT(str);
   if (!str) sp_raise_cls("TypeError", "no implicit conversion of nil into String");

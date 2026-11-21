@@ -9,6 +9,7 @@
 #include "builtin_ops.h"
 #include "repr.h"
 #include "call_plan.h"
+#include "implicit_calls.h"
 #include "share.h"
 #include "codegen_call_arms.h"
 
@@ -86,9 +87,18 @@ static int emit_p_splat_value(Compiler *c, const char *name, int argc, const int
   return 1;
 }
 
+/* A block parameter the conversion method takes but does not yield to is a
+   parameter of its C function (emit_method_signature); the conversion passes
+   none. */
+static const char *kconv_blk_arg(const Compiler *c, int mi) {
+  const Scope *s = &c->scopes[mi];
+  return s->blk_param && s->blk_param[0] && !s->yields ? ", NULL" : "";
+}
 static int emit_kconv_obj_nil(Compiler *c, int arg, int ci, const char *m1, const char *m2, Buf *b) {
-  int d = ci, mi = comp_method_in_chain(c, ci, m1, &d);
-  if (mi < 0 && m2) { m1 = m2; mi = comp_method_in_chain(c, ci, m2, &d); }
+  int host = ic_operand_host(c, arg);
+  MethodLookup ml;
+  int mi = cplan_implied_target(c, host, arg, ci, m1, 0, &ml), d = ml.def_class;
+  if (mi < 0 && m2) { m1 = m2; mi = cplan_implied_target(c, host, arg, ci, m2, 0, &ml); d = ml.def_class; }
   if (mi < 0 || !repr_of(c, arg).may_nil) return 0;
   TyKind rt = (TyKind)c->scopes[mi].ret;
   char nil_c[64];
@@ -96,7 +106,63 @@ static int emit_kconv_obj_nil(Compiler *c, int arg, int ci, const char *m1, cons
   const char *cn = c->classes[d].c_name;
   int t = ++g_tmp;
   buf_printf(b, "({ sp_%s *_t%d = (sp_%s *)(", cn, t, cn); emit_expr(c, arg, b);
-  buf_printf(b, "); SP_GC_ROOT(_t%d); _t%d ? %s(_t%d) : %s; })", t, t, mc_method(c, &c->scopes[mi]), t, nil_c);
+  buf_printf(b, "); SP_GC_ROOT(_t%d); _t%d ? %s(_t%d%s) : %s; })", t, t, mc_method(c, &c->scopes[mi]), t, kconv_blk_arg(c, mi), nil_c);
+  return 1;
+}
+
+/* Kernel.String applies the ordinary protocol to a boxed operand. A
+   reopened Symbol uses the zero-argument targets of the conversion site,
+   because a Symbol's immediate tag does not use the user-object bridge. */
+int emit_op_kernel_string(Compiler *c, const BopCtx *x, Buf *b) {
+  int argc = x->argc;
+  const int *argv = x->argv ? x->argv : call_args(c->nt, x->id, &argc);
+  int arg = argv[0], sym = comp_core_class(c, CORE_SYMBOL);
+  int str = sym >= 0 ? call_target(c, x->id, sym, "to_str", CT_IMPLIED, NULL) : -1;
+  MethodLookup lookup = { .def_class = -1 };
+  int text = sym >= 0 ? call_target(c, x->id, sym, "to_s", CT_IMPLIED, &lookup) : -1;
+  int text_undef = lookup.kind == ML_NONE && lookup.why == MLW_UNDEF;
+  if (str < 0 && text < 0 && !text_undef) {
+    buf_puts(b, "sp_poly_as_strbuf(sp_kernel_string(");
+    emit_boxed(c, arg, b);
+    buf_puts(b, "))");
+    return 1;
+  }
+  int tv = ++g_tmp, tr = ++g_tmp;
+  char argtext[56];
+  snprintf(argtext, sizeof argtext, "(sp_sym)_t%d.v.i", tv);
+  buf_printf(b, "({ sp_RbVal _t%d = ", tv);
+  emit_boxed(c, arg, b);
+  buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_RbVal _t%d = sp_box_nil(); SP_GC_ROOT_RBVAL(_t%d); ", tv, tr, tr);
+  buf_printf(b, "if (_t%d.tag == SP_TAG_SYM) { ", tv);
+  Buf str_live = {0}, text_live = {0}, text_gone = {0};
+  emit_implied_entry_test(c, str, 0, &str_live);
+  emit_implied_entry_test(c, text, 0, &text_live);
+  emit_implied_entry_test(c, text, 1, &text_gone);
+  if (str >= 0) {
+    if (str_live.p) buf_printf(b, "if (%s) ", str_live.p);
+    buf_printf(b, "_t%d = ", tr);
+    emit_zero_arg_boxed_call(c, str, argtext, b);
+    buf_printf(b, "; if (!sp_str_cmp_conv(_t%d, _t%d)) { ", tr, tv);
+  }
+  if (text >= 0) {
+    if (text_live.p) buf_printf(b, "if (%s) { ", text_live.p);
+    buf_printf(b, "_t%d = sp_kernel_string_to_s_result(_t%d, ", tr, tv);
+    emit_zero_arg_boxed_call(c, text, argtext, b);
+    buf_puts(b, "); ");
+    if (text_live.p) buf_puts(b, "}\nelse ");
+  }
+  if (text < 0 || text_live.p) {
+    if (text_gone.p) buf_printf(b, "if (%s) ", text_gone.p);
+    if (text_undef || text_gone.p)
+      buf_puts(b, "{ sp_raise_cls(\"TypeError\", \"can't convert Symbol into String\"); } ");
+    if (text_gone.p) buf_puts(b, "\nelse ");
+    if (!text_undef) buf_printf(b, "{ _t%d = sp_kernel_string(_t%d); } ", tr, tv);
+  }
+  free(str_live.p);
+  free(text_live.p);
+  free(text_gone.p);
+  if (str >= 0) buf_puts(b, "} ");
+  buf_printf(b, "}\nelse { _t%d = sp_kernel_string(_t%d); } sp_poly_as_strbuf(_t%d); })", tr, tv, tr);
   return 1;
 }
 
@@ -109,13 +175,9 @@ int emit_dispatch_row_answer(Compiler *c, int id, const int *atmp, int natmp, Ty
   if (atmp)
     for (int a = 0; a < argc && a < natmp; a++)
       if (subtree_has_side_effect(c, argv[a])) view_bind_temp(argv[a], atmp[a]);
-  Buf rb; memset(&rb, 0, sizeof rb);
-  const BuiltinOp *op = name ? bop_find(BOP_KERNEL, name, argc, nt_ref(c->nt, id, "block") >= 0) : NULL;
-  int ok = op && emit_builtin_op_arm_text(c, id, -1, BOP_KERNEL, name, NULL, 0, &rb);   /* (one arm of a dispatch: the node answers what the dispatch does) */
+  /* The result is the dispatch's, so do not observe the row as the full call. */
+  int ok = emit_builtin_kernel_dispatch_arm(c, id, name, ret, b);
   view_unbind(ov);
-  if (ok && ret == TY_POLY) emit_boxed_text(c, op->result, rb.p ? rb.p : "", b);
-  else if (ok) buf_puts(b, rb.p ? rb.p : "");
-  free(rb.p);
   return ok;
 }
 
@@ -162,7 +224,8 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
        the same END register it once */
     if (end_once) buf_printf(b, "({ static int _t%d; if (!SP_ATOMIC_EXCHANGE(&_t%d, 1, __ATOMIC_ACQ_REL)) { ", to, to);
     buf_puts(b, "sp_at_exit_push(");
-    emit_proc_literal(c, id, b);
+    /* (`at_exit(&pr)` registers the Proc the expression holds, not a block of its own) */
+    if (!emit_forwarded_proc_arg(c, nt_ref(nt, id, "block"), b)) emit_proc_literal(c, id, b);
     buf_puts(b, ")");
     if (end_once) buf_puts(b, "; } 0; })");
     return 1;
@@ -178,8 +241,9 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
   {
     int vk = vis_decl_call(c, id), cw = 0;
     if (vk) {
+      /* (one that names a method the class has none of raises NameError where it runs, as its statement does) */
       Buf wb; memset(&wb, 0, sizeof wb);
-      if ((cw = emit_vis_cell_write(c, id, &wb))) buf_printf(b, "(%s, ", wb.p);
+      if ((cw = emit_vis_word_absent(c, id, &wb)) || (cw = emit_vis_cell_write(c, id, &wb))) buf_printf(b, "(%s, ", wb.p);
       free(wb.p);
     }
     if (vk == VIS_DECL_NIL) buf_puts(b, "0");
@@ -297,7 +361,10 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     if (g_block_id >= 0 && nt_int(nt, g_block_id, "fwd_yield", 0)) {
       /* the literal a forwarded `&b` became: ask about the enclosing
          method's block (see static_block_given_cond) */
-      if (g_yield_block_fallback >= 0 || g_yield_proc_ref_fallback) buf_puts(b, "1");
+      /* a proc form's own block, NULL where its caller gave none
+         (fwd_yield_proc_form_block) */
+      if (fwd_yield_proc_form_block(c)) buf_printf(b, "(%s != NULL)", g_yield_proc_ref_fallback);
+      else if (g_yield_block_fallback >= 0 || g_yield_proc_ref_fallback) buf_puts(b, "1");
       else if (g_yield_lowered_fallback) {
         const char *sv = g_lowered_blk_name; g_lowered_blk_name = g_yield_lowered_blk_fallback;
         buf_puts(b, "("); emit_yblk_ref(b); buf_puts(b, " != NULL)");
@@ -344,7 +411,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
      `module_function; def format(...)` beside a sibling that calls it
      bare lost to Kernel#format (#4592). Same ownership test every
      other Kernel arm here makes. */
-  int kconv = (recv < 0 && (cplan_builtin_call(c, id) || call_target(c, id, -1, name, CT_TOP, NULL) < 0) &&
+  int kconv = (recv < 0 && call_target(c, id, -1, name, CT_TOP, NULL) < 0 &&
                !bare_call_class_owned(c, id));
   if (!kconv && recv >= 0) {
     TyKind krt = comp_ntype(c, recv);
@@ -579,58 +646,6 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       }
       return 1;
     }
-    if (sp_streq(name, "String") && ac == 1) {
-      TyKind at = repr_of(c, av[0]).as_ty;
-      if (at == TY_STRING && nt_kind(nt, av[0]) == NK_StringNode) emit_expr(c, av[0], b);
-      else if (at == TY_STRING) {
-        int ts = ++g_tmp;
-        buf_printf(b, "({ const char *_t%d = ", ts); emit_expr(c, av[0], b);
-        buf_printf(b, "; _t%d ? _t%d : sp_str_frozen_empty; })", ts, ts);
-      }
-      /* a nullable Integer or Float whose nil flag is set is nil, whose
-         String is "": box it, as nil where it is one */
-      else if ((at == TY_INT || at == TY_FLOAT) && call_returns_nullable_int(c, av[0])) {
-        buf_puts(b, "sp_poly_to_s("); emit_boxed(c, av[0], b); buf_puts(b, ")");
-      }
-      else if (at == TY_INT) { buf_puts(b, "sp_int_to_s("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
-      else if (at == TY_FLOAT) { buf_puts(b, "sp_float_to_s("); emit_expr(c, av[0], b); buf_puts(b, ")"); }
-      /* a boxed object answering #to_str converts through it
-         (sp_poly_check_str), as a typed one does below, and only then through
-         #to_s; the root here holds it across both, where sp_poly_check_str
-         holds it only across #to_str */
-      else if (at == TY_POLY) {
-        int ts = ++g_tmp;
-        buf_puts(b, "({ "); ts = hold_operand(c, av[0], TY_POLY, 0, ts, 1, " ", b);
-        buf_printf(b, "const char *_s%d = sp_poly_check_str(_t%d);"
-                      " _s%d ? _s%d : sp_poly_to_s(_t%d); })", ts, ts, ts, ts, ts);
-      }
-      /* the frozen "true" / "false" true.to_s answers; a bare C literal here
-         had no marker byte at all */
-      else if (at == TY_BOOL) { buf_puts(b, "(("); emit_expr(c, av[0], b); buf_puts(b, ") ? sp_str_frozen_true : sp_str_frozen_false)"); }
-      else if (at == TY_SYMBOL) { buf_puts(b, "sp_sym_to_s_new("); emit_expr(c, av[0], b); buf_puts(b, ")"); }   /* String(sym) calls to_s: a new String */
-      else if (at == TY_NIL || at == TY_UNKNOWN) { buf_puts(b, "sp_poly_to_s(sp_box_nil())"); }
-      else if (ty_is_object(at) && emit_kconv_obj_nil(c, av[0], ty_object_class(at), "to_str", NULL, b)) {}
-      /* Kernel#String asks for #to_str first, and only then #to_s (#3721) */
-      else if (ty_is_object(at) &&
-               comp_method_in_chain(c, ty_object_class(at), "to_str", NULL) >= 0) {
-        int tsc = ty_object_class(at), tsd = tsc;
-        (void)comp_method_in_chain(c, tsc, "to_str", &tsd);
-        if (expr_is_held_ref(c, av[0])) {
-          buf_printf(b, "sp_%s_to_str((sp_%s *)(", c->classes[tsd].c_name, c->classes[tsd].c_name);
-          emit_expr(c, av[0], b); buf_puts(b, "))");
-        }
-        else {
-          /* rooted: `String(C.new)` holds the fresh object nowhere else while
-             its #to_str allocates */
-          int tso = ++g_tmp;
-          buf_printf(b, "({ sp_%s *_t%d = (sp_%s *)(", c->classes[tsd].c_name, tso, c->classes[tsd].c_name);
-          emit_expr(c, av[0], b);
-          buf_printf(b, "); SP_GC_ROOT(_t%d); sp_%s_to_str(_t%d); })", tso, c->classes[tsd].c_name, tso);
-        }
-      }
-      else { buf_puts(b, "sp_poly_to_s("); emit_boxed(c, av[0], b); buf_puts(b, ")"); }  /* container/range/object: #to_s */
-      return 1;
-    }
     if (sp_streq(name, "Array") && ac == 1) {
       /* an argument already typed as an array is returned as-is (identity and
          element type preserved); a statically scalar argument wraps into a typed
@@ -659,7 +674,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
         buf_printf(b, "; SP_GC_ROOT(_t%d); sp_kernel_array(sp_box_nullable_obj(_t%d, SP_BUILTIN_STRBUF)); })", t, t);
       }
       else if (at == TY_INT || at == TY_FLOAT || at == TY_STRING) {
-        const char *ak = at == TY_INT ? "Int" : at == TY_FLOAT ? "Float" : "Str";
+        const char *ak = array_kind(ty_array_of(at));
         int t = ++g_tmp;
         /* a nullable Integer or Float whose nil flag is set is nil, and
            Array(nil) is empty: the element goes in only when it is one */
@@ -671,30 +686,37 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
           buf_printf(b, ") sp_%sArray_push(_t%d, %s.v); _t%d; })", ak, t, ref, t);
           return 1;
         }
-        buf_printf(b, "({ sp_%sArray *_t%d = sp_%sArray_new(); SP_GC_ROOT(_t%d); sp_%sArray_push(_t%d, ", ak, t, ak, t, ak, t);
-        if (at == TY_INT) emit_int_expr(c, av[0], b);
-        else if (at == TY_FLOAT) emit_float_expr(c, av[0], b);
-        else emit_expr(c, av[0], b);
-        buf_printf(b, "); _t%d; })", t);
+        buf_printf(b, "({ sp_%sArray *_t%d = sp_%sArray_new(); SP_GC_ROOT(_t%d); ", ak, t, ak, t);
+        if (at == TY_STRING) {   /* (a String Array holds the String's handle, of either face) */
+          Buf sb; memset(&sb, 0, sizeof sb); emit_expr(c, av[0], &sb);
+          emit_kind_push(c, b, ak, t, sb.p ? sb.p : "NULL"); free(sb.p);
+        }
+        else {
+          emit_elem_entry(b, 0, array_kind_ty(ak), ak, "push", ""); buf_printf(b, "(_t%d, ", t);
+          if (at == TY_INT) emit_int_expr(c, av[0], b); else emit_float_expr(c, av[0], b);
+          buf_puts(b, ")");
+        }
+        buf_printf(b, "; _t%d; })", t);
       }
       else if (ty_is_object(at) && emit_kconv_obj_nil(c, av[0], ty_object_class(at), "to_ary", "to_a", b)) {}
       /* Kernel#Array asks the object for #to_ary, then #to_a (#3721) */
       else if (ty_is_object(at) &&
-               (comp_method_in_chain(c, ty_object_class(at), "to_ary", NULL) >= 0 ||
-                comp_method_in_chain(c, ty_object_class(at), "to_a", NULL) >= 0)) {
-        int acid = ty_object_class(at), adef = acid;
-        const char *anm = comp_method_in_chain(c, acid, "to_ary", NULL) >= 0 ? "to_ary" : "to_a";
-        int ami = comp_method_in_chain(c, acid, anm, &adef);
+               (cplan_implied_target(c, id, av[0], ty_object_class(at), "to_ary", CIT_TABLE, NULL) >= 0 ||
+                cplan_implied_target(c, id, av[0], ty_object_class(at), "to_a", CIT_TABLE, NULL) >= 0)) {
+        int acid = ty_object_class(at);
+        const char *anm = cplan_implied_target(c, id, av[0], acid, "to_ary", CIT_TABLE, NULL) >= 0 ? "to_ary" : "to_a";
+        MethodLookup aml = { .def_class = -1 };
+        int ami = cplan_implied_target(c, id, av[0], acid, anm, CIT_TABLE, &aml), adef = aml.def_class;
         if (expr_is_held_ref(c, av[0])) {
           buf_printf(b, "%s((sp_%s *)(", mc_method(c, &c->scopes[ami]), c->classes[adef].c_name);
-          emit_expr(c, av[0], b); buf_puts(b, "))");
+          emit_expr(c, av[0], b); buf_printf(b, ")%s)", kconv_blk_arg(c, ami));
         }
         else {
           /* rooted, as Kernel#String roots its #to_str receiver */
           int tao = ++g_tmp;
           buf_printf(b, "({ sp_%s *_t%d = (sp_%s *)(", c->classes[adef].c_name, tao, c->classes[adef].c_name);
           emit_expr(c, av[0], b);
-          buf_printf(b, "); SP_GC_ROOT(_t%d); %s(_t%d); })", tao, mc_method(c, &c->scopes[ami]), tao);
+          buf_printf(b, "); SP_GC_ROOT(_t%d); %s(_t%d%s); })", tao, mc_method(c, &c->scopes[ami]), tao, kconv_blk_arg(c, ami));
         }
       }
       else { buf_puts(b, "sp_kernel_array("); emit_boxed(c, av[0], b); buf_puts(b, ")"); }
@@ -732,9 +754,10 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       else if (ty_is_object(at) && emit_kconv_obj_nil(c, av[0], ty_object_class(at), "to_hash", NULL, b)) {}
       /* an object answers through its own #to_hash (#3721) */
       else if (ty_is_object(at) &&
-               comp_method_in_chain(c, ty_object_class(at), "to_hash", NULL) >= 0) {
-        int hci = ty_object_class(at), hdef = hci;
-        int hmi = comp_method_in_chain(c, hci, "to_hash", &hdef);
+               cplan_implied_target(c, id, av[0], ty_object_class(at), "to_hash", CIT_TABLE, NULL) >= 0) {
+        int hci = ty_object_class(at);
+        MethodLookup hml = { .def_class = -1 };
+        int hmi = cplan_implied_target(c, id, av[0], hci, "to_hash", CIT_TABLE, &hml), hdef = hml.def_class;
         if (sp_streq(c->scopes[hmi].name, "to_hash")) buf_printf(b, "sp_%s_to_hash(", c->classes[hdef].c_name);
         else { buf_puts(b, mc_method(c, &c->scopes[hmi])); buf_puts(b, "("); }
         buf_printf(b, "(sp_%s *)(", c->classes[hdef].c_name);
@@ -960,8 +983,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
   if (recv < 0 && (sp_streq(name, "exit") || sp_streq(name, "exit!")) && !bare_call_class_owned(c, id)) {
     Scope *xsc = comp_scope_of(c, id);
     int xcls = xsc ? xsc->class_id : -1;
-    if (xcls >= 0 && (comp_reader_in_chain(c, xcls, name, NULL) ||
-                      call_target(c, id, xcls, name, 0, NULL) >= 0)) {
+    if (xcls >= 0 && call_answers(c, id, xcls, name, 0, NULL)) {
       /* not Kernel#exit: leave it to the reader/method dispatch below */
     }
     else {
@@ -1000,7 +1022,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       nt_ref(nt, id, "block") < 0) {
     buf_puts(b, "({ ");
     if (argc == 0 && sp_streq(name, "puts")) buf_puts(b, "putchar('\n');\n");
-    if (!emit_output_spilled(c, name, argc, argv, b, 0)) {
+    if (!emit_output_spilled(c, id, name, argc, argv, b, 0)) {
       for (int k = 0; k < argc; k++) {
         if (sp_streq(name, "puts")) emit_puts_one(c, argv[k], b, 0);
         else emit_print_one(c, argv[k], b, 0);
@@ -1092,6 +1114,16 @@ static void emit_env_str(Compiler *c, int v, int value, Buf *b) {
   emit_str_expr(c, v, b);
   if (env_str_checked(c, v)) buf_printf(b, ", %d)", value);
 }
+/* The ordinary operand holders keep both Ruby objects through the write. */
+void emit_env_store_value(Compiler *c, int id, const int *argv, TyKind face, Buf *b) {
+  buf_puts(b, "({ ");
+  int key = hold_operand(c, argv[0], TY_POLY, 1, ++g_tmp, 1, " ", b);
+  int value = hold_operand(c, argv[1], TY_POLY, 1, ++g_tmp, 1, " ", b);
+  if (face == TY_STRBUF) buf_puts(b, "sp_strface_h_box(");
+  else if (face == TY_STRING) buf_puts(b, "sp_strface_b_box(");
+  buf_printf(b, "sp_env_aset(_t%d, _t%d, %d)%s; })", key, value, nt_attr_write(c->nt, id),
+             face == TY_STRBUF || face == TY_STRING ? ")" : "");
+}
 /* The value ENV.delete(k)'s literal block answers when k is unset: its
    last statement (codegen_internal.h; repr_call_returns_handle asks it) */
 int env_delete_block_value(Compiler *c, int v) {
@@ -1099,8 +1131,7 @@ int env_delete_block_value(Compiler *c, int v) {
   const char *nm = v >= 0 && nt_kind(nt, v) == NK_CallNode ? nt_str(nt, v, "name") : NULL;
   int recv = is_delete_name(nm) ? nt_ref(nt, v, "receiver") : -1;
   int blk = recv >= 0 ? nt_ref(nt, v, "block") : -1, argc = 0;
-  if (blk < 0 || nt_kind(nt, blk) != NK_BlockNode || nt_kind(nt, recv) != NK_ConstantReadNode ||
-      !is_env_const(nt_str(nt, recv, "name")) || comp_const(c, "ENV"))
+  if (blk < 0 || nt_kind(nt, blk) != NK_BlockNode || !env_value_recv(c, recv, comp_ntype(c, recv)))
     return -1;
   call_args(nt, v, &argc);
   if (argc != 1) return -1;
@@ -1352,6 +1383,9 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
       int cic = g_uses_ensure ? ++g_tmp : 0;
       /* ...and the handler stack, which such a body pushed it on as $! */
       if (cic) { emit_indent(g_pre, g_indent); buf_printf(g_pre, "void *_cic%d = sp_inflight_cause; int _cicr%d = sp_rescue_sp;\n", cic, cic); }
+      /* A throw can leave a method with a Proc return home at this same
+         exception depth. Restore the chain that was live at catch entry. */
+      emit_indent(g_pre, g_indent); buf_printf(g_pre, "sp_proc_home *_cph%d = sp_proc_ret_head;\n", t);
       emit_indent(g_pre, g_indent);
       buf_puts(g_pre, "if (setjmp(sp_catch_stack[sp_catch_top-1]) == 0) {\n");
       /* a bare break in a catch body keeps today's C-break behavior */
@@ -1393,6 +1427,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
       emit_indent(g_pre, g_indent); buf_puts(g_pre, "else {\n");
       emit_indent(g_pre, g_indent + 1); buf_puts(g_pre, "sp_catch_top--;\n");
       emit_indent(g_pre, g_indent + 1); buf_puts(g_pre, "sp_gc_nroots = sp_catch_rootmark[sp_catch_top];\n");
+      emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "sp_proc_ret_head = _cph%d;\n", t);
       if (cic) { emit_indent(g_pre, g_indent + 1); buf_printf(g_pre, "sp_inflight_cause = _cic%d; sp_rescue_sp = _cicr%d;\n", cic, cic); }
       emit_indent(g_pre, g_indent + 1);
       /* a kind with an unbox of its own reads through it (emit_unbox_text): a
@@ -1470,19 +1505,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
 
   /* system(cmd, ...) expr: run, and answer true, false or nil */
   if (recv < 0 && sp_streq(name, "system") && argc >= 1 && !bare_call_class_owned(c, id)) {
-    if (emit_system_splat(c, id, argv, argc, b)) return 1;
-    system_refuse_unsupported(c, id, argv, argc);
-    /* each argument converts and is rooted before the next converts: a
-       #to_str's answer is a heap String the following conversion may collect */
-    int ts = ++g_tmp;
-    buf_puts(b, "({ ");
-    for (int k = 0; k < argc; k++) {
-      buf_printf(b, "const char *_sys_%d_%d = ", ts, k); emit_str_expr(c, argv[k], b);
-      buf_printf(b, "; SP_GC_ROOT_STR(_sys_%d_%d); ", ts, k);
-    }
-    buf_printf(b, "const char *_sys_%d[] = { ", ts);
-    for (int k = 0; k < argc; k++) { if (k > 0) buf_puts(b, ", "); buf_printf(b, "_sys_%d_%d", ts, k); }
-    buf_printf(b, ", NULL }; sp_system_answer(sp_system_args(%d, _sys_%d)); })", argc, ts);
+    emit_system_call(c, id, argv, argc, b);
     return 1;
   }
   /* trap(...) / Signal.trap(...): install the handler (a string command or a
@@ -1508,7 +1531,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         buf_puts(b, ")");
       }
       else if (argc >= 2) emit_boxed(c, argv[1], b);
-      else buf_puts(b, "sp_box_str(\"DEFAULT\")");
+      else buf_puts(b, "sp_box_str_new((&(\"\\xff\" \"DEFAULT\")[1]))");
       buf_puts(b, ")");
       return 1;
     }
@@ -1527,12 +1550,18 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
      validation (#2743, #2746, #2747, #2765, #2766, #2773). */
   {
     int erecv = nt_ref(nt, id, "receiver");
-    NodeKind erk = nt_kind(nt, erecv);
-    const char *ern = (erk == NK_ConstantReadNode) ? key_name(c, erecv) : NULL;
-    if (ern && sp_streq(ern, "ENV")) {
+    /* (a receiver typed ENV that runs code: the arms below answer from the environment and would drop it) */
+    if (erecv >= 0 && comp_ntype(c, erecv) == TY_ENV && !env_value_recv(c, erecv, TY_ENV))
+      unsupported_feature(c, id, "a call on ENV through an expression that runs code (a method answering ENV) is not supported yet; "
+                                 "hold ENV in a variable or call it on ENV itself");
+    if (env_value_recv(c, erecv, comp_ntype(c, erecv))) {
       const char *enm = nt_str(nt, id, "name");
       int eac = 0; const int *eav = call_args(nt, id, &eac);
-      /* a non-String key never converts: TypeError at the call (#2765/#2766) */
+      if (enm && eac == 2 && is_store_alias(enm)) {
+        emit_env_store_value(c, id, eav, repr_of(c, id).kind == RK_BOXED ? TY_POLY : TY_STRING, b);
+        return 1;
+      }
+      /* scalar keys to these readers raise TypeError. */
       if (enm && eac >= 1 &&
           (sp_streq(enm, "[]") || sp_streq(enm, "fetch") || sp_streq(enm, "key?") ||
            sp_streq(enm, "has_key?") || sp_streq(enm, "include?") || sp_streq(enm, "member?") ||
@@ -1666,10 +1695,8 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         int t1 = ++g_tmp, t2 = ++g_tmp;
         int dblk = nt_ref(nt, id, "block");
         int dpoly = repr_of(c, id).kind == RK_BOXED;
-        int result = dpoly ? ++g_tmp : t2;
-        /* --share-strings: a block value that is a handle is published, as
-           fetch's default is; a present key clears the return channel */
-        int dhandle = repr_call_returns_handle(c, id);
+        int dhandle = repr_of(c, id).as_ty == TY_STRBUF && repr_native_call_handle(c, id);
+        int result = dpoly || dhandle ? ++g_tmp : t2;
         /* --share-strings: a variable's handle is read as a copy of its
            bytes, which reach unsetenv past sp_env_str's allocation */
         Buf kref; memset(&kref, 0, sizeof kref);
@@ -1683,8 +1710,8 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         buf_printf(b, "; const char *_t%d = getenv(_t%d);"
                       " _t%d = _t%d ? sp_env_str(_t%d) : NULL;"
                       " unsetenv(_t%d); ", t2, t1, t2, t2, t2, t1);
-        if (dhandle) buf_puts(b, "_sp_ret_strbuf = NULL; ");
-        if (dpoly) buf_printf(b, "sp_RbVal _t%d = sp_box_str(_t%d); ", result, t2);
+        if (dhandle) buf_printf(b, "sp_String *_t%d = sp_String_new_shared(_t%d); ", result, t2);
+        else if (dpoly) buf_printf(b, "sp_RbVal _t%d = sp_box_str_new(_t%d); ", result, t2);
         if (dblk >= 0) {
           const char *dp0 = block_param_name(c, dblk, 0);
           int dbody = nt_ref(nt, dblk, "body");
@@ -1709,7 +1736,7 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
               buf_printf(b, "sp_RbVal lv_%s = sp_box_nullable_obj(%s, SP_BUILTIN_STRBUF); SP_GC_ROOT_RBVAL(lv_%s); ",
                          rename_local(dp0), kref.p, rename_local(dp0));
             else if (dpt == TY_POLY)
-              buf_printf(b, "sp_RbVal lv_%s = sp_box_str(_t%d); (void)lv_%s; ",
+              buf_printf(b, "sp_RbVal lv_%s = sp_box_str_new(_t%d); SP_GC_ROOT_RBVAL(lv_%s); ",
                          rename_local(dp0), t1, rename_local(dp0));
             else
               buf_printf(b, "const char *lv_%s = _t%d; (void)lv_%s; ",
@@ -1717,9 +1744,9 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
           }
           for (int k = 0; k < dbn - 1; k++) emit_stmt(c, dbb[k], b, 0);
           if (dval >= 0 && dhandle) {
-            buf_printf(b, "_t%d = sp_strbuf_read_pub(", result);
+            buf_printf(b, "_t%d = ", result);
             emit_strbuf_handle_of(c, dval, b);
-            buf_puts(b, "); ");
+            buf_puts(b, "; ");
           }
           else if (dval >= 0) {
             buf_printf(b, "_t%d = ", result);
@@ -1732,57 +1759,13 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         buf_printf(b, "_t%d; })", result);
         return 1;
       }
-      /* ENV.store(k, v) is []= */
-      if (enm && sp_streq(enm, "store") && eac == 2) {
-        buf_puts(b, "sp_env_aset(");
-        emit_str_expr(c, eav[0], b); buf_puts(b, ", ");
-        emit_boxed(c, eav[1], b); buf_puts(b, ")");
-        return 1;
-      }
     }
   }
   /* ENV[key] -> getenv */
   if (recv >= 0 && sp_streq(name, "[]") && argc == 1) {
-    NodeKind rty2_k = nt_kind(nt, recv);
-    if (rty2_k == NK_ConstantReadNode) {
-      const char *rn = key_name(c, recv);
-      if (rn && sp_streq(rn, "ENV")) {
+    {
+      if (env_value_recv(c, recv, comp_ntype(c, recv))) {
         buf_puts(b, "sp_env_str(getenv("); emit_env_str(c, argv[0], 0, b); buf_puts(b, "))");
-        return 1;
-      }
-    }
-  }
-  /* ENV[key] = value -> setenv (value nil unsets, like CRuby) */
-  if (recv >= 0 && sp_streq(name, "[]=") && argc == 2) {
-    NodeKind rty2_k = nt_kind(nt, recv);
-    if (rty2_k == NK_ConstantReadNode) {
-      const char *rn = nt_str(nt, recv, "name");
-      if (rn && sp_streq(rn, "ENV")) {
-        TyKind evt = comp_ntype(c, argv[1]);
-        NodeKind v1k = nt_kind(nt, argv[1]);
-        int lit_nil = v1k == NK_NilNode;
-        if (evt == TY_STRING || lit_nil) {
-          int tk = ++g_tmp, tv = ++g_tmp;
-          buf_printf(b, "({ const char *_t%d = ", tk); emit_str_expr(c, argv[0], b);
-          /* a key the operand builds (`ENV["K#{i}"] = v`) is held across the
-             value's evaluation when that can allocate */
-          if (operand_allocates_beside(c, argv[0]) && operand_allocates_beside(c, argv[1]))
-            buf_printf(b, "; SP_GC_ROOT(_t%d)", tk);
-          /* a nil VALUE unsets the variable; only the key is strict */
-          buf_printf(b, "; const char *_t%d = ", tv); emit_str_expr_nilable(c, argv[1], b);
-          if (env_str_checked(c, argv[0])) buf_printf(b, "; sp_env_chk(_t%d, 0)", tk);
-          buf_printf(b, "; if (_t%d) setenv(_t%d, %s_t%d%s, 1); else unsetenv(_t%d); _t%d; })", tv, tk,
-                     env_str_checked(c, argv[1]) ? "sp_env_chk(" : "", tv, env_str_checked(c, argv[1]) ? ", 1)" : "", tk, tv);
-        }
-        else {
-          /* runtime-typed RHS: nil deletes, a String sets, anything else
-             raises CRuby's TypeError (naming the actual class) */
-          buf_puts(b, "sp_env_aset(");
-          emit_str_expr(c, argv[0], b);
-          buf_puts(b, ", ");
-          emit_boxed(c, argv[1], b);
-          buf_puts(b, ")");
-        }
         return 1;
       }
     }
@@ -1790,10 +1773,8 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
   /* ENV.size/count/length -> environ entry count */
   if (recv >= 0 && argc == 0 &&
       is_count_alias(name)) {
-    NodeKind rty2_k = nt_kind(nt, recv);
-    if (rty2_k == NK_ConstantReadNode) {
-      const char *rn = nt_str(nt, recv, "name");
-      if (rn && sp_streq(rn, "ENV")) {
+    {
+      if (env_value_recv(c, recv, comp_ntype(c, recv))) {
         buf_puts(b, "sp_env_size()");
         return 1;
       }
@@ -1802,10 +1783,8 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
   /* ENV.key?/has_key?/include?/member?(key) -> getenv presence test */
   if (recv >= 0 && argc == 1 &&
       is_key_query(name)) {
-    NodeKind rty2_k = nt_kind(nt, recv);
-    if (rty2_k == NK_ConstantReadNode) {
-      const char *rn = nt_str(nt, recv, "name");
-      if (rn && sp_streq(rn, "ENV")) {
+    {
+      if (env_value_recv(c, recv, comp_ntype(c, recv))) {
         buf_puts(b, "(getenv("); emit_env_str(c, argv[0], 0, b); buf_puts(b, ") != NULL)");
         return 1;
       }
@@ -1813,15 +1792,13 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
   }
   /* ENV.fetch(key, default) -> getenv with fallback */
   if (recv >= 0 && sp_streq(name, "fetch") && argc >= 1) {
-    NodeKind rty2_k = nt_kind(nt, recv);
-    if (rty2_k == NK_ConstantReadNode) {
-      const char *rn = nt_str(nt, recv, "name");
-      if (rn && sp_streq(rn, "ENV")) {
+    {
+      if (env_value_recv(c, recv, comp_ntype(c, recv))) {
         /* The call's type is String joined with the default's: a String or
            nil default keeps the nullable string, any other default boxes both
            arms. (The block form is the ENV snapshot's Hash#fetch, #2742.) */
         int fpoly = repr_of(c, id).kind == RK_BOXED;
-        int fhandle = repr_call_returns_handle(c, id);
+        int fhandle = repr_of(c, id).as_ty == TY_STRBUF && repr_native_call_handle(c, id);
         int tk = ++g_tmp, tky = ++g_tmp, tv = ++g_tmp, td = ++g_tmp;
         buf_printf(b, "({ const char *_t%d = ", tky); emit_str_expr(c, argv[0], b);
         /* a key the operand builds is held across a default that can allocate */
@@ -1840,17 +1817,17 @@ int emit_call_kernel_flow_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
         /* the name is checked after the default evaluates, as CRuby does */
         buf_printf(b, "; const char *_t%d = getenv(%s%s_t%d%s%s); ", tk, env_str_checked(c, argv[0]) ? "sp_env_chk(" : "",
                    "SP_STR_B(", tky, ")", env_str_checked(c, argv[0]) ? ", 0)" : "");
-        emit_ctype(c, fpoly ? TY_POLY : TY_STRING, b);
+        emit_ctype(c, fhandle ? TY_STRBUF : fpoly ? TY_POLY : TY_STRING, b);
         buf_printf(b, " _t%d = _t%d ? ", tv, tk);
-        if (fhandle) buf_printf(b, "(_sp_ret_strbuf = NULL, sp_env_str(_t%d)) : ", tk);
-        else if (fpoly) buf_printf(b, "sp_box_str(sp_env_str(_t%d)) : ", tk);
+        if (fhandle) buf_printf(b, "sp_String_new_shared(sp_env_str(_t%d)) : ", tk);
+        else if (fpoly) buf_printf(b, "sp_box_str_new(sp_env_str(_t%d)) : ", tk);
         else buf_printf(b, "sp_env_str(_t%d) : ", tk);
-        if (fhandle) buf_printf(b, "sp_strbuf_read_pub(_t%d)", td);
-        else if (argc >= 2) buf_printf(b, "_t%d", td);
+        if (argc >= 2) buf_printf(b, "_t%d", td);
         else
           /* no default: CRuby raises KeyError naming the key. Route it through
              sp_raise_key_not_found so the key is staged for #key (#3027). */
-          buf_printf(b, "(sp_raise_key_not_found(sp_box_str(_t%d)), (const char *)0)", tky);
+          buf_printf(b, "(sp_raise_key_not_found(SP_STR_BOX(_t%d)), %s)", tky,
+                     fhandle ? "(sp_String *)0" : fpoly ? "sp_box_nil()" : "(const char *)0");
         buf_printf(b, "; _t%d; })", tv);
         return 1;
       }

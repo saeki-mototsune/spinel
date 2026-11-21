@@ -174,15 +174,13 @@ typedef struct{sp_float first;sp_float last;sp_int excl;unsigned char omitted;un
    include?/...) materializes the element array through
    sp_StrArray_from_string_range, which is how the range behaved before it was
    a value of its own. */
-/* hf / hl (--share-strings, #8321): the shared handles (sp_String *) the
-   endpoints were made from, or NULL. A Range keeps the String object, so a
-   change in place to it shows through #begin; sp_srange_live reads each
-   handle's bytes as they are now. sym: a Range of Symbols, its ends the
-   Symbols' names; Symbol#succ is String#succ on the name, so the walk and
-   the comparisons are the String Range's, and the readers that answer an
-   end or a member make the Symbol of it (sp_srange_box_end). */
-/* (one representation: the endpoints' handles typed, which the face macros read as the handle) */
-typedef struct{const char *first;const char *last;unsigned char excl;unsigned char unfrozen;unsigned char sym;struct sp_String_s *hf;struct sp_String_s *hl;}sp_StrRange;
+/* A nullable handle for each Range endpoint. Symbol ranges retain the
+   frozen String names of the Symbols and publish Symbols to Ruby. */
+typedef struct {
+  struct sp_String_s *first;
+  struct sp_String_s *last;
+  unsigned char excl, unfrozen, sym;
+} sp_StrRange;
 /* A class value. `name`, when non-NULL, is a rodata class name carried by a
    class whose cls_id table entry may not exist (an exception's class -- the
    Errno:: family and many builtin error classes have no assigned cls_id). It
@@ -253,13 +251,9 @@ typedef struct sp_gc_hdr { struct sp_gc_hdr *next; void (*finalize)(void *); voi
       generation until a full cycle -- promoted garbage was a third of an
       interpreter's heap and a third of its wall. */
    unsigned old : 1; unsigned dirty : 1; unsigned aged : 1; void (*recycle)(struct sp_gc_hdr *); } sp_gc_hdr;
-/* size/len packed to uint32 (4 GB per-string cap, far beyond any real
-   string) so the cached FNV `hash` fits without growing the 24-byte
-   header -- i.e. zero per-string RSS cost vs the pre-cache layout.
-   `size` is vestigial (written by sp_str_alloc, never read back; the
-   str-heap sweep no longer folds string bytes into sp_gc_bytes).
-   `hash` caches sp_str_hash for heap/heap-frozen keys; 0 == not yet
-   computed, invalidated to 0 on any in-place mutation (setbyte/set_len). */
+/* Byte length and the encoding and ASCII hints fit in two 32-bit words.
+   The last word caches the FNV hash or carries a retired payload's GC
+   stamp. Mutation clears the cached hash. */
 typedef struct sp_str_hdr { struct sp_str_hdr *next; uint32_t size; uint32_t len; uint64_t hash; } sp_str_hdr;
 /* One String representation, U2 (sp_str_alloc_born): a heap String's link
    to the handle it was born in, bit 1 set when the runtime keeps the String
@@ -333,11 +327,18 @@ typedef struct{void**data;sp_int len;sp_int cap;void(*scan_elem)(void*);int32_t 
 /* the element of a String Array (and a String Hash's value): the handle
    (SP_SEB spells the bytes face) */
 /* the shared String handle (sp_string.h) */
-struct sp_String_s { char *data; int64_t len; int64_t cap; unsigned binary; unsigned temporarily_locked; };
+struct sp_String_s {
+  char *data;
+  int64_t len;
+  int64_t cap;
+  unsigned binary;
+  unsigned temporarily_locked : 1;
+  unsigned copy_on_intern : 1; /* the frozen Symbol conversion keeps its own identity */
+};
 /* A frozen literal is one static String object: a GC header and the handle,
    beside its static bytes ([sp_str_hdr][0xf1][bytes][NUL]), whose header
-   links to the handle, tagged with bit 0 to tell it from the aligned links
-   of the string heap (sp_String_of_literal). The generated unit defines one
+   links to the handle, tagged with bit 0 to distinguish the static link
+   (sp_String_of_literal). The generated unit defines one
    per literal it names (fzl_emit_defs) and the runtime its own frozen
    Strings (sp_alloc.c), each with SP_STRING_LITERAL_INIT, so the handle is
    a constant address: no slot to load, no handle made on first use and no
@@ -356,7 +357,7 @@ typedef struct sp_StringLiteral { sp_gc_hdr g; struct sp_String_s s; } sp_String
 /* The constant initializer of literal object `o` over its bytes `d`, `len`
    bytes long: a static's initializer cannot be a function's answer. */
 #define SP_STRING_LITERAL_INIT(o, d, len) \
-  { { .next = &(o).g, .frozen = 1, .pinned = 1, .old = 1 }, { (char *)(d), (len), (len) + 1, 0, 0 } }
+  { { .next = &(o).g, .frozen = 1, .pinned = 1, .old = 1 }, { (char *)(d), (len), (len) + 1, 0, 0, 0 } }
 typedef struct sp_String_s *sp_strelem;
 /* head: the slots a shift stepped past (SP_ARR_BUF, above) */
 typedef struct{sp_strelem*data;sp_int len;sp_int cap;int32_t frozen;int32_t head;sp_strelem inline_data[SP_STRARR_INLINE];}sp_StrArray;
@@ -377,8 +378,6 @@ typedef struct{sp_strelem*data;sp_int len;sp_int cap;int32_t frozen;int32_t head
 /* (each evaluates its operand once: `SP_SEBOX(sp_StrArray_pop_e(a))` popped
    twice and boxed the second, empty, answer) */
 #define SP_SEB(e) ({ struct sp_String_s *_seb_e = (e); _seb_e ? _seb_e->data : (const char *)NULL; })
-/* the same for a header ahead of sp_string.h (sp_string.c) */
-struct sp_String_s *sp_strelem_of(const char *b);
 #define SP_SEBOX(e) ({ struct sp_String_s *_sebox_e = (e); _sebox_e ? sp_box_obj((void *)_sebox_e, SP_BUILTIN_STRBUF) : sp_box_nil(); })
 
 /* ---- Non-poly typed hashes ---- */
