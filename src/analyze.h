@@ -168,11 +168,13 @@ int prog_load_deferred(const Compiler *c, int f);
 int prog_ordered_load(const Compiler *c, int id);
 int prog_site_places(const Compiler *c, int id);
 int prog_load_ncand(const NodeTable *nt, int load);
+int prog_load_per_word(const NodeTable *nt, int load);
 int prog_load_cand(const NodeTable *nt, int load, int k);
 int prog_load_open(const NodeTable *nt, int load);
 int prog_rescue_runs(const NodeTable *nt, int rescue);
 enum { PROG_RS_MAY, PROG_RS_STARTS, PROG_RS_SURE };
 int prog_rescue_sure(const NodeTable *nt, int st);
+int prog_stmt_quiet(const NodeTable *nt, int st);
 int prog_load_path_seeded(const NodeTable *nt);
 void prog_top_stmts(const Compiler *c, void (*fn)(void *ud, int stmt), void *ud);
 int *prog_top_seq(const Compiler *c, int *n, int **file);
@@ -307,6 +309,8 @@ typedef struct {
                            node, which runs where its branch does and makes
                            the method as the dispatcher stands after the
                            last (lr_cond_first_arm); 0 for any other version */
+  unsigned char cut;    /* a visibility word's entry of a name past the names the word reaches (lr_word_reach), where its
+                           statement is partial: the word has not changed it, so it is no run version (lr_word_runs) */
 } LrDef;
 enum { LR_UNPLACED_LATER = 2 };   /* LrDef.unplaced */
 typedef struct { int node, body; } LrOpen;
@@ -482,15 +486,19 @@ int elab_self_value_at(Compiler *c, int node);
    that is not sure: a name the walk reads by itself (elab_block_when), one
    the program takes away somewhere, a statement that may run again. */
 int elab_block_never_runs(Compiler *c, int call, int cls);
-/* Has module cls's singleton class been made at p, which CRuby makes on
-   the first of its makers (is_singleton_class_maker, a def on the
-   singleton, `class << m`, an instance or class variable write), or at
-   boot for a builtin module (builtin_singleton_at_boot): ELAB_YES it is
-   or a maker surely ran before p; ELAB_NO no form of the program can make
-   it before p; ELAB_UNKNOWN otherwise, and for a p with no point.
-   A Method's NameError names the class `#<Class:M>` once it is made,
-   `Module` before. */
-int elab_singleton_made(Compiler *c, int cls, LoadPoint p);
+/* Has module cls's singleton class been made where node at runs, which
+   CRuby makes on the first of its makers (is_singleton_class_maker, a def
+   on the singleton, `class << m`, an instance or class variable write), or
+   at boot for a builtin module (builtin_singleton_at_boot): ELAB_YES it is
+   or a maker surely ran before at; ELAB_NO no form of the program can make
+   it before at; ELAB_UNKNOWN otherwise. A node in a body with no point of
+   its own is asked from the first statement the body may run on
+   (elab_call_window): a maker surely run before it makes it for every run.
+   own (or NULL): a name where none of its singleton's versions is live,
+   whose forms (a def of it, its module_function copy) have not run there
+   unless a removal follows them: they are not asked. A Method's NameError
+   names the class `#<Class:M>` once it is made, `Module` before. */
+int elab_singleton_made(Compiler *c, int cls, int at, const char *own);
 /* May module cls be on a singleton class's chain, so that a Method of
    that class side finds its instance methods: an extend of it (or of a
    module the record cannot name), a prepend to a singleton, an include
@@ -543,11 +551,31 @@ int elab_method_vis_varies(Compiler *c, const char *name);
 /* is call id a visibility word with names a method body runs on the class
    self is there, as the record reads it from the tree, a version of that
    body or not, where it takes no def (its value is then the word's, as in a
-   class body)? One that takes a def: is it a version of that body? */
-int elab_body_word(Compiler *c, int id);
+   class body)? One that takes a def: is it a version of that body? A
+   class-method word (private_class_method) counts only as a version. *cls:
+   the class it acts on. */
+int elab_body_word(Compiler *c, int id, int *cls);
 /* does a history of `name` hold such a word (elab_body_word), whose change
-   the record orders only against the points its body's extent spans? */
-int elab_method_body_word(Compiler *c, const char *name);
+   the record orders only against the points its body's extent spans? On
+   side sg 0 a singleton's history does not count: no singleton's method is
+   an instance method; on side 1 every one does (an extended module's words
+   reach the class side) */
+int elab_method_body_word(Compiler *c, const char *name, int sg);
+/* ...or a visibility word that may change `name` the record does not
+   place (LrDef.unplaced) or holds no entry of (a word or a section in a
+   method body or a block that is no version of it), whose change no query
+   at a point sees? */
+int elab_method_vis_unplaced(Compiler *c, const char *name);
+/* Does module mod have instance method nm where its module_function looks the name up, as rb_mod_modfunc does: an
+   entry the record holds of the name (a def, an alias, an attribute, a define_method) on the module or a module it
+   includes, or on Object, Kernel or a module Object includes, where CRuby's lookup falls back to; or a builtin
+   instance method of a builtin module among those, or of Object's (Kernel's) table? Not a def only another class
+   has, nor the module object's own methods (`name`, `instance_methods`), which the word does not find */
+int elab_module_has_method(Compiler *c, int mod, const char *nm);
+/* The class whose singleton class a visibility word at id acts on (a `class << self` body's, in a class or a
+   module, as lr_word_side reads its self), and in *levels how many singleton classes deep (2 in a `class << self`
+   body inside another); -1 where its self is no singleton class or the record cannot tell */
+int elab_word_singleton(Compiler *c, int id, int *levels);
 /* may a method `name` the program gives be protected at some point of the
    load: does one of its histories hold a protected def, alias or visibility
    word of it? 1 where the load is not recorded. */
@@ -617,6 +645,37 @@ int elab_def_scope_of(Compiler *c, int node);   /* the scope elab_def_scope file
 /* the def node whose body holds node, with no class body or other def
    between; -1 for none */
 int elab_body_def(Compiler *c, int node);
+/* The body whose runs make definer call `call` (define_method or the like in
+   a body, lr_body_call) a version, ordered against the calls by its extent
+   (LrDef.body: a def, or the define_method call whose block it is), with the
+   class and side it defines on in *cls and *sg; -1 where the record holds it
+   as no version */
+int elab_body_call_version(Compiler *c, int call, int *cls, int *sg);
+int elab_body_call_owner(Compiler *c, int call);   /* does every run of the body's definer call define on one class and side */
+/* The define_method call whose block makes self an object where node
+   stands, with no class body, eval block (or the spliced value of one),
+   def or define_singleton_method's block between (lr_body_frame), or -1. Read from the tree alone (the
+   record's parents once it is made), so the registration's walk asks it
+   too. */
+int elab_body_self_object(Compiler *c, int node);
+/* Does node run whenever body (a def's, a lambda's or a call's block node)
+   runs, once it gets past its start (lr_runs_with_body): no condition, rescued
+   begin, block of its own or early exit between them? */
+int elab_runs_with_body(Compiler *c, int node, int body);
+/* the k-th name definer call node defines (an attr_accessor's reader, then
+   its writer, `x=`, in buf, which holds ELAB_FORM_NAME_CAP bytes: a call
+   with a longer name makes no versions, lr_body_call), NULL past the last;
+   *writer (where set) says whether it is a writer */
+enum { ELAB_FORM_NAME_CAP = 256 };
+const char *elab_call_form_name(const NodeTable *nt, int node, int k, char *buf, size_t nb, int *writer);
+/* Does a Method's maker that reads the method tables (method,
+   instance_method and their kin, by a literal name, LR_REFL_MAKER) name
+   `name`? */
+int elab_method_captured(Compiler *c, const char *name);
+/* Does the program define a hook that definition form `form` (a definer call's name) fires on class cls's side sg, on
+   the class's chain, or one the record cannot tell (method_added, singleton_method_added)? A version a body's definer makes
+   would not call it where the body runs. */
+int elab_definer_hook_live(Compiler *c, int cls, int sg, const char *form);
 /* does the load phase apply def or define_method node `def` whenever the
    body it stands in runs (lr_stmt_applied): not under a run-time
    condition there, nor in an iterator's block, except a define_method an
@@ -809,6 +868,11 @@ int elab_chain_settled(Compiler *c, int cls, int sg, const char *name, LoadPoint
    cap. */
 typedef struct { const LrDef *v; int hist, cell, n; } ElabVersion;
 int elab_chain_versions(Compiler *c, int cls, int sg, const char *name, ElabVersion *out, int cap);
+/* the body whose extent version ev takes (a call may run before that body
+   does): the method body that makes it (LrDef.body), or the file root of
+   the load region it stands in, where its region's requires order it
+   (analyze_elab.c's lr_version_extent); 0 for a version at a point */
+int elab_version_extent(Compiler *c, const ElabVersion *ev);
 /* the late bit of the histories of `name` that versions vs[0..n) are in
    (elab_chain_versions): 2 where a call may run ahead of the first version
    of one of them, 3 where none is but one was not asked (a name a
@@ -865,6 +929,10 @@ int elab_autoload_file_defines(Compiler *c, int slot, int file);
    the method by a Symbol or a String, name or make methods by computed
    names, or run code the record has not seen? */
 int elab_version_captured(Compiler *c, const char *name);
+/* does a Symbol or a String literal of the program spell `name`, but node except? With runs, only one that may
+   run the method, in the program's own code (an_written_call): an argument of a presence query (respond_to?,
+   method_defined? and its kin, is_method_presence_name_query), which answers without running it, is none */
+int elab_name_spelled(Compiler *c, const char *name, int except, int runs);
 /* is module mod in the ancestors of cls (of its singleton when sg) at p? */
 int elab_mixed_at(Compiler *c, int cls, int sg, int mod, LoadPoint p);
 /* was a non-nil value written to the variable before p: a write that
@@ -992,6 +1060,7 @@ int class_def_path(const NodeTable *nt, int def_node);   /* the constant node it
 int mixin_stmt_args(const NodeTable *nt, int st, int *prepend, const int **av);   /* a body's receiverless include/prepend: its argument count, -1 for another node */
 const char *class_def_name(const NodeTable *nt, int def_node);   /* the constant name it writes, NULL for none */
 const char *class_def_bare_name(const NodeTable *nt, int def_node);   /* ...written as a plain constant, NULL under a path */
+const char *vis_arg_name(const NodeTable *nt, int arg);   /* a Symbol or String argument's method name (analyze_scope.c) */
 /* ...asked of the compiler: where the readers move from the name the header
    was stamped with to the class it opened (#10793) */
 const char *class_def_key(const Compiler *c, int def_node);
@@ -1080,8 +1149,9 @@ const ElabSurface *elab_class_surface(Compiler *c, int cls, int sg, int *n);
 /* An entry the registration applies, as the load phase ends (lr_applied):
    on class side (cls, LR_MAIN for main's; sg), of kind LrKind, by node, of
    name (an alias's original in target), with its version's scope
-   (LrDef.scope); names point into the record */
-typedef struct { int cls, sg, kind, node; const char *name, *target; int scope; } ElabEntry;
+   (LrDef.scope), and whether a method body makes it (LrDef.body); names
+   point into the record */
+typedef struct { int cls, sg, kind, node; const char *name, *target; int scope, body; } ElabEntry;
 /* every class side's entries of the kinds in mask (1 << LrKind), in the
    order the load phase makes them: by class and side, then statement, then
    the argument that names them (a reader before its writer); *n of them,
@@ -1099,13 +1169,22 @@ void elab_absent_aliases(Compiler *c);
    end`, then `def self.cfg=`; `def x`, then `attr_reader :x`): a call that
    runs while one is live runs the accessor, any other the def, so each is
    a version of its own, a method register_attr_versions makes and
-   elab_attr_scope links to it (LrDef.scope); *n of them, the caller frees
-   the array. An accessor of a history no def is in stays its class's slot
-   or field alone. */
+   elab_attr_scope links to it (LrDef.scope); so is the version of an
+   accessor a body declares (LrDef.body), which is no slot of its class's
+   from the start; *n of them, the caller frees the array. Any other
+   accessor of a history no def is in stays its class's slot or field
+   alone. */
 ElabEntry *elab_replaced_attrs(Compiler *c, int *n);
+/* ...is entry e of them one of a history that mixes accessors and defs (a
+   def replaces it: Scope.attr_version), not a body's accessor alone, whose
+   method is the name's own? */
+int elab_attr_mixed(Compiler *c, const ElabEntry *e);
 void elab_attr_scope(Compiler *c, const ElabEntry *e, int scope);
-/* does class cls's own side hold such an accessor version of name? */
-int elab_attr_replaced(Compiler *c, int cls, const char *name);
+/* is accessor entry e (elab_replaced_attrs) the only kind of version its history holds: no def replaces it, and it is
+   a method of its own because a method body's word sets its class side's visibility? */
+int elab_attr_lone(Compiler *c, const ElabEntry *e);
+/* does class cls's side sg (0: the instance side, 1: the singleton side) hold such an accessor version of name? */
+int elab_attr_replaced(Compiler *c, int cls, int sg, const char *name);
 /* Does a later method of class cls's own instance side replace its
    attr_* accessor `name` (a writer's as `x=`) as the load phase ends: the
    class's last version of the name the registration applies is a def, an
@@ -1488,6 +1567,8 @@ int splat_local_sure_lit(Compiler *c, int x);
 const char *block_kwrest_name(Compiler *c, int block);
 int block_opt_default(Compiler *c, int block, int idx);
 const char *block_keyword_name(Compiler *c, int block, int idx);
+int block_keyword_node(Compiler *c, int block, int idx);
+int block_rest_node(Compiler *c, int block);
 int block_keyword_default(Compiler *c, int block, int idx);
 
 /* True if `id` is a `proc {}` / `lambda {}` / `Proc.new {}` literal (a CallNode
@@ -1548,9 +1629,8 @@ void ie_body_restore(Compiler *c, int *snap);
 /* instance_exec keyword-arg helpers: the call's trailing KeywordHashNode (or
    -1), and the value node bound to a keyword name within it (or -1). */
 int ie_call_kwhash(Compiler *c, int id);
-size_t block_param_written_len(const Compiler *c, const char *name);
-size_t reassigned_param_written_len(const Compiler *c, const char *name);
-size_t param_written_len(const Compiler *c, const char *n);
+const char *rbp_slot_written(const Compiler *c, const char *w);
+const char *param_written_name(const Compiler *c, const char *w);
 /* What a parameter node the desugar made or named stands for, as its
    "desugared_param" mark says (desugared_param_name) */
 enum { DPN_OWN, DPN_WRITTEN, DPN_NAMELESS, DPN_NONE };

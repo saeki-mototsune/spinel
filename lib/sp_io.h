@@ -131,10 +131,6 @@ int sp_io_make_pipe(int fds[2]);
 /* IO.pipe end: wrap a raw pipe fd in a GC-managed sp_File. */
 sp_File *sp_io_fdopen(int fd, const char *mode);
 sp_File *sp_io_fdopen_ex(int fd, const char *mode, int owns_fd);
-/* a byte a read-only FIFO open took asking for a writer (lib/sp_cold.c): the
-   handle made of the descriptor gets it back */
-void sp_fifo_pushback_apply(sp_File *f);
-int sp_fifo_pushback_take(int fd, unsigned char *c);
 sp_File *sp_File_open_perm(const char *path, const char *mode, sp_oint perm);   /* a nil perm is CRuby's default, 0666 */
 int sp_io_mode_open_flags(const char *m);   /* the open(2) flags of a mode string, -1 for one File.open refuses */
 const char *sp_io_fdopen_mode(int fl);      /* the stdio mode that fits those flags */
@@ -408,10 +404,10 @@ void sp_file_rename(const char *from, const char *to);
    the older File sites (readlink, symlink, mkfifo ...) pass the syscall's
    name. An errno with no class here raises SystemCallError. */
 SP_NORETURN void sp_file_raise_errno(const char *op, const char *path);
-/* A failed IO#pread raises the errno's class: "<strerror> @ rb_io_pread -
-   <path>" for a handle with a path, the bare strerror for one without (a
-   pipe, an IO.new descriptor), as CRuby words it. */
-SP_NORETURN void sp_pread_raise_errno(sp_File *f);
+/* rb_syserr_fail_path: the errno's class with "<strerror> @ <func> -
+   <path>" for a File, the bare strerror for a pipe, a socket or an IO.new
+   descriptor, as CRuby words it (IO#pread, read_nonblock, write_nonblock) */
+SP_NORETURN void sp_io_raise_path_errno(sp_File *f, const char *func);
 /* What IO#pread checks before its pread(2), in CRuby's order: a length of 0
    answers "" before anything else, even on a closed handle; then a closed
    handle is IOError "closed stream", and one whose mode does not read (a

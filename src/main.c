@@ -564,6 +564,9 @@ static void usage(void) {
     "  --rbs DIR   Seed analyzer with RBS signatures from DIR (advisory)\n"
     "  --no-inline-rbs  Ignore inline RBS comments (`#: ...`, `# @rbs ...`)\n"
     "              in the program (default: apply them; docs/inline-rbs.md)\n"
+    "  --strict-rbs  Refuse at compile time any call site, assignment, return, or\n"
+    "              inherited layout that drops, widens, or contradicts an RBS\n"
+    "              signature pin instead of degrading or raising TypeError at run time\n"
     "  --int-overflow=MODE  Int +/-/* overflow handling (default: raise)\n"
     "  --no-bigint No value may be a Bignum: loop accumulators stay Integer and\n"
     "              raise on overflow, a value that could only be a Bignum is a\n"
@@ -572,9 +575,8 @@ static void usage(void) {
     "  --dump-ast  Print the text AST and exit (debug)\n"
     "  --dump-load-graph  Print the files the program loads and what each require\n"
     "              resolves to, and exit (debug)\n"
-    "  --load-model=MODEL  inline (default): required files are spliced in;\n"
-    "              graph: each file is its own root and a require a load node\n"
-    "              (a require that is a top-level statement, for now)\n"
+    "  --load-model=MODEL  graph (default): each file is its own root and a\n"
+    "              require a load node; inline: required files are spliced in\n"
     "  --dump-value-positions  Print the value positions of each method body and of\n"
     "              the program, and exit (debug)\n"
     "  --check-value-pos  Check the value-position iterator's limits and exit (debug)\n"
@@ -604,8 +606,8 @@ static int table_mode_of(const char *a) {
    build` has always compiled this way through SPINEL_STRICT_REQUIRE, and `spin
    flags` needs to hand the same gate to a caller driving the compiler itself
    (#4105). `--load-model=inline|graph` picks how required files are loaded:
-   spliced into one program (the default), or each kept as its own root with
-   a load node per require (#9898; requires that are top-level statements, for now). 1 when `a`
+   each kept as its own root with a load node per require (the default), or
+   spliced into one program. 1 when `a`
    is one of them. */
 static int parse_flag(const char *a) {
   if (sp_streq(a, "--strict-require")) return g_strict_require_cli = 1;
@@ -1030,6 +1032,7 @@ int main(int argc, char **argv) {
     else if (!strncmp(a, "--rbs=", 6))    { rbs_dir = a + 6; i++; }
     else if (sp_streq(a, "--rbs"))         { if (++i < argc) rbs_dir = argv[i]; i++; }
     else if (sp_streq(a, "--no-inline-rbs")) { sp_inline_rbs_enabled = 0; i++; }
+    else if (sp_streq(a, "--strict-rbs"))  { g_opt_strict_rbs = 1; i++; }
     else if (sp_streq(a, "--disable=frozen-string-literal") ||
              sp_streq(a, "--disable-frozen-string-literal")) {
       fprintf(stderr, "spinel: --disable=frozen-string-literal is not "

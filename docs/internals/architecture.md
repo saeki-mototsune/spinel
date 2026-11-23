@@ -47,8 +47,13 @@ String slots hold object handles. Sharing facts and byte routes serve
 builtin producers still being migrated under #11391.
 Boxing a String preserves the object emitted by its producer. A dynamic
 send uses that same path for the String returned by its selected method.
-String unary plus checks the returned handle's frozen state at runtime
-and copies the String only when it is frozen.
+The selected, blockless unary plus on a core String reads and returns a
+handle. A mutable String keeps its identity, and a frozen String yields
+a mutable copy. The block and String subclass call paths retain their
+own result handling.
+The safe-navigation guard holds a nullable String result through the
+call. It evaluates arguments in the nonnil arm and uses the same handle
+form for inline and hoisted results.
 Hash transformation uses the block's ordinary result when storing
 a boxed value, including a result returned through `next`.
 A nullable Integer or Float result keeps its nil through boxing.
@@ -106,6 +111,13 @@ A direct call holds its receiver when the operand-order record marks a
 read that a later operand can rebind. The temporary uses Repr's layout
 and retains references while the arguments run.
 
+The operand-order record lists an indexed operator write's receiver,
+keys and right-hand side in Ruby order. The native indexed writer takes
+the receiver before emitting an AHEAD key's statements. Both statement
+and value forms consult the receiver's HOLD slot and its holder's Repr
+when deciding whether its temporary needs a GC root. The getter runs
+before the right-hand side.
+
 A method inferred or declared to return String returns `sp_String *`.
 The String addition emitter boxes its result when Repr selects a boxed
 result for the call, even when both operands are known Strings.
@@ -132,6 +144,8 @@ objects retained by Hashes, Enumerators, and callbacks. Ordinary boxing
 reads the expression's representation, including results held by a call
 or written into a slot. A boxed inline yield keeps the block's String
 handle, including a value supplied by an early `next`.
+A rescue modifier with a demanded String result takes each arm into the
+same handle slot, whether the arm creates a String or returns an existing one.
 The destination's boxed representation takes precedence over a native
 String source for both `next` and normal block completion. Byte comparisons
 and private conversion buffers can borrow its payload through
@@ -176,6 +190,8 @@ same call view, including inherited bindings and calls through super.
 A native binding uses the producer's declared String
 result, the handle of a held operand or slot, or a checked projection from
 the boxed Ruby value. The read of an existing String keeps its object.
+When Repr says a builtin result needs a handle formed from its bytes,
+the String slot renderer wraps the result where the slot takes it.
 Boxing a reflective String read uses the handle from the selected slot.
 An ENV write holds both Ruby operands, converts the key and then the
 value, and reads their bytes for the environment after the conversions.

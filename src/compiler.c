@@ -599,10 +599,10 @@ void comp_free(Compiler *c) {
   free(c->ver_vis_call_cell); c->ver_vis_call_cell = NULL; c->ver_vis_call_cap = 0;
   free(c->ver_vis_scope_mark); c->ver_vis_scope_mark = NULL; c->ver_vis_scope_cap = 0;
   free(c->ver_vis_hist_seen); c->ver_vis_hist_seen = NULL; c->ver_vis_hist_cap = 0; c->ver_vis_guard_stamp = 0;
-  for (int i = 0; i < c->nrbp_slots; i++) free(c->rbp_slot_names[i]);
-  free(c->rbp_slot_names); free(c->rbp_slot_lens); c->rbp_slot_names = NULL; c->rbp_slot_lens = NULL; c->nrbp_slots = 0;
+  for (int i = 0; i < c->nrbp_slots; i++) { free(c->rbp_slot_names[i]); free(c->rbp_slot_written[i]); }
+  free(c->rbp_slot_names); free(c->rbp_slot_written); c->rbp_slot_names = NULL; c->rbp_slot_written = NULL; c->nrbp_slots = 0;
   if (c->bp_name) for (unsigned i = 0; i <= c->bp_mask; i++) free(c->bp_name[i]);
-  free(c->bp_name); free(c->bp_len); free(c->bp_blk); c->bp_name = NULL; c->bp_len = NULL; c->bp_blk = NULL; c->bp_mask = 0; c->nbp = 0;
+  free(c->bp_name); free(c->bp_blk); c->bp_name = NULL; c->bp_blk = NULL; c->bp_mask = 0; c->nbp = 0;
   for (int i = 0; i < c->nbp_user; i++) free(c->bp_user[i]);
   free(c->bp_user); c->bp_user = NULL; c->nbp_user = 0; c->bp_user_built = 0;
   for (int i = 0; i < c->ndef_asked; i++) free(c->def_asked[i]);
@@ -624,7 +624,8 @@ void comp_free(Compiler *c) {
     Scope *sc = &c->scopes[s];
     free(sc->name);
     free(sc->shadow_user);
-    for (int i = 0; i < sc->nlocals; i++) free(sc->locals[i].name);
+    free(sc->env_names);
+    for (int i = 0; i < sc->nlocals; i++) { free(sc->locals[i].name); free(sc->locals[i].wname); }
     free(sc->locals);
     free(sc->lidx);
     for (int i = 0; i < sc->nparams; i++) free(sc->pnames[i]);
@@ -653,6 +654,9 @@ void comp_free(Compiler *c) {
     free(c->classes[i].ivar_elem_may_nil);
     for (int j = 0; j < c->classes[i].n_rbs_pin_ivars; j++) free(c->classes[i].rbs_pin_ivars[j]);
     free(c->classes[i].rbs_pin_ivars);
+    for (int j = 0; j < c->classes[i].n_rbs_orig_ivars; j++) free(c->classes[i].rbs_orig_ivars[j]);
+    free(c->classes[i].rbs_orig_ivars);
+    free(c->classes[i].rbs_orig_ivar_types);
     for (int j = 0; j < c->classes[i].nreaders; j++) free(c->classes[i].readers[j]);
     free(c->classes[i].readers);
     for (int j = 0; j < c->classes[i].nown_readers; j++) free(c->classes[i].own_readers[j]);
@@ -5888,8 +5892,20 @@ static void scope_lidx_build(Scope *s) {
   memset(s->lidx, 0, sizeof(int) * (size_t)cap);
   for (int i = 0; i < s->nlocals; i++) scope_lidx_add(s, i);
 }
+/* A define_method block's scope reads and writes the locals of its definer's def as that def's own (Scope.env_host):
+   the host's Scope, for a name the block closes over, else NULL. Every Scope handed to scope_local is the one
+   c->scopes holds at its idx (the scratch Scope of a desugar is zeroed, with no env_host), so the host sits at the
+   difference of their indexes from it. */
+static Scope *scope_env_owner(Scope *s, const char *name) {
+  if (!s->env_host || !name) return NULL;
+  for (int i = 0; i < s->nenv_names; i++)
+    if (sp_streq(s->env_names[i], name)) return s + (s->env_host - 1 - s->idx);
+  return NULL;
+}
 LocalVar *scope_local(Scope *s, const char *name) {
   IMEMO_DEP_SCOPE(s->idx);
+  Scope *host = scope_env_owner(s, name);
+  if (host) return scope_local(host, name);
   if (s->nlocals >= SCOPE_LIDX_MIN) {
     if (!s->lidx || s->nlocals * 2 > s->lidx_cap) scope_lidx_build(s);
     if (s->lidx) {
@@ -5914,7 +5930,16 @@ void scope_locals_removed(Scope *s) {
   free(s->lidx); s->lidx = NULL; s->lidx_cap = 0;
 }
 
+/* Record the name the program wrote for slot lv: none when it is the slot's own */
+void lv_set_wname(LocalVar *lv, const char *wname) {
+  if (wname == lv->wname) return;
+  free(lv->wname);
+  lv->wname = wname && !sp_streq(wname, lv->name) ? strdup(wname) : NULL;
+}
+
 LocalVar *scope_local_intern(Scope *s, const char *name) {
+  Scope *host = scope_env_owner(s, name);
+  if (host) return scope_local_intern(host, name);
   LocalVar *lv = scope_local(s, name);
   if (lv) return lv;
   if (s->nlocals >= s->clocals) {
@@ -6703,22 +6728,25 @@ int class_recv_is_dynamic(Compiler *c, int recv) {
 }
 
 
-/* Is module m module mod, or does it include mod (through its own includes)? */
-int comp_module_includes(Compiler *c, int m, int mod, int depth) {
-  if (m == mod) return 1;
+/* Is module k module m, or does m (a class or a module) mix it in: include it, or with prepends prepend it too,
+   through m's own mixins? */
+static int comp_mixes_in_at(Compiler *c, int m, int k, int prepends, int depth) {
+  if (m == k) return 1;
   if (m < 0 || m >= c->nclasses || depth > 16) return 0;
-  ClassInfo *mi = &c->classes[m];
-  for (int k = 0; k < mi->nincluded_mods; k++)
-    if (comp_module_includes(c, mi->included_mods[k], mod, depth + 1)) return 1;
+  const ClassInfo *mi = &c->classes[m];
+  for (int i = 0; i < mi->nincluded_mods; i++) if (comp_mixes_in_at(c, mi->included_mods[i], k, prepends, depth + 1)) return 1;
+  for (int i = 0; prepends && i < mi->nprepended_mods; i++)
+    if (comp_mixes_in_at(c, mi->prepended_mods[i], k, prepends, depth + 1)) return 1;
   return 0;
 }
+int comp_mixes_in(Compiler *c, int m, int k, int prepends) { return comp_mixes_in_at(c, m, k, prepends, 0); }
 /* Does module `mod` -- or a module including it -- take part in class `ci`'s
    singleton ancestors, through an `extend` of `ci` or of a superclass? Then
    `ci.is_a?(mod)` is true. */
 int comp_class_singleton_has_module(Compiler *c, int ci, int mod) {
   for (int k = ci, d = 0; k >= 0 && k < c->nclasses && d < 64; k = c->classes[k].parent, d++)
     for (int e = 0; e < c->classes[k].nextended_mods; e++)
-      if (comp_module_includes(c, c->classes[k].extended_mods[e], mod, 0)) return 1;
+      if (comp_mixes_in(c, c->classes[k].extended_mods[e], mod, 0)) return 1;
   return 0;
 }
 /* Does class `ci` or a superclass extend any module? */

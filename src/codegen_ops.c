@@ -7,6 +7,7 @@
 #include "codegen_internal.h"
 #include "builtin_ops.h"
 #include "call_plan.h"
+#include "codegen_call_arms.h"
 
 /* The receiver's C text, emitted once. A row names it as $r, possibly
    more than once; every $r prints the same text, as the arms the rows
@@ -23,6 +24,7 @@ static char *op_recv_text(Compiler *c, const BopCtx *x) {
    so the C is emitted in the order the arm the row replaces emitted it:
      $r   the receiver, emitted at its first occurrence (or the text the
           caller rendered, x->rtext); a later $r repeats the same text
+     $S   the receiver as a String handle, including a value already held
      $R   the receiver emitted again, for an arm that emitted it twice
      $N   an Integer or Float receiver with its nil beside the value (an
           sp_oint / sp_ofloat, emit_oint_expr): a receiver that can be nil
@@ -179,6 +181,11 @@ static int emit_op_template(Compiler *c, const BopCtx *x, Buf *b) {
         r = strndup(b->p ? b->p + mark : "", b->len - mark);
       }
       else buf_puts(b, r);
+      p++;
+    }
+    else if (p[0] == '$' && p[1] == 'S') {
+      if (x->rtext) buf_printf(b, "SP_STR_HDL(%s)", x->rtext);
+      else emit_str_form_handle(c, x->recv, b);
       p++;
     }
     else if (p[0] == '$' && p[1] == 'N') {
@@ -485,6 +492,16 @@ static void plan_check_observe(Compiler *c, int id, TyKind rt, const BuiltinOp *
             id, ty_name(rt), op->name, op->argc_min, op->argc_max, ty_name(bop_result_args(op, rt, argc, arg_of, &ba, facts)));
 }
 
+/* String#unpack(fmt): an Integer Array for a literal format of integer
+   directives (an_unpack_lit_type), the boxed values otherwise */
+static int emit_op_string_unpack(Compiler *c, const BopCtx *x, Buf *b) {
+  BuiltinOp op = *x->op;
+  BopCtx y = *x;
+  op.arg = repr_of(c, x->id).as_ty == TY_INT_ARRAY ? "sp_str_unpack_ints($r, $s0)" : "sp_str_unpack($r, $s0)";
+  y.op = &op;
+  return emit_op_template(c, &y, b);
+}
+
 static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *) = {
   [BOPE_NONE] = NULL,
   [BOPE_RANGE_CLONE] = emit_op_range_clone,
@@ -496,6 +513,7 @@ static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *)
   [BOPE_THREAD_SET_REPORT] = emit_op_thread_set_report,
   [BOPE_FLOAT_RATIONALIZE] = emit_op_float_rationalize,
   [BOPE_STRING_SCAN_CHECKED] = emit_op_string_scan_checked,
+  [BOPE_STRING_UNPACK] = emit_op_string_unpack,
   [BOPE_STRING_ASET] = emit_op_string_aset,
   [BOPE_STRING_INSERT] = emit_op_string_insert,
   [BOPE_STRING_CLEAR] = emit_op_string_clear,
@@ -609,13 +627,28 @@ static int (*const bop_emitters[BOPE__COUNT])(Compiler *, const BopCtx *, Buf *)
   [BOPE_IO_SET_WINSIZE] = emit_op_io_set_winsize,
 };
 
-/* A reader of a Method whose capture raises wherever it runs (CallPlan.absent): the capture, its NameError, and the
-   row's type's zero, which nothing reads. 0 for any other row */
+/* A reader of a Method whose capture raises wherever it runs (CallPlan.absent), or where its method is closed to it
+   (CallPlan.closed): the capture, its NameError, and the row's type's zero, which nothing reads; where the capture's
+   cells tell it at the run (CP_CLOSED_RUN), the capture ahead of the row's own answer. 0 for any other row */
 static int emit_absent_method_reader(Compiler *c, const BopCtx *x, Buf *b) {
-  if (bop_family_of(x->rt) != TY_METHOD || x->op->emit == BOPE_TEMPLATE || x->recv < 0 || !cplan_method_call(c, x->id).absent) return 0;
+  if (bop_family_of(x->rt) != TY_METHOD || x->op->emit == BOPE_TEMPLATE || x->recv < 0) return 0;
+  CallPlan p = cplan_method_call(c, x->id);
+  if (!p.absent && !p.closed) return 0;
+  size_t at = b->len;
   buf_puts(b, "((void)(");
   emit_expr_for_effect(c, x->recv, b);
-  buf_printf(b, "), %s)", default_value_from_compiler(c, repr_of(c, x->id).as_ty));
+  if (p.absent || p.closed != CP_CLOSED_RUN) {
+    buf_puts(b, "), ");
+    emit_unread_value(c, x->id, b);
+    buf_puts(b, ")");
+    return 1;
+  }
+  buf_puts(b, "), ");
+  if (!bop_emitters[x->op->emit](c, x, b)) {
+    buf_erase(b, at, b->len - at);
+    return 0;
+  }
+  buf_puts(b, ")");
   return 1;
 }
 

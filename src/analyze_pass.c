@@ -2120,7 +2120,7 @@ static TyRef named_array_slot(Compiler *c, int recv) {
     }
     /* `H::L` names the constant its read resolves to (infer_constant_path) */
     case NK_ConstantPathNode: {
-      if (const_path_in_closed_builtin(c, recv) || const_path_misses_toplevel(c, recv)) return NULL;
+      if (const_path_in_closed_builtin(c, recv) || const_path_misses_toplevel(c, recv) || const_path_is_private(c, recv)) return NULL;
       LocalVar *lv = comp_const_at(c, recv);
       return lv ? &lv->type : NULL;
     }
@@ -5610,6 +5610,8 @@ static void infer_write_reads_widened(Compiler *c, const NodeTable *nt, PinShado
     LocalVar *lv = rl && wn ? scope_local(wsc, wn) : NULL;
     if (!lv || lv == rl || lv->is_param || lv->is_block_param || lv->rbs_seeded || ty_degraded(lv->type))
       continue;
+    if (lv->owner != wsc->idx) wsc = &c->scopes[lv->owner];
+    if (rl->owner != rs->idx) rs = &c->scopes[rl->owner];
     ReadWrite *w = &rw[nrw];
     w->val = v; w->dst = lv; w->dst_ix = base[wsc - c->scopes] + (int)(lv - wsc->locals);
     w->next = -1;
@@ -6050,6 +6052,22 @@ int infer_write_types(Compiler *c) {
       }
       continue;
     }
+    /* A sequence or a conditional that binds a local of its own and answers
+       it (`x = begin; c = args.shift; c; end`, a `case` arm doing the same)
+       has that write at a higher node id as well: the main loop read `c`
+       reset and left `x` UNKNOWN on every round, so a pass that decides on
+       the type of `x` as a receiver never saw it. */
+    NodeKind vk = nt_kind(nt, val_id);
+    if ((vk == NK_BeginNode || vk == NK_IfNode || vk == NK_UnlessNode || vk == NK_CaseNode) &&
+        subtree_writes_any_local(nt, val_id)) {
+      const char *snm = nt_str(nt, id, "name");
+      LocalVar *slv = snm ? scope_local(comp_scope_of(c, id), snm) : NULL;
+      if (slv && !slv->is_param && !slv->is_block_param) {
+        TyKind st = infer_type(c, val_id);
+        pin_shadow_take(c, &pins, slv, st == TY_NIL ? TY_POLY : st, val_id);
+      }
+      continue;
+    }
     if (nt_kind(nt, val_id) != NK_CallNode) continue;
     if (nt_ref(nt, val_id, "block") < 0) continue;
     const char *vnm = nt_str(nt, val_id, "name");
@@ -6155,6 +6173,7 @@ int infer_write_types(Compiler *c) {
       NT_FOREACH_KIND(nt, NK_MultiWriteNode, mw) {
         Scope *rs = NULL;
         LocalVar *rl = value_read_root(c, nt, nt_ref(nt, mw, "value"), &rs);
+        if (rl && rl->owner != rs->idx) rs = &c->scopes[rl->owner];
         if (rl && seed[fold_base[rs - c->scopes] + (int)(rl - rs->locals)]) { mw_sel[mw] = 1; nsel++; }
       }
       PinShadow fold_pins = {0};
@@ -10605,27 +10624,6 @@ static int param_supplied_memo(Compiler *c, int s, int i) {
    of this name, or in a body with no def of its own, supplies it, and so
    does one in a `self.new` for an initialize. A method the runtime calls
    (method_name_implicitly_invoked) may be passed anything. */
-/* A Symbol or String argument's text, or NULL. */
-static const char *nil_param_lit(const NodeTable *nt, int node) {
-  NodeKind k = node >= 0 ? nt_kind(nt, node) : NK_NONE;
-  if (k != NK_SymbolNode && k != NK_StringNode) return NULL;
-  const char *v = nt_str(nt, node, "value");
-  return v ? v : nt_str(nt, node, "unescaped");
-}
-static int nil_param_alias_names(Compiler *c, const char *a, const char *b) {
-  const NodeTable *nt = c->nt;
-  NT_FOREACH_KIND(nt, NK_AliasMethodNode, id) {
-    const char *o = nil_param_lit(nt, nt_ref(nt, id, "old_name"));
-    if (!o || sp_streq(o, a) || (b && sp_streq(o, b))) return 1;
-  }
-  for (int id = an_calls_named_first(c, "alias_method"); id >= 0; id = an_calls_named_next(id)) {
-    int args = nt_ref(nt, id, "arguments"), n = 0;
-    const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &n) : NULL;
-    const char *o = n >= 2 ? nil_param_lit(nt, av[1]) : NULL;
-    if (!o || sp_streq(o, a) || (b && sp_streq(o, b))) return 1;
-  }
-  return 0;
-}
 /* Whether a call made from class `from` (a `super` there, or `K.new` /
    `K.send(:new)` with K = from) can reach a method of class `to`: unless
    `to` is `from` or one of its ancestors it cannot. A module, or a class
@@ -10663,7 +10661,7 @@ static int nil_param_never_supplied(Compiler *c, int s, int i) {
       if (k >= 2 && !an_user_defines_method(c, names[k])) {
         int dargs = nt_ref(nt, id, "arguments"), dn = 0;
         const int *dav = dargs >= 0 ? nt_arr(nt, dargs, "arguments", &dn) : NULL;
-        const char *lit = dn > 0 ? nil_param_lit(nt, dav[0]) : NULL;
+        const char *lit = dn > 0 ? an_literal_name(nt, dav[0]) : NULL;
         if (!lit || sp_streq(lit, sc->name)) return 0;
         if (is_init && sp_streq(lit, "new") && nil_param_reaches(c, nil_param_recv_class(c, id), sc->class_id)) return 0;
         continue;
@@ -10671,7 +10669,7 @@ static int nil_param_never_supplied(Compiler *c, int s, int i) {
       if (psa_call_supplies(c, sc, i, is_init, is_kw, id, names[k])) return 0;
     }
   }
-  if (nil_param_alias_names(c, sc->name, is_init ? "new" : NULL)) return 0;
+  if (an_aliases_name(c, sc->name, is_init ? "new" : NULL)) return 0;
   const NodeKind sk[2] = { NK_SuperNode, NK_ForwardingSuperNode };
   for (int k = 0; k < 2; k++) {
     NT_FOREACH_KIND(nt, sk[k], id) {
@@ -13398,18 +13396,20 @@ int block_takes_no_values(Compiler *c, int block) {
   return nt_ref(nt, pn, "rest") < 0 && nt_ref(nt, pn, "keyword_rest") < 0 && nt_ref(nt, pn, "block") < 0;
 }
 
-static const char *block_rest_kind_name(Compiler *c, int block, const char *field, const char *kind) {
+static int block_rest_kind_node(Compiler *c, int block, const char *field, const char *kind) {
   int bp = nt_ref(c->nt, block, "parameters");      /* BlockParametersNode */
-  if (bp < 0) return NULL;
+  if (bp < 0) return -1;
   NodeKind bpk = nt_kind(c->nt, bp);
-  if (bpk == NK_NumberedParametersNode) return NULL;
+  if (bpk == NK_NumberedParametersNode) return -1;
   int pn = nt_ref(c->nt, bp, "parameters");          /* ParametersNode */
-  if (pn < 0) return NULL;
+  if (pn < 0) return -1;
   int rest = nt_ref(c->nt, pn, field);
-  if (rest < 0) return NULL;
+  if (rest < 0) return -1;
   const char *rty = nt_type(c->nt, rest);
-  if (!rty || !sp_streq(rty, kind)) return NULL;
-  return nt_str(c->nt, rest, "name");
+  return rty && sp_streq(rty, kind) ? rest : -1;
+}
+static const char *block_rest_kind_name(Compiler *c, int block, const char *field, const char *kind) {
+  return nt_str(c->nt, block_rest_kind_node(c, block, field, kind), "name");
 }
 
 /* The name of a block's trailing rest parameter (`|*a|`), or NULL if the block
@@ -13418,18 +13418,23 @@ static const char *block_rest_kind_name(Compiler *c, int block, const char *fiel
 const char *block_rest_name(Compiler *c, int block) {
   return block_rest_kind_name(c, block, "rest", "RestParameterNode");  /* must be `*name` */
 }
+int block_rest_node(Compiler *c, int block) {
+  return block_rest_kind_node(c, block, "rest", "RestParameterNode");
+}
 
-static const char *block_list_name(Compiler *c, int block, const char *list, int idx) {
+static int block_list_node(Compiler *c, int block, const char *list, int idx) {
   int bp = nt_ref(c->nt, block, "parameters");
-  if (bp < 0) return NULL;
+  if (bp < 0) return -1;
   NodeKind bpk = nt_kind(c->nt, bp);
-  if (bpk == NK_NumberedParametersNode) return NULL;
+  if (bpk == NK_NumberedParametersNode) return -1;
   int pn = nt_ref(c->nt, bp, "parameters");
-  if (pn < 0) return NULL;
+  if (pn < 0) return -1;
   int n = 0;
   const int *ps = nt_arr(c->nt, pn, list, &n);
-  if (idx < n) return nt_str(c->nt, ps[idx], "name");
-  return NULL;
+  return idx < n ? ps[idx] : -1;
+}
+static const char *block_list_name(Compiler *c, int block, const char *list, int idx) {
+  return nt_str(c->nt, block_list_node(c, block, list, idx), "name");
 }
 
 /* Name of a block's idx-th optional parameter (`|a, b=10|`), or NULL. */
@@ -13584,6 +13589,11 @@ const char *block_kwrest_name(Compiler *c, int block) {
 /* Name of a block's idx-th keyword parameter (`|a:, b: 5|`), or NULL. */
 const char *block_keyword_name(Compiler *c, int block, int idx) {
   return block_list_name(c, block, "keywords", idx);
+}
+/* The node of a block's idx-th keyword parameter, or -1: the keyword as
+   written is nt_wname of it. */
+int block_keyword_node(Compiler *c, int block, int idx) {
+  return block_list_node(c, block, "keywords", idx);
 }
 
 /* Default-value node of a block's idx-th keyword parameter (only present for an
@@ -14111,7 +14121,7 @@ void block_site_types(Compiler *c, const BlockSig *s, const int *av, int ac,
   if (s->kw && nt_argv_kwh(nt, av, ac) >= 0) kwh = av[--ac];
   for (int k = 0; k < s->nk; k++) {
     int kp = block_sig_kw(c, s, k);
-    int vn = kwh >= 0 ? ie_kwhash_value(c, kwh, nt_str(nt, kp, "name")) : -1;
+    int vn = kwh >= 0 ? ie_kwhash_value(c, kwh, nt_wname(nt, kp)) : -1;
     TyKind t = vn >= 0 ? bs_value(c, vn) : TY_UNKNOWN;
     int en = 0; const int *els = kwh >= 0 ? nt_arr(nt, kwh, "elements", &en) : NULL;
     for (int e = 0; e < en; e++) {
@@ -14408,7 +14418,7 @@ void check_block_rest_support(Compiler *c) {
           rt == TY_ENUMERATOR || rt == TY_STRING)) continue;
     {
       /* report the param as written, not the shadow rename's slot name */
-      char disp[128]; snprintf(disp, sizeof disp, "%.*s", (int)block_param_written_len(c, rn), rn);
+      const char *disp = nt_wname(nt, block_rest_node(c, blk));
       long long fid = nt_int(nt, id, "node_file", -1);
       const char *file = fid >= 0 ? nt_file_path(nt, (int)fid) : NULL;
       if (!file) file = nt->source_file ? nt->source_file : "source.rb";
@@ -15169,7 +15179,7 @@ int desugar_instance_eval_builtin(Compiler *c) {
       int ken = 0; const int *kels = kwh >= 0 ? nt_arr(nt, kwh, "elements", &ken) : NULL;
       for (int k = 0; k < kn && ok; k++) {
         if (!(pnames[np] = nt_str(nt, kws[k], "name"))) { ok = 0; break; }
-        int v = ie_kwhash_value(c, kwh, pnames[np]);
+        int v = ie_kwhash_value(c, kwh, nt_wname(nt, kws[k]));
         if (v >= 0) {
           if (defaulted || kmatched >= ken || nt_ref(nt, kels[kmatched], "value") != v) ok = 0;
           kmatched++;

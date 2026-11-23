@@ -981,6 +981,43 @@ static const char *scope_self_cls_text(Compiler *c, const Scope *s, char *buf, s
   snprintf(buf, size, "((sp_Class){%d})", s->class_id);
   return buf;
 }
+/* `B.const_defined?(:N)` with N a constant of builtin B that the compiler
+   reads (Process::WNOHANG, Math::PI, Process::Status): the C test in buf, 1
+   or the platform's (Process::RLIMIT_NOFILE); NULL for another name. OWN,
+   the `false` form, takes File's three separators alone in File (its flags
+   are File::Constants') and skips Math's in a class that includes Math. A
+   program class the receiver resolves to (CLS) with another name, such as
+   Foo::Process, takes Math's alone, when its chain includes Math. */
+static const char *builtin_const_defined_text(Compiler *c, int recv, int cls, const char *nm, int own, char *buf, size_t size) {
+  NodeKind rk = nt_kind(c->nt, recv);
+  const char *rn = rk == NK_ConstantReadNode || rk == NK_ConstantPathNode ? nt_str(c->nt, recv, "name") : NULL;
+  if (!rn || !nm || strstr(nm, "::")) return NULL;
+  /* (UTF8 is Spinel's alias, which CRuby's Encoding does not define) */
+  if (sp_streq(rn, "Encoding") && sp_streq(nm, "UTF8")) return NULL;
+  if (cls >= 0 && cls < c->nclasses && c->classes[cls].name && !sp_streq(c->classes[cls].name, rn)) {
+    /* (Foo::Math is the program's module, Math's only when it includes Math) */
+    if (own || !(sp_streq(nm, "PI") || sp_streq(nm, "E")) || !comp_chain_includes_core(c, cls, "Math")) return NULL;
+    snprintf(buf, size, "1");
+    return buf;
+  }
+  if (sp_streq(rn, "Process") && process_rlimit_const(nm)) {
+    snprintf(buf, size, "sp_process_rlimit_defined(\"%s\")", nm + 7);
+    return buf;
+  }
+  if (sp_streq(rn, "Process") && (sp_streq(nm, "RLIM_SAVED_MAX") || sp_streq(nm, "RLIM_SAVED_CUR"))) {
+    snprintf(buf, size, "sp_process_rlim_defined(%d)", sp_streq(nm, "RLIM_SAVED_MAX") ? 1 : 2);
+    return buf;
+  }
+  char q[256];
+  snprintf(q, sizeof q, "%s::%s", rn, nm);
+  int yes = builtin_class_id(q) != 0 || is_builtin_class_name(q) || is_builtin_module_name(q);
+  if (!yes && builtin_scoped_const_type(c, own && !sp_streq(rn, "Math") ? -1 : recv, rn, nm) != TY_UNKNOWN)
+    yes = !(own && sp_streq(rn, "File") && !sp_streq(nm, "SEPARATOR") && !sp_streq(nm, "PATH_SEPARATOR") &&
+            !sp_streq(nm, "ALT_SEPARATOR"));
+  if (!yes) return NULL;
+  snprintf(buf, size, "1");
+  return buf;
+}
 int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt) {
   if (sp_streq(name, "respond_to?") && argc >= 1 && !respond_to_user_defined(c, id, recv)) {
     NodeKind ak = nt_kind(nt, argv[0]);
@@ -1207,6 +1244,8 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
                         iak != NK_TrueNode && iak != NK_FalseNode;
           int nil_arm = rt != TY_CLASS && nil_prog && (nil_ans != 2 || ia_once);
           int cls_arm = class_value_arms(c, id, qm, &cvl, &cv);
+          /* (a boxed value's classes that all answer no leave it the builtin's answer, as with none) */
+          if (cls_arm && rt != TY_CLASS && !class_value_arms_yes(&cvl)) cplan_presence_list_free(&cvl), cls_arm = 0;
           int tv = cls_arm || nil_arm ? ++g_tmp : 0;
           if (!tv && argc == 1 && (rt == TY_POLY || rt == TY_UNKNOWN) &&
               emit_boxed_responds_builtin_absent(c, recv, qm, b)) return 1;
@@ -1740,19 +1779,19 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
         NodeKind rvk = nt_kind(nt, recv);
         const char *rnm = ((rvk == NK_ConstantReadNode ||
                                    rvk == NK_ConstantPathNode)) ? nt_str(nt, recv, "name") : NULL;
-        if (rnm && sp_streq(rnm, "Float")) {
-          if (sp_streq(cg_qm, "INFINITY")) { buf_puts(b, "sp_box_float(1.0/0.0)"); return 1; }
-          if (sp_streq(cg_qm, "NAN"))      { buf_puts(b, "sp_box_float(0.0/0.0)"); return 1; }
-          if (sp_streq(cg_qm, "MAX"))      { buf_puts(b, "sp_box_float(DBL_MAX)"); return 1; }
-          if (sp_streq(cg_qm, "MIN"))      { buf_puts(b, "sp_box_float(DBL_MIN)"); return 1; }
-          if (sp_streq(cg_qm, "EPSILON"))  { buf_puts(b, "sp_box_float(DBL_EPSILON)"); return 1; }
-          if (sp_streq(cg_qm, "DIG"))      { buf_puts(b, "sp_box_int(DBL_DIG)"); return 1; }
-          if (sp_streq(cg_qm, "MANT_DIG")) { buf_puts(b, "sp_box_int(DBL_MANT_DIG)"); return 1; }
-          if (sp_streq(cg_qm, "RADIX"))    { buf_puts(b, "sp_box_int(FLT_RADIX)"); return 1; }
-        }
-        if (rnm && sp_streq(rnm, "Math")) {
-          if (sp_streq(cg_qm, "PI")) { buf_puts(b, "sp_box_float(M_PI)"); return 1; }
-          if (sp_streq(cg_qm, "E"))  { buf_puts(b, "sp_box_float(M_E)"); return 1; }
+        TyKind bt = rnm ? builtin_scoped_const_type(c, recv, rnm, cg_qm) : TY_UNKNOWN;
+        char bq[256];
+        if (rnm) snprintf(bq, sizeof bq, "%s::%s", rnm, cg_qm);
+        /* (a builtin class nested in the receiver: Process::Status) */
+        if (bt == TY_UNKNOWN && rnm && (builtin_class_id(bq) != 0 || is_builtin_class_name(bq) || is_builtin_module_name(bq)))
+          bt = TY_CLASS;
+        if (bt != TY_UNKNOWN) {
+          Buf vb = {0};
+          if (bt == TY_CLASS) emit_builtin_class_value(c, bq, &vb);
+          else emit_builtin_scoped_const(c, recv, rnm, cg_qm, &vb);
+          emit_boxed_text(c, bt, vb.p, b);
+          free(vb.p);
+          return 1;
         }
       }
       /* literal but unresolved: evaluate the receiver for side effects, then raise.
@@ -1844,7 +1883,10 @@ int emit_call_reflection_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       }
       /* a constant not assigned yet is not defined: asked at run time */
       LocalVar *cd_lv = const_defined_slot(c, cd_rk, qm);
+      char bt[160];
+      const char *bcd = yes ? NULL : builtin_const_defined_text(c, recv, cd_rk, qm, argc >= 2 && nt_kind(nt, argv[1]) == NK_FalseNode, bt, sizeof bt);
       if (yes && const_has_flag(cd_lv)) buf_printf(b, "cst_%s__set", cd_lv->name);
+      else if (bcd) buf_puts(b, bcd);
       else buf_printf(b, "%d", yes);
       return 1;
     }
@@ -5215,10 +5257,13 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
           buf_puts(b, "; })");
           return 1;
         }
+        char bt[160];
+        const char *bcd = !yes && vci < 0 && lit0 ? builtin_const_defined_text(c, recv, rk0c, cn0, 0, bt, sizeof bt) : NULL;
         buf_printf(b, "((void)("); emit_expr_for_effect(c, recv, b);
         /* a constant not assigned yet is not defined: asked at run time */
         LocalVar *cd0 = const_defined_slot(c, rk0c, cn0);
         if (yes && const_has_flag(cd0)) buf_printf(b, "), cst_%s__set)", cd0->name);
+        else if (bcd) buf_printf(b, "), %s)", bcd);
         else buf_printf(b, "), %d)", yes);
         return 1;
       }
@@ -5788,7 +5833,7 @@ int emit_call_class_value_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
 /* The self of the call id runs in, boxed: the class a class body's or a class method's self is, main at the top
    level (and in a top-level def, which runs on main here), else the instance of the method's class, as the
    method holds it (a builtin's reopening included: emit_reopen_self_boxed) */
-static void emit_call_self_boxed(Compiler *c, int id, Buf *b) {
+void emit_call_self_boxed(Compiler *c, int id, Buf *b) {
   const Scope *s = comp_scope_of(c, id);
   char cb[48];
   int body = self_class_body(c, id);
@@ -6592,6 +6637,12 @@ int emit_call_reopen_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       if (oc_ci3 >= 0) {
         const CallPlan pl = cplan_user(c, id);
         int planned = pl.via == UC_REOPEN && pl.owner_ci == oc_ci3 && pl.dispatch == CP_DIRECT;
+        /* a class value answers a public method of Class's or Module's
+           (class_eval, name) ahead of Object's, as the plan reads it
+           (cplan_resolve_call's root fallback): a program's Kernel#class_eval
+           is not what `klass.class_eval { ... }` runs, so the call is left
+           to the class-value paths, and refused where none has it */
+        if (!planned && rt == TY_CLASS && cplan_class_value_answers(c, id, recv, name)) return 0;
         int oc_mi3 = planned ? pl.mi : call_target(c, id, oc_ci3, name, 0, NULL);
         if (g_plan_check && planned) {
           cplan_served("object-fallback");

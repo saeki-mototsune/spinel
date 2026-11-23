@@ -22,6 +22,17 @@ static const BuiltinClass *builtin_row(const char *n) {
   return r;
 }
 
+/* a Process::RLIMIT_* constant of some platform's CRuby; its value, or the
+   NameError where this platform has none, comes from the run time */
+int process_rlimit_const(const char *n) {
+  static const char *const names[] = {
+    "RLIMIT_AS", "RLIMIT_CORE", "RLIMIT_CPU", "RLIMIT_DATA", "RLIMIT_FSIZE",
+    "RLIMIT_MEMLOCK", "RLIMIT_MSGQUEUE", "RLIMIT_NICE", "RLIMIT_NOFILE",
+    "RLIMIT_NPROC", "RLIMIT_NPTS", "RLIMIT_RSS", "RLIMIT_RTPRIO", "RLIMIT_RTTIME",
+    "RLIMIT_SBSIZE", "RLIMIT_SIGPENDING", "RLIMIT_STACK", NULL };
+  return n && str_in(n, names);
+}
+
 int is_builtin_class_name(const char *n) {
   const BuiltinClass *r = builtin_row(n);
   return r && (r->flags & BC_CLASS);
@@ -370,7 +381,7 @@ int const_path_misses_member(Compiler *c, int id) {
    the inference of a builtin's constant, which asks this: once at a time.) */
 int const_path_reaches_leaf_const(Compiler *c, int id) {
   if (nt_kind(c->nt, id) != NK_ConstantPathNode) return 1;
-  if (const_path_in_closed_builtin(c, id) || const_path_misses_toplevel(c, id)) return 0;
+  if (const_path_in_closed_builtin(c, id) || const_path_misses_toplevel(c, id) || const_path_is_private(c, id)) return 0;
   /* a read the record bound to one member's slot is that member's, though
      its scope be one only the run makes (a C extension's module) */
   if (const_leaf_bound(c, id)) return 1;
@@ -809,7 +820,7 @@ static int const_path_write_reaches(Compiler *c, int t, int k) {
   int qi = qn ? const_node_class_index(c, q) : -1;
   if (qi < 0) return 1;
   for (int a = k, d = 0; a >= 0 && a < c->nclasses && d < 64; a = c->classes[a].parent, d++)
-    if (comp_module_includes(c, a, qi, 0)) return 1;
+    if (comp_mixes_in(c, a, qi, 0)) return 1;
   return 0;
 }
 /* The constant writes by the key written (const_key_at), for the tree as
@@ -1027,6 +1038,84 @@ static int builtin_scope_lacks_member(Compiler *c, int seg) {
    constant, which a path through another class or module does not reach
    (CRuby's NameError since 2.5), where the leaf-keyed table answered it.
    A NAME written in any body, or through a path, is left to the table. */
+/* `P::NAME` where P is a class or module of the program and NAME is a
+   constant the nearest class of P's superclass chain that holds it makes
+   private (`private_constant :NAME` in its body, and no `public_constant`
+   of the name beside it): CRuby's NameError, "private constant K::NAME
+   referenced", K the class that holds it. The message is written to `msg`.
+   A lexical read (`NAME` in K's body) and const_get read such a constant;
+   only a read through a scope raises. The declaration is taken as made
+   wherever the read stands: a path read ahead of it in the program's run
+   raises too. */
+static int const_visibility_names(const NodeTable *nt, int call, const char *nm) {
+  int an = 0;
+  const int *av = call_args(nt, call, &an);
+  for (int i = 0; av && i < an; i++) {
+    NodeKind ak = nt_kind(nt, av[i]);
+    const char *s = ak == NK_SymbolNode ? nt_str(nt, av[i], "value") : ak == NK_StringNode ? nt_str(nt, av[i], "content") : NULL;
+    if (s && sp_streq(s, nm)) return 1;
+  }
+  return 0;
+}
+int const_path_private(Compiler *c, int id, char *msg, size_t msg_n) {
+  const NodeTable *nt = c->nt;
+  if (nt_kind(nt, id) != NK_ConstantPathNode || !c->node_cbody) return 0;
+  /* (a path that is `Object.const_get("P::A")` rewritten reads it) */
+  if (nt_int(nt, id, "const_get_read", 0)) return 0;
+  int par = nt_ref(nt, id, "parent");
+  NodeKind pk = par >= 0 ? nt_kind(nt, par) : NK_NilNode;
+  if (pk != NK_ConstantReadNode && pk != NK_ConstantPathNode) return 0;
+  const char *nm = nt_str(nt, id, "name");
+  if (!nm) return 0;
+  /* the program's private_constant calls, read once for a node table: most
+     programs have none, and a path read asks this each time it is emitted */
+  static const NodeTable *seen_nt;
+  static int ncalls, calls[256];
+  if (seen_nt != nt) {
+    seen_nt = nt; ncalls = 0;
+    NT_FOREACH_KIND(nt, NK_CallNode, cid) {
+      const char *cn = nt_str(nt, cid, "name");
+      if (cn && sp_streq(cn, "private_constant") && nt_ref(nt, cid, "receiver") < 0 && ncalls < 256) calls[ncalls++] = cid;
+    }
+  }
+  int named = 0;
+  for (int i = 0; i < ncalls && !named; i++) named = const_visibility_names(nt, calls[i], nm);
+  if (!named) return 0;
+  int ci = const_node_class_index(c, par);
+  for (int k = ci, d = 0; k >= 0 && k < c->nclasses && d < 64; k = c->classes[k].parent, d++) {
+    int priv = 0, pub = 0, holds = 0;
+    for (int i = 0; i < ncalls; i++)
+      if (calls[i] < c->node_cap && c->node_cbody[calls[i]] == k && const_visibility_names(nt, calls[i], nm)) priv = 1;
+    if (priv) {
+      NT_FOREACH_KIND(nt, NK_CallNode, cid) {
+        const char *cn = nt_str(nt, cid, "name");
+        if (cn && sp_streq(cn, "public_constant") && nt_ref(nt, cid, "receiver") < 0 && cid < c->node_cap &&
+            c->node_cbody[cid] == k && const_visibility_names(nt, cid, nm)) pub = 1;
+      }
+      if (!pub) {
+        snprintf(msg, msg_n, "private constant %s::%s referenced", class_ruby_name(c, k), nm);
+        return 1;
+      }
+      return 0;
+    }
+    /* a nearer class that holds the name answers the read with its own */
+    NT_FOREACH_KIND(nt, NK_ConstantWriteNode, wid) {
+      const char *wn = nt_str(nt, wid, "name");
+      if (wn && sp_streq(wn, nm) && wid < c->node_cap && c->node_cbody[wid] == k) holds = 1;
+    }
+    for (int x = 0; x < c->nclasses && !holds; x++) {
+      int dn = c->classes[x].def_node;
+      const char *xn = dn >= 0 ? nt_str(nt, nt_ref(nt, dn, "constant_path"), "name") : NULL;
+      if (xn && sp_streq(xn, nm) && dn < c->node_cap && c->node_cbody[dn] == k) holds = 1;
+    }
+    if (holds) return 0;
+  }
+  return 0;
+}
+int const_path_is_private(Compiler *c, int id) {
+  char msg[512];
+  return const_path_private(c, id, msg, sizeof msg);
+}
 int const_path_misses_toplevel(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   if (nt_kind(nt, id) != NK_ConstantPathNode || !c->node_cbody) return 0;
@@ -1319,6 +1408,34 @@ int an_calls_named_first(Compiler *c, const char *name) {
   return k >= 0 ? g_cn_first[k] : -1;
 }
 int an_calls_named_next(int id) { return (id >= 0 && id < g_cn_cnt) ? g_cn_next[id] : -1; }
+/* A Symbol or String argument's text, or NULL. */
+const char *an_literal_name(const NodeTable *nt, int node) {
+  NodeKind k = node >= 0 ? nt_kind(nt, node) : NK_NONE;
+  if (k != NK_SymbolNode && k != NK_StringNode) return NULL;
+  const char *v = nt_str(nt, node, "value");
+  return v ? v : nt_str(nt, node, "unescaped");
+}
+/* Does the program alias method `a` or `b` (NULL for none): an `alias` or an `alias_method` whose old name is one of
+   them, or is no literal name (it may be)? The copy an alias makes keeps the method it found. */
+int an_aliases_name(Compiler *c, const char *a, const char *b) {
+  const NodeTable *nt = c->nt;
+  NT_FOREACH_KIND(nt, NK_AliasMethodNode, id) {
+    const char *o = an_literal_name(nt, nt_ref(nt, id, "old_name"));
+    if (!o || sp_streq(o, a) || (b && sp_streq(o, b))) return 1;
+  }
+  for (int id = an_calls_named_first(c, "alias_method"); id >= 0; id = an_calls_named_next(id)) {
+    int args = nt_ref(nt, id, "arguments"), n = 0;
+    const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &n) : NULL;
+    const char *o = n >= 2 ? an_literal_name(nt, av[1]) : NULL;
+    if (!o || sp_streq(o, a) || (b && sp_streq(o, b))) return 1;
+  }
+  return 0;
+}
+int an_name_reached(Compiler *c, const char *name, int except) {
+  for (int id = an_calls_named_first(c, name); id >= 0; id = an_calls_named_next(id))
+    if (an_written_call(id)) return 1;
+  return elab_name_spelled(c, name, except, 1);
+}
 
 /* Interposes a call named `name` (with arguments args, -1 for none) between
    call id and its receiver (`r.m` becomes `r.name.m`): a desugar's
@@ -7128,14 +7245,18 @@ int loop_may_stop(Compiler *c, int loop_call) {
 }
 
 /* See analyze_internal.h. */
-int respond_to_cells_shape(const NodeTable *nt, int id) {
+int respond_to_literal_shape(const NodeTable *nt, int id) {
   int ac = 0;
   const int *av = nt_kind(nt, id) == NK_CallNode && is_respond_to_name(nt_str(nt, id, "name")) &&
                   nt_ref(nt, id, "block") < 0 ? call_args(nt, id, &ac) : NULL;
-  int recv = av ? nt_ref(nt, id, "receiver") : -1;
-  NodeKind rk = recv >= 0 ? nt_kind(nt, recv) : NK_SelfNode, ak = ac == 2 ? nt_kind(nt, av[1]) : NK_FalseNode;
-  return av && (ac == 1 || ac == 2) && nt_kind(nt, av[0]) == NK_SymbolNode && (ak == NK_TrueNode || ak == NK_FalseNode) &&
-         (rk == NK_SelfNode || rk == NK_ConstantReadNode || rk == NK_ConstantPathNode);
+  NodeKind ak = ac == 2 ? nt_kind(nt, av[1]) : NK_FalseNode;
+  return av && (ac == 1 || ac == 2) && nt_kind(nt, av[0]) == NK_SymbolNode && (ak == NK_TrueNode || ak == NK_FalseNode);
+}
+/* See analyze_internal.h. */
+int respond_to_cells_shape(const NodeTable *nt, int id) {
+  int recv = respond_to_literal_shape(nt, id) ? nt_ref(nt, id, "receiver") : -2;
+  NodeKind rk = recv >= 0 ? nt_kind(nt, recv) : recv == -1 ? NK_SelfNode : NK_NONE;
+  return rk == NK_SelfNode || rk == NK_ConstantReadNode || rk == NK_ConstantPathNode;
 }
 /* See analyze_internal.h. */
 int list_cells_shape(const NodeTable *nt, int id) {

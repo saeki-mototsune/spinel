@@ -4,6 +4,7 @@
 static void emit_ivar_lhs_otext(Compiler *c, int cid, int iv, const char *ivn, const char *lhs, const char *otext, Buf *b);
 static int emit_strbuf_boxed_store(Compiler *c, int v, Buf *b);
 static void emit_args_for_effect(Compiler *c, int call, Buf *b, int indent);
+static void emit_effect_stmt(Compiler *c, int e, Buf *b, int indent);
 #include "repr.h"
 #include "holder.h"
 #include "share.h"
@@ -1619,13 +1620,10 @@ int strbuf_self_chain_base(Compiler *c, int v) {
     size_t bl = strlen(bn);
     for (int w = start; w >= 0 && nt_kind(nt, w) == NK_CallNode; w = nt_paren_single(c->nt, nt_ref(nt, w, "receiver"))) {
       int wb = nt_ref(nt, w, "block");
-      const char *ls = wb >= 0 ? nt_str(nt, wb, "locals") : NULL;
-      for (const char *q = ls; q && *q; ) {
-        const char *e = strchr(q, ',');
-        size_t n = e ? (size_t)(e - q) : strlen(q);
-        if (n >= bl && !strncmp(q, bn, bl) && (n == bl || !strncmp(q + bl, "__bp", 4))) return -1;   /* (renamed apart: s__bp30) */
-        q = e ? e + 1 : q + n;
-      }
+      int nls = 0;
+      const char *const *ls = nt_scope_locals(nt, wb, &nls);
+      for (int li = 0; li < nls; li++)
+        if (!strncmp(ls[li], bn, bl) && (!ls[li][bl] || !strncmp(ls[li] + bl, "__bp", 4))) return -1;   /* (renamed apart: s__bp30) */
     }
   }
   /* a chain with a block runs over the handle held ahead of the block,
@@ -1905,18 +1903,16 @@ static int strbuf_stmts_tail_plain(Compiler *c, int st) {
   const int *b = st >= 0 && nt_kind(c->nt, st) == NK_StatementsNode ? nt_arr(c->nt, st, "body", &n) : NULL;
   return n > 0 && strbuf_tail_plain(c, b[n - 1]);
 }
-/* --share-strings: a begin whose value is a variable's String or nil in
+/* A begin whose value is a variable's String or nil in
    each of its arms (its body's, each rescue's, its else's; an ensure's is
    dropped): the arms keep the handle in its result slot
-   (emit_stmt_tail_inner). So does a rescue modifier (`s.upcase! rescue
-   nil`) whose expression and fallback are such values, not both new
-   Strings (a new String's copy is unseen): the rvalue form takes each as
-   the handle into its result slot. */
+   (emit_stmt_tail_inner). A rescue modifier takes its expression and
+   fallback as handles into that same destination, including new Strings. */
 static int strbuf_route_begin(Compiler *c, int v) {
   const NodeTable *nt = c->nt;
   v = nt_paren_single(c->nt, v);
   if (v >= 0 && nt_kind(nt, v) == NK_RescueModifierNode)
-    return !share_value_fresh(c, v, 0) && strbuf_tail_plain(c, nt_ref(nt, v, "expression")) &&
+    return strbuf_tail_plain(c, nt_ref(nt, v, "expression")) &&
            strbuf_tail_plain(c, nt_ref(nt, v, "rescue_expression"));
   if (v < 0 || nt_kind(nt, v) != NK_BeginNode) return 0;
   /* the body's value is the begin's only when no else follows it */
@@ -4726,6 +4722,15 @@ void emit_strbuf_value(Compiler *c, int v, Buf *b) {
   { int vp = nt_paren_single(c->nt, v);
     if (arg_ran_first(v, 0) || (vp >= 0 && arg_ran_first(vp, 0))) { emit_strbuf_handle_of(c, v, b); return; } }
   if (repr_native_call_handle(c, v)) { emit_native_string_handle(c, v, b); return; }
+  /* The call's guard selects whether its arguments run, including when
+     the receiver is another call that answers a nullable handle. */
+  if (sn_guard_pending(c, v) && repr_call_returns_handle(c, nt_ref(c->nt, v, "receiver"))) {
+    const NodeTable *nt = c->nt;
+    int token = view_push_repr(c, v, VR_HANDLE_DEMAND, 1);
+    int handled = emit_call_safe_nav_arms(c, v, b, nt, nt_str(nt, v, "name"), nt_ref(nt, v, "receiver"));
+    view_pop(c, token);
+    if (handled) return;
+  }
   /* `x&.itself` is x, nil or not, and so is its handle */
   { int w = nt_paren_single(c->nt, v);
     if (w >= 0 && nt_kind(c->nt, w) == NK_CallNode &&
@@ -4756,11 +4761,6 @@ void emit_strbuf_value(Compiler *c, int v, Buf *b) {
   LocalVar *vlv = NULL;
   int vplus = strbuf_uplus_operand(c, v);
   Repr rpv = repr_of(c, v);
-  /* A demanded fresh String arm still emits bytes (for example 123.to_s),
-     which need their own handle; the demand alone is no reader slot. */
-  int fresh = rpv.strbuf_src == RS_FRESH &&
-              nt_kind(c->nt, v) == NK_CallNode && cplan_user(c, v).dispatch == CP_NONE &&
-              share_value_fresh(c, v, 0);
   /* a String's dup or clone where the program keeps instance variables on
      Strings (Compiler.bivar_table): the new String is made as a handle so
      that it takes a copy of the receiver's variables, as CRuby's does
@@ -4774,7 +4774,7 @@ void emit_strbuf_value(Compiler *c, int v, Buf *b) {
   }
   /* (a bang on a boxed receiver is no reader of a slot, whatever demand marks
      it: its handle is its receiver's box's, below) */
-  else if (!fresh && !(face_str_bang_call(c, v)) && strbuf_slot_text(c, v, &srefV))
+  else if (!face_str_bang_call(c, v) && strbuf_slot_text(c, v, &srefV))
     buf_puts(b, srefV.p);
   /* an element a String Array of handles reads or
      removes is the String itself (#8328 step 5) */
@@ -4862,11 +4862,19 @@ void emit_strbuf_value(Compiler *c, int v, Buf *b) {
      typed the handle where an extension's demand reached the slot it fills
      (`opaque = "#{opaque}?#{query}"` in URI's parser, beside a package
      with a C extension), the slot took a `const char *`) */
-  else if (rpv.as_ty == TY_STRBUF && !fresh &&
+  else if (rpv.as_ty == TY_STRBUF &&
            nt_kind(c->nt, v) != NK_BackReferenceReadNode && nt_kind(c->nt, v) != NK_NumberedReferenceReadNode &&
            nt_kind(c->nt, v) != NK_StringNode && nt_kind(c->nt, v) != NK_InterpolatedStringNode &&
            (nt_kind(c->nt, v) != NK_CallNode || strbuf_marked_yields_handle(c, v))) {
-    emit_expr(c, v, b);
+    /* A demanded builtin can still emit bytes. Take its handle without
+       changing how the call is emitted under the demand. */
+    if (repr_handle_apart(rpv) && nt_kind(c->nt, v) == NK_CallNode &&
+        cplan_user(c, v).dispatch == CP_NONE) {
+      str_new_handle_open(b);
+      emit_expr(c, v, b);
+      str_new_handle_close(b);
+    }
+    else emit_expr(c, v, b);
   }
   /* a box written to the slot: its nil is the slot's NULL (a String? slot
      takes nil), and only another value takes the String argument's strict
@@ -10970,7 +10978,17 @@ void emit_poly_unboxed(Compiler *c, int node, TyKind t, const char *conv, Buf *b
   else emit_expr(c, node, b);
 }
 
+/* A statement `case`. The subject's nil flag (g_case_scrut_oint) is put back
+   on the way out, as emit_case_expr does: temps are numbered again from the
+   start in the next method, so a flag left set would claim that method's
+   `_tN` has an `_oN` beside it. */
+static void emit_case_in(Compiler *c, int id, Buf *b, int indent);
 void emit_case(Compiler *c, int id, Buf *b, int indent) {
+  int sso = g_case_scrut_oint;
+  emit_case_in(c, id, b, indent);
+  g_case_scrut_oint = sso;
+}
+static void emit_case_in(Compiler *c, int id, Buf *b, int indent) {
   const NodeTable *nt = c->nt;
   int pred = nt_ref(nt, id, "predicate");
   int nw = 0;
@@ -19788,7 +19806,7 @@ static int emit_multi_write_stmt_body(Compiler *c, int id, Buf *b, int indent, c
     if (rest_tgt >= 0) masgn_store(c, id, mt, rest_tgt, rx, rest_arr_t, tr, -1, -1, indent, b);
     else {
       emit_indent(b, indent);
-      if (rest_var) buf_printf(b, "lv_%s = ", rename_local(rest_var));
+      if (rest_var) { emit_local_ref(c, id, rest_var, b); buf_puts(b, " = "); }
       else buf_printf(b, "gv_%s = ", rest_gvar);
       masgn_conv(c, id, slot_t == TY_POLY ? TY_POLY : rest_arr_t, rest_arr_t, rx, b);
       buf_puts(b, ";\n");
@@ -19811,7 +19829,7 @@ static int emit_multi_write_stmt_body(Compiler *c, int id, Buf *b, int indent, c
       int rjpoly = rjlv && rjlv->type == TY_POLY;
       /* a local that holds its nil takes the element's oint (or nil) */
       int rjo = rjlv && oint_kind(rjlv->type) && slot_is_oint(rjlv);
-      buf_printf(b, "lv_%s = ", rename_local(rnm_j));
+      emit_local_ref(c, id, rnm_j, b); buf_puts(b, " = ");
       if (ridx >= 0 && ridx < en) {
         TyKind value_type = tmpts[ridx];
         char rex[32]; snprintf(rex, sizeof rex, "_t%d", tmps[ridx]);
@@ -22287,19 +22305,29 @@ static void emit_stmt_node(Compiler *c, int id, Buf *b, int indent) {
     }
   }
 
+  /* a define_method or attr_* on self where self is an object (cplan_missing's CM_NOMETHOD_SELF) is its
+     NoMethodError, not the declaration the forms below take it for */
+  { char st[160];
+    if (ty_k == NK_CallNode && cplan_missing(c, id, st, sizeof st, NULL) == CM_NOMETHOD_SELF) {
+      emit_effect_stmt(c, id, b, indent);
+      return;
+    } }
   /* `define_method` and the `[lits].each { define_method ... }` unroll are
      resolved at analyze time into real method scopes; emit nothing here. */
   if (ty_k == NK_CallNode) {
     const char *cnm = nt_str(nt, id, "name");
-    if (cnm && sp_streq(cnm, "define_method") && nt_ref(nt, id, "receiver") < 0) return;
+    if (cnm && is_define_method_name(cnm) && nt_ref(nt, id, "receiver") < 0) {
+      emit_env_store(c, id, b, indent);
+      return;
+    }
     /* define_singleton_method on a supported target (no receiver, `self`, or a
        class-constant / namespaced-class receiver) is resolved into a class-method
        scope at analyze time, so the call emits no runtime code. Mirror exactly the
        receivers analyze registers; an arbitrary-instance receiver is NOT no-op'd
        here -- it falls through to the normal unresolved-call reject at this site. */
-    if (cnm && sp_streq(cnm, "define_singleton_method")) {
+    if (cnm && is_define_singleton_method_name(cnm)) {
       int dsm_recv = nt_ref(nt, id, "receiver");
-      if (dsm_recv < 0) return;
+      if (dsm_recv < 0) { emit_env_store(c, id, b, indent); return; }
       NodeKind dsm_rk = nt_kind(nt, dsm_recv);
       if ((dsm_rk == NK_SelfNode || dsm_rk == NK_ConstantReadNode ||
                       dsm_rk == NK_ConstantPathNode)) {
@@ -22307,6 +22335,7 @@ static void emit_stmt_node(Compiler *c, int id, Buf *b, int indent) {
            An INSTANCE constant (`B = Box.new`) matches the same node type but
            is a singleton binding, and the statement is where its override
            starts (#4084) -- a no-op for anything analyze did not mark. */
+        emit_env_store(c, id, b, indent);
         emit_sg_activate(c, id, dsm_recv, b, indent);
         return;
       }
@@ -22316,7 +22345,18 @@ static void emit_stmt_node(Compiler *c, int id, Buf *b, int indent) {
        separately; the call itself is a no-op at runtime. g_class_body_id resolves
        a `self.` receiver in a class body (a bare receiver is already filtered out
        upstream by the class-body statement loop). */
-    if (class_eval_reopen_class(c, id, g_class_body_id) >= 0) return;
+    {
+      int rci = class_eval_reopen_class(c, id, g_class_body_id);
+      if (rci >= 0) {
+        /* a block on the body's own class runs its statements here, as the
+           body's own: the body's rule for each (a def and a declaration emit
+           nothing, a call that runs is a statement) */
+        int rblk = nt_ref(nt, id, "block");
+        int rbody = rci == g_class_body_id && rblk >= 0 ? nt_ref(nt, rblk, "body") : -1;
+        if (rbody >= 0 && nt_kind(nt, rbody) == NK_StatementsNode) emit_class_body_stmts(c, rci, rbody, b, indent);
+        return;
+      }
+    }
     if (cnm && sp_streq(cnm, "each") && nt_ref(nt, id, "block") >= 0) {
       int rcv = nt_ref(nt, id, "receiver");
       if (rcv >= 0 && nt_kind(nt, rcv) == NK_ArrayNode) {
@@ -23643,10 +23683,9 @@ void emit_stmt_tail_inner(Compiler *c, int id, Buf *b, int indent) {
     return;
   }
 
-  /* A local operator-assignment whose target is a captured/cell var (inside a
-     proc/block body) has no value form in emit_expr -- cells are int-restricted
-     and statement-only -- so keep emitting it as a statement; the enclosing
-     callable returns its default. Ordinary locals/ivars fall through below. */
+  /* A local operator-assignment whose target is a captured/cell var has no value form in emit_expr, which reads a
+     local's slot, not its cell: the write is emitted as a statement and the value read back from the cell, into a
+     proc's result slot or a method's return. Ordinary locals/ivars fall through below. */
   if (k == NK_LocalVariableOperatorWriteNode) {
     const char *nm = nt_str(nt, id, "name");
     LocalVar *lv = nm ? scope_local(comp_scope_of(c, id), nm) : NULL;
@@ -23655,8 +23694,7 @@ void emit_stmt_tail_inner(Compiler *c, int id, Buf *b, int indent) {
       /* Inside a proc/lambda body the cell op-write must still return the
          POST-assignment value (`->{ n += 1 }.call` is `n+1`, not the stale
          slot). Emit the mutation as a statement, then read the cell back and
-         publish it into the proc's result slot. Outside a proc body keep the
-         plain-statement form (the method's default return covers the value). */
+         publish it into the proc's result slot. */
       if (g_in_proc_body && g_result_var) {
         emit_stmt(c, id, b, indent);
         TyKind ct = lv ? lv->type : TY_INT;
@@ -23676,6 +23714,23 @@ void emit_stmt_tail_inner(Compiler *c, int id, Buf *b, int indent) {
           else if (!co && oint_kind(ct) && g_result_oint) buf_printf(b, "%s(%s);\n", oint_of(ct), rb.p ? rb.p : "0");
           else buf_printf(b, "%s;\n", rb.p ? rb.p : "0");
         }
+        free(rb.p);
+        return;
+      }
+      /* In a method body (a define_method's, or the def whose locals a proc closes over) the value is the cell's
+         after the write, as in a proc's: a nilable number's cell answers through its oint */
+      if (lv && tail_slot_reaches_ret(c, lv->type)) {
+        emit_stmt(c, id, b, indent);
+        Buf rb; memset(&rb, 0, sizeof rb); emit_local_ref(c, id, nm, &rb);
+        emit_indent(b, indent); emit_tail_lead(b);
+        if (slot_is_oint(lv)) {
+          if (g_result_var ? g_result_poly : g_ret_type == TY_POLY) buf_printf(b, "%s(%s);\n", oint_box(lv->type), rb.p ? rb.p : "0");
+          else if (g_result_var ? g_result_oint : g_ret_oint) buf_printf(b, "%s;\n", rb.p ? rb.p : "0");
+          else buf_printf(b, "%s.v;\n", rb.p ? rb.p : "0");
+        }
+        else if (oint_kind(lv->type) && !(g_result_var ? g_result_poly : g_ret_type == TY_POLY) && (g_result_var ? g_result_oint : g_ret_oint))
+          buf_printf(b, "%s(%s);\n", oint_of(lv->type), rb.p ? rb.p : "0");   /* (a plain cell, into a method that answers nil too) */
+        else emit_tail_slot(c, lv->type, rb.p ? rb.p : "0", b, id);
         free(rb.p);
         return;
       }
@@ -25896,20 +25951,38 @@ const char *g_iow_key_ref = NULL;
 static char g_iow_recv_buf[32], g_iow_key_buf[32];
 
 enum { IOW_KEY_HASH, IOW_KEY_INT, IOW_KEY_RAW, IOW_KEY_BOXED };
-static int iow_recv_local_held(Compiler *c, int recv, int key, int v);
+
+/* The order row covers the lifetime across the explicit key and RHS. A
+   fresh receiver has no holder. A frame local of the same representation
+   keeps its object unless the row marks a rebind. Other holders may also
+   be dropped by a callback while the write runs. The Hash statement's
+   boxed fold already calls for this protection even beside pure operands. */
+static int iow_recv_needs_root(Compiler *c, int id, int recv, Repr rr, int fold) {
+  if (rr.head_held || view_held(recv)) return 0;
+  if (operand_may_allocate(c, recv)) return 1;
+  const OpSlot *slot = op_slot_of(c, id, recv);
+  if (!slot && (op_order_of(c, id) || !op_order_visited(c, id))) return 1;
+  if (slot && slot->at == OPA_HOLD) return 1;
+  if (!(slot && (slot->flags & OPF_ACROSS)) && !fold && !ic_node_may_call_program(c, id)) return 0;
+  if (nt_kind(c->nt, recv) != NK_LocalVariableReadNode) return 1;
+  HolderRef h;
+  return !holder_of_node(c, recv, &h) || h.r.as_ty != rr.as_ty || h.r.cell != RC_NONE ||
+         substituted_local_node(c->nt, recv) >= 0 ||
+         (g_cap_struct && g_cap_names && nameset_has(g_cap_names, h.name));
+}
 
 static void iow_emit_recv(Compiler *c, int recv, Buf *b) {
   if (g_iow_recv_ref) { buf_puts(b, g_iow_recv_ref); return; }
   emit_expr(c, recv, b);
 }
-static void iow_emit_key(Compiler *c, int key, Buf *b, int kind, TyKind kt) {
-  if (g_iow_key_ref) {
+static void iow_emit_key(Compiler *c, int key, Buf *b, int kind, TyKind kt, const char *held) {
+  if (held) {
     /* emit_index_opw_hoist keeps a Symbol or String key raw for a poly
        receiver, which the slot read takes as is */
-    TyKind hk = comp_ntype(c, key);
+    TyKind hk = repr_of(c, key).as_ty;
     if (kind == IOW_KEY_BOXED && (hk == TY_SYMBOL || hk == TY_STRING))
-      emit_boxed_text(c, hk, g_iow_key_ref, b);
-    else buf_puts(b, g_iow_key_ref);
+      emit_boxed_text(c, hk, held, b);
+    else buf_puts(b, held);
     return;
   }
   switch (kind) {
@@ -25918,6 +25991,26 @@ static void iow_emit_key(Compiler *c, int key, Buf *b, int kind, TyKind kt) {
     case IOW_KEY_BOXED: emit_boxed(c, key, b); return;
     default:            emit_expr(c, key, b); return;
   }
+}
+
+/* Where the phase could not place an operand, keep its prelude with it. */
+static int iow_key_ahead(Compiler *c, int id, int key) {
+  const OpSlot *slot = op_slot_of(c, id, key);
+  if (slot) return slot->at == OPA_AHEAD;
+  return op_order_of(c, id) || !op_order_visited(c, id);
+}
+
+/* Declare the key after the receiver. An AHEAD key's prelude belongs here
+   too: it can replace the local or field the receiver was read from. */
+static void iow_key_decl(Compiler *c, int ahead, int key, Buf *b, const char *type,
+                         int tmp, int kind, TyKind kt, const char *held) {
+  Buf val = {0};
+  Buf *save = g_pre;
+  if (ahead) g_pre = b;
+  iow_emit_key(c, key, &val, kind, kt, held);
+  g_pre = save;
+  buf_printf(b, "%s _t%d = %s", type, tmp, val.p ? val.p : "0");
+  free(val.p);
 }
 
 /* Evaluate the receiver and key once into prelude temps and point the two
@@ -25930,53 +26023,48 @@ int emit_index_opw_hoist(Compiler *c, int id, Buf *pre, int indent) {
   int argc = 0;
   const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
   if (recv < 0 || argc != 1 || !pre) return 0;
+  int ahead = iow_key_ahead(c, id, argv[0]);
   Repr rr = repr_of(c, recv);
   TyKind rt = rr.as_ty;
-  Buf kb; memset(&kb, 0, sizeof kb);
   const char *ktype = NULL;
-  int key_is_ptr = 0;
+  TyKind kt = repr_of(c, argv[0]).as_ty;
+  int key_is_ptr = 0, kind = IOW_KEY_RAW;
   if (ty_is_hash(rt) && ty_hash_cname(rt) && hash_opw_okey(c, argv[0], rt)) {
-    ktype = "sp_RbVal"; key_is_ptr = 1; emit_boxed(c, argv[0], &kb);   /* held boxed (hash_opw_okey) */
+    ktype = "sp_RbVal"; key_is_ptr = 1; kind = IOW_KEY_BOXED;
   }
   else if (ty_is_hash(rt) && ty_hash_cname(rt)) {
-    TyKind kt = ty_hash_key(rt);
+    kt = ty_hash_key(rt);
     ktype = c_type_name(kt);
     key_is_ptr = (kt == TY_STRING || kt == TY_POLY);
-    emit_hash_key(c, argv[0], kt, &kb);
+    kind = IOW_KEY_HASH;
   }
   else if (ty_is_array(rt) && (rt == TY_POLY_ARRAY || array_kind(rt))) {
-    ktype = "sp_int"; emit_int_expr(c, argv[0], &kb);
+    ktype = "sp_int"; kind = IOW_KEY_INT;
   }
   else if (rr.kind == RK_BOXED) {
-    TyKind kt = comp_ntype(c, argv[0]);
-    if (kt == TY_SYMBOL)      { ktype = "sp_sym";      emit_expr(c, argv[0], &kb); }
-    else if (kt == TY_STRING) { ktype = "const char *"; key_is_ptr = 1; emit_expr(c, argv[0], &kb); }
-    else if (kt == TY_INT && !poly_int_key_boxed(c, argv[0])) { ktype = "sp_int"; emit_int_expr(c, argv[0], &kb); }
-    else                      { ktype = "sp_RbVal";    key_is_ptr = 1; emit_boxed(c, argv[0], &kb); }
+    if (kt == TY_SYMBOL)      { ktype = "sp_sym"; }
+    else if (kt == TY_STRING) { ktype = "const char *"; key_is_ptr = 1; }
+    else if (kt == TY_INT && !poly_int_key_boxed(c, argv[0])) { ktype = "sp_int"; kind = IOW_KEY_INT; }
+    else                      { ktype = "sp_RbVal"; key_is_ptr = 1; kind = IOW_KEY_BOXED; }
   }
-  else { free(kb.p); return 0; }
+  else return 0;
   Buf rb; memset(&rb, 0, sizeof rb);
   emit_expr(c, recv, &rb);
   int ta = ++g_tmp, tb = ++g_tmp;
   emit_indent(pre, indent);
   buf_printf(pre, "%s _t%d = %s;\n", c_type_name(rt), ta, rb.p ? rb.p : "0");
-  /* a receiver or key that allocates has no other root while the fold below
-     runs, and the fold can collect; nor has one a key that runs code can
-     rebind (`(a[swap.call] += 7)`, a closure over `a`) while it allocates,
-     unless a plain local nothing rebinds still holds it */
-  int v = nt_ref(nt, id, "value");
-  if (subtree_may_allocate(c, recv) || subtree_has_side_effect(c, v) ||
-      (!subtree_is_pure_read(c, argv[0]) && !iow_recv_local_held(c, recv, argv[0], v))) {
+  if (iow_recv_needs_root(c, id, recv, rr, 0)) {
     emit_indent(pre, indent);
     buf_printf(pre, rr.kind == RK_BOXED ? "SP_GC_ROOT_RBVAL(_t%d);\n" : "SP_GC_ROOT(_t%d);\n", ta);
   }
   emit_indent(pre, indent);
-  buf_printf(pre, "%s _t%d = %s;\n", ktype, tb, kb.p ? kb.p : "0");
+  iow_key_decl(c, ahead, argv[0], pre, ktype, tb, kind, kt, NULL);
+  buf_puts(pre, ";\n");
   if (key_is_ptr && subtree_may_allocate(c, argv[0])) {
     emit_indent(pre, indent);
     buf_printf(pre, sp_streq(ktype, "sp_RbVal") ? "SP_GC_ROOT_RBVAL(_t%d);\n" : "SP_GC_ROOT(_t%d);\n", tb);
   }
-  free(rb.p); free(kb.p);
+  free(rb.p);
   snprintf(g_iow_recv_buf, sizeof g_iow_recv_buf, "_t%d", ta);
   snprintf(g_iow_key_buf, sizeof g_iow_key_buf, "_t%d", tb);
   g_iow_recv_ref = g_iow_recv_buf;
@@ -26096,30 +26184,6 @@ static int g_iow_val_taken = 0;
 void emit_index_opw_value_into(const char *tmp) { g_iow_val_next = tmp; g_iow_val_taken = 0; }
 int emit_index_opw_value_taken(void) { return g_iow_val_taken; }
 
-/* Whether the receiver of `recv[key] op= v` is a plain C local that still
-   holds the receiver's object while the key and the right-hand side run: a
-   local is rooted where it is declared and the collector does not move
-   objects, so the temp the receiver is copied into needs no root of its own
-   unless the key or the right-hand side can rebind the local -- by writing
-   it, or, for a local a closure captured, through the closure. */
-static int iow_recv_local_held(Compiler *c, int recv, int key, int v) {
-  const NodeTable *nt = c->nt;
-  if (nt_kind(nt, recv) != NK_LocalVariableReadNode) return 0;
-  const char *nm = nt_str(nt, recv, "name");
-  if (!nm) return 0;
-  LocalVar *lv = scope_local(comp_scope_of(c, recv), nm);
-  if (!lv || lv->is_cell || (g_cap_struct && g_cap_names && nameset_has(g_cap_names, nm)))
-    return 0;
-  /* spelled as the C local itself, not a cell or a capture slot */
-  Buf rb; memset(&rb, 0, sizeof rb);
-  emit_expr(c, recv, &rb);
-  char want[300];
-  snprintf(want, sizeof want, "lv_%s", nm);
-  int plain = rb.p && sp_streq(rb.p, want);
-  free(rb.p);
-  return plain && !subtree_writes_var(c, key, nm, VW_LOCAL) && !subtree_writes_var(c, v, nm, VW_LOCAL);
-}
-
 void emit_index_op_write(Compiler *c, int id, Buf *b, int indent) {
   const char *val_ref = g_iow_val_next;
   g_iow_val_next = NULL;
@@ -26132,7 +26196,10 @@ void emit_index_op_write(Compiler *c, int id, Buf *b, int indent) {
   const int *argv = NULL;
   if (args >= 0) argv = nt_arr(nt, args, "arguments", &argc);
   if (argc != 1 || !op) unsupported(c, id, "index operator assignment");
-  TyKind rt = comp_ntype(c, recv);
+  Repr rr = repr_of(c, recv);
+  TyKind rt = rr.as_ty;
+  int ahead = iow_key_ahead(c, id, argv[0]);
+  int root_recv = !g_iow_recv_ref && iow_recv_needs_root(c, id, recv, rr, rr.val == TY_POLY);
 
   int ta = ++g_tmp, tb = ++g_tmp;
 
@@ -26142,25 +26209,15 @@ void emit_index_op_write(Compiler *c, int id, Buf *b, int indent) {
     if (!hn) unsupported(c, id, "index operator assignment (hash)");
     TyKind kt = ty_hash_key(rt);
     emit_indent(b, indent);
-    /* The receiver's temp is the hash's only holder once the key or the RHS
-       drops it, and a key that can allocate has no holder at all: root the
-       receiver when either can -- a call, a write, or the fold on a poly
-       slot, which is a call -- and the key when it can allocate. None of
-       them drops a plain local's hash (iow_recv_local_held), which still
-       holds it. Temps the value form hoisted (g_iow_*) carry the root they
-       were declared with. */
-    int drops = subtree_has_side_effect(c, argv[0]) || subtree_has_side_effect(c, v) || vt == TY_POLY;
     buf_printf(b, "{ %s _t%d = ", c_type_name(rt), ta); iow_emit_recv(c, recv, b);
     buf_puts(b, "; ");
-    if (!g_iow_recv_ref &&
-        (subtree_may_allocate(c, recv) || (drops && !iow_recv_local_held(c, recv, argv[0], v)))) {
+    if (root_recv) {
       emit_gc_root_tmp(c, rt, ta, b); buf_puts(b, " ");
     }
     /* a key that may be nil or of another class: held boxed, the read
        misses on it and the store converts it (hash_opw_okey) */
     int ok = hash_opw_okey(c, argv[0], rt);
-    buf_printf(b, "%s _t%d = ", ok ? "sp_RbVal" : c_type_name(kt), tb);
-    iow_emit_key(c, argv[0], b, ok ? IOW_KEY_BOXED : IOW_KEY_HASH, kt);
+    iow_key_decl(c, ahead, argv[0], b, ok ? "sp_RbVal" : c_type_name(kt), tb, ok ? IOW_KEY_BOXED : IOW_KEY_HASH, kt, g_iow_key_ref);
     buf_puts(b, "; ");
     if (!g_iow_key_ref && operand_may_allocate(c, argv[0]) && (ok || needs_root(kt))) {
       emit_gc_root_tmp(c, ok ? TY_POLY : kt, tb, b); buf_puts(b, " ");
@@ -26263,12 +26320,6 @@ void emit_index_op_write(Compiler *c, int id, Buf *b, int indent) {
         sp_streq(op, "&") ? "sp_poly_band" : sp_streq(op, "|") ? "sp_poly_bor" :
         sp_streq(op, "^") ? "sp_poly_bxor" : NULL;
     emit_indent(b, indent);
-    /* The receiver temp is GC-rooted when the receiver expression itself
-       can allocate (`make_array()[i] += v`): such a fresh temporary has no
-       other root, and the RHS / fold helpers below (sp_poly_<op>,
-       sp_str_plus/repeat) can trigger a collection before the closing
-       sp_*Array_set. A bare local/ivar read is already rooted at its slot,
-       so it skips the push (keeps hot emissions byte-identical). */
     /* the fused fold below is decided here, ahead of the root and the capture
        it makes unnecessary: a pure RHS allocates nothing and has nothing to
        order against the read */
@@ -26282,18 +26333,10 @@ void emit_index_op_write(Compiler *c, int id, Buf *b, int indent) {
     int fnil = rt == TY_FLOAT_ARRAY && is_arith_op(op);
     int eff = !fuse && g_pre && subtree_has_side_effect(c, v);
     buf_printf(b, "{ %s _t%d = ", c_type_name(rt), ta); iow_emit_recv(c, recv, b);
-    /* ...and when the key can run code: it can reassign the variable the
-       receiver was read from (`@a[swap_a] += 1`) and allocate, and the temp
-       is then the old array's only holder while the key runs -- the fold
-       below writes into it. A key that is a pure read does neither, and
-       neither can one that leaves a plain local receiver alone: the local's
-       own root still holds the array (`h[k * 256 + s.getbyte(i)] += r`
-       pushed and popped a root on every turn of a histogram loop). */
-    if (subtree_may_allocate(c, recv) ||
-        (!g_iow_recv_ref && (eff || !subtree_is_pure_read(c, argv[0])) &&
-         !iow_recv_local_held(c, recv, argv[0], v)))
+    if (root_recv)
       buf_printf(b, "; SP_GC_ROOT(_t%d)", ta);
-    buf_printf(b, "; sp_int _t%d = ", tb); iow_emit_key(c, argv[0], b, IOW_KEY_INT, TY_INT);
+    buf_puts(b, "; ");
+    iow_key_decl(c, ahead, argv[0], b, "sp_int", tb, IOW_KEY_INT, TY_INT, g_iow_key_ref);
     buf_puts(b, "; ");
     char slot[192];
     typed_elem_getf(slot, sizeof slot, rt, k, "_t%d, _t%d", ta, tb);
@@ -26468,22 +26511,18 @@ void emit_index_op_write(Compiler *c, int id, Buf *b, int indent) {
     int tc = ++g_tmp;
     int eff = g_pre && subtree_has_side_effect(c, v);
     buf_printf(b, "{ sp_RbVal _t%d = ", ta); iow_emit_recv(c, recv, b);
-    /* held as the typed receivers are: a key or right-hand side that runs
-       code can rebind the variable the receiver came from (a closure over
-       `a` in `a[swap.call] += 7`) and leave the temp the old object's only
-       holder while it allocates; a plain local nothing rebinds still holds
-       it (iow_recv_local_held) */
-    if (!g_iow_recv_ref &&
-        (subtree_may_allocate(c, recv) ||
-         ((!subtree_is_pure_read(c, argv[0]) || subtree_has_side_effect(c, v)) &&
-          !iow_recv_local_held(c, recv, argv[0], v))))
+    if (root_recv)
       buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d)", ta);
     if (kt == TY_INT) {
-      buf_printf(b, "; sp_int _t%d = ", tb); iow_emit_key(c, argv[0], b, IOW_KEY_INT, TY_INT); buf_puts(b, "; ");
+      buf_puts(b, "; ");
+      iow_key_decl(c, ahead, argv[0], b, "sp_int", tb, IOW_KEY_INT, TY_INT, g_iow_key_ref);
+      buf_puts(b, "; ");
       buf_printf(b, "sp_RbVal _t%d = sp_poly_arr_get_hash(_t%d, _t%d);", tc, ta, tb);
     }
     else {
-      buf_printf(b, "; sp_RbVal _t%d = ", tb); iow_emit_key(c, argv[0], b, IOW_KEY_BOXED, TY_POLY); buf_puts(b, "; ");
+      buf_puts(b, "; ");
+      iow_key_decl(c, ahead, argv[0], b, "sp_RbVal", tb, IOW_KEY_BOXED, TY_POLY, g_iow_key_ref);
+      buf_puts(b, "; ");
       /* a key that is a new object -- a heap value the operand builds, or a
          Range its boxing allocates -- is read again by the store, after the
          read, the right-hand side and the operator, any of which can

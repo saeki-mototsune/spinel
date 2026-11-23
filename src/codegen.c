@@ -6442,11 +6442,7 @@ static void gc_roots_take_back(Compiler *c, Scope *s, Buf *b, size_t fn_off) {
     const char *last = NULL;
     for (const char *q = strstr(body, lvname); q; q = strstr(q + 1, lvname)) last = q;
     if (last && !gc_region_inert(body, last, lvname)) continue;
-    if (g_decide_on) {
-      char written[300];
-      snprintf(written, sizeof written, "%.*s", (int)block_param_written_len(c, lv->name), lv->name);
-      if (!decide_fn("root-elide", decide_method_site(c, s), written)) continue;
-    }
+    if (g_decide_on && !decide_fn("root-elide", decide_method_site(c, s), scope_local_wname(c, s->idx, lv))) continue;
     buf_erase(b, (size_t)(at - b->p), rl);
   }
   /* temps, by the same rule */
@@ -8067,6 +8063,8 @@ static void wrap_root_context(Compiler *c, Scope *s, Buf *b, size_t sig_off, siz
   free(args.p); free(inner.p);
 }
 
+static void emit_env_load(Compiler *c, Scope *dm, Buf *b, NameSet *caps, char *capst, size_t cap);
+static void emit_env_decl(Compiler *c, const Scope *dm);
 static void emit_method(Compiler *c, Scope *s, Buf *b, int loop_callee) {
   { char grp[UNIT_TAG_MAX];
     /* the unit is named after the function, past its sp_ */
@@ -8232,6 +8230,14 @@ static void emit_method(Compiler *c, Scope *s, Buf *b, int loop_callee) {
   size_t gc_save_len = b->len - gc_save_off;
   if (repr_self_handle(c, (int)(s - c->scopes))) buf_puts(b, "    SP_GC_ROOT(self);\n");
   else if (method_self_root(c, s)) buf_printf(b, "    %s(self);\n", method_self_root(c, s));
+  /* a define_method block's locals of its definer are cells it reads through the environment loaded here */
+  const char *sv_envst = g_cap_struct; NameSet *sv_envn = g_cap_names;
+  NameSet env_names = {0};
+  char env_st[32];
+  if (s->env_host) {
+    emit_env_load(c, s, b, &env_names, env_st, sizeof env_st);
+    g_cap_struct = env_st; g_cap_names = &env_names;
+  }
   /* a body that opens with guards makes its closure cells past them */
   int cdefer_at = cdefer_guard_count(c, s);
   Scope *sv_cdscope = g_cdefer_scope; int sv_cdstmts = g_cdefer_stmts, sv_cdat = g_cdefer_at;
@@ -8383,6 +8389,7 @@ static void emit_method(Compiler *c, Scope *s, Buf *b, int loop_callee) {
   g_lowered_blk_name = saved_lbn;
   g_brk_ser_var = saved_bser; g_brk_skip_id = saved_bskip;
   g_yield_proc_ref = sv_ypr9; g_yield_slot_ty = sv_yst9; free(ypr9.p);
+  g_cap_struct = sv_envst; g_cap_names = sv_envn; free(env_names.v);
   buf_puts(b, "}\n");
   if (!g_no_root_elision) gc_roots_take_back(c, s, b, gc_save_off);
   const char *site = decide_method_site(c, s);
@@ -9350,16 +9357,10 @@ static void emit_fiber_full_bind(Compiler *c, FiberParams *f, Scope *encl, NameS
     buf_puts(pb, "    sp_RbVal _fkh = _fb->pass_kw ? sp_PolyArray_get(_fa, _fn) : sp_box_nil();\n");
     int chk = ++g_tmp;
     buf_printf(pb, "    static const char *const _kw%d[] = {", chk);
-    for (int k = 0; k < K; k++) {
-      const char *nm = nt_str(nt, kws[k], "name");
-      buf_printf(pb, "\"%.*s\", ", (int)block_param_written_len(c, nm), nm);
-    }
+    for (int k = 0; k < K; k++) buf_printf(pb, "\"%s\", ", nt_wname(nt, kws[k]));
     buf_printf(pb, "0}, *const _kr%d[] = {", chk);
-    for (int k = 0; k < K; k++) {
-      const char *nm = nt_str(nt, kws[k], "name");
-      if (nt_kind(nt, kws[k]) == NK_RequiredKeywordParameterNode)
-        buf_printf(pb, "\"%.*s\", ", (int)block_param_written_len(c, nm), nm);
-    }
+    for (int k = 0; k < K; k++)
+      if (nt_kind(nt, kws[k]) == NK_RequiredKeywordParameterNode) buf_printf(pb, "\"%s\", ", nt_wname(nt, kws[k]));
     buf_printf(pb, "0}, *const _kl%d[] = {0};\n", chk);
     buf_printf(pb, "    sp_kwargs_verify(_fkh, _kw%d, _kr%d, _kl%d, %d);\n", chk, chk, chk, krs < 0);
   }
@@ -9388,8 +9389,8 @@ static void emit_fiber_full_bind(Compiler *c, FiberParams *f, Scope *encl, NameS
   for (int k = 0; k < K; k++) {
     const char *nm = nt_str(nt, kws[k], "name");
     int t = ++g_tmp;
-    buf_printf(pb, "    sp_bool _ff%d = 0;\n    sp_RbVal _fv%d = sp_poly_hash_get_pair_val(_fkh, sp_box_sym(sp_sym_intern(\"%.*s\")), &_ff%d);\n",
-               t, t, (int)block_param_written_len(c, nm), nm, t);
+    buf_printf(pb, "    sp_bool _ff%d = 0;\n    sp_RbVal _fv%d = sp_poly_hash_get_pair_val(_fkh, sp_box_sym(sp_sym_intern(\"%s\")), &_ff%d);\n",
+               t, t, nt_wname(nt, kws[k]), t);
     char have[32], val[32];
     snprintf(have, sizeof have, "_ff%d", t);
     snprintf(val, sizeof val, "_fv%d", t);
@@ -9402,11 +9403,8 @@ static void emit_fiber_full_bind(Compiler *c, FiberParams *f, Scope *encl, NameS
     int t = ++g_tmp;
     buf_printf(pb, "    sp_PolyPolyHash *_t%d = _fb->pass_kw ? sp_PolyPolyHash_from_poly(_fkh) : sp_PolyPolyHash_new();\n"
                    "    SP_GC_ROOT(_t%d);\n", t, t);
-    for (int k = 0; k < K; k++) {
-      const char *nm = nt_str(nt, kws[k], "name");
-      buf_printf(pb, "    sp_PolyPolyHash_delete(_t%d, sp_box_sym(sp_sym_intern(\"%.*s\")));\n",
-                 t, (int)block_param_written_len(c, nm), nm);
-    }
+    for (int k = 0; k < K; k++)
+      buf_printf(pb, "    sp_PolyPolyHash_delete(_t%d, sp_box_sym(sp_sym_intern(\"%s\")));\n", t, nt_wname(nt, kws[k]));
     char kv[64]; snprintf(kv, sizeof kv, "sp_box_obj(_t%d, SP_BUILTIN_POLY_POLY_HASH)", t);
     emit_fiber_param_slot(c, encl, knm, kv, caps, pb);
   }
@@ -10127,6 +10125,9 @@ static int proc_body_uses_self(Compiler *c, int id, int class_id) {
     if (imi >= 0 && repr_self_boxed(c, imi)) return 1;
     /* a bare instance_exec / instance_eval runs its block on self */
     if (nm && (sp_streq(nm, "instance_exec") || sp_streq(nm, "instance_eval"))) return 1;
+    /* a definer whose NoMethodError names self (cplan_missing's CM_NOMETHOD_SELF) */
+    char st[160];
+    if (cplan_missing(c, id, st, sizeof st, NULL) == CM_NOMETHOD_SELF) return 1;
     /* an attr_reader is not a method in the chain -- it reads the ivar
        directly off self, which the body needs captured all the same (#3750) */
     if (nm && call_attr_target(c, id, class_id, nm, CT_ATTR, NULL)) return 1;
@@ -10212,24 +10213,8 @@ static TyKind lambda_nonlocal_return_ty(Compiler *c, int id) {
   }
   return r;
 }
-/* The name a parameter shows in #parameters: a block parameter renamed to
-   avoid a scope collision carries a `__bp<N>` suffix that is ours, not the
-   program's (#3679). */
-/* Drop the suffix the shadow rename recorded: `Proc#parameters` reports the
-   name the program wrote, not the slot the rename invented. EVERY parameter
-   kind has to go through this -- rest, keyword, keyword-rest and block leaked
-   the suffix while the positional ones were stripped (#4045). */
-static const char *param_public_name(const Compiler *c, const char *n) {
-  if (!n) return n;
-  size_t len = param_written_len(c, n);
-  if (!n[len]) return n;
-  { static char *buf; static size_t cap;   /* a name of any length: nothing is cut */
-    if (len + 1 > cap) { cap = len + 1; buf = (char *)realloc(buf, cap); }
-    memcpy(buf, n, len); buf[len] = 0;
-    return buf; }
-}
 /* The symbol Proc#parameters reports for parameter node p: the name the
-   program wrote (param_public_name), `anon` for one with no name, CRuby's
+   program wrote (param_written_name), `anon` for one with no name, CRuby's
    text for an anonymous one the desugar named; -1 for a destructuring
    group's slot, which has no name, and -2 for a parameter the desugar made
    that is none, the implicit rest of a trailing comma (`|a,|`, #4045)
@@ -10240,7 +10225,7 @@ static int proc_param_sym(Compiler *c, int p, const char *anon) {
   case DPN_NONE: return -2;
   case DPN_NAMELESS: return -1;
   case DPN_WRITTEN: return comp_sym_intern(c, w);
-  default: nm = param_public_name(c, nm); return comp_sym_intern(c, nm ? nm : anon);
+  default: return comp_sym_intern(c, nm ? param_written_name(c, nt_wname(c->nt, p)) : anon);
   }
 }
 
@@ -10252,41 +10237,8 @@ static int proc_param_sym(Compiler *c, int p, const char *anon) {
    in the node's `locals`, params included, so params are asked separately. A
    name the block only READS from the enclosing scope is not there. */
 static int proc_owns_local(Compiler *c, int create, const char *nm) {
-  const char *locs = nt_str(c->nt, create, "locals");
-  if (!locs || !*locs || !nm) return 0;
-  size_t nl = strlen(nm);
-  for (const char *p = locs; *p; ) {
-    const char *e = strchr(p, ',');
-    size_t l = e ? (size_t)(e - p) : strlen(p);
-    if (l == nl && memcmp(p, nm, nl) == 0)
-      return !subtree_has_param_named_pub(c, nt_ref(c->nt, create, "parameters"), nm);
-    if (!e) break;
-    p = e + 1;
-  }
-  return 0;
-}
-
-/* 1 when a parameter in this subtree is spelled exactly `nm`. The shadow
-   rename leaves a renamed parameter's node spelled NAME__bpNN, so this tells
-   it from an unrenamed name the enclosing scope also uses, which
-   subtree_has_param_named_pub matches under either spelling. */
-static int param_spelled(const NodeTable *nt, int id, const char *nm) {
-  if (id < 0) return 0;
-  const char *ty = nt_type(nt, id);
-  NodeKind ty_k = nt_kind(nt, id);
-  if (ty && (strstr(ty, "ParameterNode") || ty_k == NK_LocalVariableTargetNode)) {
-    const char *pn = nt_str(nt, id, "name");
-    if (pn && sp_streq(pn, nm)) return 1;
-  }
-  int nr = nt_num_refs(nt, id);
-  for (int i = 0; i < nr; i++)
-    if (param_spelled(nt, nt_ref_at(nt, id, i), nm)) return 1;
-  int na = nt_num_arrs(nt, id);
-  for (int i = 0; i < na; i++) {
-    int n = 0; const int *ids = nt_arr_at(nt, id, i, &n);
-    for (int k = 0; k < n; k++) if (param_spelled(nt, ids[k], nm)) return 1;
-  }
-  return 0;
+  return nt_scope_has_local(c->nt, create, nm) &&
+         !subtree_has_param_named_pub(c, nt_ref(c->nt, create, "parameters"), nm);
 }
 
 /* 1 when `nm` is declared by a block nested in the proc body -- one of its
@@ -10307,24 +10259,15 @@ static int nested_block_declares(Compiler *c, int id, const char *nm) {
   if (!ty || ty_k == NK_LambdaNode) return 0;
   if (ty_k == NK_BlockNode) {
     int pn = nt_ref(nt, id, "parameters");
-    if (param_spelled(nt, pn, nm)) return 1;
-    const char *locs = nt_str(nt, id, "locals");
-    size_t nl = strlen(nm);
-    for (const char *p = locs ? locs : ""; *p; ) {
-      const char *e = strchr(p, ',');
-      size_t l = e ? (size_t)(e - p) : strlen(p);
-      if (l == nl && memcmp(p, nm, nl) == 0) {
-        /* The list keeps a renamed parameter's raw NAME: that entry is the
-           parameter, not the enclosing scope's `nm`. Numbered and `it`
-           parameters have no node of their own, and the list carries their
-           renamed spelling. */
-        NodeKind pk = nt_kind(nt, pn);
-        if (pk == NK_NumberedParametersNode || pk == NK_ItParametersNode) return 1;
-        if (!subtree_has_param_named_pub(c, pn, nm)) return 1;
-        break;
-      }
-      if (!e) break;
-      p = e + 1;
+    if (nt_param_binds(nt, pn, nm)) return 1;
+    if (nt_scope_has_local(nt, id, nm)) {
+      /* The list keeps a renamed parameter's raw NAME: that entry is the
+         parameter, not the enclosing scope's `nm`. Numbered and `it`
+         parameters have no node of their own, and the list carries their
+         renamed spelling. */
+      NodeKind pk = nt_kind(nt, pn);
+      if (pk == NK_NumberedParametersNode || pk == NK_ItParametersNode) return 1;
+      if (!subtree_has_param_named_pub(c, pn, nm)) return 1;
     }
   }
   int nr = nt_num_refs(nt, id);
@@ -10532,6 +10475,193 @@ static void emit_proc_param_cell(Compiler *c, Scope *bs, const char *p, Buf *pb)
     buf_printf(pb, "    sp_int *_cell_%s = (sp_int *)sp_gc_alloc(sizeof(sp_int), NULL, NULL);"
                    " SP_GC_ROOT(_cell_%s); *_cell_%s = lv_%s;%c", p, p, p, p, 10);
   }
+}
+
+/* The capture struct of a proc or of a define_method block's environment (emit_env_decl): a pointer to the cell of
+   each local `caps` names, a float capture riding a native sp_float cell, a poly capture an sp_RbVal cell, a heap
+   object its typed pointer (see emit_scope_decls); and the scan that marks the struct and then each cell, as
+   sp_Proc_scan does not mark the struct. */
+static void emit_cap_fields(Compiler *c, const Scope *bs, const NameSet *caps, Buf *b) {
+  for (int i = 0; i < caps->n; i++) {
+    LocalVar *clv = scope_local((Scope *)bs, caps->v[i]);
+    buf_puts(b, " ");
+    emit_cell_elem_type(c, clv, b);
+    buf_printf(b, " *c_%s;", caps->v[i]);
+  }
+}
+static void emit_cap_marks(const NameSet *caps, Buf *b) {
+  for (int i = 0; i < caps->n; i++)
+    buf_printf(b, "  if (_c->c_%s) sp_gc_mark((void *)_c->c_%s);\n", caps->v[i], caps->v[i]);
+}
+/* Fill the struct `_capv_<pid>` in the statement's prelude with the cells `caps` names, as named where it is BUILT.
+   Inside another proc that captures the same name, no `_cell_<n>` is in scope: the cell arrived through that proc's
+   own capture struct, and the new one forwards it from there (#3416). A name renamed here is an INLINED callee's
+   local that only shares the spelling with the enclosing capture's. */
+static void emit_cap_fill(Buf *out, int indent, const char *pid, const NameSet *caps) {
+  for (int i = 0; i < caps->n; i++) {
+    emit_indent(out, indent);
+    if (g_cap_struct && g_cap_names && nameset_has(g_cap_names, caps->v[i]) &&
+        sp_streq(rename_local(caps->v[i]), caps->v[i]))
+      buf_printf(out, "_capv_%s->c_%s = ((%s *)_cap)->c_%s;\n", pid, caps->v[i], g_cap_struct, caps->v[i]);
+    else
+      buf_printf(out, "_capv_%s->c_%s = _cell_%s;\n", pid, caps->v[i], rename_local(caps->v[i]));
+  }
+}
+/* ---- the environment of a define_method block ----
+   A define_method or define_singleton_method block in a def's body closes over that def's locals (Scope.env_host): the
+   locals are heap cells, as a proc's captures are, and the capture struct that holds the cells (the environment) is
+   built where the definer runs and stored in one global per definer scope. The method it defines loads that global
+   into a rooted local of its own as it starts, so a call already running keeps the environment it began with when
+   its body runs the definer again, and reads and writes the cells through it as a proc body does (g_cap_struct). */
+/* Does the method pass emit scope s (the one that decides which scopes the loop below skips)? */
+static int scope_is_emitted(Compiler *c, int s) {
+  const Scope *sc = &c->scopes[s];
+  return !(prog_is_top_scope(c, sc) || sc->yields || (!sc->reachable && (!sc->is_proc_form || !proc_form_live(c, s))) ||
+           scope_is_shadowed(c, s) || comp_scope_copied_away(c, s));
+}
+static NameSet env_caps(const Scope *dm, Scope *host) {
+  NameSet caps = {0};
+  for (int i = 0; i < dm->nenv_names; i++) {
+    LocalVar *lv = scope_local(host, dm->env_names[i]);
+    if (lv && lv->is_cell) nameset_add(&caps, dm->env_names[i]);
+  }
+  return caps;
+}
+/* The environment is the definer's, not a scope's: the scope of a module's method an include copies (and every other
+   copy) reads the one its definer stores, whichever of the copies is emitted. Keyed by the definer call. */
+static void env_tag(const Scope *dm, char *out, size_t cap) { snprintf(out, cap, "env%d", dm->def_node); }
+/* Is the capture struct in force (g_cap_struct) the environment of method scope dm, which has no receiving class in it
+   (a proc's struct has)? */
+static int env_struct_is(const Scope *dm, const char *capst) {
+  char pid[24], want[40];
+  if (!dm || !dm->env_host || !capst) return 0;
+  env_tag(dm, pid, sizeof pid);
+  snprintf(want, sizeof want, "_proc_cap_%s", pid);
+  return sp_streq(capst, want);
+}
+/* Is scope si the first emitted scope of its definer's environment (the one that declares it), and does any scope of
+   definer call `node` get emitted (first = 0)? */
+static int env_emitted_scope(Compiler *c, int node, int si) {
+  for (int k = 1; k < c->nscopes; k++)
+    if (c->scopes[k].env_host && c->scopes[k].def_node == node && scope_is_emitted(c, k)) return si < 0 || k == si;
+  return 0;
+}
+/* The capture struct and its scan, where the proc ones go: ahead of the bodies that name them */
+static void emit_env_decl(Compiler *c, const Scope *dm) {
+  char pid[24];
+  NameSet caps = env_caps(dm, &c->scopes[dm->env_host - 1]);
+  env_tag(dm, pid, sizeof pid);
+  buf_puts(&g_procs, "typedef struct {");
+  emit_cap_fields(c, &c->scopes[dm->env_host - 1], &caps, &g_procs);
+  buf_printf(&g_procs, " } _proc_cap_%s;\nstatic void _proc_cap_scan_%s(void *p) {\n", pid, pid);
+  buf_puts(&g_procs, "  sp_gc_mark(p);\n");
+  buf_printf(&g_procs, "  _proc_cap_%s *_c = (_proc_cap_%s *)p;\n", pid, pid);
+  emit_cap_marks(&caps, &g_procs);
+  buf_puts(&g_procs, "}\n");
+  free(caps.v);
+}
+/* The environment's global, and its line of sp_mark_user_globals */
+static void emit_env_globals(Compiler *c, Buf *decl, Buf *mark) {
+  for (int si = 1; si < c->nscopes; si++) {
+    const Scope *dm = &c->scopes[si];
+    if (!dm->env_host || !env_emitted_scope(c, dm->def_node, si)) continue;
+    buf_printf(decl, "static void *gv___spinel_env_%d;\n", dm->def_node);
+    buf_printf(mark, "  if (gv___spinel_env_%d) sp_gc_mark(gv___spinel_env_%d);\n", dm->def_node, dm->def_node);
+  }
+}
+/* Load the environment as the method starts, and read the cells through it */
+static void emit_env_missing(Compiler *c, const Scope *dm, Buf *b, const char *self, int vcall);
+static void emit_env_load(Compiler *c, Scope *dm, Buf *b, NameSet *caps, char *capst, size_t cap) {
+  char pid[24];
+  env_tag(dm, pid, sizeof pid);
+  *caps = env_caps(dm, &c->scopes[dm->env_host - 1]);
+  snprintf(capst, cap, "_proc_cap_%s", pid);
+  buf_printf(b, "    %s *_cap = (%s *)gv___spinel_env_%d;\n    SP_GC_ROOT(_cap);\n", capst, capst, dm->def_node);
+  /* A call that reaches the method before its definer ran (a poly dispatch that has no version to read) finds no
+     environment: CRuby has no such method yet */
+  buf_puts(b, "    if (SP_UNLIKELY(!_cap)) { ");
+  emit_env_missing(c, dm, b, "self", 0);
+  if (method_is_void(dm)) buf_puts(b, " return; }\n");
+  else buf_printf(b, " return %s; }\n", method_ret_zero(c, dm) ? method_ret_zero(c, dm) : "0");
+}
+/* The NoMethodError for a call that reaches a method before its definer ran, naming the receiver as CRuby does: the
+   method's own `self`, or none (NULL) where a call site spells a default, which names the class alone. */
+static void emit_env_missing(Compiler *c, const Scope *dm, Buf *b, const char *self, int vcall) {
+  Buf r; memset(&r, 0, sizeof r);
+  if (dm->is_cmethod) buf_printf(&r, "sp_box_class((sp_Class){%d, NULL})", dm->class_id);
+  else if (dm->class_id >= 0 && !c->classes[dm->class_id].is_value_type) buf_printf(&r, "sp_box_obj((void *)%s, %d)", self, dm->class_id);
+  else buf_puts(&r, "sp_box_nil()");
+  if (vcall) {   /* (a variable-like call: CRuby's NameError, as the version entries raise it) */
+    buf_puts(b, "sp_raise_cls(\"NameError\", sp_stage_recv_msg(sp_sprintf(\"undefined local variable or method '%s' for %s\", ");
+    emit_str_literal(b, dm->name);
+    buf_printf(b, ", sp_nomethod_recv_desc(%s)), %s));", r.p, r.p);
+  }
+  else {
+    buf_puts(b, "sp_raise_nomethod(sp_nomethod_msg(");
+    emit_str_literal(b, dm->name);
+    buf_printf(b, ", %s));", r.p);
+  }
+  free(r.p);
+}
+/* A default that a call site spells for a callee with an environment (a define_method block's parameter that reads
+   a local it closes over) runs in the callee's context, as its self does (dflt_self_enter): one statement
+   expression binds the definer's environment, `_cap`, ahead of the default's own code, the statements it hoists
+   included, and gives the environment's struct and names as the cap context for the reads in it. A call before the
+   definer ran finds no environment: it raises the NoMethodError there, as the method's prologue does, before
+   anything reads a cell. env_bind_begin opens it and saves the context; env_bind_end writes the hoisted code and
+   closes. */
+void env_bind_begin(Compiler *c, Scope *dm, int dflt, Buf *out, EnvBind *sv) {
+  char pid[24];
+  env_tag(dm, pid, sizeof pid);
+  sv->st = g_cap_struct; sv->names = g_cap_names;
+  sv->caps = env_caps(dm, &c->scopes[dm->env_host - 1]);
+  snprintf(sv->capst, sizeof sv->capst, "_proc_cap_%s", pid);
+  g_cap_struct = sv->capst; g_cap_names = &sv->caps;
+  buf_printf(out, "({ %s *_cap = (%s *)gv___spinel_env_%d; if (SP_UNLIKELY(!_cap)) { ", sv->capst, sv->capst, dm->def_node);
+  /* (a call written as a variable, which CRuby raises as a NameError) */
+  int vc = g_nd_call_id >= 0 && g_nd_call_id < c->nt->count && nt_kind(c->nt, g_nd_call_id) == NK_CallNode && nt_vcall(c->nt, g_nd_call_id) &&
+           nt_str(c->nt, g_nd_call_id, "name") && dm->name && sp_streq(nt_str(c->nt, g_nd_call_id, "name"), dm->name);
+  emit_env_missing(c, dm, out, "NULL", vc);
+  /* (a default that may run program code may run the definer again, which replaces the global, and collect: this one
+     is then the default's only root. Only one that provably runs none, reads of cells and locals, literals and scalar
+     operators, is left unrooted; anything else is rooted) */
+  buf_puts(out, subtree_code_is_pure_read(c, dflt) ? " } " : " } SP_GC_ROOT(_cap); ");
+  sv->at = out->len;
+  sv->pre = g_pre; sv->indent = g_indent;
+  memset(&sv->hoist, 0, sizeof sv->hoist);
+  g_pre = &sv->hoist; g_indent = 0;
+}
+void env_bind_end(Buf *out, EnvBind *sv) {
+  g_pre = sv->pre; g_indent = sv->indent;
+  char *dflt = strndup(out->p + sv->at, out->len - sv->at);
+  if (!dflt) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  out->len = sv->at;
+  if (sv->hoist.p) buf_puts(out, sv->hoist.p);
+  buf_printf(out, "%s; })", dflt);
+  free(dflt); free(sv->hoist.p);
+  g_cap_struct = sv->st; g_cap_names = sv->names;
+  free(sv->caps.v);
+}
+/* The definer's statement stores the environment, ahead of the cells' version being written */
+void emit_env_store(Compiler *c, int id, Buf *b, int indent) {
+  int di = elab_def_scope_of(c, id);
+  const Scope *dm = di > 0 ? &c->scopes[di] : NULL;
+  char pid[24];
+  if (!dm || !dm->env_host || !env_emitted_scope(c, id, -1)) return;
+  NameSet caps = env_caps(dm, &c->scopes[dm->env_host - 1]);
+  env_tag(dm, pid, sizeof pid);
+  emit_indent(b, indent);
+  buf_puts(b, "{\n");
+  emit_indent(b, indent + 1);
+  buf_printf(b, "_proc_cap_%s *_capv_%s = (_proc_cap_%s *)sp_gc_alloc(sizeof(_proc_cap_%s), NULL, _proc_cap_scan_%s);\n", pid, pid, pid, pid, pid);
+  emit_indent(b, indent + 1);
+  buf_printf(b, "SP_GC_ROOT(_capv_%s);\n", pid);
+  emit_cap_fill(b, indent + 1, pid, &caps);
+  emit_indent(b, indent + 1);
+  buf_printf(b, "gv___spinel_env_%d = _capv_%s;\n", dm->def_node, pid);
+  emit_indent(b, indent);
+  buf_puts(b, "}\n");
+  free(caps.v);
 }
 
 void emit_proc_literal(Compiler *c, int create, Buf *b) {
@@ -10867,20 +10997,7 @@ static void emit_proc_literal_here(Compiler *c, int create, Buf *b) {
       continue;
     }
     if (lv && lv->is_cell) {
-      int ptr_cell = proc_slot_is_ptr(lv->type) && !comp_ty_value_obj(c, lv->type);
-      /* Float captures ride the capture struct (a real sp_float field), not the
-         proc's argument slot, so they are safe even alongside a float parameter
-         -- a first-class proc's `.call` passes float args through the boxed
-         side-channel (sp_box_float / sp_poly_to_f), not the truncating slot. */
-      int float_cell = lv->type == TY_FLOAT;
-      int poly_cell = lv->type == TY_POLY;
-      /* a by-value struct rides its own cell, like a float (#3995 for the
-         class; the Range / Rational / Complex siblings were left on the
-         reject, and Time / Tms / a String range after them) */
-      int class_cell = cell_value_struct(lv->type) != NULL;
-      if (lv->type != TY_INT && lv->type != TY_BOOL && lv->type != TY_SYMBOL &&
-          lv->type != TY_UNKNOWN &&
-          lv->type != TY_PROC && !float_cell && !ptr_cell && !poly_cell && !class_cell) {
+      if (!repr_cell_capturable(c, lv)) {
         free(params.v); free(used.v); free(locals.v); free(caps.v);
         unsupported(c, create, "proc capturing a non-integer variable (later slice)");
         return;
@@ -11259,14 +11376,7 @@ else if (orecv >= 0 && onm) {
      the cap struct unreachable and free it out from under the proc. */
   if (ncap > 0 || cap_self || rself_boxed || ie_fb || cap_cls || ret_proc || brk_blk) {
     buf_printf(&g_procs, "typedef struct {");
-    for (int i = 0; i < ncap; i++) {
-      LocalVar *clv = scope_local(bs, caps.v[i]);
-      /* a float capture rides a native sp_float cell, a poly capture an
-         sp_RbVal cell, a heap object its typed pointer (see emit_scope_decls). */
-      buf_puts(&g_procs, " ");
-      emit_cell_elem_type(c, clv, &g_procs);
-      buf_printf(&g_procs, " *c_%s;", caps.v[i]);
-    }
+    emit_cap_fields(c, bs, &caps, &g_procs);
     if (cap_self && self_is_value) buf_printf(&g_procs, " sp_%s __self_val;", self_cls);
     else if (self_boxed) buf_puts(&g_procs, " sp_RbVal __self_rb;");
     else if (cap_self || ie_fb) buf_puts(&g_procs, " void *__self;");
@@ -11278,9 +11388,7 @@ else if (orecv >= 0 && onm) {
     buf_printf(&g_procs, "static void _proc_cap_scan_%s(void *p) {\n", pid);
     buf_printf(&g_procs, "  sp_gc_mark(p);\n");
     buf_printf(&g_procs, "  _proc_cap_%s *_c = (_proc_cap_%s *)p;\n", pid, pid);
-    for (int i = 0; i < ncap; i++) {
-      buf_printf(&g_procs, "  if (_c->c_%s) sp_gc_mark((void *)_c->c_%s);\n", caps.v[i], caps.v[i]);
-    }
+    emit_cap_marks(&caps, &g_procs);
     if (cap_self && self_is_value) {
       if (class_needs_scan(&c->classes[scls]))
         buf_printf(&g_procs, "  sp_%s__gc_scan(&_c->__self_val);\n", self_cls);
@@ -11554,28 +11662,22 @@ else if (orecv >= 0 && onm) {
      invocation -- that reset assigns `_cell_x`, and with the declaration in
      the CALLER (the capture path this local no longer takes) there was
      nothing here to assign to (#4087). */
-  { const char *blocs = nt_str(nt, create, "locals");
-    char nbuf[128];
-    for (const char *q = blocs ? blocs : ""; *q; ) {
-      const char *e = strchr(q, ',');
-      size_t l = e ? (size_t)(e - q) : strlen(q);
-      if (l && l < sizeof nbuf) {
-        memcpy(nbuf, q, l); nbuf[l] = 0;
-        LocalVar *lv = scope_local(bs, nbuf);
-        if (lv && lv->is_cell && !subtree_has_param_named_pub(c, nt_ref(nt, create, "parameters"), nbuf)) {
-          /* Allocate here, not just declare: the block-local reset that would
-             otherwise fill it runs only where emit_stmts sees this body as a
-             BlockNode, and a proc reached through the poly enumerator never
-             gets there -- the body then dereferenced a NULL cell. Each proc
-             invocation is a fresh frame, so allocating in the prologue IS the
-             per-invocation freshness; a reset that does run re-allocates on
-             top, which stays correct. */
-          emit_proc_owned_cell(c, pb, lv, nbuf);
-        }
-      }
-      if (!e) break;
-      q = e + 1;
-    } }
+  int nbl = 0;
+  const char *const *blocs = nt_scope_locals(nt, create, &nbl);
+  for (int li = 0; li < nbl; li++) {
+    const char *nbuf = blocs[li];
+    LocalVar *lv = scope_local(bs, nbuf);
+    if (lv && lv->is_cell && !subtree_has_param_named_pub(c, nt_ref(nt, create, "parameters"), nbuf)) {
+      /* Allocate here, not just declare: the block-local reset that would
+         otherwise fill it runs only where emit_stmts sees this body as a
+         BlockNode, and a proc reached through the poly enumerator never
+         gets there -- the body then dereferenced a NULL cell. Each proc
+         invocation is a fresh frame, so allocating in the prologue IS the
+         per-invocation freshness; a reset that does run re-allocates on
+         top, which stays correct. */
+      emit_proc_owned_cell(c, pb, lv, nbuf);
+    }
+  }
   /* A celled local a block nested in the body declares: this frame owns it
      too (nested_block_declares), and the block-local reset at the top of
      each run of that block gives it a fresh cell. */
@@ -11693,13 +11795,13 @@ else if (orecv >= 0 && onm) {
         buf_puts(pb, "    { static const char *const _pkw[] = {");
         for (int j = 0; j < nkw2; j++) {
           const char *kn = nt_str(nt, kwn[j], "name");
-          if (kn) buf_printf(pb, "\"%s\", ", param_public_name(c, kn));
+          if (kn) buf_printf(pb, "\"%s\", ", param_written_name(c, nt_wname(nt, kwn[j])));
         }
         buf_puts(pb, "0}, *const _pkr[] = {");
         for (int j = 0; j < nkw2; j++) {
           const char *kn = nt_str(nt, kwn[j], "name");
           if (kn && nt_kind(nt, kwn[j]) == NK_RequiredKeywordParameterNode)
-            buf_printf(pb, "\"%s\", ", param_public_name(c, kn));
+            buf_printf(pb, "\"%s\", ", param_written_name(c, nt_wname(nt, kwn[j])));
         }
         buf_printf(pb, "0}, *const _pkn[] = {0};%c", 10);
         /* judged without building anything on the path that binds: the
@@ -11712,7 +11814,7 @@ else if (orecv >= 0 && onm) {
             const char *kn = nt_str(nt, kwn[j], "name");
             if (kn && nt_kind(nt, kwn[j]) == NK_RequiredKeywordParameterNode)
               buf_printf(pb, " || !sp_poly_has_key(_sp_kwh, sp_box_sym((sp_sym)%d))",
-                         comp_sym_intern(c, param_public_name(c, kn)));
+                         comp_sym_intern(c, param_written_name(c, nt_wname(nt, kwn[j]))));
           }
           buf_puts(pb, ")");
         }
@@ -11722,7 +11824,7 @@ else if (orecv >= 0 && onm) {
           for (int j = 0; j < nkw2; j++) {
             const char *kn = nt_str(nt, kwn[j], "name");
             if (!kn || nt_kind(nt, kwn[j]) != NK_RequiredKeywordParameterNode) continue;
-            char iv[300]; snprintf(iv, sizeof iv, ":%s", param_public_name(c, kn));
+            char iv[300]; snprintf(iv, sizeof iv, ":%s", param_written_name(c, nt_wname(nt, kwn[j])));
             kw_names_add(miss, sizeof miss, &nm, iv);
           }
           kw_error_message(km, sizeof km, "missing", nm, miss);
@@ -11737,7 +11839,7 @@ else if (orecv >= 0 && onm) {
       int dv = (kpk == NK_OptionalKeywordParameterNode)
                  ? nt_ref(nt, kwn[j], "value") : -1;
       char key[128];
-      snprintf(key, sizeof key, "%s", param_public_name(c, kn));
+      snprintf(key, sizeof key, "%s", param_written_name(c, nt_wname(nt, kwn[j])));
       int sym_id = comp_sym_intern(c, key);
       char cond[160], arg[128], missing[160];
       snprintf(cond, sizeof cond, "_sp_haskw && sp_poly_has_key(_sp_kwh, sp_box_sym((sp_sym)%d))", sym_id);
@@ -11769,7 +11871,7 @@ else if (orecv >= 0 && onm) {
         for (int j = 0; j < nkw3; j++) {
           const char *kn = nt_str(nt, kwn3[j], "name");
           if (kn) buf_printf(pb, "    sp_PolyPolyHash_delete((sp_PolyPolyHash *)_kwr_%s.v.p, sp_box_sym((sp_sym)%d));%c",
-                             krn, comp_sym_intern(c, param_public_name(c, kn)), 10);
+                             krn, comp_sym_intern(c, param_written_name(c, nt_wname(nt, kwn3[j]))), 10);
         }
       }
       else
@@ -11933,18 +12035,7 @@ else if (orecv >= 0 && onm) {
          proc that captures the same name, no `_cell_<n>` is in scope -- the
          cell arrived through that proc's own capture struct, and the nested
          proc has to forward it from there (#3416). */
-      for (int i = 0; i < ncap; i++) {
-        /* no shadow publish here either: see the fiber/thread fill above */
-        emit_indent(g_pre, g_indent);
-        /* (a name renamed here is an INLINED callee's local that only shares
-           the spelling with the enclosing capture's: see the fill above) */
-        if (g_cap_struct && g_cap_names && nameset_has(g_cap_names, caps.v[i]) &&
-            sp_streq(rename_local(caps.v[i]), caps.v[i]))
-          buf_printf(g_pre, "_capv_%s->c_%s = ((%s *)_cap)->c_%s;\n", pid, caps.v[i], g_cap_struct, caps.v[i]);
-        else
-          /* as the sibling site above */
-          buf_printf(g_pre, "_capv_%s->c_%s = _cell_%s;\n", pid, caps.v[i], rename_local(caps.v[i]));
-      }
+      emit_cap_fill(g_pre, g_indent, pid, &caps);
       /* Capture the enclosing instance self: by value for a value-type class
          (deref if the enclosing method holds self as a pointer, e.g. an
          initialize body), else by pointer (#1436). */
@@ -11961,7 +12052,7 @@ else if (orecv >= 0 && onm) {
          from another proc's capture struct when this one is nested */
       if (cap_cls) {
         emit_indent(g_pre, g_indent);
-        if (g_cap_struct)
+        if (g_cap_struct && !env_struct_is(bs, g_cap_struct))
           buf_printf(g_pre, "_capv_%s->__self_cls = ((%s *)_cap)->__self_cls;\n", pid, g_cap_struct);
         else
           buf_printf(g_pre, "_capv_%s->__self_cls = %s;\n", pid, bs->yields && sv_self ? sv_self : "_sp_cls");
@@ -16892,9 +16983,10 @@ static int struct_super_handle_arg(Compiler *c, int v, Buf *b) {
 /* self, boxed, in a method of class `cls`: a builtin's reopening holds it
    as the builtin's own C value (emit_method_signature) -- a double for a
    Float, the sp_RbVal already for an Array or Object -- and an ordinary
-   class as its object pointer. What a super into Object's (boxed-self)
-   method hands on. */
+   class as its object pointer; a class method the class value. What a
+   super into Object's (boxed-self) method hands on. */
 void emit_reopen_self_boxed(Compiler *c, Scope *s, Buf *b) {
+  if (s->is_cmethod) { emit_boxed_text(c, TY_CLASS, g_self, b); return; }
   if (repr_self_handle(c, (int)(s - c->scopes))) { emit_boxed_text(c, TY_STRBUF, g_self, b); return; }
   int cls = s->class_id;
   const char *cn = cls >= 0 ? c->classes[cls].c_name : NULL;
@@ -19038,8 +19130,10 @@ void emit_regex_section(Compiler *c, Buf *b) {
      sp_tu_init can take their addresses before their definitions (emitted into
      the later `body` buffer). */
   if (g_uses_marshal) {
+    /* (the interner is not static in an --ext-init library: its declaration
+       here says the same as its definition) */
+    buf_printf(b, "%ssp_sym sp_sym_intern(const char *s);\n", g_ext_init_name ? "" : "static ");
     buf_puts(b,
-      "static sp_sym sp_sym_intern(const char *s);\n"
       "static int sp_marshal_obj_dump(sp_mar_buf *b, int cls_id, void *p);\n"
       "static sp_RbVal sp_marshal_obj_load(const char *name, sp_RbVal into, sp_RbVal iv, int *ok);\n");
   }
@@ -21158,16 +21252,11 @@ static void reject_runtime_const_get(Compiler *c) {
   NT_FOREACH_KIND(c->nt, NK_CallNode, id) if (!defer_refusals_at(c, id)) refuse_from_plan(c, id, CRF_CONST_GET, "refuse-const-get");
 }
 
-/* A define_method in a method's body that would answer calls before that
-   method runs (cplan_define_method_early) is refused before any emission,
-   with or without --defer-refusals: a deferred refusal raises only when the
-   method runs, after the earlier calls have already gone wrong. */
-static void reject_define_method_early(Compiler *c) {
-  NT_FOREACH_KIND(c->nt, NK_CallNode, id)
-    if (cplan_define_method_early(c, id))
-      unsupported_feature(c, id, "Module#define_method in a method body is supported only for a method "
-                                 "the class does not answer yet: it is defined from the start, not when "
-                                 "that method runs (see docs/limitations.md)");
+/* A define_method in a method's body the call plan answers no version of (cplan_body_definer_gap, CRF_DEFINER) is
+   refused before any emission, with or without --defer-refusals and whether the method is reached or not: a
+   deferred refusal raises only when the method runs, after the earlier calls have already gone wrong. */
+static void reject_body_definers(Compiler *c) {
+  NT_FOREACH_KIND(c->nt, NK_CallNode, id) refuse_from_plan(c, id, CRF_DEFINER, "refuse-body-definer");
 }
 
 /* A `class << K` in a method's body on a Struct or Data class
@@ -23925,22 +24014,42 @@ static int exc_has_reopen_initialize(Compiler *c) {
    boxed for a poly one or a rest, the String itself for a String one. An
    initialize whose first parameter has any other type has no arm: 0, and the
    caller keeps the runtime's message. A reopening that cannot take one
-   argument raises ArgumentError, as the call would. */
-int emit_reinit_init_text(Compiler *c, int im, const char *self, const char *msg_c, Buf *out) {
+   argument raises ArgumentError, as the call would.
+   msg_c NULL is a call that gave no message (`KeyError.new(key: 1)`): CRuby's
+   native initialize then calls super with no argument, so none is passed and an
+   initialize that needs one raises. nilable says msg_c may be a NULL pointer at
+   run time, a message given as nil, which the initialize holds as nil (an empty
+   String for a String parameter). call_id >= 0 hands the call's block to an
+   initialize that takes one. */
+int emit_reinit_init_text_ex(Compiler *c, int im, const char *self, const char *msg_c, int nilable, int call_id, Buf *out) {
   Buf pre = {0}, args = {0}, mb = {0}, src = {0};
   char raise[640];
   int builds = 0;
   int p0 = arm_arg_param(c, &c->scopes[im]);
   LocalVar *p0v = p0 >= 0 && c->scopes[im].pnames ? scope_local(&c->scopes[im], c->scopes[im].pnames[p0]) : NULL;
   TyKind p0t = p0v ? repr_of_slot(c, p0v).as_ty : TY_POLY;
-  buf_printf(&src, "sp_box_str_new(%s)", msg_c);
-  int ok = 1;
-  if (p0t == TY_POLY || p0t == TY_UNKNOWN) buf_puts(&mb, src.p);
-  else if (p0t == TY_STRING || p0t == TY_STRBUF) emit_unbox_text(c, p0t, src.p, &mb);
-  else ok = 0;
+  int ok = 1, nargs = msg_c ? 1 : 0;
+  if (msg_c) {
+    int poly = p0t == TY_POLY || p0t == TY_UNKNOWN;
+    if (nilable && poly) buf_printf(&src, "(%s ? sp_box_str_new(%s) : sp_box_nil())", msg_c, msg_c);
+    /* (sp_str_empty, not a bare ""): sp_box_str_new reads the marker byte before its text */
+    else if (nilable) buf_printf(&src, "sp_box_str_new(%s ? %s : sp_str_empty)", msg_c, msg_c);
+    else buf_printf(&src, "sp_box_str_new(%s)", msg_c);
+    if (poly) buf_puts(&mb, src.p);
+    else if (p0t == TY_STRING || p0t == TY_STRBUF) emit_unbox_text(c, p0t, src.p, &mb);
+    else ok = 0;
+  }
   if (ok) {
     const char *argv[1] = { mb.p };
-    if (emit_arm_args_text(c, im, self, argv, 1, &pre, &args, &builds, raise, sizeof raise)) {
+    if (emit_arm_args_text(c, im, self, argv, nargs, &pre, &args, &builds, raise, sizeof raise)) {
+      /* the arm's own block slot is NULL: the call's block replaces it */
+      if (call_id >= 0 && ctor_init_takes_block(c, im) && args.p) {
+        size_t n = strlen(args.p);
+        if (n >= 6 && !strcmp(args.p + n - 6, ", NULL")) {
+          args.p[n - 6] = 0; args.len = n - 6;
+          emit_ctor_block_slot(c, call_id, im, ", ", &args);
+        }
+      }
       if (pre.p) buf_puts(out, pre.p);
       buf_printf(out, " %s(%s%s);", mc_method(c, &c->scopes[im]), self, args.p ? args.p : "");
     }
@@ -23948,6 +24057,9 @@ int emit_reinit_init_text(Compiler *c, int im, const char *self, const char *msg
   }
   free(pre.p); free(args.p); free(mb.p); free(src.p);
   return ok;
+}
+int emit_reinit_init_text(Compiler *c, int im, const char *self, const char *msg_c, Buf *out) {
+  return emit_reinit_init_text_ex(c, im, self, msg_c, 0, -1, out);
 }
 
 /* sp_user_exc_reinit, the hook sp_raise_cls asks for an error the runtime
@@ -24670,7 +24782,7 @@ char *codegen_program(const NodeTable *nt) {
   reject_top_self(c);
   reject_main_chain(c);
   reject_time_parse(c);
-  reject_define_method_early(c);
+  reject_body_definers(c);
   reject_record_sclass_early(c);
   reject_define_method_runtime_block(c);
   reject_range_reopen_nonint(c);
@@ -25044,6 +25156,7 @@ char *codegen_program(const NodeTable *nt) {
     if (g_bigl_n)
       buf_printf(&mk, "  for (int _i = 0; _i < %d; _i++) if (sp_bigl[_i]) sp_gc_mark((void *)sp_bigl[_i]);\n",
                  g_bigl_n);
+    emit_env_globals(c, &b, &mk);
     g_has_user_global_marks = (mk.p && mk.len > 0);
     if (g_has_user_global_marks) {
       buf_puts(&b, "static void sp_mark_user_globals(void) {\n");
@@ -25136,12 +25249,13 @@ char *codegen_program(const NodeTable *nt) {
       if (cg_prev_s >= 0) cg_slow_note(cg_prev_s, now - cg_prev_t);
       cg_prev_s = s; cg_prev_t = now;
     }
-    if (prog_is_top_scope(c, &c->scopes[s]) || c->scopes[s].yields || (!c->scopes[s].reachable && (!c->scopes[s].is_proc_form || !proc_form_live(c, s))) || scope_is_shadowed(c, s) || comp_scope_copied_away(c, s)) continue;
+    if (!scope_is_emitted(c, s)) continue;
     int ndiag0 = g_ndiags, ndefer0 = g_stmt_deferrals;
     int orphan = scope_is_orphan_method(c, s);
     if (orphan) g_unsup_quiet = 1;
     size_t pm_at = body->len;
     int loop_callee = loop_callees && loop_callees[s];
+    if (c->scopes[s].env_host && env_emitted_scope(c, c->scopes[s].def_node, s)) emit_env_decl(c, &c->scopes[s]);
     EMIT_COLLECT_UNIT(emit_method(c, &c->scopes[s], body, loop_callee));
     g_unsup_quiet = 0;
     if (g_ndiags == ndiag0 && poll_pure_wrapped(c, s)) poll_pure_split(c, s, body, pm_at);

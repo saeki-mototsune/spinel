@@ -3436,6 +3436,139 @@ static void emit_const_undefined_raise(Buf *b, const char *checks, const char *n
   const_raise_close(b);
 }
 
+/* The value of NM read as a constant of the builtin class or module PAR_NM,
+   PAR_ID the parent node (builtin_scoped_const_type gives its type); 0 for
+   a name the compiler does not read there. */
+int emit_builtin_scoped_const(Compiler *c, int par_id, const char *par_nm, const char *nm, Buf *b) {
+  if (par_nm && sp_streq(par_nm, "Float") && nm) {
+    if (sp_streq(nm, "MAX"))      { buf_puts(b, "DBL_MAX"); return 1; }
+    if (sp_streq(nm, "MIN"))      { buf_puts(b, "DBL_MIN"); return 1; }
+    if (sp_streq(nm, "EPSILON"))  { buf_puts(b, "DBL_EPSILON"); return 1; }
+    if (sp_streq(nm, "INFINITY")) { buf_puts(b, "(1.0/0.0)"); return 1; }
+    if (sp_streq(nm, "NAN"))      { buf_puts(b, "(0.0/0.0)"); return 1; }
+    /* DIG/MANT_DIG/RADIX and the exponent limits are Integer constants */
+    if (sp_streq(nm, "DIG"))       { buf_printf(b, "((sp_int)DBL_DIG)"); return 1; }
+    if (sp_streq(nm, "MANT_DIG"))  { buf_printf(b, "((sp_int)DBL_MANT_DIG)"); return 1; }
+    if (sp_streq(nm, "RADIX"))     { buf_printf(b, "((sp_int)FLT_RADIX)"); return 1; }
+    if (sp_streq(nm, "MAX_EXP"))    { buf_printf(b, "((sp_int)DBL_MAX_EXP)"); return 1; }
+    if (sp_streq(nm, "MIN_EXP"))    { buf_printf(b, "((sp_int)DBL_MIN_EXP)"); return 1; }
+    if (sp_streq(nm, "MAX_10_EXP")) { buf_printf(b, "((sp_int)DBL_MAX_10_EXP)"); return 1; }
+    if (sp_streq(nm, "MIN_10_EXP")) { buf_printf(b, "((sp_int)DBL_MIN_10_EXP)"); return 1; }
+  }
+  if (nm && comp_const_path_on_math(c, par_id)) {
+    if (sp_streq(nm, "PI")) { buf_puts(b, "M_PI"); return 1; }
+    if (sp_streq(nm, "E"))  { buf_puts(b, "M_E"); return 1; }
+  }
+  /* Regexp option constants: CRuby's public bits (IGNORECASE=1, EXTENDED=2,
+     MULTILINE=4) the same integers Regexp.new's option arg accepts, and the
+     encoding bits Regexp#options reports (FIXEDENCODING=16, NOENCODING=32). */
+  if (par_nm && sp_streq(par_nm, "Regexp") && nm) {
+    if (sp_streq(nm, "IGNORECASE")) { buf_puts(b, "((sp_int)1)"); return 1; }
+    if (sp_streq(nm, "EXTENDED"))   { buf_puts(b, "((sp_int)2)"); return 1; }
+    if (sp_streq(nm, "MULTILINE"))  { buf_puts(b, "((sp_int)4)"); return 1; }
+    if (sp_streq(nm, "FIXEDENCODING")) { buf_puts(b, "((sp_int)16)"); return 1; }
+    if (sp_streq(nm, "NOENCODING"))    { buf_puts(b, "((sp_int)32)"); return 1; }
+  }
+  /* well-known Encoding constants -> the matching boxed encoding value.
+     Spinel has one internal representation (UTF-8 / ASCII-8BIT), so the
+     many aliases map onto those two; enough for the pervasive
+     `str.encoding == Encoding::UTF_8` comparison. */
+  if (par_nm && sp_streq(par_nm, "Encoding") && nm) {
+    if (sp_streq(nm, "UTF_8") || sp_streq(nm, "UTF8")) {
+      buf_puts(b, "sp_box_encoding(sp_encoding_utf8())"); return 1;
+    }
+    if (sp_streq(nm, "US_ASCII") || sp_streq(nm, "ASCII") || sp_streq(nm, "ANSI_X3_4_1968")) {
+      buf_puts(b, "sp_box_encoding(sp_encoding_us_ascii())"); return 1;
+    }
+    if (sp_streq(nm, "BINARY") || sp_streq(nm, "ASCII_8BIT")) {
+      buf_puts(b, "sp_box_encoding(sp_encoding_binary())"); return 1;
+    }
+    /* The Unicode version the runtime's tables follow (lib/regexp/unicase.h
+       is generated from Unicode 17.0.0), a String as in CRuby */
+    if (sp_streq(nm, "UNICODE_VERSION")) { emit_str_literal(b, "17.0.0"); return 1; }
+    /* Every other Encoding constant is a named Encoding value the runtime
+       does not transcode to or from (String#encode leaves the bytes alone
+       for it), under the name CRuby gives the encoding the constant names.
+       A name that is no encoding's is left undefined, as in CRuby. */
+    const char *ename = encoding_const_name(nm);
+    if (ename) {
+      buf_puts(b, "sp_box_encoding((sp_Encoding){");
+      emit_str_literal(b, ename);   /* marker-framed, like every literal */
+      buf_puts(b, "})");
+      return 1;
+    }
+  }
+  if (par_nm && sp_streq(par_nm, "File") && nm) {
+    /* Frozen Strings, as CRuby's are: framed as a frozen literal is
+       (emit_str_literal_src), whose header frozen? reads. A bare literal
+       answered false. */
+    if (sp_streq(nm, "SEPARATOR"))      { emit_str_literal_src(b, "/", 1, 1); return 1; }
+    if (sp_streq(nm, "PATH_SEPARATOR")) { emit_str_literal_src(b, ":", 1, 1); return 1; }
+    if (sp_streq(nm, "ALT_SEPARATOR"))  { buf_puts(b, "((const char *)0)"); return 1; }  /* nil off Windows (#2781) */
+    /* the open(2) flag constants, via the C macros (#2788) */
+    if (sp_streq(nm, "RDONLY"))   { buf_puts(b, "((sp_int)O_RDONLY)"); return 1; }
+    if (sp_streq(nm, "WRONLY"))   { buf_puts(b, "((sp_int)O_WRONLY)"); return 1; }
+    if (sp_streq(nm, "RDWR"))     { buf_puts(b, "((sp_int)O_RDWR)"); return 1; }
+    if (sp_streq(nm, "CREAT"))    { buf_puts(b, "((sp_int)O_CREAT)"); return 1; }
+    if (sp_streq(nm, "EXCL"))     { buf_puts(b, "((sp_int)O_EXCL)"); return 1; }
+    if (sp_streq(nm, "TRUNC"))    { buf_puts(b, "((sp_int)O_TRUNC)"); return 1; }
+    if (sp_streq(nm, "APPEND"))   { buf_puts(b, "((sp_int)O_APPEND)"); return 1; }
+    if (sp_streq(nm, "NONBLOCK")) { buf_puts(b, "((sp_int)O_NONBLOCK)"); return 1; }
+    if (sp_streq(nm, "NOFOLLOW")) { buf_puts(b, "((sp_int)O_NOFOLLOW)"); return 1; }
+    if (sp_streq(nm, "NOCTTY"))   { buf_puts(b, "((sp_int)O_NOCTTY)"); return 1; }
+    if (sp_streq(nm, "SYNC"))     { buf_puts(b, "((sp_int)O_SYNC)"); return 1; }
+    if (sp_streq(nm, "DSYNC"))    { buf_puts(b, "((sp_int)O_DSYNC)"); return 1; }
+    if (sp_streq(nm, "BINARY"))   { buf_puts(b, "((sp_int)0)"); return 1; }
+    /* the flock(2) operation constants (#2808) */
+    if (sp_streq(nm, "LOCK_SH")) { buf_puts(b, "((sp_int)LOCK_SH)"); return 1; }
+    if (sp_streq(nm, "LOCK_EX")) { buf_puts(b, "((sp_int)LOCK_EX)"); return 1; }
+    if (sp_streq(nm, "LOCK_UN")) { buf_puts(b, "((sp_int)LOCK_UN)"); return 1; }
+    if (sp_streq(nm, "LOCK_NB")) { buf_puts(b, "((sp_int)LOCK_NB)"); return 1; }
+    /* File.fnmatch's flags: CRuby's own values (SP_FNM_*, which
+       sp_file_fnmatch reads), not the system <fnmatch.h> macros.
+       SYSCASE and SHORTNAME are 0 off Windows, as in CRuby. */
+    if (sp_streq(nm, "FNM_NOESCAPE"))  { buf_puts(b, "((sp_int)SP_FNM_NOESCAPE)"); return 1; }
+    if (sp_streq(nm, "FNM_PATHNAME"))  { buf_puts(b, "((sp_int)SP_FNM_PATHNAME)"); return 1; }
+    if (sp_streq(nm, "FNM_DOTMATCH"))  { buf_puts(b, "((sp_int)SP_FNM_DOTMATCH)"); return 1; }
+    if (sp_streq(nm, "FNM_CASEFOLD"))  { buf_puts(b, "((sp_int)SP_FNM_CASEFOLD)"); return 1; }
+    if (sp_streq(nm, "FNM_EXTGLOB"))   { buf_puts(b, "((sp_int)SP_FNM_EXTGLOB)"); return 1; }
+    if (sp_streq(nm, "FNM_SYSCASE"))   { buf_puts(b, "((sp_int)0)"); return 1; }
+    if (sp_streq(nm, "FNM_SHORTNAME")) { buf_puts(b, "((sp_int)0)"); return 1; }
+  }
+  if (par_nm && (is_io_class_name(par_nm)) && nm) {
+    /* IO#seek whence constants (File inherits them from IO); the Ruby
+       values 0/1/2 are what sp_File_seek expects. */
+    if (sp_streq(nm, "SEEK_SET")) { buf_puts(b, "((sp_int)0)"); return 1; }
+    if (sp_streq(nm, "SEEK_CUR")) { buf_puts(b, "((sp_int)1)"); return 1; }
+    if (sp_streq(nm, "SEEK_END")) { buf_puts(b, "((sp_int)2)"); return 1; }
+    /* the null device, the name Process.spawn/File.open take to discard a
+       stream: IO's, and File's through it, a frozen String as CRuby's is.
+       Windows is not a target, so it is /dev/null (#4284). */
+    if (sp_streq(nm, "NULL"))     { emit_str_literal_src(b, "/dev/null", 9, 1); return 1; }
+  }
+  if (par_nm && sp_streq(par_nm, "Process") && nm) {
+    if (sp_streq(nm, "CLOCK_MONOTONIC")) { buf_puts(b, "((sp_int)CLOCK_MONOTONIC)"); return 1; }
+    if (sp_streq(nm, "CLOCK_REALTIME"))  { buf_puts(b, "((sp_int)CLOCK_REALTIME)"); return 1; }
+    /* the CPU-time clocks are POSIX and present on Linux and macOS; emit the
+       C macro so the value is the platform's own clock id, as CRuby's is. */
+    if (sp_streq(nm, "CLOCK_PROCESS_CPUTIME_ID")) { buf_puts(b, "((sp_int)CLOCK_PROCESS_CPUTIME_ID)"); return 1; }
+    if (sp_streq(nm, "CLOCK_THREAD_CPUTIME_ID"))  { buf_puts(b, "((sp_int)CLOCK_THREAD_CPUTIME_ID)"); return 1; }
+    /* getpriority/setpriority `which` selectors (#3046) */
+    if (sp_streq(nm, "PRIO_PROCESS")) { buf_puts(b, "((sp_int)PRIO_PROCESS)"); return 1; }
+    if (sp_streq(nm, "PRIO_PGRP"))    { buf_puts(b, "((sp_int)PRIO_PGRP)"); return 1; }
+    if (sp_streq(nm, "PRIO_USER"))    { buf_puts(b, "((sp_int)PRIO_USER)"); return 1; }
+    /* the flags of a wait (Process.wait2(pid, Process::WNOHANG)); sys/wait.h
+       comes with spinel_rt.h */
+    if (sp_streq(nm, "WNOHANG"))   { buf_puts(b, "((sp_int)WNOHANG)"); return 1; }
+    if (sp_streq(nm, "WUNTRACED")) { buf_puts(b, "((sp_int)WUNTRACED)"); return 1; }
+    if (process_rlimit_const(nm)) { buf_printf(b, "sp_process_rlimit_id(\"%s\")", nm + 7); return 1; }
+    if (sp_streq(nm, "RLIM_INFINITY"))  { buf_puts(b, "sp_process_rlim_const(0)"); return 1; }
+    if (sp_streq(nm, "RLIM_SAVED_MAX")) { buf_puts(b, "sp_process_rlim_const(1)"); return 1; }
+    if (sp_streq(nm, "RLIM_SAVED_CUR")) { buf_puts(b, "sp_process_rlim_const(2)"); return 1; }
+  }
+  return 0;
+}
+
 /* A constant read: ConstantReadNode and ConstantPathNode (A::B) (emit_expr_node's arms, in their order).
    `checks` holds the parents' presence checks of a path: the raise of an
    undefined path takes them and empties the buffer, any other form leaves
@@ -3536,6 +3669,18 @@ static int emit_constant_value(Compiler *c, int id, Buf *b, Buf *checks, const N
     return 1;
   }
   if (sp_streq(ty, "ConstantPathNode")) {
+    /* a private constant read through its scope: CRuby's NameError */
+    {
+      char pmsg[512];
+      if (const_path_private(c, id, pmsg, sizeof pmsg)) {
+        const_raise_open(b);
+        buf_puts(b, "\"");
+        emit_c_escaped_n(b, pmsg, strlen(pmsg));
+        buf_puts(b, "\"");
+        const_raise_close(b);
+        return 1;
+      }
+    }
     /* M::CONST -> the flat constant named by the final path component */
     const char *nm = const_key_at(c, id);
     int par_idc = nt_ref(nt, id, "parent");
@@ -3739,128 +3884,7 @@ static int emit_constant_value(Compiler *c, int id, Buf *b, Buf *checks, const N
     if (nm && sp_streq(nm, "ARGF")) { buf_puts(b, "(&sp_argf_obj)"); return 1; }
     if (nm && is_env_const(nm) && comp_ntype(c, id) == TY_ENV) { buf_puts(b, "(&sp_env_obj)"); return 1; }
     /* well-known module constants */
-    if (par_nmc && sp_streq(par_nmc, "Float") && nm) {
-      if (sp_streq(nm, "MAX"))      { buf_puts(b, "DBL_MAX"); return 1; }
-      if (sp_streq(nm, "MIN"))      { buf_puts(b, "DBL_MIN"); return 1; }
-      if (sp_streq(nm, "EPSILON"))  { buf_puts(b, "DBL_EPSILON"); return 1; }
-      if (sp_streq(nm, "INFINITY")) { buf_puts(b, "(1.0/0.0)"); return 1; }
-      if (sp_streq(nm, "NAN"))      { buf_puts(b, "(0.0/0.0)"); return 1; }
-      /* DIG/MANT_DIG/RADIX and the exponent limits are Integer constants */
-      if (sp_streq(nm, "DIG"))       { buf_printf(b, "((sp_int)DBL_DIG)"); return 1; }
-      if (sp_streq(nm, "MANT_DIG"))  { buf_printf(b, "((sp_int)DBL_MANT_DIG)"); return 1; }
-      if (sp_streq(nm, "RADIX"))     { buf_printf(b, "((sp_int)FLT_RADIX)"); return 1; }
-      if (sp_streq(nm, "MAX_EXP"))    { buf_printf(b, "((sp_int)DBL_MAX_EXP)"); return 1; }
-      if (sp_streq(nm, "MIN_EXP"))    { buf_printf(b, "((sp_int)DBL_MIN_EXP)"); return 1; }
-      if (sp_streq(nm, "MAX_10_EXP")) { buf_printf(b, "((sp_int)DBL_MAX_10_EXP)"); return 1; }
-      if (sp_streq(nm, "MIN_10_EXP")) { buf_printf(b, "((sp_int)DBL_MIN_10_EXP)"); return 1; }
-    }
-    if (nm && comp_const_path_on_math(c, par_idc)) {
-      if (sp_streq(nm, "PI")) { buf_puts(b, "M_PI"); return 1; }
-      if (sp_streq(nm, "E"))  { buf_puts(b, "M_E"); return 1; }
-    }
-    /* Regexp option constants: CRuby's public bits (IGNORECASE=1, EXTENDED=2,
-       MULTILINE=4) the same integers Regexp.new's option arg accepts, and the
-       encoding bits Regexp#options reports (FIXEDENCODING=16, NOENCODING=32). */
-    if (par_nmc && sp_streq(par_nmc, "Regexp") && nm) {
-      if (sp_streq(nm, "IGNORECASE")) { buf_puts(b, "((sp_int)1)"); return 1; }
-      if (sp_streq(nm, "EXTENDED"))   { buf_puts(b, "((sp_int)2)"); return 1; }
-      if (sp_streq(nm, "MULTILINE"))  { buf_puts(b, "((sp_int)4)"); return 1; }
-      if (sp_streq(nm, "FIXEDENCODING")) { buf_puts(b, "((sp_int)16)"); return 1; }
-      if (sp_streq(nm, "NOENCODING"))    { buf_puts(b, "((sp_int)32)"); return 1; }
-    }
-    /* well-known Encoding constants -> the matching boxed encoding value.
-       Spinel has one internal representation (UTF-8 / ASCII-8BIT), so the
-       many aliases map onto those two; enough for the pervasive
-       `str.encoding == Encoding::UTF_8` comparison. */
-    if (par_nmc && sp_streq(par_nmc, "Encoding") && nm) {
-      if (sp_streq(nm, "UTF_8") || sp_streq(nm, "UTF8")) {
-        buf_puts(b, "sp_box_encoding(sp_encoding_utf8())"); return 1;
-      }
-      if (sp_streq(nm, "US_ASCII") || sp_streq(nm, "ASCII") || sp_streq(nm, "ANSI_X3_4_1968")) {
-        buf_puts(b, "sp_box_encoding(sp_encoding_us_ascii())"); return 1;
-      }
-      if (sp_streq(nm, "BINARY") || sp_streq(nm, "ASCII_8BIT")) {
-        buf_puts(b, "sp_box_encoding(sp_encoding_binary())"); return 1;
-      }
-      /* The Unicode version the runtime's tables follow (lib/regexp/unicase.h
-         is generated from Unicode 17.0.0), a String as in CRuby */
-      if (sp_streq(nm, "UNICODE_VERSION")) { emit_str_literal(b, "17.0.0"); return 1; }
-      /* Every other Encoding constant is a named Encoding value the runtime
-         does not transcode to or from (String#encode leaves the bytes alone
-         for it), under the name CRuby gives the encoding the constant names.
-         A name that is no encoding's is left undefined, as in CRuby. */
-      const char *ename = encoding_const_name(nm);
-      if (ename) {
-        buf_puts(b, "sp_box_encoding((sp_Encoding){");
-        emit_str_literal(b, ename);   /* marker-framed, like every literal */
-        buf_puts(b, "})");
-        return 1;
-      }
-    }
-    if (par_nmc && sp_streq(par_nmc, "File") && nm) {
-      /* Frozen Strings, as CRuby's are: framed as a frozen literal is
-         (emit_str_literal_src), whose header frozen? reads. A bare literal
-         answered false. */
-      if (sp_streq(nm, "SEPARATOR"))      { emit_str_literal_src(b, "/", 1, 1); return 1; }
-      if (sp_streq(nm, "PATH_SEPARATOR")) { emit_str_literal_src(b, ":", 1, 1); return 1; }
-      if (sp_streq(nm, "ALT_SEPARATOR"))  { buf_puts(b, "((const char *)0)"); return 1; }  /* nil off Windows (#2781) */
-      /* the open(2) flag constants, via the C macros (#2788) */
-      if (sp_streq(nm, "RDONLY"))   { buf_puts(b, "((sp_int)O_RDONLY)"); return 1; }
-      if (sp_streq(nm, "WRONLY"))   { buf_puts(b, "((sp_int)O_WRONLY)"); return 1; }
-      if (sp_streq(nm, "RDWR"))     { buf_puts(b, "((sp_int)O_RDWR)"); return 1; }
-      if (sp_streq(nm, "CREAT"))    { buf_puts(b, "((sp_int)O_CREAT)"); return 1; }
-      if (sp_streq(nm, "EXCL"))     { buf_puts(b, "((sp_int)O_EXCL)"); return 1; }
-      if (sp_streq(nm, "TRUNC"))    { buf_puts(b, "((sp_int)O_TRUNC)"); return 1; }
-      if (sp_streq(nm, "APPEND"))   { buf_puts(b, "((sp_int)O_APPEND)"); return 1; }
-      if (sp_streq(nm, "NONBLOCK")) { buf_puts(b, "((sp_int)O_NONBLOCK)"); return 1; }
-      if (sp_streq(nm, "NOFOLLOW")) { buf_puts(b, "((sp_int)O_NOFOLLOW)"); return 1; }
-      if (sp_streq(nm, "NOCTTY"))   { buf_puts(b, "((sp_int)O_NOCTTY)"); return 1; }
-      if (sp_streq(nm, "SYNC"))     { buf_puts(b, "((sp_int)O_SYNC)"); return 1; }
-      if (sp_streq(nm, "DSYNC"))    { buf_puts(b, "((sp_int)O_DSYNC)"); return 1; }
-      if (sp_streq(nm, "BINARY"))   { buf_puts(b, "((sp_int)0)"); return 1; }
-      /* the flock(2) operation constants (#2808) */
-      if (sp_streq(nm, "LOCK_SH")) { buf_puts(b, "((sp_int)LOCK_SH)"); return 1; }
-      if (sp_streq(nm, "LOCK_EX")) { buf_puts(b, "((sp_int)LOCK_EX)"); return 1; }
-      if (sp_streq(nm, "LOCK_UN")) { buf_puts(b, "((sp_int)LOCK_UN)"); return 1; }
-      if (sp_streq(nm, "LOCK_NB")) { buf_puts(b, "((sp_int)LOCK_NB)"); return 1; }
-      /* File.fnmatch's flags: CRuby's own values (SP_FNM_*, which
-         sp_file_fnmatch reads), not the system <fnmatch.h> macros.
-         SYSCASE and SHORTNAME are 0 off Windows, as in CRuby. */
-      if (sp_streq(nm, "FNM_NOESCAPE"))  { buf_puts(b, "((sp_int)SP_FNM_NOESCAPE)"); return 1; }
-      if (sp_streq(nm, "FNM_PATHNAME"))  { buf_puts(b, "((sp_int)SP_FNM_PATHNAME)"); return 1; }
-      if (sp_streq(nm, "FNM_DOTMATCH"))  { buf_puts(b, "((sp_int)SP_FNM_DOTMATCH)"); return 1; }
-      if (sp_streq(nm, "FNM_CASEFOLD"))  { buf_puts(b, "((sp_int)SP_FNM_CASEFOLD)"); return 1; }
-      if (sp_streq(nm, "FNM_EXTGLOB"))   { buf_puts(b, "((sp_int)SP_FNM_EXTGLOB)"); return 1; }
-      if (sp_streq(nm, "FNM_SYSCASE"))   { buf_puts(b, "((sp_int)0)"); return 1; }
-      if (sp_streq(nm, "FNM_SHORTNAME")) { buf_puts(b, "((sp_int)0)"); return 1; }
-    }
-    if (par_nmc && (is_io_class_name(par_nmc)) && nm) {
-      /* IO#seek whence constants (File inherits them from IO); the Ruby
-         values 0/1/2 are what sp_File_seek expects. */
-      if (sp_streq(nm, "SEEK_SET")) { buf_puts(b, "((sp_int)0)"); return 1; }
-      if (sp_streq(nm, "SEEK_CUR")) { buf_puts(b, "((sp_int)1)"); return 1; }
-      if (sp_streq(nm, "SEEK_END")) { buf_puts(b, "((sp_int)2)"); return 1; }
-      /* the null device, the name Process.spawn/File.open take to discard a
-         stream: IO's, and File's through it, a frozen String as CRuby's is.
-         Windows is not a target, so it is /dev/null (#4284). */
-      if (sp_streq(nm, "NULL"))     { emit_str_literal_src(b, "/dev/null", 9, 1); return 1; }
-    }
-    if (par_nmc && sp_streq(par_nmc, "Process") && nm) {
-      if (sp_streq(nm, "CLOCK_MONOTONIC")) { buf_puts(b, "((sp_int)CLOCK_MONOTONIC)"); return 1; }
-      if (sp_streq(nm, "CLOCK_REALTIME"))  { buf_puts(b, "((sp_int)CLOCK_REALTIME)"); return 1; }
-      /* the CPU-time clocks are POSIX and present on Linux and macOS; emit the
-         C macro so the value is the platform's own clock id, as CRuby's is. */
-      if (sp_streq(nm, "CLOCK_PROCESS_CPUTIME_ID")) { buf_puts(b, "((sp_int)CLOCK_PROCESS_CPUTIME_ID)"); return 1; }
-      if (sp_streq(nm, "CLOCK_THREAD_CPUTIME_ID"))  { buf_puts(b, "((sp_int)CLOCK_THREAD_CPUTIME_ID)"); return 1; }
-      /* getpriority/setpriority `which` selectors (#3046) */
-      if (sp_streq(nm, "PRIO_PROCESS")) { buf_puts(b, "((sp_int)PRIO_PROCESS)"); return 1; }
-      if (sp_streq(nm, "PRIO_PGRP"))    { buf_puts(b, "((sp_int)PRIO_PGRP)"); return 1; }
-      if (sp_streq(nm, "PRIO_USER"))    { buf_puts(b, "((sp_int)PRIO_USER)"); return 1; }
-      /* the flags of a wait (Process.wait2(pid, Process::WNOHANG)); sys/wait.h
-         comes with spinel_rt.h */
-      if (sp_streq(nm, "WNOHANG"))   { buf_puts(b, "((sp_int)WNOHANG)"); return 1; }
-      if (sp_streq(nm, "WUNTRACED")) { buf_puts(b, "((sp_int)WUNTRACED)"); return 1; }
-    }
+    if (emit_builtin_scoped_const(c, par_idc, par_nmc, nm, b)) return 1;
     if (par_nmc && sp_streq(par_nmc, "Integer") && nm &&
         (sp_streq(nm, "MAX") || sp_streq(nm, "MIN"))) {
       /* Integer::MAX/MIN do not exist in Ruby -- raise NameError at runtime */
@@ -4341,10 +4365,30 @@ static int emit_defined_value(Compiler *c, int id, Buf *b, const NodeTable *nt, 
           res = "constant";
       }
     }
+    else if (vk == NK_ConstantPathNode && const_path_is_private(c, v)) {
+      /* a private constant is not defined to a read through its scope: nil */
+    }
     else if (vk == NK_ConstantPathNode && nt_kind(nt, nt_ref(nt, v, "parent")) == NK_ConstantReadNode &&
              sp_streq(nt_str(nt, nt_ref(nt, v, "parent"), "name"), "Socket") && sp_feature_required("socket")) {
       /* Socket's constants are the system's: the run time asks its table */
       buf_printf(b, "(sp_sock_const(\"%s\") >= 0 ? SPL(\"constant\") : NULL)", nt_str(nt, v, "name"));
+      return 1;
+    }
+    else if (vk == NK_ConstantPathNode && nt_kind(nt, nt_ref(nt, v, "parent")) == NK_ConstantReadNode &&
+             sp_streq(nt_str(nt, nt_ref(nt, v, "parent"), "name"), "Process") &&
+             process_rlimit_const(nt_str(nt, v, "name")) &&
+             !(comp_const(c, const_key_at(c, v)) && const_path_reaches_leaf_const(c, v))) {
+      /* the platform's sys/resource.h decides which RLIMIT_* exist, where
+         the program defines no constant of that name in Process */
+      buf_printf(b, "(sp_process_rlimit_defined(\"%s\") ? SPL(\"constant\") : NULL)", nt_str(nt, v, "name") + 7);
+      return 1;
+    }
+    else if (vk == NK_ConstantPathNode && nt_kind(nt, nt_ref(nt, v, "parent")) == NK_ConstantReadNode &&
+             sp_streq(nt_str(nt, nt_ref(nt, v, "parent"), "name"), "Process") &&
+             (sp_streq(nt_str(nt, v, "name"), "RLIM_SAVED_MAX") || sp_streq(nt_str(nt, v, "name"), "RLIM_SAVED_CUR")) &&
+             !(comp_const(c, const_key_at(c, v)) && const_path_reaches_leaf_const(c, v))) {
+      buf_printf(b, "(sp_process_rlim_defined(%d) ? SPL(\"constant\") : NULL)",
+                 sp_streq(nt_str(nt, v, "name"), "RLIM_SAVED_MAX") ? 1 : 2);
       return 1;
     }
     /* `defined?(m::Foo)` with m a class value: "constant" when m's own
@@ -6004,32 +6048,6 @@ static int emit_range_literal(Compiler *c, int id, Buf *b, const NodeTable *nt) 
   int left = nt_ref(nt, id, "left");
   int right = nt_ref(nt, id, "right");
   int excl = nt_range_excl(nt, id);
-  /* (:a..:e): a poly array of boxed symbols, walked by name succession
-     (interning through the generated TU's own table) */
-  if (left >= 0 && right >= 0 &&
-      nt_kind(nt, left) == NK_SymbolNode &&
-      nt_kind(nt, right) == NK_SymbolNode) {
-    int ta = ++g_tmp, ts = ++g_tmp, te = ++g_tmp;
-    buf_printf(b, "({ sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
-                  " const char *_t%d = sp_sym_to_s(", ta, ta, ts);
-    emit_expr(c, left, b);
-    buf_printf(b, "); const char *_t%d = sp_sym_to_s(", te);
-    emit_expr(c, right, b);
-    buf_printf(b, "); for (;;) {"
-                  " if (%d && sp_str_eq(_t%d, _t%d)) break;"
-                  " sp_PolyArray_push(_t%d, sp_box_sym(sp_sym_intern(_t%d)));"
-                  " if (!%d && sp_str_eq(_t%d, _t%d)) break;"
-                  " _t%d = sp_str_succ(_t%d);"
-                  " if (sp_str_length(_t%d) > sp_str_length(_t%d)) break; }"
-                  " _t%d; })",
-               excl, ts, te,
-               ta, ts,
-               excl, ts, te,
-               ts, ts,
-               ts, te,
-               ta);
-    return 1;
-  }
   /* (t1..t2): a Range of Times; the begin is rooted while the end is made */
   if (comp_ntype(c, id) == TY_TIME_RANGE) {
     int tl = ++g_tmp, tr = ++g_tmp;

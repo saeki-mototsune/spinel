@@ -7945,7 +7945,10 @@ static void emit_arg_or_default_at(Compiler *c, Scope *m, int idx, int provided,
   g_open_default[g_open_defaults].idx = idx;
   g_open_defaults++;
   int sv_nren = declare_default_locals(c, m, m->pdefault[idx]);
+  EnvBind env;
+  if (m->env_host) env_bind_begin(c, m, m->pdefault[idx], out, &env);
   emit_arg_or_default_fill(c, m, idx, provided, out);
+  if (m->env_host) env_bind_end(out, &env);
   g_nren = sv_nren;
   g_open_defaults--;
 }
@@ -13867,6 +13870,15 @@ static void emit_dispatch_in(Compiler *c, int cid, const char *name,
       scope_proc_form_of(c, mi) >= 0) {
     TyKind ct = repr_of(c, g_nd_call_id).as_ty;
     if (ct != TY_UNKNOWN) ret = ct;
+  }
+  /* the call's own dispatch answers the type the call is read as: an arm the
+     inference did not reach through (a later class's direct call to the last
+     version, beside the version entries the others take) answers boxed, and
+     its value is unboxed into the call's slot as each arm's is */
+  {
+    const char *cnm = g_nd_call_id >= 0 ? nt_str(nt, g_nd_call_id, "name") : NULL;
+    TyKind ct = cnm && sp_streq(cnm, name) ? repr_of(c, g_nd_call_id).as_ty : TY_UNKNOWN;
+    if (ret == TY_POLY && ct != TY_UNKNOWN && ct != TY_POLY && is_scalar_ret(ct)) ret = ct;
   }
 
   int argc = 0;

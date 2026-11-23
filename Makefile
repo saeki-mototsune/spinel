@@ -1466,6 +1466,13 @@ endif
 ifneq ($(shell uname -s),Linux)
 TESTS := $(filter-out $(shell grep -l '^\# spinel: linux' test/*.rb),$(TESTS))
 endif
+# A test only --load-model=inline answers yet: the default model refuses a
+# define_method a class method's body makes under a computed name, until
+# such a definition is placed where it runs. load-model-inline-test runs
+# these under the inline model and asks that the default one still refuses
+# them, so a program leaves the list when it compiles.
+LOAD_MODEL_INLINE_ONLY := test/class_macro_guard_after.rb
+TESTS := $(filter-out $(LOAD_MODEL_INLINE_ONLY),$(TESTS))
 # A platform that cannot give some tests their subject lists them in
 # TEST_SKIP -- native Windows (win32.mk), for tests of what only a POSIX
 # system answers -- and they are not run there.
@@ -1842,7 +1849,7 @@ test-corpus-summary: test-corpus-results
 # entries, and a raise caught through the exported try helper -- and a kernel
 # whose entries start and join threads after an init that started some, and
 # one whose at_exit hooks run when the host exits, not as its init returns,
-# and one whose entry calls a Struct's `new` the load redefined, a typed and
+# and one whose entry uses Marshal, and one whose entry calls a Struct's `new` the load redefined, a typed and
 # an untyped entry that `new` one class compile, so do a typed entry and an
 # --ext-class table that `new` one class, and an
 # --ext-entry list longer than 2048 bytes exports every method it names.
@@ -1886,6 +1893,16 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SP_RT_PIC_LIB) $(SP_RT_MT_PIC
 	    printf 'init returned\nentry 41\n42\nmain returns\nentry hook 41\ntoplevel hook\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 3 ] || \
 	      { echo "ext-test: FAIL (at_exit hooks not run at host exit, or status $$rc is not the host's 3)"; cat "$$tmp/out"; ok=0; }; \
 	  else echo "ext-test: FAIL (at_exit host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/marshal.rb -c --no-line-map --ext-init Init_ext_marshal \
+	      --ext-entry ExtMarshal.round_trip -o "$$tmp/s.c" >/dev/null 2>&1; then \
+	    echo "ext-test: FAIL (marshal emission)"; ok=0; \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" test/ext/marshal_host.c "$$tmp/s.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/shost" 2>"$$tmp/cc.err"; then \
+	    "$$tmp/shost" > "$$tmp/out" 2>&1; rc=$$?; \
+	    printf '[41, :sym, "str"]\n42\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
+	      { echo "ext-test: FAIL (a library that uses Marshal answered wrong, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
+	  else echo "ext-test: FAIL (the C of a library that uses Marshal did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
 	fi; \
 	if [ $$ok -eq 1 ]; then \
 	  if ! $(SPINEL) test/ext/pic.rb -c --no-line-map --ext-init Init_ext_pic \
@@ -2440,6 +2457,13 @@ string-minus-reject-test: $(SPINEL)
 	done; rm -rf "$$tmp"; \
 	[ $$ok = 1 ] && echo "string-minus-reject-test: pass" || exit 1
 
+# Two of its groups are refusals of the inline load model alone, and are
+# compiled under --load-model=inline: a test/reject/macro_*.rb that
+# test/analysis-forms/ holds as class_<name> (the text pass refuses the call;
+# the analysis runs the macro where the call stands, and analysis-forms-test
+# runs that program), and system_env_options_hash (the text scan sees no
+# keyword in `**opts`; the tree does, and test/system_options_spread.rb runs
+# it).
 reject-test: string-minus-reject-test $(SPINEL)
 	@ok=1; tmp=$$(mktemp -d /tmp/spinel-reject.XXXXXX); \
 	t=test/reject/string_split_local_each_rescue_modifier_retry.rb; \
@@ -2621,7 +2645,7 @@ reject-test: string-minus-reject-test $(SPINEL)
 	    { echo "reject-test: FAIL (#4318: $$t rejected without saying why)"; sed -n 1,3p "$$tmp/$$t.out"; ok=0; }; fi; \
 	done; \
 	t=test/reject/system_env_options_hash.rb; \
-	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/se.c" >"$$tmp/se.out" 2>&1; then \
+	if $(SPINEL) --load-model=inline "$$t" -c --no-line-map -o "$$tmp/se.c" >"$$tmp/se.out" 2>&1; then \
 	  echo "reject-test: FAIL (system with an environment Hash and an options Hash compiled)"; ok=0; \
 	else grep -q "system with an options Hash" "$$tmp/se.out" || \
 	  { echo "reject-test: FAIL (system with an environment and an options Hash refused without saying why)"; sed -n 1,5p "$$tmp/se.out"; ok=0; }; fi; \
@@ -2647,10 +2671,11 @@ reject-test: string-minus-reject-test $(SPINEL)
 	  { echo "reject-test: FAIL ($$t: an alias of \$$LOAD_PATH refused without saying why)"; sed -n 1,5p "$$tmp/la.out"; ok=0; }; fi; \
 	done; \
 	for t in test/reject/macro_*.rb; do \
-	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/mc.c" >"$$tmp/mc.out" 2>&1; then \
+	fl=; [ -f "test/analysis-forms/class_$$(basename "$$t")" ] && fl=--load-model=inline; \
+	if $(SPINEL) $$fl "$$t" -c --no-line-map -o "$$tmp/mc.c" >"$$tmp/mc.out" 2>&1; then \
 	  echo "reject-test: FAIL ($$t: a macro over state or a name it cannot compute was expanded)"; ok=0; \
 	else pat="unsupported send with a runtime method name|unsupported .*CallNode .(module_eval|class_eval|const_set).|no class in the program defines"; \
-	  grep -q '^# spinel: reject-define-method-name$$' "$$t" && pat="define_method with a non-literal name"; \
+	  grep -q '^# spinel: reject-define-method-name$$' "$$t" && pat="define_method with a non-literal name|define_method in a method body is supported only"; \
 	  grep -qE "$$pat" "$$tmp/mc.out" || \
 	  { echo "reject-test: FAIL ($$t: refused without saying why)"; sed -n 1,5p "$$tmp/mc.out"; ok=0; }; fi; \
 	done; \
@@ -3897,6 +3922,34 @@ build/rbs-seed-results/%.res: FORCE | rbs-seed-extractor $(SP_RT_LIB) $(SPINEL_T
 	$(SPINEL) test/rbs-seed/rbs_parse_failure_stops_build.rb -o "$$tmp/rpf" >/dev/null 2>&1 && [ "$$("$$tmp/rpf")" = 42 ] || \
 	  { echo "rbs-seed-test: FAIL (#11323 the program without --rbs)"; ok=0; }; \
 	;; \
+	strict_rbs_ok) \
+	$(SPINEL) test/rbs-seed/strict_rbs_ok.rb --rbs test/rbs-seed/sig --strict-rbs \
+	  -c --no-line-map -o "$$tmp/sro.c" 2>"$$tmp/sro.err"; \
+	if $(CC) -O0 -Ilib $(RBS_SEED_STRICT) "$$tmp/sro.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/sro" 2>"$$tmp/sro.cc"; then \
+	  "$$tmp/sro" > "$$tmp/sro.out" 2>/dev/null && \
+	  cmp -s "$$tmp/sro.out" test/rbs-seed/strict_rbs_ok.expected || { echo "rbs-seed-test: FAIL (strict_rbs_ok output mismatch)"; diff -u test/rbs-seed/strict_rbs_ok.expected "$$tmp/sro.out" || true; ok=0; }; \
+	else echo "rbs-seed-test: FAIL (strict_rbs_ok: failed under --strict-rbs)"; sed -n 1,10p "$$tmp/sro.err" "$$tmp/sro.cc"; ok=0; fi; \
+	;; \
+	strict_rbs_contradictions) \
+	if $(SPINEL) test/rbs-seed/strict_rbs_contradictions.rb --rbs test/rbs-seed/sig --strict-rbs \
+	     -c --no-line-map -o "$$tmp/src.c" >"$$tmp/src.out" 2>&1; then \
+	  echo "rbs-seed-test: FAIL (strict_rbs_contradictions compiled under --strict-rbs)"; ok=0; \
+	else \
+	  grep -q 'strict_rbs_contradictions.rb:54: --strict-rbs:.*parameter h of send_headers is declared Hash\[String, String\] but this call passes Hash\[String, Integer\]' "$$tmp/src.out" && \
+	  grep -q 'strict_rbs_contradictions.rb:55: --strict-rbs:.*parameter h of send_headers is declared Hash\[String, String\] but this call passes Hash\[String, untyped\]' "$$tmp/src.out" && \
+	  grep -q 'strict_rbs_contradictions.rb:56: --strict-rbs:.*parameter h of send_headers is declared Hash\[String, String\] but this call passes Hash\[untyped, untyped\]' "$$tmp/src.out" && \
+	  grep -q 'strict_rbs_contradictions.rb:57: --strict-rbs:.*parameter h of send_headers is declared Hash\[String, String\] but this call passes untyped' "$$tmp/src.out" && \
+	  grep -q 'strict_rbs_contradictions.rb:35: --strict-rbs:.*StrictBadApi#mixed_return is declared to return Hash\[String, String\] but this returns Hash\[String, untyped\]' "$$tmp/src.out" && \
+	  grep -q 'strict_rbs_contradictions.rb:39: --strict-rbs:.*@headers is declared Hash\[String, String\] but this assigns Hash\[String, Integer\]' "$$tmp/src.out" && \
+	  grep -q 'strict_rbs_contradictions.rb:60: --strict-rbs: inline RBS annotation contradicted: parameter h of inline_send is declared Hash\[String, String\] at test/rbs-seed/strict_rbs_contradictions.rb:42 but this call passes Hash\[String, Integer\]' "$$tmp/src.out" && \
+	  grep -q 'strict_rbs_contradictions.rb:61: --strict-rbs:.*parameter obj of initialize is declared StrictBadFoo but this call passes StrictBadBar' "$$tmp/src.out" && \
+	  grep -q 'strict_rbs_contradictions.rb:15: --strict-rbs: ivar pin @id on StrictBadChild (declared Integer) dropped: ancestor StrictBadParent holds it as untyped' "$$tmp/src.out" || \
+	  { echo "rbs-seed-test: FAIL (strict_rbs_contradictions missing expected --strict-rbs diagnostics)"; cat "$$tmp/src.out"; ok=0; }; \
+	fi; \
+	$(SPINEL) test/rbs-seed/strict_rbs_contradictions.rb --rbs test/rbs-seed/sig \
+	  -c --no-line-map -o "$$tmp/src_default.c" 2>"$$tmp/src_default.err" || \
+	  { echo "rbs-seed-test: FAIL (strict_rbs_contradictions broke default --rbs mode)"; sed -n 1,5p "$$tmp/src_default.err"; ok=0; }; \
+	;; \
 	*) echo "rbs-seed-test: FAIL (no check named $*)"; ok=0 ;; \
 	esac; } > "$$tmp/log" 2>&1; \
 	cat "$$tmp/log"; rm -rf "$$tmp"; echo $$ok > $@
@@ -3926,7 +3979,7 @@ inline-rbs-test: inline-rbs-no-parser-test
 inline-rbs-no-parser-test: $(SPINEL_NO_RBS)
 	@tmp=$$(mktemp -d); ok=1; \
 	trap 'rm -rf "$$tmp"' 0; \
-	for tp in methods=methods.rb:8 warnings=warnings_part.rb:2 syntax_error=syntax_error.rb:3 false_positives=none; do \
+	for tp in methods=methods.rb:8 warnings=warnings.rb:7 syntax_error=syntax_error.rb:3 false_positives=none; do \
 	  t=$${tp%%=*}; at=$${tp#*=}; \
 	  $(SPINEL_NO_RBS) test/inline-rbs/$$t.rb -c --no-line-map -o "$$tmp/i.c" 2>"$$tmp/i.err" || { echo "inline-rbs-no-parser-test: FAIL ($$t: compile failed)"; ok=0; }; \
 	  $(SPINEL_NO_RBS) test/inline-rbs/$$t.rb --no-inline-rbs -c --no-line-map -o "$$tmp/n.c" 2>"$$tmp/n.err" || { echo "inline-rbs-no-parser-test: FAIL ($$t: disabled compile failed)"; ok=0; }; \
@@ -3954,6 +4007,7 @@ INLINE_RBS_CHECKS := false_positives ignored_symlink ignored_errors warnings syn
 INLINE_RBS_PARITY += flag_types self_types optional_on_rest
 INLINE_RBS_PARITY += type_variables
 INLINE_RBS_PARITY += singleton_class_defs
+INLINE_RBS_PARITY += block_types proc_types
 INLINE_RBS_RESULTS := $(patsubst %,build/inline-rbs-results/%.par,$(INLINE_RBS_PARITY)) \
                       $(patsubst %,build/inline-rbs-results/%.res,$(INLINE_RBS_CHECKS))
 inline-rbs-test: $(INLINE_RBS_RESULTS)
@@ -4968,6 +5022,8 @@ infer-test-1: $(SPINEL) $(SP_RT_LIB)
 	[ "$$(awk '/^struct sp_Layer_s \{/,/^\}/' "$$tmp/oaz.c" | grep -c 'sp_PtrArray \* iv_')" = 2 ] || { echo "infer-test: FAIL (a zip over an Array of one class, as receiver or operand, kept it boxed)"; ok=0; }; \
 	$(SPINEL) test/object_method_ivar_receivers.rb -c --no-line-map -o "$$tmp/oir.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (object_method_ivar_receivers: -c)"; ok=0; }; \
 	grep -q 'static sp_PointValue sp_PointValue_new(' "$$tmp/oir.c" && ! grep -q 'iv_unused;' "$$tmp/oir.c" || { echo "infer-test: FAIL (an Object setter changes unrelated layouts)"; ok=0; }; \
+	$(SPINEL) test/string_unpack_int_array.rb -c --no-line-map -o "$$tmp/sui.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (string_unpack_int_array: -c)"; ok=0; }; \
+	grep -Fq 'static inline sp_int sp_rb_sum(' "$$tmp/sui.c" || { echo "infer-test: FAIL (a sum over unpack(\"V*\") kept the words boxed)"; ok=0; }; \
 	$(SPINEL) test/hash_store_boxed_unbounded.rb -c --no-line-map -o "$$tmp/hbu.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (hash_store_boxed_unbounded: -c)"; ok=0; }; \
 	! grep -q 'sp_PolyPolyHash_new' "$$tmp/hbu.c" || { echo "infer-test: FAIL (an unbounded boxed store widened a known Hash)"; ok=0; }; \
 	$(SPINEL) test/hash_key_walk_param_same_name.rb -c --no-line-map -o "$$tmp/hkw.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (hash_key_walk_param_same_name: -c)"; ok=0; }; \
@@ -5851,7 +5907,21 @@ magic-comment-test: $(SPINEL)
 # each required file's top level runs at its require, once; what graph mode
 # does not compile yet it refuses by name (#9898). make test runs it.
 .PHONY: load-graph-test
-test-run: load-graph-test
+test-run: load-graph-test load-model-inline-test
+.PHONY: load-model-inline-test
+load-model-inline-test: $(SPINEL)
+	@ok=1; tmp=$$(mktemp -d /tmp/spinel-lmi.XXXXXX); \
+	for t in $(LOAD_MODEL_INLINE_ONLY); do \
+	  b=$$(basename "$$t" .rb); \
+	  if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/$$b.c" >"$$tmp/$$b.out" 2>&1; then \
+	    echo "load-model-inline-test: FAIL ($$t compiles under the default model: take it off LOAD_MODEL_INLINE_ONLY)"; ok=0; fi; \
+	  if ! $(SPINEL) --load-model=inline "$$t" -o "$$tmp/$$b" >"$$tmp/$$b.out" 2>&1; then \
+	    echo "load-model-inline-test: FAIL ($$t: compile under --load-model=inline)"; sed -n 1,5p "$$tmp/$$b.out"; ok=0; continue; fi; \
+	  "$$tmp/$$b" >"$$tmp/$$b.run" 2>&1; \
+	  cmp -s "$$tmp/$$b.run" "$$t.expected" || \
+	    { echo "load-model-inline-test: FAIL ($$t: output)"; diff -u "$$t.expected" "$$tmp/$$b.run" | head -10; ok=0; }; \
+	done; \
+	[ $$ok = 1 ] && echo "load-model-inline-test: pass" || exit 1
 load-graph-test: $(SPINEL)
 	@tools/load_graph_check.sh
 
@@ -6180,16 +6250,17 @@ builtin-method-tables-regen:
 #   spinel --dump-value-positions test/value-pos/shapes.rb > test/value-pos/shapes.expected
 # --check-value-pos walks tables built by hand for the limits no program
 # reaches: the visit budget and a stack past its 32 entries. A program that is
-# an explicit `require "builtins/..."` has the builtin's last definition as
-# its final statement, a node of a builtin that the dump numbers "#p<n>": the
-# check asks for that form without pinning the builtin's line.
+# an explicit `require "builtins/..."` has that require's load node as its
+# final statement (the builtin is a file of its own, not spliced into the
+# program): the check asks for that node, a program node the dump numbers
+# plainly.
 value-pos-test: $(SPINEL)
 	@tmp=$$(mktemp -d /tmp/spinel-value-pos.XXXXXX); \
 	printf '%s\n' 'require "builtins/enumerator"' > "$$tmp/builtin.rb"; \
 	$(SPINEL) --dump-value-positions "$$tmp/builtin.rb" > "$$tmp/builtin.out" 2>&1; \
 	$(SPINEL) --dump-value-positions test/value-pos/shapes.rb > "$$tmp/out" 2>&1; \
 	if diff -u test/value-pos/shapes.expected "$$tmp/out" && $(SPINEL) --check-value-pos test/value-pos/shapes.rb && \
-	   grep -Eq '^  EXPR #p[0-9]+ DefNode ' "$$tmp/builtin.out"; \
+	   grep -Eq '^  EXPR #[0-9]+ LoadNode ' "$$tmp/builtin.out"; \
 	then echo "value-pos-test: ok"; rm -rf "$$tmp"; \
 	else echo "value-pos-test: FAIL"; rm -rf "$$tmp"; exit 1; fi
 

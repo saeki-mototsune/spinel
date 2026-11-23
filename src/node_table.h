@@ -141,6 +141,10 @@ typedef struct {
   /* the class builder each constant write holds (class_def_builder), asked
      node by node; NULL until the first */
   struct NtBuilders *builders;
+  /* the names of each scope's `locals`, split once (nt_scope_locals); NULL
+     until the first ask */
+  struct NtScopeSplit *splits;
+  int nsplits;
   /* how many times a call was marked to bind the builtin's own method
      (nt_mark_builtin_call): none, and no call is marked, which an ask can
      tell without a node read (a clone copies a marked node's mark) */
@@ -192,6 +196,18 @@ struct NtBuilders {
   unsigned ver;
   unsigned long edits;
   int cnt;
+};
+
+/* A scope node's `locals` split into names, kept on the table it was asked
+   of: entry id holds the names of the string it was split from (src), and
+   counts only while the node still holds that string. An edit retires a
+   replaced string and never frees it before nt_free, so its pointer names its
+   content and an edit clears nothing. Freed with the table. */
+struct NtScopeSplit {
+  const char *src;
+  char *buf;
+  const char **names;
+  int n;
 };
 
 /* The roots of the program's files, entry first (see file_roots). */
@@ -802,10 +818,44 @@ NodeTable *sp_parse_snippet_in(const char *src, const SnipFrame *f);
    src/main.c sets them, spinel_parse.c defines them. A string is a path to
    write, or NULL. */
 extern int g_opt_debug, g_opt_line_map, g_opt_positions, g_opt_warn_widen, g_opt_check_stores,
-           g_opt_defer_refusals, g_opt_emit_types_keep_c;
+           g_opt_defer_refusals, g_opt_emit_types_keep_c, g_opt_strict_rbs;
 extern const char *g_opt_emit_types, *g_opt_emit_rbs, *g_opt_emit_symbol_map, *g_opt_profile_symbol_map,
                   *g_opt_rbs_seed;
 
+
+/* ---- a scope's local names ----
+   A block's, lambda's, def's or class body's `locals` is one comma-joined
+   string, which every pass edits as a whole (nt_scope_locals_set); these
+   answer it as names, split once per string. */
+
+/* The names in scope node id's `locals`, in order, and their count in *out_n
+   (none: an empty list). The array is the table's own and holds until the
+   node's locals are next asked after an edit of them: a caller that edits
+   them while it reads the names copies them first. */
+const char *const *nt_scope_locals(const NodeTable *nt, int id, int *out_n);
+/* Does scope node id list a local named name? */
+int nt_scope_has_local(const NodeTable *nt, int id, const char *name);
+/* Replace scope node id's locals with the n names given. */
+void nt_scope_locals_set(NodeTable *nt, int id, const char *const *names, int n);
+/* Does a parameter in the subtree at id, a block's or def's parameters,
+   bind name, spelled so (a renamed parameter's node holds its new spelling)?
+   A block-local does not bind it as a parameter. */
+int nt_param_binds(const NodeTable *nt, int id, const char *name);
+/* The BlockLocalVariableNode with which block or lambda blk declares name as
+   a block-local (`|a; name|`), -1 if it declares none. */
+int nt_block_local_node(const NodeTable *nt, int blk, const char *name);
+
+/* The name a local-binding or local-reference node was written with: its
+   `wname`, which a pass that renamed the node (nt_rename_local) kept, else
+   its `name`. A node a desugar made has no Prism origin, so its name is what
+   it wrote. */
+static inline const char *nt_wname(const NodeTable *nt, int id) {
+  const char *w = nt_str(nt, id, "wname");
+  return w ? w : nt_str(nt, id, "name");
+}
+/* Rename local node id to newname, keeping the name it was first written
+   with in `wname`. A node without a `name` is left as it is. */
+void nt_rename_local(NodeTable *nt, int id, const char *newname);
 
 /* The name a class or module header's constant path is keyed by: the one
    qualify_colliding_classes gave a colliding header ("qc_name"), else the

@@ -104,6 +104,27 @@ static double sp_monotonic_now(void) {
   struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts);
   return (double)ts.tv_sec + (double)ts.tv_nsec * 1e-9;
 }
+/* A nanosleep of `seconds` that goes on after EINTR. What is left is read
+   from the monotonic clock: the remainder Linux's nanosleep writes includes
+   the timer slack (50 us by default), so a retry with it under signals that
+   arrive more often than that grows and never ends. raise_in_sleep puts the
+   sleep inside SP_SIG_BLOCKING; on_eintr, if set, runs after each EINTR. */
+void sp_sleep_plain(double seconds, int raise_in_sleep, void (*on_eintr)(void)) {
+  double end = sp_monotonic_now() + seconds;
+  for (;;) {
+    double left = end - sp_monotonic_now();
+    if (!(left > 0.0)) return;
+    if (left > 86400.0) left = 86400.0;   /* (a day at a time: what is left may be past time_t) */
+    struct timespec req; req.tv_sec = (time_t)left;
+    req.tv_nsec = (long)((left - (double)req.tv_sec) * 1e9);
+    if (req.tv_nsec < 0) req.tv_nsec = 0;
+    if (req.tv_nsec >= 1000000000L) req.tv_nsec = 999999999L;
+    int r = raise_in_sleep ? SP_SIG_BLOCKING(nanosleep(&req, NULL)) : nanosleep(&req, NULL);
+    if (r == 0) continue;
+    if (errno != EINTR) return;
+    if (on_eintr) on_eintr();
+  }
+}
 #ifdef SP_THREADS
 #include <pthread.h>
 static pthread_mutex_t g_sched_lock = PTHREAD_MUTEX_INITIALIZER;
@@ -2238,8 +2259,7 @@ int sp_sched_wait_child_flags(int pid, int *status, int flags) {
 #ifdef SP_THREADS
       sp_sched_sleep(back);
 #else
-      { struct timespec rq; rq.tv_sec = 0; rq.tv_nsec = (long)(back * 1e9);
-        while (nanosleep(&rq, &rq) == -1 && errno == EINTR) {} }
+      sp_sleep_plain(back, 0, NULL);
 #endif
       if (back < 0.005) back *= 2.0;
     } }
@@ -3323,6 +3343,7 @@ void sp_sig_threads_began(void);
 static inline void sp_sig_run_if_pending(void) {
   if (SP_ATOMIC_LOAD(&sp_sig_pending_flag, __ATOMIC_ACQUIRE)) sp_sig_run_pending();
 }
+static void sp_sig_run_if_pending_fn(void) { sp_sig_run_if_pending(); }
 sp_thread *sp_Thread_spawn_fiber_at(sp_Fiber *f, sp_RbVal arg, const char *file, sp_int line) {SP_GC_ROOT_RBVAL(arg);SP_GC_ROOT(f);SP_GC_ROOT_STR(file);
   sp_thread *t = sp_Thread_spawn_fiber(f, arg);
   t->birth_file = file;
@@ -4041,10 +4062,7 @@ static int sp_sched_sleep_park(double seconds) {
   if (!g_sysmon_started) {   /* the monitor was not started: plain blocking sleep */
     /* nothing else could wake us; a trap delivered meanwhile runs */
     if (seconds < 0.0) for (;;) { pause(); sp_sig_run_if_pending(); }
-    struct timespec req; req.tv_sec = (time_t)seconds;
-    req.tv_nsec = (long)((seconds - (double)req.tv_sec) * 1e9);
-    if (req.tv_nsec < 0) req.tv_nsec = 0; if (req.tv_nsec >= 1000000000L) req.tv_nsec = 999999999L;
-    while (nanosleep(&req, &req) == -1 && errno == EINTR) sp_sig_run_if_pending();
+    sp_sleep_plain(seconds, 0, sp_sig_run_if_pending_fn);
     return 0;
   }
   sp_thread *self = g_current;
@@ -4226,8 +4244,9 @@ static int sp_sched_wait_io_impl(int fd, short events, struct pollfd *set, int n
     int timed = timeout_s >= 0.0;
     sp_wlock *wl = &g_wslot[home].io_wl;
     wl_lock(wl);
-    /* Same pending-inject check as sp_sched_block. */
-    if (sp_thread_inject_pending(self)) {
+    /* Same pending-inject check as sp_sched_block. A deferred one is left
+       pending, and the park goes on (sp_fiber_defer_inject). */
+    if (sp_thread_inject_pending(self) && !sp_fiber_inject_deferred()) {
       wl_unlock(wl);
       sp_fiber_fire_inject_if_pending();   /* raises; does not return */
     }
@@ -4254,8 +4273,11 @@ static int sp_sched_wait_io_impl(int fd, short events, struct pollfd *set, int n
     int ik = inj ? sp_fiber_inject_hold(inj) : 0;
     if (ik) {
       sp_fiber_inject_release(inj, ik);
-      free(es); wl_unlock(wl);
-      sp_fiber_fire_inject_if_pending();   /* raises; does not return */
+      if (!sp_fiber_inject_deferred()) {
+        free(es); wl_unlock(wl);
+        sp_fiber_fire_inject_if_pending();   /* raises; does not return */
+      }
+      inj = NULL;
     }
     if (set) { self->io_fd = -1; self->io_events = 0; self->io_set = set; self->io_nset = n; self->ev_set = es; }
     else { self->io_fd = fd; self->io_events = events; }
@@ -4322,7 +4344,7 @@ static int sp_sched_wait_io_impl(int fd, short events, struct pollfd *set, int n
   /* Same pending-inject check as sp_sched_block. */
   if (sp_thread_inject_pending(self)) {
     SCHED_UNLOCK();
-    sp_fiber_fire_inject_if_pending();   /* raises; does not return */
+    sp_fiber_fire_inject_if_pending();   /* raises; does not return (a deferred one is left pending) */
     SCHED_LOCK();
   }
   /* A close from another thread that landed between the caller's readiness
@@ -5779,14 +5801,7 @@ static void sp_CondVar_wait_timeout_blocking(sp_mutex *m, double seconds) {
   SP_ATOMIC_STORE(&m->owner, NULL, __ATOMIC_SEQ_CST);
   sp_mutex_wake_waiter(m);   /* under m's own wait lock */
   SCHED_UNLOCK();
-  while (seconds > 86400.0) {
-    struct timespec day = {86400, 0};
-    while (nanosleep(&day, &day) == -1 && errno == EINTR) {}
-    seconds -= 86400.0;
-  }
-  struct timespec req = {(time_t)seconds, (long)((seconds - (time_t)seconds) * 1e9)};
-  if (req.tv_nsec >= 1000000000L) { req.tv_sec++; req.tv_nsec -= 1000000000L; }
-  while (nanosleep(&req, &req) == -1 && errno == EINTR) {}
+  sp_sleep_plain(seconds, 0, NULL);
   sp_Mutex_lock(m);
 }
 
@@ -6022,12 +6037,20 @@ static void sp_sched_fork_child(void) {
 }
 #endif
 
+void sp_sig_fork_child(void);   /* lib/sp_cold.c */
+#if !defined(_WIN32) && !defined(__wasi__)
+static int sp_fork_plain(void) {
+  pid_t pid = fork();
+  if (pid == 0) sp_sig_fork_child();
+  return (int)pid;
+}
+#endif
 int sp_sched_fork(void) {
 #if defined(_WIN32) || defined(__wasi__)
   sp_raise_cls("NotImplementedError", "fork() function is unimplemented on this machine");
   return -1;
 #elif defined(SP_THREADS)
-  if (!g_workers_started && !g_sysmon_started) return (int)fork();
+  if (!g_workers_started && !g_sysmon_started) return sp_fork_plain();
   /* the main thread goes on in the child; another thread has no worker 0
      under it there to run on */
   if (g_current != &g_main_thread || sp_worker_id != 0)
@@ -6051,6 +6074,7 @@ int sp_sched_fork(void) {
   g_collector_active = 0;
   pid_t pid = fork();
   if (pid == 0) {
+    sp_sig_fork_child();
     sp_sched_fork_child();
 #ifdef SP_CEXT
     sp_cext_unlock();
@@ -6068,7 +6092,7 @@ int sp_sched_fork(void) {
 #endif
   return (int)pid;
 #else
-  return (int)fork();
+  return sp_fork_plain();
 #endif
 }
 

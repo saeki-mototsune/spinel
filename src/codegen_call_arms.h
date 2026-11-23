@@ -60,6 +60,8 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
 int emit_call_handle_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
+/* The value node id takes where a raise ahead of it runs, which nothing reads: its C type's zero */
+void emit_unread_value(Compiler *c, int id, Buf *b);
 int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
 int emit_call_poly_builtin_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt);
 int emit_call_openstruct_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv);
@@ -125,6 +127,7 @@ int any_class_defines(Compiler *c, const char *qm);
 int any_class_responds(Compiler *c, const char *qm);
 int class_struct_kind(Compiler *c, int cid);
 int class_value_arms(Compiler *c, int id, const char *qm, CplanPresList *l, int *asked);
+int class_value_arms_yes(const CplanPresList *l);
 void class_value_responds(Compiler *c, const CplanPresList *l, int tv, Buf *b);
 void class_value_responds_runtime(int tv, Buf *b);
 void emit_class_value_responds_helper(Compiler *c, const char *const *texts, int ntexts, Buf *protos, Buf *defs);
@@ -154,6 +157,10 @@ int respond_to_static_answer(Compiler *c, int id, int recv, TyKind rt, const cha
 int respond_to_guard_reaches(Compiler *c, TyKind rt, const char *name);
 struct CplanCells;
 void emit_guarded_presence(Compiler *c, const struct CplanCells *cells, Buf *b);
+/* The test ahead of public_method capture id (CallPlan.closed CP_CLOSED_RUN) of ci's class method mn: CRuby's NameError,
+   naming the class cn's singleton class, where the cells there say no version is public, of the visibility they say,
+   or none live (a statement) */
+void emit_capture_closed_cells(Compiler *c, int id, const char *mn, int ci, const char *cn, Buf *b);
 int is_enum_cursor_name(const char *n);
 /* nil's static answer to respond_to?(qm, ...); *prog: by a method of the program's */
 int nil_responds_static(Compiler *c, int id, const char *qm, int argc, const int *argv, int *prog);
@@ -184,11 +191,13 @@ void emit_presence_object(Compiler *c, const CplanPresList *l, int recv, Buf *b)
    `_sp_cls.cls_id == <class> ? (void)(gv_<cell> = 1) : (void)0`), written to
    b. 0, writing nothing, for a call that writes none. */
 int emit_vis_cell_write(Compiler *c, int id, Buf *b);
-/* The NameError visibility word `id` (private, protected, public) raises
-   where it runs, written to b as `sp_raise_cls(...)`: for the first name it
-   takes that the class self is has no instance method of there (a Symbol's,
-   a String's, a `def self.m`'s: the word looks the class method's name up
-   among the instance methods). 0, writing nothing, where each is found. */
+/* The error visibility word `id` (private, protected, public,
+   module_function) raises where it runs, written to b as
+   `sp_raise_cls(...)`: a NameError for the first name it takes that the
+   class self is has no instance method of there (a Symbol's, a String's, a
+   `def self.m`'s: the word looks the class method's name up among the
+   instance methods), a TypeError for module_function given an Array, whose
+   names it does not read. 0, writing nothing, where each is found. */
 int emit_vis_word_absent(Compiler *c, int id, Buf *b);
 int respond_to_user_defined(Compiler *c, int id, int recv);
 extern const char *const respond_universal[];

@@ -1477,19 +1477,6 @@ void emit_yield_proc_call(Compiler *c, int site, TyKind result_ty, Buf *b, int i
    args. Shared by YieldNode and `block.call`. `as_expr` wraps in ({...}). */
 /* Emit a block-arg source node coerced to the block param's slot type,
    mirroring the box/unbox handling of the requireds binding arm. */
-/* The keyword a block keyword param answers to: its name without the
-   `__bp<N>` suffix a block-param rename recorded for it, which is the first
-   block_kw_key_len bytes of the name. block_kw_key copies it into `b`. */
-static int block_kw_key_len(const Compiler *c, const char *kp) { return (int)block_param_written_len(c, kp); }
-static int block_kw_key_is(const Compiler *c, const char *kp, const char *key) {
-  size_t n = block_param_written_len(c, kp);
-  return strlen(key) == n && !memcmp(kp, key, n);
-}
-static const char *block_kw_key(const Compiler *c, const char *kp, Buf *b) {
-  buf_setf(b, "%.*s", block_kw_key_len(c, kp), kp);
-  return b->p;
-}
-
 /* True when the literal keys of the yielded keyword hash `ykw` do not come in
    the order the keyword params of block `blk` bind them, as kwh_out_of_order
    judges a method's: one names a param ahead of an earlier key's, or the one
@@ -1505,7 +1492,7 @@ static int ykw_out_of_order(Compiler *c, int blk, int ykw) {
     const char *kn = nt_str(nt, key, "value");
     int at = nkw;
     for (int ki = 0; ki < nkw; ki++)
-      if (block_kw_key_is(c, block_keyword_name(c, blk, ki), kn)) { at = ki; break; }
+      if (sp_streq(nt_wname(nt, block_keyword_node(c, blk, ki)), kn)) { at = ki; break; }
     if (at < last || (at == last && at < nkw)) return 1;
     last = at;
   }
@@ -1790,34 +1777,27 @@ void emit_block_kw_binds(Compiler *c, int blk, int ykw, Scope *bsc, Buf *b, int 
   if (nkw > 0) {
     int kw_bad = ykw_splat;
     int lit_n = 0; const int *lit_els = ykw >= 0 && !ykw_splat ? nt_arr(nt, ykw, "elements", &lit_n) : NULL;
-    Buf knb; memset(&knb, 0, sizeof knb);
     for (int ki = 0; ki < nkw && !kw_bad; ki++) {
-      const char *kn = block_kw_key(c, block_keyword_name(c, blk, ki), &knb);
+      const char *kn = nt_wname(nt, block_keyword_node(c, blk, ki));
       if (block_keyword_default(c, blk, ki) < 0 && (ykw < 0 || ie_kwhash_value(c, ykw, kn) < 0)) kw_bad = 1;
     }
-    free(knb.p);
     for (int e = 0; e < lit_n && !kw_bad && !block_kwrest_name(c, blk); e++) {
       int key = nt_ref(nt, lit_els[e], "key");
       const char *ks = key >= 0 && nt_kind(nt, key) == NK_SymbolNode ? nt_str(nt, key, "value") : NULL;
       int known = 0;
       for (int ki = 0; ks && ki < nkw; ki++)
-        if (block_kw_key_is(c, block_keyword_name(c, blk, ki), ks)) known = 1;
+        if (sp_streq(nt_wname(nt, block_keyword_node(c, blk, ki)), ks)) known = 1;
       if (!known) kw_bad = 1;
     }
     if (kw_bad) {
       int chk = ++g_tmp;
       if (!as_expr) emit_indent(b, indent);
       buf_printf(b, "static const char *const _kw%d[] = {", chk);
-      for (int ki = 0; ki < nkw; ki++) {
-        const char *kp = block_keyword_name(c, blk, ki);
-        buf_printf(b, "\"%.*s\", ", block_kw_key_len(c, kp), kp);
-      }
+      for (int ki = 0; ki < nkw; ki++) buf_printf(b, "\"%s\", ", nt_wname(nt, block_keyword_node(c, blk, ki)));
       buf_printf(b, "0}, *const _kr%d[] = {", chk);
-      for (int ki = 0; ki < nkw; ki++) {
-        const char *kp = block_keyword_name(c, blk, ki);
+      for (int ki = 0; ki < nkw; ki++)
         if (block_keyword_default(c, blk, ki) < 0)
-          buf_printf(b, "\"%.*s\", ", block_kw_key_len(c, kp), kp);
-      }
+          buf_printf(b, "\"%s\", ", nt_wname(nt, block_keyword_node(c, blk, ki)));
       buf_printf(b, "0}, *const _kl%d[] = {", chk);
       for (int e = 0; e < lit_n; e++) {
         int key = nt_ref(nt, lit_els[e], "key");
@@ -1831,7 +1811,7 @@ void emit_block_kw_binds(Compiler *c, int blk, int ykw, Scope *bsc, Buf *b, int 
                  block_kwrest_name(c, blk) ? 0 : 1, as_expr ? "; " : ";\n");
     }
   }
-  Buf kprbuf, knb; memset(&kprbuf, 0, sizeof kprbuf); memset(&knb, 0, sizeof knb);
+  Buf kprbuf; memset(&kprbuf, 0, sizeof kprbuf);
   for (int ki = 0; ; ki++) {
     const char *kp = block_keyword_name(c, blk, ki);
     if (!kp) break;
@@ -1839,7 +1819,7 @@ void emit_block_kw_binds(Compiler *c, int blk, int ykw, Scope *bsc, Buf *b, int 
     buf_setf(&kprbuf, "%s", rename_local(kp));
     bi_method_side(bi);
     const char *kpr = kprbuf.p;
-    const char *kn = block_kw_key(c, kp, &knb);
+    const char *kn = nt_wname(nt, block_keyword_node(c, blk, ki));
     LocalVar *kl = bsc ? scope_local(bsc, kp) : NULL;
     TyKind kt = kl ? kl->type : TY_UNKNOWN;
     int vn = ykw >= 0 && !ykw_splat ? ie_kwhash_value(c, ykw, kn) : -1;
@@ -1878,7 +1858,7 @@ void emit_block_kw_binds(Compiler *c, int blk, int ykw, Scope *bsc, Buf *b, int 
     buf_puts(b, as_expr ? "; " : ";\n");
     emit_block_param_share(c, bsc, kl, kpr, b, 1);
   }
-  free(kprbuf.p); free(knb.p);
+  free(kprbuf.p);
   /* `**kw` keyword-rest: the remaining pairs of the trailing yielded kwargs
      hash (those no named keyword param consumed), or a fresh empty hash --
      CRuby binds {}, never nil. Built into a temp and assigned last, like the
@@ -1901,10 +1881,9 @@ void emit_block_kw_binds(Compiler *c, int blk, int ykw, Scope *bsc, Buf *b, int 
       if (!as_expr) emit_indent(b, indent);
       buf_printf(b, "SP_GC_ROOT(_t%d);%s", tkw, as_expr ? " " : "\n");
       for (int ki = 0; kwh_tmp >= 0 && ki < nkw; ki++) {
-        const char *kp = block_keyword_name(c, blk, ki);
         if (!as_expr) emit_indent(b, indent);
-        buf_printf(b, "sp_PolyPolyHash_delete(_t%d, sp_box_sym(sp_sym_intern(\"%.*s\")));%s", tkw,
-                   block_kw_key_len(c, kp), kp, as_expr ? " " : "\n");
+        buf_printf(b, "sp_PolyPolyHash_delete(_t%d, sp_box_sym(sp_sym_intern(\"%s\")));%s", tkw,
+                   nt_wname(nt, block_keyword_node(c, blk, ki)), as_expr ? " " : "\n");
       }
       if (ykw >= 0 && kwh_tmp < 0) {
         int en2 = 0; const int *els2 = nt_arr(nt, ykw, "elements", &en2);
@@ -1924,9 +1903,9 @@ void emit_block_kw_binds(Compiler *c, int blk, int ykw, Scope *bsc, Buf *b, int 
                                ? nt_str(nt, kn2, "value") : NULL;
           int consumed = 0;
           for (int ki2 = 0; ksym; ki2++) {
-            const char *kp2 = block_keyword_name(c, blk, ki2);
-            if (!kp2) break;
-            if (block_kw_key_is(c, kp2, ksym)) { consumed = 1; break; }
+            int kp2 = block_keyword_node(c, blk, ki2);
+            if (kp2 < 0) break;
+            if (sp_streq(nt_wname(nt, kp2), ksym)) { consumed = 1; break; }
           }
           if (consumed) continue;
           if (!as_expr) emit_indent(b, indent);
@@ -5090,11 +5069,16 @@ int emit_array_filter_loop(Compiler *c, int recv, int block, TyKind rt, const ch
      the frame declares boxed. A shadow cannot retype that cell, so an
      object element binds boxed into the parameter (as in emit_collect_expr). */
   int boxed_cell = flv && !one_h && flv->is_cell && fsaved == TY_POLY && ty_is_object(et);
+  /* A String Array that holds the handle (a flat_map's result, whose block
+     parameter the scope left widened): the parameter shadowed over it is
+     the handle too, as one the scope holds so is (one_h), not the bytes */
+  int held_h = flv && !one_h && !boxed_cell && et == TY_STRING && typed_elem_held(rt) == TY_STRBUF &&
+               !block_binds_gathered(c, block) && !(g_face_live_box && g_face_live_recv == recv);
   if (flv && !one_h && !boxed_cell) {
     /* a widened parameter shadowed at a numeric element type still holds
        the element's nil */
     if (fsaved == TY_POLY && (et == TY_INT || et == TY_FLOAT)) flv->nullable_int = 1;
-    lv_set_storage_type(flv, et); for (int j = 0; j < bn; j++) infer_subtree(c, bb[j]);
+    lv_set_storage_type(flv, held_h ? TY_STRBUF : et); for (int j = 0; j < bn; j++) infer_subtree(c, bb[j]);
   }
   int t = ++g_tmp, ti = ++g_tmp, to = ++g_tmp, tw = ++g_tmp, tk = ++g_tmp, tnv = ++g_tmp, te = ++g_tmp;
   int eid = ++g_tmp, tj = ++g_tmp;
@@ -5242,11 +5226,18 @@ int emit_array_filter_loop(Compiler *c, int recv, int block, TyKind rt, const ch
     else if (ote) {
       emit_ctype(c, et, b); buf_printf(b, " lv_%s = _t%d.v;", bp, te);
     }
+    else if (held_h) {
+      /* the step holds the element as the Array holds it, the handle, and
+         so does the parameter shadowed over a widened slot: a bang in the
+         block changes the element */
+      buf_printf(b, "sp_String *lv_%s = _t%d; SP_GC_ROOT(lv_%s);", bp, te, bp);
+    }
     else {
       if (et != TY_POLY || boxed_shadow) { emit_ctype(c, et, b); buf_puts(b, " "); }
       buf_printf(b, "lv_%s = _t%d;", bp, te);
     }
-    if (et == TY_STRING) buf_printf(b, " SP_GC_ROOT_STR(lv_%s);", bp);
+    if (held_h) { }
+    else if (et == TY_STRING) buf_printf(b, " SP_GC_ROOT_STR(lv_%s);", bp);
     else if (boxed_shadow) buf_printf(b, " SP_GC_ROOT_RBVAL(lv_%s);", bp);
     buf_puts(b, "\n");
   }

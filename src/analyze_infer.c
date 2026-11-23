@@ -102,7 +102,7 @@ const struct an_poly_raw_row AN_POLY_RAW[] = {
       { "numerator", 0, TY_POLY }, { "denominator", 0, TY_POLY },
       { "to_i", 0, TY_INT }, { "hash", 0, TY_INT }, { "object_id", 0, TY_INT },
       { "begin", 0, TY_POLY }, { "end", 0, TY_POLY }, { "count", 0, TY_INT },   /* a Range's bound: Integer, Float or nil */
-      { "to_f", 0, TY_FLOAT }, { "to_r", 0, TY_RATIONAL }, { "to_c", 0, TY_COMPLEX },
+      { "to_f", 0, TY_FLOAT }, { "to_r", 0, TY_POLY }, { "to_c", 0, TY_COMPLEX },   /* to_r: a big Rational too */
       { "class", 0, TY_CLASS }, { "bytes", 0, TY_INT_ARRAY },
       { NULL, 0, TY_UNKNOWN } };
 
@@ -1354,6 +1354,47 @@ static TyKind an_unpack1_lit_type(const NodeTable *nt, int arg) {
   if (strchr("cCsSlLnNvV", d)) return TY_INT;
   if (strchr("dDfFeEgG", d)) return TY_FLOAT;
   return TY_POLY;
+}
+
+/* str.unpack(fmt) with a literal format of integer directives whose values
+   an Integer slot holds (32 bits or fewer, or UTF-8 codepoints), each with
+   its count or `*`: an Integer Array, a slot the String is too short for
+   nil (sp_str_unpack_ints). The modifiers are those CRuby takes after
+   sSiIlL, less `_` / `!` on l and L, which make them 64-bit. A 32-bit
+   target's sp_int tops out at 2**31-1, so a format with L, N, V or I stays
+   boxed there, where the runtime makes a larger value a Bignum.
+   Any other format keeps the boxed Array. */
+static TyKind an_unpack_lit_type(const NodeTable *nt, int arg) {
+  extern int sp_target_int_bits;
+  if (nt_kind(nt, arg) != NK_StringNode) return TY_POLY_ARRAY;
+  const char *p = nt_str(nt, arg, "content");
+  /* a NUL in the format is an unknown directive */
+  if (!p || !p[0] || strlen(p) != nt_str_len(nt, arg, "content")) return TY_POLY_ARRAY;
+  while (*p) {
+    char d = *p++;
+    if (!strchr("cCsSlLnNvViIU", d)) return TY_POLY_ARRAY;
+    if (sp_target_int_bits == 32 && strchr("LNVI", d)) return TY_POLY_ARRAY;
+    for (; *p == '<' || *p == '>' || *p == '!' || *p == '_'; p++)
+      if (!strchr("sSiIlL", d) || ((d == 'l' || d == 'L') && (*p == '!' || *p == '_'))) return TY_POLY_ARRAY;
+    if (*p == '*') p++;
+    else while (*p >= '0' && *p <= '9') p++;
+  }
+  return TY_INT_ARRAY;
+}
+
+/* Can the Integer Array an_unpack_lit_type types hold a nil? A directive
+   other than U with a count of its own pads with nil past the end of the
+   String; `*` and U stop there. */
+int an_unpack_lit_may_pad(const NodeTable *nt, int arg) {
+  if (an_unpack_lit_type(nt, arg) != TY_INT_ARRAY) return 0;
+  for (const char *p = nt_str(nt, arg, "content"); *p; ) {
+    char d = *p++;
+    while (*p == '<' || *p == '>' || *p == '!' || *p == '_') p++;
+    if (*p == '*') { p++; continue; }
+    if (d != 'U') return 1;
+    while (*p >= '0' && *p <= '9') p++;
+  }
+  return 0;
 }
 
 /* Whether every element written into the poly-array ivar `@<ivname>` of class
@@ -3929,15 +3970,17 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
                           sp_streq(name, "to_r"))) ||
            (argc <= 1 && sp_streq(name, "rationalize")))) {   /* an optional epsilon */
         if (!an_user_poly_arm(c, name, argc)) {
-          /* concrete result types, matching the TY_NIL receiver arm so a
-             local settled on an early (pre-widening) pass stays consistent */
+          /* to_a matches the TY_NIL receiver arm, so a local settled on an
+             early (pre-widening) pass stays consistent */
           if (sp_streq(name, "to_a")) { *out = an_poly_concrete(c, id, name, TY_POLY_ARRAY); return 1; }
           /* Hash#to_h is the identity, so a boxed receiver keeps whatever
              variant it really holds: narrowing to the symbol-keyed one made
              `opts.to_h` on a String-keyed hash raise (#3972). nil.to_h is the
              empty hash, which the boxed answer covers too. */
           if (sp_streq(name, "to_h")) { *out = an_poly_concrete(c, id, name, TY_POLY); return 1; }
-          { *out = an_poly_concrete(c, id, name, TY_RATIONAL); return 1; }   /* to_r, rationalize */
+          /* to_r, rationalize: boxed, since the receiver may hold a big
+             Rational, which an sp_Rational slot cannot carry */
+          { *out = an_poly_concrete(c, id, name, TY_POLY); return 1; }
         }
       }
       /* to_h with a block (a proc argument too): the pairs it answers, boxed */
@@ -5068,6 +5111,9 @@ static int infer_builtin_cmethod_call(Compiler *c, int id, const NodeTable *nt, 
           sp_streq(name, "daemon") ||
           (sp_streq(name, "getpriority") && argc == 2)) { *out = TY_INT; return 1; }
       if (sp_streq(name, "groups") && argc == 0) { *out = TY_INT_ARRAY; return 1; }
+      /* an RLIM_INFINITY above the Integer range is a Bignum */
+      if (sp_streq(name, "getrlimit") && argc == 1) { *out = TY_POLY_ARRAY; return 1; }
+      if (sp_streq(name, "setrlimit") && (argc == 2 || argc == 3)) { *out = TY_NIL; return 1; }
       if (sp_streq(name, "clock_gettime") || sp_streq(name, "clock_getres")) {
         /* an integer unit (:nanosecond/:microsecond/:millisecond/:second) makes
            the result an Integer; the default and float units keep it Float. */
@@ -5456,6 +5502,9 @@ static int infer_handle_call(Compiler *c, int id, const NodeTable *nt, const cha
       }
       { *out = TY_IO; return 1; }
     }
+    /* tap runs its block and returns the handle, which codegen emits as the
+       typed handle */
+    if (sp_streq(name, "tap") && nt_ref(nt, id, "block") >= 0) { *out = TY_IO; return 1; }
     { *out = TY_POLY; return 1; }
   }
 
@@ -5823,6 +5872,8 @@ static int infer_string_recv_call(Compiler *c, int id, const NodeTable *nt, cons
       { *out = TY_NIL; return 1; }
     }
     if (sp_streq(name, "unpack1") && (argc == 1 || argc == 2)) { *out = an_unpack1_lit_type(nt, argv[0]); return 1; }
+    if (sp_streq(name, "unpack") && nt_ref(nt, id, "block") < 0 && (argc == 1 || argc == 2))
+      { *out = argc == 1 ? an_unpack_lit_type(nt, argv[0]) : TY_POLY_ARRAY; return 1; }
     /* byteindex/byterindex over a String or Regexp needle -> byte offset or
        nil. */
     if ((sp_streq(name, "byteindex") || sp_streq(name, "byterindex")) &&
@@ -6628,6 +6679,7 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
   switch (vis_decl_call(c, id)) {
     case VIS_DECL_NIL: { *out = TY_NIL; return 1; }
     case VIS_DECL_SYM: { *out = TY_SYMBOL; return 1; }
+    case VIS_DECL_STR: { *out = TY_STRING; return 1; }
     case VIS_DECL_ARRAY: { *out = TY_POLY_ARRAY; return 1; }
     case VIS_DECL_SELF: { *out = TY_CLASS; return 1; }
   }
@@ -10950,6 +11002,72 @@ static TyKind super_target_ret(Compiler *c, Scope *s, int mi, int id) {
   return sret;
 }
 
+/* The type of NM read as a constant of the builtin class or module PAR_NM
+   (Float::INFINITY, File::SEPARATOR, Process::WNOHANG), PAR_ID the parent
+   node (Math's PI through a program class that includes Math); TY_UNKNOWN
+   for a name the compiler does not read there. */
+TyKind builtin_scoped_const_type(Compiler *c, int par_id, const char *par_nm, const char *nm) {
+  if (par_nm && sp_streq(par_nm, "Float")) {
+    if (nm && (sp_streq(nm, "MAX") || sp_streq(nm, "MIN") || sp_streq(nm, "EPSILON") ||
+               sp_streq(nm, "INFINITY") || sp_streq(nm, "NAN"))) return TY_FLOAT;
+    /* DIG/MANT_DIG/RADIX and the exponent limits are Integer constants */
+    if (nm && (sp_streq(nm, "DIG") || sp_streq(nm, "MANT_DIG") || sp_streq(nm, "RADIX") ||
+               sp_streq(nm, "MAX_EXP") || sp_streq(nm, "MIN_EXP") ||
+               sp_streq(nm, "MAX_10_EXP") || sp_streq(nm, "MIN_10_EXP"))) return TY_INT;
+  }
+  if (comp_const_path_on_math(c, par_id)) {
+    if (nm && (sp_streq(nm, "PI") || sp_streq(nm, "E"))) return TY_FLOAT;
+  }
+  if (par_nm && sp_streq(par_nm, "Regexp")) {
+    if (nm && (sp_streq(nm, "IGNORECASE") || sp_streq(nm, "EXTENDED") ||
+               sp_streq(nm, "MULTILINE") || sp_streq(nm, "FIXEDENCODING") ||
+               sp_streq(nm, "NOENCODING"))) return TY_INT;
+  }
+  if (par_nm && sp_streq(par_nm, "Encoding") && nm) {
+    /* the Unicode version is a String; an encoding's name or alias is a
+       boxed Encoding value: the two the runtime transcodes and every other
+       name it only carries (see the codegen arm) */
+    if (sp_streq(nm, "UNICODE_VERSION")) return TY_STRING;
+    if (encoding_const_name(nm) || sp_streq(nm, "UTF8")) return TY_POLY;
+  }
+  if (par_nm && sp_streq(par_nm, "File")) {
+    if (nm && (sp_streq(nm, "SEPARATOR") || sp_streq(nm, "PATH_SEPARATOR") ||
+               sp_streq(nm, "ALT_SEPARATOR"))) return TY_STRING;
+    if (nm && (sp_streq(nm, "RDONLY") || sp_streq(nm, "WRONLY") || sp_streq(nm, "RDWR") ||
+               sp_streq(nm, "CREAT") || sp_streq(nm, "EXCL") || sp_streq(nm, "TRUNC") ||
+               sp_streq(nm, "APPEND") || sp_streq(nm, "NONBLOCK") || sp_streq(nm, "BINARY") ||
+               sp_streq(nm, "NOFOLLOW") || sp_streq(nm, "NOCTTY") || sp_streq(nm, "SYNC") ||
+               sp_streq(nm, "DSYNC") ||
+               sp_streq(nm, "LOCK_SH") || sp_streq(nm, "LOCK_EX") || sp_streq(nm, "LOCK_UN") ||
+               sp_streq(nm, "LOCK_NB")))
+      return TY_INT;   /* the open(2)/flock(2) flag constants (#2788, #2808) */
+    if (nm && (sp_streq(nm, "FNM_NOESCAPE") || sp_streq(nm, "FNM_PATHNAME") || sp_streq(nm, "FNM_DOTMATCH") ||
+               sp_streq(nm, "FNM_CASEFOLD") || sp_streq(nm, "FNM_EXTGLOB") || sp_streq(nm, "FNM_SYSCASE") ||
+               sp_streq(nm, "FNM_SHORTNAME")))
+      return TY_INT;   /* File.fnmatch's flags */
+  }
+  if (par_nm && (is_io_class_name(par_nm))) {
+    /* IO#seek whence constants (File inherits them from IO) */
+    if (nm && (sp_streq(nm, "SEEK_SET") || sp_streq(nm, "SEEK_CUR") ||
+               sp_streq(nm, "SEEK_END"))) return TY_INT;
+    /* the null device, IO's and File's through it (the codegen arm) */
+    if (nm && sp_streq(nm, "NULL")) return TY_STRING;
+  }
+  if (par_nm && sp_streq(par_nm, "Process")) {
+    /* clock ids (codegen emits their integer values) */
+    if (nm && (sp_streq(nm, "CLOCK_MONOTONIC") || sp_streq(nm, "CLOCK_REALTIME") ||
+               sp_streq(nm, "CLOCK_PROCESS_CPUTIME_ID") || sp_streq(nm, "CLOCK_THREAD_CPUTIME_ID") ||
+               sp_streq(nm, "PRIO_PROCESS") || sp_streq(nm, "PRIO_PGRP") || sp_streq(nm, "PRIO_USER") ||
+               sp_streq(nm, "WNOHANG") || sp_streq(nm, "WUNTRACED") ||
+               process_rlimit_const(nm)))
+      return TY_INT;
+    /* RLIM_INFINITY is a Bignum where rlim_t's maximum passes the Integer range */
+    if (nm && (sp_streq(nm, "RLIM_INFINITY") || sp_streq(nm, "RLIM_SAVED_MAX") ||
+               sp_streq(nm, "RLIM_SAVED_CUR"))) return TY_POLY;
+  }
+  return TY_UNKNOWN;
+}
+
 /* A ConstantPathNode (A::B) (infer_uncached's arms, in their order) */
 static int infer_constant_path(Compiler *c, int id, const NodeTable *nt, NodeKind nk, TyKind *out) {
   if (!(nk == NK_ConstantPathNode)) return 0;
@@ -11081,60 +11199,7 @@ static int infer_constant_path(Compiler *c, int id, const NodeTable *nt, NodeKin
   const char *par_nm = ((par_k == NK_ConstantReadNode ||
                                    par_k == NK_ConstantPathNode))
                        ? nt_str(nt, par_id, "name") : NULL;
-  if (par_nm && sp_streq(par_nm, "Float")) {
-    if (nm && (sp_streq(nm, "MAX") || sp_streq(nm, "MIN") || sp_streq(nm, "EPSILON") ||
-               sp_streq(nm, "INFINITY") || sp_streq(nm, "NAN"))) { *out = TY_FLOAT; return 1; }
-    /* DIG/MANT_DIG/RADIX and the exponent limits are Integer constants */
-    if (nm && (sp_streq(nm, "DIG") || sp_streq(nm, "MANT_DIG") || sp_streq(nm, "RADIX") ||
-               sp_streq(nm, "MAX_EXP") || sp_streq(nm, "MIN_EXP") ||
-               sp_streq(nm, "MAX_10_EXP") || sp_streq(nm, "MIN_10_EXP"))) { *out = TY_INT; return 1; }
-  }
-  if (comp_const_path_on_math(c, par_id)) {
-    if (nm && (sp_streq(nm, "PI") || sp_streq(nm, "E"))) { *out = TY_FLOAT; return 1; }
-  }
-  if (par_nm && sp_streq(par_nm, "Regexp")) {
-    if (nm && (sp_streq(nm, "IGNORECASE") || sp_streq(nm, "EXTENDED") ||
-               sp_streq(nm, "MULTILINE") || sp_streq(nm, "FIXEDENCODING") ||
-               sp_streq(nm, "NOENCODING"))) { *out = TY_INT; return 1; }
-  }
-  if (par_nm && sp_streq(par_nm, "Encoding") && nm) {
-    /* the Unicode version is a String; an encoding's name or alias is a
-       boxed Encoding value: the two the runtime transcodes and every other
-       name it only carries (see the codegen arm) */
-    if (sp_streq(nm, "UNICODE_VERSION")) { *out = TY_STRING; return 1; }
-    if (encoding_const_name(nm) || sp_streq(nm, "UTF8")) { *out = TY_POLY; return 1; }
-  }
-  if (par_nm && sp_streq(par_nm, "File")) {
-    if (nm && (sp_streq(nm, "SEPARATOR") || sp_streq(nm, "PATH_SEPARATOR") ||
-               sp_streq(nm, "ALT_SEPARATOR"))) { *out = TY_STRING; return 1; }
-    if (nm && (sp_streq(nm, "RDONLY") || sp_streq(nm, "WRONLY") || sp_streq(nm, "RDWR") ||
-               sp_streq(nm, "CREAT") || sp_streq(nm, "EXCL") || sp_streq(nm, "TRUNC") ||
-               sp_streq(nm, "APPEND") || sp_streq(nm, "NONBLOCK") || sp_streq(nm, "BINARY") ||
-               sp_streq(nm, "NOFOLLOW") || sp_streq(nm, "NOCTTY") || sp_streq(nm, "SYNC") ||
-               sp_streq(nm, "DSYNC") ||
-               sp_streq(nm, "LOCK_SH") || sp_streq(nm, "LOCK_EX") || sp_streq(nm, "LOCK_UN") ||
-               sp_streq(nm, "LOCK_NB")))
-      { *out = TY_INT; return 1; }   /* the open(2)/flock(2) flag constants (#2788, #2808) */
-    if (nm && (sp_streq(nm, "FNM_NOESCAPE") || sp_streq(nm, "FNM_PATHNAME") || sp_streq(nm, "FNM_DOTMATCH") ||
-               sp_streq(nm, "FNM_CASEFOLD") || sp_streq(nm, "FNM_EXTGLOB") || sp_streq(nm, "FNM_SYSCASE") ||
-               sp_streq(nm, "FNM_SHORTNAME")))
-      { *out = TY_INT; return 1; }   /* File.fnmatch's flags */
-  }
-  if (par_nm && (is_io_class_name(par_nm))) {
-    /* IO#seek whence constants (File inherits them from IO) */
-    if (nm && (sp_streq(nm, "SEEK_SET") || sp_streq(nm, "SEEK_CUR") ||
-               sp_streq(nm, "SEEK_END"))) { *out = TY_INT; return 1; }
-    /* the null device, IO's and File's through it (the codegen arm) */
-    if (nm && sp_streq(nm, "NULL")) { *out = TY_STRING; return 1; }
-  }
-  if (par_nm && sp_streq(par_nm, "Process")) {
-    /* clock ids (codegen emits their integer values) */
-    if (nm && (sp_streq(nm, "CLOCK_MONOTONIC") || sp_streq(nm, "CLOCK_REALTIME") ||
-               sp_streq(nm, "CLOCK_PROCESS_CPUTIME_ID") || sp_streq(nm, "CLOCK_THREAD_CPUTIME_ID") ||
-               sp_streq(nm, "PRIO_PROCESS") || sp_streq(nm, "PRIO_PGRP") || sp_streq(nm, "PRIO_USER") ||
-               sp_streq(nm, "WNOHANG") || sp_streq(nm, "WUNTRACED")))
-      { *out = TY_INT; return 1; }
-  }
+  { TyKind bt = builtin_scoped_const_type(c, par_id, par_nm, nm); if (bt != TY_UNKNOWN) { *out = bt; return 1; } }
   if (par_nm && sp_streq(par_nm, "Integer")) {
     if (nm && (sp_streq(nm, "MAX") || sp_streq(nm, "MIN"))) { *out = TY_UNKNOWN; return 1; } /* raises NameError */
   }
@@ -11957,17 +12022,6 @@ TyKind infer_uncached(Compiler *c, int id) {
      is a separate gap); type it as poly so the slot holds a boxed nil. */
   if (nk == NK_WhileNode || nk == NK_UntilNode || nk == NK_ForNode) return TY_POLY;
   if (nk == NK_RangeNode) {
-    /* (:a..:e): symbols enumerate by name succession -- the whole range
-       lowers to a poly array of boxed symbols (see codegen_expr) */
-    {
-      int slo = nt_ref(nt, id, "left"), shi = nt_ref(nt, id, "right");
-      const char *slt = slo >= 0 ? nt_type(nt, slo) : NULL;
-      NodeKind slk = nt_kind(nt, slo);
-      const char *sht = shi >= 0 ? nt_type(nt, shi) : NULL;
-      NodeKind shk = nt_kind(nt, shi);
-      if (slt && sht && slk == NK_SymbolNode && shk == NK_SymbolNode)
-        return TY_POLY_ARRAY;
-    }
     /* infer the bounds so codegen can tell an int range from a string range */
     int lo = nt_ref(nt, id, "left"), hi = nt_ref(nt, id, "right");
     TyKind lt = lo >= 0 ? infer_type(c, lo) : TY_UNKNOWN;
@@ -12080,10 +12134,9 @@ TyKind infer_uncached(Compiler *c, int id) {
     {
       int lo_open = lo < 0 || lt == TY_NIL;
       int hi_open = hi < 0 || ht == TY_NIL;
-      /* (:a..), (x..:e): a Range of Symbols, which sp_range_new_box builds
-         as a String Range of their names (sym); a Symbol beside anything but
-         a Symbol or nil is its ArgumentError. A literal (:a..:e) keeps its
-         Array form above. */
+      /* (:a..:e), (:a..), (x..:e): a Range of Symbols, which
+         sp_range_new_box builds as a String Range of their names (sym); a
+         Symbol beside anything but a Symbol or nil is its ArgumentError. */
       if (lt == TY_SYMBOL || ht == TY_SYMBOL) return TY_POLY;
       if (((lt == TY_POLY && (hi_open || ht == TY_POLY)) || (ht == TY_POLY && lo_open)) &&
           (!g_promote_mode || range_end_reads_poly_elem(c, lo) || range_end_reads_poly_elem(c, hi) ||
@@ -13235,20 +13288,25 @@ static int an_rat_arith(Compiler *c, int n, int depth) {
   if (!nm || recv < 0 || nt_ref(nt, n, "block") >= 0) return 0;
   int args = nt_ref(nt, n, "arguments");
   int ac = 0; const int *av = args >= 0 ? nt_arr(nt, args, "arguments", &ac) : NULL;
+  /* (the operands are asked first: the program's own operator is looked
+     up only for arithmetic that would otherwise be a Rational's) */
   if (sp_streq(nm, "-@") || sp_streq(nm, "+@"))
-    return ac == 0 && !an_rat_op_own(c, "Rational", nm) && an_rat_value_d(c, recv, depth + 1);
+    return ac == 0 && an_rat_value_d(c, recv, depth + 1) && !an_rat_op_own(c, "Rational", nm);
   if (ac != 1) return 0;
   int bin = sp_streq(nm, "+") || sp_streq(nm, "-") || sp_streq(nm, "*") || sp_streq(nm, "/") || sp_streq(nm, "quo");
   int pw = sp_streq(nm, "**");
   if (!bin && !pw) return 0;
-  if (an_rat_op_own(c, "Rational", nm) || an_rat_op_own(c, "Integer", nm)) return 0;
   int rr = an_rat_value_d(c, recv, depth + 1);
   int ai = an_int_literal(nt, av[0]);
+  int rat;
   /* Rational ** Integer is a Rational; ** a Rational may be a Float */
-  if (pw) return rr && ai;
-  int ar = !ai && an_rat_value_d(c, av[0], depth + 1);
-  int ri = !rr && an_int_literal(nt, recv);
-  return (rr && (ai || ar)) || (ar && ri);
+  if (pw) rat = rr && ai;
+  else {
+    int ar = !ai && an_rat_value_d(c, av[0], depth + 1);
+    int ri = !rr && an_int_literal(nt, recv);
+    rat = (rr && (ai || ar)) || (ar && ri);
+  }
+  return rat && !an_rat_op_own(c, "Rational", nm) && !an_rat_op_own(c, "Integer", nm);
 }
 /* The slot key of a local's holder lv read or written at node n: the scope
    whose locals hold it (the node's own first; a block's read of an outer
@@ -13310,14 +13368,28 @@ static int an_rat_op_own(Compiler *c, const char *cls, const char *op) {
   return an_rat_op_own1(c, cls, op) || an_rat_op_own1(c, "Object", op);
 }
 int an_rat_value(Compiler *c, int n) { return an_rat_value_d(c, n, 0); }
+/* `x.to_r` / `x.rationalize`: a Rational in each mode, boxed because x may
+   hold a big one (unless the program defines the conversion itself) */
+static int an_rat_conversion(Compiler *c, int n) {
+  const NodeTable *nt = c->nt;
+  if (nt_kind(nt, n) != NK_CallNode || nt_ref(nt, n, "receiver") < 0 || nt_ref(nt, n, "block") >= 0) return 0;
+  const char *nm = nt_str(nt, n, "name");
+  int args = nt_ref(nt, n, "arguments");
+  int ac = 0; if (args >= 0) nt_arr(nt, args, "arguments", &ac);
+  if (!nm || !((sp_streq(nm, "to_r") && ac == 0) || (sp_streq(nm, "rationalize") && ac <= 1))) return 0;
+  return infer_type(c, n) == TY_POLY && !an_user_poly_arm(c, nm, ac);
+}
 static int an_rat_value_d(Compiler *c, int n, int depth) {
-  if (!g_promote_mode || n < 0 || depth > 8) return 0;
+  if (n < 0 || depth > 8) return 0;
   switch (vp_one(c->nt, n, VPS_NONE | VP_PARENS_ONLY, &n)) {
   case VP1_NODE: break;
   case VP1_NIL: return 0;
   case VP1_MANY: return 0;
   }
-  if (an_rat_boxed(n)) return 1;
+  if (an_rat_conversion(c, n)) return 1;
+  /* (outside --int-overflow=promote a boxed value is a Rational only as a
+     conversion's result, or a slot each write of which is one) */
+  if (g_promote_mode && an_rat_boxed(n)) return 1;
   if (an_rat_arith(c, n, depth)) return 1;
   NodeKind k = nt_kind(c->nt, n);
   if (k != NK_LocalVariableReadNode && k != NK_InstanceVariableReadNode) return 0;
@@ -13346,7 +13418,9 @@ static int an_rat_value_d(Compiler *c, int n, int depth) {
     if (!an_rat_boxed(w)) {
       int value;
       switch (vp_one(c->nt, nt_ref(c->nt, w, "value"), VPS_NONE | VP_PARENS_ONLY, &value)) {
-      case VP1_NODE: if (!an_rat_boxed(value) && !an_rat_arith(c, value, depth + 1)) return 0; break;
+      case VP1_NODE:
+        if (!an_rat_boxed(value) && !an_rat_conversion(c, value) && !an_rat_arith(c, value, depth + 1)) return 0;
+        break;
       case VP1_NIL: return 0;
       case VP1_MANY: return 0;
       }
@@ -13616,13 +13690,16 @@ void scope_reserve_param(Scope *s) {
   if (!s->pnames || !s->pdefault) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
 }
 
-void scope_add_param(Scope *s, const char *name, int defnode) {
+/* Add parameter `name` to s; wname is the name the program wrote for it
+   (nt_wname of its node), NULL for one it did not write */
+void scope_add_param(Scope *s, const char *name, const char *wname, int defnode) {
   scope_reserve_param(s);
   s->pdefault[s->nparams] = defnode;
   s->pnames[s->nparams++] = strdup(name);
   if (defnode < 0) s->nrequired = s->nparams;
   LocalVar *lv = scope_local_intern(s, name);
   lv->is_param = 1;
+  if (wname) lv_set_wname(lv, wname);
 }
 
 /* Collect parameters from a DefNode into scope s. */

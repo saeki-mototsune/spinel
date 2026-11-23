@@ -57,7 +57,7 @@ static void method_param_add_n(MethodParam **v, int *n, int *cap, const char *ki
   (*v)[(*n)++] = (MethodParam){ kind, name, len };
 }
 /* Add the entry of parameter node p: the name the program wrote for it
-   (desugared_param_name, param_written_len), none for a destructuring
+   (desugared_param_name, param_written_name), none for a destructuring
    group's, no entry for a parameter the desugar made that is none */
 static void method_param_add(Compiler *c, MethodParam **v, int *n, int *cap, const char *kind, int p) {
   const char *w = NULL, *slot = nt_str(c->nt, p, "name");
@@ -65,7 +65,7 @@ static void method_param_add(Compiler *c, MethodParam **v, int *n, int *cap, con
   case DPN_NONE: return;
   case DPN_NAMELESS: method_param_add_n(v, n, cap, kind, NULL, 0); return;
   case DPN_WRITTEN: method_param_add_n(v, n, cap, kind, w, strlen(w)); return;
-  default: method_param_add_n(v, n, cap, kind, slot, param_written_len(c, slot)); return;
+  default: { const char *wr = param_written_name(c, nt_wname(c->nt, p)); method_param_add_n(v, n, cap, kind, wr, strlen(wr)); return; }
   }
 }
 
@@ -336,17 +336,22 @@ static void emit_method_desc_literal(Compiler *c, int mn, int mi, int from, cons
     if (!m->pnames[i]) continue;
     if (i) buf_puts(&d, ", ");
     /* a method made of an accessor: its parameter has no name (`x=(_)`) */
-    if (native || scope_of_accessor(m)) buf_puts(&d, "_");
-    else if (i == m->rest_idx) buf_printf(&d, "*%s", m->pnames[i]);
-    else if (i == m->kwrest_idx) buf_printf(&d, "**%s", m->pnames[i]);
+    if (native || scope_of_accessor(m)) { buf_puts(&d, "_"); continue; }
+    /* the name the program wrote, not the slot a rename gave a define_method's block parameter */
+    const LocalVar *plv = scope_local(m, m->pnames[i]);
+    const char *wn = param_written_name(c, plv ? lv_wname(plv) : m->pnames[i]);
+    if (i == m->rest_idx) buf_printf(&d, "*%s", wn);
+    else if (i == m->kwrest_idx) buf_printf(&d, "**%s", wn);
     else if (callee_param_is_declared_kwarg(c, m, m->pnames[i]))
-      buf_printf(&d, m->pdefault[i] >= 0 ? "%s: ..." : "%s:", m->pnames[i]);
-    else if (m->pdefault[i] >= 0) buf_printf(&d, "%s=...", m->pnames[i]);
-    else /* a define_method block's assigned parameter: the name written, not its slot */
-      buf_printf(&d, "%.*s", (int)reassigned_param_written_len(c, m->pnames[i]), m->pnames[i]);
+      buf_printf(&d, m->pdefault[i] >= 0 ? "%s: ..." : "%s:", wn);
+    else if (m->pdefault[i] >= 0) buf_printf(&d, "%s=...", wn);
+    else buf_puts(&d, wn);
   }
   /* the block parameter, last, as CRuby renders it (`&blk`; `&` anonymous) */
-  if (m->blk_param) buf_printf(&d, "%s&%s", m->nparams ? ", " : "", m->blk_param);
+  if (m->blk_param) {
+    const LocalVar *blv = m->blk_param[0] ? scope_local(m, m->blk_param) : NULL;
+    buf_printf(&d, "%s&%s", m->nparams ? ", " : "", param_written_name(c, blv ? lv_wname(blv) : m->blk_param));
+  }
   buf_puts(&d, ")");
   int ln = scope_def_line(c, m);
   if (ln > 0) buf_printf(&d, " %s:%d", scope_def_file(c, m), ln);
@@ -1464,8 +1469,9 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
        the enclosing self: it is receiverless in syntax only, so it must take
        the object-bound arm (which passes _t->self and the fn cast) rather than
        the self-less direct call, which dropped self and did not compile. A
-       top-level def and a class method stay self-less. */
-    int target_selfless = target_recvless &&
+       top-level def and a class method stay self-less, but for a capture
+       closed to its call (CallPlan.closed), which must run: its NameError. */
+    int target_selfless = target_recvless && !plan.closed &&
         !(target >= 0 && c->scopes[target].class_id >= 0 && !c->scopes[target].is_cmethod);
     if (target >= 0 && target_selfless) {
       /* A top-level target is called the way its name would be: the ordinary
@@ -2454,7 +2460,11 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
          (bam_may_lack, desugar_builtin_method_obj) */
       int bdn = c->scopes[mi].def_node;
       if (bsym && nt_int(nt, bdn, "bam_may_lack", 0) && repr_of(c, recv).kind == RK_BOXED) {
-        buf_printf(b, "if (sp_poly_lacks_builtin_method(_t%d, ", tbr);
+        /* (a name no object has, bam_never_made: a plain Object lacks it too) */
+        if (nt_int(nt, bdn, "bam_never_made", 0))
+          buf_printf(b, "if (sp_poly_lacks_never_made(_t%d, ", tbr);
+        else
+          buf_printf(b, "if (sp_poly_lacks_builtin_method(_t%d, ", tbr);
         emit_str_literal(b, bsym);
         buf_puts(b, ")) sp_raise_cls(\"NameError\", sp_nomethod_class_msg(");
         emit_str_literal(b, bsym);
@@ -2881,6 +2891,21 @@ static void emit_capture_absent_raise(Compiler *c, const char *mn, const CallPla
   buf_printf(b, "\" \"' for class '%s%s%s'\")[1]));", open, cn ? cn : c->classes[plan->owner_ci].name, close);
 }
 
+/* ...and for a public_method capture whose method's visibility closes it to the capture (CallPlan.closed): `method
+   'm' for class 'K' is private`, a class method's class named by its singleton class (`#<Class:K>`), the name staged
+   for NameError#name as emit_guarded_public_capture stages it */
+static void emit_capture_closed_raise(Compiler *c, const char *mn, const CallPlan *plan, Buf *b) {
+  int sg = c->scopes[plan->mi].is_cmethod;
+  buf_puts(b, "sp_exc_stage_name(");
+  emit_str_literal(b, mn ? mn : "");
+  buf_printf(b, "); sp_raise_cls(\"NameError\", sp_sprintf(\"method '%%s' for class '%s%%s%s' is %s\", \"", sg ? "#<Class:" : "",
+             sg ? ">" : "", plan->closed == SP_VIS_PRIVATE ? "private" : "protected");
+  emit_c_escaped(b, mn ? mn : "");
+  buf_puts(b, "\", \"");
+  emit_c_escaped(b, method_desc_class_name(c, plan->closed_cls));
+  buf_puts(b, "\"));");
+}
+
 /* ...and for a capture on main, whose singleton class CRuby names by
    main's default inspect (`#<Class:#<Object:0x...>>`) */
 static void emit_main_capture_absent_raise(Compiler *c, int id, Buf *b) {
@@ -2890,28 +2915,50 @@ static void emit_main_capture_absent_raise(Compiler *c, int id, Buf *b) {
   buf_puts(b, "\", (unsigned long long)(uintptr_t)sp_main_self().v.p));");
 }
 
+/* See codegen_call_arms.h. (a pointer's NULL is cast to the C type: a
+   Method's fields are read off the value, `.name`) */
+void emit_unread_value(Compiler *c, int id, Buf *b) {
+  TyKind at = repr_of(c, id).as_ty;
+  if (repr_of(c, id).kind == RK_PTR && c_type_name(at)) buf_printf(b, "(%s)NULL", c_type_name(at));
+  else buf_puts(b, default_value_from_compiler(c, at));
+}
+
 int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
   refuse_from_plan(c, id, CRF_CAPTURE, "refuse-capture");
   CallPlan plan = cplan_method_call(c, id);
-  /* no method of the name where it runs: CRuby's NameError, its receiver
-     evaluated first (the capture's own; a reader's is its receiver's) */
-  if (plan.absent && plan.mi < 0 && is_method_object_maker(name)) {
+  /* no method of the name where it runs, or a public_method's of one its
+     visibility closes to it (CallPlan.closed): CRuby's NameError, its
+     receiver evaluated first (the capture's own; a reader's is its
+     receiver's) */
+  int closed = is_method_object_maker(name) && (plan.closed == SP_VIS_PRIVATE || plan.closed == SP_VIS_PROTECTED);
+  if ((plan.absent && plan.mi < 0 && is_method_object_maker(name)) || closed) {
     buf_puts(b, "({ ");
     if (recv >= 0) { buf_puts(b, "(void)("); emit_expr(c, recv, b); buf_puts(b, "); "); }
-    if (plan.absent == CP_ABSENT_MAIN) emit_main_capture_absent_raise(c, id, b);
+    if (closed) emit_capture_closed_raise(c, method_sym_arg(c, id), &plan, b);
+    else if (plan.absent == CP_ABSENT_MAIN) emit_main_capture_absent_raise(c, id, b);
     else emit_capture_absent_raise(c, method_sym_arg(c, id), &plan, b);
-    /* (a pointer's NULL is cast to the call's C type: a Method's fields
-       are read off the value, `.name`) */
-    TyKind at = repr_of(c, id).as_ty;
-    if (repr_of(c, id).kind == RK_PTR && c_type_name(at)) buf_printf(b, " (%s)NULL; })", c_type_name(at));
-    else buf_printf(b, " %s; })", default_value_from_compiler(c, at));
+    buf_puts(b, " ");
+    emit_unread_value(c, id, b);
+    buf_puts(b, "; })");
     return 1;
   }
   int wrapper = is_method_object_maker(name) ? plan.mi : -1;
   int string_guard = cplan_bam_string_guard(c, id, wrapper);
   int mi = string_guard >= 0 ? string_guard : wrapper;
-  if (mi < 0 || plan.dispatch != CP_SWITCH)
-    return emit_method_obj_target(c, id, b, nt, name, recv, argc, argv, mi, NULL);
+  /* (a class method's visibility the cells tell at the run, CP_CLOSED_RUN: their test first) */
+  int run = is_method_object_maker(name) && plan.closed == CP_CLOSED_RUN;
+  if ((mi < 0 || plan.dispatch != CP_SWITCH) && !run) return emit_method_obj_target(c, id, b, nt, name, recv, argc, argv, mi, NULL);
+  if (mi < 0 || plan.dispatch != CP_SWITCH) {
+    size_t at = b->len;
+    buf_puts(b, "({ ");
+    emit_capture_closed_cells(c, id, method_sym_arg(c, id), plan.closed_cls, method_desc_class_name(c, plan.closed_cls), b);
+    if (!emit_method_obj_target(c, id, b, nt, name, recv, argc, argv, mi, NULL)) {
+      buf_erase(b, at, b->len - at);
+      return 0;
+    }
+    buf_puts(b, "; })");
+    return 1;
+  }
   const char *captured_name = string_guard >= 0 ? bam_builtin_sym(c, wrapper, NULL) : NULL;
   size_t start = b->len;
   int mark = view_mark();
@@ -2943,6 +2990,7 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
   emit_guarded_public_capture(c, id, captured_name ? captured_name : method_sym_arg(c, id),
                               captured_name ? c->scopes[mi].class_id : plan.owner_ci,
                               captured_name ? -1 : boxed_receiver, b);
+  if (run) emit_capture_closed_cells(c, id, method_sym_arg(c, id), plan.closed_cls, method_desc_class_name(c, plan.closed_cls), b);
   for (int i = 0; i < n; i++) {
     if (i) buf_puts(b, "else ");
     /* (an arm of an arm: under both tests, cplan_method_arms) */
@@ -3150,7 +3198,7 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
     int has_user_call = 0;
     for (int _k = 0; _k < c->nclasses && !has_user_call; _k++) {
       int umi = call_target(c, id, _k, name, CT_OWN, NULL);
-      int cmi = g_cls_tag_skip != id ? cplan_cmethod_arm(c, id, _k, name, NULL, NULL) : -1;
+      int cmi = g_cls_tag_skip != id ? cplan_cmethod_arm(c, id, _k, name, NULL, NULL, NULL) : -1;
       if ((umi >= 0 && (is_aref0 || argc >= c->scopes[umi].nrequired)) ||
           (cmi >= 0 && (is_aref0 || argc >= c->scopes[cmi].nrequired)) ||
           (argc == 0 && call_attr_target(c, id, _k, name, CT_ATTR, NULL)))

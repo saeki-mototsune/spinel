@@ -175,6 +175,8 @@ typedef struct {
 enum { NIE_MARKED = 1, NIE_STORED = 2, NIE_REACH = 4 };
 typedef struct {
   char *name;       /* Ruby local name (without sigil) */
+  char *wname;      /* (a parameter) the name the program wrote where a pass renamed it
+                       (nt_wname of its node), NULL when that is `name`; lv_wname */
   SP_TY_FIELD TyKind type; /* written by the local slot setters */
   SlotWhy why;      /* how `type` came to be untyped, if it is */
   int last_src;     /* the node whose value last set `type` while it was concrete; -1 = none */
@@ -205,6 +207,9 @@ typedef struct {
                        Integer, so a Range of it stays boxed in promote mode */
   int rbs_seeded;   /* param type pinned from an --rbs advisory seed: the
                        fixpoint must not widen it (see apply_rbs_seeds) */
+  TyKind rbs_decl_type; /* original type declared by an --rbs / inline RBS
+                       signature for this parameter, preserved even if
+                       param_seed_holds drops rbs_seeded (for --strict-rbs) */
   int oa_seed;      /* (params) a seed's `Array[Class]`: 1 + the class index.
                        Not a pin -- the parameter is a boxed array the seed
                        left unpinned -- but the element evidence
@@ -665,6 +670,15 @@ typedef struct {
   char *dm_subst_name;
   int dm_subst_node;
 
+  /* A define_method or define_singleton_method block in a def's body that reads or writes that def's locals
+     (scope_env_link): the def's scope index + 1 (0 for none), and the names of those locals (the strings are the
+     nodes'). A lookup of one of them in this scope answers the def's own LocalVar (scope_local), which is a heap
+     cell, and the method the block defines reads them through the environment the definer
+     stored (emit_env_store). */
+  int env_host;
+  const char **env_names;
+  int nenv_names;
+
   /* Synthesized compiler_state method (no AST body): codegen emits a
      hand-built body looping over the owning class's compiler_state entries.
      0=not synthesized, else CS_SYNTH_* (see codegen). */
@@ -724,6 +738,9 @@ typedef struct {
                           library exports (ext_emit_method_tables) */
   int ret_rbs_seeded;  /* ret pinned from an --rbs advisory seed: the fixpoint
                           must not recompute it from the body */
+  TyKind ret_rbs_type; /* original return type declared by an --rbs / inline RBS
+                          signature, preserved if ret_seed_holds drops the pin
+                          or infer_return_types widens it (for --strict-rbs) */
   int ret_rbs_box_held; /* a box reached that container seed while the
                           fixpoint ran and the seed held: the settled types
                           decide (ret_seed_holds, an_settle_seed_boxes) */
@@ -938,6 +955,9 @@ typedef struct {
   char **rbs_pin_ivars; /* ivar names (incl '@') pinned by an --rbs seed: the
                            fixpoint must not widen their type */
   int n_rbs_pin_ivars, c_rbs_pin_ivars;
+  char **rbs_orig_ivars;       /* ivars explicitly declared on this class by RBS */
+  TyKind *rbs_orig_ivar_types; /* declared TyKinds, kept if a pin drops (--strict-rbs) */
+  int n_rbs_orig_ivars, c_rbs_orig_ivars;
   int ivar_box_held;    /* a box reached one of those container pins while the
                            fixpoint ran and the pin held: the settled types
                            decide (class_ivar_pin_holds, an_settle_seed_boxes) */
@@ -1548,7 +1568,8 @@ typedef struct {
   int *anon_struct_ids;
   int n_anon_struct_ids, anon_struct_ids_valid;
   int has_anonymous_classes; /* Class.new identities with execution-time names */
-  int user_define_method;    /* 0 not asked yet, else 1 + the UDM_ kinds of the program's own define_method (an_user_define_method_kinds; 1 none) */
+  struct UserMethodKinds { char name[32]; int kinds; } user_methods[8];   /* the UDM_ kinds of the program's own methods of a name, by name (an_user_method_kinds) */
+  int nuser_methods;
 
   /* local-write-by-name index; see comp_lvw_first */
   int *lvw_head;        /* [lvw_nbuckets] first write id in each name bucket */
@@ -2015,8 +2036,10 @@ typedef struct {
   struct VerPin { int node, scope, vis; } *ver_pins;
   int nver_pins;
   /* Call guards read main's singleton chain (cls -1) or a class's own
-     instance history. Their version cells are written once, as an entry's. */
-  struct VerGuard { const char *name; int cls, cells; } *ver_guards;
+     instance history. Their version cells are written once, as an entry's;
+     vis: a module's own presence reader reads its versions' visibility cells
+     too (pres_module_cells), written as a face entry's are */
+  struct VerGuard { const char *name; int cls, cells, vis; } *ver_guards;
   int nver_guards;
   /* the entries are made (ver_entries_build): the versions the calls get
      are kept, and a call that reaches a later prepend's copy binds its
@@ -2058,15 +2081,14 @@ typedef struct {
   int *splat_views;
   int nsplat_views;
   /* the slot names desugar_reassigned_block_params invents, each with the
-     length of the name it stands for (reassigned_param_written_len) */
+     name it stands for (param_written_name) */
   char **rbp_slot_names;
-  size_t *rbp_slot_lens;
+  char **rbp_slot_written;
   int nrbp_slots;
   /* the names the shadow rename invents for block parameters, each with the
-     length of the name the program wrote (block_param_written_len) and the
-     block it was invented for: an open table of mask+1 slots, nbp used */
+     block it was invented for: an open table of mask+1 slots, nbp used. The
+     name the program wrote is on the renamed nodes (nt_wname) */
   char **bp_name;
-  size_t *bp_len;
   int *bp_blk;    /* the block each was invented for (block_param_made_for) */
   unsigned bp_mask;
   int nbp;
@@ -2184,7 +2206,7 @@ typedef int (*IvarWriteFn)(void *ctx, const char *iv);
 int node_ivar_writes(Compiler *c, int id, int cls, int depth, IvarWriteFn add, void *ctx);
 int subtree_ivar_writes(Compiler *c, int id, int cls, int depth, IvarWriteFn add, void *ctx);
 int comp_lvw_first(Compiler *c, const char *name);
-int comp_module_includes(Compiler *c, int m, int mod, int depth);
+int comp_mixes_in(Compiler *c, int m, int k, int prepends);   /* is module k m, or does m include it (prepends: or prepend it), through m's own mixins? */
 int comp_class_singleton_has_module(Compiler *c, int ci, int mod);
 int comp_class_extends_any(Compiler *c, int ci);
 int comp_lvw_next(const Compiler *c, int w);
@@ -2306,6 +2328,10 @@ void why_reset(SlotWhy *w);
 int ty_degraded(TyKind t);   /* poly, or a container of poly */
 extern int g_infer_round;    /* the fixpoint round in progress, for SlotWhy.round */
 LocalVar *scope_local_intern(Scope *s, const char *name);
+/* The name the program wrote for the slot lv, a parameter's (scope_add_param) */
+static inline const char *lv_wname(const LocalVar *lv) { return lv->wname ? lv->wname : lv->name; }
+void lv_set_wname(LocalVar *lv, const char *wname);
+const char *scope_local_wname(Compiler *c, int scope_idx, const LocalVar *lv);
 void scope_locals_appended(Scope *s);  /* scope_local's index, after an append */
 void scope_locals_removed(Scope *s);   /* ... after a local is taken out of `locals` */
 
@@ -2856,6 +2882,7 @@ int        class_is_exc_subclass(Compiler *c, int ci);   /* analyze.c */
 int        comp_plain_class(Compiler *c, int cid);    /* only Object's and Kernel's builtin methods behind the class: no core class or core module among its ancestors */
 int        comp_chain_includes_core(Compiler *c, int cid, const char *mod);   /* builtin module mod is among the class's ancestors */
 int        comp_const_path_on_math(Compiler *c, int par_id);   /* a path's parent is Math or a program class that includes it */
+TyKind     builtin_scoped_const_type(Compiler *c, int par_id, const char *par_nm, const char *nm);   /* analyze_infer.c: Float::INFINITY, Process::WNOHANG; TY_UNKNOWN for none */
 int        comp_chain_core_answers(Compiler *c, int cid, const char *name);   /* a builtin module the class or a superclass includes has the name ahead of Object */
 int        comp_enum_behind(Compiler *c, int cid);    /* Enumerable's methods behind the class: Enumerable, or an Array, Struct or native ancestor */
 int        core_method_vis(const char *cls, const char *m, int inherit, const char **owner);   /* codegen_call_class.c */
@@ -2873,8 +2900,9 @@ int        self_is_main(Compiler *c, int node);
 int        self_is_main_raw(Compiler *c, int node);
 int        self_class_body(Compiler *c, int node);
 int        attr_decl_call(Compiler *c, int id);
-enum { VIS_DECL_NIL = 1, VIS_DECL_SYM, VIS_DECL_ARRAY, VIS_DECL_SELF };
+enum { VIS_DECL_NIL = 1, VIS_DECL_SYM, VIS_DECL_STR, VIS_DECL_ARRAY, VIS_DECL_SELF };
 int        vis_decl_call(Compiler *c, int id);
+int        vis_decl_class(Compiler *c, int id);   /* the class such a word acts on (a class body's, or a method body's word's), -1 for none */
 int        setter_base_name(const char *name, char *out, size_t cap);
 char      *name_dup(const char *name);
 char      *setter_name_of(const char *attr);

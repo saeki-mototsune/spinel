@@ -1125,7 +1125,7 @@ extern int g_uses_traps;
    method on a call cycle, a loop that may not end or that no loop of its
    function encloses): one that sets a trap runs the trap's proc there
    (sp_sig_run_pending), one with no thread raises the default SIGINT or
-   SIGTERM there (sp_sig_poll_raise, which never returns) */
+   SIGTERM there (sp_sig_poll_raise, which returns while sp_sig_default_pending is 0) */
 static inline int sig_polls(void) { return g_uses_traps || !g_uses_threads; }
 static inline const char *sig_poll_stmt(void) {
   return g_uses_traps ? "if (SP_UNLIKELY(SP_ATOMIC_LOAD(&sp_sig_pending_flag, __ATOMIC_RELAXED))) sp_sig_run_pending()"
@@ -1207,8 +1207,7 @@ TyKind store_value_kind(Compiler *c, int node);
 int store_fits(Compiler *c, TyKind from, TyKind to);
 void store_check(Compiler *c, int node, TyKind slot, const char *what, Buf *b);
 void store_check_kind(Compiler *c, int node, TyKind from, TyKind slot, const char *what, Buf *b);
-/* How emit_coerce may convert: see codegen_util.c. */
-enum { CO_HOLD, CO_CONVERT };
+/* How emit_coerce may convert (CO_HOLD, CO_CONVERT in repr.h): see codegen_util.c. */
 void emit_coerce(Compiler *c, int node, TyKind slot, int how, const char *what, Buf *b);
 void emit_expr_face(Compiler *c, int node, TyKind t, Buf *b);
 void emit_coerce_text(Compiler *c, int node, TyKind from, TyKind slot, int how,
@@ -1649,6 +1648,10 @@ const char *cell_value_struct(TyKind t);
 const char *cell_value_struct_empty(TyKind t);
 const char *cell_value_struct_scan(TyKind t);
 void emit_cell_elem_type(Compiler *c, LocalVar *lv, Buf *b);
+typedef struct { const char *st; NameSet *names; NameSet caps; char capst[32]; size_t at; Buf *pre; int indent; Buf hoist; } EnvBind;
+void env_bind_begin(Compiler *c, Scope *dm, int dflt, Buf *out, EnvBind *sv);   /* the opening of a default spelled in a define_method method's environment */
+void env_bind_end(Buf *out, EnvBind *sv);
+void emit_env_store(Compiler *c, int id, Buf *b, int indent);   /* a define_method block's environment, stored where its definer runs */
 void emit_cell_defer_switch(Compiler *c, int id, int k, Buf *b, int indent);
 int splat_string_var(Compiler *c, const int *av, int ac, int *fs);
 void refuse_super_splat(Compiler *c, int id, int target);
@@ -1876,9 +1879,12 @@ const char *proc_arg_ref(int k, char *out, size_t n);
 int builtin_class_id(const char *name);
 int builtin_class_parent_id(int id);   /* analyze_util.c */
 int is_builtin_class_name(const char *n);
+int process_rlimit_const(const char *n);
 int is_builtin_module_name(const char *n);
 int const_path_in_closed_builtin(Compiler *c, int id);
 int const_path_misses_toplevel(Compiler *c, int id);
+int const_path_private(Compiler *c, int id, char *msg, size_t msg_n);
+int const_path_is_private(Compiler *c, int id);
 int builtin_module_at(int i, const char **name, int *id);
 int is_builtin_exception_name(const char *n);
 const char *superclass_builtin_exc_name(const Compiler *c, const NodeTable *nt, int sc);   /* analyze_util.c */
@@ -2595,6 +2601,9 @@ int emit_arm_args_text(Compiler *c, int mi, const char *armself, const char *con
    with the C text msg_c (a const char *) as its one argument; 0: no arm for its
    first parameter's type. (codegen.c) */
 int emit_reinit_init_text(Compiler *c, int im, const char *self, const char *msg_c, Buf *out);
+/* The same for a native construction (msg_c NULL: no message given; nilable: msg_c may be NULL, a nil given;
+   call_id >= 0: the call whose block the initialize takes). (codegen.c) */
+int emit_reinit_init_text_ex(Compiler *c, int im, const char *self, const char *msg_c, int nilable, int call_id, Buf *out);
 /* Can running the node `id` assign self's instance variable `iv`, self an
    instance of class `cls` (-1: none known) or of one below it? `depth`
    counts the self calls followed into their methods (0 at the call site);
@@ -2637,6 +2646,7 @@ void emit_call(Compiler *c, int id, Buf *b);
 /* The class value of builtin class `name` (codegen_call_class.c): its
    reopening's index when the program reopens it, else its id and name */
 void emit_builtin_class_value(Compiler *c, const char *name, Buf *b);
+int  emit_builtin_scoped_const(Compiler *c, int par_id, const char *par_nm, const char *nm, Buf *b);   /* codegen_expr.c: Float::INFINITY, Process::WNOHANG */
 void emit_cv_canon(Compiler *c, Buf *b, const char *fmt, ...) __attribute__((format(printf, 3, 4)));
 /* A builtin call the builtin-op table covers (codegen_ops.c): 1 when it
    emitted the call, 0 to keep falling through the chain. */
@@ -3517,6 +3527,7 @@ __attribute__((noreturn)) void refuse_nil_store(Compiler *c, int node, TyKind t,
 int node_may_be_nil(Compiler *c, int node);
 int call_names_only_void_methods(Compiler *c, int node);   /* codegen_stmt.c */
 int call_misses_self_method(Compiler *c, int id);   /* codegen_call.c: a self-call NoMethodError raises */
+void emit_call_self_boxed(Compiler *c, int id, Buf *b);   /* codegen_call_class.c: the self call id runs on, boxed */
 /* node as a plain scalar through its oint form: `sp_oint_val(<oint>, op)`
    when the node may be nil (cmp_operand_may_be_nil), else emit_expr */
 void emit_oint_unwrap_ck(Compiler *c, int node, TyKind t, const char *op, Buf *b);

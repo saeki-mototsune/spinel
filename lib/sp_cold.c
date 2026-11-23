@@ -13,6 +13,7 @@
 #ifndef _GNU_SOURCE
 #define _GNU_SOURCE   /* statx / STATX_BTIME for File.birthtime on Linux */
 #endif
+#include <limits.h>
 #include <stddef.h>
 #include <stdint.h>
 #include <string.h>
@@ -45,7 +46,6 @@
 #include "sp_system.h" /* sp_last_status for backtick */
 #include "sp_format.h" /* sp_float_to_rational for sp_float_denominator/numerator */
 #include <sys/select.h>  /* IO.select and the IO#wait_* readiness family */
-#include <sys/ioctl.h>   /* FIONREAD: a read-only FIFO open asking for a writer */
 #include <poll.h>        /* POLLIN/POLLOUT for the scheduler park behind them */
 #include <sys/socket.h> /* SOCK_STREAM / SOCK_DGRAM for Addrinfo */
 
@@ -723,8 +723,10 @@ static int sp_fnm_match(const char *p, const char *s, int flags) {
    FNM_PATHNAME: the component holds no separator by construction. A
    leading dot is hidden unless the pattern asks for one or the glob runs
    under FNM_DOTMATCH, which is CRuby's rule. */
+static int sp_glob_fold = 0;   /* the directory the walk reads does not tell letter cases apart */
 static int sp_glob_comp_match(const char *comp, const char *name) {
-  return sp_fnm_match(comp, name, (sp_glob_dotmatch ? SP_FNM_DOTMATCH : 0) | (sp_glob_flags & SP_FNM_NOESCAPE));
+  return sp_fnm_match(comp, name, (sp_glob_dotmatch ? SP_FNM_DOTMATCH : 0) | (sp_glob_flags & SP_FNM_NOESCAPE) |
+                                  (sp_glob_fold ? SP_FNM_CASEFOLD : 0));
 }
 
 /* Whether a component is read from its directory by the matcher: a wildcard,
@@ -735,6 +737,48 @@ static int sp_glob_has_meta(const char *comp) {
     if (*p == '*' || *p == '?' || *p == '[' || *p == '\\') return 1;
   return 0;
 }
+
+/* Whether the directory's volume tells letter cases apart, which decides
+   how a glob matches the names under it with a wildcard, as CRuby's glob
+   asks each directory it opens (dir.c, is_case_sensitive): under a folding
+   one the matcher takes FNM_CASEFOLD, which folds the ASCII letters, as
+   CRuby's does. On macOS the volume says (pathconf's _PC_CASE_SENSITIVE:
+   APFS and HFS+ as the system makes them fold, a volume made
+   case-sensitive does not); a pathconf that fails keeps the cases.
+   Elsewhere every volume keeps them: Windows folds under CRuby
+   (FNM_SYSCASE), which this does not follow, untried. */
+#if defined(__APPLE__) && defined(_PC_CASE_SENSITIVE)
+static int sp_glob_dir_folds(const char *fsdir) { return pathconf(fsdir[0] ? fsdir : ".", _PC_CASE_SENSITIVE) == 0; }
+#else
+static int sp_glob_dir_folds(const char *fsdir) { (void)fsdir; return 0; }
+#endif
+
+/* The name of a path as the disk spells it, for a literal component: a
+   folding volume finds "A.txt" for a.txt and "\xC3\xA9.txt" for
+   "\xC3\x89.txt", by its own rule (APFS folds Unicode letters, the
+   matcher the ASCII ones), and CRuby answers the name the disk holds
+   (dir.c, replace_real_basename). On macOS the volume tells it
+   (getattrlist, ATTR_CMN_NAME); elsewhere, and when the ask fails, the
+   component is its own name. Answers 0 for the latter. */
+#if defined(__APPLE__)
+#include <sys/attr.h>
+static int sp_glob_disk_name(const char *path, char *out, size_t cap) {
+  struct attrlist al;
+  struct { uint32_t len; attrreference_t ref; char name[NAME_MAX + 1]; } __attribute__((aligned(4), packed)) buf;
+  memset(&al, 0, sizeof al);
+  al.bitmapcount = ATTR_BIT_MAP_COUNT;
+  al.commonattr = ATTR_CMN_NAME;
+  if (getattrlist(path, &al, &buf, sizeof buf, FSOPT_NOFOLLOW) != 0) return 0;
+  size_t n = buf.ref.attr_length;   /* the name and its NUL */
+  const char *name = (const char *)&buf.ref + buf.ref.attr_dataoffset;
+  if (n == 0 || n > cap || name + n > (const char *)&buf + sizeof buf) return 0;
+  memcpy(out, name, n);
+  out[n - 1] = 0;
+  return 1;
+}
+#else
+static int sp_glob_disk_name(const char *path, char *out, size_t cap) { (void)path; (void)out; (void)cap; return 0; }
+#endif
 
 static void sp_glob_push(sp_StrArray *a, const char *path) {
   char *copy = sp_str_alloc(strlen(path));
@@ -824,9 +868,20 @@ static void sp_glob_walk_at(const char *fsdir, const char *outprefix,
   }
 
   if (!sp_glob_has_meta(comp)) {
-    /* A literal component needs no readdir: ask the filesystem directly. */
+    /* A literal component needs no readdir: ask the filesystem directly,
+       and spell the answer as the disk does (a folding volume finds the
+       name in another case). */
     snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, SP_GLOB_SEP(fsdir), comp);
-    snprintf(outpath, sizeof outpath, "%s%s", outprefix, comp);
+    char disk[NAME_MAX + 1];
+    const char *name = comp;
+    /* ("." and ".." name a directory by another path: the disk's name for
+       them is that directory's own, which is no name under this one) */
+    int dots = comp[0] == '.' && (comp[1] == 0 || (comp[1] == '.' && comp[2] == 0));
+    if (!dots && sp_glob_exists(fspath) && sp_glob_disk_name(fspath, disk, sizeof disk) && strcmp(disk, comp)) {
+      name = disk;
+      snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, SP_GLOB_SEP(fsdir), name);
+    }
+    snprintf(outpath, sizeof outpath, "%s%s", outprefix, name);
     if (last) { if (sp_glob_exists(fspath)) sp_glob_push(a, outpath); return; }
     if (sp_glob_is_dir(fspath)) {
       char sub[sizeof outpath + 1];   /* outpath and its trailing slash, whatever outpath holds */
@@ -836,6 +891,7 @@ static void sp_glob_walk_at(const char *fsdir, const char *outprefix,
     return;
   }
 
+  int fold = sp_glob_dir_folds(fsdir);
   DIR *d = opendir(fsdir[0] ? fsdir : ".");
   if (!d) return;
   struct dirent *e;
@@ -845,6 +901,9 @@ static void sp_glob_walk_at(const char *fsdir, const char *outprefix,
        while ".." never is. Both stay hidden without the flag. */
     if (name[0] == '.' && name[1] == '.' && name[2] == 0) continue;
     if (name[0] == '.' && name[1] == 0 && (!sp_glob_dotmatch || descended)) continue;
+    /* the walk below sets the fold of its own directory: this one's again
+       for the next name here */
+    sp_glob_fold = fold;
     if (!sp_glob_comp_match(comp, name)) continue;
     if (sp_glob_bad) break;
     snprintf(fspath, sizeof fspath, "%s%s%s", fsdir, SP_GLOB_SEP(fsdir), name);
@@ -904,6 +963,9 @@ sp_StrArray *sp_dir_glob_dot(const char *pattern) {SP_GC_ROOT_STR(pattern);
    spelled relative to it, as Dir.glob(pattern, base:) answers. */
 static void sp_dir_glob_one(const char *pattern, const char *base, sp_StrArray *a) {
   char buf[2048];
+  /* a pattern that does not fit in buf matches nothing; snprintf would
+     truncate it */
+  if (strlen(pattern) >= sizeof buf) return;
   snprintf(buf, sizeof buf, "%s", pattern);
   char *comps[64];
   int ncomp = 0;
@@ -933,7 +995,8 @@ static void sp_dir_glob_one(const char *pattern, const char *base, sp_StrArray *
     if (!sl) break;
     tok = sl + 1;
   }
-  if (ncomp == 0) return;
+  /* a pattern of only separators names the root, spelled as given */
+  if (ncomp == 0) { if (absolute && sp_glob_exists(SP_GLOB_ROOT)) sp_glob_push(a, pattern); return; }
   /* Stripping the separator turned a trailing recursive component into the
      one-level form; it is the SEPARATOR that makes it descend, so put the
      level back by asking for everything under it. */
@@ -1062,8 +1125,8 @@ const char *sp_poly_inspect(sp_RbVal v);   /* lib/sp_poly_cold.c */
 /* Dir.glob's flags and keyword options reuse the walk: FNM_DOTMATCH and
    FNM_NOESCAPE reach the matcher of each component; FNM_CASEFOLD and the
    others change nothing in a glob, as CRuby ignores them there (the case
-   rule is the filesystem's); sort: false keeps the walk's order, which the
-   filesystem gives. */
+   rule is the directory's volume's, sp_glob_dir_folds); sort: false keeps
+   the walk's order, which the filesystem gives. */
 sp_StrArray *sp_dir_glob_flags(const char *pattern, const char *base, sp_int flags, sp_RbVal sort) {
   SP_GC_ROOT_STR(pattern); SP_GC_ROOT_STR(base); SP_GC_ROOT_RBVAL(sort);
   if (sort.tag != SP_TAG_BOOL)
@@ -1431,6 +1494,240 @@ sp_IntArray *sp_process_groups(void) {  /* (#3046) */
   for (int i = 0; i < n; i++) sp_IntArray_push(a, (sp_int)buf[i]);
   free(buf);
   return a;
+}
+
+/* Process.getrlimit / Process.setrlimit. `name` is the Symbol's or
+   String's text, NULL for another value (spinel_rt.h reads it). */
+static const struct { const char *name; int id; } sp_rlimit_names[] = {
+#ifdef RLIMIT_AS
+  { "AS", RLIMIT_AS },
+#endif
+#ifdef RLIMIT_CORE
+  { "CORE", RLIMIT_CORE },
+#endif
+#ifdef RLIMIT_CPU
+  { "CPU", RLIMIT_CPU },
+#endif
+#ifdef RLIMIT_DATA
+  { "DATA", RLIMIT_DATA },
+#endif
+#ifdef RLIMIT_FSIZE
+  { "FSIZE", RLIMIT_FSIZE },
+#endif
+#ifdef RLIMIT_MEMLOCK
+  { "MEMLOCK", RLIMIT_MEMLOCK },
+#endif
+#ifdef RLIMIT_MSGQUEUE
+  { "MSGQUEUE", RLIMIT_MSGQUEUE },
+#endif
+#ifdef RLIMIT_NICE
+  { "NICE", RLIMIT_NICE },
+#endif
+#ifdef RLIMIT_NOFILE
+  { "NOFILE", RLIMIT_NOFILE },
+#endif
+#ifdef RLIMIT_NPROC
+  { "NPROC", RLIMIT_NPROC },
+#endif
+#ifdef RLIMIT_NPTS
+  { "NPTS", RLIMIT_NPTS },
+#endif
+#ifdef RLIMIT_RSS
+  { "RSS", RLIMIT_RSS },
+#endif
+#ifdef RLIMIT_RTPRIO
+  { "RTPRIO", RLIMIT_RTPRIO },
+#endif
+#ifdef RLIMIT_RTTIME
+  { "RTTIME", RLIMIT_RTTIME },
+#endif
+#ifdef RLIMIT_SBSIZE
+  { "SBSIZE", RLIMIT_SBSIZE },
+#endif
+#ifdef RLIMIT_SIGPENDING
+  { "SIGPENDING", RLIMIT_SIGPENDING },
+#endif
+#ifdef RLIMIT_STACK
+  { "STACK", RLIMIT_STACK },
+#endif
+};
+
+extern sp_Bigint *sp_bigint_new_u64(uint64_t v);
+extern int sp_bigint_mag_u64(sp_Bigint *b, uint64_t *out);
+extern const char *sp_errno_class_name(int e);
+static int sp_rlimit_lookup(const char *name, int *id);
+static void sp_rlimit_name_nul(sp_RbVal v, const char *name);
+
+/* rlimit_resource_type in CRuby's process.c */
+static int sp_rlimit_resource(sp_RbVal v, const char *name) {
+  if (name) {
+    int id;
+    sp_rlimit_name_nul(v, name);
+    size_t n = sp_str_byte_len(name);
+    if (strlen(name) == n && sp_rlimit_lookup(name, &id)) return id;
+    /* a Symbol with an ASCII name is US-ASCII, escaped as bytes like a
+       binary String */
+    int bin = 1;
+    if (sp_rbval_is_string(v)) bin = sp_str_is_binary(name);
+    else for (size_t i = 0; i < n && bin; i++) bin = (unsigned char)name[i] < 0x80;
+    const char *q = sp_str_quote_unprintable(name, n, bin);
+    SP_GC_ROOT_STR(q);
+    sp_raise_cls("ArgumentError", sp_sprintf("invalid resource name: %s", q));
+  }
+  sp_int r = sp_poly_arg_int(v);
+  if ((int64_t)r > INT_MAX || (int64_t)r < INT_MIN)
+    sp_raise_cls("RangeError", sp_sprintf("integer %lld too %s to convert to 'int'",
+                                          (long long)r, r < 0 ? "small" : "big"));
+  return (int)r;
+}
+
+static int sp_rlimit_lookup(const char *name, int *id) {
+  for (size_t i = 0; i < sizeof sp_rlimit_names / sizeof sp_rlimit_names[0]; i++)
+    if (strcmp(name, sp_rlimit_names[i].name) == 0) { *id = sp_rlimit_names[i].id; return 1; }
+  return 0;
+}
+
+/* Process::RLIMIT_<name>, and defined?(Process::RLIMIT_<name>) */
+sp_int sp_process_rlimit_id(const char *name) {
+  int id;
+  if (!sp_rlimit_lookup(name, &id))
+    sp_raise_cls("NameError", sp_sprintf("uninitialized constant Process::RLIMIT_%s", name));
+  return id;
+}
+int sp_process_rlimit_defined(const char *name) {
+  int id;
+  return sp_rlimit_lookup(name, &id);
+}
+
+/* StringValueCStr's check on a String name */
+static void sp_rlimit_name_nul(sp_RbVal v, const char *name) {
+  if (sp_rbval_is_string(v) && memchr(name, 0, sp_str_byte_len(name)))
+    sp_raise_cls("ArgumentError", "string contains null byte");
+}
+
+/* rlimit_resource_value in CRuby's process.c */
+static rlim_t sp_rlimit_value(sp_RbVal v, const char *name) {
+  if (name) {
+    sp_rlimit_name_nul(v, name);
+    if (strcmp(name, "INFINITY") == 0) return RLIM_INFINITY;
+#ifdef RLIM_SAVED_MAX
+    if (strcmp(name, "SAVED_MAX") == 0) return RLIM_SAVED_MAX;
+    if (strcmp(name, "SAVED_CUR") == 0) return RLIM_SAVED_CUR;
+#endif
+    /* CRuby's rb_raise refuses the NUL when it formats the message */
+    if (memchr(name, 0, sp_str_byte_len(name))) sp_raise_cls("ArgumentError", "string contains null byte");
+    sp_raise_cls("ArgumentError", sp_sprintf("invalid resource value: %s", name));
+  }
+  if (v.tag == SP_TAG_INT) return (rlim_t)(uint64_t)(int64_t)v.v.i;
+  if (v.tag == SP_TAG_NIL) sp_raise_nil_to_int(1);
+  /* CRuby's NUM2RLIM: NUM2ULONG for an unsigned long rlim_t (glibc),
+     NUM2ULL for an unsigned long long one (macOS), NUM2LONG or NUM2LL for
+     a signed one (FreeBSD) */
+  int ul = _Generic((rlim_t)0, unsigned long: 1, long: 1, default: 0);
+  if ((rlim_t)-1 < 0) {
+    if (v.tag == SP_TAG_FLT) {
+      double d = v.v.f;
+      if (d < 9223372036854775808.0 && d >= -9223372036854775808.0) return (rlim_t)(long long)d;
+      const char *of = ul ? "integer" : "long long";
+      if (!isfinite(d))
+        sp_raise_cls("RangeError", sp_sprintf("float %s out of range of %s",
+                                              isnan(d) ? "NaN" : d > 0 ? "Inf" : "-Inf", of));
+      sp_raise_cls("RangeError", sp_sprintf("float %-.10g out of range of %s", d, of));
+    }
+    if (v.tag == SP_TAG_BIGINT) {
+      uint64_t u;
+      int neg = sp_bigint_sign((sp_Bigint *)v.v.p) < 0;
+      if (!sp_bigint_mag_u64((sp_Bigint *)v.v.p, &u) || u > (uint64_t)INT64_MAX + (neg ? 1 : 0))
+        sp_raise_cls("RangeError", sp_sprintf("bignum too big to convert into '%s'", ul ? "long" : "long long"));
+      return neg ? (rlim_t)(-(long long)(u - 1) - 1) : (rlim_t)u;
+    }
+    return (rlim_t)(int64_t)sp_poly_arg_int(v);
+  }
+  if (v.tag == SP_TAG_FLT) {
+    double d = v.v.f;
+    double hi = ul ? (double)ULONG_MAX + 1.0 : 18446744073709551616.0;
+    double lo = ul ? (double)LONG_MIN : (double)LLONG_MIN;
+    if (d < hi && (d > lo - 1.0 || (lo - 1.0 == lo && d >= lo)))
+      return d >= 0 ? (rlim_t)d : (rlim_t)(long long)d;
+    const char *of = ul ? "integer" : "unsigned long long";
+    if (!isfinite(d))
+      sp_raise_cls("RangeError", sp_sprintf("float %s out of range of %s",
+                                            isnan(d) ? "NaN" : d > 0 ? "Inf" : "-Inf", of));
+    sp_raise_cls("RangeError", sp_sprintf("float %-.10g out of range of %s", d, of));
+  }
+  if (v.tag == SP_TAG_BIGINT) {
+    const char *tn = ul ? "unsigned long" : "unsigned long long";
+    uint64_t max = ul ? (uint64_t)ULONG_MAX : UINT64_MAX;
+    uint64_t neg_max = (ul ? (uint64_t)LONG_MAX : (uint64_t)INT64_MAX) + 1;
+    uint64_t u;
+    if (!sp_bigint_mag_u64((sp_Bigint *)v.v.p, &u) || u > max)
+      sp_raise_cls("RangeError", sp_sprintf("bignum too big to convert into '%s'", tn));
+    if (sp_bigint_sign((sp_Bigint *)v.v.p) >= 0) return (rlim_t)u;
+    if (u > neg_max)
+      sp_raise_cls("RangeError", sp_sprintf("bignum out of range of %s", tn));
+    return (rlim_t)(0 - u);
+  }
+  return (rlim_t)(uint64_t)(int64_t)sp_poly_arg_int(v);
+}
+
+static sp_RbVal sp_rlimit_box(rlim_t v) {
+  if ((uint64_t)v > (uint64_t)INTPTR_MAX) return sp_box_bigint(sp_bigint_new_u64((uint64_t)v));
+  return sp_box_int((sp_int)v);
+}
+
+/* Process::RLIM_INFINITY (0), RLIM_SAVED_MAX (1), RLIM_SAVED_CUR (2) */
+sp_RbVal sp_process_rlim_const(int k) {
+#ifdef RLIM_SAVED_MAX
+  if (k == 1) return sp_rlimit_box(RLIM_SAVED_MAX);
+  if (k == 2) return sp_rlimit_box(RLIM_SAVED_CUR);
+#else
+  if (k)
+    sp_raise_cls("NameError", k == 1 ? "uninitialized constant Process::RLIM_SAVED_MAX"
+                                     : "uninitialized constant Process::RLIM_SAVED_CUR");
+#endif
+  return sp_rlimit_box(RLIM_INFINITY);
+}
+int sp_process_rlim_defined(int k) {
+#ifdef RLIM_SAVED_MAX
+  (void)k;
+  return 1;
+#else
+  return k == 0;
+#endif
+}
+
+sp_PolyArray *sp_process_getrlimit_at(sp_RbVal res, const char *name) {
+  SP_GC_ROOT_RBVAL(res);
+  struct rlimit rl;
+  if (getrlimit(sp_rlimit_resource(res, name), &rl) < 0) {
+    int e = errno;
+    sp_raise_cls(sp_errno_class_name(e), sp_sprintf("%s - getrlimit", strerror(e)));
+  }
+  sp_PolyArray *a = sp_PolyArray_new_cap(2);
+  SP_GC_ROOT(a);
+  sp_PolyArray_push(a, sp_rlimit_box(rl.rlim_cur));
+  sp_PolyArray_push(a, sp_rlimit_box(rl.rlim_max));
+  return a;
+}
+
+/* proc_setrlimit in CRuby's process.c: spinel_rt.h converts the soft
+   limit, then the hard limit, then the resource */
+unsigned long long sp_process_rlimit_value(sp_RbVal v, const char *name) {
+  SP_GC_ROOT_RBVAL(v);
+  return (unsigned long long)sp_rlimit_value(v, name);
+}
+int sp_process_rlimit_resource(sp_RbVal v, const char *name) {
+  SP_GC_ROOT_RBVAL(v);
+  return sp_rlimit_resource(v, name);
+}
+void sp_process_setrlimit_ids(int res, unsigned long long cur, unsigned long long max) {
+  struct rlimit rl;
+  rl.rlim_cur = (rlim_t)cur;
+  rl.rlim_max = (rlim_t)max;
+  if (setrlimit(res, &rl) < 0) {
+    int e = errno;
+    sp_raise_cls(sp_errno_class_name(e), sp_sprintf("%s - setrlimit", strerror(e)));
+  }
 }
 
 sp_int sp_file_size(const char *path) {SP_GC_ROOT_STR(path);
@@ -2921,22 +3218,6 @@ static void sp_file_open_raise(const char *path) {
   int e = errno;
   sp_raise_cls(sp_errno_class_name(e), sp_sprintf("%s @ rb_sysopen - %s", strerror(e), path ? path : ""));
 }
-/* A byte a read-only FIFO open took while asking for a writer (below): the
-   handle made of the descriptor gets it back (sp_fifo_pushback_apply). */
-static SP_TLS int sp_fifo_pushback_fd = -1;
-static SP_TLS unsigned char sp_fifo_pushback_byte;
-int sp_fifo_pushback_take(int fd, unsigned char *c) {
-  int has = sp_fifo_pushback_fd >= 0 && fd == sp_fifo_pushback_fd;
-  if (has) *c = sp_fifo_pushback_byte;
-  sp_fifo_pushback_fd = -1;
-  return has;
-}
-void sp_fifo_pushback_apply(sp_File *f) {
-  unsigned char c;
-  if (f && f->fp && sp_fifo_pushback_take(fileno(f->fp), &c)) ungetc(c, f->fp);
-  sp_fifo_pushback_fd = -1;
-}
-
 /* The descriptor of a FIFO open, blocking again: the O_NONBLOCK of the ask
    goes, so every read and write after this behaves as it did. */
 static int sp_fifo_opened(int fd) {
@@ -2950,13 +3231,9 @@ static int sp_fifo_opened(int fd) {
    meets the end of the file where CRuby's reader gets the writer's bytes.
    With no other green thread alive the blocking open waits, in a native
    section so a collection does not wait for it; nothing else runs here
-   anyway. With one alive the descriptor is asked until a writer is there, which
-   the kernel tells only through a read: bytes waiting (FIONREAD), or EAGAIN
-   for a writer that has sent none, where no writer answers the end of the
-   file. A byte that arrives between the two asks is read here and kept for
-   the handle (sp_fifo_pushback_apply). */
+   anyway. With one alive the thread sleeps until the descriptor turns
+   readable (below). */
 static int sp_fifo_open_read(const char *path, int fl, int perm) {
-  sp_fifo_pushback_fd = -1;
   if (!sp_sched_other_threads_live()) {
     int fd;
     sp_native_enter();
@@ -2972,16 +3249,16 @@ static int sp_fifo_open_read(const char *path, int fl, int perm) {
      waiting, and the thread died of it at the program's end) */
   int fd = open(path, fl | O_NONBLOCK, (mode_t)perm);
   if (fd < 0) return -1;
-#ifdef __linux__
-  /* On Linux the descriptor itself says when to go on, and the thread
-     sleeps in the scheduler until it does: readable once a writer has
-     sent bytes, and hung up (POLLHUP) once a writer has come and gone,
-     which a FIFO no writer ever opened is not. Nothing is read here, so
-     no byte is taken from a child handed the descriptor, and the thread
-     is asleep the whole wait (Thread#status), where an ask every
-     millisecond ran between two asks. The open answers at the writer's
-     first byte or its close, not at its open: a writer that opens and
-     waits for the reader before it writes is not met. */
+  /* The descriptor itself says when to go on, and the thread sleeps in
+     the scheduler until it does: readable once a writer has sent bytes,
+     and on Linux hung up (POLLHUP) once a writer has come and gone, which
+     a FIFO no writer ever opened is not. macOS reports no hangup, so there
+     the open waits on past a writer that closes without sending a byte.
+     Nothing is read here, so no byte is taken from a child handed the
+     descriptor, and the thread is asleep the whole wait (Thread#status).
+     The open answers at the writer's first byte or (on Linux) its close,
+     not at its open: a writer that opens and waits for the reader before
+     it writes is not met. */
   for (;;) {
     struct pollfd pf = { fd, POLLIN, 0 };
     int pr = poll(&pf, 1, 0);
@@ -2991,20 +3268,6 @@ static int sp_fifo_open_read(const char *path, int fl, int perm) {
        no scheduler wait to link, and never comes here) */
     sp_io_wait_fd_readable(fd);
   }
-#else
-  for (;;) {
-#ifdef FIONREAD
-    int avail = 0;
-    if (ioctl(fd, FIONREAD, &avail) == 0 && avail > 0) return sp_fifo_opened(fd);
-#endif
-    unsigned char c;
-    ssize_t n = read(fd, &c, 1);
-    if (n < 0 && (errno == EAGAIN || errno == EWOULDBLOCK)) return sp_fifo_opened(fd);
-    if (n > 0) { sp_fifo_pushback_fd = fd; sp_fifo_pushback_byte = c; return sp_fifo_opened(fd); }
-    if (n < 0 && errno != EINTR) { int e = errno; close(fd); errno = e; return -1; }
-    sp_sleep(0.001);
-  }
-#endif
 }
 
 /* open(2) on a FIFO waits for the other end, and it waits in the kernel with
@@ -3057,7 +3320,6 @@ sp_File *sp_File_open_flags_perm(const char *path, sp_int fl, sp_oint perm) {SP_
                 : (acc == O_WRONLY) ? (((int)fl & O_APPEND) ? "a" : "w")
                 : (((int)fl & O_APPEND) ? "a+" : "r+");
   sp_File *f = sp_io_fdopen(fd, m);
-  sp_fifo_pushback_apply(f);
   f->path = path;
   f->is_file = 1;
   return f;
@@ -3081,7 +3343,6 @@ sp_File *sp_File_open_perm(const char *path, const char *mode, sp_oint perm) {SP
   /* fdopen reads its own mode grammar ("wx+" is write-only to it): hand it
      the access mode the flag word says, as the flags form does */
   sp_File *f = sp_io_fdopen(fd, sp_io_fdopen_mode(fl));
-  sp_fifo_pushback_apply(f);
   f->path = sp_str_retained(path);
   f->mode = m;
   f->is_file = 1;
@@ -4339,6 +4600,14 @@ extern volatile int sp_sig_pending_flag;   /* (lib/sp_alloc.c: sp_gc_alloc_nogc 
    sp_sig_default_pending, and the raise it makes is the generated program's
    (sp_sig_default_raiser, set by sp_sig_install_defaults) */
 volatile int sp_sig_async_ok;
+/* Nonzero while sp_process_spawn is between fork() and its return. A signal
+   that arrives then is recorded and runs at the next safe point, after the
+   caller has the child pid, so the ensure in Open3.__capture can wait for
+   the child. Raised inside sp_process_spawn, the exception would leave
+   before the caller had the pid. The counter is process-wide, so a spawn on
+   one thread also delays signals for the other threads until the spawn
+   returns. */
+volatile int sp_sig_hold;
 volatile int sp_sig_default_pending;
 void (*sp_sig_default_raiser)(int);
 /* A safe point of a program that sets no trap: the recorded default signal
@@ -4354,16 +4623,16 @@ static void sp_gc_poll_run(void) {
   sp_gc_poll_collect();
 }
 /* A safe point of a program that sets no trap: a collection asked of it
-   runs, and the recorded default signal is raised. Returns only when it
-   had a collection and no signal to run. */
+   runs, and the recorded default signal is raised. Returns while
+   sp_sig_default_pending is 0: after a collection, or after
+   sp_sig_blocking_raise has raised the signal the flag was set for. */
 void sp_sig_poll_raise(void) {
   SP_ATOMIC_STORE(&sp_sig_pending_flag, 0, __ATOMIC_RELAXED);
-  int gc = sp_gc_poll_due;
   sp_gc_poll_run();
   int no = sp_sig_default_pending;
-  if (gc && !no) return;
+  if (!no) return;
   sp_sig_default_pending = 0;
-  if (no && sp_sig_default_raiser) sp_sig_default_raiser(no);
+  if (sp_sig_default_raiser) sp_sig_default_raiser(no);
   abort();
 }
 #ifdef SP_THREADS
@@ -4382,6 +4651,33 @@ void sp_sig_c_handler(int no) {
 #endif
   errno = e;
 }
+/* The count of sp_sig_run_pending calls between their read of sp_sig_hold
+   and their take of a recorded signal. A take adds to the count and then
+   reads sp_sig_hold; sp_sig_hold_begin adds to sp_sig_hold and then waits
+   for the count to reach zero. Both are sequentially consistent, so a take
+   that read zero is over before the spawn forks, and a signal recorded
+   after sp_sig_hold_begin returns is not taken until sp_sig_hold_end. The
+   trap proc runs after the count is given back. sp_sig_run_pending runs
+   with sp_sig_async_ok at 0, so the default handler records a signal that
+   arrives during its take; sp_sig_blocking_raise, with sp_sig_async_ok
+   raised, blocks SIGINT and SIGTERM for its take. */
+static volatile int sp_sig_taking;
+static int sp_sig_take_begin(void) {
+  SP_ATOMIC_FETCH_ADD(&sp_sig_taking, 1, __ATOMIC_SEQ_CST);
+  if (!SP_ATOMIC_LOAD(&sp_sig_hold, __ATOMIC_SEQ_CST)) return 1;
+  SP_ATOMIC_FETCH_SUB(&sp_sig_taking, 1, __ATOMIC_SEQ_CST);
+  return 0;
+}
+static void sp_sig_take_end(void) { SP_ATOMIC_FETCH_SUB(&sp_sig_taking, 1, __ATOMIC_SEQ_CST); }
+/* sp_sig_run_pending stopped with signals still recorded. The trap thread
+   is woken by sp_sig_hold_end; with no trap thread the safe points' flag is
+   set again. */
+static void sp_sig_left_pending(void) {
+#ifdef SP_THREADS
+  if (SP_ATOMIC_LOAD(&sp_sig_wake[1], __ATOMIC_ACQUIRE) >= 0) return;
+#endif
+  SP_ATOMIC_STORE(&sp_sig_pending_flag, 1, __ATOMIC_RELEASE);
+}
 /* Run the procs of the signals delivered since the last call. Deliveries of
    one signal that arrive before its proc runs are one run, as the kernel
    merges them while the signal is pending. The signal is blocked while its
@@ -4389,17 +4685,21 @@ void sp_sig_c_handler(int no) {
    proc instead of nesting on it; sp_trap_call unblocks it when the proc
    leaves by a raise or a throw. */
 void sp_sig_run_pending(void) {
+  if (!sp_sig_take_begin()) { sp_gc_poll_run(); return; }
   SP_ATOMIC_STORE(&sp_sig_pending_flag, 0, __ATOMIC_RELAXED);
+  int dno = 0;
+  if (sp_sig_default_pending && sp_sig_default_raiser) { dno = sp_sig_default_pending; sp_sig_default_pending = 0; }
+  sp_sig_take_end();
   sp_gc_poll_run();   /* (a collection sp_gc_alloc_nogc asked of this safe point) */
   /* a recorded default SIGINT / SIGTERM first: its raise leaves */
-  if (sp_sig_default_pending && sp_sig_default_raiser) {
-    int no = sp_sig_default_pending;
-    sp_sig_default_pending = 0;
-    sp_sig_default_raiser(no);
-  }
+  if (dno) sp_sig_default_raiser(dno);
   for (int no = 1; no < SP_SIG_MAX; no++) {
     if (!SP_ATOMIC_LOAD(&sp_sig_pending[no], __ATOMIC_RELAXED)) continue;
-    if (!SP_ATOMIC_EXCHANGE(&sp_sig_pending[no], 0, __ATOMIC_ACQUIRE)) continue;
+    /* (a Process.spawn began on another thread: the signals left wait for it) */
+    if (!sp_sig_take_begin()) { sp_sig_left_pending(); return; }
+    int n = SP_ATOMIC_EXCHANGE(&sp_sig_pending[no], 0, __ATOMIC_ACQUIRE);
+    sp_sig_take_end();
+    if (!n) continue;
     sp_Proc *p = (sp_Proc *)sp_trap_proc[no];
     if (!p) continue;
     sigset_t m; sigemptyset(&m); sigaddset(&m, no);
@@ -4412,12 +4712,54 @@ void sp_sig_run_pending(void) {
     sp_sig_unblock(no, 0);
   }
 }
+/* SP_SIG_BLOCKING, with sp_sig_async_ok raised: a default signal recorded
+   before the call is raised here, so a SIGTERM held by a Process.spawn is
+   raised when the Process.wait after the spawn begins. While a spawn holds
+   signals it stays recorded. SIGINT and SIGTERM are blocked while the take
+   is held: the handler would raise out of it and leave sp_sig_taking at 1,
+   and the next sp_sig_hold_begin would wait on it. */
+void sp_sig_blocking_raise(void) {
+  if (!sp_sig_default_raiser) return;
+  sigset_t m, old; sigemptyset(&m); sigaddset(&m, SIGINT); sigaddset(&m, SIGTERM);
+#ifdef SP_THREADS
+  pthread_sigmask(SIG_BLOCK, &m, &old);
+#else
+  sigprocmask(SIG_BLOCK, &m, &old);
+#endif
+  int no = 0;
+  if (sp_sig_take_begin()) { no = sp_sig_default_pending; sp_sig_default_pending = 0; sp_sig_take_end(); }
+#ifdef SP_THREADS
+  pthread_sigmask(SIG_SETMASK, &old, NULL);
+#else
+  sigprocmask(SIG_SETMASK, &old, NULL);
+#endif
+  if (no) sp_sig_default_raiser(no);
+}
 /* A wait for a child has answered and its caller has stored $?: the signals
    recorded while it went on run now, as CRuby runs them on the way out of
    its wait (a trap for CHLD, which the child's own end records; a default
    SIGINT, whose raise then leaves $? set). */
 void sp_sig_after_wait(void) {
   if (SP_ATOMIC_LOAD(&sp_sig_pending_flag, __ATOMIC_ACQUIRE)) sp_sig_run_pending();
+}
+void sp_sig_hold_begin(void) {
+  SP_ATOMIC_FETCH_ADD(&sp_sig_hold, 1, __ATOMIC_SEQ_CST);
+  while (SP_ATOMIC_LOAD(&sp_sig_taking, __ATOMIC_SEQ_CST)) SP_CPU_RELAX();
+}
+/* Wakes the trap thread, which skipped signals recorded while sp_sig_hold
+   was nonzero. */
+void sp_sig_hold_end(void) {
+  SP_ATOMIC_FETCH_ADD(&sp_sig_hold, -1, __ATOMIC_RELEASE);
+#ifdef SP_THREADS
+  int wfd = SP_ATOMIC_LOAD(&sp_sig_wake[1], __ATOMIC_ACQUIRE);
+  if (wfd >= 0) { char b = 0; ssize_t w = write(wfd, &b, 1); (void)w; }
+#endif
+}
+/* The child of a fork made while another thread was in sp_process_spawn:
+   that spawn is the parent's, and nothing in the child would end its hold. */
+void sp_sig_fork_child(void) {
+  SP_ATOMIC_STORE(&sp_sig_hold, 0, __ATOMIC_SEQ_CST);
+  SP_ATOMIC_STORE(&sp_sig_taking, 0, __ATOMIC_SEQ_CST);
 }
 /* Is a proc set for a signal (EXIT aside)? A child wait of a program with
    one thread polls while one is, so the proc runs in the wait
@@ -4467,17 +4809,30 @@ void sp_sig_exit_dispatch(void) {
   sp_trap_proc[0] = NULL;   /* run once */
   if (p) { sp_int slot = 0; _sp_proc_poly_args[0] = sp_box_int(0); sp_proc_call(p, 1, &slot); }
 }
+/* What trap returns for a signal at its default, as CRuby: "DEFAULT" for a
+   signal CRuby handles itself, nil for PIPE, "SYSTEM_DEFAULT" otherwise. */
+static const char *sp_trap_default_name(int no) {
+  switch (no) {
+  case SIGINT: case SIGHUP: case SIGQUIT: case SIGTERM:
+  case SIGALRM: case SIGUSR1: case SIGUSR2: case SIGCHLD:
+    return (&("\xff" "DEFAULT")[1]);
+  case SIGPIPE:
+    return NULL;
+  }
+  return (&("\xff" "SYSTEM_DEFAULT")[1]);
+}
 sp_RbVal sp_signal_trap(sp_RbVal sig, sp_RbVal handler) {SP_GC_ROOT_RBVAL(sig);SP_GC_ROOT_RBVAL(handler);
   int no = sp_signal_resolve(sig);
   if (no == SIGKILL || no == SIGSTOP)
     sp_raise_cls("Errno::EINVAL",
                  sp_sprintf("Invalid argument - SIG%s", sp_signal_signame(no)));
   /* the previous handler: a stored proc or command string; an untouched
-     signal reads "DEFAULT", except EXIT whose default handler is nil (#2839) */
+     signal reads its default (sp_trap_default_name), and EXIT nil (#2839) */
+  const char *dflt = no == 0 ? NULL : sp_trap_default_name(no);
   sp_RbVal prev = sp_trap_proc[no] ? sp_box_proc((sp_Proc *)sp_trap_proc[no])
                 : sp_trap_state[no] ? sp_box_str_fresh(sp_trap_state[no])
-                : no == 0 ? sp_box_nil()
-                : sp_box_str_fresh((&("\xff" "DEFAULT")[1]));
+                : dflt ? sp_box_str_fresh(dflt)
+                : sp_box_nil();
   SP_GC_ROOT_RBVAL(prev);
   if (handler.tag == SP_TAG_OBJ && handler.cls_id == SP_BUILTIN_PROC && handler.v.p) {
     sp_trap_proc[no] = (sp_Proc *)handler.v.p;
@@ -4502,11 +4857,12 @@ sp_RbVal sp_signal_trap(sp_RbVal sig, sp_RbVal handler) {SP_GC_ROOT_RBVAL(sig);S
     int ignore = strcmp(hs, "IGNORE") == 0 || strcmp(hs, "SIG_IGN") == 0;
     sp_trap_proc[no] = NULL;
     /* SYSTEM_DEFAULT reads back as itself (#2839); it installs SIG_DFL too.
+       DEFAULT reads back as the default of the signal (sp_trap_default_name).
        An EXIT string command clears the handler, whose read-back is nil. */
     sp_trap_state[no] = no == 0 ? NULL
                       : ignore ? (&("\xff" "IGNORE")[1])
                       : strcmp(hs, "SYSTEM_DEFAULT") == 0 ? (&("\xff" "SYSTEM_DEFAULT")[1])
-                      : (&("\xff" "DEFAULT")[1]);
+                      : dflt;
     if (no != 0) signal(no, ignore ? SIG_IGN : SIG_DFL);
   }
   return prev;
@@ -6472,14 +6828,9 @@ void sp_sleep(sp_float s) {
      monitor thread wakes it after the duration (see lib/sp_sched.c). */
   sp_sched_sleep((double)s);
 #else
-  struct timespec req;
-  req.tv_sec = (time_t)s;
-  req.tv_nsec = (long)((s - (double)req.tv_sec) * 1e9);
-  if (req.tv_nsec < 0) req.tv_nsec = 0;
-  if (req.tv_nsec >= 1000000000L) req.tv_nsec = 999999999L;
   /* a trap delivered meanwhile runs, and the sleep goes on, as CRuby's does */
-  while (SP_SIG_BLOCKING(nanosleep(&req, &req)) == -1 && errno == EINTR)
-    if (SP_ATOMIC_LOAD(&sp_sig_pending_flag, __ATOMIC_ACQUIRE)) sp_sig_run_pending();
+  extern void sp_sleep_plain(double seconds, int raise_in_sleep, void (*on_eintr)(void));   /* lib/sp_sched.c */
+  sp_sleep_plain((double)s, 1, sp_sig_after_wait);
 #endif
 }
 

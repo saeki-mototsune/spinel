@@ -2469,11 +2469,7 @@ static int subtree_has_param_named(const Compiler *c, int id, const char *nm) {
     const char *pn = nt_str(nt, id, "name");
     /* shadow-renaming rewrites a param's node-table name to NAME__bpNN;
        the parser's locals list keeps the raw NAME -- match both. */
-    if (pn) {
-      size_t nl = strlen(nm);
-      if (sp_streq(pn, nm)) return 1;
-      if (block_param_written_len(c, pn) == nl && !strncmp(pn, nm, nl)) return 1;
-    }
+    if (pn && (sp_streq(pn, nm) || sp_streq(nt_wname(nt, id), nm))) return 1;
   }
   int nr = nt_num_refs(nt, id);
   for (int i = 0; i < nr; i++)
@@ -2583,108 +2579,95 @@ void emit_param_cell_fresh(Compiler *c, int blk, const char *pname, Buf *b, int 
 }
 void emit_block_locals_reset(Compiler *c, int blk, Buf *b, int indent) {
   if (blk < 0) return;
-  const char *locs = nt_str(c->nt, blk, "locals");
-  if (!locs || !*locs) return;
-  char tmpn_buf[128];
-  const char *p = locs;
-  while (*p) {
-    const char *e = strchr(p, ',');
-    size_t l = e ? (size_t)(e - p) : strlen(p);
-    if (l) {
-      /* names longer than the stack buffer are legal Ruby; heap-fall back
-         rather than silently skipping the reset */
-      char *tmpn = l < sizeof tmpn_buf ? tmpn_buf : malloc(l + 1);
-      if (!tmpn) break;
-      memcpy(tmpn, p, l); tmpn[l] = 0;
-      /* Skip every name bound by the block's parameter list, including
-         destructured, optional, rest, and shadow (`; x`) declarations --
-         collected straight from the parameters subtree, since
-         block_param_name only covers plain leading params. */
-      int is_param = subtree_has_param_named(c, nt_ref(c->nt, blk, "parameters"), tmpn);
+  int nloc = 0;
+  const char *const *locs = nt_scope_locals(c->nt, blk, &nloc);
+  for (int li = 0; li < nloc; li++) {
+    const char *tmpn = locs[li];
+    /* Skip every name bound by the block's parameter list, including
+       destructured, optional and rest parameters -- collected straight
+       from the parameters subtree, since block_param_name only covers
+       plain leading params. A block-local (`; x`) binds no parameter, and
+       is reset. */
+    int is_param = subtree_has_param_named(c, nt_ref(c->nt, blk, "parameters"), tmpn);
 
-      if (is_param) {
-        /* A cell_shadow param is bound by the loop emitters WRITING THE PLAIN C
-           SLOT, while every read in the body already goes through the cell. The
-           publish used to sit at the capture fill -- the point the lifted proc
-           is built -- so every read before that read a cell still holding the
-           previous iteration's value, or nil on the first pass. Two nested
-           blocks and a `next` were enough to arrange it: doom's build_composite
-           saw `pref` as nil on the first patch of every texture and drew
-           nothing. The slot is current from the moment the loop writes it, so
-           publish here, at the top of the body, which is where the LocalVar
-           doc has always said the copy belongs. */
-        Scope *psc = comp_scope_of(c, blk);
-        LocalVar *plv = psc ? scope_local(psc, tmpn) : NULL;
-        if (plv && plv->is_cell && plv->cell_shadow) {
-          const char *prn = rename_local(tmpn);
-          /* Inlined inside a real proc function the cell is reachable only
-             through the capture struct, and the slot is not this frame's at
-             all -- there the capture fill is still the only publish. */
-          if (!(g_cap_struct && g_cap_names && nameset_has(g_cap_names, prn))) {
-            /* A fresh cell first, as a captured block-local gets below: the
-               parameter is bound anew by every iteration too, and one shared
-               cell had every proc a `&blk` callee stored answer the last
-               value the parameter took (#4462). */
-            char pcell_buf[160];
-            emit_fresh_cell(c, plv, cell_var_name(prn, pcell_buf, sizeof pcell_buf), b, indent);
-            emit_indent(b, indent);
-            if (plv->type == TY_PROC)
-              buf_printf(b, "*_cell_%s = (sp_int)(uintptr_t)lv_%s;\n", prn, prn);
-            else
-              buf_printf(b, "*_cell_%s = lv_%s;\n", prn, prn);
-          }
-        }
-      }
-      else {
-        Scope *sc = comp_scope_of(c, blk);
-        LocalVar *lv = sc ? scope_local(sc, tmpn) : NULL;
-        /* A captured (cell-backed) block-local gets a FRESH cell each
-           invocation: the capture struct copies the current cell pointer at
-           proc creation, so per-iteration closures each keep their own
-           binding -- one shared cell made every closure observe the final
-           iteration's value (#3230). The prologue's SP_GC_ROOT registered
-           the cell VARIABLE's address, so the reassignment stays rooted;
-           earlier cells stay live through their captures' scans. */
-        if (lv && lv->is_cell) {
-          const char *rn2 = rename_local(tmpn);
-          /* The cell VARIABLE is declared in the frame that owns the scope. A
-             block body is not always emitted into that frame: when an
-             enclosing block became a real proc function, this one is inlined
-             INSIDE it, and there the cell is reachable only through the
-             capture struct -- `_cell_terms` named nothing the function
-             declared and the C build stopped (#4127). Refreshing the capture
-             slot is also the right per-iteration semantics: a proc created in
-             this iteration copies the slot at creation, so it keeps this
-             iteration's binding. */
-          char cellv_buf[160];
-          const char *cellv = cell_var_name(rn2, cellv_buf, sizeof cellv_buf);
-          emit_fresh_cell(c, lv, cellv, b, indent);
-        }
-        else if (lv && lv->type != TY_UNKNOWN && !lv->is_cell) {
+    if (is_param) {
+      /* A cell_shadow param is bound by the loop emitters WRITING THE PLAIN C
+         SLOT, while every read in the body already goes through the cell. The
+         publish used to sit at the capture fill -- the point the lifted proc
+         is built -- so every read before that read a cell still holding the
+         previous iteration's value, or nil on the first pass. Two nested
+         blocks and a `next` were enough to arrange it: doom's build_composite
+         saw `pref` as nil on the first patch of every texture and drew
+         nothing. The slot is current from the moment the loop writes it, so
+         publish here, at the top of the body, which is where the LocalVar
+         doc has always said the copy belongs. */
+      Scope *psc = comp_scope_of(c, blk);
+      LocalVar *plv = psc ? scope_local(psc, tmpn) : NULL;
+      if (plv && plv->is_cell && plv->cell_shadow) {
+        const char *prn = rename_local(tmpn);
+        /* Inlined inside a real proc function the cell is reachable only
+           through the capture struct, and the slot is not this frame's at
+           all -- there the capture fill is still the only publish. */
+        if (!(g_cap_struct && g_cap_names && nameset_has(g_cap_names, prn))) {
+          /* A fresh cell first, as a captured block-local gets below: the
+             parameter is bound anew by every iteration too, and one shared
+             cell had every proc a `&blk` callee stored answer the last
+             value the parameter took (#4462). */
+          char pcell_buf[160];
+          emit_fresh_cell(c, plv, cell_var_name(prn, pcell_buf, sizeof pcell_buf), b, indent);
           emit_indent(b, indent);
-          /* A value-type object is stored inline (sp_X, not sp_X*), so its
-             empty/nil reset is a zeroed struct -- default_value_from_compiler(c, )'s blanket
-             "NULL" would assign a pointer to a struct lvalue (#3267). */
-          if (ty_is_object(lv->type) && c->classes[ty_object_class(lv->type)].is_value_type) {
-            buf_printf(b, "lv_%s = (sp_%s){0};\n", rename_local(tmpn),
-                       c->classes[ty_object_class(lv->type)].c_name);
-          }
-          else {
-            /* a block-local starts every iteration nil: an oint slot's nil,
-               a plain scalar's zero */
-            const char *nv = slot_is_oint(lv) ? oint_nil(lv->type) : nil_value(lv->type);
-            if (!nv) nv = lv->type == TY_RANGE ? "(sp_Range){0}" : default_value_from_compiler(c, lv->type);
-            buf_printf(b, "lv_%s = %s;\n", rename_local(tmpn), nv);
-          }
+          if (plv->type == TY_PROC)
+            buf_printf(b, "*_cell_%s = (sp_int)(uintptr_t)lv_%s;\n", prn, prn);
+          else
+            buf_printf(b, "*_cell_%s = lv_%s;\n", prn, prn);
         }
       }
-      if (tmpn != tmpn_buf) free(tmpn);
     }
-    if (!e) break;
-    p = e + 1;
+    else {
+      Scope *sc = comp_scope_of(c, blk);
+      LocalVar *lv = sc ? scope_local(sc, tmpn) : NULL;
+      /* A captured (cell-backed) block-local gets a FRESH cell each
+         invocation: the capture struct copies the current cell pointer at
+         proc creation, so per-iteration closures each keep their own
+         binding -- one shared cell made every closure observe the final
+         iteration's value (#3230). The prologue's SP_GC_ROOT registered
+         the cell VARIABLE's address, so the reassignment stays rooted;
+         earlier cells stay live through their captures' scans. */
+      if (lv && lv->is_cell) {
+        const char *rn2 = rename_local(tmpn);
+        /* The cell VARIABLE is declared in the frame that owns the scope. A
+           block body is not always emitted into that frame: when an
+           enclosing block became a real proc function, this one is inlined
+           INSIDE it, and there the cell is reachable only through the
+           capture struct -- `_cell_terms` named nothing the function
+           declared and the C build stopped (#4127). Refreshing the capture
+           slot is also the right per-iteration semantics: a proc created in
+           this iteration copies the slot at creation, so it keeps this
+           iteration's binding. */
+        char cellv_buf[160];
+        const char *cellv = cell_var_name(rn2, cellv_buf, sizeof cellv_buf);
+        emit_fresh_cell(c, lv, cellv, b, indent);
+      }
+      else if (lv && lv->type != TY_UNKNOWN && !lv->is_cell) {
+        emit_indent(b, indent);
+        /* A value-type object is stored inline (sp_X, not sp_X*), so its
+           empty/nil reset is a zeroed struct -- default_value_from_compiler(c, )'s blanket
+           "NULL" would assign a pointer to a struct lvalue (#3267). */
+        if (ty_is_object(lv->type) && c->classes[ty_object_class(lv->type)].is_value_type) {
+          buf_printf(b, "lv_%s = (sp_%s){0};\n", rename_local(tmpn),
+                     c->classes[ty_object_class(lv->type)].c_name);
+        }
+        else {
+          /* a block-local starts every iteration nil: an oint slot's nil,
+             a plain scalar's zero */
+          const char *nv = slot_is_oint(lv) ? oint_nil(lv->type) : nil_value(lv->type);
+          if (!nv) nv = lv->type == TY_RANGE ? "(sp_Range){0}" : default_value_from_compiler(c, lv->type);
+          buf_printf(b, "lv_%s = %s;\n", rename_local(tmpn), nv);
+        }
+      }
+    }
   }
 }
-
 /* The receiver's local name when it is a shared-mutable (TY_STRBUF) string
    local read, else NULL (#3227 shim gate). */
 const char *strbuf_local_name(Compiler *c, int recv) {
@@ -4903,6 +4886,23 @@ static int const_recv_hold(Compiler *c, int id, Buf *b, int *holds_slot, int stm
 int emit_const_class_call_wrap(Compiler *c, int id, Buf *b, void (*emit)(Compiler *, int, Buf *)) {
   if (nt_kind(c->nt, id) != NK_CallNode) return 0;
   int r = nt_ref(c->nt, id, "receiver");
+  /* a private constant read through its scope, as a call's receiver: the
+     read's NameError runs ahead of the call, which is emitted behind it for
+     its type alone */
+  {
+    static int in_private;
+    char pmsg[512];
+    if (r >= 0 && !in_private && const_path_private(c, r, pmsg, sizeof pmsg)) {
+      buf_puts(b, "({ sp_raise_cls(\"NameError\", \"");
+      emit_c_escaped_n(b, pmsg, strlen(pmsg));
+      buf_puts(b, "\"); ");
+      in_private = 1;
+      emit(c, id, b);
+      in_private = 0;
+      buf_puts(b, "; })");
+      return 1;
+    }
+  }
   if (r < 0 || !an_const_read_keeps_class(c, r) || const_value_recv(c, r) >= 0 || view_const_read_done(c, r)) return 0;
   for (int i = g_n_argov - 1; i >= 0; i--)
     if (g_argov_node[i] == id || g_argov_node[i] == r) return 0;
@@ -8291,10 +8291,8 @@ void arity_kw_suffix(const Compiler *c, int params, char *out, size_t n) {
   for (int i = 0, first = 1; i < nk && off < n; i++) {
     if (!param_is_required_kw(nt, kws[i])) continue;
     /* a block parameter's rename suffix (`k__bp3`) is ours, not the name */
-    const char *kn = nt_str(nt, kws[i], "name");
-    if (!kn) kn = "?";
-    int kl = block_param_is_renamed(c, kn) ? (int)block_param_written_len(c, kn) : (int)strlen(kn);
-    off += (size_t)snprintf(out + off, n - off, "%s%.*s", first ? "" : ", ", kl, kn);
+    const char *kn = nt_str(nt, kws[i], "name") ? nt_wname(nt, kws[i]) : "?";
+    off += (size_t)snprintf(out + off, n - off, "%s%s", first ? "" : ", ", kn);
     first = 0;
   }
 }
