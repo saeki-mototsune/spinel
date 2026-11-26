@@ -176,6 +176,7 @@ Compiler *comp_new(const NodeTable *nt) {
   if (!c->pow_signed) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   c->store_misfit_arg = calloc((size_t)n, 1);
   c->ivar_widen_src = calloc((size_t)n, 1);
+  c->box_lift_arr = calloc((size_t)n, 1);
   c->hash_want = calloc((size_t)n, sizeof(TyKind));
   c->arr_want = calloc((size_t)n, sizeof(TyKind));
   c->poly_builtin_ty = calloc((size_t)n, sizeof(TyKind));
@@ -187,12 +188,13 @@ Compiler *comp_new(const NodeTable *nt) {
   for (int k = 0; k < CORE_N; k++) c->core_cls[k] = -1;
   comp_node_pbases(c);
   comp_node_ords(c);   /* the parsed nodes, before any rewrite */
+  comp_name_locals(c, 0);   /* each local of a block, lambda or class body by its slot, tagged as the nodes are */
   nt_track_origins((NodeTable *)nt);   /* the appended ones, by origin */
   return c;
 }
 
 /* The number a name the compiler invents from a node carries (`__fwdc_12`,
-   `x__bp12`), in place of the node id. The builtins are spliced into the
+   `__cap_12_x`), in place of the node id. The builtins are spliced into the
    source ahead of the program, so every node a builtin gained or lost moved
    the id of every node after it, and with it a name in programs that never
    call that builtin. A program node is numbered by its place in table order
@@ -403,6 +405,91 @@ static void comp_node_ords(Compiler *c) {
   c->node_ord_parsed = n;
 }
 
+/* A subtree of a parsed snippet imported into the program (nt_import_subtree), its locals named by their scope. */
+int comp_import_subtree(Compiler *c, const NodeTable *src, int root) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  int first = nt->count, id = nt_import_subtree(nt, src, root);
+  if (id >= 0) comp_name_locals(c, first);
+  return id;
+}
+static int decl_is_frame_root(const NodeTable *nt, int d) {
+  NodeKind k = nt_kind(nt, d);
+  return k == NK_ProgramNode || k == NK_DefNode || nt_int(nt, d, "frame_root", 0);   /* (a define_method block, a method's body: nt_rekey_scope) */
+}
+/* Does a node of kind k bind or read a local variable (a write, read, parameter or block-local)? */
+static int comp_is_local_node(NodeKind k) {
+  return comp_is_local_write(k) || k == NK_LocalVariableReadNode || k == NK_RequiredParameterNode ||
+         k == NK_OptionalParameterNode || k == NK_RestParameterNode || k == NK_BlockParameterNode ||
+         k == NK_KeywordRestParameterNode || k == NK_RequiredKeywordParameterNode ||
+         k == NK_OptionalKeywordParameterNode || k == NK_BlockLocalVariableNode;
+}
+/* The nodes from `from` on that bind or read a local variable name it by the scope that declares it. The bridge
+   wrote the names as the program did and each node's `decl`; a local of a scope that is no frame root (a block,
+   lambda, class or module body; the roots are the program and a def) takes `B<n>_<tag of its scope>_<written>`
+   (nt_slot_name), the name written kept as `wname`. So do the scope's own `locals` and the `_1`.. names of a
+   numbered-parameters node (a lambda's on the lambda). A name is then one variable wherever a pass sees it,
+   before any of them runs; a snippet's nodes, appended since, are named the same way (sce_graft). */
+void comp_name_locals(Compiler *c, int from) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  for (int id = from; id < nt->count; id++) {
+    NodeKind k = nt_kind(nt, id);
+    if (!nt_type(nt, id)) continue;
+    if (comp_is_local_node(k)) {
+      int d = (int)nt_int(nt, id, "decl", -1);
+      const char *w = nt_str(nt, id, "name");
+      if (d < 0 || !w || nt_str(nt, id, "wname") || decl_is_frame_root(nt, d)) continue;
+      char *wr = strdup(w);
+      if (!wr) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      nt_node_set_str(nt, id, "wname", wr);
+      nt_node_set_str(nt, id, "name", nt_slot_name(nt, wr, comp_node_tag(c, d)));
+      free(wr);
+    }
+    else if (nt_str(nt, id, "dead_locals") && nt_int(nt, id, "decl", -1) >= 0 &&
+             !decl_is_frame_root(nt, (int)nt_int(nt, id, "decl", -1))) {
+      /* the locals a pruned branch wrote (spinel_parse.c) are the scope's: by their slots */
+      int d = (int)nt_int(nt, id, "decl", -1);
+      const char *tag = comp_node_tag(c, d);
+      char *dl = strdup(nt_str(nt, id, "dead_locals")), *out = NULL;
+      size_t cap = strlen(nt_str(nt, id, "dead_locals")) * 2 + strlen(tag) * 8 + 64, ol = 0;
+      if (dl) out = malloc(cap);
+      if (!dl || !out) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      out[0] = 0;
+      for (char *p = dl, *sv = NULL, *nm = strtok_r(p, ",", &sv); nm; nm = strtok_r(NULL, ",", &sv)) {
+        const char *slot = nt_slot_written(nt, nm) ? nm : nt_slot_name(nt, nm, tag);
+        size_t need = ol + strlen(slot) + 2;
+        if (need > cap) { cap = need * 2; out = realloc(out, cap); if (!out) exit(1); }
+        ol += (size_t)sprintf(out + ol, "%s%s", ol ? "," : "", slot);
+      }
+      nt_node_set_str(nt, id, "dead_locals", out);
+      free(dl); free(out);
+    }
+    if (k == NK_BlockNode || k == NK_LambdaNode || k == NK_ClassNode || k == NK_ModuleNode) {
+      int n = 0;
+      const char *const *ls = nt_scope_locals(nt, id, &n);
+      char *tag = n > 0 || k == NK_BlockNode || k == NK_LambdaNode ? strdup(comp_node_tag(c, id)) : NULL;
+      if (n > 0) {   /* each entry on its own: a list may hold slots (an import's) beside written names */
+        const char **out = malloc((size_t)n * sizeof *out);
+        if (!out) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+        for (int i = 0; i < n; i++) out[i] = nt_slot_written(nt, ls[i]) ? ls[i] : nt_slot_name(nt, ls[i], tag);
+        nt_scope_locals_set(nt, id, out, n);
+        free(out);
+      }
+      int np = -1, max = 0;
+      if (k == NK_LambdaNode) { np = id; max = (int)nt_int(nt, id, "numbered_max", 0); }
+      else if (k == NK_BlockNode) {
+        int pn = nt_ref(nt, id, "parameters");
+        if (pn >= 0 && nt_kind(nt, pn) == NK_NumberedParametersNode) { np = pn; max = (int)nt_int(nt, pn, "maximum", 0); }
+      }
+      for (int q = 1; np >= 0 && q <= max && q <= 9; q++) {
+        char key[8], w2[8];
+        snprintf(key, sizeof key, "n%d", q); snprintf(w2, sizeof w2, "_%d", q);
+        nt_node_set_str(nt, np, key, nt_slot_name(nt, w2, tag));
+      }
+      free(tag);
+    }
+  }
+}
+
 /* A parsed node's tag: "12" for a program node outside every def and class,
    "p5Model_5label_3" for one in a method (its base's key and its number
    there), and for a builtin's "q", its method's name and its number there
@@ -502,6 +589,7 @@ void comp_grow_node_arrays(Compiler *c) {
   if (!c->pow_signed) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   c->store_misfit_arg = realloc(c->store_misfit_arg, (size_t)n);
   c->ivar_widen_src = realloc(c->ivar_widen_src, (size_t)n);
+  c->box_lift_arr = realloc(c->box_lift_arr, (size_t)n);
   c->hash_want = realloc((TyKind *)c->hash_want, sizeof(TyKind) * (size_t)n);
   c->arr_want = realloc((TyKind *)c->arr_want, sizeof(TyKind) * (size_t)n);
   c->poly_builtin_ty = realloc((TyKind *)c->poly_builtin_ty, sizeof(TyKind) * (size_t)n);
@@ -511,8 +599,17 @@ void comp_grow_node_arrays(Compiler *c) {
   for (int i = c->node_cap; i < n; i++) c->bop_inf[i] = NULL;
   c->ucall_inf = realloc(c->ucall_inf, sizeof *c->ucall_inf * (size_t)n);
   memset(c->ucall_inf + c->node_cap, 0, sizeof *c->ucall_inf * (size_t)(n - c->node_cap));
-  for (int i = c->node_cap; i < n; i++) { ((TyKind *)c->ntype)[i] = TY_UNKNOWN; c->norigin[i] = -1; ((TyKind *)c->nilnarrow)[i] = TY_UNKNOWN; c->nscope[i] = 0; c->node_cbody[i] = -1; ((char *)c->empty_arr_recv)[i] = 0; ((char *)c->empty_hash_recv)[i] = 0; ((char *)c->empty_hash_arg)[i] = 0; ((char *)c->pow_signed)[i] = 0; c->store_misfit_arg[i] = 0; c->ivar_widen_src[i] = 0; ((TyKind *)c->hash_want)[i] = TY_UNKNOWN; ((TyKind *)c->arr_want)[i] = TY_UNKNOWN; ((TyKind *)c->poly_builtin_ty)[i] = TY_UNKNOWN; c->lw_joined[i] = TY_UNKNOWN; ((unsigned char *)c->strbuf_box)[i] = 0; ((unsigned char *)c->strbuf_handle_demand)[i] = 0; c->strbuf_read_raw[i] = 0; ((unsigned char *)c->poly_strbuf_lift)[i] = 0; ((unsigned char *)c->nil_tested)[i] = 0; ((unsigned char *)c->head_held)[i] = 0; ((unsigned char *)c->value_discarded)[i] = 0; ((unsigned char *)c->str_shadow)[i] = 0; }
+  for (int i = c->node_cap; i < n; i++) { ((TyKind *)c->ntype)[i] = TY_UNKNOWN; c->norigin[i] = -1; ((TyKind *)c->nilnarrow)[i] = TY_UNKNOWN; c->nscope[i] = 0; c->node_cbody[i] = -1; ((char *)c->empty_arr_recv)[i] = 0; ((char *)c->empty_hash_recv)[i] = 0; ((char *)c->empty_hash_arg)[i] = 0; ((char *)c->pow_signed)[i] = 0; c->store_misfit_arg[i] = 0; c->ivar_widen_src[i] = 0; c->box_lift_arr[i] = 0; ((TyKind *)c->hash_want)[i] = TY_UNKNOWN; ((TyKind *)c->arr_want)[i] = TY_UNKNOWN; ((TyKind *)c->poly_builtin_ty)[i] = TY_UNKNOWN; c->lw_joined[i] = TY_UNKNOWN; ((unsigned char *)c->strbuf_box)[i] = 0; ((unsigned char *)c->strbuf_handle_demand)[i] = 0; c->strbuf_read_raw[i] = 0; ((unsigned char *)c->poly_strbuf_lift)[i] = 0; ((unsigned char *)c->nil_tested)[i] = 0; ((unsigned char *)c->head_held)[i] = 0; ((unsigned char *)c->value_discarded)[i] = 0; ((unsigned char *)c->str_shadow)[i] = 0; }
   c->node_cap = n;
+}
+
+int comp_cache_check_on(void) {
+  static int on = -1;
+  if (on < 0) {
+    const char *e = getenv("SPINEL_CACHE_CHECK");
+    on = (e && e[0] && !sp_streq(e, "0")) ? 1 : 0;
+  }
+  return on;
 }
 
 void comp_free(Compiler *c) {
@@ -528,7 +625,6 @@ void comp_free(Compiler *c) {
   free(c->cext_stubs);
   for (int i = 0; i < c->n_cext_classes; i++) free(c->cext_classes[i].path);
   free(c->cext_classes);
-  share_facts_free(c);
   dsn_free(c);
   order_facts_free(c);
   free(c->ie_map.cls); free(c->ie_map.nonobj); free(c->ie_map.own); free(c->ie_map.pending);
@@ -580,6 +676,8 @@ void comp_free(Compiler *c) {
   for (int i = 0; i < c->nver_late; i++) free(c->ver_late[i].name);
   free(c->ver_late); c->ver_late = NULL; c->nver_late = 0;
   ver_hold_free(c);
+  scopes_by_name_free(c);
+  name_owners_free(c);
   main_chain_free(c);
   ver_chain_free(c);
   new_inits_free(c);
@@ -599,17 +697,13 @@ void comp_free(Compiler *c) {
   free(c->ver_vis_call_cell); c->ver_vis_call_cell = NULL; c->ver_vis_call_cap = 0;
   free(c->ver_vis_scope_mark); c->ver_vis_scope_mark = NULL; c->ver_vis_scope_cap = 0;
   free(c->ver_vis_hist_seen); c->ver_vis_hist_seen = NULL; c->ver_vis_hist_cap = 0; c->ver_vis_guard_stamp = 0;
-  for (int i = 0; i < c->nrbp_slots; i++) { free(c->rbp_slot_names[i]); free(c->rbp_slot_written[i]); }
-  free(c->rbp_slot_names); free(c->rbp_slot_written); c->rbp_slot_names = NULL; c->rbp_slot_written = NULL; c->nrbp_slots = 0;
-  if (c->bp_name) for (unsigned i = 0; i <= c->bp_mask; i++) free(c->bp_name[i]);
-  free(c->bp_name); free(c->bp_blk); c->bp_name = NULL; c->bp_blk = NULL; c->bp_mask = 0; c->nbp = 0;
-  for (int i = 0; i < c->nbp_user; i++) free(c->bp_user[i]);
-  free(c->bp_user); c->bp_user = NULL; c->nbp_user = 0; c->bp_user_built = 0;
   for (int i = 0; i < c->ndef_asked; i++) free(c->def_asked[i]);
   free(c->def_asked); c->def_asked = NULL; c->ndef_asked = c->cdef_asked = 0;
   c->pres_names = NULL; c->pres_flags = NULL; c->npres = c->cpres = 0;
   free(c->nil_fact);
   free(c->nil_elem_fact);
+  free(c->scope_may_raise);
+  free(c->node_elide_setjmp);
   free(c->cls_fact); cls_pool_free(c->cls_pool, c->ncls_pool); free(c->cls_bk_sub); free(c->cls_bk_sub_ok); cplan_send_owners_free(c); cplan_memo_free(c);
   free(c->send_param_memo);
   free(c->node_ord); free(c->node_base); free(c->node_pbase);
@@ -703,6 +797,10 @@ void comp_free(Compiler *c) {
   }
   free(c->ffi_sources);
   free(c->nscope);
+  free(c->scope_ret_has);
+  c->scope_ret_has = NULL;
+  c->scope_ret_nscopes = 0;
+  c->scope_ret_built = 0;
   free((unsigned char *)c->str_shadow);
   if (c->stmt_wr_names)
     for (int i = 0; i < c->stmt_wr_cap; i++) free(c->stmt_wr_names[i]);
@@ -716,6 +814,7 @@ void comp_free(Compiler *c) {
   free((char *)c->pow_signed);
   free(c->store_misfit_arg);
   free(c->ivar_widen_src);
+  free(c->box_lift_arr);
   free((TyKind *)c->hash_want);
   free(c->ctr_site_node); free(c->ctr_site_kind); free(c->ctr_site_kind_of);
   free((TyKind *)c->arr_want);
@@ -1061,7 +1160,6 @@ Scope *comp_scope_new(Compiler *c, const char *name, int def_node) {
   }
   Scope *s = &c->scopes[c->nscopes++];
   memset(s, 0, sizeof(*s));
-  s->ret_param = -1;
   s->name = name ? strdup(name) : NULL;
   { s->def_node = def_node; comp_touch_scope(s->idx); }
   { s->body = -1; comp_touch_scope(s->idx); }
@@ -2537,6 +2635,18 @@ int comp_poly_arm_reader_any(Compiler *c, const char *name, int argc) {
   return 0;
 }
 
+/* Is there a class whose hash is a reader rather than a def? */
+int comp_has_hash_reader(Compiler *c) {
+  int n;
+  const int *owners = comp_name_reader_owners(c, "hash", &n);
+  for (int i = 0; i < n; i++) {
+    int mi = comp_name_responder(c, owners[i], "hash", CT_OWN);
+    /* A reader over an inherited method has its own synthesized def. */
+    if (mi < 0 || nt_int(c->nt, c->scopes[mi].def_node, "reader_over_inherited_def", 0)) return 1;
+  }
+  return 0;
+}
+
 /* See compiler.h. Kept as comp_name_reader_any's answers are, under the same
    stamps, in a table of its own: the names, each one's list and count. */
 static char **rdo_name; static int **rdo_list; static int *rdo_n; static int rdo_cap, rdo_cnt;
@@ -2760,9 +2870,9 @@ int comp_arysub_reopen(Compiler *c, int cid) {
 /* The String subclasses whose instances answer `name` with a public method
    or reader of their own, not the String reopen's: a boxed instance is its
    String handle, and the dispatch on `name` keeps it for the class switch
-   (emit_poly_recv_deref, emit_poly_str_guard). Ascending; *n their count.
+   (emit_poly_recv_deref, emit_str_kind_test). Ascending; *n their count.
    The list is kept until the next ask. */
-const int *comp_strsub_own_classes(Compiler *c, const char *name, int *n) {
+const int *comp_strsub_own_classes(Compiler *c, const char *name, StrOwnVis vis, int *n) {
   static int *ks; static int cap;
   int cnt = 0;
   mtab_enter(c);   /* (the candidate owner of the String subclasses that answer name: no call's question) */
@@ -2771,7 +2881,7 @@ const int *comp_strsub_own_classes(Compiler *c, const char *name, int *n) {
     int dc = -1, ro = comp_arysub_reopen(c, k);
     if (!((comp_method_in_chain(c, k, name, &dc) >= 0 && (ro < 0 || dc != ro)) ||
           comp_reader_in_chain(c, k, name, NULL))) continue;
-    if (comp_method_vis_in_chain(c, k, name) != SP_VIS_PUBLIC) continue;
+    if (vis == STROWN_PUBLIC && comp_method_vis_in_chain(c, k, name) != SP_VIS_PUBLIC) continue;
     if (cnt == cap) {
       cap = cap ? cap * 2 : 8;
       ks = realloc(ks, sizeof(int) * (size_t)cap);
@@ -4389,9 +4499,119 @@ void comp_poly_candidates_reset(void) {
   for (struct pc_entry *e = pc_retired; e; ) { struct pc_entry *nx = e->next; free(e->name); free(e->cands); free(e->overridden); free(e); e = nx; }
   pc_retired = NULL;
 }
-static void pc_build(Compiler *c, const char *name, PolyCand **out, int *n_out) {
-  PolyCand *v = NULL; int n = 0, cap = 0;
+/* The index of where a name can be answered, for the candidate build and for a class's chain names: each name by the
+   classes that own a scope, a reader or an alias of it, and each class by the scopes it owns (top-level scopes under
+   class nclasses). A class answers a name through its own chain only (chain_lookup follows the parent links and
+   resolves aliases from the class's own table), so the classes that can answer it are the owners and their
+   descendants, with the native classes and those under one, which are always listed. Made on the first ask after the
+   scopes, the class count, the reader and alias tables or the class shape move, and only while the scope index is
+   frozen and no scope is moved; any other ask scans every class or scope as before. */
+struct NameOwners {
+  unsigned gen, tgen, shape; int nscopes, nclasses;
+  ANameHash names; char **key; int *head, *ent_cls, *ent_next, nent, cent;   /* per name: its owners */
+  int *always, nalways;   /* the native classes and those below one */
+  int *sc_head, *sc_next;   /* per class (and top level), its scopes in order */
+  int *mark, tick;   /* a class's candidacy by the name being asked */
+};
+void name_owners_free(Compiler *c) {
+  struct NameOwners *m = c->name_owners;
+  if (!m) return;
+  for (int i = 0; i < m->names.n; i++) free(m->key[i]);
+  anh_free(&m->names);
+  free(m->key); free(m->head); free(m->ent_cls); free(m->ent_next); free(m->always); free(m->sc_head); free(m->sc_next); free(m->mark); free(m);
+  c->name_owners = NULL;
+}
+static int owner_int_cmp(const void *a, const void *b) { return *(const int *)a - *(const int *)b; }
+static void name_owner_add(struct NameOwners *m, const char *name, int cls) {
+  int ix = anh_find(&m->names, name);
+  if (ix < 0) {
+    ix = m->names.n;
+    if (!(m->key = realloc(m->key, sizeof *m->key * (size_t)(ix + 1))) || !(m->head = realloc(m->head, sizeof(int) * (size_t)(ix + 1))) ||
+        !(m->key[ix] = strdup(name))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    anh_add(&m->names, m->key[ix]);
+    m->head[ix] = -1;
+  }
+  if (m->nent == m->cent) {
+    m->cent = m->cent ? 2 * m->cent : 256;
+    if (!(m->ent_cls = realloc(m->ent_cls, sizeof(int) * (size_t)m->cent)) || !(m->ent_next = realloc(m->ent_next, sizeof(int) * (size_t)m->cent))) {
+      fprintf(stderr, "spinel: out of memory\n"); exit(1);
+    }
+  }
+  m->ent_cls[m->nent] = cls; m->ent_next[m->nent] = m->head[ix]; m->head[ix] = m->nent++;
+}
+static struct NameOwners *name_owners(Compiler *c) {
+  if (!sm_frozen || mv_n || c->nclasses <= 0) return NULL;
+  struct NameOwners *m = c->name_owners;
+  if (m && (m->gen != sm_gen || m->tgen != comp_table_gen || m->shape != cmc_shape || m->nscopes != c->nscopes || m->nclasses != c->nclasses)) {
+    name_owners_free(c); m = NULL;
+  }
+  if (m) return m;
+  if (!(m = c->name_owners = calloc(1, sizeof *m))) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  m->gen = sm_gen; m->tgen = comp_table_gen; m->shape = cmc_shape; m->nscopes = c->nscopes; m->nclasses = c->nclasses;
+  m->sc_head = malloc(sizeof(int) * (size_t)(c->nclasses + 1));
+  m->sc_next = malloc(sizeof(int) * (size_t)(c->nscopes + 1));
+  m->mark = calloc((size_t)c->nclasses, sizeof(int));
+  m->always = malloc(sizeof(int) * (size_t)c->nclasses);
+  if (!m->sc_head || !m->sc_next || !m->mark || !m->always) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  for (int k = 0; k <= c->nclasses; k++) m->sc_head[k] = -1;
+  for (int sc = c->nscopes - 1; sc >= 0; sc--) {
+    const Scope *s = &c->scopes[sc];
+    int k = s->class_id >= 0 && s->class_id < c->nclasses ? s->class_id : s->class_id < 0 ? c->nclasses : -1;
+    if (k < 0) continue;
+    m->sc_next[sc] = m->sc_head[k]; m->sc_head[k] = sc;
+    if (k < c->nclasses && s->name) {
+      name_owner_add(m, s->name, k);
+      if (s->mixin_guarded) name_owner_add(m, comp_scope_user_name(s), k);
+    }
+  }
   for (int k = 0; k < c->nclasses; k++) {
+    const ClassInfo *ci = &c->classes[k];
+    for (int r = 0; r < ci->nreaders; r++) name_owner_add(m, ci->readers[r], k);
+    for (int a = 0; a < ci->naliases; a++) name_owner_add(m, ci->alias_new[a], k);
+    if (ci->is_native_class || ci->nsub_root > 0) m->always[m->nalways++] = k;
+  }
+  return m;
+}
+/* The classes that can answer name by their own chain, ascending (malloc'd, *n of them), or NULL while the index is
+   not available: the caller asks every class. */
+static int *pc_classes_of(Compiler *c, const char *name, int *n) {
+  struct NameOwners *m = name_owners(c);
+  if (!m) return NULL;
+  int *out = malloc(sizeof(int) * (size_t)c->nclasses), cnt = 0, ix = anh_find(&m->names, name);
+  if (!out) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  m->tick++;
+  for (int i = 0; i < m->nalways; i++) if (m->mark[m->always[i]] != m->tick) { m->mark[m->always[i]] = m->tick; out[cnt++] = m->always[i]; }
+  for (int e = ix >= 0 ? m->head[ix] : -1; e >= 0; e = m->ent_next[e]) {
+    int nd = 0, o = m->ent_cls[e];
+    const int *ds = comp_descendants(c, o, &nd);
+    for (int i = -1; i < nd; i++) {
+      int k = i < 0 ? o : ds[i];
+      if (m->mark[k] != m->tick) { m->mark[k] = m->tick; out[cnt++] = k; }
+    }
+  }
+  if (cnt > 1) qsort(out, (size_t)cnt, sizeof *out, owner_int_cmp);
+  *n = cnt;
+  return out;
+}
+/* See compiler.h. */
+int *comp_class_scopes(Compiler *c, int cls, int *n) {
+  struct NameOwners *m = name_owners(c);
+  int *out = malloc(sizeof(int) * (size_t)(c->nscopes + 1)), cnt = 0;
+  if (!out) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  if (!m) {
+    for (int sc = 0; sc < c->nscopes; sc++)
+      if (c->scopes[sc].class_id == cls || (cls < 0 && c->scopes[sc].class_id < 0)) out[cnt++] = sc;
+  }
+  else
+    for (int sc = m->sc_head[cls < 0 ? c->nclasses : cls]; sc >= 0; sc = m->sc_next[sc]) out[cnt++] = sc;
+  *n = cnt;
+  return out;
+}
+static void pc_build(Compiler *c, const char *name, PolyCand **out, int *n_out) {
+  PolyCand *v = NULL; int n = 0, cap = 0, nks = 0;
+  int *ks = pc_classes_of(c, name, &nks);   /* (the classes that can answer it, or every class) */
+  for (int i = 0; i < (ks ? nks : c->nclasses); i++) {
+    int k = ks ? ks[i] : i;
     PolyCand pc; pc.cls = k; pc.rdcls = -1; pc.native = c->classes[k].is_native_class;
     int mdc = -1, rdc = -1;
     pc.mi = comp_method_in_chain(c, k, name, &mdc);
@@ -4409,6 +4629,7 @@ static void pc_build(Compiler *c, const char *name, PolyCand **out, int *n_out) 
     if (n == cap) { cap = cap ? cap * 2 : 8; v = realloc(v, sizeof *v * (size_t)cap); }
     v[n++] = pc;
   }
+  free(ks);
   *out = v; *n_out = n;
 }
 static struct pc_entry *pc_memo(Compiler *c, const char *name) {
@@ -5930,6 +6151,64 @@ void scope_locals_removed(Scope *s) {
   free(s->lidx); s->lidx = NULL; s->lidx_cap = 0;
 }
 
+typedef struct { const char *slot, *wr; int frame, decl, node; } LnEntry;
+static int ln_by_slot(const void *x, const void *y) {
+  const LnEntry *a = x, *b = y;
+  if (a->frame != b->frame) return a->frame < b->frame ? -1 : 1;
+  int r = strcmp(a->slot, b->slot);
+  return r ? r : a->decl != b->decl ? (a->decl < b->decl ? -1 : 1) : a->node - b->node;
+}
+static int ln_by_decl(const void *x, const void *y) {
+  const LnEntry *a = x, *b = y;
+  if (a->decl != b->decl) return a->decl < b->decl ? -1 : 1;
+  int r = strcmp(a->wr, b->wr);
+  return r ? r : a->node - b->node;
+}
+/* The slot invariant of the local names (comp_name_locals): every local a scope that is no frame root
+   declares carries a slot name, recorded with the name the program wrote (its `wname`); within a frame (the def
+   or the program a scope is in) a slot names one declaration (the declaring scope and the name written) and a
+   declaration has one slot. A copy of a scope (nt_clone_subtree, `clone_of`) is its source's declaration, run
+   at another place; a pass that makes a new declaration of a written name gives it a slot of its own.
+   It does not cover: a local with no `decl` (a temporary a pass invents: `__pv`, `__py`, `__ewi_v`, `__sm_*`,
+   `__bs*`, and the nodes subtree_rename_local gives a model of -1), whose name is the pass's own and is not
+   proved unique here; the slots a pass names itself (P_, D<n>_), checked only to be recorded; and the copies of
+   a scope, which share their source's slots by design (two copies in one frame are not reported). */
+void local_names_check(Compiler *c) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  const int *par = nt_parents(nt);
+  LnEntry *e = NULL; int n = 0, cap = 0;
+  for (int id = 0; id < nt->count; id++) {
+    NodeKind k = nt_kind(nt, id);
+    if (!nt_type(nt, id)) continue;
+    if (!comp_is_local_node(k)) continue;
+    const char *nm = nt_str(nt, id, "name");
+    int d = (int)nt_int(nt, id, "decl", -1);
+    if (!nm || d < 0 || d >= nt->count) continue;
+    const char *w = nt_wname(nt, id);
+    if (!decl_is_frame_root(nt, d) && (!nt_slot_written(nt, nm) || strcmp(nt_slot_written(nt, nm), w))) {
+      fprintf(stderr, "plan-check: local-name: node %d %s %s of scope %d (%s) carries no slot of its written name\n",
+              id, nt_type(nt, id), nm, d, nt_type(nt, d));
+      continue;
+    }
+    int fr = d;
+    while (fr >= 0 && !decl_is_frame_root(nt, fr)) fr = par[fr];
+    if (n == cap) { cap = cap ? 2 * cap : 256; e = realloc(e, (size_t)cap * sizeof *e); if (!e) { fprintf(stderr, "spinel: out of memory\n"); exit(1); } }
+    e[n++] = (LnEntry){ nm, w, fr, (int)nt_int(nt, d, "clone_of", d), id };
+  }
+  qsort(e, (size_t)n, sizeof *e, ln_by_slot);
+  for (int i = 1; i < n; i++)
+    if (e[i].frame == e[i - 1].frame && !strcmp(e[i].slot, e[i - 1].slot) && e[i].decl != e[i - 1].decl)
+      fprintf(stderr, "plan-check: local-name: slot %s names the declarations of scopes %d and %d (nodes %d, %d)\n",
+              e[i].slot, e[i - 1].decl, e[i].decl, e[i - 1].node, e[i].node);
+  qsort(e, (size_t)n, sizeof *e, ln_by_decl);
+  for (int i = 1; i < n; i++)
+    if (e[i].decl == e[i - 1].decl && !strcmp(e[i].wr, e[i - 1].wr) && strcmp(e[i].slot, e[i - 1].slot) &&
+        nt_slot_minted(nt, e[i].slot) && nt_slot_minted(nt, e[i - 1].slot))
+      fprintf(stderr, "plan-check: local-name: `%s` of scope %d has slots %s and %s (nodes %d, %d)\n",
+              e[i].wr, e[i].decl, e[i - 1].slot, e[i].slot, e[i - 1].node, e[i].node);
+  free(e);
+}
+
 /* Record the name the program wrote for slot lv: none when it is the slot's own */
 void lv_set_wname(LocalVar *lv, const char *wname) {
   if (wname == lv->wname) return;
@@ -5985,7 +6264,9 @@ LocalVar *scope_local_intern(Scope *s, const char *name) {
   lv->boxed_store_val = TY_UNKNOWN;
   lv->store_key_src = 0;
   lv->store_val_src = 0;
+  lv->store_push_src = 0;
   lv->store_elems_src = 0;
+  lv->store_splat_src = 0;
   lv->store_merge_src = 0;
   lv->store_merge_nblocks = 0;
   lv->store_rest_src = 0;
@@ -6106,34 +6387,6 @@ const char *comp_super_bowner(Compiler *c, const Scope *s, const char *uname) {
   return root ? builtin_super_owner(root, uname, self && !s->is_prepend_copy) : NULL;
 }
 
-/* Does lower_builtin_supers lower a super in site scope st named uname whose
-   plan names builtin bowner? Not every owner has a call path from a program
-   object's self yet: each family is carried when its path is (the owners
-   not carried keep the ladder in emit_super, which answers them, as before).
-   Carried: a Kernel module function that takes no block (BSP_KERNEL: called
-   bare, as `Kernel.format` is); a super in an Array, Hash, String or Time
-   subclass (the instance is the builtin's value) for the names the Array
-   path answers (comp_arysub_builtin_name; BSP_ARRAY, which passes the
-   method's block on); a method a module prepended to a builtin reopening put
-   in front of the builtin's (BSP_PREPENDED). A module included into a
-   reopened builtin, and a prepended one's self typed as the builtin's value,
-   have no such path: `self.m` there reaches no method at run time, or
-   returns an Enumerator where the method answers a boxed value. */
-BsuperPath comp_bsuper_carried(Compiler *c, int id, const Scope *st, const char *uname, const char *bowner) {
-  /* (the stand-in a version entry's else arm calls for the call made before a later include or prepend is that
-     call's method: a Kernel function is private, and the visibility-blind call a lowered super is would answer an
-     explicit receiver where CRuby raises) */
-  if (builtin_owner_kind(bowner) == BOWN_KERNEL && !st->super_behind && is_kernel_module_function(uname) && !is_frame_reading_function(uname) &&
-      !iter_row(BOP_KERNEL, uname, -1, 0))
-    return BSP_KERNEL;
-  int self = 0;
-  const char *root = comp_super_builtin_root(c, st->class_id, &self);
-  int slot = root ? builtin_core_class_slot(root) : -1;
-  if (st->is_prepend_copy && self && slot >= 0 && slot != CORE_OBJECT && is_builtin_reopen_name(root)) return BSP_PREPENDED;
-  /* (Array's initialize and initialize_copy are rewrite_array_subclass_super's) */
-  return comp_ary_root(c, st->class_id) >= 0 && !is_initialize_family(uname) && comp_arysub_builtin_name(c, id, st->class_id, uname) ? BSP_ARRAY : BSP_NONE;
-}
-
 /* The proc-form clone scope `s` runs, or -1. A def that was cloned holds its
    clone (Scope.pf_clone). A yielding def that lost its name to a later one in
    its class, a reopen or a copy an include makes (pf_by_name), runs the clone
@@ -6196,7 +6449,7 @@ int comp_zsuper_plain_params(Compiler *c, const Scope *s, int *out, int cap) {
 /* The plain argument count a super passes, or -1 for a splat, a keyword
    or a forwarded list: a bare super's comes from the method's requireds
    and optionals (comp_zsuper_plain_params). */
-static int super_plain_argc(Compiler *c, int id, const Scope *s) {
+int comp_super_plain_argc(Compiler *c, int id, const Scope *s) {
   const NodeTable *nt = c->nt;
   if (nt_kind(nt, id) == NK_ForwardingSuperNode) return comp_zsuper_plain_params(c, s, NULL, 0);
   int sa = nt_ref(nt, id, "arguments"), n = 0;
@@ -6208,8 +6461,20 @@ static int super_plain_argc(Compiler *c, int id, const Scope *s) {
   }
   return n;
 }
+/* See compiler.h. */
+int comp_super_blockarg_effect(const NodeTable *nt, int id) {
+  int bk = nt_ref(nt, id, "block");
+  int e = bk >= 0 && nt_kind(nt, bk) == NK_BlockArgumentNode ? nt_ref(nt, bk, "expression") : -1;
+  /* a variable's read has no effect, and a block parameter of the
+     method is not in scope where the fold is emitted */
+  NodeKind ek = e >= 0 ? nt_kind(nt, e) : NK_NilNode;
+  if (e < 0 || ek == NK_LocalVariableReadNode || ek == NK_InstanceVariableReadNode ||
+      ek == NK_GlobalVariableReadNode || ek == NK_NilNode || ek == NK_SymbolNode)
+    return -1;
+  return e;
+}
 const BuiltinOp *comp_super_kernel_row(Compiler *c, const Scope *s, const char *uname, int id) {
-  const BuiltinOp *op = uname ? bop_find(BOP_KERNEL, uname, super_plain_argc(c, id, s), 0) : NULL;
+  const BuiltinOp *op = uname ? bop_find(BOP_KERNEL, uname, comp_super_plain_argc(c, id, s), 0) : NULL;
   return op && !(op->flags & BOPF_INTERNAL) ? op : NULL;
 }
 int comp_super_object_builtin(Compiler *c, const Scope *s, const char *uname, int id) {
@@ -6220,14 +6485,18 @@ int comp_super_object_builtin(Compiler *c, const Scope *s, const char *uname, in
      (Exception's private one) answer as the row does */
   const BuiltinOp *krow = comp_super_kernel_row(c, s, uname, id);
   int any_core = krow != NULL;
-  if (sp_streq(uname, "==") || sp_streq(uname, "equal?")) { kind = SUPER_OBJ_SAME; nargs = 1; }
-  else if (sp_streq(uname, "eql?")) { kind = SUPER_OBJ_SAME; nargs = 1; kernel = 1; }
-  else if (sp_streq(uname, "!")) kind = SUPER_OBJ_FALSE;
-  else if (sp_streq(uname, "nil?")) { kind = SUPER_OBJ_FALSE; kernel = 1; }
-  else if (sp_streq(uname, "frozen?")) { kind = SUPER_OBJ_FROZEN; kernel = 1; }
-  else if (sp_streq(uname, "itself")) { kind = SUPER_OBJ_SELF; kernel = 1; }
-  else if (any_core) { kind = SUPER_OBJ_ROW; nargs = super_plain_argc(c, id, s); kernel = 1; }
-  if (!kind || super_plain_argc(c, id, s) != nargs) return 0;
+  switch (object_super_arm(uname)) {
+  case OSA_SAME: kind = SUPER_OBJ_SAME; nargs = 1; break;
+  case OSA_KERNEL_SAME: kind = SUPER_OBJ_SAME; nargs = 1; kernel = 1; break;
+  case OSA_FALSE: kind = SUPER_OBJ_FALSE; break;
+  case OSA_KERNEL_FALSE: kind = SUPER_OBJ_FALSE; kernel = 1; break;
+  case OSA_FROZEN: kind = SUPER_OBJ_FROZEN; kernel = 1; break;
+  case OSA_SELF: kind = SUPER_OBJ_SELF; kernel = 1; break;
+  default:
+    if (any_core) { kind = SUPER_OBJ_ROW; nargs = comp_super_plain_argc(c, id, s); kernel = 1; }
+    break;
+  }
+  if (!kind || comp_super_plain_argc(c, id, s) != nargs) return 0;
   /* (Comparable reached through Object's own include answers == too) */
   if (!any_core && (!comp_plain_class(c, s->class_id) || class_is_comparable(c, s->class_id))) return 0;
   /* the method runs for a subclass's instance too, and a subclass that

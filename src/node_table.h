@@ -18,6 +18,8 @@
 
 #include <stddef.h>
 #include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 #include "types.h"   /* sp_streq -- used by the node-table accessors below */
 
 /* Field lookups are by NAME and are the compiler's hottest operation
@@ -77,9 +79,9 @@ typedef struct {
                           library file (nt_put_file_tier); 0 (SP_LIB_NONE) for
                           the program's own; nfile_tier its length */
   int nfile_tier;
-  /* Under --load-model=graph (#9898) each file the program loads is a root:
-     its ProgramNode, by graph id (0 is the entry, the table's root). None
-     under the inline model, whose one root is root_id (nt_root). */
+  /* Each file the program loads is a root (#9898): its ProgramNode, by
+     graph id (0 is the entry, the table's root). None on a table no parse
+     of a program made, whose one root is root_id (nt_root). */
   int *file_roots;
   int nfile_roots;
   /* Bumped whenever a node is added or a string field is rewritten, i.e. by
@@ -126,6 +128,7 @@ typedef struct {
      be reading. */
   int **kind_ids;
   int *kind_n, *kind_cap;
+  unsigned *kind_gen;
   int kind_count;
   int *kind_moved, nkind_moved, ckind_moved;
   int kind_live;
@@ -145,6 +148,10 @@ typedef struct {
      until the first ask */
   struct NtScopeSplit *splits;
   int nsplits;
+  /* the name written for each slot a pass named (nt_slot_name, nt_set_local_name) */
+  struct NtSlots *slots;
+  /* the scopes the parse is flattening, outermost first (nt_build_scope_push): freed with the table */
+  int *build_scope, nbuild_scope, cbuild_scope;
   /* how many times a call was marked to bind the builtin's own method
      (nt_mark_builtin_call): none, and no call is marked, which an ask can
      tell without a node read (a clone copies a marked node's mark) */
@@ -210,6 +217,13 @@ struct NtScopeSplit {
   int n;
 };
 
+struct NtSlots {
+  char **slot, **written;
+  unsigned char *minted;
+  int n, cap;
+  int *hash, hcap;   /* open addressing over slot[]: index + 1, 0 empty */
+};
+
 /* The roots of the program's files, entry first (see file_roots). */
 static inline int nt_nroots(const NodeTable *nt) { return nt->nfile_roots ? nt->nfile_roots : 1; }
 static inline int nt_root(const NodeTable *nt, int i) { return nt->nfile_roots ? nt->file_roots[i] : nt->root_id; }
@@ -272,6 +286,9 @@ static inline NodeKind nt_kind(const NodeTable *nt, int id) {
    Lets a pass iterate only the nodes it cares about instead of scanning the
    whole table and filtering by kind. *count receives the number of ids. */
 const int *nt_nodes_of_kind(const NodeTable *nt, NodeKind k, int *count);
+/* Generation counter for kind `k`'s id list: bumped whenever a node of kind
+   `k` is added, removed, retyped, swapped, or renumbered. */
+unsigned nt_kind_gen(const NodeTable *nt, NodeKind k);
 
 /* Iterate the ids of kind KIND (ascending), binding each to a fresh `int IDV`:
      NT_FOREACH_KIND(nt, NK_CallNode, id) { ... use id ... }
@@ -338,6 +355,8 @@ void nt_renumber(NodeTable *nt, const int *order);
    Appends nodes and grows nt->count -- parallel per-node arrays must be
    resized to match afterward. */
 int nt_clone_subtree(NodeTable *nt, int root);
+/* Does any node under `root` have kind `k`? (descends every ref and array field) */
+int nt_subtree_has_kind(const NodeTable *nt, int root, NodeKind k);
 /* The ids of the subtrees at roots[0..n), each once, in walk order (a node
    two roots share is listed once): a malloc'd list the caller frees, its
    length in *out. A walk of those subtrees alone. */
@@ -691,6 +710,15 @@ static inline int nt_argv_splat_count(const NodeTable *nt, const int *argv, int 
     if (nt_kind(nt, argv[i]) == NK_SplatNode) n++;
   return n;
 }
+/* A keyword hash of `**h` splats alone (`f(**h)`, `f(**a, **b)`), which
+   passes nothing when they are all empty, where a `k: v` always passes. */
+static inline int nt_kwh_splats_only(const NodeTable *nt, int kwh) {
+  int en = 0;
+  const int *els = nt_kind(nt, kwh) == NK_KeywordHashNode ? nt_arr(nt, kwh, "elements", &en) : NULL;
+  for (int e = 0; e < en; e++)
+    if (nt_kind(nt, els[e]) != NK_AssocSplatNode) return 0;
+  return en > 0;
+}
 /* CONTAINS_KEYWORDS: does the call pass keyword arguments -- a literal
    `k: v` or a `**h`? A sole keyword hash counts too (the Struct/Data member
    form, `d.class.new(x: 1)`, is built as the static `D.new(x: 1)` is). */
@@ -722,6 +750,16 @@ static inline int nt_argv_has_kwsplat(const NodeTable *nt, const int *argv, int 
   for (int i = 0; argv && i < argc; i++)
     if (nt_kind(nt, argv[i]) == NK_KeywordHashNode && nt_hash_has_splat(nt, argv[i])) return 1;
   return 0;
+}
+/* Do the arguments bind a block's required parameters one to one -- no splat,
+   block argument or `...`? A keyword hash is one positional Hash (a `**h`
+   one too, unless h is empty at run time, which a caller that cannot see it
+   asks nt_argv_has_kwsplat about). A class_exec / module_exec call whose
+   block takes only required parameters binds them from such arguments
+   (desugar_class_eval_value and desugar_body_class_exec_args_left check the
+   parameters). */
+static inline int nt_argv_binds_one_to_one(const NodeTable *nt, const int *argv, int argc) {
+  return !nt_argv_has(nt, argv, argc, NT_ARG_SPLAT | NT_ARG_BLOCK | NT_ARG_FORWARDING);
 }
 /* The call's `&blk` or `&`: its block when that is a BlockArgumentNode, -1
    for a literal block or none. */
@@ -818,9 +856,9 @@ NodeTable *sp_parse_snippet_in(const char *src, const SnipFrame *f);
    src/main.c sets them, spinel_parse.c defines them. A string is a path to
    write, or NULL. */
 extern int g_opt_debug, g_opt_line_map, g_opt_positions, g_opt_warn_widen, g_opt_check_stores,
-           g_opt_defer_refusals, g_opt_emit_types_keep_c, g_opt_strict_rbs;
+           g_opt_defer_refusals, g_opt_emit_types_keep_c, g_opt_strict_rbs, g_opt_warn_verbose;
 extern const char *g_opt_emit_types, *g_opt_emit_rbs, *g_opt_emit_symbol_map, *g_opt_profile_symbol_map,
-                  *g_opt_rbs_seed;
+                  *g_opt_rbs_seed, *g_opt_eval_path;
 
 
 /* ---- a scope's local names ----
@@ -845,17 +883,52 @@ int nt_param_binds(const NodeTable *nt, int id, const char *name);
    a block-local (`|a; name|`), -1 if it declares none. */
 int nt_block_local_node(const NodeTable *nt, int blk, const char *name);
 
-/* The name a local-binding or local-reference node was written with: its
-   `wname`, which a pass that renamed the node (nt_rename_local) kept, else
-   its `name`. A node a desugar made has no Prism origin, so its name is what
-   it wrote. */
+/* The name a local-binding or local-reference node was written with: its `wname`, which the bridge
+   writes where the slot's name (`name`) differs from it, else its `name`. A node a desugar made has no
+   Prism origin, so its name is what it wrote. */
 static inline const char *nt_wname(const NodeTable *nt, int id) {
   const char *w = nt_str(nt, id, "wname");
   return w ? w : nt_str(nt, id, "name");
 }
-/* Rename local node id to newname, keeping the name it was first written
-   with in `wname`. A node without a `name` is left as it is. */
-void nt_rename_local(NodeTable *nt, int id, const char *newname);
+/* The parse step's stack of the scope nodes it is flattening, outermost first: a local's Prism `depth` names the
+   scope that declares it, `depth` scopes out from the innermost (nt_build_scope_at; -1 for none, as for a
+   snippet's host scopes). */
+void nt_build_scope_push(NodeTable *nt, int id);
+void nt_build_scope_pop(NodeTable *nt);
+int nt_build_scope_at(const NodeTable *nt, int depth);
+/* The slot name of local `written` declared by a scope that is no frame root (a block, lambda or class body):
+   `B<n>_<tag>_<written>`, `tag` being the scope node's comp_node_tag and `n` its length, so a name is one
+   variable wherever it is seen, the name does not move when code elsewhere in the program does, and no two
+   (tag, written) pairs make one name. A frame root's locals (the program's, a def's) keep the name they were
+   written with. A Ruby local never begins with an uppercase letter, so no name a program writes is a minted
+   slot name (the slots a pass names for itself, `P_<slot>` and `D<n>_<slot>`, are as unspellable), and `lv_`
+   plus a slot is a plain C identifier. The table remembers the name written for each slot
+   (nt_slot_written): nothing reads it back out of the spelling. The result is the table's own. */
+const char *nt_slot_name(NodeTable *nt, const char *written, const char *tag);
+/* The name a program wrote for slot `name` (minted, or a pass's own: nt_set_local_name), NULL for a name that is
+   not a recorded slot. */
+const char *nt_slot_written(const NodeTable *nt, const char *name);
+/* Is `name` a slot nt_slot_name minted (not one a pass named for itself)? */
+int nt_slot_minted(const NodeTable *nt, const char *name);
+/* Local node id's name is `name` from now on, its written name kept (`wname`, the name it has now when it has
+   none yet): the one entry for a pass that gives a slot a name of its own (a repeated `_`'s, a snippet's own
+   locals) and for the bridge's naming of the table (comp_name_locals). */
+void nt_set_local_name(NodeTable *nt, int id, const char *name);
+/* The slot scope node `scope` holds for the local its program wrote as `written` (a name in scope's `locals`),
+   NULL when it declares none. */
+const char *nt_scope_slot_of(const NodeTable *nt, int scope, const char *written);
+/* A new node of `type` for the variable local or parameter node `model` is one of: its name, written name and
+   decl. A pass that makes a read, write or target of a program's variable makes it so, not from a bare name. */
+int nt_new_local_of(NodeTable *nt, const char *type, int model);
+/* ...and the written name and decl alone, for a node that takes another name of the same variable. */
+void nt_local_facts_from(NodeTable *nt, int id, int model);
+/* Local node id names a variable scope `scope` declares: its decl, and its written name (what the table
+   records for its slot name, nt_slot_written). */
+void nt_decl_in(NodeTable *nt, int id, int scope);
+/* The locals of the subtree at id that scope `from` declares become the frame root's `to`'s: a
+   block whose parameters and body a pass makes a def's (define_method's) holds plain names there, so
+   each takes the name the program wrote (nt_wname) and `to` as its decl. */
+void nt_rekey_scope(NodeTable *nt, int id, int from, int to);
 
 /* The name a class or module header's constant path is keyed by: the one
    qualify_colliding_classes gave a colliding header ("qc_name"), else the

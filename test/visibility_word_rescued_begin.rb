@@ -164,3 +164,39 @@ p [Y.new.y1, Y.new.y2, Y.new.y3]
 p [BO.new.ba, PC.new.pa, PC.new.pb, DA.new.da, DA.new.dy, DA.new.dz]
 p [BC.new.bc]
 p [Foo::SK.new.sc, Foo::SO.new.so]
+class IA
+  begin; private(:ia, def ia; 1; end); rescue NameError; end
+end
+class I3x
+  def i3c = :i3c
+  begin; private(def i3d; 1; end, :missing3x, :i3c); rescue NameError; end
+end
+p [(IA.new.ia rescue $!.class), I3x.new.i3c, (I3x.new.i3d rescue $!.class)]
+module MR
+  def mra = :mra
+  begin; module_function :mra, raise("stop"); rescue RuntimeError; end
+end
+class MH; include MR; end
+p [MH.new.respond_to?(:mra), MR.respond_to?(:mra)]
+module MS
+  def msa = :msa
+  begin; module_function :msa, (raise("x") rescue :msa); rescue RuntimeError; end
+end
+class HS; include MS; end
+p [HS.new.respond_to?(:msa)]
+class I5
+  def i5a = :i5a
+  def i5b = :i5b
+  begin; private :i5a, :missing5, :i5b; rescue NameError; end
+  alias_method :i5c, :i5b
+  alias i5d i5b
+end
+p [(I5.new.i5a rescue $!.class), I5.new.i5b, I5.new.i5c, I5.new.i5d]
+class I3
+  def i3b = :i3b
+  begin; private(def i3a; 1; end, :missing3, :i3b); rescue NameError; end
+  def self.hide = private(:i3b)
+end
+p [(I3.new.i3b rescue $!.class)]
+I3.hide
+p [(I3.new.i3b rescue $!.class)]

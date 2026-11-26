@@ -2543,18 +2543,20 @@ int reduce_tail_from_acc(Compiler *c, int tail, const char *accp) {
   return 0;
 }
 
-/* obj.methods / public_methods / singleton_methods on an instance of `cid`:
-   listable ahead of time when the class does not define the name itself and
-   every ancestor is a user class whose whole method surface spinel knows --
-   not an exception, a native class, or a class whose superclass is a
+/* obj.methods / public_methods / singleton_methods (call id, or -1) on an
+   instance of `cid`: listable ahead of time when the class does not define
+   the name itself, or the call is the builtin's own (builtin_only: a super's),
+   and every ancestor is a user class whose whole method surface spinel knows
+   -- not an exception, a native class, or a class whose superclass is a
    builtin. */
-int an_object_methods_listable(Compiler *c, int cid, const char *name) {
+int an_object_methods_listable(Compiler *c, int id, int cid, const char *name) {
   const NodeTable *nt = c->nt;
   if (cid < 0 || cid >= c->nclasses || class_is_exc_subclass(c, cid)) return 0;
-  if (comp_name_responder(c, cid, name, 0) >= 0) return 0;
+  int bonly = id >= 0 && cplan_builtin_call(c, id);
+  if (!bonly && comp_name_responder(c, cid, name, 0) >= 0) return 0;
   /* nor where it answers the name with a reader of its own: a Struct member
      or an attr named `methods` (#10345) */
-  if (call_answers(c, -1, cid, name, 0, NULL)) return 0;
+  if (call_answers(c, id, cid, name, 0, NULL)) return 0;
   for (int k = cid, g = 0; k >= 0 && g <= c->nclasses; k = c->classes[k].parent, g++) {
     if (c->classes[k].is_native_class) return 0;
     if (c->classes[k].parent < 0 && !c->classes[k].is_struct) {
@@ -2620,10 +2622,11 @@ const char *an_value_methods_class(Compiler *c, int recv, TyKind rt, const char 
    define the name itself and every ancestor is a user class spinel knows the
    class methods of -- not a Struct/Data (whose generated class methods are
    not scopes), an exception, a native class, or a builtin's subclass. */
-int an_class_singleton_methods_listable(Compiler *c, int cid) {
+static int class_method_list_listable(Compiler *c, int cid, const char *name) {
   const NodeTable *nt = c->nt;
   if (cid < 0 || cid >= c->nclasses || class_is_exc_subclass(c, cid)) return 0;
-  if (comp_name_responder(c, cid, "singleton_methods", CT_CMETHOD) >= 0) return 0;
+  /* a class method of the program's under the list's name answers the call */
+  if (comp_name_responder(c, cid, name, CT_CMETHOD) >= 0) return 0;
   for (int k = cid, g = 0; k >= 0 && g <= c->nclasses; k = c->classes[k].parent, g++) {
     ClassInfo *ci = &c->classes[k];
     if (ci->is_native_class || ci->is_struct || ci->is_data) return 0;
@@ -2633,12 +2636,46 @@ int an_class_singleton_methods_listable(Compiler *c, int cid) {
   }
   return 1;
 }
+int an_class_singleton_methods_listable(Compiler *c, int cid) {
+  return class_method_list_listable(c, cid, "singleton_methods");
+}
 
-int an_singleton_methods_foldable(Compiler *c, int recv) {
+/* The list `name` of the class constant `recv` names: a builtin's, unless a
+   reopening defines a class method of the name; a program class's where
+   class_method_list_listable says. */
+static int const_method_list_foldable(Compiler *c, int recv, const char *name) {
   const char *cn = nt_str(c->nt, recv, "name");
   int ci = const_node_class_index(c, recv);
-  if (builtin_class_id(cn)) return ci < 0 || comp_name_responder(c, ci, "singleton_methods", CT_CMETHOD) < 0;
-  return an_class_singleton_methods_listable(c, ci);
+  if (builtin_class_id(cn)) return ci < 0 || comp_name_responder(c, ci, name, CT_CMETHOD) < 0;
+  return class_method_list_listable(c, ci, name);
+}
+int an_singleton_methods_foldable(Compiler *c, int recv) {
+  return const_method_list_foldable(c, recv, "singleton_methods");
+}
+
+/* Klass.singleton_methods (with `all` or not), and a class's methods(false)
+   (the same list: its singleton methods) and private_methods(false) (its
+   private class methods beside Class's own), asked of a constant or of self
+   in the class's body: listable ahead of time, as the singleton methods are
+   (a module's private_methods are Module's own, which are not listed). */
+int an_class_method_list_foldable(Compiler *c, const char *name, int recv, int argc, const int *argv) {
+  const NodeTable *nt = c->nt;
+  if (!name || recv < 0 || argc > 1) return 0;
+  int single = sp_streq(name, "singleton_methods"), priv = sp_streq(name, "private_methods");
+  if (!single && !priv && !sp_streq(name, "methods")) return 0;
+  NodeKind ak = argc == 1 ? nt_kind(nt, argv[0]) : NK_FalseNode;
+  if (ak != NK_FalseNode && !(single && ak == NK_TrueNode)) return 0;
+  if (!single && argc != 1) return 0;
+  int ci;
+  if (nt_kind(nt, recv) == NK_ConstantReadNode) {
+    if (!const_method_list_foldable(c, recv, name)) return 0;
+    ci = const_node_class_index(c, recv);
+    if (!priv) return 1;
+  } else {
+    ci = class_body_self_ci(c, recv);
+    if (ci < 0 || !class_method_list_listable(c, ci, name)) return 0;
+  }
+  return !priv || (ci >= 0 && !comp_class_is_module(c, &c->classes[ci]));
 }
 
 /* Does the program build Method objects (`method(:x)` / `instance_method(:x)`)?
@@ -3551,7 +3588,8 @@ static TyKind an_bop_seed_type(const void *ud, int i) {
 const BuiltinOp *an_bop_find_arg(Compiler *c, int id, TyKind rt, const char *name,
                                  int argc, const int *argv, int has_block) {
   AnBopArgs a = { c, argv };
-  const BuiltinOp *op = bop_find_arg(rt, name, argc, has_block, an_bop_arg_type, &a);
+  const BuiltinOp *op = bop_find_stage(rt, name, argc, has_block, nt_argv_has_splat(c->nt, argv, argc),
+                                       an_bop_arg_type, &a, -1);
   if (op && op->result != TY_UNKNOWN && an_bop_records(c, id))
     c->bop_inf[id] = op;
   return op;
@@ -3566,8 +3604,9 @@ const BuiltinOp *an_bop_row_for_kind(Compiler *c, int id, TyKind rt) {
   int an = nt_ref(c->nt, id, "arguments"), argc = 0;
   const int *argv = an >= 0 ? nt_arr(c->nt, an, "arguments", &argc) : NULL;
   AnBopArgs a = { c, argv };
-  const BuiltinOp *op = bop_find_arg(bop_family_of(rt), nt_str(c->nt, id, "name"), argc,
-                                     nt_ref(c->nt, id, "block") >= 0, an_bop_arg_type, &a);
+  const BuiltinOp *op = bop_find_stage(bop_family_of(rt), nt_str(c->nt, id, "name"), argc,
+                                       nt_ref(c->nt, id, "block") >= 0, nt_argv_has_splat(c->nt, argv, argc),
+                                       an_bop_arg_type, &a, -1);
   return op && op->result != TY_UNKNOWN ? op : NULL;  /* as an_bop_find records */
 }
 
@@ -3823,7 +3862,7 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
        happens to define one (e.g. `-@cents` with @cents widened to poly must
        not infer the enclosing Money type). */
     if (argc == 0 && (is_unary_sign(name))) { *out = TY_POLY; return 1; }
-    if (argc == 0 && sp_streq(name, "~")) { *out = TY_INT; return 1; }
+    if (argc == 0 && sp_streq(name, "~")) { *out = (rt == TY_POLY && cls_fact_may_hold_builtin(c, recv, CORE_REGEXP)) ? TY_POLY : TY_INT; return 1; }
     /* The disagreeing arm only matters when the RECEIVER's own identity is
        ambiguous (rt == TY_POLY: it could dynamically be the reopening
        class). A poly ARGUMENT alone, on a receiver whose kind is concrete
@@ -4541,8 +4580,8 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
       if (argc == 1 && sp_streq(name, "getbyte")) { *out = an_poly_concrete(c, id, name, TY_POLY); return 1; }
       /* After the random: forms, read the same boxed fallback as emission. */
       {
-        const BuiltinOp *op = bop_find_stage(BOP_BOXED_FALLBACK, name, argc,
-                                             nt_ref(nt, id, "block") >= 0, NULL, NULL, 0);
+        const BuiltinOp *op = bop_find_stage(BOP_BOXED_FALLBACK, name, argc, nt_ref(nt, id, "block") >= 0,
+                                             nt_argv_has_splat(nt, argv, argc), NULL, NULL, 0);
         if (op && !an_user_poly_arm(c, name, argc)) {
           if (an_bop_records(c, id)) c->bop_inf[id] = op;
           *out = an_poly_concrete(c, id, name, bop_result(op, rt));
@@ -5018,7 +5057,7 @@ static int rand_lit_range_float(Compiler *c, int arg) {
    exponent is not an Integer literal (a negative real ** a fraction)? Asked
    once per compile, for the boxed result of Math.sqrt, so a program with no
    Complex keeps a Float one. */
-static int an_program_makes_complex(Compiler *c, const NodeTable *nt) {
+int an_program_makes_complex(Compiler *c, const NodeTable *nt) {
   static const Compiler *mc_c; static int mc;
   if (mc_c == c) return mc;
   mc_c = c;
@@ -6594,10 +6633,7 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
     if (argc == 1 && sp_streq(name, "class_variable_defined?")) { *out = TY_BOOL; return 1; }
     if (sp_streq(name, "class_variable_get") || sp_streq(name, "class_variable_set")) { *out = TY_POLY; return 1; }
     if (argc <= 1 && is_instance_method_list(name)) { *out = TY_POLY; return 1; }
-    if (argc <= 1 && sp_streq(name, "singleton_methods") &&
-        nt_kind(nt, recv) == NK_ConstantReadNode &&
-        an_singleton_methods_foldable(c, recv))
-      { *out = TY_POLY; return 1; }
+    if (an_class_method_list_foldable(c, name, recv, argc, argv)) { *out = TY_POLY; return 1; }
     /* a user class method on a Class-typed value carried in a plain variable
        (`model.table_name`): unify the return types of every user class
        defining it (poly on disagreement). A constant/accessor receiver keeps
@@ -6713,10 +6749,11 @@ static int infer_class_module_call(Compiler *c, int id, const NodeTable *nt, con
       /* a generated READER of the name owns it on a concrete object, as any
          reader does in CRuby: fall through to the member-read rule (#4190);
          so does a method the class defines itself, whose value is what its
-         body answers -- `def dup = self.class.new(...)` answers boxed (#5461) */
-      !(ty_is_object(rt) &&
-        (call_answers(c, -1, ty_object_class(rt), name, 0, NULL))) &&
-      !(rt == TY_POLY && an_user_defines_method(c, name)) &&
+         body answers -- `def dup = self.class.new(...)` answers boxed (#5461).
+         Not for the builtin's own call (builtin_only: a super's), as the
+         emission has it */
+      !(!cplan_builtin_call(c, id) && ty_is_object(rt) && call_answers(c, -1, ty_object_class(rt), name, 0, NULL)) &&
+      !(!cplan_builtin_call(c, id) && rt == TY_POLY && an_user_defines_method(c, name)) &&
       /* (nor where TrueClass or FalseClass defines it: the reopen rule below
          types each value's side, cplan_bool_sides) */
       !(rt == TY_BOOL && cplan_bool_sides(c, id, &self_tmi, &self_fmi))) {
@@ -7045,7 +7082,7 @@ static int infer_receiverless_call(Compiler *c, int id, const NodeTable *nt, con
      (a bare module-body cmethod call, e.g. `take(mk)` where mk is
      `def self.mk`). */
   if (recv < 0 && !kernel) {
-    int cbody = c->node_cbody[id];
+    int cbody = self_class_body(c, id);
     if (cbody >= 0) {
       int smi = call_target(c, id, cbody, name, CT_CMETHOD, NULL);
       if (smi >= 0) { *out = an_user_call(c, id, smi, UC_CMETH, cbody); return 1; }
@@ -7140,12 +7177,6 @@ static int infer_receiverless_call(Compiler *c, int id, const NodeTable *nt, con
 
   /* user-defined free-function call (no receiver) */
   if (recv < 0) {
-    /* in a class or module body, the body's own class method comes first,
-       as the call plan takes it (comp_cbody_call_mi); not where an
-       instance_eval block's receiver answers the name */
-    { int iec = ie_class_of(c, id);
-      int cb = iec >= 0 && iec < c->nclasses && call_target(c, id, iec, name, 0, NULL) >= 0 ? -1 : comp_cbody_call_mi(c, id, name);
-      if (cb >= 0) { *out = an_user_call(c, id, cb, UC_CMETH, c->node_cbody[id]); return 1; } }
     int mi = call_target(c, id, -1, name, CT_TOP | CT_INCLUDED, NULL), fvia = UC_TOP;
     if (mi >= 0 && c->scopes[mi].class_id >= 0 && !c->scopes[mi].is_cmethod) fvia = UC_INCLUDED;   /* (a module main extends or Object includes) */
     /* in a block run by instance_eval, the receiver's own method answers
@@ -7194,22 +7225,23 @@ static int infer_receiverless_call(Compiler *c, int id, const NodeTable *nt, con
     }
     if (sp_streq(name, "rand")) {
       if (argc == 0) { *out = TY_FLOAT; return 1; }
-      if (infer_type(c, argv[0]) == TY_FLOAT_RANGE) { *out = TY_FLOAT; return 1; }   /* rand(float range) */
+      if (infer_type(c, argv[0]) == TY_FLOAT_RANGE) { *out = TY_POLY; return 1; }   /* Float, or nil if empty */
       NodeKind atype_k = nt_kind(nt, argv[0]);
       if (atype_k == NK_RangeNode) {
         int lo = nt_ref(nt, argv[0], "left");
         int hi = nt_ref(nt, argv[0], "right");
-        if (rand_lit_range_float(c, argv[0])) { *out = TY_FLOAT; return 1; }   /* rand(float_range), either bound */
+        if (rand_lit_range_float(c, argv[0])) { *out = TY_POLY; return 1; }   /* Float, or nil if empty */
+        if (lo < 0 || hi < 0) { *out = TY_INT; return 1; }   /* open side raises Errno::EDOM */
         /* a statically empty/reversed int range yields nil (#2519) */
-        if (lo >= 0 && hi >= 0 &&
-            nt_kind(nt, lo) == NK_IntegerNode &&
+        if (nt_kind(nt, lo) == NK_IntegerNode &&
             nt_kind(nt, hi) == NK_IntegerNode) {
           long long lov = nt_int(nt, lo, "value", 0);
           long long hiv = nt_int(nt, hi, "value", 0);
           int excl = nt_range_excl(nt, argv[0]);
-          if ((excl ? hiv - 1 : hiv) < lov) { *out = TY_POLY; return 1; }   /* nil */
+          if (excl ? hiv <= lov : hiv < lov) { *out = TY_POLY; return 1; }   /* nil */
+          { *out = TY_INT; return 1; }
         }
-        { *out = TY_INT; return 1; }
+        { *out = TY_POLY; return 1; }
       }
       /* rand(int range held in a variable): an Integer, or nil if the range is
          empty at runtime -> a poly (#3221). (A Float range in a variable is
@@ -7693,9 +7725,9 @@ static int infer_universal_call(Compiler *c, int id, const NodeTable *nt, const 
     if (rt == TY_STRING) { *out = TY_STRING; return 1; }  /* +str = mutable copy; -str = frozen self */
     { *out = ty_is_numeric(rt) ? rt : rt == TY_POLY ? TY_POLY : TY_UNKNOWN; return 1; }
   }
-  /* unary bitwise complement: ~int / ~poly -> int (poly value coerced via to_i) */
+  /* unary ~: ~int -> int; ~poly -> poly when receiver may hold Regexp (Regexp#~ -> int|nil) */
   if (sp_streq(name, "~") && recv >= 0 && argc == 0 && (rt == TY_INT || rt == TY_POLY))
-    { *out = TY_INT; return 1; }
+    { *out = (rt == TY_POLY && cls_fact_may_hold_builtin(c, recv, CORE_REGEXP)) ? TY_POLY : TY_INT; return 1; }
   if (sp_streq(name, "!")) { *out = TY_BOOL; return 1; }
   if (sp_streq(name, "respond_to?") && recv >= 0) { *out = TY_BOOL; return 1; }
   if ((sp_streq(name, "method_defined?") || sp_streq(name, "const_defined?") ||
@@ -7892,6 +7924,74 @@ static int infer_universal_call(Compiler *c, int id, const NodeTable *nt, const 
   return 0;
 }
 
+/* arr.each.with_index(off).<terminal> / arr.each_with_index.<terminal>:
+   a blockless [elem, index]-pair enumerator over an Array consumed by the
+   terminal, typed as the chain emitters walk the array.
+   (matz/spinel#1481 inject/reduce result; #1483 others.) */
+static int infer_indexed_each_terminal(Compiler *c, int id, const NodeTable *nt, const char *name, int recv, TyKind *out) {
+  if (recv >= 0 &&
+      nt_kind(nt, recv) == NK_CallNode &&
+      nt_ref(nt, recv, "block") < 0) {
+    int chain_arr = an_indexed_each_source(nt, recv);
+    TyKind chain_at = chain_arr >= 0 ? infer_type(c, chain_arr) : TY_UNKNOWN;
+    if (ty_is_array(chain_at)) {
+      TyKind elem = ty_array_elem(chain_at);
+      if (is_reduce_alias(name)) {
+        int args = nt_ref(nt, id, "arguments");
+        int argc = 0; const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
+        TyKind acc = (argc > 0 && argv) ? infer_type(c, argv[0]) : elem;
+        if (acc == TY_NIL) acc = TY_POLY;   /* a nil seed: boxed, as infer_array_reduce's */
+        /* an empty `{}` seed is a general boxed-key/value hash builder, like
+           each_with_object({}) -- not the element type (#2958) */
+        if (acc == TY_UNKNOWN && argc > 0 && argv &&
+            nt_kind(nt, argv[0]) == NK_HashNode) {
+          int hn = 0; nt_arr(nt, argv[0], "elements", &hn);
+          if (hn == 0) acc = TY_POLY_POLY_HASH;
+        }
+        if (acc == TY_UNKNOWN) acc = elem;
+        int blk = nt_ref(nt, id, "block");
+        if (blk >= 0) {
+          int body = nt_ref(nt, blk, "body");
+          int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+          if (bn > 0) {
+            TyKind bt = infer_type(c, bb[bn - 1]);
+            if (ty_is_numeric(bt)) acc = ty_promote_numeric(acc, bt);
+            /* a boxed body (a fold that may promote under
+               --int-overflow=promote, a Rational) cannot fold back into a
+               numeric seed slot: the accumulator is boxed, as the array
+               inject rule has it */
+            else if (ty_is_numeric(acc) && (bt == TY_POLY || bt == TY_BIGINT || bt == TY_RATIONAL || bt == TY_COMPLEX))
+              acc = TY_POLY;
+          }
+        }
+        { *out = acc; return 1; }
+      }
+      int blk = nt_ref(nt, id, "block");
+      int body = blk >= 0 ? nt_ref(nt, blk, "body") : -1;
+      int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
+      /* The codegen path only handles the |v, i| two-param block form; gate the
+         result type on it so single-param forms fall to their normal rules. */
+      int two_param = blk >= 0 && !block_param_is_multi(c, blk, 0) &&
+                      block_param_name(c, blk, 0) && block_param_name(c, blk, 1);
+      if (two_param && (is_map_alias(name)))
+        { *out = infer_map_block_ty(c, id, blk); return 1; }   /* a valued next's too, as a map's */
+      if (is_to_array_alias(name) ||
+          (two_param && (is_select_reject(name))))
+        { *out = TY_POLY_ARRAY; return 1; }   /* an array of [element, index] pairs */
+      if (blk < 0 && sp_streq(name, "to_h")) {
+        /* an array of [element, index] pairs collected into {element => index};
+           the block form instead maps each pair, so leave it to its own rule. */
+        TyKind h = ty_hash_of(elem, TY_INT);
+        { *out = h != TY_UNKNOWN ? h : TY_POLY_POLY_HASH; return 1; }
+      }
+      if (two_param && sp_streq(name, "count")) { *out = TY_INT; return 1; }
+      if (two_param && (sp_streq(name, "any?") || sp_streq(name, "all?") || sp_streq(name, "none?")))
+        { *out = TY_BOOL; return 1; }
+    }
+  }
+  return 0;
+}
+
 /* An enumerator chain (each_slice, with_index, the each family's value form) and an object array's iterators (infer_call_inner's rules, in their order) */
 static int infer_enum_chain_call(Compiler *c, int id, const NodeTable *nt, const char *name, int recv, int args, int argc, const int *argv, TyKind rt, TyKind *out) {
   /* each_slice(n).map/collect { |...| } chain: return array of block result type.
@@ -7949,11 +8049,7 @@ static int infer_enum_chain_call(Compiler *c, int id, const NodeTable *nt, const
     if (inner && ty_is_array(arr_t)) {
       if (is_map_alias(inner)) {
         int blk = nt_ref(nt, id, "block");
-        if (blk >= 0) {
-          int body = nt_ref(nt, blk, "body");
-          int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
-          { *out = ty_array_of(bn > 0 ? yield_aware_elem_ty(c, bb[bn - 1]) : TY_UNKNOWN); return 1; }
-        }
+        if (blk >= 0) { *out = infer_map_block_ty(c, id, blk); return 1; }   /* a valued next's too, as a map's */
       }
       else if (sp_streq(inner, "each") || sp_streq(inner, "select") ||
                sp_streq(inner, "filter") || sp_streq(inner, "reject") ||
@@ -7964,69 +8060,7 @@ static int infer_enum_chain_call(Compiler *c, int id, const NodeTable *nt, const
     }
   }
 
-  /* arr.each.with_index(off).<terminal> / arr.each_with_index.<terminal>:
-     a blockless [elem, index]-pair enumerator consumed by the terminal.
-     (matz/spinel#1481 inject/reduce result; #1483 others.) */
-  if (recv >= 0 &&
-      nt_kind(nt, recv) == NK_CallNode &&
-      nt_ref(nt, recv, "block") < 0) {
-    int chain_arr = an_indexed_each_source(nt, recv);
-    TyKind chain_at = chain_arr >= 0 ? infer_type(c, chain_arr) : TY_UNKNOWN;
-    if (ty_is_array(chain_at)) {
-      TyKind elem = ty_array_elem(chain_at);
-      if (is_reduce_alias(name)) {
-        int args = nt_ref(nt, id, "arguments");
-        int argc = 0; const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
-        TyKind acc = (argc > 0 && argv) ? infer_type(c, argv[0]) : elem;
-        if (acc == TY_NIL) acc = TY_POLY;   /* a nil seed: boxed, as infer_array_reduce's */
-        /* an empty `{}` seed is a general boxed-key/value hash builder, like
-           each_with_object({}) -- not the element type (#2958) */
-        if (acc == TY_UNKNOWN && argc > 0 && argv &&
-            nt_kind(nt, argv[0]) == NK_HashNode) {
-          int hn = 0; nt_arr(nt, argv[0], "elements", &hn);
-          if (hn == 0) acc = TY_POLY_POLY_HASH;
-        }
-        if (acc == TY_UNKNOWN) acc = elem;
-        int blk = nt_ref(nt, id, "block");
-        if (blk >= 0) {
-          int body = nt_ref(nt, blk, "body");
-          int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
-          if (bn > 0) {
-            TyKind bt = infer_type(c, bb[bn - 1]);
-            if (ty_is_numeric(bt)) acc = ty_promote_numeric(acc, bt);
-            /* a boxed body (a fold that may promote under
-               --int-overflow=promote, a Rational) cannot fold back into a
-               numeric seed slot: the accumulator is boxed, as the array
-               inject rule has it */
-            else if (ty_is_numeric(acc) && (bt == TY_POLY || bt == TY_BIGINT || bt == TY_RATIONAL || bt == TY_COMPLEX))
-              acc = TY_POLY;
-          }
-        }
-        { *out = acc; return 1; }
-      }
-      int blk = nt_ref(nt, id, "block");
-      int body = blk >= 0 ? nt_ref(nt, blk, "body") : -1;
-      int bn = 0; const int *bb = body >= 0 ? nt_arr(nt, body, "body", &bn) : NULL;
-      /* The codegen path only handles the |v, i| two-param block form; gate the
-         result type on it so single-param forms fall to their normal rules. */
-      int two_param = blk >= 0 && !block_param_is_multi(c, blk, 0) &&
-                      block_param_name(c, blk, 0) && block_param_name(c, blk, 1);
-      if (two_param && (is_map_alias(name)))
-        { *out = ty_array_of(bn > 0 ? yield_aware_elem_ty(c, bb[bn - 1]) : TY_UNKNOWN); return 1; }
-      if (is_to_array_alias(name) ||
-          (two_param && (is_select_reject(name))))
-        { *out = TY_POLY_ARRAY; return 1; }   /* an array of [element, index] pairs */
-      if (blk < 0 && sp_streq(name, "to_h")) {
-        /* an array of [element, index] pairs collected into {element => index};
-           the block form instead maps each pair, so leave it to its own rule. */
-        TyKind h = ty_hash_of(elem, TY_INT);
-        { *out = h != TY_UNKNOWN ? h : TY_POLY_POLY_HASH; return 1; }
-      }
-      if (two_param && sp_streq(name, "count")) { *out = TY_INT; return 1; }
-      if (two_param && (sp_streq(name, "any?") || sp_streq(name, "all?") || sp_streq(name, "none?")))
-        { *out = TY_BOOL; return 1; }
-    }
-  }
+  { TyKind r; if (infer_indexed_each_terminal(c, id, nt, name, recv, &r)) { *out = r; return 1; } }
 
   /* homogeneous object array (sp_PtrArray of unboxed sp_X*): the typed
      counterpart of the poly-array block below, for the narrowed TY_OBJ_ARRAY
@@ -8347,6 +8381,10 @@ static int infer_runtime_value_call(Compiler *c, int id, const NodeTable *nt, co
   }
   /* TY_ENUMERATOR instance methods */
   if (recv >= 0 && rt == TY_ENUMERATOR) {
+    /* an immediate arr.each_with_index / arr.each.with_index chain is typed
+       by its chain rule, as the chain emitter walks the array (its `map` an
+       Array of the block's values, not the generic Enumerator's boxed one) */
+    if (infer_indexed_each_terminal(c, id, nt, name, recv, out)) return 1;
     const BuiltinOp *op = an_bop_find(c, id, rt, name, argc, nt_ref(nt, id, "block") >= 0);
     if (op && op->result != TY_UNKNOWN) { *out = an_bop_result(c, op, rt, id, argc, argv); return 1; }
     if (sp_streq(name, "+") && argc == 1 && infer_type(c, argv[0]) == TY_ENUMERATOR) { *out = TY_ENUMERATOR; return 1; }  /* #2481 */
@@ -8710,9 +8748,11 @@ static int infer_last_resort_call(Compiler *c, int id, const NodeTable *nt, cons
      if the receiver were that handle. Codegen unboxes it back to exactly that
      before re-dispatching, and checks the runtime cls_id first, so a value of
      any other kind still raises NoMethodError (#4158 follow-up). */
+  /* (asked for the builtin answer alone, the dispatch's default arm beside a
+     class of the program's that defines the name: that arm is the handle's) */
   if (recv >= 0 && rt == TY_POLY && !face_active() &&
       ty_poly_handle_face_args(name, argc) != TY_UNKNOWN &&
-      !an_user_defines_or_reads(c, name) && !an_native_defines_method(c, name)) {
+      (an_builtin_only || (!an_user_defines_or_reads(c, name) && !an_native_defines_method(c, name)))) {
     an_face_push(recv, ty_poly_handle_face_args(name, argc));
     TyKind kt = infer_call(c, id);
     an_face_pop();
@@ -9279,8 +9319,6 @@ static int reopen_owner_of(Compiler *c, int id, int cn, const char *name) {
      reopen (`alias orig_first first`) still names the builtin */
   if (ami < 0 || ml.def_class != aci || !c->scopes[ami].name || !sp_streq(c->scopes[ami].name, name)) return -1;
   if (cplan_reopen_runs_builtin(c, id, ami)) return -1;
-  if (nt_ref(c->nt, id, "block") >= 0 && builtin_method_known(core_class_name(cn), name) && c->scopes[ami].yields &&
-      !(cn == CORE_ARRAY && sp_streq(name, "concat"))) return -1;
   return ami;
 }
 static int array_hash_reopen_owner(Compiler *c, int id, TyKind rt, const char *name) {
@@ -9493,8 +9531,8 @@ int an_poly_object_methods_listable(Compiler *c, int id, const char *name, int a
   for (int i = 0; i < n; i++) {
     int k = ks ? ks[i] : i;
     if (k < 0 || k >= c->nclasses || !c->classes[k].instantiated || is_builtin_reopen(c->classes[k].name)) continue;
-    if (call_answers(c, -1, k, name, 0, NULL)) return 0;
-    if (an_object_methods_listable(c, k, name)) any = 1;
+    if (call_answers(c, id, k, name, 0, NULL)) return 0;
+    if (an_object_methods_listable(c, id, k, name)) any = 1;
   }
   return any;
 }
@@ -9505,7 +9543,7 @@ static int infer_methods_listed(Compiler *c, int id, int recv, TyKind rt, const 
       (sp_streq(name, "methods") || sp_streq(name, "public_methods") ||
        sp_streq(name, "singleton_methods")) &&
       an_object_methods_all_arg(c, ty_object_class(rt), argc, argv) >= 0 &&
-      an_object_methods_listable(c, ty_object_class(rt), name))
+      an_object_methods_listable(c, id, ty_object_class(rt), name))
     return 1;
   if (recv >= 0 && rt == TY_POLY && an_poly_object_methods_listable(c, id, name, argc, argv)) return 1;
   return an_value_methods_class(c, recv, rt, name, argc, argv) != NULL;
@@ -9758,9 +9796,9 @@ static TyKind infer_call_inner(Compiler *c, int id) {
   }
 
   /* Kernel#dup / #clone an alias captured on a program object
-     (builtin_only): a copy of the receiver, whatever the class's own method
-     of the name answers */
-  if ((bonly || cplan_builtin_call(c, id)) && recv >= 0 && is_copy_alias(name)) {
+     (builtin_only), or Kernel#freeze a super is: a copy of the receiver, or
+     the receiver, whatever the class's own method of the name answers */
+  if ((bonly || cplan_builtin_call(c, id)) && recv >= 0 && (is_copy_alias(name) || is_freeze_name(name))) {
     TyKind crt = infer_type(c, recv);
     if (ty_is_object(crt)) return crt;
   }
@@ -10348,11 +10386,10 @@ static TyKind infer_call_inner(Compiler *c, int id) {
      method list, boxed as on the constant */
   if ((recv < 0 || nt_kind(nt, recv) == NK_SelfNode) && argc <= 1 &&
       (sp_streq(name, "instance_methods") || sp_streq(name, "public_instance_methods"))) {
-    Scope *self = comp_scope_of(c, id);
-    if (self && self->is_cmethod && self->class_id >= 0 &&
-        call_target(c, id, self->class_id, name, CT_CMETHOD, NULL) < 0 &&
-        !comp_class_is_module(c, &c->classes[self->class_id]))
-      return TY_POLY;
+    /* (the class the call plan lists for, which the emitter lists: cplan_self_list_class) */
+    const Scope *cm;
+    int ci = cplan_self_list_class(c, id, recv, name, &cm);
+    if (ci >= 0 && !comp_class_is_module(c, &c->classes[ci])) return TY_POLY;
   }
 
   { TyKind r; if (infer_block_kernel_call(c, id, nt, name, recv, rt, &r)) return r; }
@@ -11946,9 +11983,52 @@ static TyKind ctr_site_join(TyKind nat, TyKind want) {
 }
 /* What a super that comp_super_object_builtin answers (kind) is typed: self for
    itself, the row's result for Kernel's row, a Boolean for the rest. */
-static TyKind super_object_type(Compiler *c, const Scope *s, const char *uname, int id, int kind) {
-  return kind == SUPER_OBJ_SELF ? (repr_self_boxed(c, (int)(s - c->scopes)) ? TY_POLY : ty_object(s->class_id))
-       : kind == SUPER_OBJ_ROW ? bop_result(comp_super_kernel_row(c, s, uname, id), BOP_KERNEL) : TY_BOOL;
+/* The type a super into a builtin answers, where no method of the program's does: the call plan's arm's
+   (CallPlan.bsuper), the one the super emission renders */
+static TyKind super_builtin_type(Compiler *c, int id, Scope *s, const char *uname) {
+  switch ((BsuperArm)cplan_user_fresh(c, id).bsuper) {
+  case BSUP_OBJ_TEXT: case BSUP_STRUCT_TEXT: case BSUP_BACKTICK: return TY_STRING;
+  case BSUP_CLASS_NEW:
+    /* an instance of the receiving class, which is this one or, through an inherited `self.new`, any descendant
+       (comp_super_class_new_boxed) */
+    return comp_super_class_new_boxed(c, id) ? TY_POLY : ty_object(s->class_id);
+  case BSUP_ALLOCATE: case BSUP_FREEZE: case BSUP_DATA_WITH: return ty_object(s->class_id);
+  case BSUP_SUBCLASSES: case BSUP_ANCESTORS: return TY_POLY_ARRAY;
+  case BSUP_SUPERCLASS: return TY_CLASS;
+  case BSUP_RESPOND_TO: case BSUP_IS_A: case BSUP_INSTANCE_OF: case BSUP_SAME: case BSUP_FALSE: case BSUP_FROZEN:
+    return TY_BOOL;
+  case BSUP_SELF: return repr_self_boxed(c, (int)(s - c->scopes)) ? TY_POLY : ty_object(s->class_id);
+  case BSUP_KERNEL_ROW: return bop_result(comp_super_kernel_row(c, s, uname, id), BOP_KERNEL);
+  case BSUP_NATIVE_CTOR: return TY_NIL;
+  case BSUP_NATIVE: {
+    int sa = nt_ref(c->nt, id, "arguments"), sac = 0;
+    if (sa >= 0) (void)nt_arr(c->nt, sa, "arguments", &sac);
+    int nm = comp_native_method_find(c, c->classes[s->class_id].nsub_root - 1, uname, sac, 0);
+    if (nm < 0) return TY_UNKNOWN;
+    return sp_streq(c->native_methods[nm].ret, "self") ? ty_object(s->class_id) : native_spec_to_ty(c->native_methods[nm].ret);
+  }
+  /* Exception's message, the String the exception keeps (super_reaches_exc_text), unless its #to_s of the
+     program's answers no String; a reopening above picked at run time answers either a Ruby override's value or
+     that text, kept boxed */
+  case BSUP_EXC_TEXT: return super_reaches_exc_text(c, id, 0) ? TY_STRING : TY_UNKNOWN;
+  case BSUP_EXC_REOPEN: return is_exception_message(uname) ? TY_POLY : TY_UNKNOWN;
+  default: return TY_UNKNOWN;
+  }
+}
+/* A super node: the program method the call plan binds it to (the next method of the prepend chain, else the parent
+   chain's, found from class ml.from; a class method's through the parent's CLASS-method chain), else the builtin's
+   (super_builtin_type) */
+static TyKind infer_super(Compiler *c, int id) {
+  if (g_plan_check && !an_pure_reads && id >= 0 && id < c->node_cap) c->ucall_inf[id].via = UC_NONE;
+  Scope *s = comp_scope_of(c, id);
+  if (s->class_id < 0 || !s->name) return TY_UNKNOWN;
+  MethodLookup ml = { .def_class = -1 };
+  int mi = cplan_super_target(c, id, s, &ml);
+  const Scope *st = comp_super_site(c, s);
+  if (mi < 0) return comp_super_shadow(c, st) ? TY_UNKNOWN : super_builtin_type(c, id, s, comp_super_name(c, ml.from, st));
+  /* (a yielding shadow is spliced as a parent is) */
+  an_user_call_record(c, id, mi, UC_SUPER, ml.from);
+  return super_target_ret(c, s, mi, id);
 }
 /* The ivar nm at node id inside an instance_eval/exec block on a boxed
    receiver: the meeting of the slots of the classes the receiver can be,
@@ -11968,6 +12048,31 @@ static int ie_poly_ivar_ty(Compiler *c, int id, const char *nm, int read, TyKind
   }
   *out = pr;
   return npk > 0;
+}
+static TyKind infer_if_unless(Compiler *c, int id, NodeKind nk) {
+  const NodeTable *nt = c->nt;
+  int is_unless = nk == NK_UnlessNode;
+  int then_b = nt_ref(nt, id, "statements");
+  int else_b = nt_ref(nt, id, is_unless ? "else_clause" : "subsequent");
+  /* statically-answered constant or defined? predicate types as its live arm */
+  int dpred = nt_ref(nt, id, "predicate");
+  int ec = dpred >= 0 && nt_int(nt, dpred, "engine_check", 0) > 0 ? (nt_kind(nt, dpred) == NK_TrueNode) : -1;
+  int df = ec >= 0 ? !ec : comp_defined_guard_false(c, dpred);
+  int dt = ec >= 0 ? ec : (df ? 0 : comp_defined_guard_true(c, dpred));
+  if (df || dt) {
+    int take_then = is_unless ? df : dt;
+    return take_then ? (then_b >= 0 ? infer_type(c, then_b) : TY_NIL) : (else_b >= 0 ? infer_type(c, else_b) : TY_NIL);
+  }
+  int tdiv = branch_diverges(c, then_b);
+  int ediv = branch_diverges(c, else_b);
+  /* both arms diverging leaves nothing to type: fall through to the plain
+     unify rather than answering UNKNOWN out of nowhere */
+  if (tdiv && !ediv) return an_branch_ty(c, else_b);
+  if (ediv && !tdiv) return an_branch_ty(c, then_b);
+  TyKind tt = an_branch_ty(c, then_b);
+  TyKind et = an_branch_ty(c, else_b);
+  { TyKind ej = an_empty_arm_join(c, then_b, else_b, tt, et); if (ej != TY_UNKNOWN) return ej; }
+  return ty_unify(tt, et);
 }
 TyKind infer_uncached(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
@@ -12535,31 +12640,7 @@ TyKind infer_uncached(Compiler *c, int id) {
     }
     return r;
   }
-  if (nk == NK_IfNode || nk == NK_UnlessNode) {
-    int is_unless = nk == NK_UnlessNode;
-    int then_b = nt_ref(nt, id, "statements");
-    int else_b = nt_ref(nt, id, is_unless ? "else_clause" : "subsequent");
-    /* a statically-answered defined? predicate types as its live arm alone
-       (the dead arm is never emitted -- see the codegen folds) */
-    int dpred = nt_ref(nt, id, "predicate");
-    int df = comp_defined_guard_false(c, dpred);
-    int dt = df ? 0 : comp_defined_guard_true(c, dpred);
-    if (df || dt) {
-      int take_then = is_unless ? df : dt;
-      if (take_then) return then_b >= 0 ? infer_type(c, then_b) : TY_NIL;
-      return else_b >= 0 ? infer_type(c, else_b) : TY_NIL;
-    }
-    int tdiv = branch_diverges(c, then_b);
-    int ediv = branch_diverges(c, else_b);
-    /* both arms diverging leaves nothing to type: fall through to the plain
-       unify rather than answering UNKNOWN out of nowhere */
-    if (tdiv && !ediv) return an_branch_ty(c, else_b);
-    if (ediv && !tdiv) return an_branch_ty(c, then_b);
-    TyKind tt = an_branch_ty(c, then_b);
-    TyKind et = an_branch_ty(c, else_b);
-    { TyKind ej = an_empty_arm_join(c, then_b, else_b, tt, et); if (ej != TY_UNKNOWN) return ej; }
-    return ty_unify(tt, et);
-  }
+  if (nk == NK_IfNode || nk == NK_UnlessNode) return infer_if_unless(c, id, nk);
   if (nk == NK_ElseNode) {
     int s = nt_ref(nt, id, "statements");
     return s >= 0 ? infer_type(c, s) : TY_NIL;
@@ -12740,99 +12821,7 @@ TyKind infer_uncached(Compiler *c, int id) {
     return TY_NIL;
   }
   { TyKind r; if (infer_yield_node(c, id, nt, nk, &r)) return r; }
-  if (nk == NK_SuperNode || nk == NK_ForwardingSuperNode) {
-    if (g_plan_check && !an_pure_reads && id >= 0 && id < c->node_cap) c->ucall_inf[id].via = UC_NONE;
-    Scope *s = comp_scope_of(c, id);
-    if (s->class_id < 0 || !s->name) return TY_UNKNOWN;
-    /* where the call plan binds the super: the next method of the prepend chain, else the
-       parent chain's, found from class ml.from (a class method's through the parent's
-       CLASS-method chain, which the instance chain would miss `def self.x` entirely) */
-    MethodLookup ml = { .def_class = -1 };
-    int mi = cplan_super_target(c, id, s, &ml);
-    if (comp_super_shadow(c, comp_super_site(c, s))) {
-      if (mi < 0) return TY_UNKNOWN;
-      /* a yielding shadow is spliced as a parent is */
-      an_user_call_record(c, id, mi, UC_SUPER, ml.from);
-      return super_target_ret(c, s, mi, id);
-    }
-    /* Class#new: an instance of the receiving class, which is this one or,
-       through an inherited `self.new`, any descendant (see
-       comp_super_class_new_boxed) */
-    if (comp_super_is_class_new(c, id))
-      return comp_super_class_new_boxed(c, id) ? TY_POLY : ty_object(s->class_id);
-    /* Class#allocate from an own allocate: an empty object of the class
-       the method (or its copy for a subclass) runs for */
-    if (allocate_super_reaches_class(c, id)) return ty_object(s->class_id);
-    int p = ml.from;
-    const char *uname = comp_super_name(c, p, comp_super_site(c, s));
-    /* `super` in a respond_to? override no ancestor defines is Object's
-       respond_to?: a boolean (see emit_super_respond_to) */
-    int rto_super = !s->is_cmethod && uname &&
-                    (sp_streq(uname, "respond_to?") ||
-                     /* and is_a? / kind_of? / instance_of? (codegen's twin) */
-                     sp_streq(uname, "is_a?") || sp_streq(uname, "kind_of?") ||
-                     sp_streq(uname, "instance_of?"));
-    /* (`super` in an exception subclass's #message / #to_s that reaches
-       Exception's is the message String, super_reaches_exc_text: untyped,
-       `def message = super` answered nil), and `super` in a freeze override
-       no ancestor defines is Object#freeze, which answers the object
-       (codegen's twin in emit_super) */
-    int freeze_super = !s->is_cmethod && uname && sp_streq(uname, "freeze");
-    /* and `super` in an ==, equal?, eql?, !, nil?, frozen? or itself
-       override reaches BasicObject's or Kernel's (comp_super_object_builtin;
-       emit_super_object_builtin is codegen's twin) */
-    int obj_super = comp_super_object_builtin(c, s, uname, id);
-    /* and `super` in a class method named subclasses reaches Class#subclasses,
-       an Array of classes (emit_super's twin) */
-    int subs_super = s->is_cmethod && uname && sp_streq(uname, "subclasses") &&
-                     nt_ref(nt, id, "arguments") < 0;
-    /* and `super` in a class method named superclass or ancestors reaches
-       Class#superclass (a class) or Module#ancestors (an Array of them);
-       a module has no #superclass (emit_super's twin) */
-    int rel_super = 0;
-    if (s->is_cmethod && uname && nt_ref(nt, id, "arguments") < 0 && s->class_id >= 0)
-      rel_super = sp_streq(uname, "ancestors") ? 2
-                : sp_streq(uname, "superclass") && !comp_class_is_module(c, &c->classes[s->class_id]) ? 1 : 0;
-    /* and `super` in a ` override reaches Kernel#`: the command's output */
-    int bt_arg, bt_super = uname && sp_streq(uname, "`") && an_super_backtick_shape(c, id, s, &bt_arg) > 0;
-    TyKind none = super_reaches_exc_text(c, id, 0) ? TY_STRING
-                : an_super_object_text(c, id, (int)(s - c->scopes)) || an_super_struct_text(c, id, (int)(s - c->scopes)) ? TY_STRING
-                : bt_super ? TY_STRING
-                : subs_super || rel_super == 2 ? TY_POLY_ARRAY
-                : rel_super == 1 ? TY_CLASS
-                : rto_super ? TY_BOOL
-                : freeze_super ? ty_object(s->class_id)
-                : obj_super ? super_object_type(c, s, uname, id, obj_super) : TY_UNKNOWN;
-    /* and `super` in a Data's own with reaches Data#with: a copy, or self
-       (emit_super_data_with) */
-    if (!s->is_cmethod && uname && sp_streq(uname, "with") &&
-        c->classes[s->class_id].is_struct && c->classes[s->class_id].is_data) none = ty_object(s->class_id);
-    /* The exception reopening switch can answer either a Ruby override's
-       value or Exception's stored text. Keep that joined result boxed. */
-    if (mi < 0 && !s->is_cmethod && is_exception_message(uname) &&
-        (class_is_exc_subclass(c, s->class_id) || class_is_exc_reopen(c, s->class_id))) {
-      int xr[8], xn = exc_reopen_definers(c, uname, xr, 8);
-      for (int i = 0; i < xn; i++)
-        if (xr[i] != s->class_id) return TY_POLY;
-    }
-    if (p < 0 && mi < 0) return none;
-    /* a subclass of a native class (#9269): super reaches the native
-       class's constructor (initialize) or binding */
-    if (mi < 0 && !s->is_cmethod && uname && c->classes[s->class_id].nsub_root > 0) {
-      int root = c->classes[s->class_id].nsub_root - 1;
-      if (sp_streq(uname, "initialize")) return TY_NIL;
-      int sa = nk == NK_SuperNode ? nt_ref(nt, id, "arguments") : -1, sac = 0;
-      if (sa >= 0) (void)nt_arr(nt, sa, "arguments", &sac);
-      if (nk == NK_ForwardingSuperNode) sac = s->nparams;
-      int nm = comp_native_method_find(c, root, uname, sac, 0);
-      if (nm >= 0)
-        return sp_streq(c->native_methods[nm].ret, "self") ? ty_object(s->class_id)
-                                                           : native_spec_to_ty(c->native_methods[nm].ret);
-    }
-    if (mi < 0) return none;
-    an_user_call_record(c, id, mi, UC_SUPER, p);
-    return super_target_ret(c, s, mi, id);
-  }
+  if (nk == NK_SuperNode || nk == NK_ForwardingSuperNode) return infer_super(c, id);
   if (nk == NK_AndNode || nk == NK_OrNode) {
     int lnd = nt_ref(nt, id, "left"), rnd = nt_ref(nt, id, "right");
     TyKind lt = infer_type(c, lnd);

@@ -83,6 +83,22 @@ int interp_is_literal_fold(const NodeTable *nt, int id) {
   return fold;
 }
 
+/* Are the bytes literal id spells, a StringNode or a tree interp_is_literal_fold
+   folds, all ASCII? Such a literal is read as written in any ASCII-compatible
+   encoding, so a text it is appended to keeps its own. */
+int str_literal_ascii(const NodeTable *nt, int id) {
+  int *flat = &id, n = 1, cap = 0, ok = 1;
+  if (nt_kind(nt, id) == NK_InterpolatedStringNode) { flat = NULL; n = 0; interp_flatten(nt, id, &flat, &n, &cap); }
+  for (int k = 0; k < n && ok; k++) {
+    const unsigned char *s = (const unsigned char *)nt_str(nt, flat[k], "content");
+    size_t len = s ? nt_str_len(nt, flat[k], "content") : 0;
+    ok = nt_kind(nt, flat[k]) == NK_StringNode;
+    for (size_t i = 0; i < len && ok; i++) ok = s[i] < 0x80;
+  }
+  if (flat != &id) free(flat);
+  return ok;
+}
+
 /* Single-buffer construction: every part is either an escaped literal
    (compile-time length), a bounded-width scalar (int <= 21 digits, bool
    <= 5), or a dynamic part pre-evaluated -- in part order, preserving
@@ -2158,7 +2174,12 @@ void emit_expr(Compiler *c, int id, Buf *b) {
    needs. */
 void emit_expr_for_effect(Compiler *c, int node, Buf *b) {
   int v = effect_view_open(c, node);
-  emit_expr(c, node, b);
+  /* an Integer or Float that may be nil (node_may_be_nil: not one bound to a
+     plain temp) is its own sp_oint here: read as the plain scalar it would be
+     unwrapped, and a nil nothing reads would raise */
+  Repr r = node >= 0 ? repr_of(c, node) : (Repr){0};
+  if (r.opt_producer && oint_kind(r.as_ty) && node_may_be_nil(c, node)) emit_oint_expr(c, node, r.as_ty, b);
+  else emit_expr(c, node, b);
   effect_view_close(c, v);
 }
 /* The view emit_expr_for_effect holds, for a discarding site whose operand
@@ -3569,6 +3590,20 @@ int emit_builtin_scoped_const(Compiler *c, int par_id, const char *par_nm, const
   return 0;
 }
 
+/* Returns 1 when par resolves to a program class whose Ruby name differs
+   from pn, such as App::IO, and path id resolves to the class whose Ruby
+   name is the parent's Ruby name followed by ::nm, such as
+   App::IO::WaitReadable. */
+static int const_path_program_member(Compiler *c, int id, int par, const char *pn, const char *nm) {
+  int pk = const_node_class_index(c, par);
+  const char *prn = pk >= 0 ? class_ruby_name(c, pk) : NULL;
+  if (!prn || sp_streq(prn, pn)) return 0;
+  int k = const_node_class_index(c, id);
+  const char *rn = k >= 0 ? class_ruby_name(c, k) : NULL;
+  char want[256];
+  return rn && snprintf(want, sizeof want, "%s::%s", prn, nm) < (int)sizeof want && sp_streq(rn, want);
+}
+
 /* A constant read: ConstantReadNode and ConstantPathNode (A::B) (emit_expr_node's arms, in their order).
    `checks` holds the parents' presence checks of a path: the raise of an
    undefined path takes them and empties the buffer, any other form leaves
@@ -3715,13 +3750,16 @@ static int emit_constant_value(Compiler *c, int id, Buf *b, Buf *checks, const N
       char qbuf[160];
       snprintf(qbuf, sizeof qbuf, "%s::%s", par_nmc, nm);
       int qid = builtin_class_id(qbuf);
-      if (qid != 0) {
+      /* App::IO::WaitReadable and App::Errno::ENOENT resolve to the program's
+         class (const_path_program_member) */
+      int prog = (qid != 0 || is_builtin_exception_name(qbuf)) && const_path_program_member(c, id, par_idc, par_nmc, nm);
+      if (qid != 0 && !prog) {
         emit_builtin_class_value(c, qbuf, b);
         return 1;
       }
       /* the Errno:: family (and its id-less siblings) is a name-backed
          Class value; raised exceptions carry this same qualified name */
-      if (is_builtin_exception_name(qbuf)) {
+      if (is_builtin_exception_name(qbuf) && !prog) {
         emit_builtin_class_value(c, qbuf, b);
         return 1;
       }
@@ -5107,6 +5145,8 @@ else {
    respond_to? it settles, and, for a `block_given? ? a : b` pair, `paired`,
    that), -1 for a run-time one. */
 static int if_expr_arm_known(Compiler *c, int pred, int paired) {
+  if (pred >= 0 && nt_int(c->nt, pred, "engine_check", 0) > 0)
+    return nt_kind(c->nt, pred) == NK_TrueNode ? 1 : 0;
   int df = comp_defined_guard_false(c, pred);
   int dt = df ? 0 : comp_defined_guard_true(c, pred);
   int known = df ? 0 : (dt ? 1 : static_isa_cond(c, pred));
@@ -5332,6 +5372,13 @@ static void emit_ternary_ladder(Compiler *c, int id, TyKind res, int res_o, Buf 
 }
 
 /* An if or unless in value position (and the ternary) (emit_expr_node's arms, in their order) */
+/* The type a value-position conditional's result slot holds: its own, or boxed
+   where it has no C storage type (a void or nil-typed if, an untyped one whose
+   every arm diverges). */
+static TyKind cond_value_ty(Compiler *c, int id) {
+  TyKind res = repr_of(c, id).as_ty;
+  return res == TY_VOID || res == TY_NIL || res == TY_UNKNOWN ? TY_POLY : res;
+}
 static int emit_if_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *ty) {
   if (!(sp_streq(ty, "IfNode") || sp_streq(ty, "UnlessNode"))) return 0;
   /* if/unless as a value: a ternary when both branches are single
@@ -5359,8 +5406,7 @@ static int emit_if_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, const 
     if (known < 0 && tn == 1 && en == 1) {
       int bg = static_block_given_cond(c, pred);
       if (bg >= 0) {
-        TyKind res = repr_of(c, id).as_ty;
-        if (res == TY_VOID || res == TY_NIL) res = TY_POLY;
+        TyKind res = cond_value_ty(c, id);
         emit_ternary_arm_o(c, (is_unless ? !bg : bg) ? tb[0] : eb[0], res, cond_res_oint(c, id, res), b);
         return 1;
       }
@@ -5375,15 +5421,20 @@ static int emit_if_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, const 
       int live = take_then ? then_b : else_stmts;
       int ln = 0;
       const int *lb = live >= 0 ? nt_arr(nt, live, "body", &ln) : NULL;
-      if (ln == 0) { buf_puts(b, "sp_box_nil()"); return 1; }
+      if (ln == 0) {
+        /* no arm is left: the nil, in the form the slot takes, as the
+           unfolded pair's absent arm (res_zero) */
+        TyKind nres = cond_value_ty(c, id);
+        buf_puts(b, res_zero(c, nres, cond_res_oint(c, id, nres)));
+        return 1;
+      }
       /* The live arm still has to be rendered at the WHOLE expression's
          type, the way the unfolded pair below is: the slot receiving this
          was declared from that type, and the arm's own may be narrower.
          Emitting the arm raw put a `const char *` into an sp_RbVal local
          whenever an is_a? predicate folded (#4280's tmpdir package could
          not compile at its simplest call). */
-      TyKind fres = repr_of(c, id).as_ty;
-      if (fres == TY_VOID || fres == TY_NIL) fres = TY_POLY;
+      TyKind fres = cond_value_ty(c, id);
       /* Only the WIDENING conversion, into a poly result. Forcing a narrower
          one would convert rather than carry -- and where the result type is
          narrower than the arm the analysis has already gone wrong, so the C
@@ -5419,13 +5470,12 @@ static int emit_if_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, const 
     }
   }
   if (tn == 1 && en == 1) {
-    TyKind res = repr_of(c, id).as_ty;
+    TyKind res = cond_value_ty(c, id);
     /* A void/nil-typed if (e.g. an arm that is a writer call, doom's
        `self.fullscreen = value if respond_to?(...)`), or an untyped one
        whose every arm diverges, has no C storage type -- emit_ctype would
        declare `void _tN` -- so hold the result boxed; void arms degrade
-       to nil. */
-    if (res == TY_VOID || res == TY_NIL || res == TY_UNKNOWN) res = TY_POLY;
+       to nil (cond_value_ty). */
     /* Each arm is emitted with a CAPTURED prelude: an arm whose sub-expressions
        hoist statements (a rooted call argument, a constructed receiver, ...)
        cannot ride a flat C ternary -- a shared prelude would evaluate BOTH
@@ -5439,9 +5489,8 @@ static int emit_if_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, const 
   /* Multi-stmt branches or no-else: emit as if/else block with a result temp.
      Preludes and the if structure go into g_pre; `b` receives only _t<N>. */
   {
-    TyKind res = repr_of(c, id).as_ty;
     /* void/nil result: no C storage type (see the ternary form above). */
-    if (res == TY_VOID || res == TY_NIL) res = TY_POLY;
+    TyKind res = cond_value_ty(c, id);
     int res_o = cond_res_oint(c, id, res);
     int tr = ++g_tmp;
     /* Declare the temp and default-initialize it (an absent arm is nil). */
@@ -5488,6 +5537,62 @@ static int untyped_boxed_call(Compiler *c, int node) {
 }
 
 /* And/or, a rescue modifier and a begin block in value position (emit_expr_node's arms, in their order) */
+/* Emit an rvalue `expr rescue fallback` whose expression provably cannot raise
+   (an_rescue_mod_elides_setjmp): skip setjmp and coerce `e` to the modifier's
+   result representation. */
+static int emit_rescue_modifier_elided(Compiler *c, int id, int e, Buf *b) {
+  const NodeTable *nt = c->nt;
+  TyKind rt = repr_of(c, id).as_ty;
+  if (rt == TY_VOID || rt == TY_UNKNOWN || rt == TY_NIL) rt = TY_POLY;
+  int res_o = cond_res_oint(c, id, rt);
+  if (e < 0) {
+    buf_puts(b, res_o ? oint_nil(rt) : slot_zero(c, rt));
+    return 1;
+  }
+  Repr er = repr_of(c, e);
+  TyKind et = er.as_ty;
+  int one, e_yields = 0, e_nil = 0, e_val = e;
+  switch (vp_one(nt, e, VPS_NONE | VP_PARENS_ONLY, &one)) {
+    case VP1_NODE:
+      e_yields = is_yield_or_blk_param_call(c, one);
+      e_nil = nt_kind(nt, one) == NK_NilNode;
+      e_val = one;
+      break;
+    case VP1_NIL: e_nil = 1; break;
+    case VP1_MANY: break;
+  }
+  int e_diverges = (er.untyped || et == TY_VOID || (et == TY_NIL && rt != TY_POLY && e_yields)) &&
+                   !an_empty_container_kind(c, e);
+  int hdem = rt == TY_STRBUF && repr_of(c, id).demand;
+  if (!e_diverges && rt != TY_POLY && et != rt && !(hdem && et == TY_STRING) &&
+      !ty_is_numeric(rt) && nt_kind(nt, e_val) == NK_CallNode)
+    e_diverges = 1;
+  if (!e_diverges) {
+    buf_puts(b, "(");
+    if (rt == TY_POLY && er.kind != RK_BOXED) emit_boxed(c, e, b);
+    else if (res_o) emit_oint_expr(c, e, rt, b);
+    else if (hdem) emit_strbuf_handle_of(c, e, b);
+    else if (et == TY_NIL && e_nil && nil_value(rt)) emit_ternary_arm_o(c, e, rt, res_o, b);
+    else emit_expr_slot(c, e, rt, b);
+    buf_puts(b, ")");
+    return 1;
+  }
+  int t = ++g_tmp;
+  buf_puts(b, "({ ");
+  emit_res_ctype(c, rt, res_o, b);
+  buf_printf(b, " _t%d = %s;\n  ", t, res_o ? oint_nil(rt) : slot_zero(c, rt));
+  Buf epre; memset(&epre, 0, sizeof epre);
+  Buf *sv_pre = g_pre; int sv_ind = g_indent;
+  g_pre = &epre; g_indent = 1;
+  Buf ev; memset(&ev, 0, sizeof ev);
+  emit_expr_for_effect(c, e, &ev);
+  g_pre = sv_pre; g_indent = sv_ind;
+  if (epre.p) buf_puts(b, epre.p);
+  buf_printf(b, "%s; _t%d; })", ev.p ? ev.p : "", t);
+  free(epre.p); free(ev.p);
+  return 1;
+}
+
 static int emit_and_or_begin_expr(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *ty) {
   if (sp_streq(ty, "AndNode") || sp_streq(ty, "OrNode")) {
     int is_and = sp_streq(ty, "AndNode");
@@ -5780,6 +5885,8 @@ static int emit_and_or_begin_expr(Compiler *c, int id, Buf *b, const NodeTable *
        on exception, evaluate fallback instead. */
     int e  = nt_ref(nt, id, "expression");
     int r  = nt_ref(nt, id, "rescue_expression");
+    if (an_rescue_mod_elides_setjmp(c, id))
+      return emit_rescue_modifier_elided(c, id, e, b);
     TyKind rt = repr_of(c, id).as_ty;
     /* a value-less modifier (`(raise "x" rescue (return :a if c))`) still
        answers one, nil when the fallback falls through: held boxed */
@@ -6545,7 +6652,7 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
       int one_to = nlv && (nlv->type == TY_STRING || nlv->type == TY_STRBUF);
       if (one_to) buf_printf(b, "lv_%s = SP_STR_TO(lv_%s, sp_re_named_capture(sp_re_pat_%d, ", rename_local(tnm), rename_local(tnm), reidx);
       else buf_printf(b, "lv_%s = sp_re_named_capture(sp_re_pat_%d, ", rename_local(tnm), reidx);
-      emit_str_literal(b, tnm);
+      emit_str_literal(b, nt_wname(nt, tv[ti]));   /* the group is named as the program wrote it */
       buf_puts(b, one_to ? ")); " : "); ");
     }
     buf_printf(b, "_t%d; })", t);
@@ -7275,7 +7382,13 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
          the write and the read then share. Without this the value form
          declined outright, which is what `v[s.tag] += 1` as a block's last
          expression hit (#3417). */
-      int cheap = idx_opw_node_is_cheap(nt, ir) && idx_opw_node_is_cheap(nt, iav[0]);
+      /* (and a right-hand side that runs code can rebind the variable the
+         receiver or the key reads, `p(a[2] += (a = [7]; 2))`: the read-back
+         then read the new object's slot, so the two are held as for a call
+         receiver, #11506) */
+      int ov = nt_ref(nt, id, "value");
+      int cheap = idx_opw_node_is_cheap(nt, ir) && idx_opw_node_is_cheap(nt, iav[0]) &&
+                  !(ov >= 0 && subtree_has_side_effect(c, ov));
       /* a boxed receiver's store answers the stored value into a temp of its
          own (emit_index_opw_value_into): a String's slot read back after the
          splice is one character of it */

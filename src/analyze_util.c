@@ -83,11 +83,14 @@ int is_builtin_exception_name(const char *n) {
    walk of the class bodies, the path writes and the nils a desugaring
    dropped. Each question walked all of them, once for each pair, and N
    scoped reads of N names asked N pairs. */
-struct ConstPairs { const NodeTable *nt; unsigned ver; unsigned long edits; int count; ANameHash keys; };
+struct ConstPairs { const NodeTable *nt; unsigned ver; unsigned long edits; int count; ANameHash keys, heads; };
 static void const_pairs_clear(struct ConstPairs *p) {
   for (int i = 0; i < p->keys.n; i++) free((char *)p->keys.key[i]);
+  for (int i = 0; i < p->heads.n; i++) free((char *)p->heads.key[i]);
   anh_free(&p->keys);
+  anh_free(&p->heads);
   memset(&p->keys, 0, sizeof p->keys);
+  memset(&p->heads, 0, sizeof p->heads);
 }
 void const_pairs_free(Compiler *c) {
   if (!c->const_pairs) return;
@@ -146,6 +149,9 @@ static const ANameHash *const_pairs_of(Compiler *c) {
     NT_FOREACH_KIND(nt, dk[dh], d) {
       const char *dn = class_def_opens_cref(nt, d) ? class_def_key(c, d) : NULL;
       if (dn) body_const_writes(c, nt, class_def_body(nt, d), dn, &p->keys);
+      /* heads: the path P::N of a header such as `class Encoding::Converter` */
+      int cp = class_def_path(nt, d), q = cp >= 0 && nt_kind(nt, cp) == NK_ConstantPathNode ? nt_ref(nt, cp, "parent") : -1;
+      if (q >= 0 && nt_kind(nt, q) == NK_ConstantReadNode) const_pair_add(&p->heads, nt_str(nt, q, "name"), nt_str(nt, cp, "name"));
     }
   static const NodeKind writes[] = { NK_ConstantPathWriteNode, NK_ConstantPathOrWriteNode,
                                      NK_ConstantPathAndWriteNode, NK_ConstantPathOperatorWriteNode };
@@ -163,6 +169,16 @@ int program_writes_const_in(Compiler *c, const char *pn, const char *nm) {
   if (!pn || !nm) return 0;
   char kb[256], *key = const_pair_key(kb, sizeof kb, pn, nm);
   int r = anh_has(const_pairs_of(c), key);
+  if (key != kb) free(key);
+  return r;
+}
+/* Does a class or module header open the path `pn::nm` (`class
+   Encoding::Converter`)? */
+static int program_opens_path(Compiler *c, const char *pn, const char *nm) {
+  if (!pn || !nm) return 0;
+  const_pairs_of(c);
+  char kb[256], *key = const_pair_key(kb, sizeof kb, pn, nm);
+  int r = anh_has(&c->const_pairs->heads, key);
   if (key != kb) free(key);
   return r;
 }
@@ -595,6 +611,7 @@ int const_node_class_index(Compiler *c, int id) {
     if (one >= 0) return one;
   }
   int k = const_node_class_index_tree(c, id);
+  if (const_path_builtin_other(c, id, k)) return -1;
   /* the record resolves the name to the builtin (Object holds no constant of
      the program's by it): only a top-level class of that name can be the
      program's reopening of it, not a nested one that shares its leaf
@@ -637,7 +654,8 @@ int const_node_match_class_or_named(Compiler *c, int node) {
   if (k >= 0) return k;
   const char *n = const_node_match_class_name(c, node);
   if (!n) n = nt_str(c->nt, node, "name");
-  return n ? comp_class_index(c, n) : -1;
+  k = n ? comp_class_index(c, n) : -1;
+  return const_path_builtin_other(c, node, k) ? -1 : k;
 }
 static int const_node_class_index_tree(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
@@ -753,6 +771,48 @@ static int lexically_sees_nested(Compiler *c, int id, const char *leaf) {
     for (int j = 0; j < c->nclasses; j++)
       if (c->classes[j].enclosing_class == k && class_leaf_is(c, j, leaf)) return 1;
   return 0;
+}
+/* Is class k a constant of a namespace `leaf` nested in a scope around node
+   `id` (App::IO::WaitReadable for `IO::WaitReadable` written in App)? */
+static int class_in_lexical_nested(Compiler *c, int id, const char *leaf, int k) {
+  int p = c->classes[k].enclosing_class;
+  if (p < 0 || p >= c->nclasses || !class_leaf_is(c, p, leaf)) return 0;
+  if (!c->node_cbody || id >= c->node_cap) return 1;
+  int d = 0;
+  for (int e = c->node_cbody[id]; e >= 0 && e < c->nclasses && d < 64; e = c->classes[e].enclosing_class, d++)
+    if (c->classes[p].enclosing_class == e) return 1;
+  return 0;
+}
+static int program_gives_builtin_const(Compiler *c, const char *nm);
+/* Returns 1 when constant path id is a builtin's path (IO::WaitReadable,
+   File::Stat) and class k, which the lookup found by the path's leaf, is a
+   program class with another Ruby name (T::WaitReadable, T::Stat). The
+   caller then uses the builtin. Returns 0 when the Ruby name of k is the
+   whole path, as for `class Enumerator::Chain`, which reopens the builtin.
+   For a path listed in lib/sp_builtin_classes.h (IO::WaitReadable) or an
+   Errno path (Errno::EACCES), the function also returns 0 when k is a
+   constant of a namespace App::IO nested where the path is written
+   (App::IO::WaitReadable), except for a path from
+   the top level (::IO::WaitReadable). For another builtin path (File::Stat),
+   the function also returns 0 when the program can define the leaf in the
+   builtin: a module App::File nested where the path is written, a class
+   header or write of the path, a module mixed into a builtin, or a
+   const_set. */
+int const_path_builtin_other(Compiler *c, int id, int k) {
+  const NodeTable *nt = c->nt;
+  if (k < 0 || id < 0 || nt_kind(nt, id) != NK_ConstantPathNode) return 0;
+  int par = nt_ref(nt, id, "parent");
+  int root = par >= 0 && nt_kind(nt, par) == NK_ConstantPathNode && nt_ref(nt, par, "parent") < 0;
+  const char *pn = par >= 0 && (root || nt_kind(nt, par) == NK_ConstantReadNode) ? nt_str(nt, par, "name") : NULL;
+  const char *nm = nt_str(nt, id, "name"), *rn = class_ruby_name(c, k);
+  char qn[256];
+  if (!pn || !nm || snprintf(qn, sizeof qn, "%s::%s", pn, nm) >= (int)sizeof qn || (rn && sp_streq(rn, qn))) return 0;
+  if (builtin_core_class_slot(qn) >= 0 || !strncmp(qn, "Errno::", 7)) return root || !class_in_lexical_nested(c, id, pn, k);
+  /* qc_orig_name is the leaf the program wrote when a pass renamed the
+     path to the alias's class (M::A to Foo) */
+  const char *wn = nt_str(nt, id, "qc_orig_name"), *ln = class_leaf_name(wn ? wn : nm);
+  return class_leaf_is(c, k, ln) && const_path_in_closed_builtin(c, id) && !program_gives_builtin_const(c, ln) &&
+         !program_places_const_dynamically(c, ln) && !program_opens_path(c, pn, nm);
 }
 /* `P::NAME` where P is a builtin class or module: NAME is P's own constant,
    never a program constant that shares the leaf name (the leaf-keyed table
@@ -1623,6 +1683,29 @@ int node_is_empty_container(Compiler *c, int node) {
   int ca = nt_ref(nt, node, "arguments");
   int argc = 0; if (ca >= 0) nt_arr(nt, ca, "arguments", &argc);
   return argc == 0 && cplan_const_user(c, node, r, 1).mi < 0;
+}
+
+/* If `node` (through parentheses) is a plain zero-argument, blockless
+   `.freeze` / `.dup` / `.clone` on an empty container (`[]`, `{}`, bare
+   `Array.new` / `Hash.new`) with no user override replacing the builtin,
+   return the unwrapped receiver node and set *frozen_out (when non-NULL) to 1
+   for `freeze` and 0 otherwise; else return -1. */
+int empty_container_copy_recv(Compiler *c, int node, int *frozen_out) {
+  const NodeTable *nt = c->nt;
+  int u = nt_paren_single(nt, node);
+  if (u < 0 || nt_kind(nt, u) != NK_CallNode || nt_ref(nt, u, "block") >= 0) return -1;
+  int recv = nt_ref(nt, u, "receiver");
+  if (recv < 0) return -1;
+  const char *nm = nt_str(nt, u, "name");
+  int args = nt_ref(nt, u, "arguments"), an = 0;
+  if (args >= 0) nt_arr(nt, args, "arguments", &an);
+  if (an != 0 || !nm || (!sp_streq(nm, "freeze") && !sp_streq(nm, "dup") && !sp_streq(nm, "clone"))) return -1;
+  CallPlan cp = cplan_user(c, u);
+  if (cp.mi >= 0 || cp.dispatch != CP_NONE) return -1;
+  int r = nt_paren_single(nt, recv);
+  if (!node_is_empty_container(c, r)) return -1;
+  if (frozen_out) *frozen_out = sp_streq(nm, "freeze");
+  return r;
 }
 
 int is_arith_op(const char *op) {
@@ -4090,25 +4173,21 @@ TyKind yield_value_type(Compiler *c, int mi) {
   int pf_fwd = 0, poly_site = 0;
   YvtIndex *y = yvt_get(c);
   YvtIt yit; yvt_it_init(c, &yit, mi);
-  /* Under --load-model=graph the call sites are taken in the program's
-     order (prog_sort): where the first site's block answers (a method
-     specialized per site keeps one), it is the site the program reaches
-     first, whichever file holds it, not the one the node table happens to
-     number first. One program text (the inline model) numbers its nodes in
-     that order already, and its sites are read as they come. */
+  /* The call sites are taken in the program's order (prog_sort): where the
+     first site's block answers (a method specialized per site keeps one), it
+     is the site the program reaches first, whichever file holds it, not the
+     one the node table happens to number first. */
   int nsite = 0, csite = 0, si = 0, *site = NULL;
-  if (prog_has_files(c)) {
-    for (int ii; (ii = yvt_it_next(&yit)) >= 0; ) {
-      if (nsite == csite) {
-        csite = csite ? csite * 2 : 16;
-        site = realloc(site, sizeof(int) * (size_t)csite);
-        if (!site) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-      }
-      site[nsite++] = ii;
+  for (int ii; (ii = yvt_it_next(&yit)) >= 0; ) {
+    if (nsite == csite) {
+      csite = csite ? csite * 2 : 16;
+      site = realloc(site, sizeof(int) * (size_t)csite);
+      if (!site) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
     }
-    prog_sort(c, site, nsite, y->ids);
+    site[nsite++] = ii;
   }
-  for (int ii; (ii = site ? (si < nsite ? site[si++] : -1) : yvt_it_next(&yit)) >= 0; ) {
+  prog_sort(c, site, nsite, y->ids);
+  for (int ii; (ii = si < nsite ? site[si++] : -1) >= 0; ) {
     int cid = y->ids[ii];
     /* A `callee(...)` forward carries its block implicitly inside the `...`
        (no explicit block node); treat it as a forwarded block too. */
@@ -5511,8 +5590,9 @@ int send_blind_recv_owns(Compiler *c, int call, int recv, TyKind srt, const char
 /* A receiverless call directly in a class body is sent to the class. */
 int comp_cbody_call_mi(Compiler *c, int id, const char *name) {
   Scope *s = comp_scope_of(c, id);
-  if (!name || (s && s->name) || c->node_cbody[id] < 0) return -1;
-  return call_target(c, id, c->node_cbody[id], name, CT_CMETHOD, NULL);
+  int body = self_class_body(c, id);
+  if (!name || (s && s->name) || body < 0) return -1;
+  return call_target(c, id, body, name, CT_CMETHOD, NULL);
 }
 
 TyKind proc_call_ret(Compiler *c, int recv) {
@@ -6203,12 +6283,45 @@ int method_call_param_shift(Compiler *c, int mn, int mi) {
   return (m->class_id < 0 && !m->is_cmethod && m->nparams > 0 && m->pnames) ? 1 : 0;
 }
 
-/* True when scope `scope_idx` contains an explicit `return`, which needs
-   a return funnel when the method is inlined at its call sites. */
-int scope_has_return(Compiler *c, int scope_idx) {
+static int scope_has_return_scan(Compiler *c, int scope_idx) {
   NT_FOREACH_KIND(c->nt, NK_ReturnNode, id)
     if (c->nscope[id] == scope_idx) return 1;
   return 0;
+}
+
+/* True when scope `scope_idx` contains an explicit `return`, which needs
+   a return funnel when the method is inlined at its call sites. */
+int scope_has_return(Compiler *c, int scope_idx) {
+  if (scope_idx < 0 || scope_idx >= c->nscopes || !comp_scope_index_is_frozen())
+    return scope_has_return_scan(c, scope_idx);
+  unsigned kgen = nt_kind_gen(c->nt, NK_ReturnNode);
+  unsigned sgen = comp_scope_index_gen();
+  if (!c->scope_ret_built || c->scope_ret_kgen != kgen ||
+      c->scope_ret_nscopes != c->nscopes || c->scope_ret_sgen != sgen) {
+    int ns = c->nscopes;
+    unsigned char *has = (unsigned char *)calloc((size_t)(ns > 0 ? ns : 1), 1);
+    if (!has) return scope_has_return_scan(c, scope_idx);
+    NT_FOREACH_KIND(c->nt, NK_ReturnNode, id) {
+      int si = c->nscope[id];
+      if (si >= 0 && si < ns) has[si] = 1;
+    }
+    free(c->scope_ret_has);
+    c->scope_ret_has = has;
+    c->scope_ret_nscopes = ns;
+    c->scope_ret_kgen = kgen;
+    c->scope_ret_sgen = sgen;
+    c->scope_ret_built = 1;
+  }
+  int ans = c->scope_ret_has[scope_idx] ? 1 : 0;
+  if (comp_cache_check_on()) {
+    int ref = scope_has_return_scan(c, scope_idx);
+    if (ans != ref) {
+      fprintf(stderr, "spinel-cache-check: scope_has_return mismatch for scope %d: cached=%d scan=%d\n",
+              scope_idx, ans, ref);
+      abort();
+    }
+  }
+  return ans;
 }
 
 /* Resolve a block-bearing CallNode to an INLINE-ABLE yielding user method:
@@ -6716,7 +6829,7 @@ int strh_call_op(Compiler *c, int call, TyKind rt) {
   const int *av = ca >= 0 ? nt_arr(nt, ca, "arguments", &argc) : NULL;
   if (nt_argv_has(nt, av, argc, NT_ARG_SPLAT | NT_ARG_KEYWORDS | NT_ARG_BLOCK)) return STRH_NONE;
   int op = strh_op(nm, argc, blk < 0 ? 0 : nt_kind(nt, blk) == NK_BlockNode ? 1 : 2);
-  if (op == STRH_NONE || share_builtin_overridden(c, "Array", nm)) return STRH_NONE;
+  if (op == STRH_NONE || cplan_builtin_overridden(c, "Array", nm)) return STRH_NONE;
   if (argc == 1) {
     /* (`[]` at an index known only at run time, where the call is typed a
        String: its emitter reads the element) */
@@ -7270,6 +7383,25 @@ int list_cells_shape(const NodeTable *nt, int id) {
   return ac <= 1 && (rk == NK_ConstantReadNode || rk == NK_ConstantPathNode) && (ak == NK_FalseNode || (side == 1 && ak == NK_TrueNode)) ? side : 0;
 }
 /* See analyze_internal.h. */
+int list_chain_shape(const NodeTable *nt, int id) {
+  int ac = 0;
+  if (nt_kind(nt, id) != NK_CallNode || nt_ref(nt, id, "block") >= 0 || !is_chain_method_list(nt_str(nt, id, "name"))) return 0;
+  const int *av = call_args(nt, id, &ac);
+  if (ac > 1) return 0;
+  NodeKind ak = ac == 1 ? nt_kind(nt, av[0]) : NK_TrueNode;
+  /* (an object's list takes the flag the run decides too, an_object_methods_all_arg's 2; a class's instance-method list does not) */
+  return ak == NK_TrueNode || (!is_instance_method_list(nt_str(nt, id, "name")) && ak != NK_FalseNode && ak != NK_NilNode && ak != NK_SplatNode);
+}
+/* See analyze_internal.h. */
+int list_own_object_shape(const NodeTable *nt, int id) {
+  int ac = 0;
+  const char *nm = nt_kind(nt, id) == NK_CallNode ? nt_str(nt, id, "name") : NULL;
+  if (!nm || nt_ref(nt, id, "block") >= 0 || !is_chain_method_list(nm) || is_instance_method_list(nm) || method_list_vis_mask(nm) != 1 << SP_VIS_PUBLIC)
+    return 0;
+  const int *av = call_args(nt, id, &ac);
+  return ac == 1 && (nt_kind(nt, av[0]) == NK_FalseNode || nt_kind(nt, av[0]) == NK_NilNode);
+}
+/* See analyze_internal.h. */
 int capture_cells_shape(const NodeTable *nt, int id) {
   int ac = 0;
   const int *av = nt_kind(nt, id) == NK_CallNode && is_bound_method_maker(nt_str(nt, id, "name")) &&
@@ -7286,7 +7418,7 @@ int respond_to_missing_defined(Compiler *c) {
   unsigned tgen = comp_table_gen, shape = comp_class_shape_gen();
   if (!c->rtm_memo.ans || c->rtm_memo.count != nt->count || c->rtm_memo.version != nt->version || c->rtm_memo.edits != nt->edits ||
       c->rtm_memo.tgen != tgen || c->rtm_memo.shape != shape || c->rtm_memo.ncls != c->nclasses) {
-    int ans = 1 + !an_name_binder_free(c, "respond_to_missing?");
+    int ans = 1 + !an_name_binder_free(c, RESPOND_TO_MISSING_NAME);
     c->rtm_memo.ans = ans; c->rtm_memo.count = nt->count; c->rtm_memo.ncls = c->nclasses; c->rtm_memo.version = nt->version;
     c->rtm_memo.tgen = tgen; c->rtm_memo.shape = shape; c->rtm_memo.edits = nt->edits;
   }

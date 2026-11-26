@@ -217,6 +217,8 @@ typedef enum {
   BOPE_STRING_SLICE,
   BOPE_STRING_BYTESPLICE,
   BOPE_STRING_APPEND_AS_BYTES,
+  BOPE_STRING_CONCAT_LIST,
+  BOPE_STRING_PREPEND_LIST,
   BOPE_STRING_DEDUP,     /* String#dedup: -@ under the name a nil receiver is raised with */
   BOPE_STRING_SCRUB_BLOCK, /* String#scrub with a block */
   BOPE_STRING_LINES,       /* String#lines without a block */
@@ -249,7 +251,7 @@ typedef struct BuiltinOp {
   const char *arg;        /* BOPE_TEMPLATE's C text */
   BopKinds arg0, arg1;    /* the kinds the first and second argument may
                              have (BOP_K), or 0 for any */
-  unsigned short flags;   /* BOPF_* */
+  unsigned int flags;     /* BOPF_* */
   unsigned char stage;    /* the codegen lookup that emits the row: 0, the
                              default, is the one each family has always had;
                              a family whose arms sit at several distant
@@ -385,6 +387,39 @@ typedef struct BuiltinOp {
 /* The emitter accepts the full Ruby operand list, including a spread or
    a fixed count beyond BOP_ARGC_ANY. A boxed arm can reuse held operands. */
 #define BOPF_ARGV 32768
+/* The call's own answer can be nil on a miss, empty receiver, EOF, timeout,
+   fixed-offset Time without a zone name, missing capture, or out-of-range
+   slice/index, even when its receiver is not nil (distinct from
+   BOPF_SELF_OR_NIL, which answers nil when a mutator changed nothing). */
+#define BOPF_MAY_NIL    65536u
+/* An Array removal (pop(), shift(), delete(x), delete_at(i)) that answers
+   nil once the Array is empty, the index is outside it, or no element
+   matches: NFW_TAKEN on an object Array (and may-nil on any Array). */
+#define BOPF_TAKEN_NIL  131072u
+/* An Array call whose returned Array holds elements taken from its receiver
+   (select, reject, uniq, sort, reverse, take, drop, subarray slices,
+   first(n), pop(n), ...), so element-nilness (NFW_ELEM_NIL) flows from
+   receiver to result. Compacting calls (compact, filter_map) omit it. */
+#define BOPF_KEEP_ELEMS 262144u
+/* A call returning a container whose elements may be nil even when its
+   receiver holds no nil (Array#values_at(i, ...), Array#minmax/minmax_by on
+   an empty Array, StringRange#minmax on an empty range, Hash#values). */
+#define BOPF_ELEM_NIL   524288u
+/* The row answers only a call whose operand list holds a splat, a list
+   whose length is known at run time (`s.concat(*parts)`); the call's other
+   forms are left to the rows and routes of their own. */
+#define BOPF_SPREAD     1048576u
+/* A call whose answer reads every character or byte of its receiver,
+   whatever its arguments (a length that counts characters, a count, a
+   search, match or scan, a case or character conversion, a split, a
+   substitution), so its time grows with what the receiver holds: one call
+   on a long String may take milliseconds. A loop or builtin iterator step
+   whose pass makes one polls at that pass (loop_pass_grows). Not a
+   comparison or a character-indexed read, which stop at the shorter
+   operand or at the index, typically a short literal or the first
+   characters, where a poll at each pass of a tight loop would cost more
+   than it saves. */
+#define BOPF_WALKS_RECV 2097152u
 
 /* A row's recv may name a family of kinds rather than one; a caller looks
    the family up with the family's value. Not a TyKind any value has. */
@@ -470,7 +505,9 @@ int bop_row_count(void);
 const BuiltinOp *bop_row(int i);
 const BuiltinOp *bop_find(TyKind rt, const char *name, int argc, int has_block);
 /* The flags (BOPF_*) of the row of kind rt for `name`, 0 for none */
-int bop_flags(TyKind rt, const char *name);
+unsigned bop_flags(TyKind rt, const char *name);
+/* Does `name` on `rt` walk its receiver (BOPF_WALKS_RECV, on any of its rows)? */
+int bop_walks_recv(TyKind rt, const char *name);
 /* Is there a row of `name` whose method takes no keywords in CRuby (a row
    without BOPF_KEYWORDS, of any kind)? Its call gets a non-empty `**` operand
    as one positional Hash, and an empty one as nothing. */
@@ -506,8 +543,9 @@ typedef TyKind (*BopArgKind)(const void *ud, int i);
 const BuiltinOp *bop_find_arg(TyKind rt, const char *name, int argc, int has_block,
                               BopArgKind arg_of, const void *ud);
 /* bop_find_arg over the rows of one stage only (codegen's lookups); a
-   negative stage reads every row, as bop_find_arg does */
-const BuiltinOp *bop_find_stage(TyKind rt, const char *name, int argc, int has_block,
+   negative stage reads every row, as bop_find_arg does. spread says the
+   call's operands hold a splat: only then do the BOPF_SPREAD rows fit. */
+const BuiltinOp *bop_find_stage(TyKind rt, const char *name, int argc, int has_block, int spread,
                                 BopArgKind arg_of, const void *ud, int stage);
 
 /* Is op a library's IO row (io/console's winsize, winsize=) that emits the
@@ -614,6 +652,41 @@ int iter_hands_recv(const char *name);
 /* Whether that call reads its arguments of the receiver's builtin class as
    that builtin (BOPF_ARGS_BUILTIN), looked up as bop_answers_self does. */
 int bop_args_as_builtin(TyKind rt, const char *name, int argc, int has_block);
+
+/* Whether a builtin call's own answer can be nil (analyze_nil.c), read from
+   the row's flags (BOPF_SELF_OR_NIL, BOPF_TAKEN_NIL, BOPF_MAY_NIL), Object
+   pass-throughs (itself, tap, dup, clone, freeze), and container
+   element-returning rows (BOPR_ELEM). */
+typedef enum {
+  BOPN_NONE = 0,       /* never nil on a non-nil receiver */
+  BOPN_RECV,           /* nil iff the receiver is nil */
+  BOPN_SELF_OR_NIL,    /* nil when unchanged (BOPF_SELF_OR_NIL) */
+  BOPN_TAKEN,          /* Array removal (BOPF_TAKEN_NIL) */
+  BOPN_ELEM_ONLY,      /* returns an element of the receiver; raises on miss */
+  BOPN_MAY_NIL,        /* can return nil (BOPF_MAY_NIL) */
+  BOPN_UNKNOWN         /* no builtin row covers this call */
+} BopNilKind;
+BopNilKind bop_nil_kind(TyKind rt, const char *name,
+                        int argc, int has_block, BopArgKind arg_of, const void *ud);
+
+/* How an Array-returning builtin call propagates element-nilness
+   (NFW_ELEM_NIL in analyze_nil.c). */
+typedef enum {
+  BOPEL_NONE = 0,      /* result does not inherit nil elements (compact, filter_map, ...) */
+  BOPEL_RECV,          /* result inherits receiver's element-nilness */
+  BOPEL_MERGE,         /* result inherits receiver's and operand Arrays' element-nilness */
+  BOPEL_MAP,           /* result elements come from the block's value */
+  BOPEL_FLAT_MAP,      /* result elements come from the block's value or its elements */
+  BOPEL_MAY_NIL        /* call itself can introduce nil elements (values_at(i, ...)) */
+} BopElemNil;
+BopElemNil bop_elem_nil_kind(TyKind rt, const char *name, int argc, int has_block,
+                             BopArgKind arg_of, const void *ud);
+
+/* Whether the runtime or a builtin may invoke a user method named `name`
+   with arguments the analysis cannot see at a Ruby call site (equality,
+   ordering, coercion, method_missing/respond_to_missing?, copy hooks,
+   module/class definition hooks, Marshal/YAML loaders). */
+int bop_runtime_callback(const char *name);
 
 /* ---- What a builtin call does with the Strings it is handed (#6765) ----
    The facts --share-strings reads (analyze_share.c): which of the call's

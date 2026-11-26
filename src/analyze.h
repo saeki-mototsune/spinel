@@ -123,6 +123,18 @@ const ArmFact *arm_fact_find(const Compiler *c, int block, TyKind kind);
    Scope.ret_obj_may_nil. repr_of and repr_of_slot read them into may_nil. */
 enum { NF_UNKNOWN, NF_NOT_NIL, NF_MAY_NIL, NF_GUARDED /* not nil past a guard */ };
 void an_nil_facts(Compiler *c);
+/* Whole-program conservative may_raise / nothrow analysis (analyze_raise.c).
+   One place per decision: codegen reads these settled facts for both setjmp
+   emission (emit_begin, RescueModifierNode) and volatile qualification
+   (is_setjmp_construct, scope_emits_setjmp, begin_volatile_names). */
+void an_raise_facts(Compiler *c);
+int an_scope_may_raise(const Compiler *c, int si);
+int an_expr_may_raise(Compiler *c, int id);
+int an_stmt_may_raise(Compiler *c, int id);
+int an_begin_elides_setjmp(const Compiler *c, int id);
+int an_rescue_mod_elides_setjmp(const Compiler *c, int id);
+int an_rescue_elided(const Compiler *c, int id);
+int an_subtree_has_local_jump(const NodeTable *nt, int id);
 /* Which constants a read can reach before their assignment: sets
    LocalVar.const_early on each one whose assignment is not settled
    (analyze_const.c). Runs once the constants are registered, ahead of the
@@ -148,13 +160,14 @@ int an_class_presence_write(Compiler *c, int id);
 ConstReadEffect an_const_read_effect(Compiler *c, int id);
 int an_const_read_keeps_class(Compiler *c, int id);
 int an_const_read_is_value(Compiler *c, int id);
-/* The program's files under --load-model=graph (analyze_program.c, #9898):
+/* The program's files (analyze_program.c, #9898):
    their top-level scopes and roots, and what the model refuses for now. */
 void prog_file_scopes(Compiler *c);
 void prog_refuse_loads(Compiler *c);
+void prog_refuse_nested_lambda_returns(Compiler *c);
 void prog_settle_files(Compiler *c);
 /* Is node in a required file prog_settle_files dropped, as no live require
-   reaches it (--load-model=graph)? */
+   reaches it? */
 int prog_node_in_dropped_file(Compiler *c, int node);
 void prog_refuse_order(Compiler *c);
 int prog_is_top_scope(const Compiler *c, const Scope *s);
@@ -185,7 +198,6 @@ void prog_visit_files(const Compiler *c, void (*fn)(void *ud, int node, int file
 enum { PROG_BEFORE = -1, PROG_SAME = 0, PROG_AFTER = 1, PROG_UNKNOWN = 2 };
 int prog_order(Compiler *c, int a, int b);
 void prog_sort(Compiler *c, int *v, int n, const int *node_of);
-int prog_has_files(const Compiler *c);
 int prog_cmp(Compiler *c, int a, int b, int at, const char *reader);
 int prog_cmp_run(Compiler *c, int a, int b, int at, const char *reader);   /* prog_cmp in the record's run order: BEGIN first */
 /* The load-phase record (analyze_elab.c, #9898): where each statement of
@@ -241,7 +253,8 @@ enum { ELAB_NO, ELAB_YES, ELAB_UNKNOWN };
 /* (an answer of the method lookups that read an undef: the lookup stops
    there, the name is undefined: elab_main_singleton_at) */
 enum { ELAB_STOP = 3 };
-enum { LR_MAY_IN = 2 };   /* LrDef.may */
+enum { LR_MAY_IN = 2, LR_MAY_GATE = 3 };   /* LrDef.may: LR_MAY_GATE, the `may` of an entry with LrDef.gate set where the word stands under no condition of its own */
+enum { LR_HAS_CELL = 2 };   /* a name's presence at a word the run's version cells decide (elab_word_elem_cell) */
 /* When a call's block (or an END body) runs, from the syntax alone
    (elab_block_runs): not now, at a time the syntax does not tell (a later
    def may or may not have run by then); not known (a program method may
@@ -311,6 +324,9 @@ typedef struct {
                            last (lr_cond_first_arm); 0 for any other version */
   unsigned char cut;    /* a visibility word's entry of a name past the names the word reaches (lr_word_reach), where its
                            statement is partial: the word has not changed it, so it is no run version (lr_word_runs) */
+  unsigned char gate;   /* a visibility word's entry of a word that takes a name the run's cells decide (lr_word_reach), up to the end of the
+                           reach: the word changes the names from that one on only where the names ahead of it are present, so it writes the
+                           visibility cells as it passes each name, between the tests (elab_version_word), whatever condition holds the word */
 } LrDef;
 enum { LR_UNPLACED_LATER = 2 };   /* LrDef.unplaced */
 typedef struct { int node, body; } LrOpen;
@@ -330,10 +346,16 @@ typedef enum { LR_INCLUDE, LR_EXTEND, LR_PREPEND, LR_SG_PREPEND } LrMixKind;   /
    runs whenever its body does (no condition of its own, elab_point_may),
    and stands in the body that made the class, or in a reopening that runs
    before any object of the class, or of one below it, may exist
-   (lr_early_settle). */
-typedef struct { int node, kind, mod, ref; unsigned char dup, cond, applied; int open; unsigned char early; } LrMixin;
+   (lr_early_settle). unplaced: recorded by a body the walk does not
+   place (lr_nested_body), as an unplaced LrDef is: its statement's point
+   is no point the call runs at. */
+typedef struct { int node, kind, mod, ref; unsigned char dup, cond, applied; int open; unsigned char early, unplaced; } LrMixin;
 typedef enum { ELAB_GVAR, ELAB_MAIN_IVAR, ELAB_CONST } ElabVar;
 struct HostStep;
+/* ELAB_UNKNOWN for an unresolved receiver, ELAB_YES for possible shadowing on a resolved chain. */
+int elab_autoload_shadow(Compiler *c, int id);
+/* Whether a literal lambda block's constructor reaches builtin Kernel#lambda. */
+int elab_builtin_lambda(Compiler *c, int call, const int *parent);
 void elab_program(Compiler *c, struct HostStep *h);
 void elab_const_keys(Compiler *c);   /* each constant write and resolved read takes its entity's key (#10787); SPINEL_CONST_KEY_CHECK reports the changes */
 /* (the same from the node table alone: a key whose node a later pass
@@ -539,6 +561,8 @@ int elab_cvar_cref_at(Compiler *c, int node);
    module's histories: defs, define_methods, attrs, aliases, module_function
    copies, undefs and removes (not visibility changes) */
 int elab_method_versions(Compiler *c, const char *name);
+/* ...the i-th name the record holds versions of, in no order; NULL past the last */
+const char *elab_version_name(Compiler *c, int i);
 /* may a call of `name` reach a replaced version: does some class's (or
    main's) history of it hold more than one version, or an alias, which
    names the version it captured? */
@@ -548,6 +572,25 @@ int elab_method_replaced(Compiler *c, const char *name);
    do the methods its versions give have more than one visibility (a
    module's private one and a class's public one)? */
 int elab_method_vis_varies(Compiler *c, const char *name);
+/* ...does a visibility word of `name` stand under a condition the run decides, with a write that keeps the name's
+   visibility cell (lr_vis_cellable), so that a call and a reader read that cell? The name's one def is versioned for
+   it alone: a face entry over the def, whose arm tests the cell. Of the instance side's histories: a class method's
+   word waits for the class side's cells */
+int elab_method_vis_gated(Compiler *c, const char *name);
+/* ...and is the last change of the name along cls's lookup at p (mixins and prepends among it) a word that takes a name the run's cells decide
+   (LrDef.gate), standing in class def_cls, the class of the def a public_method capture binds? Then the table's visibility, the word taken
+   as run, is the one the capture reads, as it was where the record applied such a word whole. A subclass's own def, an extended module's, a
+   singleton's, or a word under a condition after it is another answer */
+int elab_method_vis_tied(Compiler *c, int cls, const char *name, int def_cls, LoadPoint p);
+/* does the k-th name of visibility word node, taken on instance-side class cls, stand where the word runs by the run's version cells
+   (LR_HAS_CELL): its versions a method's body makes may or may not have run, each with a cell that tells? The word then tests the
+   cells, raises NameError where the name is absent, and changes the names from there on only where it passes (cplan_word_elem_presence) */
+int elab_word_elem_cell(Compiler *c, int node, int cls, int k);
+/* does word node take any name the run's cells decide on instance-side class cls (elab_word_elem_cell)? */
+int elab_word_has_cell(Compiler *c, int node, int cls);
+/* visibility word node's elements, and the name of the k-th (NULL for none or for one that is no name; *def says it is a def) */
+int elab_word_elems(const NodeTable *nt, int node);
+const char *elab_word_elem(const NodeTable *nt, int node, int k, int *def);
 /* is call id a visibility word with names a method body runs on the class
    self is there, as the record reads it from the tree, a version of that
    body or not, where it takes no def (its value is then the word's, as in a
@@ -595,14 +638,6 @@ int elab_method_late(Compiler *c, const char *name);
    presence answers (refl_fixed). A respond_to? whose answer the version
    cells hold for a class method (sg) does not. */
 int elab_method_reflected(Compiler *c, const char *name, int sg);
-/* ...the same for a method body's version of `name` on side sg, whose
-   calls take the entry before the body runs (lr_late_make): a
-   respond_to?, defined? or method_defined? of an instance's method, which
-   the plan's presence answers there (cplan_presence's PR_CELLS), does not
-   count, nor one on side sg in a program that defines respond_to_missing?;
-   a list counts for its own side only (a class-side list the cells answer,
-   `K.singleton_methods`, leaves an instance method's versions alone) */
-int elab_body_reflected(Compiler *c, const char *name, int sg);
 /* Does any reflection reader the record takes (lr_refl_take) name `name`:
    one answering from the table, a respond_to? or defined? the cells
    answer, a Method's maker; or one name any? */
@@ -835,7 +870,7 @@ void elab_call_meet(Compiler *c, int id, int cls, const char *name, int sg, int 
    to elab_call_meet), into out[0..cap): elab_method_span's answer, or
    ELAB_SPAN_NO_WINDOW for a call with no window. elab_call_meet asks it
    after its answer at the point (elab_method_at). The call plan asks it
-   itself in three places: ct_window_version, which has no answer at the
+   itself in three places: cplan_window_version, which has no answer at the
    point, and user_new_at and capture_live_at, whose answer there is
    elab_call_method's, not elab_method_at's. */
 enum { ELAB_SPAN_NO_WINDOW = -3 };
@@ -902,8 +937,10 @@ int elab_physical_version_vis(Compiler *c, const ElabVersion *ev);
 /* ...and the visibility words that write that cell (`public :m`, in the
    version's history or the one that is one table entry with it), by the
    index i of the two histories' entries: 1 for a word (its node and
-   visibility in *node, *vis), 0 for another entry, -1 past the last. */
-int elab_version_word(Compiler *c, const ElabVersion *ev, int i, int *node, int *vis);
+   visibility in *node, *vis, and in *elem the element of the word that names it; 2 for a word whose entry applies only
+   where the names of the word ahead of it the run's cells decide are present, LR_MAY_GATE), 0 for another entry, -1 past
+   the last. */
+int elab_version_word(Compiler *c, const ElabVersion *ev, int i, int *node, int *vis, int *elem);
 /* ...and whether Object's own history of `name` (its reopenings' defs, not
    main's top-level ones) holds a live version at p: ELAB_YES, ELAB_NO, or
    ELAB_UNKNOWN where the record cannot say */
@@ -1055,6 +1092,8 @@ int class_def_record(const NodeTable *nt, int def_node);   /* the record call a 
 int class_def_record_is_data(const NodeTable *nt, int call);   /* is record call `call` Data.define's? */
 const NodeKind *class_def_kinds(int *n);   /* the node kinds a definition can be */
 const NodeKind *class_def_module_kinds(int *n);   /* ...a module's definition can be */
+/* The literal block of a class_eval, class_exec, module_eval or module_exec call that takes no argument (`C.class_eval { }`), -1 for any other node */
+int class_eval_block(const NodeTable *nt, int call);
 int class_def_builder(const NodeTable *nt, int def_node);   /* a constant write's Class.new / Module.new call that defines a class, -1 for none */
 int class_def_path(const NodeTable *nt, int def_node);   /* the constant node it writes: a header's path, a builder's write or path target */
 int mixin_stmt_args(const NodeTable *nt, int st, int *prepend, const int **av);   /* a body's receiverless include/prepend: its argument count, -1 for another node */
@@ -1199,7 +1238,7 @@ int elab_accessor_node(Compiler *c, int cls, const char *name);
    of a module it does not know, a computed method name, a method of the
    program its body calls) run on cls before p? */
 int elab_opaque_before(Compiler *c, int cls, LoadPoint p);
-int elab_opaque_before_bar_state(Compiler *c, int cls, LoadPoint p);   /* ...leaving out the state-only macro calls the walk ran (ct_state_note) */
+int elab_opaque_before_bar_state(Compiler *c, int cls, LoadPoint p, int *writes);   /* ...leaving out the state-only macro calls the walk ran (ct_state_note); with writes, code that only writes variables too (*writes says it met some) */
 int nil_fact_node(const Compiler *c, int node);
 int nil_fact_ivar(const Compiler *c, int cid, const char *ivn);
 /* where a nil comes from: a node's (nil_fact_why), a slot's flag itself.
@@ -1298,12 +1337,6 @@ int an_value_top(Compiler *c, int n);
    isn't the start of a non-capturing/extension group '(?...'. scan returns
    nested arrays for capturing patterns, which the str_array path can't model. */
 int an_re_has_captures(const char *src);
-/* Whether every String result is fresh, or comes from one parameter. */
-int scope_ret_fresh(Compiler *c, int mi);
-int scope_ret_param(Compiler *c, int mi);
-/* A String `||` or `&&` over a String left operand: a tail whose operands
-   are its arms (an_tail_is_shared_handle, emit_tail_value). */
-int an_tail_logic_op(Compiler *c, int node);
 int an_send_name_is_computed(Compiler *c, int arg);
 /* Is scope si an iterator synth_struct_each generated, not a def? */
 int scope_is_struct_synth(Compiler *c, int si);
@@ -1541,9 +1574,8 @@ int block_param_used_up(Compiler *c, int blk, const char *nm, int value);
    Kernel#loop rescues (analyze_util.c)? 0 only when nothing in it, nor any
    method it calls by name, can: its emitters then open no setjmp frame. */
 int loop_may_stop(Compiler *c, int loop_call);
-/* The name of a numbered block parameter (`_1`..`_9`) on this parameters node.
-   Per BLOCK where a scope holds more than one such block; see
-   scope_numbered_block_params. Every site that needs the name goes here. */
+/* The name of a numbered block parameter (`_1`..`_9`) on this parameters node:
+   the slot its block owns (`B<n>_<tag>__1`). Every site that needs the name goes here. */
 const char *numbered_param_name(Compiler *c, int params_node, int idx);
 /* Name of a block's trailing rest parameter (`|*a|`), or NULL. */
 const char *block_rest_name(Compiler *c, int block);
@@ -1562,6 +1594,8 @@ int product_block_binds_elems(Compiler *c, int block);
 int block_auto_splats(int P, int O, int Q, int R);
 int block_no_keywords(Compiler *c, int block);
 void block_fill(int P, int O, int Q, int R, int n, int *ot, int *ps);
+/* The value of local read x's one write ahead of it, or -1. */
+int local_sole_write(Compiler *c, int x);
 /* The array literal a splat of this local is sure to spread, or -1. */
 int splat_local_sure_lit(Compiler *c, int x);
 const char *block_kwrest_name(Compiler *c, int block);
@@ -1605,11 +1639,12 @@ int an_program_names_name_error(Compiler *c);   /* the program names NameError o
 int an_program_makes_dir(Compiler *c);   /* the program names Dir anywhere */
 int an_program_makes_bsearch_enum(Compiler *c);   /* Array#bsearch without a block, anywhere */
 int an_program_makes_io(Compiler *c);   /* a boxed value may be an IO (a syntactic test) */
+int an_program_makes_complex(Compiler *c, const NodeTable *nt);   /* the program builds a Complex */
 int an_zero_arg_builtin_shadowed(Compiler *c, const char *name, int argc);
 int an_user_recv_defines_method(Compiler *c, const char *name);
 /* obj.methods / public_methods / singleton_methods on an instance of `cid`
    fold to a static symbol list */
-int an_object_methods_listable(Compiler *c, int cid, const char *name);
+int an_object_methods_listable(Compiler *c, int id, int cid, const char *name);
 int an_object_methods_all_arg(Compiler *c, int cid, int argc, const int *argv);
 int an_poly_object_methods_listable(Compiler *c, int id, const char *name, int argc, const int *argv);   /* a boxed receiver's list, per class it can hold */
 /* obj.methods / public_methods on a builtin value: the core class it lists as */
@@ -1617,6 +1652,7 @@ const char *an_value_methods_class(Compiler *c, int recv, TyKind rt, const char 
                                    const int *argv);
 int an_class_singleton_methods_listable(Compiler *c, int cid);
 int an_singleton_methods_foldable(Compiler *c, int recv);
+int an_class_method_list_foldable(Compiler *c, const char *name, int recv, int argc, const int *argv);
 int ewo_memo_passed_to_callable_at(Compiler *c, int callid, int pidx);
 
 /* Class index when a receiverless instance_eval/exec resolves to self, else -1. */
@@ -1629,15 +1665,10 @@ void ie_body_restore(Compiler *c, int *snap);
 /* instance_exec keyword-arg helpers: the call's trailing KeywordHashNode (or
    -1), and the value node bound to a keyword name within it (or -1). */
 int ie_call_kwhash(Compiler *c, int id);
-const char *rbp_slot_written(const Compiler *c, const char *w);
-const char *param_written_name(const Compiler *c, const char *w);
 /* What a parameter node the desugar made or named stands for, as its
    "desugared_param" mark says (desugared_param_name) */
 enum { DPN_OWN, DPN_WRITTEN, DPN_NAMELESS, DPN_NONE };
 int desugared_param_name(const NodeTable *nt, int p, const char **written);
-int block_param_is_renamed(const Compiler *c, const char *name);
-int block_param_made_for(const Compiler *c, const char *name, int blk);   /* an invented name of that block */
-char *block_param_invent_name(Compiler *c, const char *written, int blk);
 int ie_kwhash_value(Compiler *c, int kwhash, const char *name);
 TyKind ie_kwhash_computed_type(Compiler *c, int kwhash);
 
@@ -1781,6 +1812,7 @@ int std_stream_assigned(Compiler *c, const char *nm);   /* ... or is assigned at
 int std_stream_value_classes(Compiler *c, char *set);   /* classes the streams' stores hold; 0: unbounded */
 int std_stream_foreign_writer(Compiler *c, const char *nm);   /* an object output cannot write to */
 int std_stream_bare_call_own(Compiler *c, int id, const char *nm);   /* bare nm reaches the program's own */
+int std_stream_io_frozen(Compiler *c);   /* the program calls freeze on an IO */
 /* The operation (StrhOp, builtin_names.h) call node `call` is on a String
    Array, whose elements are handles, given the receiver's type rt:
    STRH_NONE unless rt is TY_STR_ARRAY, the call's index is an Integer

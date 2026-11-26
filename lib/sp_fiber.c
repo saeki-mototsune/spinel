@@ -12,7 +12,9 @@
 #include "sp_fiber.h"
 #include <stdlib.h>
 #include <string.h>
+#include <errno.h>
 #include <sys/mman.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 /* OpenBSD requires the stack a coroutine runs on to be MAP_STACK, else the
@@ -216,6 +218,24 @@ static void sp_raise(const char *msg) {SP_GC_ROOT_STR(msg); sp_raise_cls("Runtim
    self-contained here rather than borrowing the runtime's sym_poly_hash so
    the runtime sym_poly_hash stays collector-private to the generated TU. */
 typedef struct { sp_sym *keys; sp_RbVal *vals; sp_int len, cap; } sp_FiberStore;
+/* cap == -1 identifies the extended store. No extra fields or allocations
+   are needed by ordinary storage or Fiber attributes. */
+typedef struct {
+  sp_FiberStore base;
+  sp_RbVal hash;
+  const sp_FiberStorageHashOps *ops;
+} sp_FiberHashStore;
+static void sp_FiberHashStore_scan(void *p) {
+  sp_mark_rbval(((sp_FiberHashStore *)p)->hash);
+}
+static sp_FiberStore *sp_FiberHashStore_new(sp_RbVal hash, const sp_FiberStorageHashOps *ops) {
+  SP_GC_ROOT_RBVAL(hash);
+  sp_FiberHashStore *s = sp_gc_alloc(sizeof(*s), NULL, sp_FiberHashStore_scan);
+  s->base = (sp_FiberStore){ .cap = -1 };
+  s->hash = hash;
+  s->ops = ops;
+  return &s->base;
+}
 static void sp_FiberStore_scan(void *p) { sp_FiberStore *s = (sp_FiberStore *)p; for (sp_int i = 0; i < s->len; i++) sp_mark_rbval(s->vals[i]); }
 static void sp_FiberStore_fin(void *p) { sp_FiberStore *s = (sp_FiberStore *)p; free(s->keys); free(s->vals); }
 static sp_FiberStore *sp_FiberStore_new(void) {
@@ -265,6 +285,10 @@ static void sp_FiberStore_delete(sp_FiberStore *s, sp_sym k) {
   }
 }
 static sp_FiberStore *sp_FiberStore_dup(sp_FiberStore *o) {SP_GC_ROOT(o);
+  if (o->cap == -1) {
+    sp_FiberHashStore *h = (sp_FiberHashStore *)o;
+    return sp_FiberHashStore_new(h->ops->copy(h->hash), h->ops);
+  }
   sp_FiberStore *s = sp_FiberStore_new();
   for (sp_int i = 0; i < o->len; i++) sp_FiberStore_set(s, o->keys[i], o->vals[i]);
   return s;
@@ -602,6 +626,16 @@ void sp_main_stack_run(void (*body)(void)) {
      is what is set, once, before the program's first write and its first
      thread. A file or a pipe keeps the buffer stdio gives it. */
   if (isatty(1)) setvbuf(stdout, NULL, _IONBF, 0);
+  /* a closed fd 0 reads as the end of an empty pipe, as CRuby's
+     fill_standard_fds makes it, and the program's first open does not take it */
+  {
+    struct stat st;
+    int p[2];
+    if (fstat(0, &st) == -1 && errno == EBADF && pipe(p) == 0) {
+      close(p[1]);
+      if (p[0] != 0) { dup2(p[0], 0); close(p[0]); }
+    }
+  }
   size_t guard = sp_fiber_guard();
   size_t want = sp_main_stack_bytes();
   char *base = MAP_FAILED;
@@ -807,16 +841,58 @@ f->stack=sp_stack_cache_take(f->stack_size);if(!f->stack){f->stack=(char*)mmap(N
   f->tsan_fiber=__tsan_create_fiber(0);f->caller_fiber=NULL;
 #endif
   return f;}
-sp_RbVal sp_Fiber_storage_get(sp_Fiber*f,sp_sym k){if(!f->storage)return sp_box_nil();return sp_FiberStore_get((sp_FiberStore*)f->storage,k);}
+sp_RbVal sp_Fiber_storage_get(sp_Fiber *f, sp_sym k) {
+  if (!f->storage) return sp_box_nil();
+  sp_FiberStore *s = f->storage;
+  if (s->cap == -1) {
+    sp_FiberHashStore *h = (sp_FiberHashStore *)s;
+    return h->ops->get(h->hash, k);
+  }
+  return sp_FiberStore_get(s, k);
+}
 /* store v under k as it is, nil included */
-void sp_Fiber_storage_put(sp_Fiber*f,sp_sym k,sp_RbVal v){SP_GC_ROOT_RBVAL(v);SP_GC_ROOT(f); sp_gc_wb((void*)f);if(!f->storage){f->storage=sp_FiberStore_new();sp_gc_wb((void*)f);}sp_FiberStore_set((sp_FiberStore*)f->storage,k,v);}
+void sp_Fiber_storage_put(sp_Fiber *f, sp_sym k, sp_RbVal v) {
+  SP_GC_ROOT_RBVAL(v); SP_GC_ROOT(f);
+  sp_gc_wb(f);
+  if (!f->storage) {
+    f->storage = sp_FiberStore_new();
+    sp_gc_wb(f);
+  }
+  sp_FiberStore *s = f->storage;
+  if (s->cap == -1) {
+    sp_FiberHashStore *h = (sp_FiberHashStore *)s;
+    h->ops->put(h->hash, k, v);
+    return;
+  }
+  sp_FiberStore_set(s, k, v);
+}
 /* Fiber[k] = v: nil removes the key (CRuby) */
 void sp_Fiber_storage_set(sp_Fiber*f,sp_sym k,sp_RbVal v){
   if(v.tag==SP_TAG_NIL){
-    if(f->storage)sp_FiberStore_delete((sp_FiberStore*)f->storage,k);
+    if (f->storage) {
+      sp_FiberStore *s = f->storage;
+      if (s->cap == -1) {
+        sp_FiberHashStore *h = (sp_FiberHashStore *)s;
+        sp_RbVal key = { .tag = SP_TAG_SYM, .v.i = k };
+        /* parenthesized: lib/win32/stdio.h defines remove(p) as a function-like macro */
+        (h->ops->remove)(h->hash, key);
+      }
+      else sp_FiberStore_delete(s, k);
+    }
     return;
   }
   sp_Fiber_storage_put(f,k,v);
+}
+void sp_Fiber_storage_from_hash(sp_Fiber *f, sp_RbVal hash, const sp_FiberStorageHashOps *ops) {
+  SP_GC_ROOT(f);
+  sp_FiberStore *s = sp_FiberHashStore_new(hash, ops);
+  sp_gc_wb(f);
+  f->storage = s;
+}
+sp_RbVal sp_Fiber_storage_hash_copy(sp_Fiber *f) {
+  if (!f->storage || ((sp_FiberStore *)f->storage)->cap != -1) return sp_box_nil();
+  sp_FiberHashStore *h = f->storage;
+  return h->ops->copy(h->hash);
 }
 /* the whole store, for Fiber#storage / #storage= (the Hash side is in
    spinel_rt.h) */

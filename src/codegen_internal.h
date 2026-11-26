@@ -321,7 +321,6 @@ int strbuf_arg_carries(Compiler *c, int v);
 int logic_value_handle(Compiler *c, int v);
 int strbuf_arg_bang(Compiler *c, int v);
 int strbuf_arg_bang_value(Compiler *c, int v);
-int strbuf_next_srange_value(Compiler *c, int v);
 int strbuf_srange_arm(Compiler *c, int v);
 int strbuf_value_handleish(Compiler *c, int v);
 int strbuf_yield_proc_box(Compiler *c, int v);
@@ -613,6 +612,16 @@ int hc_array(Compiler *c, int recv, int is_float, char *d, char *l, char *w, siz
 void hc_read_len(const char *hd, char *out, size_t cap);
 int hc_ptr_array(Compiler *c, int recv, char *d, char *l, size_t cap);
 int hc_index_in_range(Compiler *c, int recv, int idx);
+/* Joint guards (codegen_stmt.c): how many of the n statements at stmts,
+   from the first, form a run of in-place element updates on cached arrays
+   that one range test ahead of the run can guard (0 when fewer than two) */
+int hc_joint_run(Compiler *c, const int *stmts, int n);
+/* `a[i] op= x` folds in place on an array the loop being emitted caches:
+   *hd its data, *wl the length an index below it writes in place */
+int iow_fused_cached(Compiler *c, int id, char *hd, char *wl, size_t cap);
+/* Its right-hand side is held as an optional value (a nilable Integer or
+   Float) and unwrapped at the operator, which raises for nil */
+int iow_opnd_held(Compiler *c, int id);
 /* Co-bounded reads (codegen_stmt.c): a loop proved over the index local
    bi (the C variable bic) in [0, trip) -- a trip that reads trip_node again
    at each pass, or -1 -- reads other arrays at that index in place, behind one
@@ -624,6 +633,14 @@ void *hcv_begin(Compiler *c, int node, int body, int blk, const char *bi, const 
                 const char *trip, int trip_node, int walk, Buf **bp);
 extern int g_loop_quiet;   /* the next emit_loop_body leaves its safepoint and finalizer polls to an enclosing loop */
 void hcv_end(Compiler *c, void *v, int indent);
+/* an array's block walk, versioned with a counter it steps (`i = 0` ahead,
+   `i += 1` last) as its index where it has one */
+void *hcv_begin_walk(Compiler *c, int node, int body, int blk, const char *trip, int trip_node, Buf **bp);
+/* a yield's parameters bound from a versioned loop's index (emit_block_invoke) */
+int hcv_alias_mark(void);
+int hcv_yield_arg_is_index(Compiler *c, int yarg);
+void hcv_alias_param(Compiler *c, int blk, int k);
+void hcv_alias_drop(int mark);
 int hc_cob_entry(Compiler *c, int recv, int idx, char *d, size_t cap);
 int hc_cob_entry_of(Compiler *c, int recv, char *d, size_t cap);
 /* Does the loop with body `body` and block `blk` (-1 for none) leave the
@@ -634,11 +651,14 @@ void hc_cob_mark(Buf *b, int part);
 extern int g_hc_cob_off;
 /* ...and that state, saved and put back around a unit a refusal may abandon
    (EmitUnitState, codegen.c) */
-typedef struct { void *hc, *hcv; int cob_off, loop_quiet; } HcState;
+typedef struct { void *hc, *hcv; int cob_off, loop_quiet, nalias; } HcState;
 void hc_state_save(HcState *s);
 void hc_state_restore(const HcState *s);
 void *hc_iter_begin(Compiler *c, int id, Buf **bp);   /* an Integer block loop's header cache region */
 void hc_iter_end(void *h, Buf **bp, int indent, int keep);
+const char *hc_iter_poll_mark(int nest, int close);   /* a block loop's own polls' marks */
+int text_has_code(const char *p, size_t beg, size_t end, const char *s);  /* codegen.c: s outside the `#line` lines */
+size_t text_code_bytes(const char *p, size_t beg, size_t end);   /* codegen.c: its bytes outside them, line breaks too */
 extern int g_loop_polls_in_cond;   /* the next emit_loop_body leaves its polls to the loop's condition */
 int hc_string(Compiler *c, int recv, char *d, char *l, size_t cap);
 /* an IO::Buffer's cached view (sp_iob_view): *d its bytes, *l their count;
@@ -763,6 +783,7 @@ void emit_into_pre_line(Compiler *c, void (*fn)(Compiler *, int, Buf *), int nod
 extern int g_inline_recv_class;
 /* When emitting class/module body statements, the class index (-1 outside). */
 extern int g_class_body_id;
+int emit_self_class_body(Compiler *c, int id);
 /* Class id of the scope currently being emitted (-1 if none). Used to resolve
    implicit self calls in included-module methods to the including class. */
 extern int g_emitting_class_id;
@@ -893,7 +914,9 @@ extern int g_block_brk_rescue_base;
    can be boxed when the method returns poly but the value is concrete. */
 extern TyKind g_ret_type;
 extern int g_c_ret_void;   /* the C function returns void (a fiber body) */
-extern int g_c_ret_void;   /* the C function returns void (a fiber body) */
+/* emitting a required file's top level (emit_file_tops): a return there ends the file's load, and main's exit,
+   with the `_sp_main_rc` main's body declares, is not in reach */
+extern int g_in_file_top;
 extern int g_fiber_body;   /* that fiber body's statements, or -1 */
 extern const char *g_fn_pr_label;   /* real function's return funnel (see codegen_util.c) */
 extern const char *g_fn_pr_var;
@@ -1125,7 +1148,8 @@ extern int g_uses_traps;
    method on a call cycle, a loop that may not end or that no loop of its
    function encloses): one that sets a trap runs the trap's proc there
    (sp_sig_run_pending), one with no thread raises the default SIGINT or
-   SIGTERM there (sp_sig_poll_raise, which returns while sp_sig_default_pending is 0) */
+   SIGTERM there (sp_sig_poll_raise, which returns while sp_sig_default_pending[0] and
+   sp_sig_default_pending[1] are 0) */
 static inline int sig_polls(void) { return g_uses_traps || !g_uses_threads; }
 static inline const char *sig_poll_stmt(void) {
   return g_uses_traps ? "if (SP_UNLIKELY(SP_ATOMIC_LOAD(&sp_sig_pending_flag, __ATOMIC_RELAXED))) sp_sig_run_pending()"
@@ -1229,7 +1253,7 @@ int exc_message_super_to_s(Compiler *c, int id, int *out, int cap);
 int class_has_exc_name(Compiler *c, int ci);
 int any_exc_reopen(Compiler *c);
 char **dsend_candidates(Compiler *c, int *out_n);
-int emit_super_respond_to(Compiler *c, int id, Scope *s, Buf *b);
+void emit_super_respond_to(Compiler *c, int id, Scope *s, Buf *b);
 /* a super's forwarded parameter pi, boxed (an oint slot through oint_box) */
 void emit_boxed_fwd_param(Compiler *c, Scope *s, int pi, Buf *b);
 /* a super's block argument run for its effect: "(void)(x); " */
@@ -1250,6 +1274,12 @@ int class_mixes_in(Compiler *c, int cid, int mod, int depth);
 int class_is_comparable(Compiler *c, int cid);
 void emit_visible_cls_id(Compiler *c, const char *var, Buf *b);
 void obj_default_name(Compiler *c, int ci, char *name, size_t nn, char *arg, size_t na);
+/* Kernel#to_s or #inspect (want_inspect) of an object of program class cid,
+   the builtin's own text whatever the program defines: #<Name:0x...>, and
+   for inspect the default ivar walk (sp_obj_kernel_inspect). obj is the C
+   expression of the object's pointer, typed as the class's (the address of
+   a by-value one), evaluated once or twice. */
+void emit_obj_kernel_text(Compiler *c, int cid, int want_inspect, const char *obj, Buf *b);
 void emit_obj_default_inspect(Compiler *c, int cid, const char *p, Buf *b);
 int class_has_ctor(const ClassInfo *ci);   /* does the class get a sp_X_new (an object of it may exist) */
 int anon_class_text(Compiler *c, int ci, const char *head, Buf *b);
@@ -1258,6 +1288,13 @@ void emit_raise_operands(Compiler *c, int m, int staged, int t0, Buf *b);
 int scope_def_line(Compiler *c, Scope *s);
 const char *scope_def_file(Compiler *c, Scope *s);
 int display_method_scope(Compiler *c, int site, int cid, int want_inspect, int *defcls);
+/* The program's own Object#inspect (to_s unless inspect) that an object of
+   program class k answers with, having none on its own chain: CRuby's lookup
+   reaches a reopened Object ahead of Kernel. Called on the boxed object;
+   -1 for none (or one the display arms cannot call: it yields or takes
+   parameters). Asked at node site, the displayed value, or -1 for the
+   display dispatcher (emit_display_overrides), which no call stands behind. */
+int obj_root_display_scope(Compiler *c, int site, int k, int inspect);
 const char *obj_str_cname(Compiler *c, int site, int cid, int want_inspect);
 int obj_str_undef(Compiler *c, int site, int cid, int want_inspect);
 void emit_nomethod_raise(Compiler *c, int obj, int argc, const int *argv, const char *name, const char *dflt, const char *same, Buf *b);
@@ -1276,7 +1313,7 @@ void emit_stmt(Compiler *c, int id, Buf *b, int indent);
 /* The trace build's node marker (src/emit_trace.c): 'c' a call, 's' a statement, 'l' a method's last one. */
 void emit_trace_node(Compiler *c, int id, int kind);
 #endif
-/* A require under --load-model=graph, as its value (codegen_stmt.c) */
+/* A require, as its value (codegen_stmt.c) */
 void emit_load_call(Compiler *c, int id, Buf *b);
 int emit_autoload_register(Compiler *c, int id, Buf *b);
 int ivar_slot_below(Compiler *c, int k, const char *nm);
@@ -1500,9 +1537,6 @@ int emit_unknown_kwarg_raise(Compiler *c, Scope *m, const int *argv, int argc);
 void emit_str_append_arg(Compiler *c, int arg, const char *rtext, Buf *b);
 /* The bytes are consumed by this append before another operand runs. */
 void emit_str_append_arg_immediate(Compiler *c, int arg, const char *rtext, Buf *b);
-/* ...for a consumer that takes every argument before it appends any: a
-   String argument is read as a copy (emit_str_expr_own). */
-void emit_str_append_arg_own(Compiler *c, int arg, const char *rtext, Buf *b);
 void emit_str_force_encoding(Compiler *c, const char *name, const char *r, const int *argv, int argc, Buf *b);
 int rest_shortfall_required(Compiler *c, Scope *m);
 /* Emit a hash key, unboxing a poly value to the typed-hash's key type. */
@@ -1701,6 +1735,7 @@ const char *re_lit_src(Compiler *c, int nid);
 void emit_interp(Compiler *c, int id, Buf *b);
 int emit_interp_append(Compiler *c, int id, const char *open, const char *open_n, Buf *b, int indent);
 int interp_is_literal_fold(const NodeTable *nt, int id);
+int str_literal_ascii(const NodeTable *nt, int id);
 int emit_regex_pat_to_buf(Compiler *c, int nid, Buf *b);
 int nameset_has(NameSet *s, const char *nm);
 /* the program's own Array#inspect (a reopened Array), or -1 (codegen.c) */
@@ -1855,6 +1890,8 @@ const char *sg_refused_msg(Compiler *c, int def);
 void sg_refused_def(Compiler *c, int def);
 __attribute__((noreturn)) void unsupported_feature(Compiler *c, int id, const char *msg);
 void unsupported_feature_collect(Compiler *c, int id, const char *msg);
+/* the file and line a refusal of node id is reported at (codegen_util.c) */
+const char *unsup_pos(Compiler *c, int id, int *line);
 /* a Range literal only walked from an Integer begin (codegen.c) */
 int range_rat_walk(Compiler *c, int rn);
 
@@ -2159,6 +2196,7 @@ int read_of_fixed_param(Compiler *c, int node);
 int read_unbound_in_stmt(Compiler *c, int node);
 int  typed_array_src_held(Compiler *c, int node);   /* a typed Array held while it is boxed */
 int  proc_form_live(Compiler *c, int s);
+int  scope_unspliced_fn(Compiler *c, int mi);   /* the scope whose function a hook's call of mi with no block runs: mi, a yielding one's proc-form clone, or -1 */
 int  proc_form_source(Compiler *c, int s);
 int  ctor_site_on_cycle(Compiler *c, int id, int initm);
 int  ctor_init_proc_form(Compiler *c, int cid);
@@ -2336,7 +2374,7 @@ int kwh_merged(Compiler *c, Scope *m, int kwh);
    as a Data or Struct construction and a `**kwrest` of any key
    (kwrest_any_key) need (TY_POLY_POLY_HASH). */
 int emit_ds_hash_merge(Compiler *c, int kwh, int any_key, TyKind *out_type);
-int emit_super_data_with(Compiler *c, int id, Scope *s, Buf *b);
+void emit_super_data_with(Compiler *c, int id, Scope *s, Buf *b);
 /* True when emit_ds_hash_materialize runs keyword code with an effect ahead
    of the call's positionals: a kwh_merged call's merged hash, or a first
    `**` operand with a side effect that it evaluates. */
@@ -2485,8 +2523,6 @@ const struct BuiltinOp *an_bop_row_for_kind(Compiler *c, int id, TyKind rt);
 const struct BuiltinOp *poly_scalar_row(TyKind k, const char *name, int argc, int has_block);   /* analyze_infer.c */
 TyKind reduce_empty_seed_kind(Compiler *c, int id);   /* analyze_infer_recv.c: an empty `[]` reduce seed's Array kind */
 int an_arg_is_shared_handle(Compiler *c, int node);
-int an_super_object_text(Compiler *c, int n, int mi);
-int an_super_struct_text(Compiler *c, int n, int mi);
 int an_user_defines_method(Compiler *c, const char *name);
 int an_enum_own_find_index(Compiler *c, int id);
 /* Can no method of the program take `name`: no def of it or of method_missing, and no alias, define_method, attr_* or Struct / Data member that names it (or names a method only the run time knows)? */
@@ -2511,7 +2547,9 @@ int method_user_override_recv(Compiler *c, int node);
 void ty_recv_call_extra_args(const Compiler *c, const int *av, int argc,
                               TyKind *arg1, int *range_has_float_bound);
 int node_is_empty_container(Compiler *c, int node);
+int empty_container_copy_recv(Compiler *c, int node, int *frozen_out);
 int emit_call_block_arg_stmt(Compiler *c, int id, Buf *b, int indent);   /* codegen_call.c */
+void emit_block_arg_check_staged(Compiler *c, int id, Buf *b);   /* codegen_call.c */
 int an_empty_container_kind(Compiler *c, int b);
 TyKind ffi_spec_to_ty(const char *spec);
 int local_sole_range_node(Compiler *c, int recv);
@@ -2546,7 +2584,7 @@ int program_has_arysub(Compiler *c);
 int program_has_timesub(Compiler *c);   /* codegen.c: some class is a Time subclass (sp_timesub_copy) */
 int program_has_strsub(Compiler *c);   /* a class of the program that subclasses String */
 void emit_obj_switch_key(Compiler *c, int tv, Buf *b);   /* codegen.c: a class switch's key, Array subclasses included */
-void emit_poly_str_guard(Compiler *c, int tv, const char *name, Buf *b);   /* codegen.c: the String arm's test, a String subclass with its own method left to the switch */
+void emit_str_kind_test(Compiler *c, const char *name, StrOwnVis vis, Buf *b, const char *vfmt, ...) __attribute__((format(printf, 5, 6)));   /* codegen.c: the test that the boxed value named by the printf-formatted C text is a String, a String subclass with its own `name` left to the class switch */
 void emit_arysub_machinery(Compiler *c, Buf *b);
 /* a call Array answers on an Array subclass instance (#7449), as an
    expression or as a statement (codegen_call_array.c) */
@@ -2726,6 +2764,12 @@ unsigned view_class_is_read(int tok);
 /* A call re-entered after its enclosing emitter tested the receiver. */
 int view_push_call_nil_tested(Compiler *c, int id);
 int view_call_nil_tested(Compiler *c, int id);
+/* an element write whose index the header cache's joint guard tested
+   (view_range_tested answers RANGE_TESTED_INDEX, or 0), and with
+   RANGE_TESTED_OPND its right-hand side's nil too */
+enum { RANGE_TESTED_INDEX = 1, RANGE_TESTED_OPND = 2 };
+int view_push_range_tested(Compiler *c, int id, int tested);
+int view_range_tested(Compiler *c, int id);
 void view_nil_test_written(Compiler *c, int recv);   /* the guard of emit_nil_target_own's arm wrote its test */
 int emit_delegated_equality(Compiler *c, int id, int negate, Buf *b);
 int view_type_top(int node, TyKind *kind);   /* the open type view on node, if any */
@@ -2944,6 +2988,8 @@ int emit_op_string_insert(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_string_clear(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_string_slice(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_string_append_as_bytes(Compiler *c, const BopCtx *x, Buf *b);
+int emit_op_string_concat_list(Compiler *c, const BopCtx *x, Buf *b);
+int emit_op_string_prepend_list(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_string_bytesplice(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_string_dedup(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_string_lines(Compiler *c, const BopCtx *x, Buf *b);
@@ -3168,6 +3214,7 @@ void refuse_unredirected_output(Compiler *c, int id);   /* a bare print past a r
 void emit_system_call(Compiler *c, int id, const int *argv, int argc, Buf *b);
 int int_value_plain(Compiler *c, int node);   /* an Integer that can never be nil */
 int emit_output_spilled(Compiler *c, int id, const char *name, int argc, const int *argv, Buf *b, int indent);
+int emit_io_frozen(Compiler *c);   /* the program calls freeze on an IO */
 void emit_assign(Compiler *c, int id, Buf *b, int indent);
 void emit_op_assign(Compiler *c, int id, Buf *b, int indent);
 int emit_array_op_assign(Compiler *c, const char *lval, TyKind t, const char *op, int v, Buf *b);
@@ -3203,6 +3250,10 @@ int rescue_is_catchall_name(const char *n);
 int rescue_chain_catches(Compiler *c, int rc, const char *const *above, int bare);
 int loop_rescue_sees_interrupt(Compiler *c, int id);
 int loop_body_polls_alone(Compiler *c, int body);
+int loop_pass_grows(Compiler *c, int body);   /* codegen_stmt.c */
+int loop_keeps_sig_poll(Compiler *c, int body);   /* codegen_stmt.c */
+void emit_step_polls(Compiler *c, int body, Buf *b, int indent);   /* codegen_iter.c */
+void emit_iter_step_lead(Compiler *c, int body, int n, Buf *b, int indent);   /* codegen_fold.c */
 int subtree_has_retry(const NodeTable *nt, int id);
 void emit_rescue(Compiler *c, int id, Buf *b, int indent, int fr, const char *resultvar);
 void emit_begin(Compiler *c, int id, Buf *b, int indent, const char *resultvar);
@@ -3228,6 +3279,8 @@ void emit_gc_root_tmp(Compiler *c, TyKind t, int tmp, Buf *b);
 int text_uses_tmp(const char *txt, int n);
 int ty_gc_holds_refs(Compiler *c, TyKind t);
 void emit_gc_root_tmp_refs(Compiler *c, TyKind t, int tmp, Buf *b);
+/* root a block-value temp where its block body has an `ensure` (codegen_fold.c) */
+int emit_bv_root(Compiler *c, int body, TyKind t, int tmp, Buf *b);
 void emit_srange_marks(Compiler *c, const char *ref, Buf *b);
 void emit_srange_walk_open(Compiler *c, int recv, int stride, char *elem, size_t elemcap, Buf *b, int indent);
 void emit_srange_member_param(Compiler *c, int block, const char *p0_orig, const char *p0, const char *elem, Buf *b, int indent);
@@ -3254,8 +3307,10 @@ void emit_int_expr(Compiler *c, int node, Buf *b);
    what the compare's out-of-range arm runs first, "" or the checked sum of
    an `x + c` whose check waited (codegen.c) */
 void emit_int_index_late(Compiler *c, int node, int tk, char *redo, size_t n, Buf *b);
+/* The literal c of an index `x + c` or `x - c` emit_int_index_late sums
+   wrapped (no further than 2^20 from 0, not 0), in *lit; else 0. */
+int index_sum_lit(Compiler *c, int node, long long *lit);
 void emit_str_expr(Compiler *c, int node, Buf *b);
-void emit_str_expr_own(Compiler *c, int node, Buf *b);
 void emit_path_expr(Compiler *c, int node, Buf *b);
 void emit_to_s_expr(Compiler *c, int node, Buf *b);
 /* Converted String operands held across the call they enter (codegen.c).
@@ -3357,6 +3412,7 @@ int proc_body_node(Compiler *c, int create);
 int proc_slot_is_direct(TyKind t);
 int proc_slot_is_ptr(TyKind t);
 int proc_body_has_yield(Compiler *c, int id);
+int proc_body_calls_block(Compiler *c, int id);   /* a yield, or a call of the method's own &blk */
 int proc_body_has_return(Compiler *c, int id);
 int proc_does_nonlocal_return(Compiler *c, int create);
 int scope_creates_returning_proc(Compiler *c, int si);

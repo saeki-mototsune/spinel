@@ -80,16 +80,6 @@ static void emit_str_between_cmp(int tv, int tbnd, const char *op, Buf *b) {
              tbnd, tv, tbnd, op);
 }
 
-/* between?, object_id / __id__, hash, nil? and === on a receiver whose kind decides them */
-/* Is there a class whose hash is a reader rather than a def? */
-static int hash_reader_class(Compiler *c) {
-  int n;
-  const int *owners = comp_name_reader_owners(c, "hash", &n);
-  for (int i = 0; i < n; i++)
-    if (comp_name_responder(c, owners[i], "hash", 0) < 0) return 1;
-  return 0;
-}
-
 /* See codegen_call_arms.h. */
 int emit_main_text_call(Compiler *c, int id, Buf *b) {
   if (!cplan_main_text_call(c, id)) return 0;
@@ -98,6 +88,7 @@ int emit_main_text_call(Compiler *c, int id, Buf *b) {
   return 1;
 }
 
+/* between?, object_id / __id__, hash, nil? and === on a receiver whose kind decides them */
 int emit_call_identity_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, TyKind rt) {
   /* between?(lo, hi): lo <= self <= hi */
   if (sp_streq(name, "between?") && argc == 2) {
@@ -220,8 +211,13 @@ int emit_call_identity_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
     /* An Integer/Float receiver with a Rational bound: `>=`/`<=` against an
        sp_Rational struct will not compile. Box both sides and compare through
        sp_poly_cmp_ck, which orders Rational against Integer/Float exactly (#3232). */
+    /* So does a boxed bound that reaches here: the bounds a Symbol's proc
+       hands on (`s.to_sym.to_proc.call(1)`, whose dispatch has an arm for
+       between?) are boxed values, and the plain compare below was written
+       against the box. */
     if ((rt == TY_INT || rt == TY_FLOAT) &&
-        (comp_ntype(c, argv[0]) == TY_RATIONAL || comp_ntype(c, argv[1]) == TY_RATIONAL)) {
+        (comp_ntype(c, argv[0]) == TY_RATIONAL || comp_ntype(c, argv[1]) == TY_RATIONAL ||
+         comp_ntype(c, argv[0]) == TY_POLY || comp_ntype(c, argv[1]) == TY_POLY)) {
       int ts = hoist_boxed_rooted(c, recv);
       int tlo = hoist_boxed_rooted(c, argv[0]), thi = hoist_boxed_rooted(c, argv[1]);
       buf_printf(b, "(sp_poly_cmp_ck(_t%d, _t%d) >= 0 && sp_poly_cmp_ck(_t%d, _t%d) <= 0)",
@@ -322,12 +318,12 @@ int emit_call_identity_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
      values use the pointer bit pattern; a symbol's is SP_SYM_OBJECT_ID of
      its interned id, apart from every other kind's. The immediates have
      fixed ids: nil is 4, false is 0, true is 20. */
-  if ((sp_streq(name, "object_id") || sp_streq(name, "__id__")) && recv >= 0 && argc == 0 &&
-      /* a generated READER of this name owns it on a concrete object, as in
-         CRuby (which warns and defines it): fall through to the member read,
-         which the inference already typed (#4190) */
-      !(ty_is_object(rt) &&
-        call_attr_target(c, -1, ty_object_class(rt), name, 0, NULL))) {
+  if (is_object_id_name(name) && recv >= 0 && argc == 0 &&
+      /* a method or a generated READER of this name owns it on a concrete
+         object, as in CRuby (which warns and defines it): fall through to
+         its call or the member read, which the inference already typed
+         (#4190); not for the builtin's own call (builtin_only: a super's) */
+      !(ty_is_object(rt) && call_answers(c, id, ty_object_class(rt), name, 0, NULL))) {
     /* a nullable Integer or Float whose nil flag is set is nil, whose id
        is nil's */
     if ((rt == TY_INT || rt == TY_FLOAT) && call_returns_nullable_int(c, recv)) {
@@ -373,14 +369,6 @@ int emit_call_identity_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
              rt == TY_STR_RANGE || rt == TY_TIME || rt == TY_FLOAT) {
       buf_puts(b, "sp_rbval_hash_key("); emit_boxed(c, recv, b); buf_puts(b, ")");
     }
-    /* a value-type user object is a by-value struct with no pointer identity;
-       hash its bytes for a stable id (`o.object_id == o.object_id`) (#2283) */
-    else if (ty_is_object(rt) && comp_ty_value_obj(c, rt)) {
-      int t = ++g_tmp;
-      buf_printf(b, "({ sp_%s _t%d = ", c->classes[ty_object_class(rt)].c_name, t);
-      emit_expr(c, recv, b);
-      buf_printf(b, "; sp_bytes_hash(&_t%d, sizeof _t%d); })", t, t);
-    }
     else { buf_puts(b, "((sp_int)(uintptr_t)("); emit_expr(c, recv, b); buf_puts(b, "))"); }
     return 1;
   }
@@ -389,23 +377,21 @@ int emit_call_identity_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
      hashing the Hash container uses to bucket keys, so `h[k]` and `k.hash`
      agree. A boxed user object routes through sp_obj_hash_hook, which dispatches
      to a user-defined #hash (or pointer identity as Object#hash's default). */
-  /* #hash on a value-type user object with no user #hash: a by-value struct has
-     no pointer identity, so hash its bytes for a stable, content-based id that
-     agrees across calls (#2284). */
-  if (sp_streq(name, "hash") && recv >= 0 && argc == 0 && ty_is_object(rt) &&
-      comp_ty_value_obj(c, rt) && !call_answers(c, id, ty_object_class(rt), name, 0, NULL) &&
+  /* the builtin's own Object#hash of a program object (builtin_only: the call a super is lowered to) is its
+     identity, the address the runtime's key takes for an object without a hash of its own; never through
+     sp_obj_hash_hook, which comes back into the program's hash, the method holding the super */
+  if (is_hash_name(name) && recv >= 0 && argc == 0 && ty_is_object(rt) && cplan_builtin_call(c, id) &&
       !c->classes[ty_object_class(rt)].is_struct) {
-    int t = ++g_tmp;
-    buf_printf(b, "({ sp_%s _t%d = ", c->classes[ty_object_class(rt)].c_name, t);
+    buf_puts(b, node_is_oint(c, id) ? "sp_oint_of((sp_int)(uintptr_t)(" : "((sp_int)(uintptr_t)(");
     emit_expr(c, recv, b);
-    buf_printf(b, "; sp_bytes_hash(&_t%d, sizeof _t%d); })", t, t);
+    buf_puts(b, "))");
     return 1;
   }
   /* a boxed receiver that may be an object whose class answers hash with a
      reader (`attr_reader :hash`) is left to the dispatch, which reads it: the
      key below reaches a def of hash through the runtime's hook (with its
      recursion guard) but hashes a reader's object by its identity */
-  if (sp_streq(name, "hash") && recv >= 0 && argc == 0 && rt == TY_POLY && hash_reader_class(c)) return 0;
+  if (sp_streq(name, "hash") && recv >= 0 && argc == 0 && rt == TY_POLY && comp_has_hash_reader(c)) return 0;
   if (sp_streq(name, "hash") && recv >= 0 && argc == 0 &&
       rt != TY_MATCHDATA &&   /* MatchData has a dedicated content hash (#3014) */
       (!ty_is_object(rt) ||
@@ -2593,7 +2579,8 @@ int emit_call_object_override_arms(Compiler *c, int id, Buf *b, const NodeTable 
       Scope *nm2 = nmi2 >= 0 ? &c->scopes[nmi2] : NULL;
       int plain = nm2 && nm2->nparams == nc2 && nc2 <= 1 && nm2->rest_idx < 0 && nm2->kwrest_idx < 0 &&
                   (nc2 == 0 || (nm2->pdefault[0] < 0 && !callee_has_kwarg(c, nm2, nm2->pnames[0])));
-      if (nmi2 >= 0) {
+      /* (a yielding one has no function: the general call path inlines it) */
+      if (nmi2 >= 0 && !nm2->yields) {
         /* A value-type object is passed BY VALUE (sp_X, not sp_X *): casting
            it to a pointer is not a conversion the C compiler accepts, so a
            class with ivars that defines #! did not build (#3819). */

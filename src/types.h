@@ -84,6 +84,8 @@ enum {
   PF_SAME_OK  = 1 << 17, /* ... and contents that are the receiver's own mean no write, so no frozen check (scrub!) */
   PF_ENC      = 1 << 18, /* ... and the new contents carry the result's encoding, which a shared handle takes, binary or text (bytesplice) */
   PF_STR_TYPED = 1 << 19, /* a String bang for a receiver known to be a String (ty_str_typed_bang_flags), whose row is the mutator kind's for a boxed receiver (reverse!, scrub!); PF_STR_SELF on it says it answers self, PF_SAME_OK that an unchanged String is no write */
+  PF_SPREAD   = 1 << 20, /* the owner's typed emitter takes a splat's operand list too (concat, prepend, merge): a call that spreads one re-enters it */
+  PF_SPREAD_ONLY = 1 << 21, /* ... a row for that call alone: a plain one keeps the boxed arm it has (merge) */
   PF_LAST     = 1 << 16  /* answers only once no poly-receiver emitter of its own has claimed the name */
 };
 typedef struct {
@@ -216,6 +218,7 @@ const char *ty_name(TyKind t);         /* legacy string tag, for diagnostics */
 int ty_builtin_ivar_less(TyKind t);    /* a builtin value that lays out no ivars */
 int ty_bivar_keyed(TyKind t);          /* ...whose ivars the runtime's map can hold */
 int ty_is_numeric(TyKind t);           /* INT or FLOAT */
+int ty_is_string(TyKind t);            /* a String of either face: STRING or STRBUF */
 int ty_never_callable(TyKind t);       /* kind can never answer #call */
 TyKind ty_promote_numeric(TyKind a, TyKind b); /* fold-accumulator numeric promotion */
 /* Can a seeded fold (sum(seed), inject(seed, :op)) keep the element's C type?
@@ -373,6 +376,7 @@ static inline TyKind ty_poly_handle_face(const char *nm) {
     static const char *const ENUMERATOR[] = { "next_values", "peek_values", "with_index", 0 };
     for (int i = 0; ENUMERATOR[i]; i++) if (sp_streq(nm, ENUMERATOR[i])) return TY_ENUMERATOR;
   }
+  if (sp_streq(nm, "fixed_encoding?")) return TY_REGEX;
   return TY_UNKNOWN;
 }
 /* The same, for a call passing `argc` arguments: the zero-argument names
@@ -384,6 +388,7 @@ static inline TyKind ty_poly_handle_face_args(const char *nm, int argc) {
   if (argc == 0) return ty_poly_handle_face(nm);
   static const struct { const char *nm; TyKind k; int lo, hi; } ARGS[] = {
     { "begin", TY_MATCHDATA, 1, 1 }, { "end", TY_MATCHDATA, 1, 1 },
+    { "bytebegin", TY_MATCHDATA, 1, 1 }, { "byteend", TY_MATCHDATA, 1, 1 },
     { "offset", TY_MATCHDATA, 1, 1 }, { "byteoffset", TY_MATCHDATA, 1, 1 },
     { "match_length", TY_MATCHDATA, 1, 1 },
     { "with_index", TY_ENUMERATOR, 1, 1 },
@@ -456,7 +461,7 @@ static inline const TyTraits *ty_traits_of(TyKind t) {
    a builtin kind whose row has a box, a String of either face, a user
    object or an object array. An unsettled kind (TY_UNKNOWN) cannot. */
 static inline int ty_boxable(TyKind t) {
-  if (t == TY_STRING || t == TY_STRBUF) return 1;
+  if (ty_is_string(t)) return 1;
   const TyTraits *tr = ty_traits_of(t);
   if (tr) return tr->box_text != 0;
   return ty_is_object(t) || ty_is_obj_array(t);

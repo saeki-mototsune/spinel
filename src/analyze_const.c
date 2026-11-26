@@ -252,7 +252,7 @@ static void cw_stmt_walk(ConstWalk *w, int id, int depth) {
       return;
     }
     case NK_LoadNode: {
-      /* --load-model=graph: a require naming its file runs no code of its
+      /* a require naming its file runs no code of its
          own; the file's top level is walked at its load, in load order
          (prog_top_stmts). One whose path is computed may load any. */
       const char *how = nt_str(nt, id, "how");
@@ -365,6 +365,22 @@ static int const_literal_write(Compiler *c, int first) {
   int v = nt_ref(nt, first, "value");
   NodeKind vk = v >= 0 ? nt_kind(nt, v) : NK_NONE;
   return (vk == NK_IntegerNode || vk == NK_FloatNode) && elab_const_write_final(c, first) ? v + 1 : 0;
+}
+
+/* A Class#subclasses call asks the presence flag of each class whose header
+   names superclass `rn` (every class with a superclass for NULL: a receiver
+   the call does not name) */
+static void mark_subclass_presence_read(Compiler *c, const char *rn) {
+  const NodeTable *nt = c->nt;
+  for (int k = 0; k < c->nclasses; k++) {
+    ClassInfo *ci = &c->classes[k];
+    if (ci->def_node < 0 || ci->is_singleton_of || is_builtin_reopen(ci->name)) continue;
+    int sn = nt_kind(nt, ci->def_node) == NK_ClassNode ? class_def_super(nt, ci->def_node) : -1;
+    if (sn < 0) continue;
+    const char *pn = nt_str(nt, sn, "name");
+    if (rn && !(pn && sp_streq(pn, rn))) continue;
+    ci->presence_read = 1;
+  }
 }
 
 /* Mark the constants some assignment can follow a read of: LocalVar.const_early
@@ -498,15 +514,17 @@ void an_const_presence(Compiler *c) {
     if (!nm || !sp_streq(nm, "subclasses") || (call_args(nt, id, &argc), argc)) continue;
     int r = nt_ref(nt, id, "receiver");
     const char *rn = r >= 0 && nt_kind(nt, r) == NK_ConstantReadNode ? nt_str(nt, r, "name") : NULL;
-    for (int k = 0; k < c->nclasses; k++) {
-      ClassInfo *ci = &c->classes[k];
-      if (ci->def_node < 0 || ci->is_singleton_of || is_builtin_reopen(ci->name)) continue;
-      int sn = nt_kind(nt, ci->def_node) == NK_ClassNode ? class_def_super(nt, ci->def_node) : -1;
-      if (sn < 0) continue;
-      const char *pn = nt_str(nt, sn, "name");
-      if (rn && !(pn && sp_streq(pn, rn))) continue;
-      ci->presence_read = 1;
-    }
+    mark_subclass_presence_read(c, rn);
+  }
+  /* ...and a `super` in a class method named subclasses reaches Class#subclasses
+     of the receiving class, any class under the definer's: every subclass */
+  NodeKind skinds[] = { NK_SuperNode, NK_ForwardingSuperNode };
+  for (int k = 0; k < 2; k++) NT_FOREACH_KIND(nt, skinds[k], id) {
+    if (nt_ref(nt, id, "arguments") >= 0) continue;
+    int d = w.par[id];
+    while (d >= 0 && nt_kind(nt, d) != NK_DefNode) d = w.par[d];
+    const char *dn = d >= 0 ? nt_str(nt, d, "name") : NULL;
+    if (dn && sp_streq(dn, "subclasses")) mark_subclass_presence_read(c, NULL);
   }
   for (int id = 0; id < (int)nn && id < nt->count; id++) {
     /* (a read a desugar made with its holder's name keeps it) */
@@ -534,7 +552,7 @@ int const_has_flag(const LocalVar *lv) {
    builder is written under (path_ns) only. */
 static int header_in_unplaced_file(Compiler *c, int ci) {
   int node = c->classes[ci].def_node;
-  return prog_has_files(c) && node >= 0 && elab_point_from(c, node).region > 0;
+  return node >= 0 && elab_point_from(c, node).region > 0;
 }
 int an_class_needs_presence(Compiler *c, int ci) {
   if (ci < 0 || ci >= c->nclasses) return 0;

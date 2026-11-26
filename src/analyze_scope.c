@@ -1127,8 +1127,7 @@ int class_eval_reopen_class(Compiler *c, int id, int enclosing_class) {
     /* (a block on the body's own class, in that body, runs its other
        statements as the body's own: codegen emits them where the call
        stands, #10785) */
-    if (ci == enclosing_class && is_class_eval_family(nm) && nt_ref(nt, blk, "parameters") < 0 &&
-        nt_ref(nt, id, "arguments") < 0) continue;
+    if (ci == enclosing_class && class_eval_block(nt, id) == blk && nt_ref(nt, blk, "parameters") < 0) continue;
     return -1;  /* a non-definition statement: not a pure reopen */
   }
   return ci;
@@ -1229,6 +1228,7 @@ void desugar_class_reopen(Compiler *c) {
       unsupported_feature(c, id, "the constant name Class__reopen is reserved by the compiler");
   }
   class_reopen_stmts(c, nt_ref(nt, nt->root_id, "statements"), 0);
+  for (int i = 1; i < nt_nroots(nt); i++) class_reopen_stmts(c, prog_root_stmts(c, i), 0);
   NT_FOREACH_KIND(nt, NK_CallNode, id) {
     const char *nm = nt_str(nt, id, "name");
     if (!is_class_eval_name(nm) || !is_class_const(nt, nt_ref(nt, id, "receiver"))) continue;
@@ -2167,6 +2167,7 @@ static void walk_scope_in(Compiler *c, int id, WalkCtx w) {
           dm_mname = nt_str(c->nt, dm_argv[0], "content");
         int dm_blk = nt_ref(c->nt, id, "block");
         if (dm_mname && dm_blk >= 0) {
+          nt_rekey_scope((NodeTable *)c->nt, dm_blk, dm_blk, dm_blk);   /* the block is a method's body: its variables are the method's own, plain */
           Scope *dm_s = comp_scope_new(c, dm_mname, id);
           int dm_new_idx = c->nscopes - 1;
           elab_def_scope(c, id, dm_new_idx);
@@ -2542,6 +2543,7 @@ void register_locals(Compiler *c) {
      is that receiver's, which infer_ivar_types interns once its class is
      known, holder_ivar_side: the structure's rebound marks) */
   const unsigned char *rb = ie_rebound_marks(c);
+  int any_dead_locals = 0;
   for (int id = 0; id < nt->count; id++) {
     const char *ty = nt_type(nt, id);
     NodeKind k = nt_kind(nt, id);
@@ -2556,6 +2558,26 @@ void register_locals(Compiler *c) {
       if (nm) {
         LocalVar *lv = scope_local_intern(comp_scope_of(c, id), nm);
         if (k == NK_LocalVariableOrWriteNode) lv->or_written = 1;
+      }
+    }
+    const char *dl = nt_str(nt, id, "dead_locals");
+    if (dl && *dl) {
+      any_dead_locals = 1;
+      Scope *ds = comp_scope_of(c, id);
+      for (const char *p = dl; *p; ) {
+        const char *comma = strchr(p, ',');
+        size_t len = comma ? (size_t)(comma - p) : strlen(p);
+        if (len > 0) {
+          char sbuf[256];
+          char *nm = len < sizeof sbuf ? sbuf : malloc(len + 1);
+          if (nm) {
+            memcpy(nm, p, len);
+            nm[len] = '\0';
+            scope_local_intern(ds, nm);
+            if (nm != sbuf) free(nm);
+          }
+        }
+        p = comma ? comma + 1 : p + len;
       }
     }
     if (k == NK_InstanceVariableWriteNode ||
@@ -2574,6 +2596,65 @@ void register_locals(Compiler *c) {
       Scope *s = comp_scope_of(c, id);
       if (nm && s->class_id >= 0 && !(id < c->ie_map.cap && (rb[id] & IE_RB_OWN)))
         comp_ivar_intern(&c->classes[s->class_id], nm, s->is_cmethod ? IVS_CLASS : IVS_INST);
+    }
+  }
+  /* A local written ONLY inside a pruned constant-guard branch has value `nil`
+     on every execution; pinning it to TY_NIL now lets enclosing arrays and
+     constants see its real type from pass 1 instead of narrowing around
+     TY_UNKNOWN and colliding after an_phase_late_widen. Locals with any live
+     write or parameter binding stay untouched (zero widening). */
+  if (any_dead_locals && c->nscopes > 0) {
+    int *off = malloc(sizeof(int) * (size_t)c->nscopes);
+    int total = 0;
+    if (off) {
+      for (int s = 0; s < c->nscopes; s++) { off[s] = total; total += c->scopes[s].nlocals; }
+      unsigned char *live_w = total > 0 ? calloc((size_t)total, 1) : NULL;
+      if (live_w) {
+        for (int id = 0; id < nt->count; id++) {
+          NodeKind k = nt_kind(nt, id);
+          if (k == NK_LocalVariableWriteNode || k == NK_LocalVariableTargetNode ||
+              k == NK_LocalVariableOperatorWriteNode || k == NK_LocalVariableOrWriteNode ||
+              k == NK_LocalVariableAndWriteNode || k == NK_RequiredParameterNode ||
+              k == NK_OptionalParameterNode || k == NK_RestParameterNode ||
+              k == NK_BlockParameterNode || k == NK_KeywordRestParameterNode ||
+              k == NK_RequiredKeywordParameterNode || k == NK_OptionalKeywordParameterNode) {
+            const char *nm = nt_str(nt, id, "name");
+            Scope *sc = comp_scope_of(c, id);
+            LocalVar *lv = nm && sc ? scope_local(sc, nm) : NULL;
+            if (lv) {
+              int si = (int)(sc - c->scopes), li = (int)(lv - sc->locals);
+              if (si >= 0 && si < c->nscopes && li >= 0 && li < sc->nlocals) live_w[off[si] + li] = 1;
+            }
+          }
+        }
+        for (int id = 0; id < nt->count; id++) {
+          const char *dl = nt_str(nt, id, "dead_locals");
+          if (!dl || !*dl) continue;
+          Scope *ds = comp_scope_of(c, id);
+          int si = ds ? (int)(ds - c->scopes) : -1;
+          if (si < 0 || si >= c->nscopes) continue;
+          for (const char *p = dl; *p; ) {
+            const char *comma = strchr(p, ',');
+            size_t len = comma ? (size_t)(comma - p) : strlen(p);
+            if (len > 0) {
+              char sbuf[256];
+              char *nm = len < sizeof sbuf ? sbuf : malloc(len + 1);
+              if (nm) {
+                memcpy(nm, p, len); nm[len] = '\0';
+                LocalVar *lv = scope_local(ds, nm);
+                if (lv && !lv->is_param && lv->type == TY_UNKNOWN) {
+                  int li = (int)(lv - ds->locals);
+                  if (li >= 0 && li < ds->nlocals && !live_w[off[si] + li]) lv_set_type(lv, TY_NIL);
+                }
+                if (nm != sbuf) free(nm);
+              }
+            }
+            p = comma ? comma + 1 : p + len;
+          }
+        }
+        free(live_w);
+      }
+      free(off);
     }
   }
   /* Parameters are bound on entry, so their `||=` never sees the slot
@@ -2691,6 +2772,11 @@ static int builder_call(const NodeTable *nt, int def_node, int *module) {
   }
   *module = b->module[def_node];
   return b->call[def_node];
+}
+int class_eval_block(const NodeTable *nt, int call) {
+  if (nt_kind(nt, call) != NK_CallNode || !is_class_eval_family(nt_str(nt, call, "name")) || nt_ref(nt, call, "arguments") >= 0) return -1;
+  int blk = nt_ref(nt, call, "block");
+  return blk >= 0 && nt_kind(nt, blk) == NK_BlockNode ? blk : -1;
 }
 int class_def_builder(const NodeTable *nt, int def_node) {
   int module;
@@ -4096,8 +4182,8 @@ int an_block_captures(const NodeTable *nt, int node, int level) {
 }
 /* ...the names of those locals into `names`, and in *yields (a bit mask) whether the subtree yields (1) or writes
    one of them through a regex's named capture (2) (the environment a
-   define_method block closes over: scope_env_link). The names one block binds are renamed apart from the
-   method's (block_param_invent_name), so a name the block reads from the method is never one it binds too. */
+   define_method block closes over: scope_env_link). The names one block binds carry the block's tag (a slot), so a name the block reads from the
+   method is never one it binds too. */
 void an_block_env(const NodeTable *nt, int block, ANameSet *names, int *yields) {
   *yields = 0;
   (void)an_block_env_walk(nt, block, 0, names, yields);
@@ -4643,10 +4729,10 @@ static int body_stmt_assigns_civ(const NodeTable *nt, int n, const char *ivname)
   if (k == NK_ElseNode) return body_stmt_assigns_civ(nt, nt_ref(nt, n, "statements"), ivname);
   /* a class_eval block on the body's own class: its statements are the
      body's (#10785) */
-  if (k == NK_CallNode && is_class_eval_family(nt_str(nt, n, "name")) && nt_ref(nt, n, "arguments") < 0) {
-    int recv = nt_ref(nt, n, "receiver"), blk = nt_ref(nt, n, "block");
-    if ((recv < 0 || nt_kind(nt, recv) == NK_SelfNode) && blk >= 0 && nt_kind(nt, blk) == NK_BlockNode &&
-        nt_ref(nt, blk, "parameters") < 0)
+  int blk = k == NK_CallNode ? class_eval_block(nt, n) : -1;
+  if (blk >= 0) {
+    int recv = nt_ref(nt, n, "receiver");
+    if ((recv < 0 || nt_kind(nt, recv) == NK_SelfNode) && nt_ref(nt, blk, "parameters") < 0)
       return body_stmt_assigns_civ(nt, nt_ref(nt, blk, "body"), ivname);
   }
   return 0;
@@ -4762,6 +4848,77 @@ void register_attrs(Compiler *c) {
       comp_add_sg_civ(k, base);
   }
   free(a);
+}
+
+/* Walk node n of a class method of a builtin class: each receiverless `new`
+   becomes `self.new`, which it is in Ruby (a nested def or class body is
+   another self). */
+static void bare_new_self(Compiler *c, int n, int *changed) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  if (n < 0) return;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_DefNode || class_def_opens_frame(nt, n) || k == NK_SingletonClassNode) return;
+  if (k == NK_CallNode && nt_ref(nt, n, "receiver") < 0 && is_new_name(nt_str(nt, n, "name"))) {
+    int self = nt_new_node(nt, "SelfNode");
+    if (self >= 0) {
+      comp_grow_node_arrays(c);
+      c->nscope[self] = c->nscope[n];   /* (the class method's self, not main's) */
+      nt_node_set_int(nt, self, "node_line", nt_int(nt, n, "node_line", -1));
+      nt_node_set_int(nt, self, "node_file", nt_int(nt, n, "node_file", -1));
+      nt_set_self_receiver(nt, n, self);
+      *changed = 1;
+    }
+  }
+  for (int i = 0, nr = nt_num_refs(nt, n); i < nr; i++) bare_new_self(c, nt_ref_at(nt, n, i), changed);
+  for (int i = 0, na = nt_num_arrs(nt, n); i < na; i++) {
+    int m = 0;
+    const int *ids = nt_arr_at(nt, n, i, &m);
+    int *cp = m > 0 ? malloc(sizeof(int) * (size_t)m) : NULL;
+    if (m > 0 && !cp) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    if (m > 0) memcpy(cp, ids, sizeof(int) * (size_t)m);
+    for (int j = 0; j < m; j++) bare_new_self(c, cp[j], changed);
+    free(cp);
+  }
+}
+/* A builtin class's own class method (`class String; def self.blank =
+   new("")`): a bare `new` there is the builtin's, built through the
+   class-value `self.new` the receiver form takes. The constructor path a
+   program class's bare `new` takes wrote the program-class constructor,
+   with no initialize to take the argument: the C did not build. (A
+   module's method a builtin class extends, copied in as its class method,
+   keeps the module's body and is not taken here.) */
+void register_builtin_bare_new(Compiler *c) {
+  int changed = 0;
+  for (int s = 0; s < c->nscopes; s++) {
+    const Scope *m = &c->scopes[s];
+    if (!m->is_cmethod || m->class_id < 0 || m->class_id >= c->nclasses || m->def_node < 0) continue;
+    const ClassInfo *k = &c->classes[m->class_id];
+    if (!is_builtin_class_name(k->name) || k->is_native_class) continue;
+    /* (the class's own `def self.x`, not a module's method an extend
+       copies in, whose body is the module's) */
+    if (nt_ref(c->nt, m->def_node, "receiver") < 0) continue;
+    bare_new_self(c, nt_ref(c->nt, m->def_node, "body"), &changed);
+  }
+  if (changed) comp_grow_node_arrays(c);
+}
+
+/* A `class << self` accessor's slot is the class-level ivar's (sg_civ) where
+   a class method names `@x`, register_attrs and the inheritance pass ask
+   before the mixins are copied: a module's method the class extends, copied
+   in as one of its class methods (register_extends), reads and writes the
+   class-level ivar too, and the accessor kept its own slot, so
+   `self.k = v` through the accessor was not the `@k` the extended method
+   read. Asked again once the extends are copied. */
+void register_sg_civ_after_extends(Compiler *c) {
+  for (int i = 0; i < c->nclasses; i++) {
+    ClassInfo *k = &c->classes[i];
+    for (int j = 0; j < k->nsg_readers + k->nsg_writers; j++) {
+      const char *base = j < k->nsg_readers ? k->sg_readers[j] : k->sg_writers[j - k->nsg_readers];
+      char ivname[260];
+      snprintf(ivname, sizeof ivname, "@%s", base);
+      if (!comp_is_sg_civ(k, base) && cmethod_names_ivar(c, i, ivname)) comp_add_sg_civ(k, base);
+    }
+  }
 }
 
 /* Collect `alias new old` (AliasMethodNode) and `alias_method :new, :old`
@@ -4952,7 +5109,7 @@ static void alias_refuse_early_call(Compiler *c, ClassInfo *cls, const char *nw,
     if (!nm || !sp_streq(nm, nw)) continue;
     /* code run where the alias is: in its scope, or a file's top level as
        the alias is (a class body runs in its file's top-level scope, and
-       under --load-model=graph a reopening in another file has another) */
+       a reopening in another file has another) */
     Scope *ns = &c->scopes[c->nscope[n]], *as = &c->scopes[c->nscope[alias_node]];
     if (ns != as && !(prog_is_top_scope(c, ns) && prog_is_top_scope(c, as))) continue;
     /* class-body code of this class (any reopening of it): a call of the
@@ -12168,7 +12325,10 @@ typedef struct PivsFacts {
   int query, sweep, active;  /* active: the memo entry the query fills, -1 for none */
   int hash_mode;            /* the query's: 0 classes, 1 Hash origins, 2 callables */
   int init_args;            /* the query follows an initialize parameter through the arguments
-                               of the `K.new` calls that reach it (presence queries) */
+                               of the `K.new` calls that reach it (presence and Hash origin queries) */
+  int init_walk;            /* a Hash origins query is inside such a walk (pivs_unfollowed) */
+  int *init_done_q, ninit_done;   /* per scope: the query that walked it through a bare super, */
+  const char **init_done_pn;      /* and the parameter (pivs_param) */
   int stores_settled, stores_held, stores_widened;
   const NodeTable *ix_nt;
   unsigned ix_ver;
@@ -12203,6 +12363,7 @@ void pivs_facts_free(Compiler *c) {
   if (!f) return;
   for (int i = 0; i < f->nmemo; i++) { free(f->memo[i].set); free(f->memo[i].cls); free(f->memo[i].hash); free(f->memo[i].cvals); }
   free(f->memo); free(f->memo_at); free(f->seen);
+  free(f->init_done_q); free(f->init_done_pn);
   pivs_ix_clear(f);
   pivs_rv_clear(f);
   free(f);
@@ -12351,6 +12512,12 @@ static int pivs_elems(Compiler *c, int arr, char *set, int depth);
 static void pivs_note_builtin(Compiler *c) {
   if (c->pivs->active >= 0) c->pivs->memo[c->pivs->active].builtin = 1;
 }
+/* Inside the walk of an initialize parameter, a Hash origins query walks
+   on past a branch it cannot follow: the store widens the Hashes found on
+   the other branches (infer_hash_aset_call). */
+static int pivs_unfollowed(Compiler *c) {
+  return c->pivs->hash_mode == 1 && c->pivs->init_walk;
+}
 /* A constant naming a class or module, or a self that is one, read as a
    value: the class query records it beside its instance set
    (poly_recv_class_values) and walks on, though the instance set's own
@@ -12444,6 +12611,15 @@ static int pivs_local_writes_ok(Compiler *c, int si, const char *vn) {
     if (nt_int(nt, w, "depth", 0) > 0 && sp_streq(nt_str(nt, w, "name"), vn)) return 0;
   return 1;
 }
+/* A Hash origins query's walk of each argument of a call it cannot map to
+   a parameter: a splat's elements, any other argument's value. */
+static void pivs_each_arg(Compiler *c, const int *av, int ac, char *set, int depth) {
+  for (int k = 0; k < ac; k++) {
+    NodeKind ak = nt_kind(c->nt, av[k]);
+    if (ak == NK_SplatNode) pivs_elems(c, nt_ref(c->nt, av[k], "expression"), set, depth + 1);
+    else if (ak != NK_BlockArgumentNode) pivs_value(c, av[k], set, depth + 1);
+  }
+}
 /* Positional parameter `pn` of method scope `s` (a required one or an
    optional one ahead of any rest), rebound nowhere: the argument each call
    of the method's name passes there, or its default. A Symbol of the name
@@ -12470,18 +12646,32 @@ static int pivs_param(Compiler *c, Scope *s, const char *pn, char *set, int dept
   int init = pn && c->pivs->init_args && is_initialize_name(mn) && !s->is_cmethod && s->class_id >= 0 &&
              !class_is_exc_subclass(c, s->class_id);
   if (!init) for (int k = 0; PROTO[k]; k++) if (sp_streq(mn, PROTO[k])) return 0;
+  if (init && c->pivs->hash_mode == 1 && !c->pivs->init_walk) {
+    c->pivs->init_walk = 1;
+    int ok = pivs_param(c, s, pn, set, depth);
+    c->pivs->init_walk = 0;
+    return ok;
+  }
   if (!(isalpha((unsigned char)mn[0]) || mn[0] == '_')) return 0;
   for (const char *q = mn; *q; q++)
     if (!(isalnum((unsigned char)*q) || *q == '_' || ((*q == '?' || *q == '!' || (!pn && *q == '=')) && !q[1]))) return 0;
-  /* `super` in a method of this name passes its own arguments on */
-  for (int u = pivs_ix_first(c, PX_SUPER, mn); u >= 0; u = c->pivs->next[u]) {
+  /* the call sites below omit a `super` from an override of this method
+     (for an initialize, an override in a subclass or a module) */
+  if (!pivs_unfollowed(c)) for (int u = pivs_ix_first(c, PX_SUPER, mn); u >= 0; u = c->pivs->next[u]) {
     Scope *us = comp_scope_of(c, u);
-    if (us && us->name && sp_streq(us->name, mn)) return 0;
+    if (!us || !us->name || !sp_streq(us->name, mn)) continue;
+    if (!init || us->class_id < 0 || comp_class_is_module(c, &c->classes[us->class_id])) return 0;
+    for (int x = us == s ? -1 : us->class_id; x >= 0; x = c->classes[x].parent)
+      if (x == s->class_id) return 0;
   }
-  int i = -1, dflt = -1;
+  int i = -1, dflt = -1, kwpos = 0;
   if (pn) {
     int ps = nt_ref(nt, s->def_node, "parameters");
-    int rn = 0, on = 0;
+    int rn = 0, on = 0, kn = 0;
+    if (ps >= 0) nt_arr(nt, ps, "keywords", &kn);
+    /* brace-free pairs are the last positional argument of a method
+       with no keyword parameter (Hash origins queries) */
+    kwpos = c->pivs->hash_mode == 1 && kn == 0 && (ps < 0 || nt_ref(nt, ps, "keyword_rest") < 0);
     const int *rq = ps >= 0 ? nt_arr(nt, ps, "requireds", &rn) : NULL;
     const int *op = ps >= 0 ? nt_arr(nt, ps, "optionals", &on) : NULL;
     for (int k = 0; k < rn && i < 0; k++)
@@ -12497,26 +12687,80 @@ static int pivs_param(Compiler *c, Scope *s, const char *pn, char *set, int dept
     for (int w = comp_lvw_first_sc(c, si, pn); w >= 0; w = comp_lvw_next_sc(c, w))
       if (c->nscope[w] == si && sp_streq(nt_str(nt, w, "name"), pn)) return 0;
   }
-  for (int y = pivs_ix_first(c, PX_SYMBOL, mn); y >= 0; y = c->pivs->next[y])
+  /* A Hash origins query also takes what a `super` in the initialize of a
+     subclass or a module passes at the position, or for a bare `super` what
+     that initialize's own parameter there takes. */
+  if (init && pn && pivs_unfollowed(c)) {
+    static const Scope *open[32];
+    static int nopen;
+    PivsFacts *f = c->pivs;
+    if (f->ninit_done < c->nscopes) {
+      f->init_done_q = realloc(f->init_done_q, sizeof *f->init_done_q * (size_t)c->nscopes);
+      f->init_done_pn = realloc(f->init_done_pn, sizeof *f->init_done_pn * (size_t)c->nscopes);
+      if (!f->init_done_q || !f->init_done_pn) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+      for (int k = f->ninit_done; k < c->nscopes; k++) f->init_done_q[k] = -1;
+      f->ninit_done = c->nscopes;
+    }
+    int skip = nopen == 32;
+    for (int k = 0; k < nopen && !skip; k++) skip = open[k] == s;
+    if (skip) return 1;
+    open[nopen++] = s;
+    for (int u = pivs_ix_first(c, PX_SUPER, mn); u >= 0; u = c->pivs->next[u]) {
+      Scope *us = comp_scope_of(c, u);
+      if (!us || !us->name || !sp_streq(us->name, mn) || us->class_id < 0 || us->def_node == s->def_node) continue;
+      if (!comp_class_is_module(c, &c->classes[us->class_id]) && !is_descendant(c, us->class_id, s->class_id) &&
+          !cplan_caller_includes_module(c, us->class_id, s->class_id)) continue;
+      if (nt_kind(nt, u) == NK_SuperNode) {
+        int a = nt_ref(nt, u, "arguments"), ac = 0;
+        const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &ac) : NULL;
+        int splat = 0;
+        for (int k = 0; k < ac && k <= i; k++) splat |= nt_kind(nt, av[k]) == NK_SplatNode;
+        if (splat) pivs_each_arg(c, av, ac, set, depth);
+        else if (i < ac || dflt >= 0) pivs_value(c, i < ac ? av[i] : dflt, set, depth + 1);
+        continue;
+      }
+      int ps = nt_ref(nt, us->def_node, "parameters"), rn = 0, on = 0;
+      const int *rq = ps >= 0 ? nt_arr(nt, ps, "requireds", &rn) : NULL;
+      const int *op = ps >= 0 ? nt_arr(nt, ps, "optionals", &on) : NULL;
+      int at = i < rn ? rq[i] : i - rn < on ? op[i - rn] : -1;
+      const char *an = at >= 0 ? nt_str(nt, at, "name") : NULL;
+      /* (each initialize once per query: modules passing on to each other) */
+      int ui = (int)(us - c->scopes);
+      if (!an || (f->init_done_q[ui] == f->query && f->init_done_pn[ui] == an)) continue;
+      pivs_param(c, us, an, set, depth + 1);
+      f->init_done_q[ui] = f->query; f->init_done_pn[ui] = an;
+    }
+    nopen--;
+  }
+  if (!pivs_unfollowed(c)) for (int y = pivs_ix_first(c, PX_SYMBOL, mn); y >= 0; y = c->pivs->next[y])
     if (sp_streq(nt_str(nt, y, nt_kind(nt, y) == NK_SymbolNode ? "value" : "content"), mn)) return 0;
   /* ... nor can a `new` be reached by its name */
-  if (init) for (int y = pivs_ix_first(c, PX_SYMBOL, "new"); y >= 0; y = c->pivs->next[y])
+  if (init && !pivs_unfollowed(c)) for (int y = pivs_ix_first(c, PX_SYMBOL, "new"); y >= 0; y = c->pivs->next[y])
     if (sp_streq(nt_str(nt, y, nt_kind(nt, y) == NK_SymbolNode ? "value" : "content"), "new")) return 0;
   int ncalls = 0;
   for (int u = an_calls_named_first(c, init ? "new" : mn); u >= 0; u = an_calls_named_next(u)) {
     if (nt_kind(nt, u) != NK_CallNode || !sp_streq(nt_str(nt, u, "name"), init ? "new" : mn)) continue;
+    int loose = 0;
     if (init) {
       /* the class a constant receiver names: a call of another class's
          initialize is none of ours; a receiver that is no constant (a
          variable, an implicit self) or a `new` of the program's own cannot
-         be followed */
-      int r = nt_ref(nt, u, "receiver");
-      if (r < 0 || (nt_kind(nt, r) != NK_ConstantReadNode && nt_kind(nt, r) != NK_ConstantPathNode)) return 0;
-      const char *rn = nt_str(nt, r, "name");
-      int rc = rn ? const_node_class_index(c, r) : -1;
-      if (rc < 0) { if (rn && is_builtin_class_name(rn)) continue; return 0; }
-      if (cplan_user_new(c, u, rc) >= 0) return 0;
-      if (cplan_hook_target(c, u, rc, "initialize", NULL) != (int)(s - c->scopes)) continue;
+         be followed, and a Hash origins query takes its arguments */
+      int r = nt_ref(nt, u, "receiver"), rc = -1;
+      if (r >= 0 && (nt_kind(nt, r) == NK_ConstantReadNode || nt_kind(nt, r) == NK_ConstantPathNode)) {
+        const char *rn = nt_str(nt, r, "name");
+        rc = rn ? const_node_class_index(c, r) : -1;
+        if (rc < 0 && rn && is_builtin_class_name(rn)) continue;
+      }
+      if (rc < 0 || cplan_user_new(c, u, rc) >= 0) {
+        if (!pivs_unfollowed(c)) return 0;
+        loose = 1;
+      }
+      else {
+        /* (a Hash origins query takes a class's copy of a module's initialize) */
+        int t = cplan_hook_target(c, u, rc, "initialize", NULL);
+        if (t != (int)(s - c->scopes) && !(pivs_unfollowed(c) && t >= 0 && c->scopes[t].def_node == s->def_node)) continue;
+      }
     }
     if (!pn) {
       int r = nt_ref(nt, u, "receiver");
@@ -12529,16 +12773,23 @@ static int pivs_param(Compiler *c, Scope *s, const char *pn, char *set, int dept
     }
     int a = nt_ref(nt, u, "arguments"), ac = 0;
     const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &ac) : NULL;
-    for (int k = 0; k < ac && k <= i; k++) {
+    int shape = !loose;
+    for (int k = 0; k < ac && k <= i && shape; k++) {
       NodeKind ak = nt_kind(nt, av[k]);
-      if (ak == NK_SplatNode || ak == NK_BlockArgumentNode || ak == NK_KeywordHashNode) return 0;
+      if (ak == NK_SplatNode || ak == NK_BlockArgumentNode) shape = 0;
+      if (ak == NK_KeywordHashNode && !(kwpos && k == i && !nt_hash_has_splat(nt, av[k]))) shape = 0;
+    }
+    if (!shape) {
+      if (!pivs_unfollowed(c)) return 0;
+      pivs_each_arg(c, av, ac, set, depth);
+      continue;
     }
     int x = i < ac ? av[i] : dflt;
     if (x < 0) continue;   /* too few: ArgumentError, no value */
     if (!pivs_value(c, x, set, depth + 1)) return 0;
     ncalls++;
   }
-  return !pn || ncalls > 0;
+  return !pn || ncalls > 0 || pivs_unfollowed(c);
 }
 /* A proc parameter follows arguments only while all its calls are in sight. */
 static int pivs_proc_param(Compiler *c, int lit, const char *pn, char *set, int depth, int elems) {
@@ -12817,6 +13068,10 @@ static int pivs_var_stores(Compiler *c, NodeKind rk, const char *vn, int key, ch
   for (int e = comp_vsite_first(c, VS_STORE, rk, vn, key); e >= 0; e = comp_vsite_next(c, e)) {
     int w = comp_vsite_var(c, e);
     if (!pivs_names_var(c, w, rk, vn, key)) continue;
+    /* a store in a method no call can reach never runs (an initialize a
+       reopened class defines again): it holds no value */
+    Scope *ws = comp_scope_of(c, w);
+    if (ws && ws->def_node >= 0 && ws->name && !ws->reachable) continue;
     if (nt_kind(nt, w) != (glob ? NK_GlobalVariableWriteNode : NK_InstanceVariableWriteNode) ||
         !pivs_value(c, nt_ref(nt, w, "value"), set, depth + 1)) return 0;
     saw = 1;
@@ -12834,7 +13089,7 @@ typedef struct {
 static int pivs_arm(const VpLeaf *leaf, void *ud) {
   PivsArms *a = ud;
   int (*f)(Compiler *, int, char *, int) = a->elems ? pivs_elems : pivs_value;
-  if (leaf->kind != VPK_GAVE_UP && f(a->c, leaf->node, a->set, a->depth + 1)) return 0;
+  if (leaf->kind != VPK_GAVE_UP ? f(a->c, leaf->node, a->set, a->depth + 1) : pivs_unfollowed(a->c)) return 0;
   a->ok = 0;
   return 1;
 }
@@ -12907,7 +13162,7 @@ static int pivs_visit(Compiler *c, int v, char *set, int depth, int elems) {
     if (!elems) pivs_note_builtin(c);
     return !elems;
   }
-  if (depth > 32) return 0;
+  if (depth > 32) return pivs_unfollowed(c);
   PivsFacts *f = c->pivs;
   int key = v, slot = elems;
   if (nt_kind(c->nt, v) == NK_LocalVariableReadNode) {
@@ -12928,8 +13183,10 @@ static int pivs_visit(Compiler *c, int v, char *set, int depth, int elems) {
   uint64_t bit = UINT64_C(1) << depth;
   if (f->seen[key].done[slot] & bit) return 1;
   int ok = elems ? pivs_elems_uncached(c, v, set, depth) : pivs_value_uncached(c, v, set, depth);
+  /* (a failure the initialize walk walks past is not done: a walk outside
+     it visits the node again) */
   if (ok) f->seen[key].done[slot] |= bit;
-  return ok;
+  return ok || pivs_unfollowed(c);
 }
 static int pivs_value(Compiler *c, int v, char *set, int depth) {
   return pivs_visit(c, v, set, depth, 0);
@@ -12979,7 +13236,7 @@ static int pivs_value_walk(Compiler *c, int v, char *set, int depth) {
     return 1;
   }
   switch (nt_kind(nt, v)) {
-    case NK_HashNode:
+    case NK_HashNode: case NK_KeywordHashNode:
       pivs_note_builtin(c);
       if (c->pivs->hash_mode == 1 && !c->pivs->seen[v].done[0]) {
         int m = c->pivs->active, n = c->pivs->memo[m].nhash;
@@ -13047,6 +13304,11 @@ static int pivs_value_walk(Compiler *c, int v, char *set, int depth) {
       }
       if ((sp_streq(un, "itself") || sp_streq(un, "dup") || sp_streq(un, "clone")) && ac == 0)
         return pivs_value(c, r, set, depth + 1);
+      /* a Hash's merge! answers its receiver (a merge! of two Hashes is
+         a chain of two): the Hash origins follow it. A block's break
+         answers another value. */
+      if (c->pivs->hash_mode == 1 && is_hash_merge_bang(un) && ac >= 1 && nt_ref(nt, v, "block") < 0)
+        return pivs_value(c, r, set, depth + 1);
       return 0;
     }
     case NK_ConstantReadNode:
@@ -13094,6 +13356,7 @@ static PivsFacts *pivs_ready(Compiler *c) {
     for (int i = 0; i < f->nmemo; i++) { free(f->memo[i].set); free(f->memo[i].cls); free(f->memo[i].hash); free(f->memo[i].cvals); }
     free(f->memo_at); free(f->seen);
     f->nmemo = f->query = 0; f->memo_n = c->nclasses; f->memo_count = c->nt->count;
+    f->ninit_done = 0;
     f->memo_ver = c->nt->version;
     f->memo_rb = c->ie_map.rb_ver;
     f->memo_at = calloc((size_t)(f->memo_count > 0 ? f->memo_count : 1) * 3, sizeof *f->memo_at);
@@ -13140,7 +13403,9 @@ static const char *pivs_call_set(Compiler *c, int call, const int **cls, int *n,
       const int *av = a >= 0 ? nt_arr(c->nt, a, "arguments", &ac) : NULL;
       if (ac == 1) recv = av[0];
     }
+    f->init_args = hashes == 1;
     f->memo[m].walked = pivs_value(c, recv, f->memo[m].set, 0);
+    f->init_args = 0;
     /* a Class value is no instance: the instance set bounds nothing then */
     f->memo[m].ok = f->memo[m].walked && !f->memo[m].has_class;
     f->memo[m].cls = NULL; f->memo[m].ncls = 0;
@@ -13233,7 +13498,7 @@ int poly_cls_arm_left_out(Compiler *c, int call, int k, int kmi) {
   Scope *ks = &c->scopes[kmi];
   int own_module_cmethod = ks->is_cmethod && ks->class_id == k && !ks->origin_module_ci &&
                            !strstr(c->classes[k].name, "__reopen") && comp_class_is_module(c, &c->classes[k]);
-  return own_module_cmethod && (!comp_class_may_be_value(c, k) || !share_target_reachable(c, call, kmi));
+  return own_module_cmethod && (!comp_class_may_be_value(c, k) || !cplan_target_reachable(c, call, kmi));
 }
 /* See analyze.h. */
 int poly_recv_cls_method_owns(Compiler *c, int call, const char *name) {
@@ -13783,19 +14048,38 @@ static int infer_struct_aset_call(Compiler *c, int id, NilWrites *writes, Struct
 /* A store through a bounded box types the original Hashes, so every alias
    observes the store. An unbounded answer changes no Hash. The store
    decides from settled types: until the re-narrow it is only noted as held
-   (pivs_settle_hash_stores). */
+   (pivs_settle_hash_stores). A merge! or update of typed Hashes, without a
+   block, stores the keys and values of each Hash the same way. */
 static int infer_hash_aset_call(Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   int recv = nt_ref(nt, id, "receiver"), a = nt_ref(nt, id, "arguments"), ac = 0;
   const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &ac) : NULL;
-  if (recv < 0 || ac != 2 || infer_type(c, recv) != TY_POLY) return 0;
-  TyKind hk = infer_type(c, av[0]), hv = infer_type(c, av[1]);
-  if (hk == TY_UNKNOWN || hv == TY_UNKNOWN) return 0;
+  if (recv < 0 || infer_type(c, recv) != TY_POLY) return 0;
+  int merge = is_hash_merge_bang(nt_str(nt, id, "name")), known = 0;
+  if (merge) {
+    if (ac < 1 || nt_ref(nt, id, "block") >= 0) return 0;
+    for (int i = 0; i < ac; i++) {
+      TyKind t = infer_type(c, av[i]);
+      if (!ty_is_hash(t)) return 0;
+      known |= ty_hash_key(t) != TY_UNKNOWN && ty_hash_val(t) != TY_UNKNOWN;
+    }
+  }
+  else {
+    if (ac != 2) return 0;
+    known = infer_type(c, av[0]) != TY_UNKNOWN && infer_type(c, av[1]) != TY_UNKNOWN;
+  }
+  if (!known) return 0;
   PivsFacts *f = pivs_facts(c);
   if (!f->stores_settled) { f->stores_held = 1; return 0; }
   if (!pivs_call_set(c, id, NULL, NULL, 1)) return 0;
   int m = f->memo_at[(size_t)id * 3 + 1] - 1, changed = 0;
-  for (int i = 0; i < f->memo[m].nhash; i++) changed |= widen_hash_arg_for_store(c, f->memo[m].hash[i], hk, hv);
+  for (int j = 0; j < (merge ? ac : 1); j++) {
+    TyKind t = merge ? infer_type(c, av[j]) : TY_UNKNOWN;
+    TyKind hk = merge ? ty_hash_key(t) : infer_type(c, av[0]);
+    TyKind hv = merge ? ty_hash_val(t) : infer_type(c, av[1]);
+    if (hk == TY_UNKNOWN || hv == TY_UNKNOWN) continue;
+    for (int i = 0; i < f->memo[m].nhash; i++) changed |= widen_hash_arg_for_store(c, f->memo[m].hash[i], hk, hv);
+  }
   f->stores_widened += changed;
   return changed;
 }
@@ -14046,6 +14330,10 @@ int infer_ivar_types(Compiler *c) {
       if (is_store_alias(nt_str(nt, id, "name"))) {
         if (infer_hash_aset_call(c, id)) changed = 1;
         if (infer_struct_aset_call(c, id, &nilw, &aset)) changed = 1;
+        continue;
+      }
+      if (is_hash_merge_bang(nt_str(nt, id, "name"))) {
+        if (infer_hash_aset_call(c, id)) changed = 1;
         continue;
       }
       /* attr-writer assignment: obj.x = v  (CallNode "x=") */
@@ -14612,7 +14900,7 @@ static void bc_check(Bc *b, int id, int in_defined) {
      the read does not look in: once the file runs, the read and defined?
      would take the leaf's class from those scopes */
   if (nt_autoload_named(nt, n)) {
-    unsupported_feature(b->c, id, "--load-model=graph: an autoloaded constant the program defines only in another scope, for now");
+    unsupported_feature(b->c, id, "load model: an autoloaded constant the program defines only in another scope, for now");
     return;
   }
   if (in_defined) {
@@ -14715,7 +15003,7 @@ static void bc_check_scoped(Bc *b, int v) {
     /* a registration of the leaf: refused where the leaf names a constant
        elsewhere, as bc_check refuses a bare read */
     else if (bc_has(&b->nested, nm) || bc_has(&b->defs, nm))
-      unsupported_feature(b->c, v, "--load-model=graph: an autoloaded constant the program defines only in another scope, for now");
+      unsupported_feature(b->c, v, "load model: an autoloaded constant the program defines only in another scope, for now");
   }
   free(p);
 }

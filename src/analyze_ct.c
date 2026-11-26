@@ -55,11 +55,7 @@
    as that literal, or one the loop made, written as a new unfrozen String;
    an object the loop made (such a String, an Array) is written at one place
    only, since each place's node is a new object (ct_objects_written_once).
-   Anything else leaves the loop as written.
-
-   Until the inline load model goes (#9898's last part), its text expansion
-   (sp_const_loop.c) runs these loops before the parse, and this desugar runs
-   on graph tables only (ct_loops_in_analysis). */
+   Anything else leaves the loop as written. */
 #include <stdlib.h>
 #include <string.h>
 
@@ -71,16 +67,6 @@
 /* two names, either of which may be missing (NULL), are the same */
 static int ct_eq(const char *a, const char *b) { return a && b && sp_streq(a, b); }
 
-/* The inline/graph coexistence switch: the inline model's text pass
-   expands the loops, so this desugar runs only on a graph table (its root
-   carries load_file), and under SPINEL_TABLE_LOOPS=analysis, where the
-   inline model leaves its loops to it (a test-only switch, to compare the
-   two). Deleted with the inline model. */
-static int ct_loops_in_analysis(const NodeTable *nt) {
-  const char *sw = getenv("SPINEL_TABLE_LOOPS");
-  return nt_int(nt, nt->root_id, "load_file", -1) >= 0 || ct_eq(sw, "analysis");
-}
-
 /* Does `call` stand in the block of a loop the walk may run
    (ct_table_loop_form: `H.each { |k, v| ... }`, H a constant, a statement
    of a class or module body)? A pass ahead of the walk leaves such a call
@@ -88,7 +74,6 @@ static int ct_loops_in_analysis(const NodeTable *nt) {
    superclass); where the walk does not run the loop, it is the call it
    was. parent: the parent map. */
 int ct_in_walk_loop_block(const NodeTable *nt, const int *parent, int call) {
-  if (!ct_loops_in_analysis(nt)) return 0;
   for (int x = call; x >= 0; x = parent[x]) {
     if (nt_kind(nt, x) != NK_BlockNode) continue;
     int lp = parent[x];
@@ -846,17 +831,7 @@ static int ct_try_loop(NodeTable *nt, int **parent, int *pcount, const int *befo
    reads a constant or class variable only when the macro is defined in the
    same body as the call (both are lexical); a String of the frame only for
    its bytes, or frozen where the block answers it. Anything else leaves
-   the call as written.
-
-   Until the inline load model goes, its text expansion (sp_macro.c) runs
-   these macros before the parse, and this form runs on graph tables only
-   (or under SPINEL_CLASS_MACROS=analysis, a test-only switch, where the
-   parse leaves them to it). */
-
-static int ct_macros_in_analysis(const NodeTable *nt) {
-  const char *sw = getenv("SPINEL_CLASS_MACROS");
-  return nt_int(nt, nt->root_id, "load_file", -1) >= 0 || ct_eq(sw, "analysis");
-}
+   the call as written. */
 
 /* What the walk's macros asked of the whole program, once per walk: the
    parent map of the nodes [0, count) and the core methods asked about; and
@@ -1054,7 +1029,7 @@ static int ct_macro_def(void *host, const char *meth) {
    frame. */
 typedef struct { const char *name; int frame; char *as; } CtProm;
 typedef struct {
-  NodeTable *nt; const CtEnv *e; int frame, lexical, residual, value, apply;
+  NodeTable *nt; const CtEnv *e; int frame, lexical, residual, value, apply, root;
   const CtFx *fx;
   CtProm *prom; int nprom, cprom;
 } CtBind;
@@ -1108,6 +1083,47 @@ static const char *ct_promoted(const CtBind *b, int frame, const char *nm) {
   return NULL;
 }
 
+/* Does node id read a local named nm, anywhere under it? */
+static int ct_reads_name(const NodeTable *nt, int id, const char *nm) {
+  if (id < 0) return 0;
+  if (nt_kind(nt, id) == NK_LocalVariableReadNode && sp_streq(nt_str(nt, id, "name"), nm)) return 1;
+  for (int i = 0, nr = nt_num_refs(nt, id); i < nr; i++) if (ct_reads_name(nt, nt_ref_at(nt, id, i), nm)) return 1;
+  for (int i = 0, na = nt_num_arrs(nt, id); i < na; i++) {
+    int n = 0;
+    const int *v = nt_arr_at(nt, id, i, &n);
+    for (int j = 0; j < n; j++) if (ct_reads_name(nt, v[j], nm)) return 1;
+  }
+  return 0;
+}
+/* A residual hands a String local on to code that runs where it stands,
+   which may change it (`keep(fk)`, a method of the program's that appends
+   to its argument): the run went on reading the bytes it held. May an
+   effect the run made after the residual have read the local (a
+   define_method's name, not its block), or come of a frame the run
+   entered after it, whose arguments it may have computed from it? Then
+   the residual can't share it. */
+static int ct_read_after(const CtBind *b, const char *nm) {
+  const CtEnv *e = b->e;
+  int at = b->fx ? (int)(b->fx - e->fx) : -1;
+  if (at < 0 || at >= e->nfx) return 1;
+  for (int g = at + 1; g < e->nfx; g++) {
+    const CtFx *f = &e->fx[g];
+    if (f->frame != b->fx->frame) return 1;
+    /* (a define_method's block reads the local itself where it runs, as
+       a promoted local, never bytes the run read: its arguments are what
+       the run read, kept in dm_args where the walk made the call the
+       refusal stand-in) */
+    if (f->k == CT_FX_DEFINE_METHOD) {
+      int da = nt_int(b->nt, f->site, "define_method_name", 0) == 1 ? (int)nt_int(b->nt, f->site, "dm_args", -1)
+                                                                    : nt_ref(b->nt, f->site, "arguments");
+      if (ct_reads_name(b->nt, da, nm)) return 1;
+      continue;
+    }
+    if (ct_reads_name(b->nt, f->site, nm)) return 1;
+  }
+  return 0;
+}
+
 static int ct_bind_read(CtBind *b, int id, int lv, int par, int gpar) {
   NodeTable *nt = b->nt;
   const char *nm = nt_str(nt, id, "name");
@@ -1138,7 +1154,7 @@ static int ct_bind_read(CtBind *b, int id, int lv, int par, int gpar) {
                          (gk != NK_EmbeddedStatementsNode && (!mv.frozen || !mv.lit || (gk != NK_BlockNode && gk != NK_BeginNode &&
                           gk != NK_RescueNode && gk != NK_ElseNode && gk != NK_EnsureNode)))))
   {
-    if (b->residual || !ct_promote(b, l, nm)) return 0;
+    if ((b->residual && ct_read_after(b, nm)) || !ct_promote(b, l, nm)) return 0;
     if (b->apply) nt_node_set_str(nt, id, "name", ct_promoted(b, b->frame, nm));
     return 1;
   }
@@ -1178,6 +1194,14 @@ static int ct_bind_read(CtBind *b, int id, int lv, int par, int gpar) {
    through any receiver. No jump out of the macro, alias, undef or super,
    and no instance or class variable (a module body's are rewritten before
    the walk). */
+/* Is nm a name the steps before the walk read as a class body's own word
+   (attr_*, include, private, ...: is_load_effect_call), or one that
+   reflects, defines or asks of constants, which they read through any
+   receiver? */
+static int ct_body_word_name(const char *nm) {
+  return is_load_effect_call(nm) || is_method_name_reflection(nm) || is_const_query_name(nm) ||
+         is_reflective_access(nm) || is_definition_hook_name(nm);
+}
 static int ct_residual_node(const NodeTable *nt, int id, NodeKind k) {
   switch (k) {
   case NK_CallNode: {
@@ -1207,7 +1231,15 @@ static int ct_bind(CtBind *b, int id, int lv, int par, int gpar) {
   for (int i = 0; b->fx && i < b->fx->nfold; i++) if (b->fx->fold[i] == id) return 1;   /* written as its Symbol */
   NodeKind k = nt_kind(nt, id);
   int here = nt_int(nt, id, "depth", -1) == lv;
-  if (b->residual && !ct_residual_node(nt, id, k)) return 0;
+  /* (a call on self in a residual runs the program's method of the name,
+     no word of a class body's, which the steps before the walk read: a
+     macro's call ct_exec_call leaves for a frame that defines nothing, or
+     one whose value the statement uses, `has_manys << x`) */
+  int self_call = b->residual && k == NK_CallNode && b->e->self_macro &&
+                  (nt_ref(nt, id, "receiver") < 0 || nt_kind(nt, nt_ref(nt, id, "receiver")) == NK_SelfNode) &&
+                  nt_ref(nt, id, "block") < 0 && nt_str(nt, id, "name") && !ct_body_word_name(nt_str(nt, id, "name")) &&
+                  b->e->self_macro(b->e->host, nt_str(nt, id, "name")) >= 0;
+  if (b->residual && !self_call && !ct_residual_node(nt, id, k)) return 0;
   switch (k) {
   case NK_LocalVariableReadNode: return !here || ct_bind_read(b, id, lv, par, gpar);
   case NK_LocalVariableWriteNode: case NK_LocalVariableOperatorWriteNode: case NK_LocalVariableOrWriteNode:
@@ -1292,6 +1324,7 @@ static int ct_bind_fx(CtBind *b, Compiler *c, int list, const CtFx *f, int code)
   b->residual = f->k == CT_FX_RESIDUAL;
   b->fx = f->k == CT_FX_DEFINE_METHOD ? NULL : f;
   b->value = f->k == CT_FX_LOCAL || f->k == CT_FX_CONST_SET;
+  b->root = code;   /* (the statement itself, or its clone where the bindings are written) */
   return ct_bind(b, code, 0, f->k == CT_FX_DEFINE_METHOD ? f->site : -1, -1);
 }
 
@@ -1897,7 +1930,7 @@ int ct_table_loop_form(Compiler *c, int st, int list, int j) {
   int bn = 0, frame = -1;
   const int *bb = nt_arr(nt, list, "body", &bn);
   if (!h || nt_kind(nt, st) != NK_CallNode || nt_ref(nt, st, "block") < 0 || j >= bn || bb[j] != st ||
-      !ct_loops_in_analysis(nt) || elab_stmt_list(c, st, &frame) != list ||
+      elab_stmt_list(c, st, &frame) != list ||
       !class_def_opens_frame(nt, frame) || class_def_body(nt, frame) != list)
     return -1;
   /* the loop's shape first (`H.each { |k, v| ... }`, H a constant): the
@@ -1975,6 +2008,30 @@ static int ct_ffi_decl_note(Compiler *c, HostStep *h, int call, int cls, LoadPoi
   return 1;
 }
 
+/* Does tree `id` hold a define_method of a computed name that the scope
+   walk made a refusal (define_method_name 1)? */
+static int ct_holds_dm_refusal(const NodeTable *nt, int id) {
+  if (id < 0) return 0;
+  if (nt_kind(nt, id) == NK_CallNode && nt_int(nt, id, "define_method_name", 0) == 1) return 1;
+  for (int i = 0, nr = nt_num_refs(nt, id); i < nr; i++) if (ct_holds_dm_refusal(nt, nt_ref_at(nt, id, i))) return 1;
+  for (int i = 0, na = nt_num_arrs(nt, id); i < na; i++) {
+    int n = 0;
+    const int *v = nt_arr_at(nt, id, i, &n);
+    for (int k = 0; k < n; k++) if (ct_holds_dm_refusal(nt, v[k])) return 1;
+  }
+  return 0;
+}
+
+/* A run that defined nothing (a macro that returned early, `return if
+   name == :id`) is still the macro's form when a def it ran holds such a
+   define_method: left as written, the call would reach that refusal,
+   where CRuby runs the same branch and defines nothing */
+static int ct_ran_dm_refusal(const NodeTable *nt, const CtEnv *e) {
+  for (int i = 0; i < e->nframes; i++)
+    if (ct_holds_dm_refusal(nt, nt_ref(nt, e->frames[i].def, "body"))) return 1;
+  return 0;
+}
+
 int ct_macro_form(Compiler *c, int call, int list, int j) {
   NodeTable *nt = (NodeTable *)c->nt;
   HostStep *h = elab_walk_host(c);
@@ -1982,15 +2039,15 @@ int ct_macro_form(Compiler *c, int call, int list, int j) {
   int rv = nt_ref(nt, call, "receiver"), bn = 0, frame = -1;
   const int *bb = nt_arr(nt, list, "body", &bn);
   if (!h || !name || (rv >= 0 && nt_kind(nt, rv) != NK_SelfNode && !nt_int(nt, call, "self_call", 0)) ||
-      nt_ref(nt, call, "block") >= 0 || j >= bn || bb[j] != call || !ct_macros_in_analysis(nt) || elab_stmt_list(c, call, &frame) != list ||
+      nt_ref(nt, call, "block") >= 0 || j >= bn || bb[j] != call || elab_stmt_list(c, call, &frame) != list ||
       !class_def_opens_frame(nt, frame) || !ct_body_arm(nt, class_def_body(nt, frame), list))
     return -1;
   /* the class, and what its call can meet at its point */
-  int cls = elab_self_at(c, call);
+  int cls = elab_self_at(c, call), opaque_writes = 0;
   LoadPoint p = elab_point_of(c, call);
   if (cls >= 0 && ct_ffi_decl_note(c, h, call, cls, p)) return -1;
   if (cls < 0 || (!elab_class_provisional(c, cls) && (is_builtin_class_name(c->classes[cls].name) || is_builtin_module_name(c->classes[cls].name))) ||
-      elab_opaque_before_bar_state(c, cls, p) != ELAB_NO || elab_body_visibility_at(c, call) != BVIS_PUBLIC ||
+      elab_opaque_before_bar_state(c, cls, p, &opaque_writes) != ELAB_NO || elab_body_visibility_at(c, call) != BVIS_PUBLIC ||
       elab_method_at(c, cls, "method_added", 1, p, NULL) != ELAB_NO)
     return -1;
   /* run it: self the class, the parameters the call's values; the macros
@@ -2001,6 +2058,9 @@ int ct_macro_form(Compiler *c, int call, int list, int j) {
   /* self's state as the class's statements before the call leave it */
   CtIvs st;
   ct_class_state(c, ct_macro_facts(c, h), cls, call, list, j, &st);
+  /* (code ahead of the call the record does not follow wrote variables:
+     none of self's is known) */
+  if (opaque_writes) ct_ivs_open(&st);
   for (int i = 0; i < st.n; i++) {
     CtVal v; memset(&v, 0, sizeof v);
     if (st.iv[i].known) v.mv = st.iv[i].v;
@@ -2026,10 +2086,10 @@ int ct_macro_form(Compiler *c, int call, int list, int j) {
                 (k == CT_FX_CONST_SET && ct_macro_const_set_ok(c, &e, f, cls, p)));
     if (ok) ok = ct_fx_each_name(&e.fx[f], ct_name_unasked, c);
     }
-  if (ok) ok = defs > 0 && !ct_macro_core_changed(c, h, e.ran, e.nran) && !ct_relied_redefined(nt, &e, tid, tn);
+  if (ok) ok = (defs > 0 || ct_ran_dm_refusal(nt, &e)) && !ct_macro_core_changed(c, h, e.ran, e.nran) && !ct_relied_redefined(nt, &e, tid, tn);
   /* the code each effect carries must run where the call stands; a local
      a promoted local's value reads may need promoting too */
-  CtBind b = { nt, &e, 0, 0, 0, 0, 0, NULL, NULL, 0, 0 };
+  CtBind b = { nt, &e, 0, 0, 0, 0, 0, -1, NULL, NULL, 0, 0 };
   for (int f = 0; f < e.nfx && ok; f++)
     if (e.fx[f].k != CT_FX_LOCAL && e.fx[f].k != CT_FX_ATTR && e.fx[f].k != CT_FX_EVAL &&
         (e.fx[f].k != CT_FX_CONST_SET || e.fx[f].vcode))
@@ -2061,14 +2121,16 @@ int ct_macro_form(Compiler *c, int call, int list, int j) {
     return -1;
   }
   free(seed_nw);
-  /* each statement, bound, where the call stood */
-  int *out = malloc(sizeof(int) * (size_t)(bn + nout));
+  /* each statement, bound, where the call stood (a run that leaves none,
+     ct_ran_dm_refusal's, leaves nil there, as the call's value is unread) */
+  int *out = malloc(sizeof(int) * (size_t)(bn + nout + 1));
   if (!out) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   memcpy(out, bb, sizeof(int) * (size_t)j);
   b.apply = 1;
   for (int f = 0, o = j; f < e.nfx; f++)
     if (e.fx[f].k == CT_FX_EVAL) for (int i = 0; i < tn[f]; i++) out[o++] = tid[f][i];
     else if (ct_fx_kept(&b, &e.fx[f])) out[o++] = ct_fx_stmt(&b, c, list, call, &e.fx[f]);
+  if (!nout) { out[j] = ct_node_at(nt, "NilNode", call); nout = 1; }
   bb = nt_arr(nt, list, "body", &bn);
   memcpy(out + j + nout, bb + j + 1, sizeof(int) * (size_t)(bn - j - 1));
   nt_node_set_arr(nt, list, "body", out, bn - 1 + nout);

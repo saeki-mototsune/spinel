@@ -80,10 +80,17 @@ static int emit_p_splat_value(Compiler *c, const char *name, int argc, const int
       buf_puts(b, "); ");
     }
   }
-  buf_printf(b, "for (sp_int _i%d = 0; _i%d < _t%d->len; _i%d++) { "
-                "sp_puts_line(%s(_t%d->data[_i%d])); } "
-                "_t%d->len == 0 ? sp_box_nil() : _t%d->len == 1 ? _t%d->data[0] : sp_box_poly_array(_t%d); })",
-             t, t, t, t, p_inspect_fn(c, name), t, t, t, t, t, t);
+  /* (in a program that freezes an IO: the inspect, then the check, then
+     the write, and p checks once more, since p flushes) */
+  if (emit_io_frozen(c))
+    buf_printf(b, "for (sp_int _i%d = 0; _i%d < _t%d->len; _i%d++) { "
+                  "const char *_s%d = %s(_t%d->data[_i%d]); sp_io_stdout_check_frozen(); sp_p_line(_s%d); } %s",
+               t, t, t, t, t, p_inspect_fn(c, name), t, t, t, sp_streq(name, "p") ? "sp_io_stdout_check_frozen(); " : "");
+  else
+    buf_printf(b, "for (sp_int _i%d = 0; _i%d < _t%d->len; _i%d++) { "
+                  "sp_puts_line(%s(_t%d->data[_i%d])); } ", t, t, t, t, p_inspect_fn(c, name), t, t);
+  buf_printf(b, "_t%d->len == 0 ? sp_box_nil() : _t%d->len == 1 ? _t%d->data[0] : sp_box_poly_array(_t%d); })",
+             t, t, t, t);
   return 1;
 }
 
@@ -245,7 +252,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       argv += vskip, argc -= vskip;
       /* (one that names a method the class has none of raises NameError where it runs, as its statement does) */
       Buf wb; memset(&wb, 0, sizeof wb);
-      if ((cw = emit_vis_word_absent(c, id, &wb)) || (cw = emit_vis_cell_write(c, id, &wb))) buf_printf(b, "(%s, ", wb.p);
+      if ((cw = emit_vis_word_absent(c, id, 0, &wb)) || (cw = emit_vis_cell_write(c, id, &wb))) buf_printf(b, "(%s, ", wb.p);
       free(wb.p);
     }
     if (vk == VIS_DECL_NIL) buf_puts(b, "0");
@@ -825,10 +832,10 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     if (sp_streq(name, "rand")) {
       if (ac == 0) { buf_puts(b, "sp_krand_float()"); return 1; }
       Repr a0r = repr_of(c, av[0]);
-      if (a0r.range == TY_FLOAT) {   /* rand(1.0..10.0) -> a Float in [first, last) */
+      if (a0r.range == TY_FLOAT) {   /* rand(1.0..10.0) -> Float, or nil if empty */
         int tr = ++g_tmp;
         buf_printf(b, "({ sp_FloatRange _t%d = ", tr); emit_expr(c, av[0], b);
-        buf_printf(b, "; _t%d.first + sp_Random_rand_float(sp_random_default_get()) * (_t%d.last - _t%d.first); })", tr, tr, tr);
+        buf_printf(b, "; sp_rand_frange_v(sp_random_default_get(), _t%d, 1); })", tr);
         return 1;
       }
       if (a0r.range == TY_INT) {
@@ -844,25 +851,24 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
         /* either bound a Float draws a Float; an Integer begin keeps the end
            as written (sp_range_end_num) */
         int is_float = (lo >= 0 && repr_of(c, lo).as_ty == TY_FLOAT) || (hi >= 0 && repr_of(c, hi).as_ty == TY_FLOAT);
-        /* a statically empty/reversed int range -> nil (#2519) */
-        if (islit && !is_float && lo >= 0 && hi >= 0 &&
+        int is_const_int = islit && !is_float && lo >= 0 && hi >= 0 &&
             nt_kind(nt, lo) == NK_IntegerNode &&
-            nt_kind(nt, hi) == NK_IntegerNode) {
+            nt_kind(nt, hi) == NK_IntegerNode;
+        /* a statically empty/reversed int range -> nil (#2519) */
+        if (is_const_int) {
           long long lov = nt_int(nt, lo, "value", 0);
           long long hiv = nt_int(nt, hi, "value", 0);
           int excl = nt_range_excl(nt, av[0]);
-          if ((excl ? hiv - 1 : hiv) < lov) { buf_puts(b, "sp_box_nil()"); return 1; }
+          if (excl ? hiv <= lov : hiv < lov) { buf_puts(b, "sp_box_nil()"); return 1; }
         }
         int tr = ++g_tmp;
         buf_printf(b, "({ sp_Range _t%d = ", tr); emit_expr(c, av[0], b); buf_puts(b, "; ");
-        if (is_float)
-          buf_printf(b, "(sp_float)_t%d.first + sp_Random_rand_float(sp_random_default_get()) * (sp_range_end_num(_t%d) - (sp_float)_t%d.first); })", tr, tr, tr);
-        else if (islit)
-          buf_printf(b, "_t%d.first + sp_Random_rand_int(sp_random_default_get(), _t%d.last - _t%d.first + 1 - _t%d.excl); })", tr, tr, tr, tr);
+        if (is_const_int)
+          buf_printf(b, "sp_Random_rand_range(sp_random_default_get(), _t%d); })", tr);
         else
-          /* a range held in a variable can be empty at run time -> nil, like
-             CRuby, open -> Errno::EDOM, and an end written as a Float draws a
-             Float: the result is a poly (#3221, sp_rand_range_v) */
+          /* a range with non-literal or Float ends can be empty at run time ->
+             nil, like CRuby, open -> Errno::EDOM, and an end written as a
+             Float draws a Float: the result is a poly (#3221, sp_rand_range_v) */
           buf_printf(b, "sp_rand_range_v(sp_random_default_get(), _t%d, 1); })", tr);
         return 1;
       }
@@ -925,7 +931,7 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     }
     if (sp_streq(name, "srand")) {
       /* srand returns the PREVIOUS seed (#2517). */
-      if (ac == 0) { buf_puts(b, "sp_kernel_srand((sp_int)time(NULL))"); return 1; }
+      if (ac == 0) { buf_puts(b, "sp_kernel_srand(sp_Random_new_seed())"); return 1; }
       buf_puts(b, "sp_kernel_srand("); emit_seed_expr(c, av[0], b); buf_puts(b, ")");
       return 1;
     }
@@ -1030,7 +1036,8 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
   if (recv < 0 && !bare_call_class_owned(c, id) && (is_text_print(name)) &&
       nt_ref(nt, id, "block") < 0) {
     buf_puts(b, "({ ");
-    if (argc == 0 && sp_streq(name, "puts")) buf_puts(b, "putchar('\n');\n");
+    if (argc == 0 && sp_streq(name, "puts"))
+      buf_printf(b, "%sputchar('\\n'); ", emit_io_frozen(c) ? "sp_io_stdout_check_frozen(); " : "");
     if (!emit_output_spilled(c, id, name, argc, argv, b, 0)) {
       for (int k = 0; k < argc; k++) {
         if (sp_streq(name, "puts")) emit_puts_one(c, argv[k], b, 0);
@@ -1057,6 +1064,14 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
       emit_boxed_operand(c, argv, argc, k, b);
       buf_puts(b, "); ");
     }
+    /* (in a program that freezes an IO: the inspect, then the check, then
+       the write, and p checks once more, since p flushes) */
+    if (emit_io_frozen(c))
+      buf_printf(b, "for (sp_int _i%d = 0; _i%d < _t%d->len; _i%d++) { "
+                    "const char *_s%d = %s(_t%d->data[_i%d]); sp_io_stdout_check_frozen(); sp_p_line(_s%d); } %s_t%d; })",
+                 t, t, t, t, t, p_inspect_fn(c, name), t, t, t,
+                 sp_streq(name, "p") ? "sp_io_stdout_check_frozen(); fflush(stdout); " : "", t);
+    else
     buf_printf(b, "for (sp_int _i%d = 0; _i%d < _t%d->len; _i%d++) { "
                   "sp_puts_line(%s(_t%d->data[_i%d])); } %s_t%d; })",
                t, t, t, t, p_inspect_fn(c, name), t, t, sp_streq(name, "p") ? "fflush(stdout); " : "", t);
@@ -1066,6 +1081,10 @@ int emit_call_kernel_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, cons
     TyKind at = repr_of(c, argv[0]).as_ty;
     int t = ++g_tmp;
     buf_puts(b, "({ "); t = hold_operand(c, argv[0], TY_POLY, 1, t, 1, " ", b);
+    if (emit_io_frozen(c))
+      buf_printf(b, "{ const char *_s%d = %s(_t%d); sp_io_stdout_check_frozen(); sp_p_line(_s%d); } %s", t, p_inspect_fn(c, name), t, t,
+                 sp_streq(name, "p") ? "sp_io_stdout_check_frozen(); fflush(stdout); " : "");
+    else
     buf_printf(b, "sp_puts_line(%s(_t%d)); %s", p_inspect_fn(c, name), t,
                sp_streq(name, "p") ? "fflush(stdout); " : "");   /* p flushes, as CRuby's does */
     char tv[16]; snprintf(tv, sizeof tv, "_t%d", t);

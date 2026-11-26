@@ -10,6 +10,7 @@
 #include "implied_calls.h"
 #include "value_pos.h"
 #include <errno.h>
+static int iter_cob_open(Compiler *c, int arr, int oint_slot, TyKind ek, int t, Buf *b);   /* the element in place, in a versioned walk */
 
 /* Is `s` the C text of an integer literal (`589LL`, `-8LL`, `(-8LL)`)? Its
    value in *v. */
@@ -541,7 +542,7 @@ static void inline_target_lookup(Compiler *c, int id, const char *name, int recv
         if (t->mi >= 0) t->implicit_self = 1;
       }
     }
-    else if (g_class_body_id >= 0) {
+    else if (emit_self_class_body(c, id) >= 0) {
       t->mi = call_target(c, id, g_class_body_id, name, CT_CMETHOD, NULL);
       if (t->mi >= 0) t->cm_class = g_class_body_id;
     }
@@ -656,7 +657,7 @@ static int inline_target_plan(Compiler *c, int id, const char *name, int recv, i
       return 1;
     }
     if (ecls < 0 && g_class_body_id >= 0 && p.via == UC_CMETH && p.owner_ci == g_class_body_id &&
-        c->node_cbody[id] == g_class_body_id) {
+        emit_self_class_body(c, id) >= 0) {
       t->mi = p.mi; t->cm_class = g_class_body_id;
       return 1;
     }
@@ -2284,18 +2285,17 @@ void emit_block_binds(Compiler *c, int blk, const int *yargs, int yc,
      by index, `yield(x)` with x = [1, 2, 3] into `|a, b = 5, c|` answered
      [1, 5, nil]. Leading requireds alone keep the lighter per-index read
      below. */
-  /* An object of the program's yielded alone converts through its own
-     to_ary, as a boxed one does (its parameters' row): it is boxed, and
-     the Array its to_ary answers splats */
+  /* An object of the program's, or a String, yielded alone converts through
+     its own to_ary, as a boxed one does (its parameters' row): it is boxed,
+     and the Array its to_ary answers splats */
   int yobj_to_ary = 0;
   if (autosplat && yc == 1 && yargs && nt_kind(nt, yargs[0]) != NK_SplatNode) {
     Repr yr = repr_of(c, yargs[0]);
-    if (yr.kind != RK_BOXED && ty_is_object(yr.as_ty)) {
-      int oc = ty_object_class(yr.as_ty);
+    if (yr.kind != RK_BOXED && cplan_to_ary_class_of(c, yr.as_ty) >= 0) {
       int *ks = malloc(sizeof(int) * (size_t)(c->nclasses + 1));
       if (!ks) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
       int nk = cplan_boxed_to_ary_classes(c, nt_ref(nt, blk, "parameters"), NTI_YIELDED, ks, NULL, c->nclasses + 1);
-      for (int q = 0; q < nk; q++) yobj_to_ary |= is_descendant(c, ks[q], oc);
+      for (int q = 0; q < nk; q++) yobj_to_ary |= cplan_to_ary_takes(c, ks[q], yr.as_ty);
       free(ks);
     }
   }
@@ -2737,6 +2737,14 @@ void emit_block_invoke(Compiler *c, int site, Buf *b, int indent, int as_expr,
     BI_METHOD_SIDE();
   }
   emit_block_binds(c, blk, yargs, yc, b, indent, as_expr, &bi);
+  /* a parameter bound from a versioned loop's index reads as that index in
+     the body (hcv_alias_param), on the block's side below; a yield that
+     spreads binds its parameters from the gathered values, not argument k
+     to parameter k (`yield(*pre, i)`), so it has none */
+  int hcv_amark = hcv_alias_mark(), hcv_idx[4], hcv_nidx = 0;
+  int hcv_spread = yargs && call_args_need_spread(c->nt, yargs, yc);
+  for (int k = 0; !hcv_spread && k < yc && hcv_nidx < 4; k++)
+    if (hcv_yield_arg_is_index(c, yargs[k])) hcv_idx[hcv_nidx++] = k;
   /* Keep the rename table active for the block body: the block's variable
      references are in the same lexical scope as the surrounding inlined
      method, so renames like x → _y3_x must stay visible. Nested inlines
@@ -2760,6 +2768,7 @@ void emit_block_invoke(Compiler *c, int site, Buf *b, int indent, int as_expr,
      yield inside the body splices at the right level */
   BI_BLOCK_SIDE();
   int sv_bnren = g_block_nren; g_block_nren = g_yield_block_fallback_nren;
+  for (int q = 0; q < hcv_nidx; q++) hcv_alias_param(c, blk, hcv_idx[q]);
   /* The block body about to be emitted is g_block_owner_param_name's own
      code: a `<name>.call(...)` inside it, where <name> is THAT scope's own
      &block parameter, must still expand as a yield there, so this splice
@@ -2911,9 +2920,13 @@ void emit_block_invoke(Compiler *c, int site, Buf *b, int indent, int as_expr,
       g_ie_next_ty = (nx_bt == TY_INT || nx_bt == TY_FLOAT || nx_bt == TY_STRBUF ||
                       ty_is_array(nx_bt) || ty_is_hash(nx_bt)) ? nx_bt : TY_UNKNOWN;
       g_ie_next_oint = ywo && oint_kind(nx_bt);
+      /* the carrier holds the value while an `ensure` the block leaves
+         through runs, before the yield's caller takes it: rooted then
+         (emit_bv_root), whatever it holds */
       if (g_ie_res_poly) {
         buf_printf(b, "sp_RbVal _t%d = sp_box_nil(); ", nx_tmp);
         if (string_result) buf_printf(b, "SP_GC_ROOT_RBVAL(_t%d); ", nx_tmp);
+        else if (emit_bv_root(c, bbody, TY_POLY, nx_tmp, b)) buf_puts(b, " ");
       }
       else if (g_ie_next_oint) buf_printf(b, "%s _t%d = %s; ", oint_ctype(nx_bt), nx_tmp, oint_nil(nx_bt));
       else if (nx_bt == TY_INT || nx_bt == TY_BOOL || nx_bt == TY_SYMBOL)
@@ -2923,6 +2936,7 @@ void emit_block_invoke(Compiler *c, int site, Buf *b, int indent, int as_expr,
         if (ty_is_array(nx_bt) || ty_is_hash(nx_bt)) {
           emit_gc_root_tmp(c, nx_bt, nx_tmp, b); buf_puts(b, " ");
         }
+        else if (emit_bv_root(c, bbody, nx_bt, nx_tmp, b)) buf_puts(b, " ");
       }
       /* a Float, a Range, a Rational ...: the carrier is the value's own C
          type, not the sp_int it was declared as (a Float next truncated, a
@@ -2932,6 +2946,7 @@ void emit_block_invoke(Compiler *c, int site, Buf *b, int indent, int as_expr,
                 nx_bt == TY_RATIONAL || nx_bt == TY_COMPLEX || nx_bt == TY_TIME)) {
         emit_ctype(c, nx_bt, b);
         buf_printf(b, " _t%d = %s; ", nx_tmp, res_zero(c, nx_bt, 0));
+        if (emit_bv_root(c, bbody, nx_bt, nx_tmp, b)) buf_puts(b, " ");   /* a String Range's ends */
       }
       else {
         /* type-opaque tail (e.g. the body IS the `next`): ride a plain
@@ -3282,6 +3297,7 @@ void emit_block_invoke(Compiler *c, int site, Buf *b, int indent, int as_expr,
   g_block_nren = sv_bnren;
   BI_METHOD_SIDE();
   yield_target_restore(&yts);
+  hcv_alias_drop(hcv_amark);
   g_block_id = svb; g_yield_block_fallback = svfb; g_block_param_name = svbpn;
   g_block_owner_param_name = svbown;
   if (as_expr) {
@@ -3803,7 +3819,7 @@ int call_targets_yielding_method(Compiler *c, int id) {
       if (encl->is_cmethod) mi = call_target(c, id, encl->class_id, name, CT_CMETHOD, NULL);
       if (mi < 0 && !cmethod_of_class(c, encl)) mi = call_target(c, id, encl->class_id, name, 0, NULL);
     }
-    else if (mi < 0 && g_class_body_id >= 0)
+    else if (mi < 0 && emit_self_class_body(c, id) >= 0)
       mi = call_target(c, id, g_class_body_id, name, CT_CMETHOD, NULL);
     if (mi < 0) mi = call_target(c, id, -1, name, CT_TOP, NULL);
     /* A bare call to a method of a module included at the top level, which
@@ -4083,8 +4099,7 @@ int next_is_block_value(Compiler *c, int next) {
 /* A loop that may not end (loop, an unproved while) polls for a delivered
    signal at its back-edge; a counted one only when no loop of its function
    encloses it, so an inner counted loop keeps no poll in its body (#9222),
-   unless it is a pure one a rescue of Interrupt keeps from its pure region
-   (loop_body_polls_alone) */
+   unless loop_keeps_sig_poll */
 int g_loop_uncounted = 0, g_poll_loop_nest = 0;
 /* The signal poll of the loop whose body is being emitted sits at its latch
    (emit_loop_body): after the body, and ahead of each next and redo that
@@ -4096,25 +4111,45 @@ int g_loop_uncounted = 0, g_poll_loop_nest = 0;
    straight back. Either place is a point between two statements. */
 int g_loop_sig_latch = 0;
 void emit_loop_latch_poll(Buf *b, const char *end) {
-  if (g_loop_sig_latch) buf_printf(b, "%s%s;%s", sig_poll_stmt(), hc_mark(), end);
+  if (g_loop_sig_latch)
+    buf_printf(b, "%s%s%s;%s%s", hc_iter_poll_mark(g_poll_loop_nest, 0), sig_poll_stmt(), hc_mark(),
+               hc_iter_poll_mark(g_poll_loop_nest, 1), end);
 }
 /* The polls at the top of a loop body (emit_loop_body): `uncounted`, the
    loop may not end; `nest`, how many loops of its function hold the body,
    the loop's own included. With `latch`, the signal poll is left to the
    caller, who puts it at the loop's latch; the answer says whether the loop
    takes one. */
+static int emit_polls(Compiler *c, int body, Buf *b, int indent, int uncounted, int nest, int latch, int quiet);
 int emit_loop_polls(Compiler *c, int body, Buf *b, int indent, int uncounted, int nest, int latch) {
   /* an array's walk an enclosing loop polls for (hcv_begin) */
   int quiet = g_loop_quiet; g_loop_quiet = 0;
-  if (g_uses_threads && !quiet) { emit_indent(b, indent); buf_printf(b, "if (SP_UNLIKELY(SP_SAFEPOINT_POLL())) sp_safepoint()%s;\n", hc_mark()); }
+  return emit_polls(c, body, b, indent, uncounted, nest, latch, quiet);
+}
+/* A builtin iterator's step (map, select, inject, sort_by, each_char, ...
+   in its own C loop, emitted by the step helpers) whose pass may take as
+   long as what a String holds (loop_pass_grows) polls at the step's head,
+   as a loop body does: one pass may take milliseconds, so the iterator
+   would hold a collection, a thread switch or a signal for the whole walk.
+   Any other step takes none: its pass is short, and the iterator yields,
+   as a runtime call over the array does, when it returns. Nor does a block
+   the runtime calls back (`merge`'s, for a key both hashes hold): a poll
+   there would run a collection inside the runtime's own walk. */
+void emit_step_polls(Compiler *c, int body, Buf *b, int indent) {
+  if (body >= 0 && loop_pass_grows(c, body)) emit_polls(c, body, b, indent, 0, g_poll_loop_nest + 1, 0, 0);
+}
+static int emit_polls(Compiler *c, int body, Buf *b, int indent, int uncounted, int nest, int latch, int quiet) {
+  /* (a block loop's region marks its own polls: hc_iter_poll_mark) */
+  const char *mo = hc_iter_poll_mark(nest, 0), *mc = hc_iter_poll_mark(nest, 1);
+  if (g_uses_threads && !quiet) { emit_indent(b, indent); buf_printf(b, "%sif (SP_UNLIKELY(SP_SAFEPOINT_POLL())) sp_safepoint()%s;%s\n", mo, hc_mark(), mc); }
   /* and for pending finalizers (sp_gc.h), when the program defines any. A
      finalizer is Ruby code that may resize an array this loop has cached, so
      the cache reloads after one runs, as after a safepoint. */
-  if (g_uses_finalizers && !quiet) { emit_indent(b, indent); buf_printf(b, "if (SP_UNLIKELY(SP_ATOMIC_LOAD(&sp_fin_pending_flag, __ATOMIC_RELAXED))) sp_fin_run_pending()%s;\n", hc_mark()); }
+  if (g_uses_finalizers && !quiet) { emit_indent(b, indent); buf_printf(b, "%sif (SP_UNLIKELY(SP_ATOMIC_LOAD(&sp_fin_pending_flag, __ATOMIC_RELAXED))) sp_fin_run_pending()%s;%s\n", mo, hc_mark(), mc); }
   /* and for a delivered Signal.trap, Ruby code as a finalizer is */
-  if (sig_polls() && (uncounted || nest == 1 || loop_body_polls_alone(c, body)) && !poll_in_pure(c, body)) {
+  if (sig_polls() && (uncounted || nest == 1 || loop_keeps_sig_poll(c, body)) && !poll_in_pure(c, body)) {
     if (latch) return 1;
-    emit_indent(b, indent); buf_printf(b, "%s%s;\n", sig_poll_stmt(), hc_mark());
+    emit_indent(b, indent); buf_printf(b, "%s%s%s;%s\n", mo, sig_poll_stmt(), hc_mark(), mc);
   }
   return 0;
 }
@@ -4532,7 +4567,7 @@ int emit_takewhile_with_index(Compiler *c, int id, Buf *b) {
     if (p1lv->type == TY_POLY) buf_printf(g_pre, "lv_%s = sp_box_int(_t%d + _t%d);\n", rename_local(p1), ti, toff);
     else buf_printf(g_pre, "lv_%s = _t%d + _t%d;\n", rename_local(p1), ti, toff);
   }
-  for (int j = 0; j < bn - 1; j++) emit_stmt(c, bb[j], g_pre, g_indent + 1);
+  emit_iter_step_lead(c, body, bn - 1, g_pre, g_indent + 1);
   int sv = g_indent; g_indent++;
   Buf cb; memset(&cb, 0, sizeof cb); emit_cond(c, bb[bn - 1], &cb); g_indent = sv;
   emit_indent(g_pre, g_indent + 1);
@@ -5494,6 +5529,9 @@ static int emit_iteration_stmt_sn(Compiler *c, int id, Buf *b, int indent) {
 }
 
 int emit_iteration_stmt(Compiler *c, int id, Buf *b, int indent) {
+  /* a reopened builtin's method of the name runs, through its proc form
+     when it yields, as in CRuby: the builtin's loop is no answer for it */
+  { CallPlan pl = cplan_user(c, id); if (pl.mi >= 0 && pl.via == UC_REOPEN) return 0; }
   if (sn_guard_pending(c, id)) {
     /* a count the row refuses raises where the receiver is not nil: the call
        is left to the `&.` guard, whose non-nil arm carries the arity guard */
@@ -6637,6 +6675,10 @@ static int iter_enum_poly_walk_arms(Compiler *c, int id, Buf *b, int indent, con
         hc_array(c, recv, rt == TY_FLOAT_ARRAY, hd, hl, hw, sizeof hd))
       hc_read_len(hd, hr, sizeof hr);
     else if (!rev && hc_ptr_array(c, recv, hd, hl, sizeof hd)) hp = 1;
+    /* the element and other arrays read at the index -- a counter the body
+       steps once per pass, `i = 0` ahead of the walk -- in place, behind one
+       test (hcv_begin_walk), as a while over the same array reads them */
+    void *ehcv = hd[0] && !rev && is_each_name(name) ? hcv_begin_walk(c, id, body, block, hl, recv, &b) : NULL;
     emit_indent(b, indent);
     if (rev) buf_printf(b, "for (sp_int _t%d = _t%d - 1; _t%d >= 0; _t%d--) {\n", t, tn, t, t);
     else if (hd[0]) buf_printf(b, "for (sp_int _t%d = 0; _t%d < %s; _t%d++) {\n", t, t, hl, t);
@@ -6730,12 +6772,22 @@ static int iter_enum_poly_walk_arms(Compiler *c, int id, Buf *b, int indent, con
           buf_puts(b, rb.p); buf_printf(b, ", _t%d));\n", t);
         }
         else if (hp) buf_printf(b, "lv_%s = %s[_t%d];\n", p0, hd, t);
-        else if (hd[0] && !o0)
-          buf_printf(b, "lv_%s = SP_LIKELY((unsigned long long)_t%d < (unsigned long long)%s) ? %s[_t%d] : sp_%sArray_get(%s, _t%d);\n",
-                     p0, t, hr, hd, t, k, rb.p, t);
+        else if (hd[0] && !o0) {
+          buf_printf(b, "lv_%s = ", p0);
+          int cob = ehcv ? iter_cob_open(c, recv, 0, et, t, b) : 0;
+          buf_printf(b, "SP_LIKELY((unsigned long long)_t%d < (unsigned long long)%s) ? %s[_t%d] : sp_%sArray_get(%s, _t%d)",
+                     t, hr, hd, t, k, rb.p, t);
+          if (cob) hc_cob_mark(b, 2);
+          buf_puts(b, ";\n");
+        }
         else {
-        buf_printf(b, "lv_%s = sp_%sArray_%s(", p0, k, o0 ? "oget" : "get");
-        buf_puts(b, rb.p); buf_printf(b, ", _t%d);\n", t);
+        buf_printf(b, "lv_%s = ", p0);
+        /* (an oint slot's element in place, its nil a nil-free length rules out) */
+        int cob = ehcv && hd[0] ? iter_cob_open(c, recv, o0, et, t, b) : 0;
+        buf_printf(b, "sp_%sArray_%s(", k, o0 ? "oget" : "get");
+        buf_puts(b, rb.p); buf_printf(b, ", _t%d)", t);
+        if (cob) hc_cob_mark(b, 2);
+        buf_puts(b, ";\n");
         }
       }
     }
@@ -6751,6 +6803,7 @@ static int iter_enum_poly_walk_arms(Compiler *c, int id, Buf *b, int indent, con
     each_body:
     emit_loop_body(c, body, b, indent + 1);
     emit_indent(b, indent); buf_puts(b, "}\n");
+    hcv_end(c, ehcv, indent);
     if (outer) { emit_indent(b, indent); buf_printf(b, "lv_%s = _t%d;\n", p0, ts); }
     free(rb.p);
     return 1;

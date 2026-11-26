@@ -304,6 +304,8 @@ typedef enum {
   CF_STRBUF_HANDLE, /* --share-strings: a String into a shared String handle
                        slot, as the handle it is or a fresh one
                        (emit_strbuf_ivar_store) */
+  CF_HASH_WIDEN,    /* a fresh narrower Hash widened into a poly-valued or general Hash slot */
+  CF_ARRAY_WIDEN,   /* a fresh typed Array widened into a general Array slot */
   CF_CONVERT,       /* a conversion Ruby makes itself: truthiness, a Bignum
                        or Rational to a Float */
   CF_REFUSE,        /* no conversion keeps the value: refused */
@@ -339,5 +341,13 @@ int repr_write_share(const Compiler *c, int node);
 /* a read such a slot can be: a global's, a constant's (bare or `A::B`), a
    class variable's */
 int repr_static_read_kind(NodeKind k);
+
+/* Is node n the frozen String literal itself (a literal of a file whose
+   literals are frozen, or a freeze, -@ or dedup of one)? Its handle is the
+   literal's own static object, never a new one. */
+int repr_frozen_literal(Compiler *c, int n);
+int repr_frozen_literal_ascii(Compiler *c, int n);
+/* ...with nothing run besides it: no statements before it in parentheses */
+int repr_frozen_literal_alone(Compiler *c, int n);
 
 #endif

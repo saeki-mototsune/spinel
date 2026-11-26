@@ -531,9 +531,12 @@ static int node_is_oint_asked(Compiler *c, int node) {
          ((sp_streq(nm, "pop") || sp_streq(nm, "shift")) && an2 == 0))) return 1;
     if (r >= 0 && ty_is_hash(rt) && (sp_streq(nm, "delete") || sp_streq(nm, "find_index"))) return 1;
     if (r >= 0 && ty_is_obj_array(rt) && (sp_streq(nm, "index") || sp_streq(nm, "find_index")) && an2 == 1) return 1;
-    if (r >= 0 && rt == TY_MATCHDATA && (sp_streq(nm, "bytebegin") || sp_streq(nm, "byteend"))) return 1;
+    int md_recv = (rt == TY_MATCHDATA) ||
+                  (rt == TY_POLY && ty_poly_handle_face_args(nm, an2) == TY_MATCHDATA &&
+                   cplan_user(c, node).dispatch == CP_NONE);
+    if (r >= 0 && md_recv && (sp_streq(nm, "bytebegin") || sp_streq(nm, "byteend"))) return 1;
     if (is_range_bound_reader(nm) && r >= 0 &&
-        (rt == TY_MATCHDATA || rt == TY_RANGE || rt == TY_FLOAT_RANGE)) return 1;
+        (md_recv || rt == TY_RANGE || rt == TY_FLOAT_RANGE)) return 1;
     if (r >= 0 && (rt == TY_INT_ARRAY || rt == TY_FLOAT_ARRAY)) {
       /* an Integer / Float array's element answers: nil when empty or missing */
       if (an2 == 0 && blk < 0 &&
@@ -820,29 +823,21 @@ const NativeMethod *repr_native_string_reader(Compiler *c, int node) {
   const NodeTable *nt = c->nt;
   if (node < 0) return NULL;
   NodeKind kind = nt_kind(nt, node);
-  int cid;
-  const char *name;
-  if (kind == NK_CallNode) {
-    int recv = nt_ref(nt, node, "receiver");
-    TyKind rt = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN;
-    if (!ty_is_object(rt)) return NULL;
-    name = nt_str(nt, node, "name");
-    cid = comp_native_answer_class(c, ty_object_class(rt), name);
-  }
-  else if (kind == NK_SuperNode) {
-    const Scope *scope = comp_scope_of(c, node);
-    if (!scope || scope->is_cmethod || scope->class_id < 0) return NULL;
-    cid = c->classes[scope->class_id].nsub_root - 1;
-    if (cid < 0) return NULL;
-    const Scope *site = comp_super_site(c, scope);
-    name = comp_super_name(c, cplan_super_start(c, site), site);
-  }
-  else return NULL;
-  if (cid < 0 || !name) return NULL;
+  if (kind != NK_CallNode && kind != NK_SuperNode) return NULL;
   int argc = 0;
   call_args(nt, node, &argc);
   if (argc != 0) return NULL;
-  int nm = comp_native_method_find(c, cid, name, argc, 0);
+  int nm = -1;
+  /* (a super's: the binding the plan's arm runs, BSUP_NATIVE) */
+  if (kind == NK_SuperNode) nm = cplan_super_native(c, node);
+  else {
+    int recv = nt_ref(nt, node, "receiver");
+    TyKind rt = recv >= 0 ? comp_ntype(c, recv) : TY_UNKNOWN;
+    if (!ty_is_object(rt)) return NULL;
+    const char *name = nt_str(nt, node, "name");
+    int cid = comp_native_answer_class(c, ty_object_class(rt), name);
+    if (cid >= 0 && name) nm = comp_native_method_find(c, cid, name, argc, 0);
+  }
   const NativeMethod *m = nm >= 0 ? &c->native_methods[nm] : NULL;
   return repr_native_string_symbol(m) ? m : NULL;
 }
@@ -896,19 +891,16 @@ static int repr_boxed_native_handle(Compiler *c, int v) {
    binding's handle form answers the handle it kept. The binding, or NULL. */
 const NativeMethod *repr_super_native_keeps(Compiler *c, int n) {
   const NodeTable *nt = c->nt;
-  if (!c->share || n < 0 || nt_kind(nt, n) != NK_SuperNode) return NULL;
-  Scope *ms = comp_scope_of(c, n);
-  if (!ms || ms->is_cmethod || ms->class_id < 0 || ms->class_id >= c->nclasses || ms->def_node < 0 ||
-      !ms->name || is_initialize_family(ms->name) || c->classes[ms->class_id].nsub_root <= 0)
-    return NULL;
-  int root = c->classes[ms->class_id].nsub_root - 1;
-  if (root >= c->nclasses || !c->classes[root].native_share_keeps) return NULL;
-  int argc = 0; const int *argv = call_args(nt, n, &argc);
+  if (!c->share_applied || n < 0 || nt_kind(nt, n) != NK_SuperNode) return NULL;
+  int argc = 0;
+  (void)call_args(nt, n, &argc);
   if (argc != 1 || nt_ref(nt, n, "block") >= 0) return NULL;
-  TyKind at = comp_ntype(c, argv[0]);
-  int nm = comp_native_method_find_typed(c, root, ms->name, 1, 0, &at);
-  const NativeMethod *m = nm >= 0 ? &c->native_methods[nm] : NULL;
-  if (!m || m->kind != 0 || !(m->share & NSH_KEEPS) || !m->share_csym || m->rest || m->nargs != 1) return NULL;
+  /* (the binding the plan's arm runs, BSUP_NATIVE) */
+  int nm = cplan_super_native(c, n);
+  Scope *ms = comp_scope_of(c, n);
+  if (nm < 0 || !c->classes[c->classes[ms->class_id].nsub_root - 1].native_share_keeps) return NULL;
+  const NativeMethod *m = &c->native_methods[nm];
+  if (m->kind != 0 || !(m->share & NSH_KEEPS) || !m->share_csym || m->rest || m->nargs != 1) return NULL;
   return m;
 }
 
@@ -988,6 +980,14 @@ int repr_native_call_handle(Compiler *c, int v) {
     }
   }
   const CallPlan plan = cplan_user(c, v);
+  /* a boxed receiver's call that codegen takes as the builtin, where only a
+     class method has the name (`K.pack` beside `@a.pack("n*")`): the
+     builtin's String, not that method's handle */
+  if (k == NK_CallNode && plan.mi >= 0 && c->scopes[plan.mi].is_cmethod) {
+    int r = nt_ref(nt, v, "receiver");
+    const char *name = nt_str(nt, v, "name");
+    if (r >= 0 && comp_ntype(c, r) == TY_POLY && !user_defines_or_reads(c, name)) return 0;
+  }
   if (plan.dispatch == CP_DIRECT && plan.mi >= 0)
     return repr_method_ret_storage(&c->scopes[plan.mi]) == TY_STRBUF;
   if (plan.dispatch != CP_SWITCH && plan.dispatch != CP_PER_ARM) {
@@ -1422,6 +1422,47 @@ ReprForm repr_box_form(const Compiler *c, Repr r) {
   return RF_NULLABLE;
 }
 
+/* Is node n the frozen String literal itself: a literal of a file whose
+   literals are frozen (`fzl`), or a `freeze`, `-@` or `dedup` of one, which
+   answer their receiver? Every evaluation answers the one object the
+   literal names, so the handle a slot takes for it is that literal's own
+   static object (sp_StringLiteral), never a new one. Adjacent literals
+   (`"a" "b"`) and a squiggly heredoc of mixed indents parse as an
+   interpolated String that emit_interp folds into one literal: that is one
+   too (interp_is_literal_fold). A `+"lit"` is a call that copies, and a
+   String with a part to evaluate is built each time: neither is one.
+   Parentheses are the literal their value is (vp_one): `(x; "lit")` is
+   "lit". Its handle is the identity every reader of the literal sees, so the
+   fact is Repr's, read from the node table, the value-position walker and
+   the String freeze row. */
+int repr_frozen_literal(Compiler *c, int n) {
+  const NodeTable *nt = c->nt;
+  if (vp_one(nt, n, VPS_NONE | VP_PARENS_ONLY, &n) != VP1_NODE) return 0;
+  NodeKind k = nt_kind(nt, n);
+  if (k == NK_StringNode) return nt_int(nt, n, "fzl", 0) != 0;
+  if (k == NK_InterpolatedStringNode) return nt_int(nt, n, "fzl", 0) != 0 && interp_is_literal_fold(nt, n);
+  if (k != NK_CallNode || nt_ref(nt, n, "arguments") >= 0 || nt_ref(nt, n, "block") >= 0 ||
+      (bop_share_named(TY_STRING, nt_str(nt, n, "name")) != BSH_FROZEN && !is_freeze_name(nt_str(nt, n, "name")))) return 0;
+  return repr_frozen_literal(c, nt_ref(nt, n, "receiver"));
+}
+/* ...whose bytes are all ASCII (str_literal_ascii): appended to a text, it
+   leaves that text's encoding as it is. */
+int repr_frozen_literal_ascii(Compiler *c, int n) {
+  if (!repr_frozen_literal(c, n)) return 0;
+  vp_one(c->nt, n, VPS_NONE | VP_PARENS_ONLY, &n);
+  if (nt_kind(c->nt, n) == NK_CallNode) return repr_frozen_literal_ascii(c, nt_ref(c->nt, n, "receiver"));
+  return str_literal_ascii(c->nt, n);
+}
+/* ...with nothing run beside it: each parenthesis on the way holds the
+   literal alone, `("lit")` or `("lit").freeze`, never `(f; "lit")`, whose
+   statements run before the literal answers. */
+int repr_frozen_literal_alone(Compiler *c, int n) {
+  const NodeTable *nt = c->nt;
+  n = nt_paren_single(nt, n);
+  if (nt_kind(nt, n) == NK_ParenthesesNode || !repr_frozen_literal(c, n)) return 0;
+  /* (a freeze of one is one when its receiver is) */
+  return nt_kind(nt, n) != NK_CallNode || repr_frozen_literal_alone(c, nt_ref(nt, n, "receiver"));
+}
 /* See repr.h. Every box can, unless its form proves an immediate: an
    Integer, a Float (each with its nil or not), true, false, a Symbol, nil
    and a void value's nil; or a Class, boxed by its id or by its name
@@ -1433,10 +1474,10 @@ ReprForm repr_box_form(const Compiler *c, Repr r) {
    compiled pattern: its row roots no slot) is not one. An untyped value
    is boxed by its shape where it has one (an empty `[]` or `{}`, a bare
    Array.new or Hash.new): a new container. A frozen String literal's box
-   is its static handle (share_frozen_literal). */
+   is its static handle (repr_frozen_literal). */
 int repr_box_holds_heap(Compiler *c, int node) {
   Repr r = repr_of(c, node);
-  if (share_frozen_literal(c, node)) return 0;
+  if (repr_frozen_literal(c, node)) return 0;
   switch (repr_box_form(c, r)) {
   case RF_INT: case RF_INT_NIL: case RF_FLT: case RF_FLT_NIL: case RF_BOOL: case RF_SYM:
     return 0;
@@ -1535,8 +1576,8 @@ int repr_store_fits(Compiler *c, TyKind from, TyKind to) {
 }
 
 /* Would emit_empty_literal_as build `v` at the slot's kind? An empty
-   literal, a bare Array.new or Hash.new, for an Array or Hash slot it has
-   a constructor for. */
+   literal, a bare Array.new or Hash.new, or a plain freeze/dup/clone of
+   one, for an Array or Hash slot it has a constructor for. */
 static int repr_empty_lit_as(Compiler *c, int v, TyKind slot) {
   const NodeTable *nt = c->nt;
   v = nt_paren_single(c->nt, v);
@@ -1558,7 +1599,39 @@ static int repr_empty_lit_as(Compiler *c, int v, TyKind slot) {
     if (rn && sp_streq(rn, "Array"))
       return ty_is_ptr_array(slot) || slot == TY_POLY_ARRAY || array_kind(slot);
   }
+  /* `{}.freeze` / `[].freeze` (and `.dup` / `.clone`) when no user override
+     replaces the builtin: the receiver is built at the slot's kind and
+     frozen where asked. */
+  int r = empty_container_copy_recv(c, v, NULL);
+  if (r >= 0) return repr_empty_lit_as(c, r, slot);
   return 0;
+}
+
+/* Can a Hash of variant `from` widen losslessly into a Hash slot of variant
+   `slot`? Same-key value widening (`StrStr`/`StrInt` -> `StrPoly`) and
+   widening any Hash into the general `PolyPoly` Hash keep every key and value
+   without changing key kinds, but the runtime converters allocate a new
+   container. Only provably fresh (unaliased) Hash values may convert here so
+   retained or aliased Hashes never lose object identity or mutations. A
+   key-kind clash (`SymPoly` -> `StrPoly`) or narrowing (`PolyPoly` ->
+   `StrPoly`) is never converted here. */
+static int repr_hash_widen_ok(Compiler *c, int node, TyKind from, TyKind slot) {
+  if (!ty_is_hash(from) || !ty_is_hash(slot) || from == slot) return 0;
+  if (!(slot == TY_STR_POLY_HASH
+        ? (from == TY_STR_STR_HASH || from == TY_STR_INT_HASH)
+        : slot == TY_POLY_POLY_HASH))
+    return 0;
+  return an_is_fresh_hash_value(c, node);
+}
+
+/* Can a typed Array widen into the general `PolyArray` slot? Like Hash
+   widening, the runtime converter copies elements into a new Array, so only
+   provably fresh (unaliased) Array values may convert here. */
+static int repr_array_widen_ok(Compiler *c, int node, TyKind from, TyKind slot) {
+  if (slot != TY_POLY_ARRAY ||
+      !(from == TY_INT_ARRAY || from == TY_FLOAT_ARRAY || from == TY_STR_ARRAY))
+    return 0;
+  return an_is_fresh_array_value(c, node);
 }
 
 /* Does emit_poly_rhs_coerced take a boxed value into a `slot` slot? An
@@ -1575,6 +1648,8 @@ int repr_coerce_text_form(Compiler *c, int node, TyKind from, TyKind slot, int h
   if (slot == TY_POLY) return CF_BOX;
   if (from == TY_VOID || from == TY_NIL) return CF_NIL_SENT;
   if (slot == TY_BIGINT && from == TY_INT) return CF_INT2BIG;
+  if (how == CO_HOLD && repr_hash_widen_ok(c, node, from, slot)) return CF_HASH_WIDEN;
+  if (how == CO_HOLD && repr_array_widen_ok(c, node, from, slot)) return CF_ARRAY_WIDEN;
   if (how == CO_CONVERT && slot == TY_FLOAT && (from == TY_BIGINT || from == TY_RATIONAL))
     return CF_CONVERT;
   return CF_REFUSE;
@@ -1585,7 +1660,7 @@ int repr_coerce_plan(Compiler *c, int node, TyKind slot, int how, TyKind *from_o
   if (how == CO_CONVERT && slot == TY_BOOL) return CF_CONVERT;
   TyKind from = store_value_kind(c, node);
   if (from_out) *from_out = from;
-  int container = ty_is_array(slot) || ty_is_hash(slot);
+  int container = ty_is_array(slot) || ty_is_ptr_array(slot) || ty_is_hash(slot);
   if (from == TY_UNKNOWN && container && repr_empty_lit_as(c, node, slot)) return CF_EMPTY_LIT;
   if (repr_store_fits(c, from, slot) || (from == TY_NIL && repr_store_nil_fits(c, node, slot, how)))
     return CF_FIT;
@@ -1613,7 +1688,8 @@ int repr_coerce_form(Compiler *c, int node, TyKind slot, int how) {
 
 const char *repr_coerce_form_name(int form) {
   static const char *const names[CF__COUNT] = {
-    "FIT", "BOX", "EMPTY_LIT", "NIL_SENT", "INT2BIG", "POLY_RHS", "CHECKED_UNBOX", "STRBUF_HANDLE", "CONVERT", "REFUSE",
+    "FIT", "BOX", "EMPTY_LIT", "NIL_SENT", "INT2BIG", "POLY_RHS", "CHECKED_UNBOX", "STRBUF_HANDLE",
+    "HASH_WIDEN", "ARRAY_WIDEN", "CONVERT", "REFUSE",
   };
   return form >= 0 && form < CF__COUNT ? names[form] : "?";
 }

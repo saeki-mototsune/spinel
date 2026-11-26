@@ -1,6 +1,6 @@
 /* analyze_program.c -- the program's files and their load order.
 
-   Under --load-model=graph (#9898, CRuby's load model) each file the program
+   As CRuby loads a program (#9898), each file the program
    loads is a root of the node table (nt_root; the entry's is the table's
    root) and each require a LoadNode naming the file it loads
    (`target_file`). A file's top level is a body of its own, run when the
@@ -28,9 +28,6 @@
 #include "call_plan.h"
 #include <limits.h>
 
-static int prog_graph(const Compiler *c) { return c->nt->nfile_roots > 0; }
-/* Is the program its files (--load-model=graph), each a root? */
-int prog_has_files(const Compiler *c) { return prog_graph(c); }
 
 int prog_root_stmts(const Compiler *c, int i) {
   int r = nt_root(c->nt, i);
@@ -55,7 +52,7 @@ int prog_is_root_stmts(const Compiler *c, int st) {
    required files' scopes are made one after another (prog_file_scopes). */
 int prog_is_top_scope(const Compiler *c, const Scope *s) {
   int i = (int)(s - c->scopes), n = nt_nroots(c->nt);
-  return i == 0 || (prog_graph(c) && n > 1 && i >= c->file_scope[1] && i <= c->file_scope[n - 1]);
+  return i == 0 || (n > 1 && i >= c->file_scope[1] && i <= c->file_scope[n - 1]);
 }
 
 /* A required file's top-level scope, after main's (scope 0). */
@@ -63,7 +60,7 @@ void prog_file_scopes(Compiler *c) {
   int n = nt_nroots(c->nt);
   c->file_scope = calloc((size_t)n, sizeof(int));
   if (!c->file_scope) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  for (int i = 1; prog_graph(c) && i < n; i++) {
+  for (int i = 1; i < n; i++) {
     Scope *s = comp_scope_new(c, NULL, -1);
     { s->body = prog_root_stmts(c, i); comp_touch_scope(s->idx); }
     c->file_scope[i] = c->nscopes - 1;
@@ -86,9 +83,7 @@ static int prog_load_by(const Compiler *c, int f) {
    parser's sp_req_always_runs says no: the LoadNode's req_deferred), at any
    level of the requires that run it, or is it a file no require places? The
    one stamp prog_stamp_deferred writes on each file's root once the files
-   have their places (prog_settle_files); the inline splice stamps the
-   statements of a file spliced from such a require instead (req_deferred).
-   0 for a file with no root: the inline model's. */
+   have their places (prog_settle_files). 0 for the entry. */
 int prog_load_deferred(const Compiler *c, int f) {
   const NodeTable *nt = c->nt;
   int r = f > 0 && f < nt->nfile_roots ? nt_root(nt, f) : -1;
@@ -101,10 +96,16 @@ int prog_load_deferred(const Compiler *c, int f) {
 /* The graph file whose tree holds node, or -1. Not the node's node_file
    itself: that is the #line table's id (879be11b4), which runs past the
    graph's files once the table holds more names than the graph has files. */
+/* The table id of the file node is written in: node_file, unless a
+   `#<SPINEL_SOURCE>` marker moved that to the marker's file for messages. */
+static long long prog_node_src_file(const NodeTable *nt, int node) {
+  long long s = nt_int(nt, node, "node_src_file", -1);
+  return s >= 0 ? s : nt_int(nt, node, "node_file", -1);
+}
 static int prog_graph_file_of(const NodeTable *nt, int node) {
-  long long fid = nt_int(nt, node, "node_file", -1);
+  long long fid = prog_node_src_file(nt, node);
   for (int f = 0; fid >= 0 && f < nt_nroots(nt); f++)
-    if (nt_int(nt, nt_root(nt, f), "node_file", -2) == fid) return f;
+    if (prog_node_src_file(nt, nt_root(nt, f)) == fid) return f;
   return -1;
 }
 static int prog_stamp_deferred(Compiler *c, int f, unsigned char *state) {
@@ -134,8 +135,8 @@ int prog_ordered_load(const Compiler *c, int id) {
 /* The file a require that is not a statement of a file's top level runs:
    the target of the LoadNode prog_settle_files placed at its site, else -1.
    The record enters it where it reaches the require, so that the file's
-   statements run in place, as the inline model splices them; the top-level
-   statement holding the require is the root's `load_stmt`. */
+   statements run in place; the top-level statement holding the require is
+   the root's `load_stmt`. */
 int prog_site_places(const Compiler *c, int id) {
   const NodeTable *nt = c->nt;
   if (id < 0 || nt_kind(nt, id) != NK_LoadNode) return -1;
@@ -184,8 +185,8 @@ int prog_rescue_sure(const NodeTable *nt, int st) {
   return r ? r - 1 : PROG_RS_MAY;
 }
 /* Does the program need the run-time $LOAD_PATH to start as CRuby's does
-   (sp_load_path_seed)? Under --load-model=graph (the entry's root carries the
-   directories), where it has a require of a set of files, which searches the
+   (sp_load_path_seed)? It does (the entry's root carries the
+   directories) where it has a require of a set of files, which searches the
    array, or reads it. A program writes none of $LOAD_PATH's names (refused). */
 int prog_load_path_seeded(const NodeTable *nt) {
   if (!nt_str(nt, nt_root(nt, 0), "load_root")) return 0;
@@ -212,7 +213,8 @@ static void prog_top_walk(const Compiler *c, int f, ProgStmtFn fn, void *ud, con
   for (int k = 0; k < n; k++) {
     fn(ud, v[k], f);
     int t = prog_ordered_load(c, v[k]);
-    if (t >= 0) prog_top_walk(c, t, fn, ud, pl);
+    /* (a file placed at this very statement, its `load_stmt`, is walked below, once) */
+    if (t >= 0 && nt_int(c->nt, nt_root(c->nt, t), "load_stmt", -1) != v[k]) prog_top_walk(c, t, fn, ud, pl);
     for (int i = 0; i < pl->n; i++)
       if (nt_int(c->nt, nt_root(c->nt, pl->f[i]), "load_stmt", -1) == v[k]) prog_top_walk(c, pl->f[i], fn, ud, pl);
   }
@@ -304,7 +306,7 @@ void prog_visit_files(const Compiler *c, void (*fn)(void *ud, int node, int file
    otherwise (elab_check_order). */
 static int prog_order_now(Compiler *c, int a, int b) {
   if (a == b) return PROG_SAME;
-  if (!prog_graph(c) || a < 0 || b < 0) return a < b ? PROG_BEFORE : PROG_AFTER;
+  if (a < 0 || b < 0) return a < b ? PROG_BEFORE : PROG_AFTER;
   int fa, fb, ra, rb;
   elab_top_place(c, a, &fa, &ra);
   elab_top_place(c, b, &fb, &rb);
@@ -352,8 +354,7 @@ static void prog_sort_keyed(int *v, long long *key, int n) {
    id, as prog_order answers for two of them; a node that runs at no known
    point (one under no root, which a desugaring hung nowhere, or one of a
    file the load graph does not place) after all the others, by id, so the
-   order is a total one even where prog_order answers by ids or UNKNOWN.
-   Under the inline model, the node ids. */
+   order is a total one even where prog_order answers by ids or UNKNOWN. */
 void prog_sort(Compiler *c, int *v, int n, const int *node_of) {
   if (n < 2) return;
   long long *key = malloc(sizeof(long long) * (size_t)n);
@@ -362,14 +363,15 @@ void prog_sort(Compiler *c, int *v, int n, const int *node_of) {
   if (was) memcpy(was, v, sizeof(int) * (size_t)n);
   for (int i = 0; i < n; i++) {
     int id = node_of ? node_of[v[i]] : v[i], f = -1, r = 0;
-    if (prog_graph(c)) { elab_top_place(c, id, &f, &r); if (f < 0) r = -1; }
+    elab_top_place(c, id, &f, &r);
+    if (f < 0) r = -1;
     key[i] = ((long long)(r >= 0 ? r : INT_MAX) << 32) | (unsigned)id;
   }
   prog_sort_keyed(v, key, n);
   /* statements of a file a require places share the rank of the statement
      holding it: within a rank, by the statement the record runs first (the
      id order above stays within one statement) */
-  for (int f = 1; prog_graph(c) && f < nt_nroots(c->nt); f++) {
+  for (int f = 1; f < nt_nroots(c->nt); f++) {
     if (nt_root(c->nt, f) < 0 || nt_int(c->nt, nt_root(c->nt, f), "load_stmt", -1) < 0) continue;
     for (int i = 0; i < n; i++) {
       int id = node_of ? node_of[v[i]] : v[i], fl = -1, r = 0;
@@ -396,7 +398,7 @@ int prog_cmp(Compiler *c, int a, int b, int at, const char *reader) {
   int o = prog_order_for(c, a, b, reader);
   if (o == PROG_UNKNOWN) {
     char msg[256];
-    snprintf(msg, sizeof msg, "--load-model=graph: %s reads the order of two files, one of them loaded at no fixed point, for now", reader);
+    snprintf(msg, sizeof msg, "load model: %s reads the order of two files, one of them loaded at no fixed point, for now", reader);
     unsupported_feature(c, at, msg);
   }
   return o;
@@ -414,7 +416,7 @@ int prog_cmp_run(Compiler *c, int a, int b, int at, const char *reader) {
   int o = elab_order(c, a, b);
   if (o == PROG_UNKNOWN) {
     char msg[256];
-    snprintf(msg, sizeof msg, "--load-model=graph: %s reads the order of two files, one of them loaded at no fixed point, for now", reader);
+    snprintf(msg, sizeof msg, "load model: %s reads the order of two files, one of them loaded at no fixed point, for now", reader);
     unsupported_feature(c, at, msg);
   }
   return o;
@@ -766,23 +768,33 @@ static int prog_header_scope_autoloaded(Compiler *c, int id) {
   return 0;
 }
 
-/* What --load-model=graph does not load yet, refused by name (#9898), asked
+/* A literal block of the zero-argument builtin lambda constructor. */
+static int prog_lambda_block(Compiler *c, const int *parent, int b) {
+  const NodeTable *nt = c->nt;
+  int call = parent[b];
+  return nt_kind(nt, b) == NK_BlockNode && call >= 0 && nt_kind(nt, call) == NK_CallNode &&
+         nt_ref(nt, call, "block") == b && nt_ref(nt, call, "arguments") < 0 &&
+         is_lambda_constructor(nt_str(nt, call, "name")) && elab_builtin_lambda(c, call, parent);
+}
+
+static void prog_refuse_block_return(Compiler *c, int id) {
+  unsupported_feature(c, id, "load model: a `return` in a block at a required file's top level, for now");
+}
+/* What the load model does not load yet, refused by name (#9898), asked
    once the load sites are known, ahead of the desugaring:
      - a require of the program's own entry file, which CRuby runs again as
        a new file since `$0` is not a loaded feature;
      - an autoload: its file loads at the constant's first reference
        (part 4);
      - in a required file, an END block, registered when its statement
-       runs; `class Class`, which desugar_class_reopen reads at the entry's
-       top level only; and a `return` in a block at its top level, which
+       runs; and a non-lambda `return` in a block at its top level, which
        ends the file's load from wherever the block runs. */
 void prog_refuse_loads(Compiler *c) {
   const NodeTable *nt = c->nt;
-  if (!prog_graph(c)) return;
   NT_FOREACH_KIND(nt, NK_CallNode, id) {
     const char *name = nt_str(nt, id, "name");
     if (c->nautoloads && (is_const_query_name(name) || is_constants_list_name(name) || is_autoload_query_name(name)))
-      unsupported_feature(c, id, "--load-model=graph: constant-table query with autoload registrations, for now");
+      unsupported_feature(c, id, "load model: constant-table query with autoload registrations, for now");
     /* a receiverless include of an autoloaded module that is not a plain
        statement of a class body (the top level, a modifier `if`, a block, a
        `send`): the declaration does not take effect there, or the module's
@@ -795,49 +807,49 @@ void prog_refuse_loads(Compiler *c) {
     if (!msend && !(mav && is_mixin_call(name) && !prog_mixin_plain_stmt(c, id))) mav = NULL;
     for (int j = msend ? msent : 0; mav && j < margc; j++)
       if (elab_autoload_read(c, mav[j]))
-        unsupported_feature(c, id, "--load-model=graph loads an autoload's file at its constant's first reference only later, for now");
+        unsupported_feature(c, id, "the load model loads an autoload's file at its constant's first reference only later, for now");
     if (!is_autoload_name(name)) continue;
-    /* Name membership does not establish which receiver owns autoload. */
-    if (elab_names_method(c, name)) {
-      if (nt_ref(nt, id, "receiver") < 0)
-        unsupported_feature(c, id, "--load-model=graph loads an autoload's file at its constant's first reference only later, for now");
+    int rv = nt_ref(nt, id, "receiver");
+    int shadow = elab_autoload_shadow(c, id);
+    if (shadow == ELAB_YES || (shadow == ELAB_UNKNOWN && rv < 0)) {
+      if (rv < 0)
+        unsupported_feature(c, id, "the load model loads an autoload's file at its constant's first reference only later, for now");
       continue;
     }
     /* on a value no module can be (`Object.new.autoload`, a constant
-       holding one), there is no registration (lr_autoload_values): the call
+       holding one), there is no registration (lr_autoload_filter): the call
        stays the run-time call, which raises. Any other value may be a
        module, whose registration the parse did not take. */
-    int rv = nt_ref(nt, id, "receiver");
     NodeKind rk = rv >= 0 ? nt_kind(nt, rv) : NK_SelfNode;
     if (rk != NK_SelfNode && elab_value_not_module(c, rv)) continue;
-    if (rk != NK_SelfNode && rk != NK_ConstantReadNode && rk != NK_ConstantPathNode)
-      unsupported_feature(c, id, "--load-model=graph: unresolved autoload owner");
+    if (shadow == ELAB_UNKNOWN || (rk != NK_SelfNode && rk != NK_ConstantReadNode && rk != NK_ConstantPathNode))
+      unsupported_feature(c, id, "load model: unresolved autoload owner");
     int n; const AutoloadRegistration *a = comp_autoloads(c, id, &n);
-    if (!n) unsupported_feature(c, id, "--load-model=graph: unresolved autoload registration");
+    if (!n) unsupported_feature(c, id, "load model: unresolved autoload registration");
     /* These body emitters do not dispatch an implicit rescue/ensure body.
        Any other dropped ancestor has the same effect on the registration. */
     if (prog_registration_dropped(c, id))
-      unsupported_feature(c, id, "--load-model=graph loads an autoload's file at its constant's first reference only later, for now");
+      unsupported_feature(c, id, "the load model loads an autoload's file at its constant's first reference only later, for now");
     for (int j = 0; j < n; j++) {
       if (elab_point_from(c, id).region > 0 && c->node_cbody[id] >= 0)
-        unsupported_feature(c, id, "--load-model=graph: autoload registration in a deferred class or module body, for now");
-      if (!a[j].slot) unsupported_feature(c, id, "--load-model=graph: unresolved autoload owner");
-      if (!a[j].file) unsupported_feature(c, id, "--load-model=graph does not load the program's own entry file again, for now");
+        unsupported_feature(c, id, "load model: autoload registration in a deferred class or module body, for now");
+      if (!a[j].slot) unsupported_feature(c, id, "load model: unresolved autoload owner");
+      if (!a[j].file) unsupported_feature(c, id, "the load model does not load the program's own entry file again, for now");
       /* after another registration's autoload ran the file, CRuby still
          answers defined? of this one "constant" until its own runs; the
          runtime keeps the file's state, not each registration's */
       if (a[j].file > 0 && prog_autoload_file_shared(c, &a[j]) && !elab_autoload_file_defines(c, a[j].slot, a[j].file))
-        unsupported_feature(c, id, "--load-model=graph: autoload registrations sharing a file that does not define each one's constant, for now");
+        unsupported_feature(c, id, "load model: autoload registrations sharing a file that does not define each one's constant, for now");
     }
   }
   if (c->nautoloads) {
     NT_FOREACH_KIND(nt, NK_ConstantPathNode, id)
       if (elab_autoload_scope_open(c, id))
-        unsupported_feature(c, id, "--load-model=graph loads an autoload's file at its constant's first reference only later, for now");
+        unsupported_feature(c, id, "the load model loads an autoload's file at its constant's first reference only later, for now");
     int ndk = 0; const NodeKind *dk = class_def_kinds(&ndk);
     for (int dh = 0; dh < ndk; dh++) NT_FOREACH_KIND(nt, dk[dh], id)
       if ((class_def_is_class(nt, id) || class_def_is_module(nt, id)) && prog_header_scope_autoloaded(c, id))
-        unsupported_feature(c, id, "--load-model=graph: a class header whose scope an autoload defines, for now");
+        unsupported_feature(c, id, "load model: a class header whose scope an autoload defines, for now");
   }
   int *parent = an_parent_map(nt);
   if (!parent) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
@@ -846,32 +858,61 @@ void prog_refuse_loads(Compiler *c) {
     NodeKind k = kinds[ki];
     if (k == NK_LoadNode) {
       if (nt_int(nt, id, "target_file", -1) == 0)
-        unsupported_feature(c, id, "--load-model=graph does not load the program's own entry file again, for now");
+        unsupported_feature(c, id, "the load model does not load the program's own entry file again, for now");
       for (int j = 0; j < prog_load_ncand(nt, id); j++)
         if (prog_load_cand(nt, id, j) == 0)
-          unsupported_feature(c, id, "--load-model=graph: a computed require may load the program's own entry file again, for now");
+          unsupported_feature(c, id, "load model: a computed require may load the program's own entry file again, for now");
     }
     else if (k == NK_ReturnNode) {
-      /* the nearest method, lambda or block around it: a block's, at the top level */
+      /* A block return at the file's top level needs a lambda boundary. */
       int a = parent[id];
       while (a >= 0 && nt_kind(nt, a) != NK_DefNode && nt_kind(nt, a) != NK_LambdaNode && nt_kind(nt, a) != NK_BlockNode)
         a = parent[a];
       int r = a >= 0 && nt_kind(nt, a) == NK_BlockNode ? prog_root_of(c, parent, id) : -1;
-      for (int b = a; r >= 0 && b >= 0; b = parent[b])
-        if (nt_kind(nt, b) == NK_DefNode || nt_kind(nt, b) == NK_LambdaNode) r = -1;
-      if (r >= 0 && r != nt->root_id)
-        unsupported_feature(c, id, "--load-model=graph: a `return` in a block at a required file's top level, for now");
+      int lambda = -1;
+      for (int b = a; r >= 0 && r != nt->root_id && b >= 0; b = parent[b]) {
+        NodeKind k = nt_kind(nt, b);
+        if (k == NK_DefNode || k == NK_LambdaNode) r = -1;
+        else if (lambda < 0 && prog_lambda_block(c, parent, b)) lambda = b;
+      }
+      if (r < 0 || r == nt->root_id) continue;
+      if (lambda < 0) prog_refuse_block_return(c, id);
+      for (int b = a; b != lambda; b = parent[b])
+        if (nt_kind(nt, b) == NK_BlockNode) {
+          nt_node_set_int((NodeTable *)nt, b, "graph_lambda_return", id + 1);
+          c->graph_lambda_nested_returns = 1;
+        }
     }
   }
-  for (int i = 1; i < nt_nroots(nt); i++) {
-    int st = prog_root_stmts(c, i), n = 0;
-    const int *v = st >= 0 ? nt_arr(nt, st, "body", &n) : NULL;
-    for (int k = 0; k < n; k++)
-      if ((nt_kind(nt, v[k]) == NK_ClassNode || nt_kind(nt, v[k]) == NK_ModuleNode) &&
-          is_class_const(nt, nt_ref(nt, v[k], "constant_path")))
-        unsupported_feature(c, v[k], "--load-model=graph: `class Class` in a required file (desugar_class_reopen reads one file), for now");
-  }
   free(parent);
+}
+
+/* A nested block may be emitted as its own callable, with no return path
+   to the lambda's activation. The inline iterator arms below keep the
+   return in the lambda when the settled call target does not lift it. */
+static int prog_lambda_block_inline(Compiler *c, int call, int block) {
+  const NodeTable *nt = c->nt;
+  if (call < 0 || nt_kind(nt, call) != NK_CallNode || nt_ref(nt, call, "block") != block ||
+      nt_ref(nt, call, "arguments") >= 0 || nt_int(nt, call, "blk_kept", 0)) return 0;
+  int recv = nt_ref(nt, call, "receiver");
+  if (recv < 0) return 0;
+  const char *name = nt_str(nt, call, "name");
+  TyKind rt = infer_type(c, recv);
+  int array = ty_is_array(rt) || ty_is_obj_array(rt);
+  int inlined = is_each_name(name) ? array || ty_is_hash(rt) || rt == TY_RANGE
+                                  : array && (is_map_alias(name) || is_tap_name(name));
+  return inlined && !a_block_is_lifted(c, call);
+}
+
+void prog_refuse_nested_lambda_returns(Compiler *c) {
+  if (!c->graph_lambda_nested_returns) return;
+  const NodeTable *nt = c->nt;
+  const int *parent = comp_parent_map(c);
+  NT_FOREACH_KIND(nt, NK_BlockNode, b) {
+    int ret = nt_int(nt, b, "graph_lambda_return", 0) - 1;
+    if (ret >= 0 && prog_root_of(c, parent, b) >= 0 && !prog_lambda_block_inline(c, parent[b], b))
+      prog_refuse_block_return(c, ret);
+  }
 }
 
 /* What each file the entry reaches is loaded by, once the folds have run
@@ -880,9 +921,8 @@ void prog_refuse_loads(Compiler *c) {
      fold of a constant condition (RUBY_VERSION, the engine checks) leaves a
      `require` in the branch it decided dead under no root's tree, and a file
      only such requires name, or only the requires of a file so dropped, is
-     never loaded. The inline model splices a file at its require, so a dead
-     branch takes the file along; here the file's statements are taken out
-     of the tree, and nothing registers its classes, methods and constants
+     never loaded: the file's statements are taken out of the tree, and
+     nothing registers its classes, methods and constants
      (ruby_version_fold's `const_defined?`). A file named by an autoload has
      no LoadNode: it is refused (prog_refuse_loads) until its own step. One a
      computed require's closed set names is reached by that LoadNode
@@ -898,20 +938,53 @@ void prog_refuse_loads(Compiler *c) {
      a class body, an iterator's block, an assignment's value), is placed at
      that require: `load_by` the LoadNode, `load_stmt` the top-level
      statement holding it. The record enters it there, with the require's
-     may, as the inline model splices it. Any other file keeps a region of
-     its own.
+     may. So is one whose other requires
+     are each a top-level `require` statement of the order that runs after
+     the statement holding that one, which surely runs (ELAB_SITE_SURE):
+     the file is loaded by then, and those requires load nothing (a file
+     a class body requires that a later top-level statement requires
+     again). Any other file keeps a region of its own.
    Asked after the folds, ahead of the readers of the program's order. */
-typedef struct { Compiler *c; int stmt, n, open; int *nsite, *site, *at; unsigned char *ok; } ProgSites;
+typedef struct {
+  Compiler *c; int stmt, n, open; int *nsite, *site, *at; unsigned char *ok;
+  /* the requires that are no top-level `require` statement (nest), and the ones that are (top: file, LoadNode) */
+  int *nnest, *nest_site, *nest_at; unsigned char *nest_sure, *spoil;
+  int *top_file, *top_load, ntop, captop;
+  /* every nested require, with the top-level statement holding it (file, statement) */
+  int *nf_file, *nf_at, nnf, capnf;
+} ProgSites;
 static void prog_site_note(void *ud, int load, int in_place) {
   ProgSites *q = ud;
-  for (int k = 0; k < prog_load_ncand(q->c->nt, load); k++) {   /* a set's files: no one site places them */
-    int t = prog_load_cand(q->c->nt, load, k);
-    if (t > 0 && t < q->n) { q->nsite[t]++; q->ok[t] = 0; }
+  const NodeTable *nt = q->c->nt;
+  for (int k = 0; k < prog_load_ncand(nt, load); k++) {   /* a set's files: no one site places them */
+    int t = prog_load_cand(nt, load, k);
+    if (t > 0 && t < q->n) { q->nsite[t]++; q->ok[t] = 0; q->spoil[t] = 1; }
   }
-  q->open |= prog_load_open(q->c->nt, load);
-  int t = (int)nt_int(q->c->nt, load, "target_file", -1);
+  q->open |= prog_load_open(nt, load);
+  int t = (int)nt_int(nt, load, "target_file", -1);
   if (t <= 0 || t >= q->n) return;
-  q->nsite[t]++; q->site[t] = load; q->at[t] = q->stmt; q->ok[t] = (unsigned char)(in_place);
+  q->nsite[t]++; q->site[t] = load; q->at[t] = q->stmt; q->ok[t] = (unsigned char)(in_place & 1);
+  /* (not a `load`, which runs its file again) */
+  const char *m = nt_str(nt, load, "method");
+  if (load == q->stmt && m && (sp_streq(m, "require") || sp_streq(m, "require_relative"))) {
+    if (q->ntop == q->captop) {
+      q->captop = q->captop ? q->captop * 2 : 8;
+      q->top_file = realloc(q->top_file, sizeof(int) * (size_t)q->captop);
+      q->top_load = realloc(q->top_load, sizeof(int) * (size_t)q->captop);
+      if (!q->top_file || !q->top_load) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    }
+    q->top_file[q->ntop] = t; q->top_load[q->ntop++] = load;
+    return;
+  }
+  q->nnest[t]++; q->nest_site[t] = load; q->nest_at[t] = q->stmt;
+  q->nest_sure[t] = (unsigned char)((in_place & 1) && (in_place & ELAB_SITE_SURE));
+  if (q->nnf == q->capnf) {
+    q->capnf = q->capnf ? q->capnf * 2 : 8;
+    q->nf_file = realloc(q->nf_file, sizeof(int) * (size_t)q->capnf);
+    q->nf_at = realloc(q->nf_at, sizeof(int) * (size_t)q->capnf);
+    if (!q->nf_file || !q->nf_at) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  q->nf_file[q->nnf] = t; q->nf_at[q->nnf++] = q->stmt;
 }
 /* The top-level statement of a file that holds node id, or -1. */
 static int prog_top_stmt_of(const Compiler *c, const int *parent, int id) {
@@ -1371,16 +1444,14 @@ static void prog_rescue_mark_in(LoadSrc *s, int load, int n) {
    raise counted as run (not told apart). Otherwise it is the first that
    is not quiet (prog_stmt_quiet). That first one starts for sure (a
    call's own effect, an undef's, taken as run), and the statement lists
-   it runs are marked so in turn (prog_rescue_mark). These are asked in
-   both load models,
-   rescue_runs only in the graph one, which keeps the requires.
+   it runs are marked so in turn (prog_rescue_mark).
    Asked ahead of the reach (prog_reach), which reads it. */
 static void prog_note_rescues(Compiler *c) {
   NodeTable *nt = (NodeTable *)c->nt;
   int nrc = 0;
   (void)nt_nodes_of_kind(nt, NK_RescueNode, &nrc);
   if (!nrc) return;
-  int byval = elab_consts_by_value(c, 0), graph = prog_graph(c);
+  int byval = elab_consts_by_value(c, 0);
   const int *parent = comp_parent_map(c);
   int hooks = prog_may_give_hook(c);
   unsigned char *retry = calloc((size_t)nt->count + 1, 1);
@@ -1412,7 +1483,7 @@ static void prog_note_rescues(Compiler *c) {
     int rc0 = nt_ref(nt, b, "rescue_clause");
     for (int rc = rc0, first = 1; rc >= 0; rc = nt_ref(nt, rc, "subsequent"), first = 0) {
       load &= prog_rescue_load_only(c, parent, rc);
-      if (byval || !graph) continue;
+      if (byval) continue;
       int names = prog_rescue_names(c, parent, rc);
       int runs = first && raises && (names & PROG_RC_LOAD) && !retry[rc] ? 1 : quiet && (names & PROG_RC_SCRIPT) ? 0 : -1;
       if (runs >= 0) nt_node_set_int(nt, rc, "rescue_runs", runs);
@@ -1441,7 +1512,7 @@ static void prog_warn_missing(Compiler *c, const unsigned char *seen) {
     int r = prog_root_of(c, parent, id);
     const char *file = r >= 0 ? nt_str(nt, r, "file_path") : nt_file_path(nt, (int)nt_int(nt, id, "node_file", 0));
     /* --strict-require (spin build): a require no file answers is a
-       compile-time refusal, as the inline model's resolve makes it */
+       compile-time refusal */
     if (g_strict_require) {
       fprintf(stderr, "spinel: %s:%lld: cannot load such file -- %s (%s \"%s\")\n",
               file ? file : "-", nt_int(nt, id, "node_line", 0), nt_str(nt, id, "path"), nt_str(nt, id, "method"),
@@ -1461,7 +1532,42 @@ static void prog_warn_missing(Compiler *c, const unsigned char *seen) {
    its own). A placed file whose require is no longer in the order, since
    its file lost its place, has none either. (A window that tells when a
    method can first be called would tighten this: the statement holding the
-   require is the earliest it can run.) */
+   require is the earliest it can run.) A require in a file with no place
+   runs no earlier than the first statement of the order that may load that
+   file (prog_file_earliest). */
+/* The earliest position in the order (pos) at which file f's top level can
+   begin: the least of the statements holding the requires that may load it,
+   a require in a file with no place counting from that file's own earliest
+   in turn. A requirer the walk is already asking about (a cycle of
+   requires) adds no way in. -1 when no bound is known: an autoload, a
+   require no statement holds, or a file nothing loads. */
+static int prog_file_earliest(Compiler *c, const int *parent, const int *pos, const unsigned char *seen,
+                              int f, int *asking, int depth) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  enum { DEPTH = 32 };
+  if (f <= 0 || depth >= DEPTH) return -1;
+  for (int k = 0; k < c->nautoloads; k++)
+    if (c->autoloads[k].file == f && seen[c->autoloads[k].node]) return -1;
+  asking[depth] = f;
+  int best = -1, any = 0;
+  NT_FOREACH_KIND(nt, NK_LoadNode, id) {
+    if (!seen[id]) continue;
+    int may = (int)nt_int(nt, id, "target_file", -1) == f || prog_load_open(nt, id);
+    for (int k = 0, nc = prog_load_ncand(nt, id); k < nc && !may; k++) may = prog_load_cand(nt, id, k) == f;
+    if (!may) continue;
+    int from = prog_graph_file_of(nt, id);
+    int cyc = 0;
+    for (int k = 0; k <= depth && !cyc; k++) cyc = asking[k] == from;
+    if (cyc) continue;
+    int ts = prog_top_stmt_of(c, parent, id), at = ts >= 0 ? pos[ts] : -1;
+    if (at < 0) at = prog_file_earliest(c, parent, pos, seen, from, asking, depth + 1);
+    if (at < 0) return -1;
+    if (!any || at < best) best = at;
+    any = 1;
+  }
+  return any ? best : -1;
+}
+
 static void prog_unplace_candidates(Compiler *c, const unsigned char *seen, const unsigned char *live) {
   NodeTable *nt = (NodeTable *)c->nt;
   int n = nt_nroots(nt);
@@ -1481,6 +1587,10 @@ static void prog_unplace_candidates(Compiler *c, const unsigned char *seen, cons
       int nc = prog_load_ncand(nt, id), open = prog_load_open(nt, id);
       if (!seen[id] || (!nc && !open)) continue;
       int ts = prog_top_stmt_of(c, parent, id), sp = ts >= 0 ? pos[ts] : -1;
+      if (sp < 0) {
+        int asking[32];
+        sp = prog_file_earliest(c, parent, pos, seen, prog_graph_file_of(nt, id), asking, 0);
+      }
       for (int k = 0; k < (open ? n - 1 : nc); k++) {
         int f = open ? k + 1 : prog_load_cand(nt, id, k), l = f > 0 && f < n && (open ? live[f] : 1) ? prog_load_by(c, f) : -1;
         if (l >= 0 && (sp < 0 || pos[l] > sp)) { nt_node_set_int(nt, nt_root(nt, f), "load_by", -1); again = 1; }
@@ -1493,26 +1603,28 @@ static void prog_unplace_candidates(Compiler *c, const unsigned char *seen, cons
 /* See analyze.h. */
 int prog_node_in_dropped_file(Compiler *c, int node) {
   const NodeTable *nt = c->nt;
-  if (node < 0 || !prog_graph(c)) return 0;
-  long long fid = nt_int(nt, node, "node_file", -1);
+  if (node < 0) return 0;
+  long long fid = prog_node_src_file(nt, node);
   if (fid < 0) return 0;
   for (int f = 1; f < nt_nroots(nt); f++)
-    if (nt_int(nt, nt_root(nt, f), "node_file", -2) == fid) return nt_int(nt, nt_root(nt, f), "file_dropped", 0) != 0;
+    if (prog_node_src_file(nt, nt_root(nt, f)) == fid) return nt_int(nt, nt_root(nt, f), "file_dropped", 0) != 0;
   return 0;
 }
 
 void prog_settle_files(Compiler *c) {
   NodeTable *nt = (NodeTable *)c->nt;
   int n = nt_nroots(nt);
-  prog_note_rescues(c);   /* (both models: a rescued body's sure statements) */
-  if (!prog_graph(c)) return;
+  prog_note_rescues(c);
   unsigned char *seen = calloc((size_t)nt->count + 1, 1), *live = calloc((size_t)n, 1), *ok = calloc((size_t)n, 1);
   int *nsite = calloc((size_t)n, sizeof(int)), *site = calloc((size_t)n, sizeof(int)), *at = calloc((size_t)n, sizeof(int));
   if (!seen || !live || !ok || !nsite || !site || !at) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   prog_reach(c, seen, live);
   prog_warn_missing(c, seen);
   if (n < 2) { free(seen); free(live); free(ok); free(nsite); free(site); free(at); return; }
-  ProgSites q = { c, -1, n, 0, nsite, site, at, ok };
+  int *nnest = calloc((size_t)n, sizeof(int)), *nest_site = calloc((size_t)n, sizeof(int)), *nest_at = calloc((size_t)n, sizeof(int));
+  unsigned char *nest_sure = calloc((size_t)n, 1), *spoil = calloc((size_t)n, 1);
+  if (!nnest || !nest_site || !nest_at || !nest_sure || !spoil) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  ProgSites q = { c, -1, n, 0, nsite, site, at, ok, nnest, nest_site, nest_at, nest_sure, spoil, NULL, NULL, 0, 0, NULL, NULL, 0, 0 };
   for (int f = 0; f < n; f++) {
     int st = prog_root_stmts(c, f), m = 0;
     const int *v = st >= 0 && live[f] ? nt_arr(nt, st, "body", &m) : NULL;
@@ -1520,10 +1632,17 @@ void prog_settle_files(Compiler *c) {
   }
   for (int k = 0; k < c->nautoloads; k++) {
     const AutoloadRegistration *a = &c->autoloads[k];
-    if (seen[a->node] && a->file > 0 && a->file < n) { nsite[a->file]++; ok[a->file] = 0; }
+    if (seen[a->node] && a->file > 0 && a->file < n) { nsite[a->file]++; ok[a->file] = 0; spoil[a->file] = 1; }
   }
   if (q.open) memset(ok, 0, (size_t)n);   /* an open require may run any file first */
   prog_unplace_candidates(c, seen, live);
+  int sn = 0, *seq = q.ntop ? prog_top_seq(c, &sn, NULL) : NULL, *pos = NULL;
+  if (seq) {
+    pos = malloc(sizeof(int) * ((size_t)nt->count + 1));
+    if (!pos) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+    for (int i = 0; i < nt->count; i++) pos[i] = -1;
+    for (int k = 0; k < sn; k++) pos[seq[k]] = k;
+  }
   for (int f = 1; f < n; f++) {
     int st = live[f] ? -1 : prog_root_stmts(c, f);
     if (st >= 0) { nt_node_set_arr(nt, st, "body", NULL, 0); nt_node_set_int(nt, nt_root(nt, f), "file_dropped", 1); }
@@ -1531,7 +1650,56 @@ void prog_settle_files(Compiler *c) {
       nt_node_set_int(nt, nt_root(nt, f), "load_by", site[f]);
       nt_node_set_int(nt, nt_root(nt, f), "load_stmt", at[f]);
     }
+    else if (live[f] && pos && prog_load_by(c, f) < 0 && !q.open && !spoil[f] && nnest[f] == 1 && nest_sure[f] &&
+             pos[nest_at[f]] >= 0) {
+      int after = 1;
+      for (int k = 0; k < q.ntop && after; k++)
+        if (q.top_file[k] == f) after = pos[q.top_load[k]] > pos[nest_at[f]];
+      if (after) {
+        nt_node_set_int(nt, nt_root(nt, f), "load_by", nest_site[f]);
+        nt_node_set_int(nt, nt_root(nt, f), "load_stmt", nest_at[f]);
+      }
+    }
   }
+  if (pos) {   /* the files the passes above placed: their statements join the order */
+    free(seq); seq = prog_top_seq(c, &sn, NULL);
+    for (int i = 0; i < nt->count; i++) pos[i] = -1;
+    for (int k = 0; k < sn; k++) pos[seq[k]] = k;
+  }
+  /* A file that several requires name, each a top-level `require`
+     statement or one nested in a statement that runs after the first of
+     those: the first loads it and the others load nothing, as CRuby runs
+     them, so it is placed at that first one -- once every one of them is
+     in the order (`pos`: a statement of a placed file). Placing a file puts
+     its statements in the order, so the files settle in rounds (the
+     program and a package it requires both require another package). */
+  for (int round = 0, again = pos && !q.open; again && round < n; round++) {
+    again = 0;
+    for (int f = 1; f < n; f++) {
+      if (!live[f] || prog_load_by(c, f) >= 0 || spoil[f] || nsite[f] < 2) continue;
+      int first = -1, firstpos = -1, all = 1;
+      for (int k = 0; k < q.ntop && all; k++) {
+        if (q.top_file[k] != f) continue;
+        int p = pos[q.top_load[k]];
+        if (p < 0) all = 0;
+        else if (first < 0 || p < firstpos) { first = q.top_load[k]; firstpos = p; }
+      }
+      for (int k = 0; k < q.nnf && all; k++)
+        if (q.nf_file[k] == f && (first < 0 || pos[q.nf_at[k]] <= firstpos)) all = 0;   /* may run it first */
+      if (!all || first < 0) continue;
+      nt_node_set_int(nt, nt_root(nt, f), "load_by", first);
+      nt_node_set_int(nt, nt_root(nt, f), "load_stmt", first);
+      again = 1;
+    }
+    if (again) {   /* the placed files' statements join the order */
+      free(seq); seq = prog_top_seq(c, &sn, NULL);
+      for (int i = 0; i < nt->count; i++) pos[i] = -1;
+      for (int k = 0; k < sn; k++) pos[seq[k]] = k;
+    }
+  }
+  free(seq); free(pos);
+  free(nnest); free(nest_site); free(nest_at); free(nest_sure); free(spoil); free(q.top_file); free(q.top_load);
+  free(q.nf_file); free(q.nf_at);
   unsigned char *state = calloc((size_t)n, 1);
   if (!state) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
   for (int f = 1; f < n; f++) prog_stamp_deferred(c, f, state);
@@ -1545,14 +1713,13 @@ void prog_settle_files(Compiler *c) {
    `include` in a required file's top level. */
 void prog_refuse_order(Compiler *c) {
   const NodeTable *nt = c->nt;
-  if (!prog_graph(c)) return;
   for (int i = 0; i < nt_nroots(nt); i++) {
     int st = prog_root_stmts(c, i), n = 0;
     const int *v = st >= 0 ? nt_arr(nt, st, "body", &n) : NULL;
     for (int k = 0; k < n; k++) {
       int prep; const int *av;
       if (i > 0 && mixin_stmt_args(nt, v[k], &prep, &av) >= 0 && !prep)
-        unsupported_feature(c, v[k], "--load-model=graph: a top-level include in a required file, for now");
+        unsupported_feature(c, v[k], "load model: a top-level include in a required file, for now");
     }
   }
 }

@@ -43,23 +43,6 @@ TyKind ffi_spec_to_ty(const char *spec);
 int ffi_find_func(Compiler *c, const char *mod, const char *name);
 /* `Fiber.new { }`'s block, or -1 */
 int an_fiber_new_block(Compiler *c, int v);
-/* --share-strings: can boxed or untyped receiver r be a String
-   (analyze.c)? `lits` is the asker's: bound() says how a literal block or
-   a lambda of scope `scope` binds variable `name`: 0 not at all, 1 only as
-   Enumerator.new's yielder, 2 another way (analyze_share.c keeps it).
-   ivar(), when set, says whether instance variable `name` (with its `@`)
-   may hold a String, by everything that writes one of that name; the
-   receiver an ivar's read or an attribute reader's call is answers by
-   it. */
-typedef struct PolyLits {
-  int (*bound)(void *ctx, Compiler *c, int scope, const char *name);
-  void *ctx;
-  int (*ivar)(void *ctx, Compiler *c, const char *name);
-} PolyLits;
-int an_recv_may_be_string(Compiler *c, int r, const PolyLits *lits);
-/* Can value v be a String, as an_recv_may_be_string reads a variable's
-   written value (by its type, or its form with `lits`)? */
-int an_value_may_be_string(Compiler *c, int v, const PolyLits *lits);
 int ffi_find_buf(Compiler *c, const char *mod, const char *name);
 int ffi_find_reader(Compiler *c, const char *mod, const char *name);
 int ffi_find_writer(Compiler *c, const char *mod, const char *name);
@@ -187,8 +170,6 @@ int object_instance_method_name(const char *n);        /* analyze_desugar.c: one
 int class_inherits_builtin_exception(Compiler *c, int ci);
 /* 1 if super node n, in instance method mi `inspect` / `to_s` of a plain
    class, reaches Kernel's, which builds a new String each call. */
-int an_super_object_text(Compiler *c, int n, int mi);
-int an_super_struct_text(Compiler *c, int n, int mi);
 int an_user_defines_or_reads(Compiler *c, const char *name);
 /* Defined in codegen_util.c: does a value of builtin type t answer `is_a?(cn)` (1), not (0), or
    only at run time (-1); exact is the instance_of? form. Reached by name, as codegen_internal.h is
@@ -262,6 +243,7 @@ int an_local_writes_named_next(int id);
 int *an_scope_call_candidates(Compiler *c, Scope *m, int *n);
 int is_arith_op(const char *op);
 int node_is_empty_container(Compiler *c, int node);
+int empty_container_copy_recv(Compiler *c, int node, int *frozen_out);
 int nt_self_singleton_class(const NodeTable *nt, int recv);
 int bind_coerce_operator_params(Compiler *c);
 int is_cmp_op(const char *op);
@@ -524,6 +506,7 @@ void elab_header_opened(Compiler *c, int node, int cls, int made);
 int elab_rec_open(Compiler *c, int node, int cp, const char *cname, const char *rname, int encl);
 void elab_prov_apply(Compiler *c);
 void header_parent_encloses(Compiler *c, int par, int child, const char *leaf, int named);
+enum { ELAB_SITE_SURE = 2 };
 void elab_load_sites(Compiler *c, int stmt, void (*fn)(void *ud, int load, int in_place), void *ud);
 void walk_scope_stmt(Compiler *c, int stmt, int k, int scope_idx, ElabPos pos);
 int scope_own_defaults(Compiler *c, int di);
@@ -540,6 +523,8 @@ void register_structs(Compiler *c);
 void register_singleton_defs(Compiler *c);
 void register_attr_versions(Compiler *c);
 void register_attrs(Compiler *c);
+void register_sg_civ_after_extends(Compiler *c);
+void register_builtin_bare_new(Compiler *c);
 void register_aliases(Compiler *c);
 void register_alias_methods(Compiler *c, int modules);   /* analyze_scope.c */
 void scope_copy_method_shape(Scope *dst, Scope *src);    /* analyze_scope.c */
@@ -559,6 +544,8 @@ int infer_multiwrite_const_types(Compiler *c);
 int masgn_tuple_rhs(const NodeTable *nt, int value);
 int multi_return_elem_types(Compiler *c, int value, TyKind *out, int max);
 int multi_return_elem_nodes(Compiler *c, int value, const int **elems);
+int scope_tuple_elem_nodes(Compiler *c, int mi, const int **elems);   /* analyze_pass.c: the same for a method scope */
+int method_overridden_below(Compiler *c, int site, int cid, const char *name, int mi);   /* analyze_pass.c: a descendant answers `name` with another method */
 void resolve_parents(Compiler *c);
 void resolve_inherited_aliases(Compiler *c);
 void settle_object_builtin_aliases(Compiler *c);
@@ -591,6 +578,10 @@ void class_unpin_ivar(ClassInfo *ci, const char *name);
 int class_ivar_pin_holds(ClassInfo *ci, const char *name, TyKind vt);
 int param_seed_holds(LocalVar *lv, TyKind at);
 int ret_seed_holds(Scope *s, TyKind r);
+/* A version a later definition replaces, which a version entry may still run, whose
+   body answers, at any value it can return, a type its return seed cannot hold: the seed is dropped there.
+   The signature describes the method its class ends with. */
+int replaced_ret_seed_gives_way(Compiler *c, int si);
 void sp_narrow_memo_bump(void);
 int infer_write_types(Compiler *c);
 void seed_unsupplied_nil_defaults(Compiler *c);
@@ -635,7 +626,6 @@ int arm_arg_param(Compiler *c, Scope *m);                        /* codegen_fold
 int arg_layout_param_node(Compiler *c, Scope *m, int call, int i, int *spread); /* codegen_fold.c */
 void arg_layout_param_map(Compiler *c, Scope *m, const int *argv, int argc, int *out); /* codegen_fold.c */
 void arg_layout_call_param_map(Compiler *c, Scope *m, int call, int n, int *out, int *spread); /* codegen_fold.c */
-int arg_layout_param_source(Compiler *c, Scope *m, int call, int i, int *spread);
 int zsuper_param_source(Compiler *c, Scope *s, Scope *pm, int j);         /* codegen_fold.c */
 int ty_runs_no_code(TyKind t);  /* codegen_call.c: a builtin reading such a value runs no program code */
 int refl_member_of_struct_superclass(Compiler *c, int ci, const char *m);  /* codegen_call.c */
@@ -666,12 +656,22 @@ int capture_cells_shape(const NodeTable *nt, int id);
    2 for `C.instance_methods(false)` and its public_, private_ and protected_ forms, its own instance
    methods'; 0 for any other */
 int list_cells_shape(const NodeTable *nt, int id);
+/* ...and is call id a list of a whole chain's methods, of one the plan may read the cells of (cplan_list_cells):
+   `x.methods`, `x.public_methods`, `K.instance_methods` and the like with no argument or `true` (an object's list
+   also with a flag the run decides), and no block; 0 for any other (its own methods' form, `(false)`, reads the
+   tables) */
+int list_chain_shape(const NodeTable *nt, int id);
+/* ...and `x.public_methods(false)`, an object's list of its class's own public methods (the plan reads their cells as
+   it reads a chain's) */
+int list_own_object_shape(const NodeTable *nt, int id);
 /* May a respond_to? answer for a name other than by the methods: the program
    defines respond_to_missing?. The cells answer no respond_to? then. */
 int respond_to_missing_defined(Compiler *c);
 int exc_has_nonstring_msg_override(Compiler *c);                 /* codegen_util.c */
 int interp_is_literal_fold(const NodeTable *nt, int id);         /* codegen_expr.c */
 int is_fresh_array(Compiler *c, int v);                          /* analyze_pass.c */
+int an_is_fresh_hash_value(Compiler *c, int node);               /* analyze_pass.c */
+int an_is_fresh_array_value(Compiler *c, int node);              /* analyze_pass.c */
 int ivar_assigned_in_initialize(Compiler *c, int k, const char *ivn);  /* analyze.c */
 int json_parse_ostruct_opts(Compiler *c, int kwh);               /* codegen_call_class.c */
 int kwh_lookup(const NodeTable *nt, int kwh, const char *kname); /* codegen_fold.c */
@@ -897,16 +897,16 @@ int ct_in_walk_loop_block(const NodeTable *nt, const int *parent, int call);   /
 enum {
   LW_NIL_BLOCK_ARG, LW_CONST_SET_WRITE, LW_THREAD_START, LW_MARSHAL_RESTORE, LW_SOCKET_OPEN, LW_SYSTEM_OPTIONS, LW_IO_POPEN_BLOCK,
   LW_USER_BACKTICK, LW_LITERAL_UNDEF_METHOD, LW_EXPLICIT_INITIALIZE_CALLS, LW_NOARG_DISPLAY_WRAPPERS, LW_BIND_ATTR_HELPERS,
-  LW_PAREN_BLOCK_ARG, LW_PAREN_OPERANDS, LW_SEND_CLASS_MAKERS, LW_BODY_SEND_DECL, LW_BODY_CLASS_EXEC_ARGS, LW_SELF_SUPERCLASS, LW_STRUCT_SUBCLASS_NEW_WRITE,
+  LW_PAREN_BLOCK_ARG, LW_PAREN_OPERANDS, LW_SEND_CLASS_MAKERS, LW_BODY_SEND_DECL, LW_BODY_CLASS_EXEC_ARGS, LW_BUILTIN_REOPEN_SELF_CALLS, LW_BUILTIN_IVARS, LW_SELF_SUPERCLASS, LW_STRUCT_SUBCLASS_NEW_WRITE,
   LW_REFUSE_SUPERCLASS_EXPRS, LW_RESCUE_BLOCK_BODIES, LW_BIND_MEMBER_HELPERS,
   LW_MARK_SYM_PROC_BLOCKS, LW_BUILDER_BLOCK_PARAM, LW_BODY_LOCAL_SCOPES, LW_ERRNO_ALIASES, LW_PAREN_DEF_BODY, LW_MARK_MATCH_RANGES,
   LW_MARK_RANGE_LOCALS, LW_DUPLICATE_UNDERSCORE_PARAMS, LW_ENCODING_QUERIES, LW_ALIAS_METHOD_STRING_NAMES,
   LW_ALIAS_METHOD_VALUES, LW_BODY_INHERITED_ALIAS, LW_REASSIGNED_BLOCK_PARAMS, LW_BODY_SINGLETON_CLASS_META, LW_CLASS_BODY_VALUES,
   LW_ITSELF_RECEIVER, LW_TAP_VALUE_WRITE, LW_BODY_SELF_IVAR_ACCESS, LW_CONST_IVAR_CALL, LW_BLK_PARAM_WRITES, LW_REST_PARAM_WRITES, LW_YIELD_IN_CLOSURE,
-  LW_SAFE_NAV_ATTR_WRITE, LW_CONST_ATTR_OP_ASSIGN, LW_STORED_ENUM_EACH, LW_SCOPE_NUMBERED_BLOCK_PARAMS,
+  LW_SAFE_NAV_ATTR_WRITE, LW_CONST_ATTR_OP_ASSIGN, LW_STORED_ENUM_EACH,
   LW_SINGLETON_CLASS_DEFINE_METHOD, LW_EMPTY_HASH_COMPARE_BY_IDENTITY, LW_DEFINE_METHOD_PROC_ARG,
-  LW_DEFINE_METHOD_CAPTURES, LW_DEFINE_METHOD_KEYWORDS, LW_NAME_ANON_BLOCK_KWREST, LW_RENAME_SHADOWING_BLOCK_PARAMS,
-  LW_SYM_TO_PROC_CALL, LW_ENUM_CHAIN_SHAPES, LW_BUILTIN_KWSPLAT, LW_RIGHTWARD_PATTERN, LW_MATCH_PREDICATE,
+  LW_DEFINE_METHOD_CAPTURES, LW_DEFINE_METHOD_KEYWORDS, LW_NAME_ANON_BLOCK_KWREST,
+  LW_SYM_TO_PROC_CALL, LW_SYM_TO_PROC_LAMBDA, LW_ENUM_CHAIN_SHAPES, LW_BUILTIN_KWSPLAT, LW_RIGHTWARD_PATTERN, LW_MATCH_PREDICATE,
   LW_SORT_BY_WITH_INDEX, LW_FORWARDING_TO_REST_CALLEE, LW_ANON_BLOCK_PARAM, LW_BLOCK_IMPLICIT_REST,
   LW_MULTI_VALUE_JUMP, LW_BLOCK_DESTRUCTURE_PARAMS, LW_FOR_NONLOCAL_INDEX, LW_ENUM_FOR_WITH_ARGS,
   LW_ENUMERATOR_PRODUCE, LW_PARAM_DEFAULT_ASSIGNS_LOCAL, LW_RECURSIVE_PARAM_DEFAULTS,
@@ -924,9 +924,6 @@ typedef struct LowerCtx {
   int scope_n;
   /* scratch of the running row, zero at each run */
   int serial;               /* the fresh-name counter of a run */
-  char **used;              /* names the program wrote that a row's invented ones must step past */
-  int nused;
-  int used_built;
   int *ids;                 /* node ids a row's gate collected for its visits */
   int nids;
   const char **aliases;     /* recursive_param_defaults: the program's alias pairs, new name then old */
@@ -949,7 +946,6 @@ typedef struct LowerCtx {
   int span_now;             /* ... and they are the walk's, lowered one splice at a time as it makes them */
   int *later, nlater, clater;   /* span_now: (row, owner) pairs, a row that visits the body's owner, which
                                    lower_settle visits once for all the spans of that body */
-  struct BlkpStep *blkp;    /* rename_shadowing_block_params' span form: the program's names, kept for the step */
 } LowerCtx;
 
 typedef int LowerFn(Compiler *c, LowerCtx *lc, int id);
@@ -965,7 +961,6 @@ int lower_run(Compiler *c, LowerCtx *lc, int row);   /* the nodes it rewrote */
 int lower_row_once(Compiler *c, int row);   /* a row on a context of its own, for a pass the fixpoint repeats */
 int lower_span(Compiler *c, LowerCtx *lc, int owner, int body, const int *stmts, const int *scopes, int n);   /* the rows that ran, on spliced statements */
 int *lower_span_ids(const LowerCtx *lc, int *n);   /* the span's nodes and the ones rows appended for it, ascending; the caller frees */
-void blkp_step_free(struct BlkpStep *st);   /* analyze.c */
 void lower_settle(Compiler *c, LowerCtx *lc);   /* the rows spans left to the program, once per step */
 
 /* ---- the host (analyze_elab.c, #9898) ----
@@ -1024,14 +1019,14 @@ LowerFn desugar_itself_receiver_at, desugar_itself_receiver_left;
 LowerGate desugar_const_set_write_gate;
 LowerFn desugar_body_send_decl_at, desugar_body_send_decl_left;
 LowerFn desugar_body_class_exec_args_at, desugar_body_class_exec_args_left;
+LowerFn desugar_builtin_reopen_self_calls_at, desugar_builtin_ivars_at;
 LowerFn desugar_body_self_ivar_access_at, desugar_body_singleton_class_meta_at, desugar_body_inherited_alias_at, desugar_const_ivar_call_at;
 LowerFn desugar_const_set_write_at, desugar_const_set_write_left;
 LowerFn desugar_struct_subclass_new_write_at, desugar_struct_subclass_new_write_left;
-LowerFn refuse_superclass_exprs_at, desugar_sym_to_proc_call_at, desugar_builtin_kwsplat_at;
+LowerFn refuse_superclass_exprs_at, desugar_sym_to_proc_call_at, desugar_sym_to_proc_lambda_at, desugar_builtin_kwsplat_at;
 LowerGate desugar_user_backtick_gate;
 LowerFn desugar_user_backtick_at;                                            /* analyze.c */
-LowerFn desugar_explicit_initialize_calls_at, scope_numbered_block_params_at, rename_shadowing_block_params_at,
-  rename_shadowing_block_params_span;
+LowerFn desugar_explicit_initialize_calls_at;
 LowerFn desugar_body_local_scopes_at, desugar_define_method_captures_at;     /* analyze_desugar.c */
 LowerFn desugar_builder_block_param_at, desugar_builder_block_param_left;   /* analyze_desugar.c */
 LowerFn desugar_forwarding_to_rest_callee_at, desugar_recursive_param_defaults_at;
@@ -1374,9 +1369,6 @@ int ie_own_class_of(Compiler *c, int node);
 int ie_pending_node(Compiler *c, int node);
 int blkp_params_node(Compiler *c, int create);
 int blkp_binds_param(Compiler *c, int create, const char *name);
-void blkp_rewrite_refs(Compiler *c, int node, const char *oldn, const char *newn);
-void numbered_rename_locals_str(NodeTable *nt, int L, const char *from, const char *to);
-void blkp_mark_subtree(const NodeTable *nt, int node, char *marks);
 void qc_collect_writes(Compiler *c, int node, char (*path)[64], int depth, QCWrite **ws, int *n, int *cap);
 int qc_read_chain(const NodeTable *nt, int node, char (*chain)[64], int *abs_anchor);
 void qc_qualified_name(char *out, size_t cap, const QCWrite *w);

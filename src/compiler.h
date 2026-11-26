@@ -315,6 +315,18 @@ typedef struct {
                        the key (value). Boxed when the callers disagree, so
                        the binding checks each call's argument j against the
                        container instead. */
+  unsigned long long store_push_src; /* (params, containers) the bits of
+                       store_val_src whose store lands in an Array: a push,
+                       unshift or insert, or an element write by an Integer
+                       key. A boxed argument's Arrays widen for each call's
+                       argument j (widen_boxed_arg_by_sources); a Hash's
+                       value does not reach them. */
+  unsigned long long store_splat_src; /* (params, arrays) bit j set: a push
+                       of the method's own parameter j splatted, or a concat
+                       of it, stores its ELEMENTS through this parameter,
+                       each one a value: the binding checks each call's
+                       argument j's elements as a splat's are
+                       (array_elems_foreign), a boxed one as it lands. */
   unsigned long long store_elems_src; /* (params, arrays) bit j set: a splice
                        through this parameter stores the ELEMENTS of the
                        method's own positional parameter j (`a[i, n] = src`),
@@ -598,6 +610,10 @@ typedef struct {
                                    (inc_super_behind), which a Method made
                                    of it does not hold: it holds what the
                                    super reaches */
+  unsigned char super_lowered;  /* a super of the method became the
+                                   builtin's own call on self
+                                   (lower_builtin_supers): it calls super
+                                   still, where no super node is left */
   unsigned char mixin_plain_late;   /* a plain copy an include or prepend
                                        that may not run made where its
                                        guard could not tell the copy's
@@ -768,10 +784,6 @@ typedef struct {
                            methods (`def pass(x) = x.p_`) and methods whose value
                            is their block's (`def key_of(x) = yield x`), which no
                            RBS signature covers (#3505). */
-  unsigned char ret_fresh; /* the same return-tail walk proves a new String
-                              (or nil) on every path; no incoming handle */
-  int ret_param;       /* --share-strings: every non-fresh return reads this
-                          unchanged parameter; -1 when no such proof */
   int ret_obj_may_nil; /* the nil fact for the method's value (analyze_nil.c,
                           #7444): its body's value or a `return` may be nil;
                           nonzero, where the nil comes from (NFW_*) */
@@ -1345,6 +1357,7 @@ typedef struct { int mi; short owner_ci; unsigned char via; } UCallInf;
 typedef struct {
   const NodeTable *nt;
   AutoloadRegistration *autoloads; int nautoloads, auto_nodes;
+  int graph_lambda_nested_returns;   /* a required file's lambda has a return in an inner block */
   int *auto_at; /* parsed node -> first registration + 1; names/paths borrowed from nt */
   SP_TY_FIELD TyKind *ntype;    /* [node_cap] node id -> inferred type */
   int *norigin;     /* [node_cap] node id -> where its degraded type came from: the
@@ -1436,6 +1449,13 @@ typedef struct {
                         (LocalVar.obj_elem_may_nil); read through repr_of's
                         elem_nil_marked */
   int nil_fact_n;
+  unsigned char *scope_may_raise; /* [scope_may_raise_n] 1 if scope may raise or
+                        non-locally unwind, 0 if provably nothrow (analyze_raise.c) */
+  int scope_may_raise_n;
+  unsigned char *node_elide_setjmp; /* [node_elide_setjmp_n] 1 if BeginNode /
+                        RescueModifierNode elides setjmp, or RescueNode belongs
+                        to an elided BeginNode (analyze_raise.c) */
+  int node_elide_setjmp_n;
   int *cls_fact;    /* [cls_fact_n] per node: the index in cls_pool of the
                        set of user classes its value can hold (analyze_cls.c,
                        #8530); 0 is every class. Read through cls_fact_node. */
@@ -1466,6 +1486,10 @@ typedef struct {
                           the method stores an element into that the array
                           cannot hold: codegen refuses it unless the binding
                           widened it */
+  char *box_lift_arr;   /* [node_cap] a new Array a builtin answers, held in a
+                          box a push of an element its kind cannot hold
+                          reaches (widen_boxed_array_sources): boxed as the
+                          general Array */
   char *ivar_widen_src; /* [node_cap] an ivar read, or a reader call, that a
                           caller's array comes from (through locals and method
                           values) when a parameter it reaches stores elements
@@ -1824,6 +1848,17 @@ typedef struct {
   /* respond_to_missing_defined's answer, 1 + it (0 unasked), and the state it read: the tree's (count, version,
      edits) and the class tables' comp_name_reader_any keys on */
   struct { int ans, count, ncls; unsigned version, tgen, shape; unsigned long edits; } rtm_memo;
+  /* fi_fiber_stack_risk's answer (codegen.c), 1 + it (0 unasked), and the
+     table/class state it read. */
+  struct { int ans, count, ncls, has_lrec; unsigned version, shape; unsigned long edits; } fiber_risk_memo;
+  /* per-scope cache for scope_has_return (analyze_util.c): 1 if scope `si`
+     holds an NK_ReturnNode, rebuilt from NK_ReturnNode ids when their
+     generation or the scope table changes. */
+  unsigned char *scope_ret_has;
+  int scope_ret_nscopes;
+  unsigned scope_ret_kgen;
+  unsigned scope_ret_sgen;
+  int scope_ret_built;
   /* the last eight method C names mc_method spelled, and the next to reuse:
      each grown to its name (mc_ring_setf), which no length bounds */
   char *mc_ring[8]; size_t mc_ring_cap[8]; int mc_ring_next;
@@ -1848,14 +1883,10 @@ typedef struct {
   /* the scope + 1 whose block a yield under emit_proc_yield hands its
      arguments to (a proc form, or a method with a `&blk` it calls), or 0 */
   int proc_arg_src;
-  struct ShareFacts *share;
+  int share_applied;   /* the share rule has run on this program's types (share_rule_begin) */
   /* the operand-order record (order_plan.c): per operand list, where each
      operand is evaluated; built by the analysis phase operand_order */
   struct OrderFacts *order;
-  /* --share-strings: the walk deciding the methods' answers while
-     an_mark_return_origins runs (analyze.c), else NULL: a method's answer
-     asked meanwhile is decided where it is asked (scope_ret_fresh, scope_ret_param) */
-  struct ReturnWalk *ret_walk;
   /* per class, whether its class object can be a value
      (comp_class_may_be_value), built for the node and class counts kept */
   unsigned char *cls_value;
@@ -1869,7 +1900,6 @@ typedef struct {
   unsigned char *bsl_val;
   int bsl_n, bsl_depth;
   unsigned bsl_cur;
-  struct HandleArgTab *share_args; /* final callers, while sealing share facts */
   struct SbArgIndex *sb_args; /* settled parameter sources, built once for storage */
   /* the names the program's global writes assign, as of the node table it
      was made for (analyze_infer.c, gvar_has_write; NULL before the first ask) */
@@ -1976,7 +2006,7 @@ typedef struct {
   /* the visibility cells a visibility word inside an expression writes as
      its own call runs (`c && public(:m, :n)`), one per cell, with the
      value (call_plan.c, ver_cells_put; cplan_vis_cell_after) */
-  struct VerVisAfter { int node, cell, v; } *ver_vis_after;
+  struct VerVisAfter { int node, cell, v, elem; } *ver_vis_after;
   int nver_vis_after;
   /* the visibility cells a call guard reads (CallPlan.vis_cell), one per call
      and cell: the history's name, its cell, the call; written: its cell's
@@ -2020,6 +2050,8 @@ typedef struct {
   int nver_defer;
   struct MainChainMemo *main_chain;   /* the main-chain fact by (name, point or window start, side): call_plan.c, ct_main_chain */
   struct VerChain *ver_chain;   /* how many versions a class's chain holds of a name, by (class, side, name) (call_plan.c, ver_chain_count) */
+  struct ScopesByName *scopes_by_name;   /* the scopes of each name while the scope index is frozen (analyze.c, an_sbn) */
+  struct NameOwners *name_owners;   /* where a name can be answered, and each class's scopes (compiler.c, name_owners) */
   struct VerHold *ver_hold;   /* the holders of a name worth asking, by name (call_plan.c, ver_holders) */
   struct NewInits *new_inits;   /* the initialize methods a `new` of a class may run, by class (call_plan.c, cplan_new_initializers) */
   struct AttrFacts *attr_facts;   /* whether a name's only attr_* call on a class chain comes first, by (class, name) (call_plan.c, ct_attr_point) */
@@ -2080,22 +2112,6 @@ typedef struct {
      which desugar_splat_view_scalars rewrites once typed (-1 once seen) */
   int *splat_views;
   int nsplat_views;
-  /* the slot names desugar_reassigned_block_params invents, each with the
-     name it stands for (param_written_name) */
-  char **rbp_slot_names;
-  char **rbp_slot_written;
-  int nrbp_slots;
-  /* the names the shadow rename invents for block parameters, each with the
-     block it was invented for: an open table of mask+1 slots, nbp used. The
-     name the program wrote is on the renamed nodes (nt_wname) */
-  char **bp_name;
-  int *bp_blk;    /* the block each was invented for (block_param_made_for) */
-  unsigned bp_mask;
-  int nbp;
-  /* the names the program wrote that hold `__bp` or `__bq`, collected when
-     the first invented name is made (bp_user_uses) */
-  char **bp_user;
-  int nbp_user, bp_user_built;
   /* the method names a definition query (`method_defined?(:m)`, its public
      form) asked before the walk, where a fold answered it from the program's
      text (desugar_engine_branches, desugar_def_unless_method_defined): a
@@ -2132,6 +2148,8 @@ typedef struct {
      the shallowest method still being asked that an answer rested on */
   int bvi_epoch, bvi_calls, bvi_mdepth, bvi_low;
   struct { unsigned long ty, edits; unsigned version, scope_gen; int nscopes; } bvi_stamp;
+  /* std_stream_io_frozen at emit: 0 before the first ask, 1 for no, 2 for yes */
+  unsigned char io_frozen_emit;
 } Compiler;
 /* A scope's shape moved: its name, its class, is_cmethod, its entry kind or the flags that say what copy it is and what it
    guards (mixin_guarded, guard_behind, mixin_unversioned, mixin_conditional, shadow, is_include_copy, is_extend_copy,
@@ -2148,6 +2166,9 @@ enum { IE_RB_IN = 1, IE_RB_OWN = 2, IE_RB_ROOT = 4, IE_RB_FWD = 8 };
 AutoloadRegistration *comp_autoloads(const Compiler *c, int node, int *count);
 Compiler *comp_new(const NodeTable *nt);
 void comp_free(Compiler *c);
+/* True when SPINEL_CACHE_CHECK is set and non-zero (verifies cached whole-
+   program predicates against their uncached scans). */
+int comp_cache_check_on(void);
 /* the dynamic send's candidate memo and literal set (Compiler.dsn), dropped (analyze_desugar.c) */
 void dsn_free(Compiler *c);
 void ic_free(Compiler *c);   /* implicit_calls.c */
@@ -2160,6 +2181,8 @@ void comp_def_asked_add(Compiler *c, const char *name);   /* a fold answered a d
 void comp_grow_node_arrays(Compiler *c);
 void comp_node_pbases(Compiler *c);   /* the parsed program nodes' bases (comp_new) */
 const char *comp_node_tag(Compiler *c, int id);
+void comp_name_locals(Compiler *c, int from);
+int comp_import_subtree(Compiler *c, const NodeTable *src, int root);   /* nt_import_subtree, then the locals named */   /* the locals of nodes from `from` on, named by their scope (a slot) */
 
 /* If `id` is a ternary `cond ? A : B` -- an IfNode whose then- and else-clauses
    are each a single value expression (the shape the ternary emitter lowers to a
@@ -2332,6 +2355,7 @@ LocalVar *scope_local_intern(Scope *s, const char *name);
 static inline const char *lv_wname(const LocalVar *lv) { return lv->wname ? lv->wname : lv->name; }
 void lv_set_wname(LocalVar *lv, const char *wname);
 const char *scope_local_wname(Compiler *c, int scope_idx, const LocalVar *lv);
+void local_names_check(Compiler *c);   /* --plan-check: slot-named nodes carry their written name */
 void scope_locals_appended(Scope *s);  /* scope_local's index, after an append */
 void scope_locals_removed(Scope *s);   /* ... after a local is taken out of `locals` */
 
@@ -2421,6 +2445,7 @@ void builtin_given_free(Compiler *c);
 int const_path_class(Compiler *c, int id);
 /* a segment naming a builtin class, module or constant (analyze_util.c) */
 int const_seg_builtin(Compiler *c, int id);
+int const_path_builtin_other(Compiler *c, int id, int k);
 
 /* Classes. */
 ClassInfo *comp_class_new(Compiler *c, const char *name, int def_node);
@@ -2480,6 +2505,11 @@ int        class_name_reader_argc_raises(Compiler *c, int id, const char *nm, in
 /* a Module/Class reopen or an Object class method answers name/to_s/inspect */
 int        prog_owns_class_name_reader(Compiler *c, int id, const char *nm);
 int        dynamic_new_may_reach(Compiler *c, int call_id, int cid);  /* k.new can build cid */
+/* The initialize of class k whose parameters call_id, a `new` on a Class
+   value, gives its arguments to (bind_dynamic_new_initializers): the one
+   the call's arm for k runs, where the call can reach k and the initialize
+   takes that many arguments. -1 where there is none. */
+int        dynamic_new_initialize(Compiler *c, int call_id, int k);
 int        anon_struct_ci_for_value(Compiler *c, int val);  /* k = Struct.new(...) value node */
 const char *struct_call_dup_member(Compiler *c, int callnode);  /* first duplicate member sym name, or NULL */
 const char *sym_static_value(Compiler *c, int node);  /* SymbolNode or sole-symbol local */
@@ -2670,6 +2700,13 @@ int        comp_shadowed_body(Compiler *c, int class_id, int is_cm, int def_node
    name for each; at every boxed comparison site, every round, that was a
    third of a Rails program's re-narrow round (1,299 classes). */
 const int *comp_name_responders(Compiler *c, const char *name, int is_cm, int *n);
+void scopes_by_name_free(Compiler *c);
+/* The scopes class cls owns (the top-level ones for -1), in scope order, malloc'd, *n of them. The walks that asked
+   every scope of the program for each class read the class's own list while the scope index is frozen. */
+int *comp_class_scopes(Compiler *c, int cls, int *n);
+void name_owners_free(Compiler *c);
+/* Whether boxed #hash sends can select a user-defined reader. */
+int        comp_has_hash_reader(Compiler *c);
 /* Whether some class's chain answers `name` with a reader
    (comp_reader_in_chain), kept per name while the reader and alias tables
    and the class shape stand still. A retargeted send on a boxed receiver
@@ -2713,7 +2750,10 @@ int        comp_ary_is_array_proper(Compiler *c, int cid);
 int        comp_implicit_to_ary_mi(Compiler *c, int site, int op, int cid);
 int        comp_ty_ary_root(Compiler *c, TyKind t);
 int        comp_ty_arysub_array(Compiler *c, TyKind t);
-const int *comp_strsub_own_classes(Compiler *c, const char *name, int *n);
+/* Which of a method's visibilities make a String subclass answer it as its own: an
+   explicit call reaches the public ones, an implicit conversion (to_ary) any */
+typedef enum { STROWN_PUBLIC, STROWN_ANY } StrOwnVis;
+const int *comp_strsub_own_classes(Compiler *c, const char *name, StrOwnVis vis, int *n);
 TyKind     comp_ary_kind(Compiler *c, int cid);
 /* Whether Array answers a call named n on an instance of Array subclass
    cid: no method, reader or writer of the class chain takes the name, it
@@ -2952,8 +2992,6 @@ int method_answers_receiver(Compiler *c, int mi);
 int comp_super_parent(Compiler *c, int class_id, int is_cmethod); /* super in `self.new` is Class#new */
 const char *comp_super_builtin_root(Compiler *c, int cid, int *self);   /* the builtin at the top of class cid's chain ("Array", "Struct", "Object"); *self: cid is that reopening */
 const char *comp_super_bowner(Compiler *c, const Scope *s, const char *uname);   /* the builtin a super in instance method scope s reaches when no program method answers: the call plan's bowner */
-typedef enum { BSP_NONE, BSP_ARRAY, BSP_KERNEL, BSP_PREPENDED } BsuperPath;
-BsuperPath comp_bsuper_carried(Compiler *c, int id, const Scope *st, const char *uname, const char *bowner);   /* the call path lower_builtin_supers lowers a super whose plan names bowner to: an Array, Hash, String or Time subclass's own, a Kernel module function's bare call, a module prepended into a builtin, or none yet */
 const Scope *comp_super_site(Compiler *c, const Scope *s);   /* the method scope a super in s resolves as: its class starts the parent chain, its def names the method asked for; a copy of an alias (Scope.super_of) is the owner's */
 enum { SUPER_OBJ_SAME = 1, SUPER_OBJ_FALSE, SUPER_OBJ_FROZEN, SUPER_OBJ_SELF, SUPER_OBJ_ROW };
 /* a super (node id) no program ancestor answers that reaches BasicObject's
@@ -2965,8 +3003,15 @@ int comp_super_object_builtin(Compiler *c, const Scope *s, const char *uname, in
    requireds then the optionals, as parameter nodes into out (up to cap; out
    may be NULL), and their count; -1 where the def has a post, keyword or rest
    parameter (a block parameter is passed as the block, not counted); the one
-   place super_plain_argc and codegen read. */
+   place comp_super_plain_argc and codegen read. */
 int comp_zsuper_plain_params(Compiler *c, const Scope *s, int *out, int cap);
+/* The plain argument count super id in s passes, or -1 for a splat, a keyword or a forwarded list (a bare super's:
+   comp_zsuper_plain_params) */
+int comp_super_plain_argc(Compiler *c, int id, const Scope *s);
+/* The expression of super id's block argument (`super(o, &side)`) whose
+   evaluation has an effect, or -1: none, or a read or literal, which has
+   none. Where the method reached takes no block it runs for that effect. */
+int comp_super_blockarg_effect(const NodeTable *nt, int id);
 /* Kernel's builtin row (a non-internal BOP_KERNEL row, matched by the count of
    super id's plain operands) that owns uname: the answer of a super that
    reaches Kernel's method of that name (SUPER_OBJ_ROW). NULL for none. */
@@ -3087,6 +3132,7 @@ static inline uint64_t comp_node_marks_digest(const Compiler *c, uint64_t h, int
   if (c->pow_signed) h = mix(h, c->pow_signed, (size_t)n * sizeof *c->pow_signed);
   if (c->store_misfit_arg) h = mix(h, c->store_misfit_arg, (size_t)n * sizeof *c->store_misfit_arg);
   if (c->ivar_widen_src) h = mix(h, c->ivar_widen_src, (size_t)n * sizeof *c->ivar_widen_src);
+  if (c->box_lift_arr) h = mix(h, c->box_lift_arr, (size_t)n * sizeof *c->box_lift_arr);
   if (c->hash_want) h = mix(h, c->hash_want, (size_t)n * sizeof *c->hash_want);
   if (c->arr_want) h = mix(h, c->arr_want, (size_t)n * sizeof *c->arr_want);
   if (c->lw_joined) h = mix(h, c->lw_joined, (size_t)n * sizeof *c->lw_joined);

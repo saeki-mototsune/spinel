@@ -328,7 +328,7 @@ build/csrc/analyze_desugar.o build/csrc-work/analyze_desugar.o build/csrc/codege
 SPINEL_OBJ  = build/csrc/node_table.o build/csrc/types.o build/csrc/compiler.o \
                build/csrc/ffi_spec.o build/csrc/ct_value.o build/csrc/ct_eval.o build/csrc/analyze_ct.o \
                build/csrc/analyze.o build/csrc/analyze_util.o build/csrc/analyze_infer.o build/csrc/analyze_infer_recv.o \
-               build/csrc/analyze_cext.o build/csrc/analyze_scope.o build/csrc/analyze_pass.o build/csrc/analyze_desugar.o build/csrc/analyze_nil.o build/csrc/analyze_cls.o build/csrc/analyze_arm.o build/csrc/analyze_const.o build/csrc/analyze_program.o build/csrc/analyze_elab.o build/csrc/analyze_lower.o build/csrc/analyze_share.o build/csrc/repr.o build/csrc/holder.o build/csrc/codegen.o build/csrc/codegen_util.o build/csrc/ty_traits_check.o \
+               build/csrc/analyze_cext.o build/csrc/analyze_scope.o build/csrc/analyze_pass.o build/csrc/analyze_desugar.o build/csrc/analyze_nil.o build/csrc/analyze_raise.o build/csrc/analyze_cls.o build/csrc/analyze_arm.o build/csrc/analyze_const.o build/csrc/analyze_program.o build/csrc/analyze_elab.o build/csrc/analyze_lower.o build/csrc/analyze_share.o build/csrc/repr.o build/csrc/holder.o build/csrc/codegen.o build/csrc/codegen_util.o build/csrc/ty_traits_check.o \
                build/csrc/codegen_fold.o build/csrc/codegen_call.o build/csrc/codegen_call_poly.o build/csrc/codegen_call_method.o build/csrc/codegen_call_io.o build/csrc/codegen_call_kernel.o build/csrc/codegen_call_exception.o build/csrc/codegen_call_module.o build/csrc/codegen_call_string.o build/csrc/codegen_call_class.o build/csrc/codegen_call_operator.o build/csrc/codegen_call_object.o build/csrc/codegen_ops.o build/csrc/codegen_call_concurrency.o build/csrc/codegen_call_numeric.o build/csrc/codegen_call_hash.o build/csrc/codegen_call_array.o build/csrc/codegen_view.o build/csrc/builtin_ops.o build/csrc/builtin_names.o build/csrc/codegen_call_recv.o build/csrc/codegen_iter.o build/csrc/call_plan.o build/csrc/value_pos.o build/csrc/implied_calls.o build/csrc/implicit_calls.o build/csrc/codegen_poly_plan.o build/csrc/codegen_str.o \
                build/csrc/codegen_expr.o build/csrc/codegen_stmt.o build/csrc/csplit.o build/csrc/main.o
 # The decision registry (--decisions, --decisions-log; `make decisions-test`).
@@ -344,8 +344,8 @@ SPINEL_OBJ  += build/csrc/order_plan.o
 SPINEL_HDRS += src/sha256.h
 SPINEL_OBJ  += build/csrc/sha256.o
 # --incremental's native step: preprocess, split into units, build.
-SPINEL_HDRS += src/unit_cache.h
-SPINEL_OBJ  += build/csrc/unit_cache.o
+SPINEL_HDRS += src/unit_cache.h src/pre_const.h
+SPINEL_OBJ  += build/csrc/unit_cache.o build/csrc/pre_const.o
 
 build/csrc:
 	@mkdir -p build/csrc
@@ -454,15 +454,15 @@ build/csrc/codegen_util.o: build/csrc/sp_rt_names.h
 
 FORCE:
 
-build/csrc/sp_parse_lib.o: src/spinel_parse.c src/prism_eval.c src/sp_macro.c src/sp_const_loop.c src/ct_value.h src/inline_rbs.c src/rbs_map.h src/node_table.h src/types.h $(PRISM_LIB) $(PLATFORM_HDRS) | build/csrc
+build/csrc/sp_parse_lib.o: src/spinel_parse.c src/prism_eval.c src/sp_macro.c src/sp_const_loop.c src/ct_value.h src/pre_const.h src/inline_rbs.c src/rbs_map.h src/node_table.h src/types.h $(PRISM_LIB) $(PLATFORM_HDRS) | build/csrc
 	$(CC) $(CFLAGS) -Werror=implicit-function-declaration -I$(PRISM_INC) $(INLINE_RBS_CFLAGS) -c src/spinel_parse.c -o $@
-build/csrc/rbs_map.o: src/rbs_map.c src/rbs_map.h $(PLATFORM_HDRS) | build/csrc
+build/csrc/rbs_map.o: src/rbs_map.c src/rbs_map.h lib/sp_builtin_classes.h $(PLATFORM_HDRS) | build/csrc
 	$(CC) -c $(CFLAGS) -Werror=implicit-function-declaration -I$(RBS_INC) src/rbs_map.c -o $@
 
 # Exercise the fallback even when vendor/rbs is present, without replacing
 # the parser object used by the ordinary compiler.
 SPINEL_NO_RBS = build/spinel-no-rbs
-build/csrc/sp_parse_no_rbs.o: src/spinel_parse.c src/prism_eval.c src/sp_macro.c src/sp_const_loop.c src/ct_value.h src/node_table.h src/types.h $(PRISM_LIB) $(PLATFORM_HDRS) | build/csrc
+build/csrc/sp_parse_no_rbs.o: src/spinel_parse.c src/prism_eval.c src/sp_macro.c src/sp_const_loop.c src/ct_value.h src/pre_const.h src/node_table.h src/types.h $(PRISM_LIB) $(PLATFORM_HDRS) | build/csrc
 	$(CC) $(CFLAGS) -Werror=implicit-function-declaration -I$(PRISM_INC) -U SPINEL_INLINE_RBS -c src/spinel_parse.c -o $@
 
 # The compiler links the regexp engine so it can compile a literal at build
@@ -572,7 +572,7 @@ build/csrc-san/%.o: src/%.c $(SPINEL_HDRS) | build/csrc
 	$(CC) $(CFLAGS) $(SAN_FLAGS) -Isrc -Ibuild/csrc -c $< -o $@
 build/csrc-san/main.o: build/csrc/spinel_rev.h
 build/csrc-san/codegen_util.o: build/csrc/sp_rt_names.h
-build/csrc-san/sp_parse_lib.o: src/spinel_parse.c src/prism_eval.c src/sp_macro.c src/sp_const_loop.c src/ct_value.h src/inline_rbs.c src/rbs_map.h src/node_table.h src/types.h $(PRISM_LIB) | build/csrc
+build/csrc-san/sp_parse_lib.o: src/spinel_parse.c src/prism_eval.c src/sp_macro.c src/sp_const_loop.c src/ct_value.h src/pre_const.h src/inline_rbs.c src/rbs_map.h src/node_table.h src/types.h $(PRISM_LIB) | build/csrc
 	@mkdir -p build/csrc-san
 	$(CC) $(CFLAGS) $(SAN_FLAGS) -I$(PRISM_INC) $(INLINE_RBS_CFLAGS) -c src/spinel_parse.c -o $@
 $(SPINEL_SAN): $(SPINEL_SAN_OBJ) build/csrc-san/sp_parse_lib.o build/csrc/re_lit_check.o $(RE_OBJ) $(PRISM_LIB) $(INLINE_RBS_LIBS)
@@ -1393,7 +1393,7 @@ endif
 # pow_typed_negative_base_raises pins the Math::DomainError a typed negative
 # Rational or Integer base raises for a fractional power; promote boxes those
 # values, and a boxed base returns CRuby's Complex.
-RAISE_MODE_PINS := test/pow_typed_negative_base_raises.rb test/literal_array_hash_capacity.rb test/float_to_r_bounded.rb test/rational_string_overflow.rb test/int_overflow_raises.rb test/int_overflow_op_assign.rb test/poly_int_overflow_raises.rb test/str_to_i_overflow.rb test/string_to_i_overflow_raises.rb test/bounded_counter_unchecked_add.rb test/float_to_int_out_of_range.rb test/bigrational_to_i_out_of_range.rb test/float_to_int_boundary.rb test/poly_call_legacy_abi_gate.rb test/poly_call_fast_abi_gate.rb test/poly_method_return_kinds.rb test/int_min_overflow_raises.rb test/masgn_boxed_ivar_slot_mismatch.rb test/array_index_sum_overflow.rb
+RAISE_MODE_PINS := test/pow_typed_negative_base_raises.rb test/literal_array_hash_capacity.rb test/float_to_r_bounded.rb test/rational_string_overflow.rb test/int_overflow_raises.rb test/int_overflow_op_assign.rb test/poly_int_overflow_raises.rb test/str_to_i_overflow.rb test/string_to_i_overflow_raises.rb test/bounded_counter_unchecked_add.rb test/float_to_int_out_of_range.rb test/bigrational_to_i_out_of_range.rb test/float_to_int_boundary.rb test/poly_call_legacy_abi_gate.rb test/poly_call_fast_abi_gate.rb test/poly_method_return_kinds.rb test/int_min_overflow_raises.rb test/masgn_boxed_ivar_slot_mismatch.rb test/array_index_sum_overflow.rb test/joint_guard_key_overflow.rb
 # Tests a promote gap fails, out of the promote lane until it is fixed.
 # step_boxed_float_bound: under promote every Integer local is boxed, so a
 # boxed limit or step is not known to be a Float or Rational, and an
@@ -1466,13 +1466,6 @@ endif
 ifneq ($(shell uname -s),Linux)
 TESTS := $(filter-out $(shell grep -l '^\# spinel: linux' test/*.rb),$(TESTS))
 endif
-# A test only --load-model=inline answers yet: the default model refuses a
-# define_method a class method's body makes under a computed name, until
-# such a definition is placed where it runs. load-model-inline-test runs
-# these under the inline model and asks that the default one still refuses
-# them, so a program leaves the list when it compiles.
-LOAD_MODEL_INLINE_ONLY := test/class_macro_guard_after.rb
-TESTS := $(filter-out $(LOAD_MODEL_INLINE_ONLY),$(TESTS))
 # A platform that cannot give some tests their subject lists them in
 # TEST_SKIP -- native Windows (win32.mk), for tests of what only a POSIX
 # system answers -- and they are not run there.
@@ -1749,7 +1742,7 @@ share-strings-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(BUNDLED_NATIVE_OBJS
 	  xargs -P $(NPROC) -n 1 sh tools/share_strings_one.sh $(SPINEL) > "$$tmp/runs" 2>&1 || ok=0; \
 	cat "$$tmp/runs"; \
 	if ! $(SPINEL) test/share_strings_class_value_stat_fields.rb -c --no-line-map -o "$$tmp/stat.c" >"$$tmp/out" 2>&1 || \
-	   grep -q 'sp_pd_[0-9a-f]' "$$tmp/stat.c"; then \
+	   grep -q '^static .*sp_pd_[0-9a-f_]*(.*switch (_t' "$$tmp/stat.c"; then \
 	  echo "share-strings-test: FAIL (Class calls of Stat field names add a dispatch)"; ok=0; \
 	fi; \
 	if ! $(SPINEL) test/share/share_strings_literal_queries.rb -c --no-line-map -o "$$tmp/queries.c" >"$$tmp/out" 2>&1 || \
@@ -1849,6 +1842,7 @@ test-corpus-summary: test-corpus-results
 # entries, and a raise caught through the exported try helper -- and a kernel
 # whose entries start and join threads after an init that started some, and
 # one whose at_exit hooks run when the host exits, not as its init returns,
+# one that renders no Symbol and no class name (SP_TU_NO_POLY_RENDER),
 # and one whose entry uses Marshal, and one whose entry calls a Struct's `new` the load redefined, a typed and
 # an untyped entry that `new` one class compile, so do a typed entry and an
 # --ext-class table that `new` one class, and an
@@ -1953,6 +1947,18 @@ ext-test: $(SPINEL) $(SP_RT_LIB) $(SP_RT_MT_LIB) $(SP_RT_PIC_LIB) $(SP_RT_MT_PIC
 	    printf '2\n3\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
 	      { echo "ext-test: FAIL (late_new host output mismatch, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
 	  else echo "ext-test: FAIL (late_new host C did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
+	fi; \
+	if [ $$ok -eq 1 ]; then \
+	  if ! $(SPINEL) test/ext/no_poly.rb -c --no-line-map --ext-init Init_ext_no_poly \
+	      -o "$$tmp/np.c" >/dev/null 2>&1; then \
+	    echo "ext-test: FAIL (no_poly emission)"; ok=0; \
+	  elif ! grep -q '^#define SP_TU_NO_POLY_RENDER' "$$tmp/np.c"; then \
+	    echo "ext-test: FAIL (no_poly renders a value now; it no longer covers SP_TU_NO_POLY_RENDER)"; ok=0; \
+	  elif $(CC) -O1 -w $(PLATFORM_FLAGS) -Ilib -I"$$tmp" test/ext/no_poly_host.c "$$tmp/np.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/nphost" 2>"$$tmp/cc.err"; then \
+	    "$$tmp/nphost" > "$$tmp/out" 2>&1; rc=$$?; \
+	    printf 'loaded 42\ninit returned\n' | cmp -s - "$$tmp/out" && [ $$rc -eq 0 ] || \
+	      { echo "ext-test: FAIL (no_poly host output mismatch, or status $$rc)"; cat "$$tmp/out"; ok=0; }; \
+	  else echo "ext-test: FAIL (an ext-init library with no poly rendering did not compile)"; sed -n 1,6p "$$tmp/cc.err"; ok=0; fi; \
 	fi; \
 	if [ $$ok -eq 1 ]; then \
 	  if ! $(SPINEL) test/ext/reopen_include.rb -c --no-line-map --ext-init Init_ext_reopen_include \
@@ -2246,7 +2252,7 @@ test-run: decisions-test
 # would be named by no bisect. A key holds the whole of a long name.
 # Each kind also has its row in the table in tools/README.md.
 DECISION_TESTS = $(shell grep -l '^\# spinel: decisions$$' test/*.rb test/fixtures/decisions/*.rb)
-DECISION_KINDS = aon-get case-root fetch-inert fetch-slot gc-save hc-cobound index-sum inline-force masgn-root nn-inb nn-read no-alloc \
+DECISION_KINDS = aon-get case-root fetch-inert fetch-slot gc-save hc-cobound hc-joint index-sum inline-force masgn-root nn-inb nn-read no-alloc \
                  pd-hoist pow-int push-slot root-context root-elide root-frame strbuf-raw
 decisions-test: $(SPINEL) $(SPINEL_TIMEOUT)
 	@ok=1; tmp=$$(mktemp -d /tmp/spinel-decisions.XXXXXX); : > "$$tmp/none"; \
@@ -2457,13 +2463,6 @@ string-minus-reject-test: $(SPINEL)
 	done; rm -rf "$$tmp"; \
 	[ $$ok = 1 ] && echo "string-minus-reject-test: pass" || exit 1
 
-# Two of its groups are refusals of the inline load model alone, and are
-# compiled under --load-model=inline: a test/reject/macro_*.rb that
-# test/analysis-forms/ holds as class_<name> (the text pass refuses the call;
-# the analysis runs the macro where the call stands, and analysis-forms-test
-# runs that program), and system_env_options_hash (the text scan sees no
-# keyword in `**opts`; the tree does, and test/system_options_spread.rb runs
-# it).
 reject-test: string-minus-reject-test $(SPINEL)
 	@ok=1; tmp=$$(mktemp -d /tmp/spinel-reject.XXXXXX); \
 	t=test/reject/string_split_local_each_rescue_modifier_retry.rb; \
@@ -2644,11 +2643,6 @@ reject-test: string-minus-reject-test $(SPINEL)
 	  else grep -Eq "is not a (class|module)" "$$tmp/$$t.out" || \
 	    { echo "reject-test: FAIL (#4318: $$t rejected without saying why)"; sed -n 1,3p "$$tmp/$$t.out"; ok=0; }; fi; \
 	done; \
-	t=test/reject/system_env_options_hash.rb; \
-	if $(SPINEL) --load-model=inline "$$t" -c --no-line-map -o "$$tmp/se.c" >"$$tmp/se.out" 2>&1; then \
-	  echo "reject-test: FAIL (system with an environment Hash and an options Hash compiled)"; ok=0; \
-	else grep -q "system with an options Hash" "$$tmp/se.out" || \
-	  { echo "reject-test: FAIL (system with an environment and an options Hash refused without saying why)"; sed -n 1,5p "$$tmp/se.out"; ok=0; }; fi; \
 	t=test/reject/typed_array_kept_by_struct_into_boxed_param_store.rb; \
 	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/tb.c" >"$$tmp/tb.out" 2>&1; then \
 	  echo "reject-test: FAIL (a typed array held by the caller, stored into through a boxed parameter, compiled)"; ok=0; \
@@ -2671,8 +2665,7 @@ reject-test: string-minus-reject-test $(SPINEL)
 	  { echo "reject-test: FAIL ($$t: an alias of \$$LOAD_PATH refused without saying why)"; sed -n 1,5p "$$tmp/la.out"; ok=0; }; fi; \
 	done; \
 	for t in test/reject/macro_*.rb; do \
-	fl=; [ -f "test/analysis-forms/class_$$(basename "$$t")" ] && fl=--load-model=inline; \
-	if $(SPINEL) $$fl "$$t" -c --no-line-map -o "$$tmp/mc.c" >"$$tmp/mc.out" 2>&1; then \
+	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/mc.c" >"$$tmp/mc.out" 2>&1; then \
 	  echo "reject-test: FAIL ($$t: a macro over state or a name it cannot compute was expanded)"; ok=0; \
 	else pat="unsupported send with a runtime method name|unsupported .*CallNode .(module_eval|class_eval|const_set).|no class in the program defines"; \
 	  grep -q '^# spinel: reject-define-method-name$$' "$$t" && pat="define_method with a non-literal name|define_method in a method body is supported only"; \
@@ -3295,7 +3288,12 @@ backtrace-test: $(SPINEL) $(SP_RT_LIB)
 	           "block_frames.rb:20:in .block (3 levels) in Runner#run'" "block_frames.rb:29:in .block in <main>'" \
 	           "block_frames.rb:31:in .block in <main>'" "block_frames_lib.rb:2:in .block in lib_blocks'"; do \
 	    grep -q "$$f" "$$tmp/bf.out" || { echo "backtrace-test: FAIL (a frame inside a block: no $$f)"; cat "$$tmp/bf.out"; ok=0; }; \
-	  done;; \
+	  done; \
+	  $(SPINEL) --debug --no-inline-hot test/backtrace/joint_guard_line.rb -o "$$tmp/jg" >/dev/null 2>&1 || \
+	    { echo "backtrace-test: FAIL (compile joint_guard_line)"; ok=0; }; \
+	  "$$tmp/jg" > "$$tmp/jg.out" 2>&1; \
+	  grep -q "joint_guard_line.rb:8:in .upd'" "$$tmp/jg.out" || \
+	    { echo "backtrace-test: FAIL (a joint guard's first index raised under another statement's line)"; cat "$$tmp/jg.out"; ok=0; };; \
 	esac; \
 	rm -rf "$$tmp"; \
 	if [ $$ok -eq 1 ]; then echo "backtrace-test: pass"; else exit 1; fi
@@ -3417,6 +3415,17 @@ build/rbs-seed-results/%.res: FORCE | rbs-seed-extractor $(SP_RT_LIB) $(SPINEL_T
 	  grep -q 'parameter value of as_array is declared Array\[String\] but this call passes String' "$$tmp/sptu.err" && \
 	  grep -q 'The value is parameter value of wrap, which every call of wrap hands a String' "$$tmp/sptu.err" || \
 	  { echo "rbs-seed-test: FAIL (#10681 the refusal of a String through untyped parameters)"; sed -n 1,4p "$$tmp/sptu.err"; ok=0; }; \
+	fi; \
+	;; \
+	widen_aliased_container_refuse) \
+	if $(SPINEL) test/rbs-seed/widen_aliased_container_refuse.rb --rbs test/rbs-seed/sig -o "$$tmp/wacr" >/dev/null 2>"$$tmp/wacr.err"; then \
+	  echo "rbs-seed-test: FAIL (aliased container widening compiled instead of refusing)"; ok=0; \
+	else \
+	  SP_COLLECT_ERRORS=1 $(SPINEL) test/rbs-seed/widen_aliased_container_refuse.rb --rbs test/rbs-seed/sig -c -o "$$tmp/wacr.c" >/dev/null 2>"$$tmp/wacr.all"; \
+	  [ "$$(grep -c 'a parameter default given a Array, which no conversion keeps in its sp_PolyArray \* slot' "$$tmp/wacr.all")" = 2 ] && \
+	  [ "$$(grep -c 'a parameter default given a Hash, which no conversion keeps in its sp_StrPolyHash \* slot' "$$tmp/wacr.all")" = 3 ] && \
+	  grep -q 'an instance variable write given a Hash, which no conversion keeps in its sp_StrPolyHash \* slot' "$$tmp/wacr.all" || \
+	  { echo "rbs-seed-test: FAIL (expected all 6 aliased/recursive container widening refusals)"; cat "$$tmp/wacr.all"; ok=0; }; \
 	fi; \
 	;; \
 	dyn_send_arm_seed_contradiction) \
@@ -3921,10 +3930,19 @@ build/rbs-seed-results/%.res: FORCE | rbs-seed-extractor $(SP_RT_LIB) $(SPINEL_T
 	fi; \
 	$(SPINEL) test/rbs-seed/rbs_parse_failure_stops_build.rb -o "$$tmp/rpf" >/dev/null 2>&1 && [ "$$("$$tmp/rpf")" = 42 ] || \
 	  { echo "rbs-seed-test: FAIL (#11323 the program without --rbs)"; ok=0; }; \
+	for d in 'sig$$(touch ran)' 'sig`touch ran`' 'sig"x'; do \
+	  case "$(TEST_HOST_OS):$$d" in MINGW*'"'*|MSYS*'"'*) continue ;; esac; \
+	  mkdir "$$tmp/$$d" && cp test/rbs-seed/broken_sig/broken_sig_box.rbs "$$tmp/$$d/"; \
+	  (cd "$$tmp" && "$(CURDIR)/$(SPINEL)" "$(CURDIR)/test/rbs-seed/rbs_parse_failure_stops_build.rb" --rbs "$$d" -o rpf) >/dev/null 2>"$$tmp/rpf.err"; \
+	  grep -qF "parse failed in $$d/broken_sig_box.rbs" "$$tmp/rpf.err" || \
+	    { echo "rbs-seed-test: FAIL (--rbs $$d did not reach the extractor as one path)"; sed -n 1,2p "$$tmp/rpf.err"; ok=0; }; \
+	done; \
+	[ ! -e "$$tmp/ran" ] || { echo "rbs-seed-test: FAIL (the shell ran a command substitution in an --rbs path)"; ok=0; }; \
 	;; \
 	strict_rbs_ok) \
 	$(SPINEL) test/rbs-seed/strict_rbs_ok.rb --rbs test/rbs-seed/sig --strict-rbs \
 	  -c --no-line-map -o "$$tmp/sro.c" 2>"$$tmp/sro.err"; \
+	if grep -q "warning:.*RBS\|warning: --rbs" "$$tmp/sro.err"; then echo "rbs-seed-test: FAIL (strict_rbs_ok dropped an annotation)"; cat "$$tmp/sro.err"; ok=0; fi; \
 	if $(CC) -O0 -Ilib $(RBS_SEED_STRICT) "$$tmp/sro.c" $(SP_RT_LIB) $(LDFLAGS) -lm -o "$$tmp/sro" 2>"$$tmp/sro.cc"; then \
 	  "$$tmp/sro" > "$$tmp/sro.out" 2>/dev/null && \
 	  cmp -s "$$tmp/sro.out" test/rbs-seed/strict_rbs_ok.expected || { echo "rbs-seed-test: FAIL (strict_rbs_ok output mismatch)"; diff -u test/rbs-seed/strict_rbs_ok.expected "$$tmp/sro.out" || true; ok=0; }; \
@@ -4003,7 +4021,7 @@ INLINE_RBS_PARITY := methods attrs association identity_reopen identity_collide 
 INLINE_RBS_CHECKS := false_positives ignored_symlink ignored_errors warnings syntax_error syntax_error_multiline syntax_error_rbs two_annotations precedence_agree precedence_disagree precedence_module_function reader_pin_precedence reader_pin_conflicts stray_rb override_family check_false off_switch \
                      placements duplicate_reopen_agree duplicate_reopen_disagree duplicate_nilable precedence_objarray duplicate_rbs_decl \
                      redefine_unannotated redefine_unannotated_req redefine_define_method redefine_class_eval redefine_ignored redefine_refused mixin_not_applied analyzer_warnings dump_ast_malformed \
-                     contradiction_inline objarray_boxed desugared_warnings self_types_agree sclass_receiver_def
+                     contradiction_inline objarray_boxed desugared_warnings self_types_agree sclass_receiver_def uncalled_method
 INLINE_RBS_PARITY += flag_types self_types optional_on_rest
 INLINE_RBS_PARITY += type_variables
 INLINE_RBS_PARITY += singleton_class_defs
@@ -4124,6 +4142,14 @@ build/inline-rbs-results/%.res: FORCE | rbs-seed-extractor $(SP_RT_LIB) $(SPINEL
 	sclass_receiver_def) \
 	$(SPINEL) $(IRB)/sclass_receiver_def.rb -c --no-line-map -o "$$tmp/srd.c" 2>"$$tmp/srd.err" || { echo "inline-rbs-test: FAIL (a malformed annotation on a def self. in class << self stopped the build)"; sed -n 1,3p "$$tmp/srd.err"; ok=0; }; \
 	[ "$$(grep -c 'not applied' "$$tmp/srd.err")" = 1 ] && grep -q 'sclass_receiver_def.rb:7:' "$$tmp/srd.err" || { echo "inline-rbs-test: FAIL (class << self: the def self. annotation was not the one warning, or the receiverless def's was not applied)"; sed -n 1,3p "$$tmp/srd.err"; ok=0; }; \
+	;; \
+	uncalled_method) \
+	$(SPINEL) $(IRB)/uncalled_method.rb -c --no-line-map -o "$$tmp/u.c" 2>"$$tmp/u.err" || { echo "inline-rbs-test: FAIL (an annotated method nothing calls stopped the build)"; sed -n 1,3p "$$tmp/u.err"; ok=0; }; \
+	if grep -vq '^Wrote ' "$$tmp/u.err"; then echo "inline-rbs-test: FAIL (an annotated method nothing calls drew a diagnostic)"; sed -n 1,3p "$$tmp/u.err"; ok=0; fi; \
+	if $(SPINEL) $(IRB)/uncalled_method.rb --rbs $(IRB)/sig/uncalled_method_disagree -c --no-line-map -o "$$tmp/d.c" >"$$tmp/d.err" 2>&1; then echo "inline-rbs-test: FAIL (inline RBS on a method nothing calls disagreeing with --rbs compiled)"; ok=0; \
+	else grep -q 'uncalled_method.rb:7:.*names.rbs:2' "$$tmp/d.err" || { echo "inline-rbs-test: FAIL (a disagreement on a method nothing calls was refused without naming both)"; sed -n 1,5p "$$tmp/d.err"; ok=0; }; fi; \
+	$(SPINEL) $(IRB)/uncalled_method_replaced.rb --rbs $(IRB)/sig/uncalled_method_disagree -c --no-line-map -o "$$tmp/r.c" 2>"$$tmp/r.err" || { echo "inline-rbs-test: FAIL (a replaced annotated method nothing calls stopped the build)"; sed -n 1,3p "$$tmp/r.err"; ok=0; }; \
+	[ "$$(grep -c 'not applied' "$$tmp/r.err")" = 1 ] && grep -q 'uncalled_method_replaced.rb:5:3: .*uncalled_method_replaced.rb:8, replaces this one' "$$tmp/r.err" || { echo "inline-rbs-test: FAIL (a replaced annotated method nothing calls: the one warning did not name the replacement)"; sed -n 1,3p "$$tmp/r.err"; ok=0; }; \
 	;; \
 	self_types_agree) \
 	$(SPINEL) $(IRB)/self_types.rb --rbs $(IRB)/sig/self_types_agree -c --no-line-map -o "$$tmp/both.c" 2>"$$tmp/both.err" || { echo "inline-rbs-test: FAIL (an inline -> self agreeing with the class the .rbs names was refused)"; sed -n 1,5p "$$tmp/both.err"; ok=0; }; \
@@ -4327,7 +4353,7 @@ build/inline-rbs-results/%.res: FORCE | rbs-seed-extractor $(SP_RT_LIB) $(SPINEL
 	cmp -s "$$tmp/w.c" "$$tmp/n.c" || { echo "inline-rbs-test: FAIL (an annotation the compiler reported was applied, in part or whole)"; diff "$$tmp/n.c" "$$tmp/w.c" | head -10; ok=0; }; \
 	$(call IRB_IGNORED,analyzer_warnings.rb); \
 	for w in 'analyzer_warnings_part.rb:3:3: warning: inline RBS: the signature of `part_count` is not applied: `Array[Set]` names no type' \
-	         'analyzer_warnings.rb:9:3: warning: inline RBS: the declaration of @log is not applied: `Array[Time]` names no type' \
+	         'analyzer_warnings.rb:9:3: warning: inline RBS: the declaration of @log is not applied: `Array[UnknownTime]` names no type' \
 	         'analyzer_warnings.rb:12:24: warning: inline RBS: this type is not applied: `Regexp?` names no type' \
 	         'analyzer_warnings.rb:10:3: warning: inline RBS: the declaration of @zone is not applied: `Net::HTTP` names no type' \
 	         'analyzer_warnings.rb:20:3: warning: inline RBS: the signature of `at` is not applied: `Regexp` names no type' \
@@ -5110,6 +5136,19 @@ infer-test-1: $(SPINEL) $(SP_RT_LIB)
 	$(SPINEL) test/array_fill_span.rb -c --no-line-map -o "$$tmp/afs.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (array_fill_span: -c)"; ok=0; }; \
 	[ "$$(grep -cE 'sp_(Int|Float)Array_fill_span\(' "$$tmp/afs.c")" -ge 20 ] && [ "$$(grep -cE 'sp_(Int|Float)Array_set(_nilable)?\(' "$$tmp/afs.c")" = 0 ] || \
 	  { echo "infer-test: FAIL (fill on an Integer or Float Array stores slot by slot again instead of its span: sp_<K>Array_fill_span)"; ok=0; }; \
+	$(SPINEL) test/each_counter_reads_in_place.rb -c --no-line-map -o "$$tmp/ecr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (each_counter_reads_in_place: -c)"; ok=0; }; \
+	[ "$$(grep -cE '^static [^(]* sp_(rb_)?(dot_ewi|idot_ewi|dot_count)\(.*\{$$' "$$tmp/ecr.c")" = 3 ] || { echo "infer-test: FAIL (each_counter_reads_in_place: dot_ewi, idot_ewi or dot_count not found)"; ok=0; }; \
+	[ "$$(awk '/^static [^(]* sp_(rb_)?dot_ewi\(.*\{$$/,/^\}/' "$$tmp/ecr.c" | grep -oE '_hcv[0-9]+_[0-9]+\[' | sort -u | wc -l | tr -d ' ')" = 2 ] || \
+	  { echo "infer-test: FAIL (an each_with_index no longer reads its element and the other array at the counter in place: hcv_begin_walk, dot_ewi)"; ok=0; }; \
+	[ "$$(awk '/^static [^(]* sp_(rb_)?idot_ewi\(.*\{$$/,/^\}/' "$$tmp/ecr.c" | grep -oE '_hcv[0-9]+_[0-9]+\[' | sort -u | wc -l | tr -d ' ')" = 2 ] || \
+	  { echo "infer-test: FAIL (an each_with_index no longer reads its element and the other array at the counter in place: hcv_begin_walk, idot_ewi)"; ok=0; }; \
+	[ "$$(awk '/^static [^(]* sp_(rb_)?dot_count\(.*\{$$/,/^\}/' "$$tmp/ecr.c" | grep -oE '_hcv[0-9]+_[0-9]+\[' | sort -u | wc -l | tr -d ' ')" = 2 ] || \
+	  { echo "infer-test: FAIL (a counted each no longer reads its element and the other array at the counter in place: hcv_begin_walk, dot_count)"; ok=0; }; \
+	$(SPINEL) test/each_with_index_map_typed.rb -c --no-line-map -o "$$tmp/ewm.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (each_with_index_map_typed: -c)"; ok=0; }; \
+	[ "$$(grep -cE '^static [^(]*sp_(Float|Int)Array \* sp_(rb_)?(fmap|imap|wmap|wmap1)\(.*\{$$' "$$tmp/ewm.c")" = 4 ] || \
+	  { echo "infer-test: FAIL (each_with_index_map_typed: each_with_index.map / each.with_index.map no longer answers a typed Array: infer_indexed_each_terminal)"; ok=0; }; \
+	[ "$$(awk '/^static [^(]* sp_(rb_)?(fmap|imap|wmap|wmap1)\(.*\{$$/,/^\}/' "$$tmp/ewm.c" | grep -c 'Array_new_fresh')" = 4 ] || \
+	  { echo "infer-test: FAIL (each_with_index_map_typed: each_with_index.map no longer fills its result at the receiver length: map_fills_fresh)"; ok=0; }; \
 	$(SPINEL) test/loop_block_value_while_reads.rb -c --no-line-map -o "$$tmp/lbv.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_block_value_while_reads: -c)"; ok=0; }; \
 	[ "$$(awk '/^static inline [^(]* sp_(rb_)?(dots|dots_int|dots_from_one)\(.*\{$$/,/^\}/' "$$tmp/lbv.c" | grep -c '_hcvr[0-9]*_[0-9]* >= ')" -ge 3 ] || \
 	  { echo "infer-test: FAIL (a while in a map block's value no longer sees the start ahead of it and reads the second row in place: hc_prev_stmt)"; ok=0; }; \
@@ -5119,6 +5158,10 @@ infer-test-1: $(SPINEL) $(SP_RT_LIB)
 	[ "$$(grep -cE '^static inline sp_o?int sp_(count_to|first_square_over|halvings)\(sp_int lv_n\) \{' "$$tmp/lss.c")" = 3 ] || { echo "infer-test: FAIL (loop_stop_iteration_sources: count_to, first_square_over or halvings not found)"; ok=0; }; \
 	[ "$$(awk '/^static inline sp_o?int sp_(count_to|first_square_over|halvings)\(sp_int lv_n\) \{/,/^\}/' "$$tmp/lss.c" | grep -c 'setjmp')" = 0 ] || { echo "infer-test: FAIL (a loop whose body cannot raise StopIteration opened a handler)"; ok=0; }; \
 	[ "$$(grep -c 'setjmp(sp_exc_stack' "$$tmp/lss.c")" = 7 ] || { echo "infer-test: FAIL (a loop whose body can raise StopIteration lost its handler)"; ok=0; }; \
+	$(SPINEL) test/nothrow_setjmp_elision.rb -c --no-line-map -o "$$tmp/nse.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (nothrow_setjmp_elision: -c)"; ok=0; }; \
+	[ "$$(grep -cE '^static inline [^;]* sp_(pure_rescue_else_ensure|pure_def_rescue|pure_rescue_mod|pure_ensure_local_return|pure_break_with_begin|div_safe_literal)\(.*\{$$' "$$tmp/nse.c")" = 6 ] || { echo "infer-test: FAIL (nothrow_setjmp_elision: pure functions not found)"; ok=0; }; \
+	[ "$$(awk '/^static inline [^;]* sp_(pure_rescue_else_ensure|pure_def_rescue|pure_rescue_mod|pure_ensure_local_return|pure_break_with_begin|div_safe_literal)\(.*\{$$/,/^\}/' "$$tmp/nse.c" | grep -cE 'setjmp|volatile|sp_brk_push')" = 0 ] || { echo "infer-test: FAIL (a nothrow begin/rescue/ensure still emitted setjmp, volatile or sp_brk_push)"; ok=0; }; \
+	[ "$$(awk '/^static inline [^;]* sp_(rb_)?(nonlocal_proc_return_ensure|caller_nonlocal_yield_return|caught_transitive_raise|div_may_raise|mod_float_may_raise|type_error_unbox|nomethod_nil_recv|nomethod_boxed_recv|frozen_ivar_write)\(.*\{$$/,/^\}/' "$$tmp/nse.c" | grep -c 'setjmp')" -ge 10 ] || { echo "infer-test: FAIL (a may-raise or non-local-unwind begin lost its setjmp handler)"; ok=0; }; \
 	$(SPINEL) test/poly_each_struct_elsewhere.rb -c --no-line-map -o "$$tmp/pse.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (poly_each_struct_elsewhere: -c)"; ok=0; }; \
 	[ "$$(grep -cE '^static inline sp_o?int sp_(run|count)\(sp_RbVal lv_ops[^;]*\{$$' "$$tmp/pse.c")" = 2 ] || { echo "infer-test: FAIL (poly_each_struct_elsewhere: run or count not found)"; ok=0; }; \
 	[ "$$(awk '/^static inline sp_o?int sp_(run|count)\(sp_RbVal lv_ops[^;]*\{$$/,/^\}/' "$$tmp/pse.c" | grep -c 'sp_proc_new')" = 0 ] || { echo "infer-test: FAIL (a block over a boxed Array became a proc because a Struct the receiver cannot hold has an each)"; ok=0; }; \
@@ -5188,7 +5231,7 @@ infer-test-1: $(SPINEL) $(SP_RT_LIB)
 	  grep -q "sp_$${cls}_decorate(sp_$$cls \*self, sp_String \* lv_s) {" "$$tmp/bsv.c" || { echo "infer-test: FAIL (a setjmp-live String handed through super is not the shared handle: $$cls)"; ok=0; }; \
 	done; \
 	for param in optional post; do \
-	  grep -Eq "sp_String \* lv__y[0-9]+_$$param = " "$$tmp/bsv.c" || { echo "infer-test: FAIL (a yielded block alias of a setjmp-live String is not the shared handle: $$param)"; ok=0; }; \
+	  grep -Eq "sp_String \* lv__y[0-9]+_B[0-9]+_[A-Za-z0-9_]+_$${param} =" "$$tmp/bsv.c" || { echo "infer-test: FAIL (a yielded block alias of a setjmp-live String is not the shared handle: $$param)"; ok=0; }; \
 	done; \
 	grep -q 'sp_rb_kw_leaf(sp_String \* lv_s, $(STR_SLOT_C) lv_suffix) {' "$$tmp/bsv.c" && \
 	grep -q 'sp_two_slots($(STR_BYREF_PLAIN), sp_String \* lv_guarded) {' "$$tmp/bsv.c" || { echo "infer-test: FAIL (the shared handle of a setjmp-live String is not selective per parameter or through keywords)"; ok=0; }; \
@@ -5205,12 +5248,12 @@ infer-test-1: $(SPINEL) $(SP_RT_LIB)
 	grep -Eq '_t[0-9]+ = lv_env;' "$$tmp/rfp_v.c" && ! grep -A1 -E '_t[0-9]+ = lv_env;' "$$tmp/rfp_v.c" | grep -q 'SP_GC_ROOT' || { echo "infer-test: FAIL (a parameter the method never reassigns is copied into a rooted argument temp)"; ok=0; }; \
 	grep -A1 -E '_t[0-9]+ = lv_env;' "$$tmp/rfp_w.c" | grep -q 'SP_GC_ROOT(_t' || { echo "infer-test: FAIL (a reassigned parameter's argument temp lost its root)"; ok=0; }; \
 	$(SPINEL) test/infer/hash_one_class_each_value.rb -c --no-line-map -o "$$tmp/hoc.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (hash_one_class_each_value: -c)"; ok=0; }; \
-	grep -q 'sp_Item \* lv_it' "$$tmp/hoc.c" && grep -q 'sp_Item_describe((sp_Item \*)lv_it)' "$$tmp/hoc.c" || { echo "infer-test: FAIL (#4846 a one-class hash's each_value is not typed)"; ok=0; }; \
+	grep -q 'sp_Item \* lv_B[0-9]*_[A-Za-z0-9_]*_it' "$$tmp/hoc.c" && grep -q 'sp_Item_describe((sp_Item \*)lv_B[0-9]*_[A-Za-z0-9_]*_it)' "$$tmp/hoc.c" || { echo "infer-test: FAIL (#4846 a one-class hash's each_value is not typed)"; ok=0; }; \
 	$(SPINEL) test/hash_one_class_value_unbox.rb -c --no-line-map -o "$$tmp/hcu.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (hash_one_class_value_unbox: -c)"; ok=0; }; \
 	awk '/^static inline void \*sp_poly_unbox_cls\(.*\)\{/,/^}/' "$$tmp/hcu.c" > "$$tmp/hcu_u.c"; \
-	grep -Eq 'sp_poly_unbox_cls\(sp_StrPolyHash_get\(lv_h, (lv_key|SP_STR_B\(\(lv_key \? sp_String_cstr\(lv_key\) : NULL\)\)|SP_STR_B\(sp_strbuf_read\(lv_key\)\))\), 0,' "$$tmp/hcu.c" && grep -q 'v.cls_id==cls))return v.v.p;' "$$tmp/hcu_u.c" && ! grep -q 'sp_class_le' "$$tmp/hcu_u.c" || { echo "infer-test: FAIL (a one-class Hash's object read walks the class chain instead of checking the class id inline)"; ok=0; }; \
+	grep -Eq 'sp_poly_unbox_cls\(sp_StrPolyHash_get\(lv_h, (lv_B[0-9]*_[A-Za-z0-9_]*_key|SP_STR_B\(\(lv_B[0-9]*_[A-Za-z0-9_]*_key \? sp_String_cstr\(lv_B[0-9]*_[A-Za-z0-9_]*_key\) : NULL\)\)|SP_STR_B\(sp_strbuf_read\(lv_B[0-9]*_[A-Za-z0-9_]*_key\)\))\), 0,' "$$tmp/hcu.c" && grep -q 'v.cls_id==cls))return v.v.p;' "$$tmp/hcu_u.c" && ! grep -q 'sp_class_le' "$$tmp/hcu_u.c" || { echo "infer-test: FAIL (a one-class Hash's object read walks the class chain instead of checking the class id inline)"; ok=0; }; \
 	$(SPINEL) test/block_param_walk_name_collision.rb -c --no-line-map -o "$$tmp/bpc.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (block_param_walk_name_collision: -c)"; ok=0; }; \
-	grep -Eq 'sp_Pt \* lv_pt__bp[0-9]+ = NULL;' "$$tmp/bpc.c" || { echo "infer-test: FAIL (a write to a local whose name hashes alike boxed an object walk's block parameter)"; ok=0; }; \
+	grep -q 'sp_Pt \* lv_B[0-9]*_[A-Za-z0-9_]*_pt = NULL;' "$$tmp/bpc.c" || { echo "infer-test: FAIL (a write to a local whose name hashes alike boxed an object walk's block parameter)"; ok=0; }; \
 	$(SPINEL) test/obj_array_self_ref_walk.rb -c --no-line-map -o "$$tmp/osr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (obj_array_self_ref_walk: -c)"; ok=0; }; \
 	grep -q 'sp_PtrArray \* iv_kids;' "$$tmp/osr.c" && grep -q 'sp_PtrArray \* lv_q = NULL;' "$$tmp/osr.c" && grep -q 'sp_PolyArray \* iv_items;' "$$tmp/osr.c" || { echo "infer-test: FAIL (a tree walk ending in each made an object Array polymorphic)"; ok=0; }; \
 	$(SPINEL) test/boxed_recv_class_set_binding.rb -c --no-line-map -o "$$tmp/bcs.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (boxed_recv_class_set_binding: -c)"; ok=0; }; \
@@ -5255,6 +5298,13 @@ infer-test-1: $(SPINEL) $(SP_RT_LIB)
 	grep -B1 '^static .*sp_pd_[0-9a-f_]*(sp_RbVal _t0) {' "$$tmp/pdl_lm.c" | grep -q '^#line 12 "test/infer/poly_dispatch_out_of_line.rb"' || { echo "infer-test: FAIL (#4928 an out-of-line dispatch function does not name the call site it came from)"; ok=0; }; \
 	$(SPINEL) test/infer/poly_dispatch_out_of_line_array_subclass.rb -c --no-line-map -o "$$tmp/pdla.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (poly_dispatch_out_of_line_array_subclass: -c)"; ok=0; }; \
 	[ "$$(grep -c '^static .*sp_pd_[0-9a-f_]*(sp_RbVal _t0) {' "$$tmp/pdla.c")" = 1 ] && [ "$$(grep -o '= sp_pd_[0-9a-f_]*(' "$$tmp/pdla.c" | wc -l | tr -d ' ')" = 2 ] || { echo "infer-test: FAIL (a poly dispatch in a program that subclasses Array is not one shared out-of-line function)"; ok=0; }; \
+	$(SPINEL) test/infer/const_get_sites_shared.rb -c --no-line-map -o "$$tmp/cgs.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (const_get_sites_shared: -c)"; ok=0; }; \
+	[ "$$(grep -c 'strcmp(_t[0-9]*, "K7")' "$$tmp/cgs.c")" = 1 ] && [ "$$(grep -o '= sp_pd_[0-9a-f_]*(' "$$tmp/cgs.c" | wc -l | tr -d ' ')" = 3 ] || { echo "infer-test: FAIL (#12511 the arms of a run-time const_get are copied at each site, not one shared function)"; ok=0; }; \
+	[ "$$(grep -c 'sp_K7_s_v()' "$$tmp/cgs.c")" = 1 ] || { echo "infer-test: FAIL (#12511 a class method called on the Class a const_get answers is dispatched at each site, not in one shared function)"; ok=0; }; \
+	$(SPINEL) test/infer/class_method_args_sites_shared.rb -c --no-line-map -o "$$tmp/cms.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (class_method_args_sites_shared: -c)"; ok=0; }; \
+	[ "$$(grep -o '? sp_pd_[0-9a-f_]*(' "$$tmp/cms.c" | wc -l | tr -d ' ')" = 3 ] && [ "$$(grep -o '? sp_pd_[0-9a-f_]*(' "$$tmp/cms.c" | sort -u | wc -l | tr -d ' ')" = 1 ] || { echo "infer-test: FAIL (#12511 a class method called with arguments on the Class a const_get answers is dispatched at each site, not in one shared function)"; ok=0; }; \
+	$(SPINEL) test/infer/const_get_self_sites_shared.rb -c --no-line-map -o "$$tmp/cgself.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (const_get_self_sites_shared: -c)"; ok=0; }; \
+	[ "$$(grep -c 'strcmp(_t[0-9]*, "K7")' "$$tmp/cgself.c")" = 1 ] && [ "$$(grep -o '= sp_pd_[0-9a-f_]*(_t[0-9]*, _t[0-9]*)' "$$tmp/cgself.c" | wc -l | tr -d ' ')" = 3 ] || { echo "infer-test: FAIL (#12511 the arms of a run-time const_get on self in a class method are copied at each site, not one shared function)"; ok=0; }; \
 	$(SPINEL) test/infer/string_handle_initialize_reader.rb -c --no-line-map -o "$$tmp/shi.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (string_handle_initialize_reader: -c)"; ok=0; }; \
 	grep -q 'sp_Count_initialize(sp_Count \*self, $(STR_SLOT_C) lv_s)' "$$tmp/shi.c" && grep -q 'sp_Name_initialize(sp_Name \*self, $(STR_SLOT_C) lv_s)' "$$tmp/shi.c" && grep -q '$(STR_SLOT_C) lv_line = NULL;' "$$tmp/shi.c" && grep -q 'sp_Grow_initialize(sp_Grow \*self, sp_String \* lv_s)' "$$tmp/shi.c" || { echo "infer-test: FAIL (#6179 an initialize that only reads or keeps its String took the shared handle)"; ok=0; }; \
 	$(SPINEL) test/infer/tally_typed.rb -c --no-line-map -o "$$tmp/tly.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (tally_typed: -c)"; ok=0; }; \
@@ -5298,7 +5348,7 @@ infer-test-1: $(SPINEL) $(SP_RT_LIB)
 	awk '/^[a-z].* sp_sieve\(.*\{$$/,/^}/' "$$tmp/rshc.c" | grep -qE '_hcd[0-9]+_[0-9]+\[_t[0-9]+\] = _t[0-9]+; else sp_IntArray_set\(lv_primes' || { echo "infer-test: FAIL (an Integer Range's step(k) { } still reads its array's header at every store, and the upto around it lost its cache)"; ok=0; }; \
 	awk '/^[a-z].* sp_swaps\(.*\{$$/,/^}/' "$$tmp/rshc.c" | grep -q '^#define _SP_HCR' && { echo "infer-test: FAIL (a step loop that reassigns its array local read it through a cached header)"; ok=0; }; \
 	$(SPINEL) test/loop_string_getbyte_unheld.rb -c --no-line-map -o "$$tmp/lsgu.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_string_getbyte_unheld: -c)"; ok=0; }; \
-	awk '/^[a-z].* sp_(total|edges|uncached)\(.*\{$$/,/^}/' "$$tmp/lsgu.c" | grep -cE 'getbyte_opt\((sp_String_cstr|SP_STR_B)\(lv_rows\), ' | grep -qx 3 || { echo "infer-test: FAIL (String#getbyte with an arithmetic index does not read its receiver where the call needs it)"; ok=0; }; \
+	for f in total edges uncached; do awk "/^[a-z].* sp_$$f\\(.*\\{\$$/,/^}/" "$$tmp/lsgu.c" | grep -qE 'getbyte_opt\((sp_String_cstr|SP_STR_B)\(lv_rows\), ' || { echo "infer-test: FAIL (String#getbyte with an arithmetic index does not read its receiver where the call needs it: $$f)"; ok=0; }; done; \
 	awk '/^[a-z].* sp_(total|edges|uncached)\(.*\{$$/,/^}/' "$$tmp/lsgu.c" | grep -q 'SP_GC_ROOT(_t' && { echo "infer-test: FAIL (String#getbyte with an arithmetic index fetches and roots its receiver's bytes ahead of the index)"; ok=0; }; \
 	awk '/^[a-z].* sp_built\(.*\{$$/,/^}/' "$$tmp/lsgu.c" | grep -qE 'sp_int _t([0-9]+) = [^;]*; sp_str_getbyte_opt\(SP_STR_B\(lv_rows\), _t\1\)' || { echo "infer-test: FAIL (String#getbyte with an index that allocates does not run the index ahead of the receiver's read)"; ok=0; }; \
 	$(SPINEL) test/begin_while_locals_not_volatile.rb -c --no-line-map -o "$$tmp/bwv.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (begin_while_locals_not_volatile: -c)"; ok=0; }; \
@@ -5316,9 +5366,38 @@ infer-test-1: $(SPINEL) $(SP_RT_LIB)
 	$(SPINEL) test/loop_bounded_index_polls.rb -c --no-line-map -o "$$tmp/lbp.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_bounded_index_polls: -c)"; ok=0; }; \
 	grep -F 'while (({ if (SP_UNLIKELY(SP_SAFEPOINT_POLL())) sp_safepoint(), _SP_HCR' "$$tmp/lbp.c" | grep -qF 'sp_fin_run_pending(), _SP_HCR' && grep -qE '_hcd[0-9]+_[0-9]+\[lv_i\]' "$$tmp/lbp.c" || { echo "infer-test: FAIL (a loop that reads a[i] untested does not poll ahead of its i < a.length test)"; ok=0; }; \
 	awk '/^[a-z].* sp_total\(.*\{$$/,/^}/' "$$tmp/lbp.c" | awk 'f { print; exit } /while \(\(\{/ { f = 1 }' | grep -qE 'SP_SAFEPOINT_POLL|SP_FIN_POLL|sp_fin_run_pending' && { echo "infer-test: FAIL (a loop that reads a[i] untested polls between its test and the read)"; ok=0; }; \
-	awk '/^[a-z].* sp_back\(.*\{$$/,/^}/' "$$tmp/lbp.c" | grep -qE '^ +if .*sp_fin_run_pending\(\), _SP_HCR' || { echo "infer-test: FAIL (a cached loop does not read its headers again after a finalizer runs)"; ok=0; }; \
+	awk '/^[a-z].* sp_back\(.*\{$$/,/^}/' "$$tmp/lbp.c" | grep -qE 'sp_fin_run_pending\(\), _SP_HCR' || { echo "infer-test: FAIL (a cached loop does not read its headers again after a finalizer runs)"; ok=0; }; \
+	$(SPINEL) test/loop_chunked_polls.rb -c --no-line-map -o "$$tmp/lcr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_chunked_polls: -c)"; ok=0; }; \
+	$(SPINEL) test/loop_slow_pass_trap.rb -c --no-line-map -o "$$tmp/lst.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_slow_pass_trap: -c)"; ok=0; }; \
+	awk '/^[a-z].* sp_W_top_map\(.*\{$$/,/^}/' "$$tmp/lst.c" | grep -q 'sp_sig_' || { echo "infer-test: FAIL (a map whose pass reads what a String holds takes no signal poll at its step)"; ok=0; }; \
+	awk '/^[a-z].* sp_tight_sum\(.*\{$$/,/^}/' "$$tmp/lst.c" | grep -q 'sp_sig_' && { echo "infer-test: FAIL (a map whose pass reads no String's characters takes a signal poll at each step)"; ok=0; }; \
+	$(SPINEL) test/slow_pass_safepoint.rb -c --no-line-map -o "$$tmp/sps.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (slow_pass_safepoint: -c)"; ok=0; }; \
+	[ "$$(awk '/^[a-z].* sp_nested_walk\(.*\{$$/,/^}/' "$$tmp/sps.c" | grep -c 'SP_SAFEPOINT_POLL')" -ge 2 ] || { echo "infer-test: FAIL (a nested walk whose pass reads what a String holds leaves its safepoint poll to the enclosing loop)"; ok=0; }; \
+	awk '/^[a-z].* sp_slow_map\(.*\{$$/,/^}/' "$$tmp/sps.c" | grep -q 'SP_SAFEPOINT_POLL' || { echo "infer-test: FAIL (a map whose pass reads what a String holds takes no safepoint poll at its step)"; ok=0; }; \
+	awk '/^[a-z].* sp_tight_map\(.*\{$$/,/^}/' "$$tmp/sps.c" | grep -qE 'SP_SAFEPOINT_POLL|sp_fin_pending|sp_sig_' && { echo "infer-test: FAIL (a map whose pass reads no String's characters polls at each step)"; ok=0; }; \
+	awk '/^[a-z].* sp_psum\(.*\{$$/,/^}/' "$$tmp/lcr.c" | grep -qE '\} while \(SP_CHUNK_MORE\(lv_[ij], <, _pr[0-9]+\)\);' || { echo "infer-test: FAIL (a proved loop in a threaded program polls at each pass, not once per run)"; ok=0; }; \
+	awk '/^[a-z].* sp_Box_sum_to\(.*\{$$/,/^}/' "$$tmp/lcr.c" | grep -qE '\} while \(SP_CHUNK_MORE\(lv_[ij], <, _pr[0-9]+\)\);' || { echo "infer-test: FAIL (a loop counted to an instance variable's bound polls at each pass, not once per run)"; ok=0; }; \
+	awk '/^[a-z].* sp_Box_sum_lowered\(.*\{$$/,/^}/' "$$tmp/lcr.c" | grep -q '_pr[0-9]* = ' && { echo "infer-test: FAIL (a loop whose body lowers its bound with &&= runs in chunks to the old bound)"; ok=0; }; \
+	awk '/^[a-z].* sp_(rb_)?char_count\(.*\{$$/,/^}/' "$$tmp/lcr.c" | grep -q '_pr[0-9]* = ' && { echo "infer-test: FAIL (a loop whose pass counts a String's characters runs 1024 of them between polls)"; ok=0; }; \
+	awk '/^[a-z].* sp_(rb_)?char_rows\(.*\{$$/,/^}/' "$$tmp/lcr.c" | grep -qF 'while (({ if (SP_UNLIKELY(SP_SAFEPOINT_POLL())) sp_safepoint(), _SP_HCR' || { echo "infer-test: FAIL (a nested loop whose pass counts a String's characters leaves its polls to the enclosing loop)"; ok=0; }; \
+	for f in yield_chars yield_grow; do awk "/^[a-z].* sp_(rb_)?$$f\\(.*\\{\$$/,/^}/" "$$tmp/lcr.c" | grep -qF 'while (({ if (SP_UNLIKELY(SP_SAFEPOINT_POLL())) sp_safepoint(), ' || { echo "infer-test: FAIL (a nested loop whose yield splices in a block that counts characters or grows its array leaves its polls to the enclosing loop: $$f)"; ok=0; }; done; \
+	$(SPINEL) test/loop_chunked_polls.rb --int-overflow=wrap -c --no-line-map -o "$$tmp/lcw.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_chunked_polls: -c wrap)"; ok=0; }; \
+	awk '/^[a-z].* sp_Box_sum_to\(.*\{$$/,/^}/' "$$tmp/lcw.c" | grep -qF '= SP_CHUNK_RUN(lv_j, self->iv_n, 1024, 1LL, 1, 0);' || { echo "infer-test: FAIL (a chunked loop's run is not SP_CHUNK_RUN, whose wrap form counts its passes so a variable that wraps past its bound reaches a poll)"; ok=0; }; \
+	$(SPINEL) test/iter_chunked_polls.rb -c --no-line-map -o "$$tmp/icp.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (iter_chunked_polls: -c)"; ok=0; }; \
+	for f in isum wsum byte_total; do awk "/^[a-z].* sp_$$f\\(.*\\{\$$/,/^}/" "$$tmp/icp.c" | grep -q 'sp_chunk_run_end(' || { echo "infer-test: FAIL (a block loop the region holds polls at each pass, not once per run: $$f)"; ok=0; }; done; \
+	awk '/^[a-z].* sp_lens\(.*\{$$/,/^}/' "$$tmp/icp.c" | grep -q 'sp_chunk_run_end(' && { echo "infer-test: FAIL (a block loop whose pass counts a String's characters runs 1024 of them between polls)"; ok=0; }; \
+	awk '/^[a-z].* sp_(rb_)?fill\(.*\{$$/,/^}/' "$$tmp/icp.c" | grep -q 'SP_CHUNK_FITS(' || { echo "infer-test: FAIL (a times whose block stores into an array has no plain loop, though no store grows its count)"; ok=0; }; \
+	awk '/^[a-z].* sp_copy\(.*\{$$/,/^}/' "$$tmp/icp.c" | grep -q 'sp_chunk_run_end(' || { echo "infer-test: FAIL (an each_with_index whose block stores into an array polls at each pass)"; ok=0; }; \
+	awk '/^[a-z].* sp_copy\(.*\{$$/,/^}/' "$$tmp/icp.c" | grep -q 'SP_CHUNK_FITS(' && { echo "infer-test: FAIL (an each_with_index whose block stores into an array runs a plain loop with no poll, though the store may grow the length it walks)"; ok=0; }; \
+	awk '/^[a-z].* sp_until_zero\(.*\{$$/,/^}/' "$$tmp/icp.c" | grep -q 'sp_chunk_run_end(' || { echo "infer-test: FAIL (a block loop whose pass may raise polls at each pass, so a raise mid-run is not tested)"; ok=0; }; \
+	grep -q '/\*@CP' "$$tmp/icp.c" "$$tmp/lcr.c" "$$tmp/lcw.c" && { echo "infer-test: FAIL (a block loop's poll marks were left in the C)"; ok=0; }; \
+	$(SPINEL) test/iter_chunked_polls.rb -c -o "$$tmp/icl.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (iter_chunked_polls: -c with the line map)"; ok=0; }; \
+	for f in isum wsum byte_total; do awk "/^[a-z].* sp_$$f\\(.*\\{\$$/,/^}/" "$$tmp/icl.c" | grep -q 'sp_chunk_run_end(' || { echo "infer-test: FAIL (with the line map's #line directives in its body, a block loop polls at each pass: $$f)"; ok=0; }; done; \
+	$(SPINEL) test/iter_chunked_polls.rb --int-overflow=promote -c --no-line-map -o "$$tmp/icpp.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (iter_chunked_polls: -c promote)"; ok=0; }; \
+	awk '/^[a-z].* sp_fsum\(.*\{$$/,/^}/' "$$tmp/icpp.c" | grep -q '_hcl' || { echo "infer-test: FAIL (a Float Array's walk under promote is not held by a region)"; ok=0; }; \
+	awk '/^[a-z].* sp_fsum\(.*\{$$/,/^}/' "$$tmp/icpp.c" | grep -q 'sp_chunk_run_end(' && { echo "infer-test: FAIL (a block loop under promote, where no region loop takes runs (hc_subtree_slow), runs 1024 passes between polls)"; ok=0; }; \
 	$(SPINEL) test/loop_bounded_index_nested.rb -c --no-line-map -o "$$tmp/lbn.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_bounded_index_nested: -c)"; ok=0; }; \
-	grep -qE '_hcd[0-9]+_[0-9]+\[lv_e\]' "$$tmp/lbn.c" && grep -qE '_hcd[0-9]+_[0-9]+\[lv_ie\]' "$$tmp/lbn.c" && grep -qE '_hcd[0-9]+_[0-9]+\[lv_wi\]' "$$tmp/lbn.c" || { echo "infer-test: FAIL (a while nested in a cached loop is not proved by its own i < a.length test)"; ok=0; }; \
+	grep -qE '_hcd[0-9]+_[0-9]+\[lv_e\]' "$$tmp/lbn.c" && grep -qE '_hcd[0-9]+_[0-9]+\[lv_ie\]' "$$tmp/lbn.c" && grep -qE '_hcd[0-9]+_[0-9]+\[lv_B[0-9]*_[A-Za-z0-9_]*_wi\]' "$$tmp/lbn.c" || { echo "infer-test: FAIL (a while nested in a cached loop is not proved by its own i < a.length test)"; ok=0; }; \
 	grep -qE 'while \(\(lv_e < _hcl[0-9]+_[0-9]+\)\) \{' "$$tmp/lbn.c" || { echo "infer-test: FAIL (a nested loop proved by its i < a.length test that stores no element polls in its own condition)"; ok=0; }; \
 	$(SPINEL) test/loop_bounded_index_nested_quiet.rb -c --no-line-map -o "$$tmp/lbq.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (loop_bounded_index_nested_quiet: -c)"; ok=0; }; \
 	awk '/^[a-z].* sp_quiet_hist\(.*\{$$/,/^}/' "$$tmp/lbq.c" | grep -qE '^ +if \(SP_UNLIKELY\(SP_SAFEPOINT_POLL\(\)\)\) sp_safepoint\(\), _SP_HCR' || { echo "infer-test: FAIL (the loop enclosing a quiet nested loop does not poll at its back-edge)"; ok=0; }; \
@@ -5328,8 +5407,8 @@ infer-test-1: $(SPINEL) $(SP_RT_LIB)
 	grep -q 'sp_IntArray_new_fill(' "$$tmp/anf.c" && grep -q 'sp_FloatArray_new_fill(' "$$tmp/anf.c" || { echo "infer-test: FAIL (Array.new(n, v) on an Integer or Float array grows by n pushes instead of allocating n)"; ok=0; }; \
 	$(SPINEL) test/reader_operands_pure_read.rb -c --no-line-map -o "$$tmp/rop.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (reader_operands_pure_read: -c)"; ok=0; }; \
 	awk '/^[a-z].* sp_total\(/,/^}/' "$$tmp/rop.c" | grep -q 'SP_GC_ROOT(_t' && { echo "infer-test: FAIL (operands that are all pure reads were bound to rooted temps)"; ok=0; }; \
-	grep -qE 'sp_IntArray \* _t[0-9]+ = sp_Loud_vals\(\(sp_Loud \*\)lv_l\); SP_GC_ROOT' "$$tmp/rop.c" || { echo "infer-test: FAIL (a def overriding a reader was taken for a pure field read)"; ok=0; }; \
-	grep -qE '= \(lv_h\)->iv_data; SP_GC_ROOT\(_t' "$$tmp/rop.c" || { echo "infer-test: FAIL (a reader next to a call that reassigns it lost its ordering)"; ok=0; }; \
+	grep -qE 'sp_IntArray \* _t[0-9]+ = sp_Loud_vals\(\(sp_Loud \*\)lv_B[0-9]*_[A-Za-z0-9_]*_l\); SP_GC_ROOT' "$$tmp/rop.c" || { echo "infer-test: FAIL (a def overriding a reader was taken for a pure field read)"; ok=0; }; \
+	grep -qE '= \(lv_B[0-9]*_[A-Za-z0-9_]*_h\)->iv_data; SP_GC_ROOT\(_t' "$$tmp/rop.c" || { echo "infer-test: FAIL (a reader next to a call that reassigns it lost its ordering)"; ok=0; }; \
 	$(SPINEL) test/infer/typed_array_elem_arg_types_param.rb -c --no-line-map -o "$$tmp/tae.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (typed_array_elem_arg_types_param: -c)"; ok=0; }; \
 	grep -Eq 'sp_Plan_write_column\(sp_Plan \*self, sp_o?int lv_wcol\)' "$$tmp/tae.c" || { echo "infer-test: FAIL (an int-array element passed as an argument left the parameter boxed)"; ok=0; }; \
 	grep -q 'sp_Plan_shout(sp_Plan \*self, $(STR_SLOT_C) lv_s)' "$$tmp/tae.c" || { echo "infer-test: FAIL (a String-array element passed as an argument left the parameter boxed)"; ok=0; }; \
@@ -5362,13 +5441,13 @@ infer-test-1: $(SPINEL) $(SP_RT_LIB)
 	grep -q 'sp_ofloat_cmp_opnd(sp_FloatArray_oget(lv_a, ' "$$tmp/fefp.c" && ! grep -q 'SP_FLOAT_NIL_CMP_CK(' "$$tmp/fefp.c" || { echo "infer-test: FAIL (a Float array element in a comparison took the up-front nil check of both operands instead of the nil-free read)"; ok=0; }; \
 	$(SPINEL) test/infer/object_array_map.rb -c --no-line-map -o "$$tmp/oam.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (object_array_map: -c)"; ok=0; }; \
 	grep -q 'sp_PtrArray \* iv_list;' "$$tmp/oam.c" || { echo "infer-test: FAIL (#4846 an array of one class walked by map stayed boxed)"; ok=0; }; \
-	grep -q '(lv_x)->iv_name' "$$tmp/oam.c" || { echo "infer-test: FAIL (#4846 an element call is not a direct read)"; ok=0; }; \
+	grep -q '(lv_B[0-9]*_[A-Za-z0-9_]*_x)->iv_name' "$$tmp/oam.c" || { echo "infer-test: FAIL (#4846 an element call is not a direct read)"; ok=0; }; \
 	rounds=$$(SP_FIXPOINT_LOG=1 $(SPINEL) test/infer/object_array_each.rb -c --no-line-map -o "$$tmp/oae.c" 2>&1 | sed -n 's/^\[fp\] rounds=\([0-9]*\).*/\1/p' | tail -1); \
 	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count for object_array_each)"; ok=0;; \
 	  *) [ "$$rounds" -lt 128 ] || { echo "infer-test: FAIL (an each walk's parameter pin and its boxed binding traded the parameter every round: the fixpoint ran to its cap)"; ok=0; };; \
 	esac; \
 	grep -q 'sp_PtrArray \* iv_pts;' "$$tmp/oae.c" || { echo "infer-test: FAIL (an array of one class whose class defines each stayed boxed through a walk)"; ok=0; }; \
-	[ "$$(grep -cE '\(lv_pt__bp[A-Za-z0-9_]+\)->iv_x' "$$tmp/oae.c")" = 3 ] || { echo "infer-test: FAIL (an each, reverse_each or each_with_index walk over an array of one class bound its parameter boxed)"; ok=0; }; \
+	[ "$$(grep -oE '\(lv_B[0-9]*_[A-Za-z0-9_]*_pt\)->iv_x' "$$tmp/oae.c" | sort -u | wc -l | tr -d ' ')" = 3 ] || { echo "infer-test: FAIL (an each, reverse_each or each_with_index walk over an array of one class bound its parameter boxed)"; ok=0; }; \
 	rm -rf "$$tmp"; \
 	if [ $$ok -eq 1 ]; then echo "infer-test: pass (1 of 2)"; else exit 1; fi
 infer-test-2: $(SPINEL) $(SP_RT_LIB)
@@ -5403,13 +5482,13 @@ infer-test-2: $(SPINEL) $(SP_RT_LIB)
 	$(SPINEL) test/table_printed_user_puts.rb -c --no-line-map -o "$$tmp/tpu.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (table_printed_user_puts: -c)"; ok=0; }; \
 	grep -qE '^ +sp_PolyArray \* lv_x = NULL;$$' "$$tmp/tpu.c" || { echo "infer-test: FAIL (a table handed to the program's own puts narrowed)"; ok=0; }; \
 	$(SPINEL) test/table_walk_row_each_proc.rb -c --no-line-map -o "$$tmp/twr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (table_walk_row_each_proc: -c)"; ok=0; }; \
-	awk '/^static inline sp_PolyArray \* sp_run\(sp_PtrArray \* lv_xs\) \{$$/ { f = 1 } f && /^}/ { exit } f' "$$tmp/twr.c" | grep -qE '^ +sp_IntArray \* lv_row__bp[0-9a-z_]* = NULL;$$' || { echo "infer-test: FAIL (a walk over a parameter's table of Integer rows kept its row boxed)"; ok=0; }; \
-	awk '/^static inline sp_RbVal sp_floats\(sp_PtrArray \* lv_xs\) \{$$/ { f = 1 } f && /^}/ { exit } f' "$$tmp/twr.c" | grep -qE '^ +sp_FloatArray \* lv_row__bp[0-9a-z_]* = NULL;$$' || { echo "infer-test: FAIL (a walk over a parameter's table of Float rows kept its row boxed)"; ok=0; }; \
+	awk '/^static inline sp_PolyArray \* sp_run\(sp_PtrArray \* lv_xs\) \{$$/ { f = 1 } f && /^}/ { exit } f' "$$tmp/twr.c" | grep -qE '^ +sp_IntArray \* lv_B[0-9]*_[A-Za-z0-9_]*_row = NULL;$$' || { echo "infer-test: FAIL (a walk over a parameter's table of Integer rows kept its row boxed)"; ok=0; }; \
+	awk '/^static inline sp_RbVal sp_floats\(sp_PtrArray \* lv_xs\) \{$$/ { f = 1 } f && /^}/ { exit } f' "$$tmp/twr.c" | grep -qE '^ +sp_FloatArray \* lv_B[0-9]*_[A-Za-z0-9_]*_row = NULL;$$' || { echo "infer-test: FAIL (a walk over a parameter's table of Float rows kept its row boxed)"; ok=0; }; \
 	$(SPINEL) test/object_array_reader_boxed_receiver.rb -c --no-line-map -o "$$tmp/orb.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (object_array_reader_boxed_receiver: -c)"; ok=0; }; \
 	[ "$$(awk '/^struct sp_(Node|Box|Crate|Pile|Bin)_s \{/ { c = $$2 } c && /iv_(links|items|first|slots)/ { print c, $$1; c = "" }' "$$tmp/orb.c" | tr '\n' ' ')" = "sp_Node_s sp_PtrArray sp_Box_s sp_PolyArray sp_Crate_s sp_PolyArray sp_Pile_s sp_PolyArray sp_Bin_s sp_PolyArray " ] || { echo "infer-test: FAIL (a reader called on a boxed value of one class kept its list boxed, or one that another class, a builtin or a foreign element could reach narrowed it)"; ok=0; }; \
 	$(SPINEL) test/one_class_hash_read_local.rb -c --no-line-map -o "$$tmp/ohr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (one_class_hash_read_local: -c)"; ok=0; }; \
 	[ "$$(awk '/^struct sp_(Lru|Nd)_s \{/ { c = $$2 } /^\}/ { c = "" } c && /^ +[a-zA-Z_]+ \*? ?iv_(h|head|nxt);/ { print c, $$1, $$NF }' "$$tmp/ohr.c" | tr '\n' ' ')" = "sp_Nd_s sp_Nd iv_nxt; sp_Lru_s sp_StrPolyHash iv_h; sp_Lru_s sp_Nd iv_head; " ] || { echo "infer-test: FAIL (a one-class hash read kept in a local boxed what it reached)"; ok=0; }; \
-	[ "$$(grep -c 'sp_Nd \* lv_n = NULL;' "$$tmp/ohr.c")" = 2 ] && grep -q 'sp_Lru_touch(sp_Lru \*self, sp_Nd \* lv_n) {' "$$tmp/ohr.c" && grep -q 'sp_RbVal lv_v = sp_box_nil();' "$$tmp/ohr.c" || { echo "infer-test: FAIL (a one-class hash read's local stayed boxed, or a mixed hash's read narrowed)"; ok=0; }; \
+	[ "$$(grep -c 'sp_Nd \* lv_n = NULL;' "$$tmp/ohr.c")" = 2 ] && grep -q 'sp_Lru_touch(sp_Lru \*self, sp_Nd \* lv_n) {' "$$tmp/ohr.c" && grep -q 'sp_RbVal lv_B[0-9]*_[A-Za-z0-9_]*_v = sp_box_nil();' "$$tmp/ohr.c" || { echo "infer-test: FAIL (a one-class hash read's local stayed boxed, or a mixed hash's read narrowed)"; ok=0; }; \
 	$(SPINEL) test/field_from_unpassed_nil_param.rb -c --no-line-map -o "$$tmp/fnp.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (field_from_unpassed_nil_param: -c)"; ok=0; }; \
 	[ "$$(awk '/^struct sp_[A-Za-z]+_s \{/ { c = $$2 } /^\}/ { c = "" } c && /^ +[a-zA-Z_]+ \*? ?iv_(prev|next|last|flag);/ { print c, $$1, $$NF }' "$$tmp/fnp.c" | tr '\n' ' ')" = "sp_Node_s sp_Node iv_prev; sp_Node_s sp_Node iv_next; sp_BySend_s sp_String iv_prev; sp_ByAliasMethod_s sp_String iv_prev; sp_BySuper_s sp_String iv_prev; sp_BySuperKid_s sp_String iv_prev; sp_ByZsuper_s sp_String iv_prev; sp_ByZsuperKid_s sp_String iv_prev; sp_ByBind_s sp_String iv_prev; sp_Rewritten_s sp_String iv_prev; sp_BySelfNew_s sp_String iv_prev; sp_ByCoerce_s sp_RbVal iv_last; sp_ExecTarget_s sp_RbVal iv_flag; sp_BaseInit_s sp_String iv_prev; sp_ChildNew_s sp_String iv_prev; sp_ExecA_s sp_RbVal iv_flag; sp_ExecB_s sp_RbVal iv_flag; sp_Plain_s sp_Plain iv_prev; sp_PlainKid_s sp_Plain iv_prev; " ] || { echo "infer-test: FAIL (a field written from a never-supplied nil parameter stayed boxed, or one a call can supply narrowed)"; ok=0; }; \
 	$(SPINEL) test/infer/obj_array_literal_arg.rb -c --no-line-map -o "$$tmp/oal.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (obj_array_literal_arg: -c)"; ok=0; }; \
@@ -5596,18 +5675,18 @@ infer-test-2: $(SPINEL) $(SP_RT_LIB)
 	awk '/^struct sp_OwnEach_s \{/,/^\}/' "$$tmp/cww.c" | grep -Fq 'sp_PolyArray * iv_output;' || { echo "infer-test: FAIL (the walk ending the block of a program's own each narrowed)"; ok=0; }; \
 	$(SPINEL) test/nested_table_iter.rb -c --no-line-map -o "$$tmp/nti.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile nested_table_iter)"; exit 1; }; \
 	grep -Eq 'sp_mul\(sp_PtrArray \* *lv_a, sp_PtrArray \* *lv_b\)' "$$tmp/nti.c" || { echo "infer-test: FAIL (a nested table passed as a method argument stayed boxed)"; grep -E 'sp_mul\(' "$$tmp/nti.c" | head -1; ok=0; }; \
-	grep -Eq 'sp_FloatArray \* *lv_bj' "$$tmp/nti.c" || { echo "infer-test: FAIL (each_with_index on that argument did not yield a float row)"; ok=0; }; \
-	grep -Eq 'sp_FloatArray_o?get\(lv_bj,' "$$tmp/nti.c" || { echo "infer-test: FAIL (the zip read the yielded row through the poly accessor)"; ok=0; }; \
+	grep -Eq 'sp_FloatArray \* *lv_B[0-9]*_[A-Za-z0-9_]*_bj' "$$tmp/nti.c" || { echo "infer-test: FAIL (each_with_index on that argument did not yield a float row)"; ok=0; }; \
+	grep -Eq 'sp_FloatArray_o?get\(lv_B[0-9]*_[A-Za-z0-9_]*_bj,' "$$tmp/nti.c" || { echo "infer-test: FAIL (the zip read the yielded row through the poly accessor)"; ok=0; }; \
 	grep -Eq 'sp_PtrArray \* *lv_c' "$$tmp/nti.c" || { echo "infer-test: FAIL (each_with_index on the result table left it boxed)"; ok=0; }; \
-	grep -Eq 'sp_FloatArray \* *lv_ci' "$$tmp/nti.c" || { echo "infer-test: FAIL (each_with_index on the result table did not yield a float row)"; ok=0; }; \
+	grep -Eq 'sp_FloatArray \* *lv_B[0-9]*_[A-Za-z0-9_]*_ci' "$$tmp/nti.c" || { echo "infer-test: FAIL (each_with_index on the result table did not yield a float row)"; ok=0; }; \
 	grep -Eq 'sp_PtrArray \* *lv_other' "$$tmp/nti.c" || { echo "infer-test: FAIL (a nested table passed as zip'\''s other operand stayed boxed)"; ok=0; }; \
-	grep -Eq 'sp_IntArray \* *lv_o' "$$tmp/nti.c" || { echo "infer-test: FAIL (zip did not yield an int row from that operand)"; ok=0; }; \
-	grep -q 'sp_poly_arr_get' "$$tmp/nti.c" && grep -v -E 'lv_[abc]__bp[A-Za-z0-9_]+ = sp_poly_arr_get\(' "$$tmp/nti.c" | grep -q 'sp_poly_arr_get' && { echo "infer-test: FAIL (a nested-table iterator still read through sp_poly_arr_get)"; ok=0; }; \
+	grep -Eq 'sp_IntArray \* *lv_B[0-9]*_[A-Za-z0-9_]*_o' "$$tmp/nti.c" || { echo "infer-test: FAIL (zip did not yield an int row from that operand)"; ok=0; }; \
+	grep -q 'sp_poly_arr_get' "$$tmp/nti.c" && grep -v -E 'lv_B[0-9]+_[A-Za-z0-9_]+_[abc] = sp_poly_arr_get\(' "$$tmp/nti.c" | grep -q 'sp_poly_arr_get' && { echo "infer-test: FAIL (a nested-table iterator still read through sp_poly_arr_get)"; ok=0; }; \
 	grep -Eq 'sp_PtrArray \* *lv_rows' "$$tmp/nti.c" || { echo "infer-test: FAIL (the int table walked by each lost its typed representation)"; ok=0; }; \
 	grep -Eq 'sp_PtrArray \* *lv_frows' "$$tmp/nti.c" || { echo "infer-test: FAIL (the float table walked by each lost its typed representation)"; ok=0; }; \
-	grep -Eq 'lv_[abc]__bp[A-Za-z0-9_]+ = sp_PtrArray_get' "$$tmp/nti.c" && { echo "infer-test: FAIL (a row pointer was assigned to a parameter of a split block)"; ok=0; }; \
+	grep -Eq 'lv_B[0-9]+_[A-Za-z0-9_]+_[abc] = sp_PtrArray_get' "$$tmp/nti.c" && { echo "infer-test: FAIL (a row pointer was assigned to a parameter of a split block)"; ok=0; }; \
 	$(SPINEL) test/infer/nested_row_poly_param.rb -c --no-line-map -o "$$tmp/nrp.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile nested_row_poly_param)"; exit 1; }; \
-	grep -Eq 'lv_r = sp_box_nullable_obj\(\(void \*\)\((sp_PtrArray_get\(lv_rows,|lv_r__bpin\))' "$$tmp/nrp.c" || { echo "infer-test: FAIL (a boxed block parameter over a nested table was not given the row pointer)"; ok=0; }; \
+	grep -Eq 'lv_B[0-9]*_[A-Za-z0-9_]*_r = sp_box_nullable_obj\(\(void \*\)\((sp_PtrArray_get\(lv_rows,|lv_P_B[0-9]*_[A-Za-z0-9_]*_r\))' "$$tmp/nrp.c" || { echo "infer-test: FAIL (a boxed block parameter over a nested table was not given the row pointer)"; ok=0; }; \
 	grep -q 'lv_r = sp_PtrArray_get' "$$tmp/nrp.c" && { echo "infer-test: FAIL (a void * row was assigned straight into the boxed parameter)"; ok=0; }; \
 	$(SPINEL) test/infer/generator_element_cycle.rb -c --no-line-map -o "$$tmp/g.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile generator_element_cycle)"; exit 1; }; \
 	grep -Eq 'static (inline )?((__attribute__\(\(always_inline\)\)|SP_ALWAYS_INLINE) )?sp_int sp_F_s_add\(sp_o?int [A-Za-z_]+, sp_o?int [A-Za-z_]+\)' "$$tmp/g.c" || { echo "infer-test: FAIL (a generator whose element feeds back into its own operands latched a poly array)"; grep -E 'sp_F_s_add\(' "$$tmp/g.c" | head -1; ok=0; }; \
@@ -5634,6 +5713,8 @@ infer-test-2: $(SPINEL) $(SP_RT_LIB)
 	if $(SPINEL) test/method_capture_boxed_arg_hash_param.rb -c --no-line-map -o "$$tmp/mhp.c" >/dev/null 2>"$$tmp/mhp.err"; then \
 	! grep -q 'did not converge' "$$tmp/mhp.err" && grep -Eq 'sp_put\(sp_RbVal lv_hash\)' "$$tmp/mhp.c" || { echo "infer-test: FAIL (a captured method's Hash parameter that a Method call hands a boxed argument was narrowed and boxed again every round, or ended narrowed)"; ok=0; }; \
 	else echo "infer-test: FAIL (compile method_capture_boxed_arg_hash_param)"; ok=0; fi; \
+	$(SPINEL) test/builtin_reopen_yield_tap.rb -c --no-line-map -o "$$tmp/ryt.c" >/dev/null 2>"$$tmp/ryt.err" || { echo "infer-test: FAIL (compile builtin_reopen_yield_tap)"; ok=0; }; \
+	! grep -q 'did not converge' "$$tmp/ryt.err" || { echo "infer-test: FAIL (a tap or then of a String, Symbol, Float or Range reopen typed its block parameter as the receiver and as the method's yield on alternate rounds: the fixpoint ran to its cap)"; ok=0; }; \
 	$(SPINEL) test/infer/dead_constructor_no_arm.rb -c --no-line-map -o "$$tmp/dc.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile dead_constructor_no_arm)"; exit 1; }; \
 	grep -q 'sp_poly_add' "$$tmp/dc.c" && { echo "infer-test: FAIL (a class constructed only in dead code widened a poly receiver's field read to poly)"; ok=0; }; \
 	grep -Eq '(sp_int_add\(|sp_o?int _t[0-9]+ = )\(\{ sp_RbVal _t[0-9]+ = lv_d; sp_o?int _t[0-9]+ = (0|sp_oint_nil\(\)); switch' "$$tmp/dc.c" || { echo "infer-test: FAIL (the field read of a boxed receiver did not stay an int switch, or its receiver is rooted for an arm that cannot run)"; ok=0; }; \
@@ -5671,6 +5752,10 @@ infer-test-2: $(SPINEL) $(SP_RT_LIB)
 	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count for default_object_array_param_converges)"; ok=0;; \
 	  *) [ "$$rounds" -lt 128 ] || { echo "infer-test: FAIL (a [Info.new] default joined its poly array into an object-array parameter every round: the fixpoint ran to its cap)"; ok=0; };; \
 	esac; \
+	rounds=$$(SP_FIXPOINT_LOG=1 $(SPINEL) test/class_value_new_object_array_param_converges.rb -c --no-line-map -o "$$tmp/cvn.c" 2>&1 | sed -n 's/^\[fp\] rounds=\([0-9]*\).*/\1/p' | tail -1); \
+	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count for class_value_new_object_array_param_converges)"; ok=0;; \
+	  *) [ "$$rounds" -lt 128 ] || { echo "infer-test: FAIL (a new on a Class value joined its argument into an object-array parameter of an initialize every round: the fixpoint ran to its cap)"; ok=0; };; \
+	esac; \
 	rounds=$$(SP_FIXPOINT_LOG=1 $(SPINEL) test/infer/reopen_implicit_self_converges.rb -c --no-line-map -o "$$tmp/ris.c" 2>&1 | sed -n 's/^\[fp\] rounds=\([0-9]*\).*/\1/p' | tail -1); \
 	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count for reopen_implicit_self_converges)"; ok=0;; \
 	  *) [ "$$rounds" -lt 128 ] || { echo "infer-test: FAIL (a bare call in a Time reopen was tried on a new self node every round, and the types moved: the fixpoint ran to its cap)"; ok=0; };; \
@@ -5696,41 +5781,41 @@ infer-test-2: $(SPINEL) $(SP_RT_LIB)
 	$(SPINEL) test/infer/inline_force_fanout.rb -c --no-line-map -o "$$tmp/iff.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile inline_force_fanout)"; exit 1; }; \
 	grep -q 'SP_ALWAYS_INLINE [^(]* sp_f4(' "$$tmp/iff.c" && { echo "infer-test: FAIL (forced inlining copied a small-method chain past the size budget)"; ok=0; }; \
 	$(SPINEL) test/infer/block_kept_through_or.rb -c --no-line-map -o "$$tmp/bko.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile block_kept_through_or)"; exit 1; }; \
-	grep -q 'sp_RbVal lv_okaa' "$$tmp/bko.c" || { echo "infer-test: FAIL (a block kept through the left of a || did not widen its parameters)"; ok=0; }; \
-	grep -q 'sp_int lv_alaa' "$$tmp/bko.c" || { echo "infer-test: FAIL (the left of an && widened a block parameter it does not let go)"; ok=0; }; \
-	grep -q 'sp_int lv_opaa' "$$tmp/bko.c" || { echo "infer-test: FAIL (a || a predicate reads widened a block parameter it does not let go)"; ok=0; }; \
-	grep -q 'sp_int lv_onaa' "$$tmp/bko.c" || { echo "infer-test: FAIL (a || nested in the left of an && widened a block parameter it does not let go)"; ok=0; }; \
-	grep -q 'sp_int lv_oraa' "$$tmp/bko.c" || { echo "infer-test: FAIL (the right of a || a predicate reads widened a block parameter it does not let go)"; ok=0; }; \
-	grep -q 'sp_RbVal lv_orkaa' "$$tmp/bko.c" || { echo "infer-test: FAIL (a block kept through the right of a parenthesized || did not widen its parameters)"; ok=0; }; \
+	grep -q 'sp_RbVal lv_B[0-9]*_[A-Za-z0-9_]*_okaa' "$$tmp/bko.c" || { echo "infer-test: FAIL (a block kept through the left of a || did not widen its parameters)"; ok=0; }; \
+	grep -q 'sp_int lv_B[0-9]*_[A-Za-z0-9_]*_alaa' "$$tmp/bko.c" || { echo "infer-test: FAIL (the left of an && widened a block parameter it does not let go)"; ok=0; }; \
+	grep -q 'sp_int lv_B[0-9]*_[A-Za-z0-9_]*_opaa' "$$tmp/bko.c" || { echo "infer-test: FAIL (a || a predicate reads widened a block parameter it does not let go)"; ok=0; }; \
+	grep -q 'sp_int lv_B[0-9]*_[A-Za-z0-9_]*_onaa' "$$tmp/bko.c" || { echo "infer-test: FAIL (a || nested in the left of an && widened a block parameter it does not let go)"; ok=0; }; \
+	grep -q 'sp_int lv_B[0-9]*_[A-Za-z0-9_]*_oraa' "$$tmp/bko.c" || { echo "infer-test: FAIL (the right of a || a predicate reads widened a block parameter it does not let go)"; ok=0; }; \
+	grep -q 'sp_RbVal lv_B[0-9]*_[A-Za-z0-9_]*_orkaa' "$$tmp/bko.c" || { echo "infer-test: FAIL (a block kept through the right of a parenthesized || did not widen its parameters)"; ok=0; }; \
 	$(SPINEL) test/infer/yield_splat_int_params.rb -c --no-line-map -o "$$tmp/ysi.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile yield_splat_int_params)"; exit 1; }; \
-	for m in 'sp_oint lv_e = ' 'sp_oint lv_f = ' 'sp_int_mul(sp_oint_val(lv_e, "\*"), sp_oint_opnd(lv_f))'; do \
+	for m in 'sp_oint lv_B[0-9]*_[A-Za-z0-9_]*_e = ' 'sp_oint lv_B[0-9]*_[A-Za-z0-9_]*_f = ' 'sp_int_mul(sp_oint_val(lv_B[0-9]*_[A-Za-z0-9_]*_e, "\*"), sp_oint_opnd(lv_B[0-9]*_[A-Za-z0-9_]*_f))'; do \
 	  grep -q "$$m" "$$tmp/ysi.c" || { echo "infer-test: FAIL (yield(*xs) of an Integer array left a block parameter boxed: $$m)"; ok=0; }; \
 	done; \
-	grep -q 'sp_oint lv_a = ' "$$tmp/ysi.c" && grep -q 'sp_oint lv_b = ' "$$tmp/ysi.c" || { echo "infer-test: FAIL (a yield(*xs) reached before xs is typed boxed its block parameters for good)"; ok=0; }; \
-	grep -q 'sp_box_oint(lv_h)' "$$tmp/ysi.c" || { echo "infer-test: FAIL (a block parameter yield(*xs) may leave without a value is not marked nullable)"; ok=0; }; \
-	grep -q 'sp_box_int(lv_d)' "$$tmp/ysi.c" || { echo "infer-test: FAIL (the parameters of yield(*[i, i + 1]) test for a nil they cannot hold)"; ok=0; }; \
+	grep -q 'sp_oint lv_B[0-9]*_[A-Za-z0-9_]*_a = ' "$$tmp/ysi.c" && grep -q 'sp_oint lv_B[0-9]*_[A-Za-z0-9_]*_b = ' "$$tmp/ysi.c" || { echo "infer-test: FAIL (a yield(*xs) reached before xs is typed boxed its block parameters for good)"; ok=0; }; \
+	grep -q 'sp_box_oint(lv_B[0-9]*_[A-Za-z0-9_]*_h)' "$$tmp/ysi.c" || { echo "infer-test: FAIL (a block parameter yield(*xs) may leave without a value is not marked nullable)"; ok=0; }; \
+	grep -q 'sp_box_int(lv_B[0-9]*_[A-Za-z0-9_]*_d)' "$$tmp/ysi.c" || { echo "infer-test: FAIL (the parameters of yield(*[i, i + 1]) test for a nil they cannot hold)"; ok=0; }; \
 	$(SPINEL) test/infer/yield_nil_int_params.rb -c --no-line-map -o "$$tmp/yni.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile yield_nil_int_params)"; exit 1; }; \
-	for m in 'sp_oint lv_a = ' 'sp_oint lv_d = ' 'sp_oint lv_f = ' 'sp_oint lv_g = '; do \
+	for m in 'sp_oint lv_B[0-9]*_[A-Za-z0-9_]*_a = ' 'sp_oint lv_B[0-9]*_[A-Za-z0-9_]*_d = ' 'sp_oint lv_B[0-9]*_[A-Za-z0-9_]*_f = ' 'sp_oint lv_B[0-9]*_[A-Za-z0-9_]*_g = '; do \
 	  grep -q "$$m" "$$tmp/yni.c" || { echo "infer-test: FAIL (a block parameter bound an Integer and nil is boxed: $$m)"; ok=0; }; \
 	done; \
-	grep -q 'lv_a = sp_oint_nil();' "$$tmp/yni.c" && grep -q 'lv_f = sp_oint_nil();' "$$tmp/yni.c" || { echo "infer-test: FAIL (a nil yielded into an Integer block parameter is not its sentinel)"; ok=0; }; \
-	grep -q 'lv_d = (1 < .*sp_unbox_oint(' "$$tmp/yni.c" || { echo "infer-test: FAIL (a nil element of yield(*[i, nil]) is not unboxed to the sentinel)"; ok=0; }; \
-	grep -q 'sp_oint lv_g = (argc > 0) ? (_sp_proc_poly_args\[0\].tag == SP_TAG_NIL ? sp_oint_nil() : sp_oint_of(args\[0\]))' "$$tmp/yni.c" || { echo "infer-test: FAIL (a proc prologue reads a nil argument as 0)"; ok=0; }; \
+	grep -q 'lv_B[0-9]*_[A-Za-z0-9_]*_a = sp_oint_nil();' "$$tmp/yni.c" && grep -q 'lv_B[0-9]*_[A-Za-z0-9_]*_f = sp_oint_nil();' "$$tmp/yni.c" || { echo "infer-test: FAIL (a nil yielded into an Integer block parameter is not its sentinel)"; ok=0; }; \
+	grep -q 'lv_B[0-9]*_[A-Za-z0-9_]*_d = (1 < .*sp_unbox_oint(' "$$tmp/yni.c" || { echo "infer-test: FAIL (a nil element of yield(*[i, nil]) is not unboxed to the sentinel)"; ok=0; }; \
+	grep -q 'sp_oint lv_B[0-9]*_[A-Za-z0-9_]*_g = (argc > 0) ? (_sp_proc_poly_args\[0\].tag == SP_TAG_NIL ? sp_oint_nil() : sp_oint_of(args\[0\]))' "$$tmp/yni.c" || { echo "infer-test: FAIL (a proc prologue reads a nil argument as 0)"; ok=0; }; \
 	$(SPINEL) test/infer/yield_nil_float_params.rb -c --no-line-map -o "$$tmp/ynf.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile yield_nil_float_params)"; exit 1; }; \
-	for m in 'sp_ofloat lv_a = ' 'sp_ofloat lv_b = ' 'sp_ofloat lv_c = ' 'sp_ofloat lv_g = ' 'sp_ofloat lv_k = ' 'sp_ofloat lv_m = '; do \
+	for m in 'sp_ofloat lv_B[0-9]*_[A-Za-z0-9_]*_a = ' 'sp_ofloat lv_B[0-9]*_[A-Za-z0-9_]*_b = ' 'sp_ofloat lv_B[0-9]*_[A-Za-z0-9_]*_c = ' 'sp_ofloat lv_B[0-9]*_[A-Za-z0-9_]*_g = ' 'sp_ofloat lv_B[0-9]*_[A-Za-z0-9_]*_k = ' 'sp_ofloat lv_B[0-9]*_[A-Za-z0-9_]*_m = '; do \
 	  grep -q "$$m" "$$tmp/ynf.c" || { echo "infer-test: FAIL (a Float block parameter bound nothing or nil is boxed: $$m)"; ok=0; }; \
 	done; \
-	grep -q 'sp_box_ofloat(lv_f)' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a Float block parameter yield(*xs) may leave without a value is not marked nullable)"; ok=0; }; \
-	grep -q 'lv_c = sp_ofloat_nil();' "$$tmp/ynf.c" && grep -q 'lv_k = sp_ofloat_nil();' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a nil yielded into a Float block parameter is not its sentinel)"; ok=0; }; \
-	grep -q 'lv_g = (1 < .*sp_unbox_ofloat(' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a nil element of yield(*[x, nil]) is not unboxed to the Float sentinel)"; ok=0; }; \
-	grep -q 'sp_ofloat lv_m = (argc > 0) ? sp_unbox_ofloat(_sp_proc_poly_args\[0\])' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a proc prologue reads a nil Float argument as 0.0)"; ok=0; }; \
+	grep -q 'sp_box_ofloat(lv_B[0-9]*_[A-Za-z0-9_]*_f)' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a Float block parameter yield(*xs) may leave without a value is not marked nullable)"; ok=0; }; \
+	grep -q 'lv_B[0-9]*_[A-Za-z0-9_]*_c = sp_ofloat_nil();' "$$tmp/ynf.c" && grep -q 'lv_B[0-9]*_[A-Za-z0-9_]*_k = sp_ofloat_nil();' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a nil yielded into a Float block parameter is not its sentinel)"; ok=0; }; \
+	grep -q 'lv_B[0-9]*_[A-Za-z0-9_]*_g = (1 < .*sp_unbox_ofloat(' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a nil element of yield(*[x, nil]) is not unboxed to the Float sentinel)"; ok=0; }; \
+	grep -q 'sp_ofloat lv_B[0-9]*_[A-Za-z0-9_]*_m = (argc > 0) ? sp_unbox_ofloat(_sp_proc_poly_args\[0\])' "$$tmp/ynf.c" || { echo "infer-test: FAIL (a proc prologue reads a nil Float argument as 0.0)"; ok=0; }; \
 	$(SPINEL) test/infer/yield_splat_rows_sure.rb -c --no-line-map -o "$$tmp/ysr.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile yield_splat_rows_sure)"; exit 1; }; \
-	for m in 'sp_oint lv_a = ' 'sp_oint lv_b = ' 'sp_oint lv_c = ' 'sp_int_mul(sp_oint_val(lv_b, "\*"), sp_oint_opnd(lv_c))'; do \
+	for m in 'sp_oint lv_B[0-9]*_[A-Za-z0-9_]*_a = ' 'sp_oint lv_B[0-9]*_[A-Za-z0-9_]*_b = ' 'sp_oint lv_B[0-9]*_[A-Za-z0-9_]*_c = ' 'sp_int_mul(sp_oint_val(lv_B[0-9]*_[A-Za-z0-9_]*_b, "\*"), sp_oint_opnd(lv_B[0-9]*_[A-Za-z0-9_]*_c))'; do \
 	  grep -q "$$m" "$$tmp/ysr.c" || { echo "infer-test: FAIL (yield(*row) of an Integer table's row left a block parameter boxed: $$m)"; ok=0; }; \
 	done; \
-	grep -q 'sp_box_oint(lv_d)' "$$tmp/ysr.c" || { echo "infer-test: FAIL (a block parameter a short row may leave without a value is not marked nullable)"; ok=0; }; \
-	grep -q 'lv_g = _t[0-9]*->data\[_t[0-9]*->start+0\];' "$$tmp/ysr.c" && grep -q 'lv_h = _t[0-9]*->data\[_t[0-9]*->start+1\];' "$$tmp/ysr.c" || { echo "infer-test: FAIL (yield(*pair) of a literal local no one changes tests a length it cannot lack)"; ok=0; }; \
-	grep -q 'sp_int_mul(lv_g, lv_h)' "$$tmp/ysr.c" && grep -q 'sp_box_int(lv_g)' "$$tmp/ysr.c" || { echo "infer-test: FAIL (yield(*pair) of a literal local no one changes binds a nil it cannot hold)"; ok=0; }; \
+	grep -q 'sp_box_oint(lv_B[0-9]*_[A-Za-z0-9_]*_d)' "$$tmp/ysr.c" || { echo "infer-test: FAIL (a block parameter a short row may leave without a value is not marked nullable)"; ok=0; }; \
+	grep -q 'lv_B[0-9]*_[A-Za-z0-9_]*_g = _t[0-9]*->data\[_t[0-9]*->start+0\];' "$$tmp/ysr.c" && grep -q 'lv_B[0-9]*_[A-Za-z0-9_]*_h = _t[0-9]*->data\[_t[0-9]*->start+1\];' "$$tmp/ysr.c" || { echo "infer-test: FAIL (yield(*pair) of a literal local no one changes tests a length it cannot lack)"; ok=0; }; \
+	grep -q 'sp_int_mul(lv_B[0-9]*_[A-Za-z0-9_]*_g, lv_B[0-9]*_[A-Za-z0-9_]*_h)' "$$tmp/ysr.c" && grep -q 'sp_box_int(lv_B[0-9]*_[A-Za-z0-9_]*_g)' "$$tmp/ysr.c" || { echo "infer-test: FAIL (yield(*pair) of a literal local no one changes binds a nil it cannot hold)"; ok=0; }; \
 	$(SPINEL) test/infer/array_nil_flag_plain_store.rb -c --no-line-map -o "$$tmp/anf.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (array_nil_flag_plain_store: -c)"; ok=0; }; \
 	! grep -q 'sp_IntArray_set_nilable(lv_a, \|sp_IntArray_push_nilable(lv_b, \|sp_FloatArray_set_nilable(lv_f, ' "$$tmp/anf.c" && grep -q '\] = _t[0-9]*; else sp_IntArray_set(lv_a, ' "$$tmp/anf.c" && grep -q 'sp_IntArray_push(lv_b, ' "$$tmp/anf.c" && grep -q 'sp_FloatArray_set(lv_f, ' "$$tmp/anf.c" || { echo "infer-test: FAIL (a loop storing numbers into a typed array took the nil-flag-setting store)"; ok=0; }; \
 	grep -q 'sp_IntArray_push_nilable(lv_c, sp_IntArray_oget(lv_a, ' "$$tmp/anf.c" && grep -q 'sp_IntArray_push_nilable(lv_q, sp_IntArray_pop_o(lv_b))' "$$tmp/anf.c" && grep -q 'sp_IntArray_push(_t[0-9]*, self->iv_v)\|sp_IntArray_push(lv_out, self\(->\|\.\)iv_v)' "$$tmp/anf.c" || { echo "infer-test: FAIL (copying an element or an ivar into a typed array took the nil-flag-setting store)"; ok=0; }; \
@@ -5902,28 +5987,27 @@ source-marker-test: $(SPINEL)
 magic-comment-test: $(SPINEL)
 	@tools/magic_comment_check.sh
 
-# Under --load-model=graph each require's LoadNode carries the file its own
+# Each require's LoadNode carries the file its own
 # call loads, the libraries CRuby has at boot come first in load order, and
 # each required file's top level runs at its require, once; what graph mode
 # does not compile yet it refuses by name (#9898). make test runs it.
 .PHONY: load-graph-test
-test-run: load-graph-test load-model-inline-test
-.PHONY: load-model-inline-test
-load-model-inline-test: $(SPINEL)
-	@ok=1; tmp=$$(mktemp -d /tmp/spinel-lmi.XXXXXX); \
-	for t in $(LOAD_MODEL_INLINE_ONLY); do \
-	  b=$$(basename "$$t" .rb); \
-	  if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/$$b.c" >"$$tmp/$$b.out" 2>&1; then \
-	    echo "load-model-inline-test: FAIL ($$t compiles under the default model: take it off LOAD_MODEL_INLINE_ONLY)"; ok=0; fi; \
-	  if ! $(SPINEL) --load-model=inline "$$t" -o "$$tmp/$$b" >"$$tmp/$$b.out" 2>&1; then \
-	    echo "load-model-inline-test: FAIL ($$t: compile under --load-model=inline)"; sed -n 1,5p "$$tmp/$$b.out"; ok=0; continue; fi; \
-	  "$$tmp/$$b" >"$$tmp/$$b.run" 2>&1; \
-	  cmp -s "$$tmp/$$b.run" "$$t.expected" || \
-	    { echo "load-model-inline-test: FAIL ($$t: output)"; diff -u "$$t.expected" "$$tmp/$$b.run" | head -10; ok=0; }; \
-	done; \
-	[ $$ok = 1 ] && echo "load-model-inline-test: pass" || exit 1
+test-run: load-graph-test decl-test
 load-graph-test: $(SPINEL)
 	@tools/load_graph_check.sh
+
+# The parser's warnings at compile time, -w's under -w (tools/parse_warnings_check.sh).
+.PHONY: parse-warnings-test
+test-run: parse-warnings-test
+parse-warnings-test: $(SPINEL)
+	@tools/parse_warnings_check.sh
+
+# The scope each local variable node, parameter and block-local is declared in
+# (its `decl`, from Prism's scope nesting): test/decl/NAME.decl, written by
+# tools/decl_check.sh --write. make test runs it.
+.PHONY: decl-test
+decl-test: $(SPINEL)
+	@SPINEL=$(SPINEL) tools/decl_check.sh
 
 # SIGINT with no trap: an Interrupt in the main thread (test/signal_default_interrupt.rb),
 # and when nothing rescues it the ensure runs and the process ends by SIGINT, a parent reads 130 (#7202).
@@ -6353,7 +6437,7 @@ LOWER_ROWS_PROGS ?= $(wildcard test/*.rb test/share/*.rb test/share/*/*.rb bench
 KWSPLAT_ROWS_PROGS ?= $(shell grep -l -F '**' $(LOWER_ROWS_PROGS))
 lower-rows-check: $(SPINEL)
 	@printf '%s\n' $(LOWER_ROWS_PROGS) | xargs -P $(NPROC) -n 1 sh -c \
-	  'SPINEL_LOWER_ROWS_CHECK=1 $(SPINEL) --load-model=graph --dump-ast "$$0" 2>&1 >/dev/null | grep "^lower-rows-check"' | \
+	  'SPINEL_LOWER_ROWS_CHECK=1 $(SPINEL) --dump-ast "$$0" 2>&1 >/dev/null | grep "^lower-rows-check"' | \
 	  awk -v want=$(words $(LOWER_ROWS_PROGS)) '/ calls, / { n++; c += $$2; d += $$4; next } { print } \
 	       END { printf "lower-rows-check: %d of %d programs, %d calls, %d disagreements\n", n, want, c, d; exit (d > 0 || n != want) }'
 # The second leg compiles the programs that write `**` (any operand: a
@@ -6362,7 +6446,7 @@ lower-rows-check: $(SPINEL)
 # compares the rows the parse noted for each shape (lr_rows, lr_rows_drop).
 # (-S writes the C to stdout, which is dropped: nothing lands in the tree.)
 	@printf '%s\n' $(KWSPLAT_ROWS_PROGS) | xargs -P $(NPROC) -n 1 sh -c \
-	  'SPINEL_LOWER_ROWS_CHECK=1 $(SPINEL) --load-model=graph -S "$$0" 2>&1 >/dev/null | grep "^lower-rows-check"' | \
+	  'SPINEL_LOWER_ROWS_CHECK=1 $(SPINEL) -S "$$0" 2>&1 >/dev/null | grep "^lower-rows-check"' | \
 	  awk -v want=$(words $(KWSPLAT_ROWS_PROGS)) '/ calls, / { n++; c += $$2; d += $$4; next } { print } \
 	       END { printf "lower-rows-check (after the split): %d of %d programs, %d calls, %d disagreements\n", n, want, c, d; exit (d > 0 || n != want) }'
 
@@ -6403,25 +6487,27 @@ IE_FORWARD_LIMIT ?= 2.5
 # The code generator's scaling: the same two programs compiled to C (-c), where
 # the leg above stops after the analysis (--emit-rbs), so the count also holds
 # every pass the emission runs. gen.sh's C grows linearly (4.03x at 4x the
-# program) but the emission's work does not: the emission alone reads 13.9x
+# program) but the emission's work does not: the emission alone read 13.9x
 # and the whole compile 6.39x. Sampled every 4,096 units, about 470M of the
-# 1.16G units above 4x are walks of the program repeated per call site or per
+# 1.16G units above 4x were walks of the program repeated per call site or per
 # method: singleton_def_of under arity_violation, whose table was cached but
 # rebuilt, a walk of the node table, whenever the emission had added a node
 # since the last call (401 rebuilds for 1,200 calls at 400 units; it is now
-# rebuilt from the declarations alone, which moved this leg's 6.51x to 6.33x:
-# the hashed lookup is not seen here, and no leg fails if the rebuild is
-# put back while this limit stands), fi_fiber_stack_risk under emit_method_signature, and
-# scope_has_return's scan of a node kind under call_breaks. The limit sits
-# just above; lower it as those go. One walk of
-# the node table per emitted method reads 7.66x. The count does not see a
-# scan that compares ids before names: scope_is_shadowed's scan of every
-# later scope, per class at every poly dispatch, was 11% of gen.sh 400's
-# instructions, and answering it from a table (285b5a8ba) moved this leg
+# rebuilt from the declarations alone, which moved this leg's 6.51x to 6.33x),
+# fi_fiber_stack_risk under emit_method_signature (now scanning only
+# NK_ConstantReadNode and NK_CallNode and cached on Compiler as
+# fiber_risk_memo, with method_inline_force fixing its set once per program),
+# and scope_has_return's scan of NK_ReturnNode (now cached per scope on
+# Compiler as scope_ret_has, keyed on nt_kind_gen(NK_ReturnNode) and the scope
+# table). One walk of the node table per emitted method reads 7.66x. The count
+# does not see a scan that compares ids before names: scope_is_shadowed's scan
+# of every later scope, per class at every poly dispatch, was 11% of gen.sh
+# 400's instructions, and answering it from a table (285b5a8ba) moved this leg
 # from 6.40x to 6.39x. Dropping the share rule's wait rounds (#10325) cut the
 # work at both sizes (100: -7.5%, 400: -5.3%) and so raised the ratio from
-# 6.77x to 6.93x: the superlinear part left is a larger share of less work.
-SCALE_CODEGEN_LIMIT ?= 7.0
+# 6.77x to 6.93x before those walks went. Today's ratio is 5.91x (605.2M ->
+# 3,576.7M units); the limit sits ~5% above to lock in the improvement.
+SCALE_CODEGEN_LIMIT ?= 6.2
 # The argument binder's and the block-parameter typing's scaling: the call
 # shapes they plan site by site (test/scale/call_shapes.sh), compiled to C at
 # N=25 and N=100 units. A buffer method a whole name group defines behind a
@@ -6534,8 +6620,8 @@ STRUCT_BLOCKS_LIMIT ?= 2.3
 # the program, and read 2.09x; asked of an index kept for the step
 # (SceConsts), 2.03x. A whole-program rebuild per splice reads as K^2 here.
 SPLICES_LIMIT ?= 2.2
-# Class-body macros (test/scale/class_macros.sh), compiled to C under
-# --load-model=graph at N=100 and N=200 classes of ten calls each to a
+# Class-body macros (test/scale/class_macros.sh), compiled to C at N=100
+# and N=200 classes of ten calls each to a
 # superclass's define_method macro: the walk runs each call at its point and
 # splices the method it makes (ct_macro_form, host_splice). The pair reads
 # 2.00x; a per-splice rebuild of a parent map, the kind lists or the load
@@ -6634,6 +6720,14 @@ INCLUDE_COPIES_LIMIT ?= 2.8
 # the method's writes and reads of the parameter, for each method: 4.00x at
 # 2x the methods; 2.00x with each scope's locals indexed once.
 BLOCK_CONDITIONS_LIMIT ?= 2.2
+# N call sites desugar_missing_method_calls asks of String's chain, N/2
+# mixins long, or splits (test/scale/missing_method_sites.sh), compiled to C
+# at N=400 and N=800: the pass's counted work (node accesses and name
+# compares; the relowering counts each listed send it visits). 3.76x at 2x
+# the sites where each split of a String arm rebuilt the load record's map
+# at the next site's undef ask, outside the plan frame; 2.37x with the
+# asks in the frame (#12542). The limit sits between them.
+MISSING_METHOD_SITES_LIMIT ?= 2.6
 # A chain of forty bangs over a String a method answers, compiled to C with
 # under a CPU-time limit, as the hash-literal fan-out is:
 # strbuf_bang_self_local asked each link once per path that reaches it,
@@ -6653,6 +6747,7 @@ BLOCK_CONDITIONS_LIMIT ?= 2.2
 # prints its count from an atexit handler, also when the compile fails, so
 # reading it alone would accept the ratio of a program that did not build.
 scale-test: $(SPINEL_WORK)
+	@sh test/scale/autoload_diamond.sh $(SPINEL_WORK)
 	@tmp=$$(mktemp -d /tmp/spinel-scale.XXXXXX); \
 	gen () { sh test/scale/$$1.sh $$2 > "$$tmp/$$3" && test -s "$$tmp/$$3" || \
 	  { echo "scale-test: FAIL (test/scale/$$1.sh $$2 failed or wrote no program)"; rm -rf "$$tmp"; exit 1; }; }; \
@@ -6705,18 +6800,18 @@ scale-test: $(SPINEL_WORK)
 	xa=$$(sw -c -o "$$tmp/x2.c" "$$tmp/x2.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	xb=$$(sw -c -o "$$tmp/x4.c" "$$tmp/x4.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	gen class_macros 100 m1.rb; gen class_macros 200 m2.rb; \
-	ma=$$(sw --load-model=graph -c -o "$$tmp/m1.c" "$$tmp/m1.rb") || { rm -rf "$$tmp"; exit 1; }; \
-	mb=$$(sw --load-model=graph -c -o "$$tmp/m2.c" "$$tmp/m2.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	ma=$$(sw -c -o "$$tmp/m1.c" "$$tmp/m1.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	mb=$$(sw -c -o "$$tmp/m2.c" "$$tmp/m2.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	gen class_macros_one "2000 written" o1.rb; gen class_macros_one 2000 o2.rb; \
-	oa=$$(sw --load-model=graph -c -o "$$tmp/o1.c" "$$tmp/o1.rb") || { rm -rf "$$tmp"; exit 1; }; \
-	ob=$$(sw --load-model=graph -c -o "$$tmp/o2.c" "$$tmp/o2.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	oa=$$(sw -c -o "$$tmp/o1.c" "$$tmp/o1.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	ob=$$(sw -c -o "$$tmp/o2.c" "$$tmp/o2.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	gen const_collisions 400 cc4.rb; gen const_collisions 800 cc8.rb; \
 	ccs="qualify_colliding_classes elab_prov_apply elab_header_owner qualify_colliding_reads elab_const_keys"; \
 	cca=$$(sws "$$ccs" -c -o "$$tmp/cc4.c" "$$tmp/cc4.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	ccb=$$(sws "$$ccs" -c -o "$$tmp/cc8.c" "$$tmp/cc8.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	gen class_macro_state 200 cs2.rb; gen class_macro_state 400 cs4.rb; \
-	csa=$$(sw --load-model=graph -c -o "$$tmp/cs2.c" "$$tmp/cs2.rb") || { rm -rf "$$tmp"; exit 1; }; \
-	csb=$$(sw --load-model=graph -c -o "$$tmp/cs4.c" "$$tmp/cs4.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	csa=$$(sw -c -o "$$tmp/cs2.c" "$$tmp/cs2.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	csb=$$(sw -c -o "$$tmp/cs4.c" "$$tmp/cs4.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	gen cond_defs 200 q2.rb; gen cond_defs 400 q4.rb; \
 	qa=$$(sw -c -o "$$tmp/q2.c" "$$tmp/q2.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	qb=$$(sw -c -o "$$tmp/q4.c" "$$tmp/q4.rb") || { rm -rf "$$tmp"; exit 1; }; \
@@ -6735,13 +6830,9 @@ scale-test: $(SPINEL_WORK)
 	gen module_functions 100 jf1.rb; gen module_functions 200 jf2.rb; \
 	jia=$$(sw -c -o "$$tmp/jf1.c" "$$tmp/jf1.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	jib=$$(sw -c -o "$$tmp/jf2.c" "$$tmp/jf2.rb") || { rm -rf "$$tmp"; exit 1; }; \
-	jga=$$(sw --load-model=graph -c -o "$$tmp/jf1.c" "$$tmp/jf1.rb") || { rm -rf "$$tmp"; exit 1; }; \
-	jgb=$$(sw --load-model=graph -c -o "$$tmp/jf2.c" "$$tmp/jf2.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	gen unplaced_definers 200 ue2.rb; gen unplaced_definers 400 ue4.rb; \
 	uea=$$(sw -c -o "$$tmp/ue2.c" "$$tmp/ue2.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	ueb=$$(sw -c -o "$$tmp/ue4.c" "$$tmp/ue4.rb") || { rm -rf "$$tmp"; exit 1; }; \
-	uga=$$(sw --load-model=graph -c -o "$$tmp/ue2.c" "$$tmp/ue2.rb") || { rm -rf "$$tmp"; exit 1; }; \
-	ugb=$$(sw --load-model=graph -c -o "$$tmp/ue4.c" "$$tmp/ue4.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	gen shadowed_extends 400 se4.rb; gen shadowed_extends 800 se8.rb; \
 	gen shadowed_extends "400 plain" sp4.rb; gen shadowed_extends "800 plain" sp8.rb; \
 	sea=$$(sw -c -o "$$tmp/se4.c" "$$tmp/se4.rb") || { rm -rf "$$tmp"; exit 1; }; \
@@ -6757,8 +6848,6 @@ scale-test: $(SPINEL_WORK)
 	gen module_functions "100 read" jr1.rb; gen module_functions "200 read" jr2.rb; \
 	jra=$$(sw -c -o "$$tmp/jr1.c" "$$tmp/jr1.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	jrb=$$(sw -c -o "$$tmp/jr2.c" "$$tmp/jr2.rb") || { rm -rf "$$tmp"; exit 1; }; \
-	jha=$$(sw --load-model=graph -c -o "$$tmp/jr1.c" "$$tmp/jr1.rb") || { rm -rf "$$tmp"; exit 1; }; \
-	jhb=$$(sw --load-model=graph -c -o "$$tmp/jr2.c" "$$tmp/jr2.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	gen include_copies 200 ic2.rb; gen include_copies 400 ic4.rb; \
 	gen include_copies "200 plain" ip2.rb; gen include_copies "400 plain" ip4.rb; \
 	ica=$$(sw -c -o "$$tmp/ic2.c" "$$tmp/ic2.rb") || { rm -rf "$$tmp"; exit 1; }; \
@@ -6780,6 +6869,9 @@ scale-test: $(SPINEL_WORK)
 	gen inherited_class_calls 200 ih2.rb; gen inherited_class_calls 800 ih8.rb; \
 	iha=$$(sws an_class_structure -c -o "$$tmp/ih2.c" "$$tmp/ih2.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	ihb=$$(sws an_class_structure -c -o "$$tmp/ih8.c" "$$tmp/ih8.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	gen missing_method_sites 400 mm4.rb; gen missing_method_sites 800 mm8.rb; \
+	mma=$$(sws desugar_missing_method_calls -c -o "$$tmp/mm4.c" "$$tmp/mm4.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	mmb=$$(sws desugar_missing_method_calls -c -o "$$tmp/mm8.c" "$$tmp/mm8.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	rm -rf "$$tmp"; \
 	if [ -z "$$wa" ] || [ -z "$$wb" ] || [ -z "$$fa" ] || [ -z "$$fb" ] || [ -z "$$pa" ] || [ -z "$$pb" ] || \
 	   [ -z "$$ha" ] || [ -z "$$hb" ] || [ -z "$$ca" ] || [ -z "$$cb" ] || [ -z "$$sa" ] || [ -z "$$sb" ] || \
@@ -6787,9 +6879,8 @@ scale-test: $(SPINEL_WORK)
 	   [ -z "$$xa" ] || [ -z "$$xb" ] || [ -z "$$ma" ] || [ -z "$$mb" ] || [ -z "$$oa" ] || [ -z "$$ob" ] || [ -z "$$qa" ] || [ -z "$$qb" ] || \
 	   [ -z "$$yna" ] || [ -z "$$ynb" ] || [ -z "$$yta" ] || [ -z "$$ytb" ] || \
 	   [ -z "$$uda" ] || [ -z "$$udb" ] || [ -z "$$sba" ] || [ -z "$$sbb" ] || \
-	   [ -z "$$jia" ] || [ -z "$$jib" ] || [ -z "$$jga" ] || [ -z "$$jgb" ] || \
-	   [ -z "$$uea" ] || [ -z "$$ueb" ] || [ -z "$$uga" ] || [ -z "$$ugb" ] || \
-	   [ -z "$$jra" ] || [ -z "$$jrb" ] || [ -z "$$jha" ] || [ -z "$$jhb" ] || \
+	   [ -z "$$jia" ] || [ -z "$$jib" ] || [ -z "$$uea" ] || [ -z "$$ueb" ] || \
+	   [ -z "$$jra" ] || [ -z "$$jrb" ] || \
 	   [ -z "$$sea" ] || [ -z "$$seb" ] || [ -z "$$spa" ] || [ -z "$$spb" ] || \
 	   [ -z "$$ica" ] || [ -z "$$icb" ] || [ -z "$$ipa" ] || [ -z "$$ipb" ] || \
 	   [ -z "$$bca" ] || [ -z "$$bcb" ] || [ -z "$$bpa" ] || [ -z "$$bpb" ]; then \
@@ -6852,24 +6943,15 @@ scale-test: $(SPINEL_WORK)
 	awk -v a="$$uea" -v b="$$ueb" -v lim="$(UNPLACED_DEFINERS_LIMIT)" 'BEGIN { r = b / a; \
 	  printf "scale-test: unplaced definer work at 2x the bodies is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
 	  { echo "scale-test: FAIL (the extents of the bodies without a load point, or a run predicate over them, grew superlinearly: see lr_extents and lr_in_body)"; exit 1; }; \
-	awk -v a="$$uga" -v b="$$ugb" -v lim="$(UNPLACED_DEFINERS_LIMIT)" 'BEGIN { r = b / a; \
-	  printf "scale-test: unplaced definer work at 2x the bodies, under graph, is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
-	  { echo "scale-test: FAIL (the extents of the bodies without a load point, or a run predicate over them, grew superlinearly under graph: see lr_extents and lr_in_body)"; exit 1; }; \
 	awk -v a="$$sba" -v b="$$sbb" -v lim="$(STRUCT_BLOCKS_LIMIT)" 'BEGIN { r = b / a; \
 	  printf "scale-test: Struct block anonymity work at 2x the blocks is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
 	  { echo "scale-test: FAIL (the anonymity pass scanned the program per call of a Struct block: see block_only_declares)"; exit 1; }; \
 	awk -v a="$$jia" -v b="$$jib" -v lim="$(MODULE_FUNCTIONS_LIMIT)" 'BEGIN { r = b / a; \
 	  printf "scale-test: module function work at 2x the modules is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
 	  { echo "scale-test: FAIL (a module function's copy or its mapping to the def grew superlinearly: see ct_def_version and mf_copy_entries)"; exit 1; }; \
-	awk -v a="$$jga" -v b="$$jgb" -v lim="$(MODULE_FUNCTIONS_LIMIT)" 'BEGIN { r = b / a; \
-	  printf "scale-test: module function work at 2x the modules, under graph, is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
-	  { echo "scale-test: FAIL (a module function's copy or its mapping to the def grew superlinearly under graph: see ct_def_version and mf_copy_entries)"; exit 1; }; \
 	awk -v a="$$jra" -v b="$$jrb" -v lim="$(MODULE_FUNCTIONS_LIMIT)" 'BEGIN { r = b / a; \
 	  printf "scale-test: kept extend copy work at 2x the modules is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
 	  { echo "scale-test: FAIL (the calls that meet an extend's version were asked superlinearly: see elab_version_met)"; exit 1; }; \
-	awk -v a="$$jha" -v b="$$jhb" -v lim="$(MODULE_FUNCTIONS_LIMIT)" 'BEGIN { r = b / a; \
-	  printf "scale-test: kept extend copy work at 2x the modules, under graph, is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
-	  { echo "scale-test: FAIL (the calls that meet an extend's version were asked superlinearly under graph: see elab_version_met)"; exit 1; }; \
 	awk -v na="$$sea" -v nb="$$seb" -v ta="$$spa" -v tb="$$spb" -v lim="$(SHADOWED_EXTENDS_LIMIT)" 'BEGIN { a = na - ta; b = nb - tb; \
 	  if (a <= 0 || b <= 0) { printf "scale-test: FAIL (the shadowing classes cost no more than the plain ones, %d - %d and %d - %d: the difference measures nothing; see test/scale/shadowed_extends.sh)\n", na, ta, nb, tb; exit 2 } \
 	  r = b / a; \
@@ -6898,7 +6980,10 @@ scale-test: $(SPINEL_WORK)
 	  { echo "scale-test: FAIL (each class a call may land on asked lookups that answer the same for every class: see ct_face_for)"; exit 1; }; \
 	awk -v a="$$iha" -v b="$$ihb" -v lim="$(INHERITED_CLASS_CALLS_LIMIT)" 'BEGIN { if (a <= 0) a = 1; r = b / a; \
 	  printf "scale-test: inherited class method lookup work at 4x the classes is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
-	  { echo "scale-test: FAIL (each class-body call scanned every scope per ancestor for its name: see comp_scope_batch_begin)"; exit 1; }
+	  { echo "scale-test: FAIL (each class-body call scanned every scope per ancestor for its name: see comp_scope_batch_begin)"; exit 1; }; \
+	awk -v a="$$mma" -v b="$$mmb" -v lim="$(MISSING_METHOD_SITES_LIMIT)" 'BEGIN { if (a <= 0) a = 1; r = b / a; \
+	  printf "scale-test: missing-method split work at 2x the call sites is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
+	  { echo "scale-test: FAIL (desugar_missing_method_calls's counted work grew faster than its call sites, as where an undef ask rebuilt the map per site outside the plan frame: see cplan_undef_at and cplan_undef_before)"; exit 1; }
 
 .PHONY: bisect-test
 # `spinel bisect`, end to end. The search has its own corpus test
@@ -6927,7 +7012,7 @@ gate-costs: $(SPINEL)
 # directory whose name holds the words the passes over the finished C look
 # for (a setjmp, a loop, a root): the directives carry the file's path, and
 # those passes read the code alone.
-LINE_MAP_SAMPLE = $(shell ls test/*.rb | awk 'NR % 10 == 0') test/setjmp_local_volatile.rb
+LINE_MAP_SAMPLE = $(shell ls test/*.rb | awk 'NR % 10 == 0') test/setjmp_local_volatile.rb test/hcv_text_size_line_map.rb
 ifeq ($(wildcard $(RBS_INC)/rbs/parser.h),)
 LINE_MAP_RBS =
 else
@@ -6971,7 +7056,7 @@ line-map-check: $(SPINEL) $(LINE_MAP_RBS)
 	else echo "line-map-check: --rbs skipped (vendor/rbs not fetched; run 'make deps')"; fi; \
 	d=$$(mktemp -d "$${TMPDIR:-/tmp}/spinel-line-map.XXXXXX") || exit 2; \
 	w="$$d/setjmp goto for (while (do {SP_GC_ROOT sp_gc_nroots"; mkdir -p "$$w"; \
-	cp test/gc_root_elided_array_slot.rb test/setjmp_local_volatile.rb "$$w/"; \
+	cp test/gc_root_elided_array_slot.rb test/setjmp_local_volatile.rb test/each_return_value.rb "$$w/"; \
 	tools/line_map_check.sh "$$w"/*.rb || ok=0; \
 	rm -rf "$${d:?}"; \
 	[ $$ok -eq 1 ]

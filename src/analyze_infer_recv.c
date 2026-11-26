@@ -1519,8 +1519,9 @@ int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out) {
        can: a slot typed as that class is only its STATIC type -- an inherited
        method storing `self` types it as the class that DEFINED the method --
        so the call dispatches at run time and its value is that union (#4023).
-       The emitter routes the same shape through the poly dispatch. */
-    if (!call_answers(c, id, cid, name, 0, NULL) && !cls->is_native_class &&
+       The emitter routes the same shape through the poly dispatch. A builtin's own call (builtin_only) answers
+       for every class below. */
+    if (!call_answers(c, id, cid, name, 0, NULL) && !cls->is_native_class && !cplan_builtin_call(c, id) &&
         comp_subclass_answers(c, cid, name)) {
       /* Runtime-name send arms on boxed self may include classes the descendant plan excludes. */
       if (g_plan_check && !nt_int(nt, id, "dyn_arm", 0)) {
@@ -1538,11 +1539,11 @@ int infer_object_call(Compiler *c, int id, TyKind rt, TyKind *out) {
         (sp_streq(name, "is_a?") || sp_streq(name, "kind_of?") || sp_streq(name, "instance_of?") ||
          sp_streq(name, "respond_to?") || sp_streq(name, "==") || sp_streq(name, "!=") ||
          sp_streq(name, "nil?") || sp_streq(name, "equal?") || sp_streq(name, "frozen?"))) { *out = TY_BOOL; return 1; }
-    /* Object#hash default (no user hash in the chain): value/pointer int.
+    /* Object#hash default (no user hash in the chain, or the builtin's own call a super is): value/pointer int.
        Structs keep their dedicated value-based hash arm. */
-    if (sp_streq(name, "hash") && argc == 0 && !cls->is_struct &&
+    if (is_hash_name(name) && argc == 0 && !cls->is_struct &&
         /* (a reader named hash answers its ivar, typed as the ivar is) */
-        !call_answers(c, -1, cid, "hash", 0, NULL)) { *out = TY_INT; return 1; }
+        !call_answers(c, id, cid, name, 0, NULL)) { *out = TY_INT; return 1; }
     /* native class (C-backed): a declared instance method returns its spec
        type, also on a subclass of the class (#9269) */
     int ncid = comp_native_answer_class(c, cid, name);
@@ -1825,16 +1826,13 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
     *out = TY_STRING;
     return 1;
   }
-  /* #hash on a boxed receiver is always the Integer sp_rbval_hash_key
-     answers -- a user #hash in the program is reached through
-     sp_obj_hash_hook inside it and its answer is folded to the key -- so the
-     static type is int whatever a user #hash of the program returns. Left to
-     the user-method union it was the union's poly (every int is poly under
-     --int-overflow=promote), and `h ^= x.hash` handed an sp_int to
-     sp_poly_bitop's sp_RbVal parameter: `require "set"` did not build there,
-     since Set#hash is exactly that loop (#4728). */
-  if (recv >= 0 && rt == TY_POLY && argc == 0 && sp_streq(name, "hash"))
-    { *out = TY_INT; return 1; }
+  /* A direct send can select a hash reader whose value is not an Integer.
+     Keep that result boxed across the dispatch. Without a reader the
+     emitter uses the integer key hash, including in promote mode (#4728). */
+  if (recv >= 0 && rt == TY_POLY && argc == 0 && sp_streq(name, "hash")) {
+    *out = comp_has_hash_reader(c) ? TY_POLY : TY_INT;
+    return 1;
+  }
   if (recv >= 0 && rt == TY_POLY && argc == 0) {
     const BuiltinOp *op = bop_find(BOP_BOXED_FALLBACK, name, argc, nt_ref(nt, id, "block") >= 0);
     if (op && op->result == TY_STRBUF && !an_user_defines_or_reads(c, name)) {
@@ -1879,11 +1877,11 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       (sp_streq(name, "unbind") || sp_streq(name, "receiver")) &&
       an_program_builds_methods(c) && !an_user_recv_defines_method(c, name))
     { *out = TY_POLY; return 1; }
-  /* Numeric#fdiv on a boxed receiver is a Float whatever the operands are
-     (#3767); without a type the boxed result was dropped and read as nil. */
+  /* Numeric#fdiv / Complex#fdiv on a boxed receiver: Complex when the
+     receiver may hold one, Float otherwise (#3767). */
   if (recv >= 0 && rt == TY_POLY && argc == 1 && nt_ref(nt, id, "block") < 0 &&
       sp_streq(name, "fdiv") && !an_user_defines_or_reads(c, name))
-    { *out = TY_FLOAT; return 1; }
+    { *out = (an_program_makes_complex(c, nt) && cls_fact_may_hold_builtin(c, recv, CORE_COMPLEX)) ? TY_POLY : TY_FLOAT; return 1; }
   /* Complex#real / #imaginary on a poly value (a Complex read out of a
      container): the component is int- or float-classed at runtime, so the
      static result is poly. Without this the call typed nil and the boxed
@@ -2044,7 +2042,10 @@ int infer_poly_call(Compiler *c, int id, TyKind rt, TyKind *out) {
       (rt == TY_POLY || ((rt == TY_STRING || rt == TY_STRBUF) &&
                          infer_type(c, argv[0]) == TY_POLY))) {
     if (sp_streq(name, "match?")) { *out = TY_BOOL; return 1; }
-    if (sp_streq(name, "match")) { *out = TY_MATCHDATA; return 1; }
+    if (sp_streq(name, "match")) {
+      *out = (rt == TY_POLY && argc == 1 && cls_fact_may_hold_builtin(c, recv, CORE_MATCHDATA)) ? TY_POLY : TY_MATCHDATA;
+      return 1;
+    }
     if (sp_streq(name, "=~")) { *out = TY_POLY; return 1; }
   }
   /* The Integer surface on a boxed value that may hold a Bignum (#4665):

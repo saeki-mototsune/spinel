@@ -119,13 +119,29 @@ a public keyword `def` whose class the record resolves, a version with the
 body's extent (`LrDef.body`, `lr_version_order`, "Versions bodies make"
 below); a constant write marked `LR_LATE`, held as a possible write
 (`lr_record_unplaced`); and a visibility word that runs later or is sent,
-held on the table it names (`lr_unplaced_words`). A class body that is no
-statement of the load phase (in a lambda, in a block kept to run later, a
-class builder's block in an expression) is its class's body all the same:
-its public defs are versions of the body around it, and its other
-definitions are recorded after the placed bodies, `unplaced`, so the
-registrations apply them but no query at a point sees them
-(`lr_record_unplaced`, `lr_body_defs`).
+held on the table it names (`lr_unplaced_words`). A class or module body in a
+value (`z = [(class K; def m = 1; end; 0)]`, an argument, a multiple
+assignment's value, a hash value, a parenthesised value) that surely runs
+whenever its statement does (`lr_runs_up_to`: no condition, rescue modifier,
+block, lambda, safe navigation or `defined?` between) is placed at that
+statement: its forms are recorded as a top-level body's are, ordered against
+the calls the statement holds by `lr_run_order`, up to the first statement
+that is a `raise` or may jump out of the body (`lr_nested_body`). A placed body
+is held when one of the versions it recorded (`LrNbody.h`: every form that
+makes a method, a def, an alias, an attr, a definer call, an undef or a copy,
+with each name it defines) is of `initialize` or a kin of it, which the plan
+answers no body version of, or of a name that has an unplaced def on its side
+in a class that may share the version's chain. A body held makes unplaced
+defs of its own versions, so the holds close over the names they reach in one
+worklist (`lr_nested_hold_close`); the record is then made again with the held
+bodies unplaced, and asked once more (`lr_nested_hold`). A class body that is no
+statement of the load phase otherwise (in a lambda, in a block kept to run
+later, a class builder's block in an expression, a body behind a condition,
+a body held) is its class's body all the same: its public defs are versions
+of the body around it, and its other definitions (and the forms of a placed
+body past a `raise` or a jump) are recorded after the placed bodies,
+`unplaced`, so the registrations apply them but no query at a point sees
+them (`lr_record_unplaced`, `lr_body_defs`).
 
 Some answers wait for the whole record. A file in a region after region 0
 is walked after everything the entry does, so the answers recorded on the
@@ -378,16 +394,49 @@ Data's member, an entry no point places or a method body's, a chain the record
 does not hold to its end. The reach stops at an unknown name as at a missing
 one: the names from there on keep the answer they have without the word, which
 is how their entries read where the word is partial (`LrDef.cut`: the word
-names them, and has not changed them). A
+names them, and has not changed them). Past a name the word raises
+NameError for, a name the record knows no method of, the entries keep the
+visibility the name had (`lr_word_end_missing`), so an alias of one takes
+that; past one the record merely cannot tell they are as the word names
+them. The walk sees only the entries it has reached, so a name only a method's
+body makes (`def self.mk = (def zz = :zz)`, `mk`, then a rescued `private :a, :zz`)
+ends the reach there. Once the run points give every body its extent,
+`lr_words_refine` asks the reach of each such word again (`lr_has_state`, through
+`lr_body_state`): a name a body's version stands for is present where that
+body surely ran ahead of the word's statement (a def in a block that runs at
+once where its call does takes its method's extent, where the call runs whenever the method's body does:
+`lr_runs_with_body`, which a condition, a loop, an iterator's block, a rescue or an early exit ahead of it fails; and
+where the chain is one the record cannot follow, `lr_chain_whole`, the extent stands as it did), absent where it first runs after it or never, and
+`LR_HAS_CELL` where it may have run before, in a chain the record holds whole (`lr_chain_whole`: to its end, with no code it
+cannot follow that may define it, which `lr_cells_settle` asks with the versions): each version has the cell the run writes, which tells. The reach goes on past such a name and
+reports the first as the word's gate (`lr_word_reach`); the entries from the gate to the end of the reach are
+`LR_MAY_GATE`, the word's visibility, applied where the names ahead of them are present. The call plan tests
+the name where the word runs (`cplan_word_elem_presence`: the cells as a `respond_to?(name, true)` reads them there;
+the word asks that entry, `presence_asks`), raises NameError there where it is absent, and writes each gated name's
+visibility cell as the word passes it (`VerVisAfter.elem`, `emit_vis_word_absent`), so a name before a missing one
+is changed and the names after are not. Any other name the record cannot tell ends the reach as before (the entries
+from there on are cut). The versions are those of the ancestry the
+lookup uses, but for a module the class prepends to itself, which the word's lookup,
+from the class's origin, does not find (`lr_link_sure`): that one is unknown. A reach that now passes names un-cuts
+their entries; where it ends at an absent name the entries past it keep the
+visibility they had. The plan reads the finished entries only. A def among the word's arguments is
+a method the word names (the arguments run first, `private(:m, def m; end)`)
+and the name of one element of it, in the reach; where the word runs
+(`lr_def_arg_runs`) the def is made whenever the statement is reached, with the
+word's visibility, as the word is (`private(def a; end, :missing)`). A
 module_function copies the names only where it makes every name private
 and is given no Array (`copies`); the word writes their visibility cells
-before it raises (`emit_vis_word_absent`, which asks the call plan whether
-a name is a method), in a module body too. In an iterator's block or a begin body with rescue
+before it raises (`emit_vis_word_absent`, which renders the call plan's
+answer whether a name is a method at the word, `cplan_word_elem_presence`), in a module body too. In an iterator's block or a begin body with rescue
 clauses, where no statement ahead of the word in its frame may raise and
 skip it and no condition holds it, the record, with no run-time cell for
 the word's visibility, takes the word either to have run or not
 (`lr_word_runs`; a word with an argument that is no literal name is left
-as any partial statement's). The position walker marks each statement in iterators'
+as any partial statement's). A word with Kernel's `raise` or `fail` as an operand (`module_function :a,
+raise("stop")`: the operands run before the word does; the program defines no method of the
+name, and a raise in a block, behind `&&` or in a rescue modifier is not one) never finishes,
+and none of its names changes: the record holds it as it holds a form main's `protected` leaves (`lr_form_never_runs`),
+and codegen runs the operands only. The position walker marks each statement in iterators'
 blocks (`ElabPos` and `LrStmt` `skip`, `unsure`): skipped where a block
 around it surely runs no time by the run count the record's iterator
 rows give (`[].each` on a literal, `0.times`) or a statement ahead of it
@@ -416,16 +465,18 @@ visibility it has where it runs (`lr_body_def_vis`: a word that takes
 it, a bare word before it in a class body's statements, private for
 `initialize` and its kin); a word's version holds the visibility it sets,
 which the plan reads where the word runs (`lr_version_vis`, from the
-version's visibility cell where only the run decides). Only a def or a
+version's visibility cell where only the run decides). A def of one version that a
+placed word changes only where the run decides (`private :m if c`, `c && private(:m)`) is versioned for
+that word alone (`elab_method_vis_gated`, on the instance side): its calls and readers take the face
+entry whose arm reads the visibility cell the word writes, and `elab_method_vis_at` tells "only the
+run" past the word. Only a def or a
 word of a name the program makes no entry of that the call plan cannot
 answer next to it is such a version (`lr_body_def_version`, over
 `lr_body_forms`); a visibility word placed in a class body is an entry of
 its name's history with a point of its own, which the plan orders before the
-body's version, so it is no such entry and bars none, but for the name its
-reach ends at in a partial statement (one no entry of the program's places
-at the word, which a body's definer may have made by then): that stays
-barred, so the body's definer of it keeps the refusal it has there; a
-class-method word (`private_class_method`, `public_class_method`) keeps
+body's version, so it is no such entry and bars none, the name its reach
+ends at in a partial statement among them (the reach is asked again of the
+finished record, below); a class-method word (`private_class_method`, `public_class_method`) keeps
 barring every name it takes, as the class side's faces read it. So is a definer call on self that stands in a
 method's body, a def's or a `define_method`'s or
 `define_singleton_method`'s block's, with no class body between
@@ -499,10 +550,7 @@ start where the class or its chain answers the name, or a Symbol or a
 String spells it (`cplan_define_method_early`), or one with a Proc or a
 Method for its body (`cplan_body_definer_gap`). It refuses a definer
 call's version too where a reader of its name does not read it
-(`cplan_call_version_unread`): a method list or a reader of a name only
-the run tells (the `elab_body_reflected` exception, which keeps a body
-def's version off the late bit, and takes in every presence reader of
-the name where a `respond_to_missing?` is defined), a `method_missing`
+(`cplan_call_version_unread`): a `method_missing`
 on the chain, a Method's maker of the name (`elab_method_captured`), a
 `method_added` or `singleton_method_added` hook of the program that the
 definition would fire (`elab_definer_hook_live`), a name Ruby calls by itself (`to_s`, `<=>`, `coerce`), keyword parameters,
@@ -813,16 +861,32 @@ the body may have run, the word's after a statement that surely ran it
 (`elab_method_vis_at`), and the visibility cell where the body may have
 run any number of times.
 
-A reader that answers from the final tables instead keeps the table's
-answer for the calls of the names it may read: such a version is not
-late (`elab_body_reflected`), so a guard and the call it guards answer
-alike. Those are a list that includes inherited names
-(`K.instance_methods`, `instance_methods.include?`), a list on a
-module (`M.instance_methods(false)`), a list on a receiver that is not
-a constant, and every reader of a program that defines
-`respond_to_missing?`; there a body's def is listed, and answers
-`respond_to?`, before it runs. A module's def such a list may read is
-the table's on a class that extends the module too, so the class value's
+The readers the plan answers read the cell of a body's version, so the
+version is late (`lr_late_asked`) and a guard and the call it guards answer
+alike; the exceptions are listed below. A list of a whole chain's methods (`x.methods`,
+`x.public_methods`, `K.instance_methods` and its forms, with no argument,
+`true` or a flag the run decides, and `x.public_methods(false)`;
+`refl_cell_list`'s bit 4) asks the cells of each name the record holds
+versions of, as a `respond_to?` of that name does (`presence_asks`):
+`cplan_list_cells` gives them, one list for each class a boxed receiver
+may hold (`emit_value_methods_reflection`,
+`emit_poly_object_methods_reflection`), and a `respond_to?` of a name only
+the run knows reads them per class (`cplan_respond_runtime_cells`). A module's own instance side takes no entry, so
+its list reads the cells of its chain's versions (`presence_module_cells`). A
+list is not answered by `respond_to_missing?`, so it reads the cells in a
+program that defines it. The readers that still answer from the final
+tables are a list on a receiver that is neither a
+constant nor an object (a module value in a variable), and a `respond_to?` or `method_defined?` of a
+program that defines `respond_to_missing?`, whose answers a body's
+version a reader names keeps from the start on either side (`lr_late_asked`:
+the instance side's presence readers, the class side's too with its lists and
+a Method's maker; reading the cells there, with `respond_to_missing?` as the else, removes it): the def is listed, and answers
+`respond_to?`, before it runs. A receiverless or `self.` list in a class body
+or class method, or in a plain block, lambda or proc in either, reads the cells of the class, and of the classes below it
+where the method takes its receiving class (`cplan_self_list_classes`); one in a module's body or class method, in a
+`class << self` body, or in a block that rebinds self (`instance_eval`, `class_eval`, `class_exec`: `self_class_body`
+declines it) is not listed ahead of time and is refused as before. A module's def such a list may read is the
+table's on a class that extends the module too, so the class value's
 `respond_to?` answers it from the start. Only list readers of the same
 side count: a class-side list (`K.singleton_methods`) leaves an instance
 method's versions to the cells. A body that makes a definition the
@@ -834,8 +898,12 @@ calls one that asks `respond_to?(:m2)` or calls `m2`) reads what that
 body does: the record follows a def it holds as a body's version
 (`lr_body_held`) instead of taking the call for one that may define
 anything (`lr_callee_defines`), so the reader's call there takes the
-entry, which finds the def once it has run. These still make the body's
-calls opaque, and the reader answers from the start: a reader reached
+entry, which finds the def once it has run. A `class_eval`, `class_exec`,
+`module_eval` or `module_exec` with a literal block and no argument is
+followed too (`lr_block_eval`): it runs its block once with the class for
+self, so what it defines is what its block holds, a def there being the
+body's version under the conditions around the call. These still make the
+body's calls opaque, and the reader answers from the start: a reader reached
 through `super`, a literal `send` or `public_send`, or a Proc kept in a
 constant; a reader that makes a lambda, or takes a block and calls it; a
 body that passes its block on to the reader (`look(&b)`); and a body that
@@ -968,17 +1036,11 @@ asking the map as it edits. `SPINEL_ELAB_CHECK=1` reports where the
 plan frame's version of a call differs from the map as it is ("the call
 plan's versions").
 
-## Requires and the two models
+## Requires
 
 [require.md](../require.md) describes `require` as a program sees it.
-The record is made under both load models.
 
-Under `--load-model=inline` required files are spliced into
-the one program text, which has one root. The walk is the same over that
-text: one region, and a statement a desugaring placed in a body has its
-point where it stands, whatever its id.
-
-Under `--load-model=graph`, the default, each file is a root of the node table
+Each file is a root of the node table
 (`nt_root`), and each require a `LoadNode` naming the file it loads
 (`target_file`). The parse's load graph places each file at the
 statement that first loads it (#10305): `prog_ordered_load` answers the
@@ -1003,7 +1065,7 @@ its end once entered. It does not tell apart a region that raises before
 its later definitions (the raise rescued), one that calls back into code of
 another region before them, or an autoload of a constant already defined,
 which never loads its file. `--dump-load-graph` prints the
-files and what each require resolves to. What the graph model does not
+files and what each require resolves to. What the load model does not
 compile it refuses by name (`prog_refuse_loads`, `prog_refuse_order`).
 
 How the load stage's lowerings (`lower_run`, `src/analyze_lower.c`) and
@@ -1024,14 +1086,13 @@ language calls for a node.
   in the plan frame against the map as it is.
 - `make load-graph-test` (`tools/load_graph_check.sh`, part of
   `make test`) compiles each test/load_graph program with an `.expected`
-  under `--load-model=graph` and compares its output, and compares
+  and compares its output, and compares
   `--dump-load-record` of each with a `.load-record` against that file.
   A change to the record's points or histories updates those files.
 - `ruby tools/load_record_oracle.rb PROGRAM...` runs each program under
   CRuby with a tracer that logs what its load phase defines (class
   bodies, methods added, removed and undefined, constants set, mixins)
   and compares it with the record: an event only CRuby ran, a sure entry
-  CRuby did not run, two events in the other order. `--inline` is for a
-  program of one file under the inline model.
+  CRuby did not run, two events in the other order.
 - `--timing` prints the map's builds (`an_elab_points`) and the record's
   own cost (`an_elab_record`).

@@ -25,6 +25,7 @@
 #include <prism.h>
 #include "node_table.h"
 #include "builtin_names.h"   /* the name layer: lowering rows, native classes, package facts */
+#include "pre_const.h"       /* compile-time target platform, -D defines, constant-branch evaluator */
 
 /* node_table.h names the node flags the passes read without including Prism;
    each must be the value Prism's own constant has. */
@@ -58,13 +59,6 @@ static const char *g_source_file = "";
    every compile; off otherwise, so the AST text format (and golden tests)
    are unchanged. */
 static int g_emit_line = 0;
-/* The buffer-line -> (file, line) map is built for every program, not only
-   under g_emit_line: `__FILE__` and `__dir__` in a required file answer
-   that file, not the entry script (#4839), and only the map knows which file
-   a node came from once the requires are spliced into one buffer. The
-   PUSH/POP marker lines it is rebuilt from are comments. g_emit_line still
-   decides whether nodes carry their line for `#line` directives. */
-static int g_src_map = 1;
 /* --emit-types (g_opt_emit_types) also gets each node's END position, so a
    consumer can pick the tightest span under a cursor: `pts`, `pts.map { }`
    and `.inspect` all start at one column. Only then: two more attributes on
@@ -97,6 +91,11 @@ static void sp_pm_options_init(pm_options_t *opts, const char *path) {
   pm_options_frozen_string_literal_set(opts, true);
   pm_options_version_set(opts, "4.0", 3);
   if (path) pm_options_filepath_set(opts, path);
+  /* the text of -e is parsed as ruby -e parses it, which differs only in
+     the warnings: no unused local at the top level, and no literal in a
+     condition taken for a comparison with $. */
+  if (path && g_opt_eval_path && strcmp(path, g_opt_eval_path) == 0)
+    pm_options_command_line_set(opts, PM_OPTIONS_COMMAND_LINE_E);
 }
 static void sp_pm_parser_init(pm_parser_t *parser, const char *src, size_t len,
                               const char *path) {
@@ -117,11 +116,11 @@ typedef struct {
   pm_node_t *root;
 } SpSrcFile;
 
-/* --load-model=graph: the name a message gives file `path` (the whole
-   path the graph holds), a file of the program's own (a compiler's
-   library keeps the path it was found at), as the inline model names it:
-   from the current directory when the entry file is given relative to it
-   and the file is under it, else the path. A pointer into path. */
+/* The name a message gives file `path` (the whole path the graph holds),
+   a file of the program's own (a compiler's library keeps the path it was
+   found at): from the current directory when the entry file is given
+   relative to it and the file is under it, else the path. A pointer into
+   path. */
 static const char *sp_shown_path(const char *path, const char *entry) {
   char cwd[1024];
   size_t cl = entry && entry[0] != '/' && getcwd(cwd, sizeof cwd) ? strlen(cwd) : 0;
@@ -231,20 +230,6 @@ static int sp_src_file_fsl(const SpSrcFile *f) {
   return 1;
 }
 
-/* How much of a file's text is code: up to its `__END__` line, which
-   Prism found (data_loc), or all of it. Nothing after that line is code.
-   In a required file, spliced into the buffer as text, it ended Prism's
-   reading of the whole program there: every file spliced after it and the
-   rest of the program were dropped without a word (#9898); in any file the
-   require scanners read it as code. The entry file is cut the same way:
-   DATA, which would read its data section, is still not defined (a
-   compile-time warning, then NameError when reached), as on master; it is
-   left for later. The length is the parser's, which saw the whole text. */
-static size_t sp_src_file_code_len(const SpSrcFile *f) {
-  const uint8_t *end = f->parser.data_loc.start ? f->parser.data_loc.start : f->parser.end;
-  return (size_t)(end - f->parser.start);
-}
-
 /* Spinel's Strings are UTF-8 (#9898). A magic comment naming another
    encoding is honoured where Prism reads the text (a byte that encoding
    allows in a literal parses), and each literal keeps the bytes it is
@@ -261,82 +246,34 @@ static void sp_src_file_warn_encoding(const SpSrcFile *f) {
           "but take UTF-8 as their encoding\n", f->shown ? f->shown : f->path, (int)line, f->parser.encoding->name);
 }
 
-/* Lines of `s` as the require splicers count them: one per '\n', plus one for
-   a trailing unterminated fragment (the splicers append the missing '\n'). */
-static size_t sp_count_lines(const char *s) {
-  size_t n = 0; const char *p = s;
-  for (; *p; p++) if (*p == '\n') n++;
-  if (p != s && p[-1] != '\n') n++;
-  return n;
-}
-
-/* Fresh flag buffer for `text`, every line carrying that file's pragma flag. */
-static unsigned char *sp_fsl_make(const char *text, int flag, size_t *n_out) {
-  size_t n = sp_count_lines(text);
-  unsigned char *v = malloc(n ? n : 1);
-  if (!v) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-  memset(v, flag ? 1 : 0, n);
-  *n_out = n;
-  return v;
-}
-
-/* Replace `remove` entries at line index `at` with the `insn` entries of
-   `ins`, mirroring a text splice on the flag buffer. */
-static void sp_fsl_splice(unsigned char **buf, size_t *n, size_t at,
-                          size_t remove, const unsigned char *ins, size_t insn) {
-  if (at > *n) at = *n;
-  if (remove > *n - at) remove = *n - at;
-  size_t newn = *n - remove + insn;
-  unsigned char *nv = malloc(newn ? newn : 1);
-  if (!nv) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-  if (at) memcpy(nv, *buf, at);
-  if (insn) memcpy(nv + at, ins, insn);
-  size_t rest = *n - at - remove;
-  if (rest) memcpy(nv + at + insn, *buf + at + remove, rest);
-  free(*buf);
-  *buf = nv;
-  *n = newn;
-}
 /* Debug multi-file source map, populated by sp_build_line_map() before
    flatten() runs and read in flatten() to attribute each node to its
    original file/line. Declared here because flatten() precedes the
    require-resolution machinery that defines the builder. */
 static int *sp_line_file = NULL;  /* buffer line (1-based) -> file id */
 static int *sp_line_orig = NULL;  /* buffer line (1-based) -> original line */
-static int *sp_line_pop = NULL;
-static void sp_stamp_req_pop(int id, int32_t bl, int32_t ol);
 /* The position a `#<SPINEL_SOURCE>file:line` marker pins for the lines after
    it (0 = none). Kept apart from the physical map above: `__FILE__`,
    `__dir__` and `require_relative` still answer from the file the code is in,
    only the positions handed to `#line`, debug and the reports follow it. */
 static int *sp_disp_file = NULL;
 static int *sp_disp_line = NULL;
-static pm_node_t **g_stmt_next, **g_stmt_end;
 static const uint8_t *g_owner;
 static int sp_line_map_n = 0;
 static char **sp_file_table;   /* id -> path; defined with the map builder below */
 
-/* --load-model=graph, the default: a require is a LoadNode
-   (sp_flatten_call_as, below). --load-model=inline clears it. */
-int g_load_model_graph = 1;
-/* --load-model=graph: the file being flattened, as the table's file list
-   has it (0 is the entry); set with g_parser for each file */
+/* The file being flattened, as the table's file list has it (0 is the
+   entry); set with g_parser for each file. A require is a LoadNode
+   (sp_flatten_call_as, below). */
 static int g_flat_file = 0;
 static int g_flat_builtin = 0;   /* ... and it is a builtins/ file */
 
 /* The file a node was written in when that is a required file, or NULL for
-   the entry script (file id 0) and when the map could not be built. Under
-   --load-model=graph each file is flattened from its own parse, which says
-   which file it is. */
+   the entry script (file id 0). Each file is flattened from its own parse,
+   which says which file it is. */
 static const char *sp_node_required_file(const pm_node_t *node) {
-  if (g_load_model_graph) return g_flat_file > 0 ? sp_file_table[g_flat_file] : NULL;
-  if (sp_line_map_n <= 0) return NULL;
-  pm_line_column_t lc = pm_newline_list_line_column(&g_parser->newline_list,
-                                                    node->location.start,
-                                                    g_parser->start_line);
-  if (lc.line < 1 || lc.line > sp_line_map_n || sp_line_orig[lc.line] <= 0) return NULL;
-  int fid = sp_line_file[lc.line];
-  return fid > 0 ? sp_file_table[fid] : NULL;
+  (void)node;
+  return g_flat_file > 0 ? sp_file_table[g_flat_file] : NULL;
 }
 
 /* What `__FILE__` answers in a required file: its absolute path, as CRuby
@@ -355,7 +292,6 @@ static char *cstr(pm_constant_id_t id) {
   return buf;
 }
 
-static void sp_find_builtin_ranges(const char *src);
 static int sp_in_builtin(const uint8_t *at);
 #include "prism_eval.c"
 #include "sp_macro.c"
@@ -394,6 +330,7 @@ static int flatten(pm_node_t *node);
 static void sp_lower_rows_note(const pm_node_t *node, int id);   /* SPINEL_LOWER_ROWS_CHECK */
 static int sp_load_call(const pm_call_node_t *n);
 static int sp_pm_name_is(const pm_parser_t *parser, pm_constant_id_t id, const char *word);
+static int sp_name_buf(const pm_parser_t *pp, pm_constant_id_t id, char *buf, size_t cap);
 static int sp_flatten_call_as(int id, pm_call_node_t *n);
 static int sp_graph_site_take(int id, const pm_node_t *call);   /* 1: its path is computed when it runs */
 /* inline RBS (inline_rbs.c): the facts of a node, written by flatten */
@@ -421,6 +358,35 @@ static void emit_int(int id, const char *field, long long val) {
   nt_put_int(out_nt, id, field, val);
 }
 
+/* ---- The scope a local belongs to ----
+   Prism pushes a scope at a program, class, module, singleton class, def,
+   block and lambda; `for`, BEGIN/END and rescue push none, and a local's
+   `depth` counts the scopes that way. The ids of the scopes being flattened,
+   outermost first, make a local node's `depth` a node: its "decl" is the
+   scope that declares it (stack[top - depth]), and a parameter's or block-
+   local's is the innermost. A snippet's host scopes stand as -1 (a local
+   there has no decl). */
+/* An `it` block's parameters, lowered to one numbered parameter that Proc#parameters names no more than CRuby does. */
+static void emit_it_parameters(int id) {
+  nt_put_type(out_nt, id, "NumberedParametersNode");
+  emit_int(id, "maximum", 1);
+  emit_int(id, "implicit_it", 1);
+}
+static void decl_push(int id) { nt_build_scope_push(out_nt, id); }
+static void decl_pop(void) { nt_build_scope_pop(out_nt); }
+/* Node id is a local variable, parameter or block-local the program wrote as `w` in the scope `depth` out of the
+   innermost: its name as written, and its decl (comp_name_locals gives a local of a scope that is no frame root its
+   slot name). */
+static void emit_local_s(int id, const char *w, int depth) {
+  int d = nt_build_scope_at(out_nt, depth);
+  emit_str(id, "name", w);
+  if (d >= 0) emit_int(id, "decl", d);
+}
+static void emit_local(int id, pm_constant_id_t name, int depth) {
+  char *w = cstr(name);
+  emit_local_s(id, w, depth);
+  free(w);
+}
 static void emit_float(int id, double val) {
   /* Issue #766: 64-byte buf; "%.17g" produces at most 24 chars, plus
      ".0" trailer = 26. Safe by margin.
@@ -447,6 +413,13 @@ static void emit_float(int id, double val) {
 static void emit_ref(int id, const char *field, pm_node_t *child) {
   int cid = child ? flatten(child) : -1;
   nt_put_ref(out_nt, id, field, cid);
+}
+
+/* Field `field` of scope node id, flattened inside the scope. */
+static void flat_scoped(int id, const char *field, pm_node_t *child) {
+  decl_push(id);
+  emit_ref(id, field, child);
+  decl_pop();
 }
 
 /* `class A < (Base)`: parentheses around a single expression carry no
@@ -571,8 +544,10 @@ static void flat_def(int id, const pm_def_node_t *n) {
   char *nm = cstr(n->name);
   emit_str(id, "name", nm);
   free(nm);
+  decl_push(id);
   emit_ref(id, "parameters", (pm_node_t *)n->parameters);
   emit_ref(id, "body", (pm_node_t *)n->body);
+  decl_pop();
   emit_ref(id, "receiver", (pm_node_t *)n->receiver);
   out_scope_locals(id, &n->locals);
 }
@@ -847,18 +822,30 @@ static size_t sp_const_accessor(const pm_node_t *n, const char **s) {
    other block argument: a binary operator (`&:+`) is left to the
    arithmetic reduce/inject lowering, the rest to the analysis. */
 static size_t sp_quoted_recv_sym(const pm_node_t *n, const char **s);
+/* The node a block argument's proc is read from: `:name.to_proc`'s Symbol,
+   as the proc is the one `&:name` passes, and any other node itself. */
+static const pm_node_t *sp_sym_proc_source(const pm_node_t *e) {
+  if (!e || PM_NODE_TYPE(e) != PM_CALL_NODE) return e;
+  const pm_call_node_t *c = (const pm_call_node_t *)e;
+  char name[8];
+  if (!c->receiver || PM_NODE_TYPE(c->receiver) != PM_SYMBOL_NODE || c->arguments || c->block ||
+      !sp_name_buf(g_parser, c->name, name, sizeof name) || !is_to_proc_name(name)) return e;
+  return c->receiver;
+}
 /* The name of the Symbol block argument `node` flatten makes a block of
    (its length, the bytes in *s); 0 for any other node */
 static size_t sp_sym_proc_name(const pm_node_t *node, const char **s) {
   if (PM_NODE_TYPE(node) != PM_BLOCK_ARGUMENT_NODE) return 0;
-  /* the Symbol written in parentheses (`&(:to_s)`) or quoted (`&:"to_s"`)
-     is the same block: left a BlockArgumentNode, a Symbol took no block */
+  /* the Symbol written in parentheses (`&(:to_s)`), quoted (`&:"to_s"`)
+     or as its proc (`&:to_s.to_proc`) is the same block: left a
+     BlockArgumentNode, a Symbol took no block */
   const pm_node_t *e = ((const pm_block_argument_node_t *)node)->expression;
   while (e && PM_NODE_TYPE(e) == PM_PARENTHESES_NODE) {
     const pm_node_t *pb = ((const pm_parentheses_node_t *)e)->body;
     if (!pb || PM_NODE_TYPE(pb) != PM_STATEMENTS_NODE || ((const pm_statements_node_t *)pb)->body.size != 1) { e = NULL; break; }
     e = ((const pm_statements_node_t *)pb)->body.nodes[0];
   }
+  e = sp_sym_proc_source(e);
   size_t n = sp_plain_sym(e, s);
   if (!n) n = sp_quoted_recv_sym(e, s);
   int word = n > 0;
@@ -1197,21 +1184,18 @@ static int flatten(pm_node_t *node) {
   if (node && PM_NODE_TYPE(node) == PM_CLASS_NODE)
     sp_fwd_super_to_rest((pm_class_node_t *)node, ((pm_class_node_t *)node)->superclass);
   int id = flatten_node(node);
-  if (g_load_model_graph) sp_lower_rows_note(node, id);
+  sp_lower_rows_note(node, id);
   if (made) pm_node_destroy((pm_parser_t *)g_parser, made);
   g_bi_base = saved;
   return id;
 }
 
-/* A StatementsNode's body, each statement under the statement cursor; a
-   def_delegators statement is flattened as the defs it stands for. */
+/* A StatementsNode's body; a def_delegators statement is flattened as the
+   defs it stands for. */
 static void flatten_statements(int id, pm_node_list_t *list) {
-  pm_node_t **next = g_stmt_next, **end = g_stmt_end;
   pm_node_list_t low = { 0 }, made = { 0 };
   pm_node_list_t *body = sp_lower_body(list, &low, &made) ? &low : list;
-  g_stmt_next = body->nodes; g_stmt_end = g_stmt_next + body->size;
   emit_node_array(id, "body", body);
-  g_stmt_next = next; g_stmt_end = end;
   for (size_t i = 0; i < made.size; i++) pm_node_destroy((pm_parser_t *)g_parser, made.nodes[i]);
   pm_node_list_free(&made);
   pm_node_list_free(&low);
@@ -1246,7 +1230,7 @@ static void flatten_parameter(int id, pm_node_t *node) {
   }
   nt_put_type(out_nt, id, type);
   emit_int(id, "flags", node->flags);
-  if (name) { char *n = cstr(name); emit_str(id, "name", n); free(n); }
+  if (name) emit_local(id, name, 0);
   if (value) emit_ref(id, "value", value);
 }
 
@@ -1280,6 +1264,735 @@ static void emit_index_write_fields(int id, const pm_node_t *node, pm_node_t *re
   emit_ref(id, "value", value);
   emit_call_flags(id, node);
 }
+/* ---- Pre-analysis constant-branch evaluation (Prism AST) ----
+ * Shared with analysis via pre_const.c ("One place per decision"). Runs before
+ * require resolution, boot-library name scanning, and flattening so untaken
+ * RUBY_PLATFORM / RUBY_ENGINE / target-fixed defined? / -D branches never load
+ * missing libraries, widen inference, or pollute g_require_unread, while
+ * preserving Ruby's lexical local variable declarations (`dead_locals`). */
+
+typedef struct {
+  int initialized;
+  int allow_engine;
+  int allow_platform;
+  int allow_version;
+  int allow_object;
+  int has_remove_const;
+  int core_ops_reopened;
+  int cli_defined_only;
+  unsigned char *def_shadowed;
+  int ndefs;
+} SpPreFileCtx;
+
+static const SpPreFileCtx *g_flat_pre = NULL;
+static int g_in_pattern = 0;
+static int g_in_basic_object = 0;
+
+static void sp_pre_ctx_free(SpPreFileCtx *c) {
+  if (!c) return;
+  free(c->def_shadowed);
+  memset(c, 0, sizeof *c);
+}
+
+/* Merge `src` into `dst`. Returns 1 if `dst` was already initialized and any
+   permissive flag became more restrictive (cross-file shadowing / reopening). */
+static int sp_pre_ctx_merge(SpPreFileCtx *dst, const SpPreFileCtx *src) {
+  if (!dst || !src) return 0;
+  if (!dst->initialized) {
+    dst->initialized = 1;
+    dst->allow_engine = src->allow_engine;
+    dst->allow_platform = src->allow_platform;
+    dst->allow_version = src->allow_version;
+    dst->allow_object = src->allow_object;
+    dst->has_remove_const = src->has_remove_const;
+    dst->core_ops_reopened = src->core_ops_reopened;
+    dst->cli_defined_only = 0;
+    dst->ndefs = src->ndefs;
+    if (src->ndefs > 0) {
+      dst->def_shadowed = calloc((size_t)src->ndefs, 1);
+      if (!dst->def_shadowed) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
+      if (src->def_shadowed) memcpy(dst->def_shadowed, src->def_shadowed, (size_t)src->ndefs);
+    }
+    return 0;
+  }
+  int tightened = 0;
+  if (!src->allow_engine && dst->allow_engine) { dst->allow_engine = 0; tightened = 1; }
+  if (!src->allow_platform && dst->allow_platform) { dst->allow_platform = 0; tightened = 1; }
+  if (!src->allow_version && dst->allow_version) { dst->allow_version = 0; tightened = 1; }
+  if (!src->allow_object && dst->allow_object) { dst->allow_object = 0; tightened = 1; }
+  if (src->has_remove_const && !dst->has_remove_const) { dst->has_remove_const = 1; tightened = 1; }
+  if (src->core_ops_reopened && !dst->core_ops_reopened) { dst->core_ops_reopened = 1; tightened = 1; }
+  for (int i = 0; i < dst->ndefs && i < src->ndefs; i++)
+    if (src->def_shadowed && src->def_shadowed[i] && !dst->def_shadowed[i]) {
+      dst->def_shadowed[i] = 1;
+      tightened = 1;
+    }
+  return tightened;
+}
+
+static int sp_pre_pm_id_is(const pm_parser_t *p, pm_constant_id_t id, const char *word) {
+  const pm_constant_t *nm = pm_constant_pool_id_to_constant(&p->constant_pool, id);
+  size_t n = strlen(word);
+  return nm->length == n && memcmp(nm->start, word, n) == 0;
+}
+
+static int sp_pre_pm_const_name(const pm_parser_t *p, const pm_node_t *node,
+                                const char **out, size_t *len, int allow_bare) {
+  if (!node) return 0;
+  pm_constant_id_t cid = 0;
+  if (PM_NODE_TYPE(node) == PM_CONSTANT_READ_NODE) {
+    if (!allow_bare) return 0;
+    cid = ((const pm_constant_read_node_t *)node)->name;
+  }
+  else if (PM_NODE_TYPE(node) == PM_CONSTANT_PATH_NODE) {
+    const pm_constant_path_node_t *cp = (const pm_constant_path_node_t *)node;
+    if (cp->parent) {
+      const char *pn = NULL; size_t pl = 0;
+      if (!sp_pre_pm_const_name(p, cp->parent, &pn, &pl, allow_bare)) return 0;
+      if (pl != 6 || memcmp(pn, "Object", 6) != 0) return 0;
+    }
+    cid = cp->name;
+  }
+  else return 0;
+  const pm_constant_t *nm = pm_constant_pool_id_to_constant(&p->constant_pool, cid);
+  *out = (const char *)nm->start;
+  *len = nm->length;
+  return 1;
+}
+
+static int sp_pre_pm_is_basic_object(const pm_parser_t *p, const pm_node_t *node) {
+  const char *nm = NULL; size_t len = 0;
+  return sp_pre_pm_const_name(p, node, &nm, &len, 1) && len == 11 && memcmp(nm, "BasicObject", 11) == 0;
+}
+
+static int sp_pre_pm_is_core_op_owner(const pm_parser_t *p, const pm_node_t *cpath) {
+  const char *nm = NULL; size_t len = 0;
+  return sp_pre_pm_const_name(p, cpath, &nm, &len, 1) && sp_pre_is_core_op_owner(nm, len);
+}
+
+typedef struct { const pm_parser_t *p; int hit; } SpPreOpScan;
+
+static bool sp_pre_pm_op_visit(const pm_node_t *node, void *data) {
+  SpPreOpScan *s = data;
+  if (s->hit) return false;
+  pm_node_type_t t = PM_NODE_TYPE(node);
+  if (t == PM_CLASS_NODE || t == PM_MODULE_NODE || t == PM_SINGLETON_CLASS_NODE) return false;
+  if (t == PM_DEF_NODE) {
+    const pm_def_node_t *d = (const pm_def_node_t *)node;
+    if (!d->receiver) {
+      const pm_constant_t *nm = pm_constant_pool_id_to_constant(&s->p->constant_pool, d->name);
+      char buf[32];
+      if (nm->length < sizeof buf) {
+        memcpy(buf, nm->start, nm->length); buf[nm->length] = '\0';
+        if (sp_pre_is_folded_op(buf)) { s->hit = 1; return false; }
+      }
+    }
+    return false;
+  }
+  if (t == PM_ALIAS_METHOD_NODE) {
+    const pm_node_t *nn = ((const pm_alias_method_node_t *)node)->new_name;
+    if (nn && PM_NODE_TYPE(nn) == PM_SYMBOL_NODE) {
+      const pm_string_t *u = &((const pm_symbol_node_t *)nn)->unescaped;
+      char buf[32];
+      if (pm_string_length(u) < sizeof buf) {
+        memcpy(buf, pm_string_source(u), pm_string_length(u)); buf[pm_string_length(u)] = '\0';
+        if (sp_pre_is_folded_op(buf)) { s->hit = 1; return false; }
+      }
+    }
+    return false;
+  }
+  if (t == PM_UNDEF_NODE) {
+    const pm_node_list_t *nl = &((const pm_undef_node_t *)node)->names;
+    for (size_t i = 0; i < nl->size; i++) {
+      if (PM_NODE_TYPE(nl->nodes[i]) == PM_SYMBOL_NODE) {
+        const pm_string_t *u = &((const pm_symbol_node_t *)nl->nodes[i])->unescaped;
+        char buf[32];
+        if (pm_string_length(u) < sizeof buf) {
+          memcpy(buf, pm_string_source(u), pm_string_length(u)); buf[pm_string_length(u)] = '\0';
+          if (sp_pre_is_folded_op(buf)) { s->hit = 1; return false; }
+        }
+      }
+    }
+    return false;
+  }
+  if (t == PM_CALL_NODE) {
+    const pm_call_node_t *c = (const pm_call_node_t *)node;
+    if (!c->receiver && (sp_pre_pm_id_is(s->p, c->name, "define_method") ||
+                         sp_pre_pm_id_is(s->p, c->name, "alias_method") ||
+                         sp_pre_pm_id_is(s->p, c->name, "undef_method") ||
+                         sp_pre_pm_id_is(s->p, c->name, "remove_method") ||
+                         sp_pre_pm_id_is(s->p, c->name, "include") ||
+                         sp_pre_pm_id_is(s->p, c->name, "prepend"))) {
+      s->hit = 1;
+      return false;
+    }
+  }
+  return true;
+}
+
+static int sp_pre_pm_eval(const pm_parser_t *p, const pm_node_t *node, const SpPreFileCtx *ctx,
+                          int allow_bare, SpPreVal *out, int *used_const, int depth) {
+  if (!node || !ctx || depth > 64) return 0;
+  switch (PM_NODE_TYPE(node)) {
+    case PM_TRUE_NODE: *out = (SpPreVal){ .kind = SP_PRE_BOOL, .b = 1 }; return 1;
+    case PM_FALSE_NODE: *out = (SpPreVal){ .kind = SP_PRE_BOOL, .b = 0 }; return 1;
+    case PM_NIL_NODE: *out = (SpPreVal){ .kind = SP_PRE_NIL }; return 1;
+    case PM_INTEGER_NODE: {
+      pm_integer_t *iv = &((pm_integer_node_t *)node)->value;
+      if (pm_int_overflows(iv)) return 0;
+      *out = (SpPreVal){ .kind = SP_PRE_INT, .i = pm_int_value(iv) };
+      return 1;
+    }
+    case PM_STRING_NODE: {
+      const pm_string_t *u = &((const pm_string_node_t *)node)->unescaped;
+      *out = (SpPreVal){ .kind = SP_PRE_STR, .s = (const char *)pm_string_source(u), .slen = pm_string_length(u) };
+      return 1;
+    }
+    case PM_PARENTHESES_NODE: {
+      const pm_node_t *body = ((const pm_parentheses_node_t *)node)->body;
+      if (!body) { *out = (SpPreVal){ .kind = SP_PRE_NIL }; return 1; }
+      return sp_pre_pm_eval(p, body, ctx, allow_bare, out, used_const, depth + 1);
+    }
+    case PM_STATEMENTS_NODE: {
+      const pm_node_list_t *b = &((const pm_statements_node_t *)node)->body;
+      return b->size == 1 ? sp_pre_pm_eval(p, b->nodes[0], ctx, allow_bare, out, used_const, depth + 1) : 0;
+    }
+    case PM_CONSTANT_READ_NODE: case PM_CONSTANT_PATH_NODE: {
+      const char *nm = NULL; size_t len = 0;
+      if (sp_pre_pm_const_name(p, node, &nm, &len, allow_bare) &&
+          sp_pre_lookup_const(nm, len, ctx->allow_engine, ctx->allow_platform,
+                              ctx->allow_version, ctx->def_shadowed, out)) {
+        *used_const = 1;
+        return 1;
+      }
+      return 0;
+    }
+    case PM_DEFINED_NODE: {
+      const char *nm = NULL; size_t len = 0;
+      if (sp_pre_pm_const_name(p, ((const pm_defined_node_t *)node)->value, &nm, &len, allow_bare) &&
+          (!ctx->cli_defined_only || sp_pre_define_index(nm, len) >= 0) &&
+          sp_pre_defined_const_fixed(nm, len, ctx->has_remove_const) == 1) {
+        *used_const = 1;
+        *out = (SpPreVal){ .kind = SP_PRE_STR, .s = "constant", .slen = 8 };
+        return 1;
+      }
+      return 0;
+    }
+    case PM_AND_NODE: case PM_OR_NODE: {
+      int is_and = PM_NODE_TYPE(node) == PM_AND_NODE;
+      const pm_node_t *l = is_and ? ((const pm_and_node_t *)node)->left : ((const pm_or_node_t *)node)->left;
+      const pm_node_t *r = is_and ? ((const pm_and_node_t *)node)->right : ((const pm_or_node_t *)node)->right;
+      int lc = 0; SpPreVal lv;
+      if (!sp_pre_pm_eval(p, l, ctx, allow_bare, &lv, &lc, depth + 1)) return 0;
+      int lt = sp_pre_val_truthy(&lv);
+      if ((is_and && !lt) || (!is_and && lt)) {
+        *used_const |= lc;
+        *out = lv;
+        return 1;
+      }
+      int rc = 0; SpPreVal rv;
+      if (!sp_pre_pm_eval(p, r, ctx, allow_bare, &rv, &rc, depth + 1)) return 0;
+      *used_const |= (lc | rc);
+      *out = rv;
+      return 1;
+    }
+    case PM_CALL_NODE: {
+      const pm_call_node_t *c = (const pm_call_node_t *)node;
+      if (c->block || !c->receiver || ctx->core_ops_reopened) return 0;
+      int snav = PM_NODE_FLAG_P(node, PM_CALL_NODE_FLAGS_SAFE_NAVIGATION);
+      const pm_constant_t *nm = pm_constant_pool_id_to_constant(&p->constant_pool, c->name);
+      char op[32];
+      if (nm->length >= sizeof op) return 0;
+      memcpy(op, nm->start, nm->length);
+      op[nm->length] = '\0';
+      size_t ac = c->arguments ? c->arguments->arguments.size : 0;
+      pm_node_t **av = c->arguments ? c->arguments->arguments.nodes : NULL;
+      if (!snav && ctx->allow_object && strcmp(op, "const_defined?") == 0 && ac == 1) {
+        const char *rn = NULL; size_t rl = 0;
+        const pm_string_t *arg_s = PM_NODE_TYPE(av[0]) == PM_SYMBOL_NODE ? &((const pm_symbol_node_t *)av[0])->unescaped :
+                                   PM_NODE_TYPE(av[0]) == PM_STRING_NODE ? &((const pm_string_node_t *)av[0])->unescaped : NULL;
+        if (arg_s && sp_pre_pm_const_name(p, c->receiver, &rn, &rl, allow_bare) && rl == 6 && memcmp(rn, "Object", 6) == 0 &&
+            (!ctx->cli_defined_only || sp_pre_define_index((const char *)pm_string_source(arg_s), pm_string_length(arg_s)) >= 0) &&
+            sp_pre_defined_const_fixed((const char *)pm_string_source(arg_s), pm_string_length(arg_s), ctx->has_remove_const) == 1) {
+          *used_const = 1;
+          *out = (SpPreVal){ .kind = SP_PRE_BOOL, .b = 1 };
+          return 1;
+        }
+        return 0;
+      }
+      int rc = 0; SpPreVal rv;
+      if (!sp_pre_pm_eval(p, c->receiver, ctx, allow_bare, &rv, &rc, depth + 1)) return 0;
+      if (snav && rv.kind == SP_PRE_NIL) return 0;
+      if (ac == 0) {
+        if (!sp_pre_eval_unary(&rv, op, out)) return 0;
+        *used_const |= rc;
+        return 1;
+      }
+      if (strcmp(op, "start_with?") == 0 || strcmp(op, "end_with?") == 0) {
+        if (ac > 16) return 0;
+        SpPreVal avals[16];
+        int auc = rc;
+        for (size_t i = 0; i < ac; i++)
+          if (!sp_pre_pm_eval(p, av[i], ctx, allow_bare, &avals[i], &auc, depth + 1)) return 0;
+        if (!sp_pre_eval_str_affix(&rv, strcmp(op, "start_with?") == 0, avals, (int)ac, out)) return 0;
+        *used_const |= auc;
+        return 1;
+      }
+      if (ac == 1) {
+        int rrc = 0; SpPreVal av0;
+        if (!sp_pre_pm_eval(p, av[0], ctx, allow_bare, &av0, &rrc, depth + 1)) return 0;
+        if (!sp_pre_eval_binary(&rv, op, &av0, out)) return 0;
+        *used_const |= (rc | rrc);
+        return 1;
+      }
+      return 0;
+    }
+    default: return 0;
+  }
+}
+
+/* 1 if provably truthy, 0 if provably falsy, -1 otherwise.
+ * When allow_pure_lit == 0, only predicates that depend on a provably fixed
+ * compile-time constant (RUBY_ENGINE, RUBY_PLATFORM, RUBY_VERSION, -D NAME,
+ * or target-fixed defined?) are folded. */
+static int sp_pre_pm_truth(const pm_parser_t *p, const pm_node_t *node, const SpPreFileCtx *ctx,
+                           int allow_bare, int allow_pure_lit) {
+  int used = 0; SpPreVal v;
+  if (!sp_pre_pm_eval(p, node, ctx, allow_bare, &v, &used, 0)) return -1;
+  if (!allow_pure_lit && !used) return -1;
+  return sp_pre_val_truthy(&v) ? 1 : 0;
+}
+
+typedef struct {
+  const pm_parser_t *p;
+  SpPreFileCtx *ctx;
+  unsigned char *def_guarded;
+  unsigned char *all_shad;
+  int in_cli_def_dead;
+  int in_pattern;
+  int in_bo;
+  int nest_depth;
+} SpPreScan;
+
+static void sp_pre_scan_note_const(SpPreScan *s, const char *nm, size_t len, int is_class_or_mod) {
+  if (!nm || !len) return;
+  if (len == 11 && memcmp(nm, "RUBY_ENGINE", 11) == 0) s->ctx->allow_engine = 0;
+  else if (len == 13 && memcmp(nm, "RUBY_PLATFORM", 13) == 0) s->ctx->allow_platform = 0;
+  else if (len == 12 && memcmp(nm, "RUBY_VERSION", 12) == 0) s->ctx->allow_version = 0;
+  else if (!is_class_or_mod && len == 6 && memcmp(nm, "Object", 6) == 0) s->ctx->allow_object = 0;
+  int di = sp_pre_define_index(nm, len);
+  if (di >= 0 && di < s->ctx->ndefs) {
+    if (s->in_cli_def_dead) s->def_guarded[di] = 1;
+    else s->ctx->def_shadowed[di] = 1;
+  }
+}
+
+/* Effective method name of a call, resolving send/__send__/public_send when its
+   first argument is a Symbol or String literal (`*via` = 1 if dispatched via send). */
+static int sp_pre_pm_sent_name(const pm_parser_t *p, const pm_call_node_t *c,
+                               const char **out, size_t *len, int *via) {
+  const pm_constant_t *nm = pm_constant_pool_id_to_constant(&p->constant_pool, c->name);
+  *via = 0;
+  if ((nm->length == 4 && memcmp(nm->start, "send", 4) == 0) ||
+      (nm->length == 8 && memcmp(nm->start, "__send__", 8) == 0) ||
+      (nm->length == 11 && memcmp(nm->start, "public_send", 11) == 0)) {
+    const pm_node_t *a0 = c->arguments && c->arguments->arguments.size >= 1 ? c->arguments->arguments.nodes[0] : NULL;
+    const pm_string_t *u = a0 && PM_NODE_TYPE(a0) == PM_SYMBOL_NODE ? &((const pm_symbol_node_t *)a0)->unescaped
+                         : a0 && PM_NODE_TYPE(a0) == PM_STRING_NODE ? &((const pm_string_node_t *)a0)->unescaped : NULL;
+    if (!u) return 0;
+    *out = (const char *)pm_string_source(u);
+    *len = pm_string_length(u);
+    *via = 1;
+    return 1;
+  }
+  *out = (const char *)nm->start;
+  *len = nm->length;
+  return 1;
+}
+
+static bool sp_pre_scan_visit(const pm_node_t *node, void *data) {
+  SpPreScan *s = data;
+  pm_node_type_t t = PM_NODE_TYPE(node);
+  if (t == PM_IN_NODE) {
+    const pm_in_node_t *n = (const pm_in_node_t *)node;
+    int prev = s->in_pattern;
+    s->in_pattern = 1;
+    if (n->pattern) pm_visit_node(n->pattern, sp_pre_scan_visit, s);
+    s->in_pattern = prev;
+    if (n->statements) pm_visit_node((const pm_node_t *)n->statements, sp_pre_scan_visit, s);
+    return false;
+  }
+  if (!s->in_pattern && s->ctx->ndefs > 0 && s->all_shad && (t == PM_IF_NODE || t == PM_UNLESS_NODE)) {
+    int is_unless = t == PM_UNLESS_NODE;
+    const pm_node_t *pred = is_unless ? ((const pm_unless_node_t *)node)->predicate : ((const pm_if_node_t *)node)->predicate;
+    const pm_node_t *body = is_unless ? (const pm_node_t *)((const pm_unless_node_t *)node)->statements
+                                      : (const pm_node_t *)((const pm_if_node_t *)node)->statements;
+    const pm_node_t *other = is_unless ? (const pm_node_t *)((const pm_unless_node_t *)node)->else_clause
+                                       : ((const pm_if_node_t *)node)->subsequent;
+    /* Evaluate ONLY `defined?(NAME)` / `Object.const_defined?(:NAME)` for CLI -D
+       defines (all -D values shadowed) so `NAME = "default" unless defined?(NAME)`
+       marks its dead default write as guarded rather than shadowing NAME. */
+    SpPreFileCtx dctx = { 1, 0, 0, 0, s->ctx->allow_object, 0, 0, 1, s->all_shad, s->ctx->ndefs };
+    int tr = sp_pre_pm_truth(s->p, pred, &dctx, !s->in_bo, 0);
+    if (tr >= 0) {
+      int take_body = is_unless ? !tr : tr;
+      pm_visit_node(pred, sp_pre_scan_visit, s);
+      s->in_cli_def_dead += take_body ? 0 : 1;
+      if (body) pm_visit_node(body, sp_pre_scan_visit, s);
+      s->in_cli_def_dead -= take_body ? 0 : 1;
+      s->in_cli_def_dead += take_body ? 1 : 0;
+      if (other) pm_visit_node(other, sp_pre_scan_visit, s);
+      s->in_cli_def_dead -= take_body ? 1 : 0;
+      return false;
+    }
+  }
+  switch (t) {
+    case PM_CONSTANT_WRITE_NODE:
+    case PM_CONSTANT_OPERATOR_WRITE_NODE:
+    case PM_CONSTANT_OR_WRITE_NODE:
+    case PM_CONSTANT_AND_WRITE_NODE:
+    case PM_CONSTANT_TARGET_NODE: {
+      pm_constant_id_t cid = t == PM_CONSTANT_WRITE_NODE ? ((const pm_constant_write_node_t *)node)->name
+                           : t == PM_CONSTANT_OPERATOR_WRITE_NODE ? ((const pm_constant_operator_write_node_t *)node)->name
+                           : t == PM_CONSTANT_OR_WRITE_NODE ? ((const pm_constant_or_write_node_t *)node)->name
+                           : t == PM_CONSTANT_AND_WRITE_NODE ? ((const pm_constant_and_write_node_t *)node)->name
+                           : ((const pm_constant_target_node_t *)node)->name;
+      const pm_constant_t *nm = pm_constant_pool_id_to_constant(&s->p->constant_pool, cid);
+      sp_pre_scan_note_const(s, (const char *)nm->start, nm->length, 0);
+      break;
+    }
+    case PM_CONSTANT_PATH_WRITE_NODE:
+    case PM_CONSTANT_PATH_OPERATOR_WRITE_NODE:
+    case PM_CONSTANT_PATH_OR_WRITE_NODE:
+    case PM_CONSTANT_PATH_AND_WRITE_NODE:
+    case PM_CONSTANT_PATH_TARGET_NODE: {
+      const pm_node_t *tgt = t == PM_CONSTANT_PATH_WRITE_NODE ? (const pm_node_t *)((const pm_constant_path_write_node_t *)node)->target
+                           : t == PM_CONSTANT_PATH_OPERATOR_WRITE_NODE ? (const pm_node_t *)((const pm_constant_path_operator_write_node_t *)node)->target
+                           : t == PM_CONSTANT_PATH_OR_WRITE_NODE ? (const pm_node_t *)((const pm_constant_path_or_write_node_t *)node)->target
+                           : t == PM_CONSTANT_PATH_AND_WRITE_NODE ? (const pm_node_t *)((const pm_constant_path_and_write_node_t *)node)->target
+                           : node;
+      if (t == PM_CONSTANT_PATH_TARGET_NODE) {
+        const pm_constant_path_target_node_t *cpt = (const pm_constant_path_target_node_t *)node;
+        const pm_constant_t *cn = pm_constant_pool_id_to_constant(&s->p->constant_pool, cpt->name);
+        const char *pn = NULL; size_t pl = 0;
+        int is_top = !cpt->parent || (sp_pre_pm_const_name(s->p, cpt->parent, &pn, &pl, 1) && pl == 6 && memcmp(pn, "Object", 6) == 0);
+        sp_pre_scan_note_const(s, (const char *)cn->start, cn->length, !is_top);
+      }
+      else if (tgt && PM_NODE_TYPE(tgt) == PM_CONSTANT_PATH_NODE) {
+        const pm_constant_path_node_t *cp = (const pm_constant_path_node_t *)tgt;
+        const pm_constant_t *cn = pm_constant_pool_id_to_constant(&s->p->constant_pool, cp->name);
+        const char *tn = NULL; size_t tl = 0;
+        int is_top = sp_pre_pm_const_name(s->p, tgt, &tn, &tl, 1);
+        sp_pre_scan_note_const(s, (const char *)cn->start, cn->length, !is_top);
+      }
+      break;
+    }
+    case PM_CLASS_NODE: case PM_MODULE_NODE: {
+      int is_cls = t == PM_CLASS_NODE;
+      const pm_node_t *cp = is_cls ? ((const pm_class_node_t *)node)->constant_path
+                                   : ((const pm_module_node_t *)node)->constant_path;
+      const pm_node_t *sup = is_cls ? ((const pm_class_node_t *)node)->superclass : NULL;
+      const pm_node_t *body = is_cls ? ((const pm_class_node_t *)node)->body
+                                     : ((const pm_module_node_t *)node)->body;
+      if (cp && PM_NODE_TYPE(cp) == PM_CONSTANT_READ_NODE) {
+        const pm_constant_t *cn = pm_constant_pool_id_to_constant(&s->p->constant_pool, ((const pm_constant_read_node_t *)cp)->name);
+        sp_pre_scan_note_const(s, (const char *)cn->start, cn->length, 1);
+      }
+      else if (cp && PM_NODE_TYPE(cp) == PM_CONSTANT_PATH_NODE) {
+        const pm_constant_t *cn = pm_constant_pool_id_to_constant(&s->p->constant_pool, ((const pm_constant_path_node_t *)cp)->name);
+        sp_pre_scan_note_const(s, (const char *)cn->start, cn->length, 1);
+      }
+      const char *top_nm = NULL; size_t top_len = 0;
+      int opens_top = sp_pre_pm_const_name(s->p, cp, &top_nm, &top_len, s->nest_depth == 0);
+      if (!s->ctx->core_ops_reopened && body && opens_top && sp_pre_is_core_op_owner(top_nm, top_len)) {
+        SpPreOpScan os = { s->p, 0 };
+        pm_visit_node(body, sp_pre_pm_op_visit, &os);
+        if (os.hit) s->ctx->core_ops_reopened = 1;
+      }
+      if (cp) pm_visit_node(cp, sp_pre_scan_visit, s);
+      if (sup) pm_visit_node(sup, sp_pre_scan_visit, s);
+      int is_bo = is_cls && sp_pre_pm_is_basic_object(s->p, sup);
+      int is_top_obj = is_cls && opens_top && top_len == 6 && memcmp(top_nm, "Object", 6) == 0;
+      s->in_bo += is_bo;
+      if (!is_top_obj) s->nest_depth++;
+      if (body) pm_visit_node(body, sp_pre_scan_visit, s);
+      if (!is_top_obj) s->nest_depth--;
+      s->in_bo -= is_bo;
+      return false;
+    }
+    case PM_SINGLETON_CLASS_NODE: {
+      const pm_singleton_class_node_t *sc = (const pm_singleton_class_node_t *)node;
+      if (sc->expression) pm_visit_node(sc->expression, sp_pre_scan_visit, s);
+      s->nest_depth++;
+      if (sc->body) pm_visit_node(sc->body, sp_pre_scan_visit, s);
+      s->nest_depth--;
+      return false;
+    }
+    case PM_CALL_NODE: {
+      const pm_call_node_t *c = (const pm_call_node_t *)node;
+      const char *mn = NULL; size_t ml = 0; int via = 0;
+      if (!sp_pre_pm_sent_name(s->p, c, &mn, &ml, &via)) break;
+      if (ml == 12 && memcmp(mn, "remove_const", 12) == 0) {
+        s->ctx->has_remove_const = 1;
+      }
+      else if (ml == 9 && memcmp(mn, "const_set", 9) == 0) {
+        size_t ai = (size_t)via;
+        const pm_node_t *a0 = c->arguments && c->arguments->arguments.size > ai ? c->arguments->arguments.nodes[ai] : NULL;
+        const pm_string_t *u = a0 && PM_NODE_TYPE(a0) == PM_SYMBOL_NODE ? &((const pm_symbol_node_t *)a0)->unescaped
+                             : a0 && PM_NODE_TYPE(a0) == PM_STRING_NODE ? &((const pm_string_node_t *)a0)->unescaped : NULL;
+        if (u) sp_pre_scan_note_const(s, (const char *)pm_string_source(u), pm_string_length(u), 0);
+        else if (s->ctx->ndefs > 0) memset(s->ctx->def_shadowed, 1, (size_t)s->ctx->ndefs);
+      }
+      else if (!s->ctx->core_ops_reopened && c->receiver &&
+               ((ml == 13 && memcmp(mn, "define_method", 13) == 0) ||
+                (ml == 12 && memcmp(mn, "alias_method", 12) == 0) ||
+                (ml == 12 && memcmp(mn, "undef_method", 12) == 0) ||
+                (ml == 13 && memcmp(mn, "remove_method", 13) == 0) ||
+                (ml == 7 && memcmp(mn, "include", 7) == 0) ||
+                (ml == 7 && memcmp(mn, "prepend", 7) == 0) ||
+                (ml == 10 && memcmp(mn, "class_eval", 10) == 0) ||
+                (ml == 11 && memcmp(mn, "module_eval", 11) == 0)) &&
+               sp_pre_pm_is_core_op_owner(s->p, c->receiver)) {
+        s->ctx->core_ops_reopened = 1;
+      }
+      break;
+    }
+    default: break;
+  }
+  return true;
+}
+
+static void sp_pre_scan_file(const pm_parser_t *p, const pm_node_t *root,
+                             const SpPreFileCtx *inherit, SpPreFileCtx *out) {
+  memset(out, 0, sizeof *out);
+  int nd = sp_pre_define_count();
+  out->initialized = 1;
+  out->allow_engine = inherit && inherit->initialized ? inherit->allow_engine : 1;
+  out->allow_platform = inherit && inherit->initialized ? inherit->allow_platform : 1;
+  out->allow_version = inherit && inherit->initialized ? inherit->allow_version : 1;
+  out->allow_object = inherit && inherit->initialized ? inherit->allow_object : 1;
+  out->has_remove_const = inherit && inherit->initialized ? inherit->has_remove_const : 0;
+  out->core_ops_reopened = inherit && inherit->initialized ? inherit->core_ops_reopened : 0;
+  out->ndefs = nd;
+  if (nd > 0) {
+    out->def_shadowed = calloc((size_t)nd, 1);
+    if (!out->def_shadowed) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
+    if (inherit && inherit->def_shadowed)
+      memcpy(out->def_shadowed, inherit->def_shadowed, (size_t)(nd < inherit->ndefs ? nd : inherit->ndefs));
+  }
+  if (!root) return;
+  unsigned char *guarded = nd > 0 ? calloc((size_t)nd, 1) : NULL;
+  unsigned char *all_shad = nd > 0 ? malloc((size_t)nd) : NULL;
+  if (nd > 0 && (!guarded || !all_shad)) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
+  if (all_shad) memset(all_shad, 1, (size_t)nd);
+  SpPreScan s = { p, out, guarded, all_shad, 0, 0, 0, 0 };
+  pm_visit_node(root, sp_pre_scan_visit, &s);
+  if (out->has_remove_const || out->core_ops_reopened || !out->allow_object) {
+    for (int i = 0; i < nd; i++) if (guarded[i]) out->def_shadowed[i] = 1;
+  }
+  free(guarded);
+  free(all_shad);
+}
+
+/* Collect depth-0 local variable names bound inside a dead Prism subtree so
+ * Ruby's lexical local-variable declaration rules hold (`if false; x = 1; end;
+ * defined?(x) == "local-variable" && x.nil?`). */
+typedef struct {
+  const pm_parser_t *p;
+  char *buf;
+  size_t len, cap;
+} SpDeadLocalWalk;
+
+static void sp_dead_local_add(SpDeadLocalWalk *w, pm_constant_id_t cid) {
+  const pm_constant_t *nm = pm_constant_pool_id_to_constant(&w->p->constant_pool, cid);
+  if (!nm->length) return;
+  size_t need = w->len + (w->len ? 1 : 0) + nm->length + 1;
+  if (need > w->cap) {
+    size_t ncap = w->cap ? w->cap * 2 : 64;
+    while (ncap < need) ncap *= 2;
+    char *nb = realloc(w->buf, ncap);
+    if (!nb) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
+    w->buf = nb; w->cap = ncap;
+  }
+  if (w->len) w->buf[w->len++] = ',';
+  memcpy(w->buf + w->len, nm->start, nm->length);
+  w->len += nm->length;
+  w->buf[w->len] = '\0';
+}
+
+static bool sp_dead_local_visit(const pm_node_t *node, void *data) {
+  SpDeadLocalWalk *w = data;
+  switch (PM_NODE_TYPE(node)) {
+    case PM_DEF_NODE: case PM_CLASS_NODE: case PM_MODULE_NODE:
+    case PM_SINGLETON_CLASS_NODE: case PM_BLOCK_NODE: case PM_LAMBDA_NODE:
+      return false;
+    case PM_LOCAL_VARIABLE_WRITE_NODE: {
+      const pm_local_variable_write_node_t *n = (const pm_local_variable_write_node_t *)node;
+      if (n->depth == 0) sp_dead_local_add(w, n->name);
+      return true;
+    }
+    case PM_LOCAL_VARIABLE_OR_WRITE_NODE: {
+      const pm_local_variable_or_write_node_t *n = (const pm_local_variable_or_write_node_t *)node;
+      if (n->depth == 0) sp_dead_local_add(w, n->name);
+      return true;
+    }
+    case PM_LOCAL_VARIABLE_AND_WRITE_NODE: {
+      const pm_local_variable_and_write_node_t *n = (const pm_local_variable_and_write_node_t *)node;
+      if (n->depth == 0) sp_dead_local_add(w, n->name);
+      return true;
+    }
+    case PM_LOCAL_VARIABLE_OPERATOR_WRITE_NODE: {
+      const pm_local_variable_operator_write_node_t *n = (const pm_local_variable_operator_write_node_t *)node;
+      if (n->depth == 0) sp_dead_local_add(w, n->name);
+      return true;
+    }
+    case PM_LOCAL_VARIABLE_TARGET_NODE: {
+      const pm_local_variable_target_node_t *n = (const pm_local_variable_target_node_t *)node;
+      if (n->depth == 0) sp_dead_local_add(w, n->name);
+      return false;
+    }
+    default: return true;
+  }
+}
+
+static void sp_pre_pm_dead_locals(const pm_parser_t *p, const pm_node_t *dead_node, int cond_id) {
+  if (!dead_node) return;
+  SpDeadLocalWalk w = { p, NULL, 0, 0 };
+  pm_visit_node(dead_node, sp_dead_local_visit, &w);
+  if (w.buf && w.len) {
+    /* the names are as written, in the scope the branch is in: its decl, for comp_name_locals */
+    int d = nt_build_scope_at(out_nt, 0);
+    if (d >= 0) emit_int(cond_id, "decl", d);
+    const char *prev = nt_str(out_nt, cond_id, "dead_locals");
+    if (prev && *prev) {
+      size_t pl = strlen(prev);
+      char *merged = malloc(pl + 1 + w.len + 1);
+      if (merged) {
+        memcpy(merged, prev, pl);
+        merged[pl] = ',';
+        memcpy(merged + pl + 1, w.buf, w.len + 1);
+        emit_str(cond_id, "dead_locals", merged);
+        free(merged);
+      }
+    }
+    else emit_str(cond_id, "dead_locals", w.buf);
+  }
+  free(w.buf);
+}
+
+static void sp_pre_emit_cli_defines(int root_id, int after_boot) {
+  int nd = sp_pre_define_count();
+  if (nd <= 0 || root_id < 0) return;
+  int st = nt_ref(out_nt, root_id, "statements");
+  if (st < 0) {
+    st = node_counter++;
+    nt_put_type(out_nt, st, "StatementsNode");
+    nt_put_ref(out_nt, root_id, "statements", st);
+  }
+  int *cids = malloc(sizeof(int) * (size_t)nd);
+  if (!cids) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
+  for (int i = 0; i < nd; i++) {
+    const char *nm = sp_pre_define_name(i);
+    const SpPreVal *v = sp_pre_define_val(i);
+    int vid = node_counter++;
+    if (v->kind == SP_PRE_BOOL) {
+      nt_put_type(out_nt, vid, v->b ? "TrueNode" : "FalseNode");
+    }
+    else if (v->kind == SP_PRE_NIL) {
+      nt_put_type(out_nt, vid, "NilNode");
+    }
+    else if (v->kind == SP_PRE_INT) {
+      nt_put_type(out_nt, vid, "IntegerNode");
+      emit_int(vid, "value", v->i);
+      if (sp_target_int_bits == 32 && (v->i < INT32_MIN || v->i > INT32_MAX)) {
+        char bbuf[32];
+        snprintf(bbuf, sizeof bbuf, "%lld", v->i);
+        emit_str(vid, "bigval", bbuf);
+      }
+    }
+    else {
+      nt_put_type(out_nt, vid, "StringNode");
+      emit_str(vid, "content", v->s ? v->s : "");
+      emit_int(vid, "fzl", 1);
+    }
+    int wid = node_counter++;
+    nt_put_type(out_nt, wid, "ConstantWriteNode");
+    emit_str(wid, "name", nm);
+    nt_put_ref(out_nt, wid, "value", vid);
+    emit_int(wid, "cli_define", 1);
+    cids[i] = wid;
+  }
+  int n = 0;
+  const int *v = nt_arr(out_nt, st, "body", &n);
+  int at = after_boot < 0 ? 0 : (after_boot > n ? n : after_boot);
+  int *nv = malloc(sizeof(int) * (size_t)(n + nd));
+  if (!nv) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
+  if (at > 0) memcpy(nv, v, sizeof(int) * (size_t)at);
+  memcpy(nv + at, cids, sizeof(int) * (size_t)nd);
+  if (n > at) memcpy(nv + at + nd, v + at, sizeof(int) * (size_t)(n - at));
+  nt_node_set_arr(out_nt, st, "body", nv, n + nd);
+  free(nv);
+  free(cids);
+}
+
+static void flat_cond(int id, pm_node_t *node, int is_unless) {
+  pm_node_t *pred = is_unless ? ((pm_unless_node_t *)node)->predicate : ((pm_if_node_t *)node)->predicate;
+  pm_node_t *body = is_unless ? (pm_node_t *)((pm_unless_node_t *)node)->statements
+                              : (pm_node_t *)((pm_if_node_t *)node)->statements;
+  pm_node_t *other = is_unless ? (pm_node_t *)((pm_unless_node_t *)node)->else_clause
+                               : ((pm_if_node_t *)node)->subsequent;
+  const char *other_k = is_unless ? "else_clause" : "subsequent";
+  nt_put_type(out_nt, id, is_unless ? "UnlessNode" : "IfNode");
+  if (!g_in_pattern && g_flat_pre) {
+    int truth = sp_pre_pm_truth(g_parser, pred, g_flat_pre, !g_in_basic_object, 0);
+    if (truth >= 0) {
+      int pid = node_counter++;
+      nt_put_type(out_nt, pid, truth ? "TrueNode" : "FalseNode");
+      emit_int(pid, "engine_check", 1);
+      if (g_emit_line)
+        emit_int(pid, "node_line", (int)pm_newline_list_line(&g_parser->newline_list, pred->location.start, g_parser->start_line));
+      nt_put_ref(out_nt, id, "predicate", pid);
+      sp_pre_pm_dead_locals(g_parser, pred, id);
+      int take_body = is_unless ? !truth : truth;
+      if (take_body) {
+        emit_ref(id, "statements", body);
+        nt_put_ref(out_nt, id, other_k, -1);
+        if (other) sp_pre_pm_dead_locals(g_parser, other, id);
+      }
+      else {
+        nt_put_ref(out_nt, id, "statements", -1);
+        emit_ref(id, other_k, other);
+        if (body) sp_pre_pm_dead_locals(g_parser, body, id);
+      }
+      return;
+    }
+  }
+  emit_ref(id, "predicate", pred);
+  emit_ref(id, "statements", body);
+  emit_ref(id, other_k, other);
+}
+
+static void flat_in(int id, pm_in_node_t *n) {
+  nt_put_type(out_nt, id, "InNode");
+  n->pattern = flat_pattern(n->pattern);
+  int prev = g_in_pattern;
+  g_in_pattern = 1;
+  emit_ref(id, "pattern", n->pattern);
+  g_in_pattern = prev;
+  emit_ref(id, "statements", (pm_node_t *)n->statements);
+}
+
+static void flat_class(int id, pm_class_node_t *n) {
+  nt_put_type(out_nt, id, "ClassNode");
+  out_scope_locals(id, &n->locals);
+  emit_ref(id, "constant_path", n->constant_path);
+  emit_ref(id, "superclass", flat_superclass(n->superclass));
+  int is_bo = sp_pre_pm_is_basic_object(g_parser, n->superclass);
+  g_in_basic_object += is_bo;
+  flat_scoped(id, "body", n->body);
+  g_in_basic_object -= is_bo;
+}
+
 static int flatten_node(pm_node_t *node) {
   if (!node) return -1;
 
@@ -1295,12 +2008,6 @@ static int flatten_node(pm_node_t *node) {
     if (g_bi_base < 0 || t == PM_DEF_NODE) g_bi_base = id;
     emit_int(id, "node_bi", g_bi_base + 1);
   }
-  if (g_stmt_next < g_stmt_end && node == *g_stmt_next) {
-    int32_t bl = pm_newline_list_line(&g_parser->newline_list, node->location.start, g_parser->start_line);
-    int32_t ol = owner ? pm_newline_list_line(&g_parser->newline_list, owner, g_parser->start_line) : 0;
-    g_stmt_next++;
-    sp_stamp_req_pop(id, bl, ol);
-  }
   if (t != PM_STATEMENTS_NODE) g_owner = t == PM_PROGRAM_NODE ? NULL : node->location.start;
 
   /* Debug builds only: stamp every node with its source line -- and, when a
@@ -1315,11 +2022,16 @@ static int flatten_node(pm_node_t *node) {
                                                       g_parser->start_line);
     int32_t bl = lc.line;
     int orig = bl;
-    int fid = g_load_model_graph ? g_flat_file : 0;
+    int fid = g_flat_file;
     if (sp_line_map_n > 0 && bl >= 1 && bl <= sp_line_map_n && sp_line_orig[bl] > 0) {
       orig = sp_line_orig[bl];
       fid = sp_line_file[bl];
-      if (sp_disp_line[bl] > 0) { orig = sp_disp_line[bl]; fid = sp_disp_file[bl]; }
+      if (sp_disp_line[bl] > 0) {
+        /* The file the node is written in, kept apart from the marker's:
+           the load graph places a node by the file that holds it */
+        if (sp_disp_file[bl] != fid) emit_int(id, "node_src_file", (long long)fid);
+        orig = sp_disp_line[bl]; fid = sp_disp_file[bl];
+      }
     }
     emit_int(id, "node_line", (long long)orig);
     emit_int(id, "node_file", (long long)fid);
@@ -1354,28 +2066,22 @@ static int flatten_node(pm_node_t *node) {
   case PM_PROGRAM_NODE: {
     pm_program_node_t *n = (pm_program_node_t *)node;
     N("ProgramNode");
-    R("statements", n->statements);
+    flat_scoped(id, "statements", (pm_node_t *)n->statements);
     break;
   }
   case PM_STATEMENTS_NODE:
     N("StatementsNode");
     flatten_statements(id, &((pm_statements_node_t *)node)->body);
     break;
-  case PM_CLASS_NODE: {
-    pm_class_node_t *n = (pm_class_node_t *)node;
-    N("ClassNode");
-    out_scope_locals(id, &n->locals);
-    R("constant_path", n->constant_path);
-    R("superclass", flat_superclass(n->superclass));
-    R("body", n->body);
+  case PM_CLASS_NODE:
+    flat_class(id, (pm_class_node_t *)node);
     break;
-  }
   case PM_MODULE_NODE: {
     pm_module_node_t *n = (pm_module_node_t *)node;
     N("ModuleNode");
     out_scope_locals(id, &n->locals);
     R("constant_path", n->constant_path);
-    R("body", n->body);
+    flat_scoped(id, "body", n->body);
     break;
   }
   case PM_SINGLETON_CLASS_NODE: {
@@ -1389,7 +2095,7 @@ static int flatten_node(pm_node_t *node) {
     pm_singleton_class_node_t *n = (pm_singleton_class_node_t *)node;
     N("SingletonClassNode");
     R("expression", n->expression);
-    R("body", n->body);
+    flat_scoped(id, "body", n->body);
     break;
   }
   case PM_DEF_NODE:
@@ -1513,23 +2219,20 @@ static int flatten_node(pm_node_t *node) {
   case PM_LOCAL_VARIABLE_WRITE_NODE: {
     pm_local_variable_write_node_t *n = (pm_local_variable_write_node_t *)node;
     N("LocalVariableWriteNode");
-    NAME("name", n->name);
-    I("depth", n->depth);
+    emit_local(id, n->name, n->depth); I("depth", n->depth);
     R("value", n->value);
     break;
   }
   case PM_LOCAL_VARIABLE_READ_NODE: {
     pm_local_variable_read_node_t *n = (pm_local_variable_read_node_t *)node;
     N("LocalVariableReadNode");
-    NAME("name", n->name);
-    I("depth", n->depth);
+    emit_local(id, n->name, n->depth); I("depth", n->depth);
     break;
   }
   case PM_LOCAL_VARIABLE_OPERATOR_WRITE_NODE: {
     pm_local_variable_operator_write_node_t *n = (pm_local_variable_operator_write_node_t *)node;
     N("LocalVariableOperatorWriteNode");
-    NAME("name", n->name);
-    I("depth", n->depth);
+    emit_local(id, n->name, n->depth); I("depth", n->depth);
     NAME("binary_operator", n->binary_operator);
     R("value", n->value);
     break;
@@ -1537,24 +2240,21 @@ static int flatten_node(pm_node_t *node) {
   case PM_LOCAL_VARIABLE_OR_WRITE_NODE: {
     pm_local_variable_or_write_node_t *n = (pm_local_variable_or_write_node_t *)node;
     N("LocalVariableOrWriteNode");
-    NAME("name", n->name);
-    I("depth", n->depth);
+    emit_local(id, n->name, n->depth); I("depth", n->depth);
     R("value", n->value);
     break;
   }
   case PM_LOCAL_VARIABLE_AND_WRITE_NODE: {
     pm_local_variable_and_write_node_t *n = (pm_local_variable_and_write_node_t *)node;
     N("LocalVariableAndWriteNode");
-    NAME("name", n->name);
-    I("depth", n->depth);
+    emit_local(id, n->name, n->depth); I("depth", n->depth);
     R("value", n->value);
     break;
   }
   case PM_LOCAL_VARIABLE_TARGET_NODE: {
     pm_local_variable_target_node_t *n = (pm_local_variable_target_node_t *)node;
     N("LocalVariableTargetNode");
-    NAME("name", n->name);
-    I("depth", n->depth);
+    emit_local(id, n->name, n->depth); I("depth", n->depth);
     break;
   }
   case PM_INSTANCE_VARIABLE_WRITE_NODE: {
@@ -1887,28 +2587,18 @@ static int flatten_node(pm_node_t *node) {
     I("flags", n->base.flags);
     break;
   }
-  case PM_IF_NODE: {
-    pm_if_node_t *n = (pm_if_node_t *)node;
-    N("IfNode");
-    R("predicate", n->predicate);
-    R("statements", n->statements);
-    R("subsequent", n->subsequent);
+  case PM_IF_NODE:
+    flat_cond(id, node, 0);
     break;
-  }
   case PM_ELSE_NODE: {
     pm_else_node_t *n = (pm_else_node_t *)node;
     N("ElseNode");
     R("statements", n->statements);
     break;
   }
-  case PM_UNLESS_NODE: {
-    pm_unless_node_t *n = (pm_unless_node_t *)node;
-    N("UnlessNode");
-    R("predicate", n->predicate);
-    R("statements", n->statements);
-    R("else_clause", n->else_clause);
+  case PM_UNLESS_NODE:
+    flat_cond(id, node, 1);
     break;
-  }
   case PM_WHILE_NODE: {
     pm_while_node_t *n = (pm_while_node_t *)node;
     N("WhileNode");
@@ -1959,14 +2649,9 @@ static int flatten_node(pm_node_t *node) {
     R("statements", n->statements);
     break;
   }
-  case PM_IN_NODE: {
-    pm_in_node_t *n = (pm_in_node_t *)node;
-    N("InNode");
-    n->pattern = flat_pattern(n->pattern);
-    R("pattern", n->pattern);
-    R("statements", n->statements);
+  case PM_IN_NODE:
+    flat_in(id, (pm_in_node_t *)node);
     break;
-  }
   case PM_BEGIN_NODE: {
     pm_begin_node_t *n = (pm_begin_node_t *)node;
     N("BeginNode");
@@ -2027,7 +2712,7 @@ static int flatten_node(pm_node_t *node) {
   }
   case PM_BLOCK_NODE: {
     pm_block_node_t *n = (pm_block_node_t *)node;
-    N("BlockNode");
+    N("BlockNode"); decl_push(id);
     if (!n->opening_loc.start) I("sym_proc_block", 1);  /* an &:name block (sp_sym_proc_block) has no `{` */
     /* Block-local variables (params + first-assigned-inside): Ruby scoping
        makes non-param locals FRESH on every block invocation; codegen needs
@@ -2056,7 +2741,7 @@ else {
         R("parameters", n->parameters);
       }
     }
-    R("body", n->body);
+    R("body", n->body); decl_pop();
     break;
   }
   case PM_PARAMETERS_NODE: {
@@ -2239,18 +2924,23 @@ else {
   case PM_LAMBDA_NODE: {
     pm_lambda_node_t *n = (pm_lambda_node_t *)node;
     N("LambdaNode");
-    out_scope_locals(id, &n->locals);
+    decl_push(id); out_scope_locals(id, &n->locals);
+    /* a lambda holds no numbered-parameters node: how many `_1`.. it reads is on the lambda */
+    if (n->parameters && PM_NODE_TYPE(n->parameters) == PM_NUMBERED_PARAMETERS_NODE)
+      I("numbered_max", ((pm_numbered_parameters_node_t *)n->parameters)->maximum);
+    else if (n->parameters && PM_NODE_TYPE(n->parameters) == PM_IT_PARAMETERS_NODE) { I("numbered_max", 1); I("implicit_it", 1); }
     if (n->parameters) {
       if (PM_NODE_TYPE(n->parameters) == PM_BLOCK_PARAMETERS_NODE) {
         pm_block_parameters_node_t *bp = (pm_block_parameters_node_t *)n->parameters;
         if (bp->parameters) R("parameters", bp->parameters);
         A("block_locals", &bp->locals);   /* (a lambda holds no BlockParametersNode to carry them) */
       }
-else if (PM_NODE_TYPE(n->parameters) != PM_NUMBERED_PARAMETERS_NODE) {
+else if (PM_NODE_TYPE(n->parameters) != PM_NUMBERED_PARAMETERS_NODE && PM_NODE_TYPE(n->parameters) != PM_IT_PARAMETERS_NODE) {
         R("parameters", n->parameters);
       }
     }
     if (n->body) R("body", n->body);
+    decl_pop();
     break;
   }
   case PM_X_STRING_NODE: {
@@ -2310,7 +3000,7 @@ else if (PM_NODE_TYPE(n->parameters) != PM_NUMBERED_PARAMETERS_NODE) {
     if (n->pattern && PM_NODE_TYPE_P(n->pattern, PM_LOCAL_VARIABLE_TARGET_NODE)) {
       pm_local_variable_target_node_t *t = (pm_local_variable_target_node_t *)n->pattern;
       N("LocalVariableWriteNode");
-      NAME("name", t->name);
+      emit_local(id, t->name, t->depth);
       R("value", n->value);
     }
 else {
@@ -2433,15 +3123,15 @@ else {
        NumberedParametersNode arity path (get_block_param) handles it
        transparently. The block body's `it` references separately
        become PM_IT_LOCAL_VARIABLE_READ_NODE, also lowered below. */
-    N("NumberedParametersNode");
-    I("maximum", 1);
+    emit_it_parameters(id);
     break;
   case PM_IT_LOCAL_VARIABLE_READ_NODE:
     /* `it` inside the block body. Lowered to a regular
        LocalVariableReadNode named "_1" so it pairs with the
        lowered NumberedParametersNode { maximum: 1 } above; implicit_it keeps it
        apart from a written `_1` (blockarg_plain_read). */
-    N("LocalVariableReadNode"); S("name", "_1"); I("implicit_it", 1);
+    N("LocalVariableReadNode"); I("implicit_it", 1);
+    emit_local_s(id, "_1", 0);
     break;
   case PM_INTERPOLATED_SYMBOL_NODE: {
     /* `:"foo_#{x}"`. Carries `parts` like InterpolatedStringNode;
@@ -2599,8 +3289,8 @@ else {
 }
 
 /* A call flattened as node `id` of another kind: `__FILE__ == $0` and its
-   spellings as the constant they answer, stamped program_guard; and under
-   --load-model=graph a require as its LoadNode, which carries its path when
+   spellings as the constant they answer, stamped program_guard; and a
+   require as its LoadNode, which carries its path when
    it is one literal (or the one path its expression names), else the
    expression that computes it when it runs, and what its site resolved to
    before the file was flattened (sp_graph_site_take). 0 for a call
@@ -2613,7 +3303,7 @@ static int sp_flatten_call_as(int id, pm_call_node_t *n) {
     emit_int(id, "program_guard", 1);
     return 1;
   }
-  if (!g_load_model_graph || !sp_load_call(n)) return 0;
+  if (!sp_load_call(n)) return 0;
   if (sp_pm_name_is(g_parser, n->name, "autoload")) {
     sp_graph_site_take(id, node);
     return 0;   /* the registration belongs to the ordinary CallNode */
@@ -2649,173 +3339,6 @@ static char *read_file(const char *path) {
   buf[nread] = '\0';
   fclose(f);
   return buf;
-}
-
-/* Track files already inlined so duplicate requires/require_relatives in
-   different files don't re-emit (and re-define structs/classes) the same
-   content. Dynamic so we don't silently drop entries on large projects. */
-static char **sp_included_paths = NULL;
-static int sp_included_count = 0;
-static int sp_included_cap = 0;
-
-/* Whether `src` references the Set constant (identifier-boundary scan: the
-   char before is not part of an identifier or a `::`/`.` qualifier, the char
-   after doesn't extend the word -- so `Set[`, `Set.new`, `Set(` hit while
-   `Settings`, `OffSet`, `Foo::Set` don't) or calls `.to_set`. Drives the
-   implicit `require "set"` splice below. */
-/* The scan runs over CODE, not over the file. It was a plain strstr over the
-   whole text, so the word in a comment counted: `# Set` at the top of a
-   hello-world spliced the whole of set.rb in and took its generated C from 41
-   lines to 959 (#4411). On the reporter's program it did worse than waste --
-   a sentence in a benchmark's header comment linked Set, which changed the
-   lowering of an unrelated closure and with it the ANSWER (#4410).
-
-   Skipping is deliberately conservative, because a false negative drops a
-   `require` the program needs while a false positive only wastes: an
-   interpolation inside a double-quoted string is scanned as the code it is,
-   and every literal form not handled here -- %w, heredocs, regexps -- stays
-   code and keeps the old over-linking behaviour. */
-static int sp_set_word_at(const char *src, const char *p) {
-  char prev = p == src ? 0 : p[-1];
-  char next = p[3];
-  int prev_ok = prev == 0 ||
-                (!((prev >= 'A' && prev <= 'Z') || (prev >= 'a' && prev <= 'z') ||
-                   (prev >= '0' && prev <= '9') || prev == '_' || prev == ':' || prev == '.'));
-  int next_ok = !((next >= 'A' && next <= 'Z') || (next >= 'a' && next <= 'z') ||
-                  (next >= '0' && next <= '9') || next == '_');
-  return prev_ok && next_ok;
-}
-/* Whether hit(src, p) answers true at some p in CODE: comments, =begin
-   blocks and the text of quoted strings are passed over, and a #{...} inside
-   double quotes is scanned as the code it is. */
-static int sp_src_code_any(const char *src, int (*hit)(const char *src, const char *p)) {
-  const char *p = src;
-  int bol = 1;   /* at the beginning of a line, for =begin/=end */
-  while (*p) {
-    if (bol && strncmp(p, "=begin", 6) == 0) {
-      const char *e = strstr(p, "\n=end");
-      if (!e) return 0;          /* unterminated: the rest of the file is comment */
-      p = e + 5;
-      continue;
-    }
-    bol = 0;
-    if (*p == '#') {             /* comment to end of line */
-      while (*p && *p != '\n') p++;
-      continue;
-    }
-    if (*p == '\'') {            /* single quotes do not interpolate: skip whole */
-      p++;
-      while (*p && *p != '\'') { if (*p == '\\' && p[1]) p++; p++; }
-      if (*p) p++;
-      continue;
-    }
-    if (*p == '"') {             /* skip the text, but scan #{...} as code */
-      p++;
-      while (*p && *p != '"') {
-        if (*p == '\\' && p[1]) { p += 2; continue; }
-        if (p[0] == '#' && p[1] == '{') {
-          const char *q = p + 2;
-          int depth = 1;
-          while (*q && depth) { if (*q == '{') depth++; else if (*q == '}') depth--; q++; }
-          for (const char *r = p + 2; r < q; r++)
-            if (hit(src, r)) return 1;
-          p = q;
-          continue;
-        }
-        p++;
-      }
-      if (*p) p++;
-      continue;
-    }
-    if (hit(src, p)) return 1;
-    if (*p == '\n') bol = 1;
-    p++;
-  }
-  return 0;
-}
-/* `:to_set` as a symbol literal: respond_to?(:to_set), send(:to_set),
-   public_send, method(:to_set) and map(&:to_set) all name the method without
-   a `.to_set` call, so a program that spells it only that way never spliced
-   the set package in and answered false (respond_to?) or died with a
-   NoMethodError at run time (the others), where CRuby 4.0 -- Set is core
-   there -- answers true and works (Kilau K-042). The word must end at the
-   name: `:to_set_x` is another symbol. A false positive only wastes. */
-static int sp_to_set_sym_at(const char *p) {
-  if (strncmp(p, ":to_set", 7) != 0) return 0;
-  char next = p[7];
-  return !((next >= 'A' && next <= 'Z') || (next >= 'a' && next <= 'z') ||
-           (next >= '0' && next <= '9') || next == '_' || next == '?' || next == '!' || next == '=');
-}
-static int sp_set_hit(const char *src, const char *p) {
-  return (strncmp(p, "Set", 3) == 0 && sp_set_word_at(src, p)) || strncmp(p, ".to_set", 7) == 0 ||
-         sp_to_set_sym_at(p);
-}
-static int source_references_set(const char *src) {
-  return sp_src_code_any(src, sp_set_hit);
-}
-
-/* Whether `src` references `IO::Buffer` in CODE, with the same
-   comment/string skipping as source_references_set above. The needle is
-   already two qualified segments, so the boundary check is only that the
-   match is not embedded in a longer identifier (`IO::BufferPool`) or
-   preceded by one (`MyIO::Buffer` still matches -- a false positive only
-   splices the declarations needlessly). Drives the implicit
-   `require "io/buffer"` splice below: CRuby provides IO::Buffer without a
-   require, so Spinel mirrors it the way it mirrors Set. */
-static int sp_iob_word_at(const char *src, const char *p) {
-  char prev = p == src ? 0 : p[-1];
-  char next = p[10];   /* strlen("IO::Buffer") */
-  int prev_ok = !((prev >= 'A' && prev <= 'Z') || (prev >= 'a' && prev <= 'z') ||
-                  (prev >= '0' && prev <= '9') || prev == '_' || prev == '.');
-  int next_ok = !((next >= 'A' && next <= 'Z') || (next >= 'a' && next <= 'z') ||
-                  (next >= '0' && next <= '9') || next == '_');
-  return prev_ok && next_ok;
-}
-static int sp_iob_hit(const char *src, const char *p) {
-  return strncmp(p, "IO::Buffer", 10) == 0 && sp_iob_word_at(src, p);
-}
-static int source_references_io_buffer(const char *src) {
-  return sp_src_code_any(src, sp_iob_hit);
-}
-
-/* Whether `src` calls String#unicode_normalize, #unicode_normalize! or
-   #unicode_normalized? in CODE, or names one as a Symbol (`send`,
-   `method`); `unicode_normalize` starts all three (the skipping of
-   sp_src_code_any). Drives the unicode_normalize splice below: CRuby
-   answers them without a require, loading its tables on first use. */
-static int sp_unorm_hit(const char *src, const char *p) {
-  (void)src;
-  return (p[0] == '.' || p[0] == ':') && strncmp(p + 1, "unicode_normalize", 17) == 0;
-}
-static int source_calls_unicode_normalize(const char *src) {
-  return sp_src_code_any(src, sp_unorm_hit);
-}
-
-/* Whether `src` calls Time.parse or Time.strptime in CODE (the skipping of
-   sp_src_code_any). `Time` starts a word that no `.` or `::` qualifies, so
-   DateTime.parse and Foo::Time.parse do not count, though a top-level
-   ::Time.parse does; the method name ends there, so Time.parser does not.
-   `Time::parse` and a `.` on the next line count too. Drives the time.rb
-   splice below; a receiver held in a variable (`k = Time; k.parse(s)`) is
-   not seen. */
-static int sp_req_ident_char(char ch);
-static int sp_time_parser_hit(const char *src, const char *p) {
-  if (strncmp(p, "Time", 4) != 0) return 0;
-  const char *b = p;
-  if (b - src >= 2 && b[-1] == ':' && b[-2] == ':') b -= 2;   /* ::Time */
-  if (b > src && (sp_req_ident_char(b[-1]) || b[-1] == '.' || b[-1] == ':')) return 0;
-  const char *q = p + 4;
-  while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
-  if (q[0] == '&' && q[1] == '.') q += 2;
-  else if (q[0] == '.') q++;
-  else if (q[0] == ':' && q[1] == ':') q += 2;
-  else return 0;
-  while (*q == ' ' || *q == '\t' || *q == '\r' || *q == '\n') q++;
-  size_t n = strncmp(q, "parse", 5) == 0 ? 5 : strncmp(q, "strptime", 8) == 0 ? 8 : 0;
-  return n && !sp_req_ident_char(q[n]);
-}
-static int source_calls_time_parser(const char *src) {
-  return sp_src_code_any(src, sp_time_parser_hit);
 }
 
 /* ---- strict-require: features enabled by a `require "name"` ----
@@ -2943,140 +3466,19 @@ static char *sp_canonical_path(const char *path) {
   return strdup("");
 }
 
-static int sp_rr_included = 0;
-static int sp_path_already_included(const char *canonical) {
-  if (!canonical) return 0;
-  for (int i = 0; i < sp_included_count; i++) {
-    if (sp_included_paths[i] && strcmp(sp_included_paths[i], canonical) == 0) return 1;
-  }
-  return 0;
-}
-
-static void sp_mark_path_included(const char *canonical) {
-  sp_included_paths = sp_grow_strs(sp_included_paths, sp_included_count, &sp_included_cap, 16);
-  sp_included_paths[sp_included_count++] = strdup(canonical);
-}
-
-/* Free the included-paths table at end of run. The process is short-lived,
-   so this matters mostly for tools (leak checkers, embedders) that
-   scrutinise end-of-run state. */
-static void sp_includes_free(void) {
-  for (int i = 0; i < sp_included_count; i++) {
-    free(sp_included_paths[i]);
-  }
-  free(sp_included_paths);
-  sp_included_paths = NULL;
-  sp_included_count = 0;
-  sp_included_cap = 0;
-}
-
-/* ---- Debug multi-file source map (g_emit_line only) -------------------
-   require/require_relative are resolved by *textual* splicing into one
-   buffer, so a node's Prism line is a line in that concatenated buffer and
-   the original file boundaries are lost. For --debug we recover them: each
-   spliced file's content is wrapped in PUSH/POP marker *comments* (Prism
-   ignores comments, so the AST is unchanged), and a single pass over the
-   final buffer reconstructs, per buffer line, which file and original line
-   it came from. The stack accounting needs no original-line bookkeeping at
-   splice time: a PUSH consumes the parent's (replaced) require line, while
-   INSERT leaves that line in place. Content lines count within the child's
-   own coordinates until POP. */
-#define SP_PUSH_PREFIX "#<SPINEL_PUSH>"
-#define SP_INSERT_PREFIX "#<SPINEL_INSERT>"
-
-/* A PUSH or INSERT marker's file, after the prefix: its path, and the tier
-   sp_wrap_included wrote ahead of it (SP_LIB_NONE for the program's own),
-   with SP_FILE_DEFERRED when the marker says the file was spliced from a
-   require in a method, a block or a lambda */
-#define SP_TIER_MARK '\x1f'
-#define SP_DEFER_MARK '\x1e'
-#define SP_FILE_DEFERRED 0x40
-static const char *sp_marker_file(const char *p, size_t *len, int *tier) {
-  int deferred = *len >= 1 && p[0] == SP_DEFER_MARK;
-  if (deferred) { p++; (*len)--; }
-  *tier = SP_LIB_NONE;
-  if (*len >= 2 && p[0] == SP_TIER_MARK && p[1] >= '0' && p[1] <= '9') { *tier = p[1] - '0'; *len -= 2; p += 2; }
-  if (deferred) *tier |= SP_FILE_DEFERRED;
-  return p;
-}
-#define SP_POP_PREFIX "#<SPINEL_POP>"
 /* A generated .rb names the source its lines came from (#7630):
    `#<SPINEL_SOURCE>greeting.html.erb:12` pins file and line for the lines
    after it, until the next marker or the end of the file it is in. */
 #define SP_SOURCE_PREFIX "#<SPINEL_SOURCE>"
 
-/* The byte ranges of the final buffer a builtins/ file was spliced into.
-   A node inside one is stamped `node_bi`, so the names the compiler invents
-   from nodes number a builtin's nodes apart from the program's, and each
-   builtin method's apart from the others': a builtin that grows or shrinks
-   then moves only its own names (comp_node_tag).
-   Read off the splice markers, which every build keeps, not off the line
-   map, which only a build with line maps has. */
-static size_t *sp_bi_lo = NULL, *sp_bi_hi = NULL;
-/* The files the require resolver took from the compiler's own builtins/
-   directory: a splice is a builtin's by where it came from, not by a
-   "/builtins/" somewhere in its path -- a program's own lib/builtins/x.rb
-   is the program's. */
-static char **sp_bi_paths = NULL;
-static int sp_bi_npaths = 0;
-static void sp_note_builtin_path(const char *path) {
-  for (int i = 0; i < sp_bi_npaths; i++) if (!strcmp(sp_bi_paths[i], path)) return;
-  char **np = realloc(sp_bi_paths, sizeof(char *) * (size_t)(sp_bi_npaths + 1));
-  if (!np) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-  sp_bi_paths = np;
-  sp_bi_paths[sp_bi_npaths++] = strdup(path);
-}
-static int sp_is_builtin_path(const char *p, size_t n) {
-  for (int i = 0; i < sp_bi_npaths; i++)
-    if (strlen(sp_bi_paths[i]) == n && !strncmp(sp_bi_paths[i], p, n)) return 1;
-  return 0;
-}
-static int sp_bi_n = 0;
-static const char *sp_bi_base = NULL;
-static void sp_find_builtin_ranges(const char *src) {
-  free(sp_bi_lo); free(sp_bi_hi); sp_bi_lo = sp_bi_hi = NULL; sp_bi_n = 0;
-  sp_bi_base = src;
-  size_t stk_lo[64]; int stk_bi[64]; int sp = 0, cap = 0;
-  for (const char *line = src; *line; ) {
-    const char *eol = strchr(line, '\n');
-    size_t len = eol ? (size_t)(eol - line) : strlen(line);
-    size_t pl = !strncmp(line, SP_PUSH_PREFIX, strlen(SP_PUSH_PREFIX)) ? strlen(SP_PUSH_PREFIX)
-              : !strncmp(line, SP_INSERT_PREFIX, strlen(SP_INSERT_PREFIX)) ? strlen(SP_INSERT_PREFIX) : 0;
-    if (pl && sp < 64) {
-      size_t fl = len - pl;
-      int tier;
-      const char *fp = sp_marker_file(line + pl, &fl, &tier);
-      int bi = sp_is_builtin_path(fp, fl);
-      stk_lo[sp] = (size_t)(line - src); stk_bi[sp] = bi; sp++;
-    }
-    else if (!strncmp(line, SP_POP_PREFIX, strlen(SP_POP_PREFIX)) && sp > 0) {
-      sp--;
-      if (stk_bi[sp]) {
-        if (sp_bi_n == cap) {
-          cap = cap ? cap * 2 : 8;
-          sp_bi_lo = realloc(sp_bi_lo, sizeof(size_t) * (size_t)cap);
-          sp_bi_hi = realloc(sp_bi_hi, sizeof(size_t) * (size_t)cap);
-          if (!sp_bi_lo || !sp_bi_hi) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-        }
-        sp_bi_lo[sp_bi_n] = stk_lo[sp]; sp_bi_hi[sp_bi_n] = (size_t)(line - src); sp_bi_n++;
-      }
-    }
-    if (!eol) break;
-    line = eol + 1;
-  }
-}
+/* A builtins/ file is a root of its own: is the file being flattened one? */
 static int sp_in_builtin(const uint8_t *at) {
-  /* under --load-model=graph a builtins/ file is a root of its own */
-  if (g_load_model_graph) return g_flat_builtin;
-  if (!sp_bi_base || !at) return 0;
-  size_t off = (size_t)((const char *)at - sp_bi_base);
-  for (int i = 0; i < sp_bi_n; i++) if (off >= sp_bi_lo[i] && off < sp_bi_hi[i]) return 1;
-  return 0;
+  (void)at;
+  return g_flat_builtin;
 }
 
 static char **sp_file_table = NULL;  /* id -> path (declared above flatten) */
-static unsigned char *sp_file_tier = NULL;   /* id -> where `require` found it (SP_LIB_*), and
-                                                SP_FILE_DEFERRED */
+static unsigned char *sp_file_tier = NULL;   /* id -> where `require` found it (SP_LIB_*) */
 static int sp_file_count = 0, sp_file_cap = 0;
 
 /* A file's tier once another require finds it too (one canonical path,
@@ -3103,8 +3505,7 @@ static int sp_new_file(const char *path, int tier) {
 static int sp_intern_file(const char *path, int tier) {
   for (int i = 0; i < sp_file_count; i++)
     if (strcmp(sp_file_table[i], path) == 0) {
-      sp_file_tier[i] = (unsigned char)(((sp_file_tier[i] | tier) & SP_FILE_DEFERRED) |
-                                        sp_tier_merge(sp_file_tier[i] & ~SP_FILE_DEFERRED, tier & ~SP_FILE_DEFERRED));
+      sp_file_tier[i] = (unsigned char)sp_tier_merge(sp_file_tier[i], tier);
       return i;
     }
   return sp_new_file(path, tier);
@@ -3143,143 +3544,57 @@ static void sp_file_tiers_mark(NodeTable *nt) {
     int src = i;   /* an id made for a marker's name has its path's first id's tier */
     if (sp_file_defer_force && sp_file_defer_force[i])
       for (int k = 0; k < i; k++) if (strcmp(sp_file_table[k], sp_file_table[i]) == 0) { src = k; break; }
-    if ((sp_file_tier[src] & ~SP_FILE_DEFERRED) != SP_LIB_NONE) nt_put_file_tier(nt, i, sp_file_tier[src] & ~SP_FILE_DEFERRED);
+    if (sp_file_tier[src] != SP_LIB_NONE) nt_put_file_tier(nt, i, sp_file_tier[src]);
   }
 }
-/* Was file fid spliced from a require that does not always run where it stands (sp_req_always_runs), or from inside
-   such a file? */
-static int sp_file_deferred(int fid) {
-  return sp_file_tier && fid >= 0 && fid < sp_file_count && (sp_file_tier[fid] & SP_FILE_DEFERRED);
-}
-/* Stamp top-level statement id, on source line bl under its owner's line ol,
-   with the splice it ends (req_pop) when the two lines' splices differ, and
-   req_deferred when its file was spliced from a require that may not run
-   (sp_req_always_runs says no), so its statements may not have run. */
-static void sp_stamp_req_pop(int id, int32_t bl, int32_t ol) {
-  if (bl < 1 || bl > sp_line_map_n || sp_line_pop[bl] <= 0 || sp_line_pop[bl] == sp_line_pop[ol]) return;
-  emit_int(id, "req_pop", sp_line_pop[bl]);
-  if (sp_file_deferred(sp_line_file[bl])) emit_int(id, "req_deferred", 1);
-}
-
-/* In debug mode, wrap an included file's (already-resolved) content with
-   PUSH <path> / POP marker lines; a library file's path carries the tier
-   `require` found it at (sp_marker_file). Takes ownership of `content`;
-   returns it unchanged when not in debug mode. */
-static char *sp_wrap_included(char *content, const char *path, int tier) {
-  if (!g_src_map) return content;
-  size_t clen = strlen(content);
-  int need_nl = (clen > 0 && content[clen - 1] != '\n') ? 1 : 0;
-  size_t total = strlen(SP_PUSH_PREFIX) + 2 + strlen(path) + 1 + clen + need_nl
-               + strlen(SP_POP_PREFIX) + 1 + 1;
-  char *w = malloc(total + 8);
-  if (!w) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-  const char *dm = tier & SP_FILE_DEFERRED ? (const char[]){ SP_DEFER_MARK, 0 } : "";
-  tier &= ~SP_FILE_DEFERRED;
-  size_t o = tier != SP_LIB_NONE ? (size_t)sprintf(w, SP_PUSH_PREFIX "%s%c%d%s\n", dm, SP_TIER_MARK, tier, path)
-                                 : (size_t)sprintf(w, SP_PUSH_PREFIX "%s%s\n", dm, path);
-  memcpy(w + o, content, clen); o += clen;
-  if (need_nl) w[o++] = '\n';
-  o += (size_t)sprintf(w + o, SP_POP_PREFIX "\n");
-  w[o] = '\0';
-  free(content);
-  return w;
-}
-
-/* Reconstruct the line map from the final spliced buffer. toplevel is the
-   path of the outermost file (interned as the initial frame). */
-static void sp_build_line_map(const char *src, const char *toplevel) {
+/* The line map of one file's text: each line's file and line, and the
+   position a `#<SPINEL_SOURCE>file:line` marker pins for the lines after it.
+   file is the text's own path. */
+static void sp_build_line_map(const char *src, const char *file) {
   size_t nlines = 1;
   for (const char *p = src; *p; p++) if (*p == '\n') nlines++;
   sp_line_map_n = (int)nlines;
   sp_line_file = (int *)calloc(nlines + 2, sizeof(int));
   sp_line_orig = (int *)calloc(nlines + 2, sizeof(int));
-  sp_line_pop = (int *)calloc(nlines + 2, sizeof(int));
   sp_disp_file = (int *)calloc(nlines + 2, sizeof(int));
   sp_disp_line = (int *)calloc(nlines + 2, sizeof(int));
-  int *stk_dfile = (int *)calloc(nlines + 2, sizeof(int));  /* a frame's pinned file id, 0 = none */
-  int *stk_dline = (int *)calloc(nlines + 2, sizeof(int));
-
-  int *stk_file = (int *)malloc(sizeof(int) * (nlines + 2));
-  int *stk_next = (int *)malloc(sizeof(int) * (nlines + 2));
-  int *stk_start = (int *)malloc(sizeof(int) * (nlines + 2));
-  if (!sp_line_file || !sp_line_orig || !sp_line_pop || !sp_disp_file || !sp_disp_line || !stk_dfile || !stk_dline || !stk_file || !stk_next || !stk_start) {
+  if (!sp_line_file || !sp_line_orig || !sp_disp_file || !sp_disp_line) {
     fprintf(stderr, "spinel_parse: out of memory\n"); exit(1);
   }
-  int sp = 0;
-  stk_file[sp] = sp_intern_file(toplevel, SP_LIB_NONE);
-  stk_next[sp] = 1;
-
+  int fid = sp_intern_file(file, SP_LIB_NONE), dfile = 0, dline = 0;   /* dfile: the pinned file id, 0 = none */
   int bl = 1;
   const char *line = src;
   while (1) {
     const char *eol = strchr(line, '\n');
     size_t len = eol ? (size_t)(eol - line) : strlen(line);
-    size_t prefix_len = 0;
-    if (strncmp(line, SP_PUSH_PREFIX, strlen(SP_PUSH_PREFIX)) == 0) {
-      /* The replaced require occupied one parent line: consume it. */
-      if (sp >= 0) stk_next[sp] += 1;
-      prefix_len = strlen(SP_PUSH_PREFIX);
-    }
-else if (strncmp(line, SP_INSERT_PREFIX, strlen(SP_INSERT_PREFIX)) == 0) {
-      prefix_len = strlen(SP_INSERT_PREFIX);
-    }
-    if (prefix_len) {
+    sp_line_file[bl] = fid;
+    sp_line_orig[bl] = bl;
+    if (strncmp(line, SP_SOURCE_PREFIX, strlen(SP_SOURCE_PREFIX)) == 0) {
+      /* file:line, split at the last colon; anything else is a comment */
       char pathbuf[1024];
-      size_t plen = len - prefix_len;
-      int tier;
-      const char *fp = sp_marker_file(line + prefix_len, &plen, &tier);
+      size_t plen = len - strlen(SP_SOURCE_PREFIX);
       if (plen >= sizeof(pathbuf)) plen = sizeof(pathbuf) - 1;
-      memcpy(pathbuf, fp, plen);
+      memcpy(pathbuf, line + strlen(SP_SOURCE_PREFIX), plen);
       pathbuf[plen] = '\0';
-      /* a file spliced inside a deferred one runs when that one does */
-      if (sp_file_deferred(stk_file[sp])) tier |= SP_FILE_DEFERRED;
-      sp++;
-      stk_file[sp] = sp_intern_file(pathbuf, tier);
-      stk_next[sp] = 1;
-      stk_start[sp] = bl;
-      stk_dfile[sp] = 0;
-      /* marker line maps to nothing meaningful */
-    }
-else if (strncmp(line, SP_POP_PREFIX, strlen(SP_POP_PREFIX)) == 0) {
-      for (int j = sp > 0 ? stk_start[sp] : bl; j < bl; j++) if (!sp_line_pop[j]) sp_line_pop[j] = bl;
-      if (sp > 0) sp--;
-    }
-else if (len < 12 || strncmp(line + len - 12, "SPINEL_COND>", 12) != 0) {
-      sp_line_file[bl] = stk_file[sp];
-      sp_line_orig[bl] = stk_next[sp];
-      stk_next[sp] += 1;
-      if (strncmp(line, SP_SOURCE_PREFIX, strlen(SP_SOURCE_PREFIX)) == 0) {
-        /* file:line, split at the last colon; anything else is a comment */
-        char pathbuf[1024];
-        size_t plen = len - strlen(SP_SOURCE_PREFIX);
-        if (plen >= sizeof(pathbuf)) plen = sizeof(pathbuf) - 1;
-        memcpy(pathbuf, line + strlen(SP_SOURCE_PREFIX), plen);
-        pathbuf[plen] = '\0';
-        while (plen > 0 && (pathbuf[plen - 1] == '\r' || pathbuf[plen - 1] == ' ')) pathbuf[--plen] = '\0';
-        char *colon = strrchr(pathbuf, ':');
-        char *end = NULL;
-        long ln = colon ? strtol(colon + 1, &end, 10) : 0;
-        if (colon && colon > pathbuf && end && end != colon + 1 && *end == '\0' && ln > 0 && ln < 1000000000) {
-          *colon = '\0';
-          stk_dfile[sp] = sp_intern_display_file(pathbuf, stk_file[sp]);
-          stk_dline[sp] = (int)ln;
-        }
+      while (plen > 0 && (pathbuf[plen - 1] == '\r' || pathbuf[plen - 1] == ' ')) pathbuf[--plen] = '\0';
+      char *colon = strrchr(pathbuf, ':');
+      char *end = NULL;
+      long ln = colon ? strtol(colon + 1, &end, 10) : 0;
+      if (colon && colon > pathbuf && end && end != colon + 1 && *end == '\0' && ln > 0 && ln < 1000000000) {
+        *colon = '\0';
+        dfile = sp_intern_display_file(pathbuf, fid);
+        dline = (int)ln;
       }
-      else if (stk_dfile[sp]) {
-        sp_disp_file[bl] = stk_dfile[sp];
-        sp_disp_line[bl] = stk_dline[sp];
-      }
+    }
+    else if (dfile) {
+      sp_disp_file[bl] = dfile;
+      sp_disp_line[bl] = dline;
     }
     bl++;
     if (!eol) break;
     line = eol + 1;
     if (*line == '\0') break;
   }
-  free(stk_file);
-  free(stk_next);
-  free(stk_start);
-  free(stk_dfile);
-  free(stk_dline);
 }
 
 /* Lexically collapse "." and ".." path segments, like File.expand_path,
@@ -3337,341 +3652,6 @@ static void sp_normalize_dots(char *path) {
   free(copy); free(seg); free(seglen);
 }
 
-/* Simple require_relative resolver: replace lines matching
-   require_relative "path" with the file content. Files that have
-   already been included once are silently skipped on subsequent
-   requires (matching Ruby's load-once semantics). */
-/* PUSH/POP wrap adds one marker line before and after (--debug only): pad the
-   file's flag lines to match so the buffer stays aligned with the text. */
-static void sp_fsl_pad_wrap(unsigned char **v, size_t *n) {
-  unsigned char z = 0;
-  if (!g_src_map) return;
-  sp_fsl_splice(v, n, 0, 0, &z, 1);
-  sp_fsl_splice(v, n, *n, 0, &z, 1);
-}
-
-/* 0-based line index of byte offset `at` in `text` (both resolvers splice at
-   line starts, so this is the spliced line's index in the flag buffer). */
-static size_t sp_fsl_line_at(const char *text, size_t at) {
-  size_t line = 0;
-  for (size_t i = 0; i < at; i++) if (text[i] == '\n') line++;
-  return line;
-}
-
-/* One `require` / `require_relative` occurrence, located by a scan that knows
-   where string literals, comments and heredoc bodies are -- so the word inside
-   a fixture string is not mistaken for a real one.
-
-   `kw` points at the keyword and `expr_end` just past the whole call (past the
-   closing paren in the parenthesized form, past the closing quote otherwise).
-   `margin` is 1 when the keyword starts the line. Only then may the inlined
-   content take the statement's place: anywhere else -- indented inside a
-   method or class body, in a condition, on an assignment's right-hand side --
-   the library belongs at the top of the program (a module cannot be defined
-   inside a method body, and a class nested in a reopened class is not the same
-   class), with the call itself replaced by the value it answers. */
-typedef struct {
-  char *kw, *arg, *expr_end;
-  size_t arg_len;
-  int margin;
-} SpReqHit;
-
-static int sp_req_ident_char(char ch) {
-  return ch == '_' || (ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') ||
-         (ch >= '0' && ch <= '9');
-}
-
-/* The quoted argument of a require starting at `p` (just past the keyword),
-   in either the bare or the parenthesized form, confined to one line. */
-static int sp_req_parse_arg(char *p, char *line_end, SpReqHit *h) {
-  int paren = 0;
-  while (p < line_end && (*p == ' ' || *p == '\t')) p++;
-  if (p < line_end && *p == '(') { paren = 1; p++; while (p < line_end && (*p == ' ' || *p == '\t')) p++; }
-  if (p >= line_end || (*p != '"' && *p != '\'')) return 0;
-  char q = *p++;
-  char *arg = p;
-  while (p < line_end && *p != q) {
-    if (*p == '\\') p++;
-    p++;
-  }
-  if (p >= line_end || *p != q) return 0;
-  h->arg = arg;
-  h->arg_len = (size_t)(p - arg);
-  p++;                                  /* past the closing quote */
-  if (paren) {
-    while (p < line_end && (*p == ' ' || *p == '\t')) p++;
-    if (p >= line_end || *p != ')') return 0;
-    p++;
-  }
-  h->expr_end = p;
-  return 1;
-}
-
-/* The first `word` call at or after `from`. Returns 0 when there is none. */
-static int sp_require_find(char *buf, char *from, const char *word, SpReqHit *out) {
-  size_t wlen = strlen(word);
-  char hd_term[128];   /* the pending heredoc terminator, "" when not in one */
-  hd_term[0] = 0;
-  char *line = buf;
-  while (*line) {
-    char *line_end = strchr(line, '\n');
-    if (!line_end) line_end = line + strlen(line);
-    if (hd_term[0]) {
-      /* inside a heredoc body: the terminator line ends it, nothing else counts */
-      char *t = line;
-      while (t < line_end && (*t == ' ' || *t == '\t')) t++;
-      size_t tl = strlen(hd_term);
-      if ((size_t)(line_end - t) == tl && strncmp(t, hd_term, tl) == 0) hd_term[0] = 0;
-      line = (*line_end == '\n') ? line_end + 1 : line_end;
-      continue;
-    }
-    for (char *p = line; p < line_end; p++) {
-      if (*p == '#') break;                                  /* comment to end of line */
-      if (*p == '"' || *p == '\'') {                         /* skip a string literal */
-        char q = *p++;
-        while (p < line_end && *p != q) { if (*p == '\\') p++; p++; }
-        if (p >= line_end) break;                            /* unterminated: give up on the line */
-        continue;
-      }
-      if (p[0] == '<' && p + 1 < line_end && p[1] == '<' &&
-          (p == line || !sp_req_ident_char(p[-1]))) {        /* a heredoc opener */
-        char *t = p + 2;
-        if (t < line_end && (*t == '~' || *t == '-')) t++;
-        char tq = 0;
-        if (t < line_end && (*t == '"' || *t == '\'')) tq = *t++;
-        char *ts = t;
-        while (t < line_end && sp_req_ident_char(*t)) t++;
-        if (t > ts && (!tq || (t < line_end && *t == tq))) {
-          size_t tl = (size_t)(t - ts);
-          if (tl < sizeof hd_term) { memcpy(hd_term, ts, tl); hd_term[tl] = 0; }
-        }
-        continue;
-      }
-      if (*p != word[0] || strncmp(p, word, wlen) != 0) continue;
-      if (sp_req_ident_char(p[wlen])) continue;              /* require_relative vs require */
-      /* `Kernel.require "x"` (`::Kernel.` too) is the bare require -- the
-         deprecation proxies in activesupport spell it so; any other
-         receiver makes it that object's method and not a require at all */
-      char *kw = p;
-      if (p > buf && p[-1] == '.') {
-        char *q = p - 1;
-        if (q - line >= 6 && strncmp(q - 6, "Kernel", 6) == 0 &&
-            (q - 6 == line || !sp_req_ident_char(q[-7]))) {
-          kw = q - 6;
-          if (kw - line >= 2 && kw[-1] == ':' && kw[-2] == ':') kw -= 2;
-        }
-        else continue;
-      }
-      else if (p > buf && (sp_req_ident_char(p[-1]) || p[-1] == ':' ||
-                           p[-1] == '@' || p[-1] == '$')) continue;
-      if (p < from) continue;
-      SpReqHit h;
-      memset(&h, 0, sizeof h);
-      if (!sp_req_parse_arg(p + wlen, line_end, &h)) continue;
-      h.kw = kw;
-      h.margin = (kw == line);
-      *out = h;
-      return 1;
-    }
-    line = (*line_end == '\n') ? line_end + 1 : line_end;
-  }
-  return 0;
-}
-
-/* The start of the top-level statement a position sits inside: the nearest
-   line at or above it that begins, at the margin, something other than the
-   continuation of a statement already open (end / else / rescue / a closing
-   bracket / a comment). A require nested in that statement -- inside an `if`,
-   a `begin`, a method body -- is spliced there, so the program keeps running
-   top to bottom: the library loads where the code needing it stands, not at
-   the very start, ahead of the definitions its own body calls (ffi-rzmq-core
-   requires libzmq4 under `if LibZMQ.version4?`, and libzmq4 reopens LibZMQ). */
-/* Is the line starting at `ls` inside a heredoc body, its terminator
-   included? The lines are read from the start of `buf` with
-   sp_require_find's view of strings, comments and heredoc openers. */
-static int sp_line_in_heredoc(const char *buf, size_t ls) {
-  char term[128];
-  term[0] = 0;
-  const char *line = buf, *stop = buf + ls;
-  while (*line && line <= stop) {
-    const char *line_end = strchr(line, '\n');
-    if (!line_end) line_end = line + strlen(line);
-    if (term[0]) {
-      if (line == stop) return 1;
-      const char *t = line;
-      while (t < line_end && (*t == ' ' || *t == '\t')) t++;
-      size_t tl = strlen(term);
-      if ((size_t)(line_end - t) == tl && strncmp(t, term, tl) == 0) term[0] = 0;
-    }
-    else {
-      if (line == stop) return 0;
-      for (const char *p = line; p < line_end; p++) {
-        if (*p == '#') break;
-        if (*p == '"' || *p == '\'') {
-          char q = *p++;
-          while (p < line_end && *p != q) { if (*p == '\\') p++; p++; }
-          if (p >= line_end) break;
-          continue;
-        }
-        if (p[0] == '<' && p + 1 < line_end && p[1] == '<' && (p == line || !sp_req_ident_char(p[-1]))) {
-          const char *t = p + 2;
-          if (t < line_end && (*t == '~' || *t == '-')) t++;
-          char tq = 0;
-          if (t < line_end && (*t == '"' || *t == '\'')) tq = *t++;
-          const char *ts = t;
-          while (t < line_end && sp_req_ident_char(*t)) t++;
-          if (t > ts && (!tq || (t < line_end && *t == tq))) {
-            size_t tl = (size_t)(t - ts);
-            if (tl < sizeof term) { memcpy(term, ts, tl); term[tl] = 0; }
-          }
-        }
-      }
-    }
-    if (*line_end != '\n') break;
-    line = line_end + 1;
-  }
-  return 0;
-}
-static size_t sp_toplevel_stmt_start(const char *buf, size_t pos) {
-  size_t ls = pos;
-  while (ls > 0 && buf[ls - 1] != '\n') ls--;
-  for (;;) {
-    const char *l = buf + ls;
-    int margin = *l && *l != ' ' && *l != '\t' && *l != '\n' && *l != '\r' && *l != '#';
-    static const char *const cont[] = { "end", "else", "elsif", "when", "in ", "rescue", "ensure",
-                                        "then", "do", "}", ")", "]", "=end", "=begin", NULL };
-    if (margin) {
-      int is_cont = 0;
-      for (int i = 0; cont[i]; i++) {
-        size_t n = strlen(cont[i]);
-        if (strncmp(l, cont[i], n) == 0 && (cont[i][n - 1] == ' ' || !sp_req_ident_char(l[n]))) { is_cont = 1; break; }
-      }
-      /* (a heredoc's body line or terminator at the margin is no
-         statement: content spliced ahead of it went into the String) */
-      if (!is_cont && !sp_line_in_heredoc(buf, ls)) return ls;
-    }
-    if (ls == 0) return 0;
-    ls--;                                   /* onto the previous line's newline */
-    while (ls > 0 && buf[ls - 1] != '\n') ls--;
-  }
-}
-
-/* A require standing alone on its line whose enclosing lines, out to the
-   margin, are all control flow -- `if`/`elsif`/`else`/`unless`/`case`/`when`/
-   `begin`/`rescue`/`ensure`/`while`/`until` -- may be inlined where it stands:
-   a class or module definition is legal there, and the file then loads only
-   when that branch runs (ffi-yajl requires its C-extension flavour or its FFI
-   one on ENV["FORCE_FFI_YAJL"], inside begin/rescue LoadError). */
-/* Inside a file that was itself inlined under a condition (between the
-   markers the conditional splice writes around it)? */
-static int sp_in_cond_region(const char *buf, const char *pos) {
-  int depth = 0;
-  for (const char *p = buf; p && p < pos; ) {
-    const char *a = strstr(p, "#<SPINEL_COND");
-    const char *z = strstr(p, "#</SPINEL_COND");
-    const char *n = a && (!z || a < z) ? a : z;
-    if (!n || n >= pos) break;
-    depth += (n == a) ? 1 : -1;
-    p = n + 1;
-  }
-  return depth > 0;
-}
-
-static int sp_req_in_control_only(const char *buf, const char *kw) {
-  const char *ls = kw;
-  while (ls > buf && ls[-1] != '\n') ls--;
-  for (const char *q = ls; q < kw; q++) if (*q != ' ' && *q != '\t') return 0;
-  size_t indent = (size_t)(kw - ls);
-  if (indent == 0) return 0;
-  static const char *const CTL[] = { "if", "elsif", "else", "unless", "case", "when", "begin",
-                                     "rescue", "ensure", "while", "until", NULL };
-  const char *l = ls;
-  while (l > buf) {
-    const char *pe = l - 1;              /* the previous line's newline */
-    const char *pl = pe;
-    while (pl > buf && pl[-1] != '\n') pl--;
-    l = pl;
-    const char *t = pl;
-    while (t < pe && (*t == ' ' || *t == '\t')) t++;
-    if (t == pe || *t == '#') continue;  /* blank or comment */
-    size_t ind = (size_t)(t - pl);
-    if (ind >= indent) continue;
-    int ctl = 0;
-    for (int i = 0; CTL[i]; i++) {
-      size_t n = strlen(CTL[i]);
-      if (strncmp(t, CTL[i], n) == 0 && !sp_req_ident_char(t[n])) { ctl = 1; break; }
-    }
-    if (!ctl) return 0;
-    indent = ind;
-    if (indent == 0) return 1;
-  }
-  return 0;
-}
-
-/* Rebuild `*result` with `content` inlined at `ins` (a require site's
-   insertion point, or sp_toplevel_stmt_start's answer for a plain require)
-   and the call itself replaced by `value`, so the statement around the
-   require -- a condition, an assignment, a method body -- survives intact. */
-static void sp_req_hoist_splice(char **result, unsigned char **fsl, size_t *fsl_n,
-                                const SpReqHit *h, size_t ins, const char *content,
-                                unsigned char *cfsl, size_t cfsl_n,
-                                const char *value) {
-  size_t kw_off = (size_t)(h->kw - *result), end_off = (size_t)(h->expr_end - *result);
-  size_t rlen = strlen(*result), clen = strlen(content), vlen = strlen(value);
-  size_t ins_line = 0;
-  for (size_t i = 0; i < ins; i++) if ((*result)[i] == '\n') ins_line++;
-  sp_fsl_splice(fsl, fsl_n, ins_line, 0, cfsl, cfsl_n);
-  /* The caller's statement survives this splice. Only its included file's
-     outer marker changes: nested requires retain their own accounting. */
-  size_t skip = strncmp(content, SP_PUSH_PREFIX, strlen(SP_PUSH_PREFIX)) == 0
-              ? strlen(SP_PUSH_PREFIX) : 0;
-  size_t add = skip ? strlen(SP_INSERT_PREFIX) : 0;
-  char *nr = malloc(rlen + clen + vlen + add - skip + 2);
-  size_t o = 0;
-  memcpy(nr + o, *result, ins);                          o += ins;
-  if (add) { memcpy(nr + o, SP_INSERT_PREFIX, add); o += add; }
-  content += skip; clen -= skip;
-  memcpy(nr + o, content, clen);                         o += clen;
-  if (clen > 0 && content[clen - 1] != '\n') nr[o++] = '\n';
-  memcpy(nr + o, *result + ins, kw_off - ins);           o += kw_off - ins;
-  memcpy(nr + o, value, vlen);                           o += vlen;
-  memcpy(nr + o, *result + end_off, rlen - end_off + 1);
-  free(*result);
-  *result = nr;
-}
-
-static int sp_req_if_modifier(const char *t) {
-  int n = (int)strspn(t, " \t"), k = strncmp(t + n, "if", 2) == 0 ? 2 : strncmp(t + n, "unless", 6) == 0 ? 6 : 0;
-  if (!k || sp_req_ident_char(t[n + k])) return 0;
-  int c = n += k, e = 0;
-  for (; t[n] && t[n] != '\n' && t[n] != '\r' && (e || t[n] != ';'); n++) {
-    if (e) continue;
-    if (t[n] == '#') e = n;
-    else if (t[n] == '"' || t[n] == '\'') {
-      char q = t[n];
-      while (t[++n] && t[n] != q && t[n] != '\n') if (t[n] == '\\' && t[n + 1]) n++;
-      if (t[n] != q) return 0;
-    }
-  }
-  for (e = e ? e : n; e > c && (t[e - 1] == ' ' || t[e - 1] == '\t'); e--) {}
-  if (e == c || t[n] == ';' || strchr("&|,(\\+-*/.<>=:", t[e - 1])) return 0;
-  return (e - c > 3 && (!strncmp(t + e - 4, " and", 4) || !strncmp(t + e - 4, " not", 4))) ||
-         (e - c > 2 && !strncmp(t + e - 3, " or", 3)) ? 0 : n;
-}
-
-static char *sp_req_cond_wrap(char *content, unsigned char **cfsl, size_t *cfsl_n, const char *head, int hl) {
-  size_t wcl = strlen(content), skip = hl && strncmp(content, SP_PUSH_PREFIX, strlen(SP_PUSH_PREFIX)) == 0 ? strlen(SP_PUSH_PREFIX) : 0;
-  char *w = malloc(wcl + hl + 48);
-  if (!w) return content;
-  sprintf(w, "#<SPINEL_COND>\n%.*s%s%s%s%s%s#</SPINEL_COND>\n", hl, head, hl ? "\n" : "", skip ? SP_INSERT_PREFIX : "",
-          content + skip, (wcl && content[wcl - 1] != '\n') ? "\n" : "", hl ? "end " : "");
-  free(content);
-  unsigned char z[2] = { 0, 0 };
-  sp_fsl_splice(cfsl, cfsl_n, 0, 0, z, hl ? 2 : 1);
-  sp_fsl_splice(cfsl, cfsl_n, *cfsl_n, 0, z, 1);
-  return w;
-}
-
 /* Dependency resolution precedes analysis, so even `if false; require ...`
    would otherwise read the file (or reject a missing one). Only erase literal
    require calls in provably unreachable branches: keep the surrounding code
@@ -3688,7 +3668,8 @@ typedef struct {
   const char *source;
   char *result;
   int dead;
-  int engine;   /* fold RUBY_ENGINE comparisons (the file does not assign the constant) */
+  int in_bo;
+  const SpPreFileCtx *pre;
   SpNodeList *blanked;
 } SpDeadRequire;
 
@@ -3696,88 +3677,6 @@ static int sp_pm_name_is(const pm_parser_t *parser, pm_constant_id_t id, const c
   const pm_constant_t *name = pm_constant_pool_id_to_constant(&parser->constant_pool, id);
   size_t n = strlen(word);
   return name->length == n && memcmp(name->start, word, n) == 0;
-}
-
-/* The truth of a predicate the splice can settle without the analyzer:
-   1 / 0 for a literal or a settled RUBY_ENGINE comparison, -1 otherwise.
-   RUBY_ENGINE is "spinel" in every program spinel compiles, so
-   `RUBY_ENGINE == "x"` (either operand order), its `!=` and a `!` around
-   either are constants too. The analyzer drops the branch such a check rules
-   out before anything in it is compiled (desugar_engine_branches), but the
-   splice runs first and used to fetch -- or warn about -- a file no one would
-   use: the harness a benchmark keeps for CRuby, a JRuby shim. */
-static int sp_require_truth(const pm_parser_t *parser, const pm_node_t *node, int engine) {
-  if (!node) return -1;
-  switch (PM_NODE_TYPE(node)) {
-    case PM_TRUE_NODE: return 1;
-    case PM_FALSE_NODE: case PM_NIL_NODE: return 0;
-    case PM_PARENTHESES_NODE:
-      return sp_require_truth(parser, ((const pm_parentheses_node_t *)node)->body, engine);
-    /* `a and b` is settled by a false side or two true ones, `a or b` by a
-       true side or two false ones (racc: `Object.const_defined?(:RUBY_ENGINE)
-       and RUBY_ENGINE == 'jruby'`) */
-    case PM_AND_NODE: case PM_OR_NODE: {
-      int is_and = PM_NODE_TYPE(node) == PM_AND_NODE;
-      const pm_node_t *l = is_and ? ((const pm_and_node_t *)node)->left : ((const pm_or_node_t *)node)->left;
-      const pm_node_t *r = is_and ? ((const pm_and_node_t *)node)->right : ((const pm_or_node_t *)node)->right;
-      int lt = sp_require_truth(parser, l, engine), rt = sp_require_truth(parser, r, engine);
-      if (lt == !is_and || rt == !is_and) return !is_and;
-      return lt == is_and && rt == is_and ? is_and : -1;
-    }
-    /* `defined?(RUBY_ENGINE)`: the constant every program has */
-    case PM_DEFINED_NODE: {
-      const pm_node_t *v = ((const pm_defined_node_t *)node)->value;
-      return engine && v && PM_NODE_TYPE(v) == PM_CONSTANT_READ_NODE &&
-             sp_pm_name_is(parser, ((const pm_constant_read_node_t *)v)->name, "RUBY_ENGINE") ? 1 : -1;
-    }
-    case PM_STATEMENTS_NODE: {
-      const pm_node_list_t *body = &((const pm_statements_node_t *)node)->body;
-      return body->size == 1 ? sp_require_truth(parser, body->nodes[0], engine) : -1;
-    }
-    case PM_CALL_NODE: {
-      const pm_call_node_t *call = (const pm_call_node_t *)node;
-      if (call->block || !call->receiver) return -1;
-      if (sp_pm_name_is(parser, call->name, "!") && !call->arguments) {
-        int truth = sp_require_truth(parser, call->receiver, engine);
-        return truth < 0 ? -1 : !truth;
-      }
-      if (!call->arguments || call->arguments->arguments.size != 1) return -1;
-      /* `Object.const_defined?(:RUBY_ENGINE)` */
-      if (engine && sp_pm_name_is(parser, call->name, "const_defined?") &&
-          PM_NODE_TYPE(call->receiver) == PM_CONSTANT_READ_NODE &&
-          sp_pm_name_is(parser, ((const pm_constant_read_node_t *)call->receiver)->name, "Object")) {
-        const pm_node_t *arg = call->arguments->arguments.nodes[0];
-        const pm_string_t *s = PM_NODE_TYPE(arg) == PM_SYMBOL_NODE ? &((const pm_symbol_node_t *)arg)->unescaped :
-                               PM_NODE_TYPE(arg) == PM_STRING_NODE ? &((const pm_string_node_t *)arg)->unescaped : NULL;
-        return s && pm_string_length(s) == 11 && memcmp(pm_string_source(s), "RUBY_ENGINE", 11) == 0 ? 1 : -1;
-      }
-      int eq = sp_pm_name_is(parser, call->name, "==");
-      if (!engine || (!eq && !sp_pm_name_is(parser, call->name, "!="))) return -1;
-      const pm_node_t *a = call->receiver, *b = call->arguments->arguments.nodes[0];
-      const pm_node_t *cst, *lit;
-      if (PM_NODE_TYPE(a) == PM_CONSTANT_READ_NODE && PM_NODE_TYPE(b) == PM_STRING_NODE) { cst = a; lit = b; }
-      else if (PM_NODE_TYPE(b) == PM_CONSTANT_READ_NODE && PM_NODE_TYPE(a) == PM_STRING_NODE) { cst = b; lit = a; }
-      else return -1;
-      if (!sp_pm_name_is(parser, ((const pm_constant_read_node_t *)cst)->name, "RUBY_ENGINE")) return -1;
-      const pm_string_t *s = &((const pm_string_node_t *)lit)->unescaped;
-      int same = pm_string_length(s) == 6 && memcmp(pm_string_source(s), "spinel", 6) == 0;
-      return eq ? same : !same;
-    }
-    default: return -1;
-  }
-}
-
-/* Does the source assign RUBY_ENGINE itself (a shim's `RUBY_ENGINE = "jruby"`)?
-   Then a comparison reads that constant, not the engine's, and is left alone --
-   the same rule desugar_engine_branches applies. */
-static int sp_source_writes_engine(const char *source) {
-  for (const char *p = source; (p = strstr(p, "RUBY_ENGINE")); p += 11) {
-    const char *q = p + 11;
-    while (*q == ' ' || *q == '\t') q++;
-    if (*q == '=' && q[1] != '=' && q[1] != '~') return 1;
-    if ((q[0] == '|' && q[1] == '|' && q[2] == '=') || (q[0] == '&' && q[1] == '&' && q[2] == '=')) return 1;
-  }
-  return 0;
 }
 
 /* `Kernel.require "x"` (`::Kernel.` too) is the bare require: the textual
@@ -3816,7 +3715,27 @@ static void sp_dead_blank(SpDeadRequire *ctx, const pm_node_t *node) {
 
 static bool sp_skip_dead_require(const pm_node_t *node, void *data) {
   SpDeadRequire *ctx = data;
-  if (!ctx->dead && (PM_NODE_TYPE(node) == PM_IF_NODE || PM_NODE_TYPE(node) == PM_UNLESS_NODE)) {
+  if (PM_NODE_TYPE(node) == PM_CLASS_NODE) {
+    const pm_class_node_t *n = (const pm_class_node_t *)node;
+    if (n->constant_path) pm_visit_node(n->constant_path, sp_skip_dead_require, ctx);
+    if (n->superclass) pm_visit_node(n->superclass, sp_skip_dead_require, ctx);
+    int is_bo = sp_pre_pm_is_basic_object(ctx->parser, n->superclass);
+    ctx->in_bo += is_bo;
+    if (n->body) pm_visit_node(n->body, sp_skip_dead_require, ctx);
+    ctx->in_bo -= is_bo;
+    return false;
+  }
+  if (PM_NODE_TYPE(node) == PM_IN_NODE) {
+    const pm_in_node_t *n = (const pm_in_node_t *)node;
+    if (n->pattern) {
+      SpDeadRequire pat = *ctx;
+      if (!ctx->dead) pat.pre = NULL;
+      pm_visit_node(n->pattern, sp_skip_dead_require, &pat);
+    }
+    if (n->statements) pm_visit_node((const pm_node_t *)n->statements, sp_skip_dead_require, ctx);
+    return false;
+  }
+  if (!ctx->dead && ctx->pre && (PM_NODE_TYPE(node) == PM_IF_NODE || PM_NODE_TYPE(node) == PM_UNLESS_NODE)) {
     const pm_node_t *predicate, *body, *other;
     int unless = PM_NODE_TYPE(node) == PM_UNLESS_NODE;
     if (unless) {
@@ -3829,7 +3748,7 @@ static bool sp_skip_dead_require(const pm_node_t *node, void *data) {
       predicate = n->predicate; body = (const pm_node_t *)n->statements;
       other = n->subsequent;
     }
-    int truth = sp_require_truth(ctx->parser, predicate, ctx->engine);
+    int truth = sp_pre_pm_truth(ctx->parser, predicate, ctx->pre, !ctx->in_bo, 1);
     if (truth >= 0) {
       SpDeadRequire branch = *ctx;
       branch.dead = truth == unless;
@@ -3857,6 +3776,17 @@ static bool sp_skip_dead_require(const pm_node_t *node, void *data) {
         }
       }
     }
+    if (!call->block && call->arguments && call->arguments->arguments.size == 2 &&
+        name->length == 8 && memcmp(name->start, "autoload", 8) == 0) {
+      const pm_node_t *arg = call->arguments->arguments.nodes[1];
+      if (PM_NODE_TYPE(arg) == PM_STRING_NODE) {
+        const pm_string_node_t *str = (const pm_string_node_t *)arg;
+        if (str->opening_loc.start && (*str->opening_loc.start == '\'' || *str->opening_loc.start == '"')) {
+          sp_dead_blank(ctx, node);
+          return false;
+        }
+      }
+    }
     /* The `$LOAD_PATH << dir` that goes with a dead branch's require goes
        with it: the branch is dropped as the require is. */
     if (call->receiver && PM_NODE_TYPE(call->receiver) == PM_GLOBAL_VARIABLE_READ_NODE &&
@@ -3874,26 +3804,6 @@ static bool sp_skip_dead_require(const pm_node_t *node, void *data) {
   return true;
 }
 
-/* The file's code (its first `code_len` bytes: sp_src_file_code_len) with
-   its dead requires blanked, read from the file's own parse; the calls
-   blanked are added to `blanked`. Only the code is read: a `RUBY_ENGINE =
-   ...` in the data section after `__END__` is not an assignment, and the
-   tree's nodes all lie before it, at the same offsets in the copy as in
-   the file. */
-static char *sp_rewrite_dead_requires(SpSrcFile *f, size_t code_len, SpNodeList *blanked) {
-  const char *source = f->text;
-  char *result = malloc(code_len + 1);
-  if (!result) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-  memcpy(result, source, code_len);
-  result[code_len] = '\0';
-  if (!strstr(result, "require")) return result;
-  if (f->parser.error_list.size == 0) {
-    SpDeadRequire ctx = { &f->parser, source, result, 0, !sp_source_writes_engine(result), blanked };
-    pm_visit_node(f->root, sp_skip_dead_require, &ctx);
-  }
-  return result;
-}
-
 /* g_require_unread: may the program load a file this compiler did not read?
    Such a file can define or reopen anything, so a pass that asks what the
    program gives a class has to take the answer as unknown where this is set.
@@ -3907,8 +3817,8 @@ static char *sp_rewrite_dead_requires(SpSrcFile *f, size_t code_len, SpNodeList 
      - every require and require_relative call of the tree was resolved: a
        file read, one read before, or a feature the runtime provides. One
        left as a raise or a warning, blanked as unreachable, or past where
-       the scan gave up counts as written and not resolved, and under
-       --load-model=graph so does a LoadNode that names no file; one a
+       the scan gave up counts as written and not resolved, and so does a
+       LoadNode that names no file; one a
        rewrite made sets the flag itself.
    The text the class macros write (sp_expand_class_macros) is parsed once
    they have, for the load and load-path nodes: the parts a macro joins need
@@ -3951,13 +3861,49 @@ int sp_requires_non_boot_feature(void) {
    load or autoload, a variable that is the load path or the loaded features
    (either sets the flag), and a call named require or require_relative
    (counted in sp_req_written when `count`). */
-typedef struct { const pm_parser_t *parser; int count; } SpLoadSites;
+typedef struct { const pm_parser_t *parser; int count; const SpPreFileCtx *pre; int in_bo; } SpLoadSites;
 
 static bool sp_load_sites_visit(const pm_node_t *node, void *data) {
-  const SpLoadSites *w = data;
+  SpLoadSites *w = data;
   pm_constant_id_t id;
   int call = 0;
   switch (PM_NODE_TYPE(node)) {
+    case PM_CLASS_NODE: {
+      const pm_class_node_t *n = (const pm_class_node_t *)node;
+      if (n->constant_path) pm_visit_node(n->constant_path, sp_load_sites_visit, w);
+      if (n->superclass) pm_visit_node(n->superclass, sp_load_sites_visit, w);
+      int is_bo = sp_pre_pm_is_basic_object(w->parser, n->superclass);
+      w->in_bo += is_bo;
+      if (n->body) pm_visit_node(n->body, sp_load_sites_visit, w);
+      w->in_bo -= is_bo;
+      return false;
+    }
+    case PM_IN_NODE: {
+      const pm_in_node_t *n = (const pm_in_node_t *)node;
+      const SpPreFileCtx *saved = w->pre;
+      w->pre = NULL;
+      if (n->pattern) pm_visit_node(n->pattern, sp_load_sites_visit, w);
+      w->pre = saved;
+      if (n->statements) pm_visit_node((const pm_node_t *)n->statements, sp_load_sites_visit, w);
+      return false;
+    }
+    case PM_IF_NODE: case PM_UNLESS_NODE: {
+      if (w->pre) {
+        int is_unless = PM_NODE_TYPE(node) == PM_UNLESS_NODE;
+        const pm_node_t *pred = is_unless ? ((const pm_unless_node_t *)node)->predicate : ((const pm_if_node_t *)node)->predicate;
+        const pm_node_t *body = is_unless ? (const pm_node_t *)((const pm_unless_node_t *)node)->statements
+                                          : (const pm_node_t *)((const pm_if_node_t *)node)->statements;
+        const pm_node_t *other = is_unless ? (const pm_node_t *)((const pm_unless_node_t *)node)->else_clause
+                                           : ((const pm_if_node_t *)node)->subsequent;
+        int tr = sp_pre_pm_truth(w->parser, pred, w->pre, !w->in_bo, 0);
+        if (tr >= 0) {
+          const pm_node_t *live = (is_unless ? !tr : tr) ? body : other;
+          if (live) pm_visit_node(live, sp_load_sites_visit, w);
+          return false;
+        }
+      }
+      return true;
+    }
     case PM_CALL_NODE: id = ((const pm_call_node_t *)node)->name; call = 1; break;
     case PM_GLOBAL_VARIABLE_READ_NODE: id = ((const pm_global_variable_read_node_t *)node)->name; break;
     case PM_GLOBAL_VARIABLE_WRITE_NODE: id = ((const pm_global_variable_write_node_t *)node)->name; break;
@@ -3986,8 +3932,8 @@ static bool sp_load_sites_visit(const pm_node_t *node, void *data) {
    require_relative calls to sp_req_written. A name the program computes is
    not found here: the analysis reads a `send(:load)` or a `method(:load)` as
    a name given by value. Once the flag is set the count is moot. */
-static void sp_load_sites_note(const pm_parser_t *parser, const pm_node_t *root, int count) {
-  SpLoadSites w = { parser, count };
+static void sp_load_sites_note(const pm_parser_t *parser, const pm_node_t *root, int count, const SpPreFileCtx *pre) {
+  SpLoadSites w = { parser, count, pre, 0 };
   if (!g_require_unread && root) pm_visit_node(root, sp_load_sites_visit, &w);
 }
 
@@ -4103,314 +4049,6 @@ static int sp_load_path_stmt(const pm_parser_t *pp, const pm_node_t *stmt, const
   free(real);
   free(nodes);
   return known;
-}
-
-/* ---- a require that runs later than the program start ----
- *
- * A require inside a method or a block (minitest's `-W` option block requires
- * minitest/error_on_warning) is hoisted: the file is spliced ahead of the
- * top-level statement it sits in, so its classes and methods exist for the
- * whole program. Its run-time statements would then run at startup, not when
- * the require does: `::Warning.singleton_class.prepend ErrorOnWarning` in that
- * file ran in every minitest binary. Such statements -- a call on a computed
- * receiver, or one that prints -- are wrapped in place as methods of their own
- * scope (`def self.__spinel_load_N_K; stmt; end`, top-level ones as private
- * methods of main), and the require's value becomes a call that runs them the
- * first time it is reached. Definitions and class macros stay where they are.
- * A statement that reads the file's locals, `self` or an instance variable at
- * the top level, or returns or yields, stays too: in a method it would mean
- * something else. Every edit stays on its statement's lines. */
-typedef struct {
-  const pm_parser_t *parser;
-  const pm_constant_id_list_t *locals;
-  int top, bad;
-} SpDeferScan;
-
-static bool sp_defer_scan(const pm_node_t *node, void *data) {
-  SpDeferScan *s = data;
-  pm_constant_id_t name = 0;
-  switch (PM_NODE_TYPE(node)) {
-    case PM_RETURN_NODE: case PM_YIELD_NODE: case PM_FORWARDING_SUPER_NODE: case PM_SUPER_NODE:
-    case PM_DEF_NODE: case PM_CLASS_NODE: case PM_MODULE_NODE: case PM_SINGLETON_CLASS_NODE:
-      s->bad = 1; return false;
-    case PM_SELF_NODE: case PM_INSTANCE_VARIABLE_READ_NODE: case PM_INSTANCE_VARIABLE_WRITE_NODE:
-    case PM_INSTANCE_VARIABLE_OPERATOR_WRITE_NODE: case PM_INSTANCE_VARIABLE_OR_WRITE_NODE:
-    case PM_INSTANCE_VARIABLE_AND_WRITE_NODE: case PM_INSTANCE_VARIABLE_TARGET_NODE:
-      if (s->top) { s->bad = 1; return false; }
-      return true;
-    case PM_LOCAL_VARIABLE_READ_NODE: name = ((const pm_local_variable_read_node_t *)node)->name; break;
-    case PM_LOCAL_VARIABLE_WRITE_NODE: name = ((const pm_local_variable_write_node_t *)node)->name; break;
-    case PM_LOCAL_VARIABLE_TARGET_NODE: name = ((const pm_local_variable_target_node_t *)node)->name; break;
-    case PM_LOCAL_VARIABLE_OPERATOR_WRITE_NODE: name = ((const pm_local_variable_operator_write_node_t *)node)->name; break;
-    case PM_LOCAL_VARIABLE_OR_WRITE_NODE: name = ((const pm_local_variable_or_write_node_t *)node)->name; break;
-    case PM_LOCAL_VARIABLE_AND_WRITE_NODE: name = ((const pm_local_variable_and_write_node_t *)node)->name; break;
-    default: return true;
-  }
-  if (pm_constant_id_list_includes((pm_constant_id_list_t *)s->locals, name)) { s->bad = 1; return false; }
-  return true;
-}
-
-/* `Foo.include Bar` and the like: on a named class, a call that shapes it */
-static int sp_defer_shape_call(const pm_parser_t *parser, const pm_call_node_t *call) {
-  static const char *const shape[] = {
-    "include", "extend", "prepend", "attr_reader", "attr_writer", "attr_accessor", "attr",
-    "private", "public", "protected", "module_function", "private_constant", "public_constant",
-    "define_method", "alias_method", "remove_method", "undef_method", "private_class_method",
-    "public_class_method", "const_set", "class_eval", "module_eval", "class_exec", "module_exec",
-    "instance_eval", "send", "__send__", "public_send", "freeze", NULL };
-  for (int i = 0; shape[i]; i++) if (sp_pm_name_is(parser, call->name, shape[i])) return 1;
-  return 0;
-}
-
-/* Does `stmt`, standing in a file's top level or a class body, only run code
-   (as opposed to defining something the program's shape depends on)? */
-static int sp_defer_stmt(const pm_parser_t *parser, const pm_node_t *stmt,
-                         const pm_constant_id_list_t *locals, int top) {
-  if (PM_NODE_TYPE(stmt) != PM_CALL_NODE) return 0;
-  const pm_call_node_t *call = (const pm_call_node_t *)stmt;
-  if (call->receiver) {
-    int recv_t = PM_NODE_TYPE(call->receiver);
-    if (recv_t == PM_SELF_NODE) return 0;
-    if ((recv_t == PM_CONSTANT_READ_NODE || recv_t == PM_CONSTANT_PATH_NODE) &&
-        sp_defer_shape_call(parser, call)) return 0;
-  }
-  else {
-    static const char *const out[] = { "puts", "print", "p", "pp", "printf", "putc", "warn", NULL };
-    int io = 0;
-    for (int i = 0; out[i]; i++) if (sp_pm_name_is(parser, call->name, out[i])) io = 1;
-    if (!io) return 0;
-  }
-  SpDeferScan s = { parser, locals, top, 0 };
-  pm_visit_node(stmt, sp_defer_scan, &s);
-  return !s.bad;
-}
-
-/* A `return` in the file's own top level (not in a method, block or lambda)
-   ends the load early: the statements after it must not become methods
-   whose definitions never run. */
-static bool sp_defer_top_return(const pm_node_t *node, void *data) {
-  int t = PM_NODE_TYPE(node);
-  if (t == PM_DEF_NODE || t == PM_BLOCK_NODE || t == PM_LAMBDA_NODE) return false;
-  if (t == PM_RETURN_NODE) { *(int *)data = 1; return false; }
-  return true;
-}
-
-typedef struct { size_t at; char *text; } SpDeferEdit;
-typedef struct {
-  const pm_parser_t *parser;
-  const char *source;
-  int file_no, n;
-  int out_of_order;   /* a statement left in place runs after a wrapped one */
-  SpDeferEdit *edits; int edits_n, edits_cap;
-  char *calls; size_t calls_len, calls_cap;
-} SpDefer;
-
-static void sp_defer_edit(SpDefer *d, size_t at, const char *text) {
-  if (d->edits_n == d->edits_cap) {
-    d->edits_cap = d->edits_cap ? d->edits_cap * 2 : 8;
-    d->edits = realloc(d->edits, sizeof *d->edits * (size_t)d->edits_cap);
-    if (!d->edits) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-  }
-  d->edits[d->edits_n].at = at;
-  d->edits[d->edits_n].text = strdup(text);
-  d->edits_n++;
-}
-
-/* Does a statement left in place only define something (a method, an alias,
-   a class macro), so that running it before a wrapped one changes nothing? */
-static int sp_defer_defines(const pm_parser_t *parser, const pm_node_t *st) {
-  switch (PM_NODE_TYPE(st)) {
-    case PM_DEF_NODE: case PM_ALIAS_METHOD_NODE: case PM_ALIAS_GLOBAL_VARIABLE_NODE:
-    case PM_UNDEF_NODE: case PM_SINGLETON_CLASS_NODE: case PM_CLASS_NODE: case PM_MODULE_NODE:
-      return 1;
-    case PM_CALL_NODE: {
-      const pm_call_node_t *call = (const pm_call_node_t *)st;
-      if (!call->receiver || PM_NODE_TYPE(call->receiver) == PM_SELF_NODE) return 1;
-      int rt = PM_NODE_TYPE(call->receiver);
-      return (rt == PM_CONSTANT_READ_NODE || rt == PM_CONSTANT_PATH_NODE) &&
-             sp_defer_shape_call(parser, call);
-    }
-    default: return 0;
-  }
-}
-
-/* `scope` is the class path the body's methods are called through ("" at the
-   top level), or NULL where it is not known (no statement is wrapped). Every
-   statement left in place must keep its order with the wrapped ones: the
-   file is not deferred when a run-time one (`ITEMS = Registry.all`) follows a
-   wrapped one (`Registry.register :a`). */
-static void sp_defer_body(SpDefer *d, const pm_node_t *body, const pm_constant_id_list_t *locals,
-                          const char *scope) {
-  if (!body || PM_NODE_TYPE(body) != PM_STATEMENTS_NODE) return;
-  const pm_node_list_t *list = &((const pm_statements_node_t *)body)->body;
-  for (size_t i = 0; i < list->size; i++) {
-    const pm_node_t *st = list->nodes[i];
-    int t = PM_NODE_TYPE(st);
-    if (t == PM_CLASS_NODE || t == PM_MODULE_NODE) {
-      const pm_node_t *cp = t == PM_CLASS_NODE ? ((const pm_class_node_t *)st)->constant_path
-                                               : ((const pm_module_node_t *)st)->constant_path;
-      const pm_node_t *inner = t == PM_CLASS_NODE ? ((const pm_class_node_t *)st)->body
-                                                  : ((const pm_module_node_t *)st)->body;
-      const pm_constant_id_list_t *il = t == PM_CLASS_NODE ? &((const pm_class_node_t *)st)->locals
-                                                           : &((const pm_module_node_t *)st)->locals;
-      /* `module A` nests under the enclosing path; `module A::B` is only
-         certain at the top level, where it is `::A::B` */
-      char path[512];
-      const char *sub = NULL;
-      size_t cl = (size_t)(cp->location.end - cp->location.start);
-      const char *ct = (const char *)cp->location.start;
-      if (scope && (PM_NODE_TYPE(cp) == PM_CONSTANT_READ_NODE || !*scope) && cl < 200 &&
-          strlen(scope) + cl + 4 < sizeof path) {
-        snprintf(path, sizeof path, "%s%s%.*s", scope, (cl >= 2 && ct[0] == ':') ? "" : "::", (int)cl, ct);
-        sub = path;
-      }
-      sp_defer_body(d, inner, il, sub);
-      continue;
-    }
-    if (!scope || !sp_defer_stmt(d->parser, st, locals, !*scope)) {
-      if (d->n && !sp_defer_defines(d->parser, st)) d->out_of_order = 1;
-      continue;
-    }
-    char head[600], call[600];
-    int k = d->n++;
-    if (*scope) {
-      snprintf(head, sizeof head, "def self.__spinel_load_%d_%d; ", d->file_no, k);
-      snprintf(call, sizeof call, "%s.__spinel_load_%d_%d; ", scope, d->file_no, k);
-    }
-    else {
-      snprintf(head, sizeof head, "def __spinel_load_%d_%d; ", d->file_no, k);
-      snprintf(call, sizeof call, "__spinel_load_%d_%d; ", d->file_no, k);
-    }
-    sp_defer_edit(d, (size_t)(st->location.start - (const uint8_t *)d->source), head);
-    sp_defer_edit(d, (size_t)(st->location.end - (const uint8_t *)d->source), "; end");
-    size_t cl = strlen(call);
-    if (d->calls_len + cl + 1 > d->calls_cap) {
-      d->calls_cap = (d->calls_len + cl + 1) * 2;
-      d->calls = realloc(d->calls, d->calls_cap);
-      if (!d->calls) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-    }
-    memcpy(d->calls + d->calls_len, call, cl + 1);
-    d->calls_len += cl;
-  }
-}
-
-/* The files a hoisted require deferred, by canonical path, with the
-   expression a require of each answers: a later require of the same file,
-   wherever it stands, runs what the first one held back. */
-static char **sp_defer_paths, **sp_defer_vals;
-static int sp_defer_count, sp_defer_cap;
-
-static const char *sp_defer_lookup(const char *canonical) {
-  for (int i = 0; canonical && i < sp_defer_count; i++)
-    if (strcmp(sp_defer_paths[i], canonical) == 0) return sp_defer_vals[i];
-  return NULL;
-}
-
-static void sp_defer_record(const char *canonical, const char *val) {
-  sp_defer_paths = sp_grow_strs(sp_defer_paths, sp_defer_count, &sp_defer_cap, 8);
-  sp_defer_vals = realloc(sp_defer_vals, sizeof(char *) * (size_t)sp_defer_cap);
-  if (!sp_defer_vals) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-  sp_defer_paths[sp_defer_count] = strdup(canonical);
-  sp_defer_vals[sp_defer_count++] = strdup(val);
-}
-
-/* Wrap `*content`'s run-time statements (above) and answer the expression
-   the require's call becomes, recorded under the file's names `canonical`
-   and `alt` (either may be NULL); NULL when the file has none and the
-   require's value stays as it was. The files this one inlined were marked
-   from `incl_from` on: one whose own statements were not deferred apart
-   (it stood at this file's margin) would be wrapped with this file and
-   answer nothing to a later require of its own, so such a file is left as
-   it was. The flag is cleared when a wrapped statement raises, so a later
-   require runs them again, as CRuby loads a file that failed again. */
-static const char *sp_defer_runtime(char **content, const char *canonical, const char *alt,
-                                    int incl_from) {
-  static int file_no = 0;
-  for (int i = incl_from; i < sp_included_count; i++) {
-    const char *ip = sp_included_paths[i];
-    if (!ip || (canonical && strcmp(ip, canonical) == 0) || (alt && strcmp(ip, alt) == 0)) continue;
-    if (!sp_defer_lookup(ip)) return NULL;
-  }
-  const char *src = *content;
-  pm_parser_t parser;
-  sp_pm_parser_init(&parser, src, strlen(src), canonical);
-  pm_node_t *root = pm_parse(&parser);
-  SpDefer d;
-  memset(&d, 0, sizeof d);
-  d.parser = &parser; d.source = src; d.file_no = file_no;
-  if (parser.error_list.size == 0 && PM_NODE_TYPE(root) == PM_PROGRAM_NODE) {
-    const pm_program_node_t *prog = (const pm_program_node_t *)root;
-    int top_return = 0;
-    pm_visit_node(root, sp_defer_top_return, &top_return);
-    if (!top_return) sp_defer_body(&d, (const pm_node_t *)prog->statements, &prog->locals, "");
-  }
-  pm_node_destroy(&parser, root);
-  pm_parser_free(&parser);
-  if (!d.n || d.out_of_order) {
-    for (int i = 0; i < d.edits_n; i++) free(d.edits[i].text);
-    free(d.edits); free(d.calls);
-    return NULL;
-  }
-  file_no++;
-  /* apply the edits, which are in source order */
-  size_t slen = strlen(src), add = 0;
-  for (int i = 0; i < d.edits_n; i++) add += strlen(d.edits[i].text);
-  char *out = malloc(slen + add + 1);
-  if (!out) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-  size_t o = 0, from = 0;
-  for (int i = 0; i < d.edits_n; i++) {
-    size_t at = d.edits[i].at, tl = strlen(d.edits[i].text);
-    memcpy(out + o, src + from, at - from); o += at - from; from = at;
-    memcpy(out + o, d.edits[i].text, tl); o += tl;
-    free(d.edits[i].text);
-  }
-  memcpy(out + o, src + from, slen - from + 1);
-  free(d.edits);
-  free(*content);
-  *content = out;
-  size_t vcap = d.calls_len + 256;
-  char *val = malloc(vcap);
-  if (!val) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-  snprintf(val, vcap, "($__spinel_loaded_%d ? false : ($__spinel_loaded_%d = true; "
-           "begin; %srescue Exception; $__spinel_loaded_%d = nil; raise; end; true))",
-           d.file_no, d.file_no, d.calls, d.file_no);
-  free(d.calls);
-  const char *ret = NULL;
-  if (canonical) { sp_defer_record(canonical, val); ret = sp_defer_vals[sp_defer_count - 1]; }
-  if (alt && (!canonical || strcmp(alt, canonical) != 0)) {
-    sp_defer_record(alt, val);
-    if (!ret) ret = sp_defer_vals[sp_defer_count - 1];
-  }
-  free(val);
-  return ret;
-}
-
-/* Where a position of the file's text is in the text being spliced: every
-   splice is recorded as the original offset it moves the text after, and
-   by how much. A require's own splices only touch its statement and what
-   comes before it, so the sites after it move as a whole; a hoist after an
-   earlier inline splice in the same statement goes after it. */
-typedef struct {
-  size_t *at;
-  ptrdiff_t *delta;
-  int n, cap;
-} SpEditMap;
-
-static void sp_emap_add(SpEditMap *m, size_t at, ptrdiff_t delta) {
-  if (m->n == m->cap) {
-    m->cap = m->cap ? m->cap * 2 : 8;
-    m->at = realloc(m->at, sizeof *m->at * (size_t)m->cap);
-    m->delta = realloc(m->delta, sizeof *m->delta * (size_t)m->cap);
-    if (!m->at || !m->delta) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-  }
-  m->at[m->n] = at;
-  m->delta[m->n++] = delta;
-}
-
-static size_t sp_emap_pos(const SpEditMap *m, size_t p) {
-  ptrdiff_t d = 0;
-  for (int i = 0; i < m->n; i++) if (m->at[i] <= p) d += m->delta[i];
-  return (size_t)((ptrdiff_t)p + d);
 }
 
 /* ---- require_relative calls, read from the file's own tree ----
@@ -4530,8 +4168,8 @@ static bool sp_first_return_visit(const pm_node_t *node, void *data) {
 }
 
 /* Does the require `node` (below the ancestors stack[0..depth), the file's ProgramNode first) always run where its
-   file's statements run? The one fact the inline splice and the load graph's LoadNode both carry as req_deferred
-   (its negation), written here and nowhere else. It does when both hold:
+   file's statements run? The load graph's LoadNode carries its negation as req_deferred, written here and nowhere
+   else. It does when both hold:
    - the require is a statement of its own, and every ancestor is the file's top-level statement list, a class,
      module or singleton class body, or the body of a `begin` that has no rescue clause (with one, an earlier
      statement's raise can skip it; without, the raise ends the program, and nothing observes the difference);
@@ -4539,7 +4177,7 @@ static bool sp_first_return_visit(const pm_node_t *node, void *data) {
      an enclosing begin, which ends the load before the require.
    Every other placement (a method, a block, a lambda, a branch, a loop, a condition or short-circuit in expression
    position, a rescue clause, an argument) is deferred; and a file required from a deferred one is deferred
-   (sp_file_deferred, below). */
+   (prog_stamp_deferred). */
 static int sp_req_always_runs(const pm_node_t *const *stack, int depth, const pm_node_t *node, SpFileReturn *ret) {
   if (depth < 1 || PM_NODE_TYPE(stack[0]) != PM_PROGRAM_NODE) return 0;
   pm_node_type_t pt = PM_NODE_TYPE(stack[depth - 1]);
@@ -4737,8 +4375,6 @@ static int sp_autoload_beside(const char *dir, const char *path, size_t plen) {
            (plen >= 3 && strncmp(path + plen - 3, ".rb", 3) == 0) ? "" : ".rb");
   return sp_path_exists(fp);
 }
-
-static int sp_autoload_is_main = 0;
 
 typedef struct {
   const pm_parser_t *parser;
@@ -5169,6 +4805,8 @@ static void sp_req_autoload(SpReqSiteScan *s, const pm_call_node_t *c) {
 /* A computed require, a loop of them or an autoload at `c`: noted as a
    rewrite. 1 when it was an unrolled loop, whose body is the rewrite's. */
 static int sp_req_rewrite_note(SpReqSiteScan *s, const pm_call_node_t *c) {
+  for (int i = 0; s->skip && i < s->skip->n; i++)
+    if (s->skip->v[i] == (const pm_node_t *)c) return 0;
   const char *t = s->text;
   char joined[512];
   if (sp_req_loop(s, c)) return 1;
@@ -5206,129 +4844,6 @@ static bool sp_req_site_visit(const pm_node_t *node, void *data) {
   return false;
 }
 
-/* The file's require_relative sites in source order (a parse with errors
-   has none: its text is resolved as it stands); the caller frees them. */
-static int sp_req_site_cmp(const void *a, const void *b) {
-  size_t x = ((const SpReqSite *)a)->kw, y = ((const SpReqSite *)b)->kw;
-  return x < y ? -1 : x > y;
-}
-
-static int sp_req_edit_cmp(const void *x, const void *y) {
-  size_t a = ((const SpReqEdit *)x)->a, b = ((const SpReqEdit *)y)->a;
-  return a < b ? -1 : a > b;
-}
-
-static void sp_req_site_push(SpReqSiteScan *s, const SpReqSite *st) {
-  if (s->n == s->cap) {
-    s->cap = s->cap ? s->cap * 2 : 8;
-    s->v = realloc(s->v, sizeof *s->v * (size_t)s->cap);
-    if (!s->v) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-  }
-  s->v[s->n++] = *st;
-}
-
-/* The sites `e` writes at `base` in the new text; their statement starts
-   are offsets in the text (rel_stmt) or, marked 2, in the old one. */
-static void sp_req_edit_sites(SpReqSiteScan *s, SpReqEdit *e, size_t base) {
-  for (int k = 0; k < e->nsites; k++) {
-    SpReqSite st = e->sites[k];
-    st.kw += base; st.arg += base; st.end += base;
-    if (st.rel_stmt) { st.stmt_start += base; st.ctl_stmt_start += base; st.rel_stmt = 0; }
-    else st.rel_stmt = 2;
-    sp_req_site_push(s, &st);
-  }
-  free(e->text); free(e->sites);
-}
-
-/* `*code` (the file's code with its dead requires blanked, at the tree's
-   offsets) with the rewrites applied, and every site at its offset in the
-   new text: the tree's moved past the rewrites, the rewrites' own added.
-   1 when anything was rewritten. */
-static int sp_req_apply_rewrites(SpReqSiteScan *s, char **code) {
-  if (!s->ned && !s->tail.text) return 0;
-  if (s->ned > 1) qsort(s->ed, (size_t)s->ned, sizeof *s->ed, sp_req_edit_cmp);
-  size_t len = strlen(*code), add = 2 + (s->tail.text ? strlen(s->tail.text) : 0);
-  for (int i = 0; i < s->ned; i++) add += strlen(s->ed[i].text);
-  char *out = malloc(len + add + 1);
-  if (!out) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-  SpEditMap map = { NULL, NULL, 0, 0 };
-  size_t o = 0, from = 0;
-  int n0 = s->n;
-  for (int i = 0; i < s->ned; i++) {
-    SpReqEdit *e = &s->ed[i];
-    memcpy(out + o, *code + from, e->a - from); o += e->a - from;
-    size_t tl = strlen(e->text);
-    memcpy(out + o, e->text, tl);
-    sp_emap_add(&map, e->b, (ptrdiff_t)tl - (ptrdiff_t)(e->b - e->a));
-    sp_req_edit_sites(s, e, o);
-    o += tl;
-    from = e->b;
-  }
-  memcpy(out + o, *code + from, len - from); o += len - from;
-  if (s->tail.text) {                       /* the tail, on lines of its own */
-    if (o > 0 && out[o - 1] != '\n') out[o++] = '\n';
-    size_t tl = strlen(s->tail.text);
-    memcpy(out + o, s->tail.text, tl);
-    sp_req_edit_sites(s, &s->tail, o);
-    o += tl;
-  }
-  out[o] = 0;
-  for (int i = 0; i < s->n; i++) {
-    SpReqSite *st = &s->v[i];
-    if (i < n0) {
-      st->kw = sp_emap_pos(&map, st->kw); st->end = sp_emap_pos(&map, st->end); st->arg = sp_emap_pos(&map, st->arg);
-    }
-    if (i < n0 || st->rel_stmt == 2) {
-      st->stmt_start = sp_emap_pos(&map, st->stmt_start); st->ctl_stmt_start = sp_emap_pos(&map, st->ctl_stmt_start);
-      st->rel_stmt = 0;
-    }
-  }
-  free(map.at); free(map.delta); free(s->ed);
-  free(*code);
-  *code = out;
-  return 1;
-}
-
-static SpReqSite *sp_req_sites(const pm_parser_t *parser, const pm_node_t *root, const char *text,
-                               const char *path, const SpNodeList *skip, const char *dir, int is_main,
-                               char **code, int *rewrote, int *n_out) {
-  SpReqSiteScan s;
-  memset(&s, 0, sizeof s);
-  s.parser = parser; s.text = text; s.path = path; s.skip = skip; s.dir = dir; s.is_main = is_main;
-  /* (a file that never spells the words has none: the walk is skipped) */
-  if (parser->error_list.size == 0 && (strstr(text, "require") || strstr(text, "autoload")))
-    pm_visit_node(root, sp_req_site_visit, &s);
-  free(s.stack);
-  *rewrote = sp_req_apply_rewrites(&s, code);
-  /* Source order (the walk visits a modifier's condition before its body),
-     less a site inside another's argument; then each site a modifier's
-     condition holds goes ahead of the site it guards, as it runs first. */
-  if (s.n > 1) qsort(s.v, (size_t)s.n, sizeof *s.v, sp_req_site_cmp);
-  int n = 0;
-  for (int i = 0; i < s.n; i++)
-    if (!n || s.v[i].kw >= s.v[n - 1].end) s.v[n++] = s.v[i];
-  for (int i = 0; i < n; i++) {
-    int j = i + 1;
-    while (j < n && s.v[j].kw < s.v[i].end + (size_t)s.v[i].ml) j++;
-    if (j > i + 1) {
-      SpReqSite guarded = s.v[i];
-      memmove(&s.v[i], &s.v[i + 1], sizeof *s.v * (size_t)(j - i - 1));
-      s.v[j - 1] = guarded;
-      i = j - 1;
-    }
-  }
-  *n_out = n;
-  return s.v;
-}
-
-
-/* A hoist put `site`'s file at `ins` and its value (of `vlen` bytes) in
-   the call's place, taking the text from `before` bytes to `after`. */
-static void sp_req_note_hoist(SpEditMap *m, const SpReqSite *site, size_t ins, size_t vlen, size_t before, size_t after) {
-  ptrdiff_t value = (ptrdiff_t)vlen - (ptrdiff_t)(site->end - site->kw);
-  sp_emap_add(m, ins, (ptrdiff_t)after - (ptrdiff_t)before - value);
-  sp_emap_add(m, site->end, value);
-}
 
 /* ---- The load graph (#9898, the load model's part 1) ----
  *
@@ -5349,10 +4864,11 @@ typedef struct {
   int from, line, plain;  /* the requiring file, the call's line, `require` (not _relative) */
   char *name;             /* the path as written */
   int how, to;            /* SP_LOAD_*; the target file for SP_LOAD_FILE */
-  int stmt, top;          /* --load-model=graph: the top-level statement of `from` the
+  int stmt, top;          /* the top-level statement of `from` the
                              call stands in (a boot library's: below 0, ahead of the
                              entry's first), and 1 when the call is that statement */
-  int node;               /* --load-model=graph: its LoadNode, once flattened (-1 before) */
+  int node;               /* its LoadNode, once flattened (-1 before) */
+  int begin_block;        /* ... and 1 when its statement is a `BEGIN { }`, which runs ahead of the file's others */
   int ncand, *cand;       /* SP_LOAD_SET: the files a path computed when it runs may name, ... */
   int open;               /* ... or (open) any file of the program */
   char *pat_pre, *pat_suf; /* ... a plain require's literal head and tail around what
@@ -5365,11 +4881,11 @@ typedef struct {
                              (SpPaths.per_word) */
 } SpLoadEdge;
 
-/* --load-model=graph: a require of a file's tree: its edge, the call node it
+/* a require of a file's tree: its edge, the call node it
    was found at, and how many LoadNodes flatten made of that call (one). */
 typedef struct { int edge; const pm_node_t *call; int taken; int deferred; } SpGraphSite;   /* deferred: sp_req_always_runs says no */
 
-/* --load-model=graph: one file of the graph, read and parsed before any file
+/* one file of the graph, read and parsed before any file
    is flattened, and its sites, in the order its tree has them. */
 typedef struct {
   char *text;
@@ -5378,6 +4894,8 @@ typedef struct {
   int root;               /* its ProgramNode, once flattened */
   SpGraphSite *site; int nsite, sitecap;
   char **dirs; int ndirs; /* the directories the program had put on its load path when the file was first named */
+  SpPreFileCtx pre;       /* pre-analysis constant-branch context for this file */
+  int has_pre;
 } SpGraphFile;
 
 typedef struct {
@@ -5388,13 +4906,16 @@ typedef struct {
   unsigned char *flags; int flagcap;        /* [file] SP_FILE_* */
   SpLoadEdge *edge; int nedge, edgecap;     /* the tree's sites */
   SpLoadEdge *spl; int nspl, splcap;        /* the plain pass's resolutions */
-  /* --load-model=graph */
+  /* the files */
   SpGraphFile **gf; int gfcap;              /* [file], each where it was made: a
                                                parser is not moved once it has parsed */
   int *boot; int nboot, bootcap;            /* the edges of the libraries loaded at the
                                                program's start (sp_graph_boot) */
   int *entered;                             /* [file] where it runs in load order (--dump-load-graph) */
   char **iroots; int niroots;               /* the roots from -I, which the load path starts with */
+  SpPreFileCtx pre_inherit;                 /* top-level shadowing propagated to subsequent files */
+  int has_pre_inherit;
+  int pre_tightened;                        /* set if a newly read file tightened pre_inherit */
 } SpLoadGraph;
 
 /* The file `path`'s id, added the first time it is named: one file per
@@ -5431,12 +4952,6 @@ static void sp_load_set_tier(SpLoadGraph *g, int id, int tier) {
   if (id < 0) return;
   unsigned char *f = sp_load_flags(g, id);
   *f = (unsigned char)((*f & ~(7 << SP_FILE_TIER_SHIFT)) | (sp_tier_merge(sp_load_tier(g, id), tier) << SP_FILE_TIER_SHIFT));
-}
-static int sp_load_walk(SpLoadGraph *g, int id) {
-  unsigned char *f = sp_load_flags(g, id);
-  if (*f & SP_FILE_WALKED) return 0;
-  *f |= SP_FILE_WALKED;
-  return 1;
 }
 
 static void sp_load_edge(SpLoadEdge **v, int *n, int *cap, int from, int line, int plain,
@@ -5570,22 +5085,6 @@ static char *sp_lib_text_appended(char *content, const char *path, int tier) {
   return content;
 }
 
-/* The edge of the plain require of `name` (as written, between `quote`s) in
-   file `from`. */
-static void sp_load_plain(SpLoadGraph *g, SpLoadEdge **v, int *n, int *cap, int from, int line,
-                          const char *name, char quote) {
-  char lib_name[256], found[1024];
-  snprintf(lib_name, sizeof lib_name, "%s", name);
-  size_t ln = strlen(lib_name);
-  if (ln > 3 && strcmp(lib_name + ln - 3, ".rb") == 0) lib_name[ln - 3] = '\0';
-  if (quote == '"' && strstr(lib_name, "#{")) sp_load_edge(v, n, cap, from, line, 1, name, SP_LOAD_RUNTIME, -1);
-  else if (sp_lib_lookup(g->lib_dir, lib_name, found, sizeof found))
-    sp_load_edge(v, n, cap, from, line, 1, name, SP_LOAD_FILE, sp_load_file(g, found));
-  else sp_load_edge(v, n, cap, from, line, 1, name,
-                    sp_lib_is_native(lib_name) ? SP_LOAD_NATIVE : sp_require_tolerated(lib_name) ? SP_LOAD_CORE
-                                                                                         : SP_LOAD_NONE, -1);
-}
-
 /* Is `arg` of a kind that names no path (a number, a Symbol, nil, true,
    false, an Array or a Hash)? Kernel#require raises TypeError for it, so a
    call that passes one is a method of the program's own that has the
@@ -5659,11 +5158,13 @@ static void sp_load_graph_free(SpLoadGraph *g) {
     SpGraphFile *r = g->gf[i];
     if (!r) continue;
     if (r->read) { sp_src_file_free(&r->src); free(r->text); }
+    if (r->has_pre) sp_pre_ctx_free(&r->pre);
     free(r->site);
     for (int k = 0; k < r->ndirs; k++) free(r->dirs[k]);
     free(r->dirs);
     free(r);
   }
+  if (g->has_pre_inherit) sp_pre_ctx_free(&g->pre_inherit);
   free(g->gf); free(g->boot); free(g->entered);
   for (int i = 0; i < g->niroots; i++) free(g->iroots[i]);
   free(g->iroots);
@@ -5677,249 +5178,6 @@ static void sp_load_graph_free(SpLoadGraph *g) {
   }
   for (int i = 0; i < g->nspl; i++) free(g->spl[i].name);
   free(g->file); free(g->found); free(g->flags); free(g->edge); free(g->spl);
-}
-
-static char *resolve_requires(SpLoadGraph *g, const char *source, const char *source_path,
-                              unsigned char **fsl_out, size_t *fsl_n_out) {
-  /* Get base directory */
-  char *path_copy = strdup(source_path);
-  char *dir = strdup(path_copy);
-  /* Find last / */
-  char *slash = strrchr(dir, '/');
-  if (slash) *slash = '\0';
-  else { free(dir); dir = strdup("."); }
-  free(path_copy);
-
-  /* The file parsed by itself, each time it is read: its pragma, its
-     encoding and its dead requires are read from this parse. */
-  SpSrcFile file;
-  sp_src_file_parse(&file, source, source_path);
-  sp_src_file_note_defers(&file);
-  int file_fsl = sp_src_file_fsl(&file);
-  sp_src_file_warn_encoding(&file);
-  size_t code_len = sp_src_file_code_len(&file);
-  sp_load_sites_note(&file.parser, file.root, 1);
-  /* computed requires spelling a literal path (#5700), then autoloads with
-     a literal path (#5696): each answers a fresh copy of what it reads */
-  SpNodeList blanked = { NULL, 0, 0 };
-  char *reachable = sp_rewrite_dead_requires(&file, code_len, &blanked);
-  /* the require_relative calls, and the computed requires (#5700) and
-     autoloads (#5696) rewritten as requires, all from the file's tree */
-  int nsites = 0, rewrote = 0;
-  char *result = reachable;
-  SpReqSite *sites = sp_req_sites(&file.parser, file.root, source, source_path, &blanked, dir,
-                                  sp_autoload_is_main, &result, &rewrote, &nsites);
-  sp_src_file_free(&file);
-  free(blanked.v);
-  /* the file in the load graph, with its plain sites; the rest are the
-     require_relative sites below */
-  int gfile = g ? sp_load_file(g, source_path) : -1, gnew = g && sp_load_walk(g, gfile);
-  {
-    int n = 0;
-    for (int i = 0; i < nsites; i++) {
-      if (!sites[i].plain) { sites[n++] = sites[i]; continue; }
-      if (!gnew || sites[i].arg_len >= 256) continue;
-      char name[256];
-      snprintf(name, sizeof name, "%.*s", (int)sites[i].arg_len, result + sites[i].arg);
-      sp_load_plain(g, &g->edge, &g->nedge, &g->edgecap, gfile, sites[i].line, name, sites[i].quote);
-    }
-    nsites = n;
-  }
-  if (rewrote) g_require_unread = 1;   /* a require the rewrites made */
-  sp_autoload_is_main = 0;
-  /* One pragma flag per line of `result`, kept in lockstep with every text
-     splice below so each literal keeps its own file's flag. */
-  size_t fsl_n;
-  unsigned char *fsl = sp_fsl_make(result, file_fsl, &fsl_n);
-  /* Each require_relative site in turn, where the splices before it have
-     moved it to (sp_emap_pos); a site a splice took in is passed over. */
-  SpEditMap emap = { NULL, NULL, 0, 0 };
-  size_t taken_to = 0, inline_kw = SIZE_MAX;   /* the last splice in place */
-  for (int si = 0; si < nsites; si++) {
-    const SpReqSite *site = &sites[si];
-    if (site->kw < taken_to) continue;
-    /* A hoisted file goes ahead of its top-level statement, or, when a file
-       this one inlined earlier in that statement stands before the call,
-       after that file, ahead of the innermost statement around the call
-       that only control flow encloses: the order the two load in. */
-    size_t ins = site->stmt_start;
-    if (inline_kw != SIZE_MAX && inline_kw >= site->stmt_start && inline_kw < site->kw)
-      ins = site->ctl_stmt_start > taken_to ? site->ctl_stmt_start : taken_to;
-    SpReqHit hit;
-    hit.kw = result + sp_emap_pos(&emap, site->kw);
-    hit.expr_end = result + sp_emap_pos(&emap, site->end);
-    hit.arg = result + sp_emap_pos(&emap, site->arg);
-    hit.arg_len = site->arg_len;
-    hit.margin = site->margin;
-    size_t len_before = strlen(result);
-    /* a file inlined under a condition is loaded only when that branch runs:
-       it (and what it requires) stays loadable elsewhere */
-    int incl_mark = sp_included_count, cond_inline = 0, ml = 0;
-    char *pos = hit.kw, *expr_end = hit.expr_end;
-    /* Issue #765: bail rather than silently truncating overlong paths
-       into the fixed-size buffers. */
-    if (hit.arg_len >= 512) break;
-    char rel_path[512];
-    snprintf(rel_path, sizeof(rel_path), "%.*s", (int)hit.arg_len, hit.arg);
-    /* What the call answers: true when this is the require that read the
-       file, false when something already had (#3453). */
-    const char *req_val = "true";
-    /* a name computed at run time: CRuby's LoadError (as for require) */
-    if (site->quote == '"' && strstr(rel_path, "#{")) {
-      if (gnew) sp_load_edge(&g->edge, &g->nedge, &g->edgecap, gfile, site->line, 0, rel_path, SP_LOAD_RUNTIME, -1);
-      char val[700];
-      snprintf(val, sizeof val, "raise(LoadError, \"cannot load such file -- %s\")", rel_path);
-      size_t cn = 0; unsigned char *cf = sp_fsl_make("", 0, &cn);
-      sp_req_hoist_splice(&result, &fsl, &fsl_n, &hit, sp_emap_pos(&emap, ins), "", cf, cn, val);
-      sp_req_note_hoist(&emap, site, ins, strlen(val), len_before, strlen(result));
-      free(cf);
-      continue;
-    }
-    /* (a file it names that is not there stops the compile below) */
-    {
-      size_t rl = strlen(rel_path);
-      char rn[512];
-      snprintf(rn, sizeof rn, "%s", rel_path);
-      if (rl > 3 && strcmp(rn + rl - 3, ".rb") == 0) rn[rl - 3] = '\0';
-      sp_note_required_feature(rn[0] == '.' && rn[1] == '/' ? rn + 2 : rn);
-    }
-
-    /* Build full path */
-    char full_path[1024];
-    /* an absolute path is taken as it is, as CRuby does */
-    int fp_n = rel_path[0] == '/' ? snprintf(full_path, sizeof(full_path), "%s", rel_path)
-                                  : snprintf(full_path, sizeof(full_path), "%s/%s", dir, rel_path);
-    if (fp_n < 0 || (size_t)fp_n >= sizeof(full_path)) break;
-    /* Collapse "." / ".." before appending ".rb", so a target ending in
-       ".." resolves to the parent dir's `<dir>.rb` rather than "...rb". */
-    sp_normalize_dots(full_path);
-    {
-      size_t fl = strlen(full_path);
-      if (fl < sizeof(full_path) - 4 && (fl < 3 || strcmp(full_path + fl - 3, ".rb") != 0))
-        strcat(full_path, ".rb");
-    }
-
-    if (gnew) sp_load_edge(&g->edge, &g->nedge, &g->edgecap, gfile, site->line, 0, rel_path, SP_LOAD_FILE,
-                           sp_load_file(g, full_path));
-    char *canonical = sp_canonical_path(full_path);
-    char *canon_keep = strdup(canonical);
-    char *content;
-    unsigned char *cfsl = NULL; size_t cfsl_n = 0;   /* spliced content's flags */
-    /* the run-time part a hoisted require held back (sp_defer_runtime) */
-    const char *dval = NULL;
-    int fresh = 0;   /* this splice reads the file */
-    if (sp_path_already_included(canonical)) {
-      /* Already inlined once -- replace require with empty content */
-      content = strdup("# require_relative skipped (already included)");
-      cfsl = sp_fsl_make(content, 0, &cfsl_n);
-      dval = sp_defer_lookup(canonical);
-      free(canonical);
-      req_val = dval ? dval : "false";
-      sp_req_resolved++;
-    }
-else {
-      fresh = 1;
-      sp_mark_path_included(canonical);
-      content = read_file(full_path);
-      if (!content) {
-        /* CRuby raises LoadError for a missing require_relative target. Spinel
-           inlines at parse time, so a missing file means the classes/methods it
-           was meant to define are simply absent -- and because dispatch then
-           silently mis-resolves a call to a same-named method on another class
-           (no missing-file error at the call site), the failure surfaces far
-           from its cause. Halt the compile instead, matching CRuby. */
-        fprintf(stderr,
-                "spinel: %s: cannot load such file -- %s (require_relative \"%s\")\n",
-                source_path, full_path, rel_path);
-        exit(1);
-      }
-else {
-        /* Recursively resolve */
-        char *resolved = resolve_requires(g, content, full_path, &cfsl, &cfsl_n);
-        free(content);
-        content = resolved;
-        sp_req_resolved++;
-      }
-      free(canonical);
-    }
-
-    /* Debug: wrap with PUSH/POP markers so the line map can attribute this
-       file's nodes to the right source. No-op outside --debug. */
-    content = sp_wrap_included(content, full_path, site->deferred && !dval && fresh ? SP_FILE_DEFERRED : SP_LIB_NONE);
-    sp_fsl_pad_wrap(&cfsl, &cfsl_n);
-
-    /* The call's value is live (a condition, an assignment, a receiver) or a
-       trailing modifier would be stranded: inline the file ahead of the line
-       and leave the value in the call's place (#3454). */
-    {
-      /* (a call in the modifier's condition may have been replaced already) */
-      ml = site->ml ? (int)(sp_emap_pos(&emap, site->end + (size_t)site->ml) - sp_emap_pos(&emap, site->end)) : 0;
-      cond_inline = !hit.margin || ml || sp_in_cond_region(result, hit.kw);
-      /* a later require of a file a hoisted one deferred stands where it
-         was, and runs what that one held back */
-      if (dval) {
-        free(content); content = strdup("");
-        free(cfsl); cfsl = sp_fsl_make(content, 0, &cfsl_n);
-      }
-      if (dval || (!hit.margin && !site->control_only) || (site->has_modifier && !ml)) {
-        if (!dval && strcmp(req_val, "true") == 0) {
-          const char *v = sp_defer_runtime(&content, canon_keep, NULL, incl_mark);
-          if (v) req_val = v;
-        }
-        sp_req_hoist_splice(&result, &fsl, &fsl_n, &hit, sp_emap_pos(&emap, ins),
-                            content, cfsl, cfsl_n, req_val);
-        sp_req_note_hoist(&emap, site, ins, strlen(req_val), len_before, strlen(result));
-        free(cfsl);
-        free(content);
-        free(canon_keep);
-        continue;
-      }
-    }
-    free(canon_keep);
-
-    /* a conditional inclusion is marked, so the requires inside it count as
-       conditional too (the markers are comments: two lines, no flags) */
-    if (cond_inline && (!hit.margin || ml)) content = sp_req_cond_wrap(content, &cfsl, &cfsl_n, expr_end, ml);
-
-    /* Replace the statement, consuming its trailing whitespace and single
-       newline; anything else on the line (`require_relative 'x'; code`) stays,
-       pushed onto its own line by the inserted content's trailing newline. */
-    char *stmt_end = expr_end + ml;
-    while (*stmt_end == ' ' || *stmt_end == '\t') stmt_end++;
-    if (*stmt_end == '\n') stmt_end++;
-    size_t line_len = (size_t)(stmt_end - pos);
-    size_t content_len = strlen(content);
-    size_t result_len = strlen(result);
-    size_t before_len = pos - result;
-
-    /* Mirror the splice on the flag buffer: the require line's one entry is
-       replaced by the included file's entries. */
-    sp_fsl_splice(&fsl, &fsl_n, sp_fsl_line_at(result, before_len), 1, cfsl, cfsl_n);
-    free(cfsl);
-
-    char *new_result = malloc(result_len - line_len + content_len + 2);
-    memcpy(new_result, result, before_len);
-    memcpy(new_result + before_len, content, content_len);
-    if (content_len > 0 && content[content_len - 1] != '\n')
-      new_result[before_len + content_len++] = '\n';
-    memcpy(new_result + before_len + content_len, pos + line_len, result_len - before_len - line_len + 1);
-
-    free(result);
-    result = new_result;
-    taken_to = site->end + (size_t)site->ml + (size_t)(stmt_end - (expr_end + ml));
-    inline_kw = site->kw;
-    sp_emap_add(&emap, taken_to, (ptrdiff_t)strlen(result) - (ptrdiff_t)len_before);
-    if (cond_inline)
-      while (sp_included_count > incl_mark) free(sp_included_paths[--sp_included_count]);
-    free(content);
-  }
-  free(sites);
-  free(emap.at);
-  free(emap.delta);
-  free(dir);
-  *fsl_out = fsl;
-  *fsl_n_out = fsl_n;
-  return result;
 }
 
 /* A `require "X"` whose X has no bundled lib/X.rb may still be provided
@@ -5963,18 +5221,6 @@ static int sp_require_tolerated(const char *name) {
   return 0;
 }
 
-/* A library CRuby already has loaded when the program starts, so its require
-   answers false rather than true even the first time it is written. Spinel is
-   in the same position for these: Set is spliced into every program that uses
-   it, so "already available" is the accurate answer here too (#3453). */
-static int sp_require_preloaded(const char *name) {
-  static const char *const preloaded[] = { "set", NULL };
-  for (int i = 0; preloaded[i]; i++) {
-    if (strcmp(name, preloaded[i]) == 0) return 1;
-  }
-  return 0;
-}
-
 /* The name a plain require looks up under packages/, or NULL to skip the
    lookup. packages/time/time.rb is CRuby's time.rb, for Time.parse and
    Time.strptime: a plain `require "time"` stays the runtime's, whose
@@ -5991,9 +5237,6 @@ static const char *sp_package_feature(const char *lib_name) {
 }
 
 /* ---- Plain require resolution ---- */
-static char *resolve_plain_requires(SpLoadGraph *g, char *source, const char *exe_path,
-                                    unsigned char **fsl, size_t *fsl_n);
-
 static void sp_lib_dir(const char *exe_path, char *lib_dir, size_t lib_dir_n);
 /* ---- builtins/: the core methods written in Ruby ----
    The names builtins/enumerable.rb defines, read once: the analyzer rewrites
@@ -6027,464 +5270,6 @@ static void sp_builtin_names_from(const char *content) {
   sp_builtin_names_from_into(content, &sp_builtin_enum_names, &sp_builtin_enum_names_n);
 }
 
-/* ---- what prism's lexer says of the text the builtin splices ask about ----
-   The splices below are decided before the parse, from the resolved text,
-   and the text alone cannot say where code stops: a `#` starts a comment
-   only where the lexer is reading code. In a string literal, a heredoc
-   body, a regexp or a %-literal it is a character, and as `#{` it opens
-   code. Nor can it say whether a word is a token or part of a string. So
-   those two questions go to prism, once per text and only when a splice has
-   to ask: the comments it found, and whether `break` and `define_finalizer`
-   were lexed as the keyword and an identifier (inside an interpolation too).
-   A program that evaluates a string has code prism lexed as text (a
-   class_eval template), so there a word counts wherever it is spelled, as
-   it did before; so does one prism could not parse. */
-typedef struct {
-  const char *src;            /* the text this was read from, NULL for none */
-  size_t *com; int com_n;     /* each comment's start and end offset, in order */
-  size_t *mods; int mods_n, mods_cap; /* each `module` keyword's offset, in order */
-  int brk, fin, evals, popen, popen_str;
-} SpSrcLex;
-static SpSrcLex sp_src_lex;
-
-static int sp_src_tok_is(const pm_token_t *tok, const char *word) {
-  size_t wl = strlen(word);
-  return (size_t)(tok->end - tok->start) == wl && memcmp(tok->start, word, wl) == 0;
-}
-
-static int sp_src_top_io(const uint8_t *src, const uint8_t *p) {
-  size_t off = (size_t)(p - src);
-  if (off >= 2 && p[-1] == ':' && p[-2] == ':') return off == 2 || !sp_req_ident_char((char)p[-3]);
-  return off == 0 || (p[-1] != ':' && !sp_req_ident_char((char)p[-1]));
-}
-
-static void sp_src_lex_token(void *data, pm_parser_t *parser, pm_token_t *tok) {
-  SpSrcLex *lx = (SpSrcLex *)data;
-  (void)parser;
-  if (tok->type == PM_TOKEN_KEYWORD_BREAK) lx->brk = 1;
-  if (tok->type == PM_TOKEN_KEYWORD_MODULE) {
-    if (lx->mods_n == lx->mods_cap) {
-      lx->mods_cap = lx->mods_cap ? lx->mods_cap * 2 : 64;
-      lx->mods = (size_t *)realloc(lx->mods, sizeof(size_t) * (size_t)lx->mods_cap);
-      if (!lx->mods) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-    }
-    lx->mods[lx->mods_n++] = (size_t)(tok->start - (const uint8_t *)lx->src);
-  }
-  for (const uint8_t *q = tok->start; tok->type == PM_TOKEN_STRING_CONTENT && q + 8 <= tok->end; q++)
-    if (!memcmp(q, "IO.popen", 8)) lx->popen_str = 1;
-  if (tok->type != PM_TOKEN_IDENTIFIER) return;
-  if (sp_src_tok_is(tok, "define_finalizer")) lx->fin = 1;
-  if (sp_src_tok_is(tok, "popen") && tok->start - (const uint8_t *)lx->src >= 3 && !memcmp(tok->start - 3, "IO.", 3) &&
-      sp_src_top_io((const uint8_t *)lx->src, tok->start - 3)) lx->popen = 1;
-  if (sp_src_tok_is(tok, "eval") || sp_src_tok_is(tok, "class_eval") ||
-      sp_src_tok_is(tok, "module_eval") || sp_src_tok_is(tok, "instance_eval")) lx->evals = 1;
-}
-
-/* The text is about to be freed or replaced: what was read from it goes. */
-static void sp_src_lex_drop(void) {
-  free(sp_src_lex.com);
-  free(sp_src_lex.mods);
-  memset(&sp_src_lex, 0, sizeof sp_src_lex);
-}
-
-static int sp_src_off_cmp(const void *a, const void *b) {
-  size_t x = *(const size_t *)a, y = *(const size_t *)b;
-  return (x > y) - (x < y);
-}
-
-static SpSrcLex *sp_src_lex_of(const char *source) {
-  SpSrcLex *lx = &sp_src_lex;
-  if (lx->src == source) return lx;
-  sp_src_lex_drop();
-  lx->src = source;
-  pm_parser_t parser;
-  pm_lex_callback_t cb = { lx, sp_src_lex_token };
-  sp_pm_parser_init(&parser, source, strlen(source), NULL);
-  parser.lex_callback = &cb;
-  pm_node_t *root = pm_parse(&parser);
-  int cap = 0;
-  for (pm_comment_t *c = (pm_comment_t *)parser.comment_list.head; c; c = (pm_comment_t *)c->node.next) {
-    if (lx->com_n + 2 > cap) {
-      cap = cap ? cap * 2 : 64;
-      lx->com = (size_t *)realloc(lx->com, sizeof(size_t) * (size_t)cap);
-      if (!lx->com) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-    }
-    lx->com[lx->com_n++] = (size_t)(c->location.start - (const uint8_t *)source);
-    lx->com[lx->com_n++] = (size_t)(c->location.end - (const uint8_t *)source);
-  }
-  if (parser.error_list.size > 0) lx->evals = 1;
-  /* the lexer reads a heredoc's body before the rest of its opening line,
-     so a `module` in the body's code comes before one later on that line */
-  if (lx->mods_n > 1) qsort(lx->mods, (size_t)lx->mods_n, sizeof(size_t), sp_src_off_cmp);
-  pm_node_destroy(&parser, root);
-  pm_parser_free(&parser);
-  return lx;
-}
-
-/* Is the byte at `at` inside a comment of `source`? */
-static int sp_src_in_comment(const char *source, const char *at) {
-  SpSrcLex *lx = sp_src_lex_of(source);
-  size_t off = (size_t)(at - source);
-  int lo = 0, hi = lx->com_n / 2;
-  while (lo < hi) {
-    int mid = (lo + hi) / 2;
-    if (off < lx->com[mid * 2]) hi = mid;
-    else if (off >= lx->com[mid * 2 + 1]) lo = mid + 1;
-    else return 1;
-  }
-  return 0;
-}
-
-/* Does the source mention `name` as a method: `.name` or a bare `name`
-   followed by `(`, ` {`, ` do` or an argument, outside a comment? A textual
-   test, as the Set splice's is: a false positive costs the parse of a small
-   file, and the names never reach the generated C uncalled. */
-static int sp_source_mentions_method(const char *src, const char *name) {
-  size_t nl = strlen(name);
-  const char *p = src;
-  while ((p = strstr(p, name)) != NULL) {
-    const char *after = p + nl;
-    unsigned char ac = (unsigned char)*after;
-    int word_end = !((ac >= 'a' && ac <= 'z') || (ac >= 'A' && ac <= 'Z') || (ac >= '0' && ac <= '9') || ac == '_' || ac == '?' || ac == '!' || ac == '=');
-    unsigned char bc = p > src ? (unsigned char)p[-1] : ' ';
-    /* a Symbol naming it (`send(:tally)`, `method(:tally)`, `&:tally`) calls
-       it as surely as `.tally` does; `Foo::tally` is a constant path's */
-    int sym = bc == ':' && p - src >= 2 && p[-2] != ':' && !(p - src >= 2 && sp_req_ident_char(p[-2]));
-    int word_start = sym || !((bc >= 'a' && bc <= 'z') || (bc >= 'A' && bc <= 'Z') || (bc >= '0' && bc <= '9') || bc == '_' || bc == '@' || bc == '$' || bc == ':');
-    p = after;
-    if (!word_end || !word_start) continue;
-    /* not in a comment: a `#` between the line start and the name is asked
-       of the lexer, since one in a string literal or opening `#{` hides
-       nothing (`puts "issue #12"; p a.partition { ... }`) */
-    const char *ls = p - nl;
-    while (ls > src && ls[-1] != '\n') ls--;
-    int in_comment = 0;
-    for (const char *k = ls; k < p - nl; k++) if (*k == '#') { in_comment = sp_src_in_comment(src, p - nl); break; }
-    if (in_comment) continue;
-    if (bc == '.' || sym) return 1;
-    if (ac == '(' || ac == ' ' || ac == '\n') return 1;
-  }
-  return 0;
-}
-
-/* A builtin library CRuby has loaded before the program runs -- RubyGems'
-   `Gem`, `RbConfig` -- that library code consults without a require. When the
-   whole program (libraries included) names the constant (`Gem.x`, `Gem::X`)
-   outside a comment and defines none of its own, builtins/<file> is spliced
-   at the top. */
-static int sp_src_names_const(const char *src, const char *w) {
-  size_t wl = strlen(w);
-  for (const char *p = strstr(src, w); p; p = strstr(p + 1, w)) {
-    char prev = p == src ? 0 : p[-1];
-    if (sp_req_ident_char(prev) || prev == '@' || prev == '$') continue;
-    /* `Foo::Gem` is Foo's; a leading `::Gem` is the top-level one */
-    if (prev == ':' && (p - src < 2 || p[-2] != ':' ||
-                        (p - src >= 3 && (sp_req_ident_char(p[-3]) || p[-3] == ')'))))
-      continue;
-    if (p[wl] != '.' && !(p[wl] == ':' && p[wl + 1] == ':')) continue;
-    const char *bol = p;
-    while (bol > src && bol[-1] != '\n') bol--;
-    while (*bol == ' ' || *bol == '\t') bol++;
-    if (*bol == '#') continue;
-    return 1;
-  }
-  return 0;
-}
-/* Does the source open `kw` ("module Enumerable", "class Set") as written,
-   the name ending there? A bare strstr also took ruby/spec's
-   `module EnumerableSpecs` or a `class Settings` for it. */
-static int sp_src_opens(const char *source, const char *kw) {
-  size_t kl = strlen(kw);
-  for (const char *p = strstr(source, kw); p; p = strstr(p + 1, kw))
-    if (!sp_req_ident_char(p[kl])) return 1;
-  return 0;
-}
-
-/* Was the `module` at `at` lexed as the keyword? */
-static int sp_src_module_keyword_at(const char *source, const char *at) {
-  SpSrcLex *lx = sp_src_lex_of(source);
-  size_t off = (size_t)(at - source);
-  int lo = 0, hi = lx->mods_n;
-  while (lo < hi) {
-    int mid = (lo + hi) / 2;
-    if (lx->mods[mid] < off) lo = mid + 1;
-    else hi = mid;
-  }
-  return lo < lx->mods_n && lx->mods[lo] == off;
-}
-
-/* Does the program open module `cname` itself (`module RbConfig`, the
-   name ending there)? A `module RbConfig` in a comment opens nothing: a
-   library's documentation comment kept builtins/rbconfig.rb out, and
-   RbConfig::CONFIG was an uninitialized constant. Nor does one in a string
-   literal or a heredoc, where the lexer read no keyword. A program that
-   evaluates a string, or that prism could not parse, counts the text
-   outside comments, as sp_src_lex_of says. */
-static int sp_src_defines_module(const char *source, const char *cname) {
-  char def[80];
-  int dl = snprintf(def, sizeof def, "module %s", cname);
-  if (dl <= 0 || (size_t)dl >= sizeof def) return 0;
-  for (const char *p = strstr(source, def); p; p = strstr(p + 1, def)) {
-    char after = p[dl];
-    if (after != '\n' && after != ' ' && after != '\t' && after != '\r' && after != ';') continue;
-    if (p > source && sp_req_ident_char(p[-1])) continue;
-    if (sp_src_in_comment(source, p)) continue;
-    if (!sp_src_lex_of(source)->evals && !sp_src_module_keyword_at(source, p)) continue;
-    return 1;
-  }
-  return 0;
-}
-
-/* Where boot package `rank` (boot_package_rank) goes among the boot packages
-   `text` already has spliced: the packages' files are the blocks of lines
-   from a PUSH or INSERT marker to the POP that closes it, which stand in a
-   row at the text's start (a package's file carries the package tier in its
-   marker; a program's own file of the same name does not), and the
-   packages' load order is the facts' order (as sp_graph_boot loads them).
-   The offset of the first block of a package that loads after it, else the
-   end of the last block of one that loads before it, else 0. */
-static size_t sp_boot_insert_at(const char *text, int rank) {
-  size_t pos = 0, after = 0;
-  for (;;) {
-    const char *line = text + pos, *eol = strchr(line, '\n');
-    size_t pl = !strncmp(line, SP_PUSH_PREFIX, strlen(SP_PUSH_PREFIX)) ? strlen(SP_PUSH_PREFIX)
-              : !strncmp(line, SP_INSERT_PREFIX, strlen(SP_INSERT_PREFIX)) ? strlen(SP_INSERT_PREFIX) : 0;
-    if (!pl || !eol) return after;
-    size_t fl = (size_t)(eol - line) - pl;
-    int tier;
-    const char *fp = sp_marker_file(line + pl, &fl, &tier);
-    int depth = 0;
-    const char *q = line;
-    do {
-      if (!strncmp(q, SP_PUSH_PREFIX, strlen(SP_PUSH_PREFIX)) || !strncmp(q, SP_INSERT_PREFIX, strlen(SP_INSERT_PREFIX))) depth++;
-      else if (!strncmp(q, SP_POP_PREFIX, strlen(SP_POP_PREFIX))) depth--;
-      const char *nl = strchr(q, '\n');
-      if (!nl) return after;   /* (a block with no end: not one) */
-      q = nl + 1;
-    } while (depth > 0);
-    int r = (tier & ~SP_FILE_DEFERRED) == SP_LIB_PACKAGE ? boot_package_rank_of_path(fp, fl) : -1;
-    if (r > rank) return pos;
-    if (r >= 0) after = (size_t)(q - text);
-    pos = (size_t)(q - text);
-  }
-}
-
-/* `head` (a require line) written into `source` at offset `at`, which is the
-   start of a line, and resolved there. The file it splices is marked as
-   inserted, so the program's own line numbers stay where they are. */
-static char *sp_splice_require_at(char *source, const char *exe_path, const char *head, size_t at,
-                                  unsigned char **fsl, size_t *fsl_n) {
-  size_t sl = strlen(source), hl = strlen(head);
-  char *ns = (char *)malloc(sl + hl + 1);
-  if (!ns) return source;
-  memcpy(ns, source, at); memcpy(ns + at, head, hl); memcpy(ns + at + hl, source + at, sl - at + 1);
-  {   /* (the line is one of the buffer's, and has no flag yet) */
-    unsigned char z = 0;
-    sp_fsl_splice(fsl, fsl_n, sp_fsl_line_at(source, at), 0, &z, 1);
-  }
-  sp_req_written++;   /* (the head is one require) */
-  sp_src_lex_drop();
-  free(source);
-  ns = resolve_plain_requires(NULL, ns, exe_path, fsl, fsl_n);
-  size_t pl = strlen(SP_PUSH_PREFIX), il = strlen(SP_INSERT_PREFIX), nl = strlen(ns);
-  char *w = strncmp(ns + at, SP_PUSH_PREFIX, pl) == 0 ? (char *)malloc(nl - pl + il + 1) : NULL;
-  if (!w) return ns;
-  memcpy(w, ns, at); memcpy(w + at, SP_INSERT_PREFIX, il); memcpy(w + at + il, ns + at + pl, nl - at - pl + 1);
-  free(ns);
-  return w;
-}
-
-/* Boot package `feature`, which the program names without requiring it
-   (CRuby has it loaded at boot): spliced among the boot packages by their
-   load order. */
-static char *sp_splice_boot_package(char *source, const char *exe_path, const char *feature,
-                                    unsigned char **fsl, size_t *fsl_n) {
-  char head[96]; snprintf(head, sizeof head, "require \"%s\"\n", feature);
-  return sp_splice_require_at(source, exe_path, head, sp_boot_insert_at(source, boot_package_rank(feature)), fsl, fsl_n);
-}
-
-static char *sp_splice_named_builtin(char *source, const char *exe_path, const char *cname,
-                                     const char *file, unsigned char **fsl, size_t *fsl_n) {
-  if (!sp_src_names_const(source, cname) || sp_src_defines_module(source, cname)) return source;
-  char head[96]; snprintf(head, sizeof head, "require \"%s\"\n", file);
-  return sp_splice_require_at(source, exe_path, head, 0, fsl, fsl_n);
-}
-
-/* builtins/monitor_mixin.rb: MonitorMixin, for a program that names it in
-   code (`include MonitorMixin`, `MonitorMixin::ConditionVariable`) and does
-   not define it -- named, not called through, so the Gem-style test of a
-   `.`/`::` after the name does not ask the right question */
-static char *sp_splice_monitor_mixin(char *source, const char *exe_path,
-                                     unsigned char **fsl, size_t *fsl_n) {
-  static const char w[] = "MonitorMixin";
-  size_t wl = sizeof w - 1;
-  int named = 0;
-  for (const char *p = strstr(source, w); p && !named; p = strstr(p + 1, w)) {
-    char prev = p == source ? 0 : p[-1];
-    if (sp_req_ident_char(prev) || prev == '@' || prev == '$' || sp_req_ident_char(p[wl])) continue;
-    const char *bol = p;
-    while (bol > source && bol[-1] != '\n') bol--;
-    while (*bol == ' ' || *bol == '\t') bol++;
-    if (*bol != '#') named = 1;
-  }
-  if (!named || sp_src_defines_module(source, w)) return source;
-  return sp_splice_require_at(source, exe_path, "require \"builtins/monitor_mixin\"\n", 0, fsl, fsl_n);
-}
-
-/* builtins/object_space.rb: the finalizer API. Only for a program that names
-   it -- the rest of ObjectSpace stays the refusal it is
-   (docs/limitations.md). Names it in code, that is: the file holds procs in
-   a table and calls them, which the whole-program analysis answers for, so a
-   program that only prints the word was refused for what it never did. */
-static char *sp_splice_object_space(char *source, const char *exe_path,
-                                    unsigned char **fsl, size_t *fsl_n) {
-  if (!strstr(source, "define_finalizer")) return source;
-  { SpSrcLex *lx = sp_src_lex_of(source); if (!lx->fin && !lx->evals) return source; }
-  if (sp_src_defines_module(source, "ObjectSpace")) return source;
-  return sp_splice_require_at(source, exe_path, "require \"builtins/object_space\"\n", 0, fsl, fsl_n);
-}
-
-/* builtins/process_detach.rb: Process.detach, for a program that calls it
-   and does not open Process itself (#7203) */
-static char *sp_splice_process_detach(char *source, const char *exe_path,
-                                      unsigned char **fsl, size_t *fsl_n) {
-  if (!strstr(source, "Process.detach") || sp_src_defines_module(source, "Process")) return source;
-  return sp_splice_require_at(source, exe_path, "require \"builtins/process_detach\"\n", 0, fsl, fsl_n);
-}
-
-/* builtins/system_spawn.rb: Kernel#system with an options or environment
-   Hash, for a program that calls system with a keyword argument (the
-   analysis renames those calls to it, desugar_system_options) */
-static int sp_src_system_call_has_keyword(const char *source) {
-  for (const char *p = strstr(source, "system"); p; p = strstr(p + 6, "system")) {
-    if (p > source && (isalnum((unsigned char)p[-1]) || p[-1] == '_' || p[-1] == '.' ||
-                       p[-1] == ':' || p[-1] == '@' || p[-1] == '$')) continue;
-    const char *q = p + 6;
-    if (*q != '(' && *q != ' ') continue;
-    /* the call's text: to the end of its line, and on through a line that
-       ends inside the argument list (a trailing comma or open parenthesis) */
-    for (; *q; q++) {
-      if (*q == '\n') {
-        const char *e = q;
-        while (e > p && (e[-1] == ' ' || e[-1] == '\t' || e[-1] == '\r')) e--;
-        if (e > p && (e[-1] == ',' || e[-1] == '(')) continue;
-        break;
-      }
-      /* `name:` and not `Name::` -- a keyword argument */
-      if (*q == ':' && q[1] != ':' && (isalnum((unsigned char)q[-1]) || q[-1] == '_')) return 1;
-    }
-  }
-  return 0;
-}
-
-static char *sp_splice_system_spawn(char *source, const char *exe_path,
-                                    unsigned char **fsl, size_t *fsl_n) {
-  if (!sp_src_system_call_has_keyword(source)) return source;
-  return sp_splice_require_at(source, exe_path, "require \"builtins/system_spawn\"\n", 0, fsl, fsl_n);
-}
-
-/* builtins/file_foreach_first.rb: File.foreach(path).first(n), for a program
-   that writes `foreach(` and `.first(` (desugar_dir_surface renames the call) */
-static char *sp_splice_foreach_first(char *source, const char *exe_path,
-                                     unsigned char **fsl, size_t *fsl_n) {
-  if (!strstr(source, "foreach(") || !strstr(source, ".first(")) return source;
-  return sp_splice_require_at(source, exe_path, "require \"builtins/file_foreach_first\"\n", 0, fsl, fsl_n);
-}
-
-/* builtins/io_popen.rb: IO.popen with a block, for a program that calls
-   IO.popen (the analysis renames the block form to it, desugar_io_popen_block) */
-static char *sp_splice_io_popen(char *source, const char *exe_path,
-                                unsigned char **fsl, size_t *fsl_n) {
-  if (!strstr(source, "IO.popen")) return source;
-  { SpSrcLex *lx = sp_src_lex_of(source); if (!lx->popen && !(lx->evals && lx->popen_str)) return source; }
-  return sp_splice_require_at(source, exe_path, "require \"builtins/io_popen\"\n", 0, fsl, fsl_n);
-}
-
-static char *sp_splice_builtins(char *source, const char *exe_path,
-                                unsigned char **fsl, size_t *fsl_n) {
-  if (getenv("SPINEL_NO_BUILTINS")) return source;   /* the A/B switch: the C emitters alone */
-  if (sp_builtin_enum_names_n == 0) {
-    char lib_dir[1024], gp[1200];
-    sp_lib_dir(exe_path, lib_dir, sizeof lib_dir);
-    int base_len = (int)strlen(lib_dir);
-    if (base_len >= 4 && strcmp(lib_dir + base_len - 4, "/lib") == 0) base_len -= 4;
-    snprintf(gp, sizeof gp, "%.*s/builtins/enumerable.rb", base_len, lib_dir);
-    char *content = read_file(gp);
-    if (!content) { snprintf(gp, sizeof gp, "%.*s/../builtins/enumerable.rb", base_len, lib_dir); content = read_file(gp); }
-    if (!content) {
-      /* The C emitters for these methods are gone: a compiler that cannot
-         find the file has no Enumerable#partition at all, and a program
-         calling one compiled to an unconditional NoMethodError whose
-         carrier then failed the C build two files away from the cause. A
-         toolchain staged by hand (binary + lib/ + packages/, the list that
-         was complete before this directory existed) is the way to get
-         here; say so, where the binary looked. */
-      fprintf(stderr,
-              "spinel: builtins/enumerable.rb not found beside the compiler (looked under %.*s and its parent);\n"
-              "        the toolchain is incomplete -- it ships with `make install`. SPINEL_NO_BUILTINS=1 compiles without it.\n",
-              base_len, lib_dir);
-      exit(1);
-    }
-    sp_builtin_names_from(content); free(content);
-    if (sp_builtin_enum_names_n == 0) return source;
-  }
-  /* A program that reopens Enumerable with a builtin's name gets the
-     builtins beside it too: its own method replaces the builtin's
-     (desugar_builtins), and the builtin's still answers an Array whose
-     class has its own method of the name (an Array's take_while), as CRuby
-     looks the class up before the module. */
-  int any = 0;
-  for (int i = 0; i < sp_builtin_enum_names_n && !any; i++)
-    if (sp_source_mentions_method(source, sp_builtin_enum_names[i])) any = 1;
-  /* the spellings the analyzer rewrites onto a builtin's name */
-  static const char *const aliases[][2] = { { "with_object", "each_with_object" }, { "collect_concat", "flat_map" }, { "detect", "find" },
-    /* Array#index with a block and no argument (desugar_builtin_enum_calls) */
-    { "index", "find_index" }, { NULL, NULL } };
-  for (int k = 0; aliases[k][0] && !any; k++) {
-    int known = 0;
-    for (int i = 0; i < sp_builtin_enum_names_n; i++) if (strcmp(sp_builtin_enum_names[i], aliases[k][1]) == 0) known = 1;
-    if (known && sp_source_mentions_method(source, aliases[k][0])) any = 1;
-  }
-  if (!any) return source;
-  return sp_splice_require_at(source, exe_path, "require \"builtins/enumerable\"\n", 0, fsl, fsl_n);
-}
-
-/* builtins/enumerator.rb: the Enumerator walks desugar_enum_walk_calls
-   (analyze_desugar.c) moves a breaking block's call onto. It can only be
-   wanted by a program that breaks out of a block given to one of the
-   names it covers; like the Integer/Float/Comparable files, a missing file
-   just never splices, and the calls stay on their typed emitters. */
-static char *sp_splice_builtin_enumerator(char *source, const char *exe_path,
-                                          unsigned char **fsl, size_t *fsl_n) {
-  if (getenv("SPINEL_NO_BUILTINS")) return source;
-  /* a String's piece walk with an index (str.each_char.with_index { }),
-     which builtins/enumerator.rb's __enumw_str_*_with_index serve when the
-     String is no variable to read again after the walk */
-  int str_walk = sp_source_mentions_method(source, "with_index") &&
-                 (sp_source_mentions_method(source, "each_char") || sp_source_mentions_method(source, "each_line") ||
-                  sp_source_mentions_method(source, "each_byte") || sp_source_mentions_method(source, "each_codepoint"));
-  if (!str_walk && !strstr(source, "break")) return source;
-  static const char *const names[] = {
-    "map", "collect", "select", "filter", "reject", "filter_map", "each_with_object", "with_object",
-    "inject", "reduce", "each_slice", "each_cons", "each_entry", "with_index", NULL
-  };
-  int any = 0;
-  for (int i = 0; names[i] && !any; i++) if (sp_source_mentions_method(source, names[i])) any = 1;
-  if (!any) return source;
-  /* the keyword, not the word in a string or a comment */
-  { SpSrcLex *lx = sp_src_lex_of(source); if (!str_walk && !lx->brk && !lx->evals) return source; }
-  char lib_dir[1024], gp[1200];
-  sp_lib_dir(exe_path, lib_dir, sizeof lib_dir);
-  int base_len = (int)strlen(lib_dir);
-  if (base_len >= 4 && strcmp(lib_dir + base_len - 4, "/lib") == 0) base_len -= 4;
-  snprintf(gp, sizeof gp, "%.*s/builtins/enumerator.rb", base_len, lib_dir);
-  FILE *fp = fopen(gp, "r");
-  if (!fp) { snprintf(gp, sizeof gp, "%.*s/../builtins/enumerator.rb", base_len, lib_dir); fp = fopen(gp, "r"); }
-  if (!fp) return source;
-  fclose(fp);
-  return sp_splice_require_at(source, exe_path, "require \"builtins/enumerator\"\n", 0, fsl, fsl_n);
-}
-
 /* ---- builtins/: the other containers (Integer, Float, Comparable, Monitor) ----
    Same splice-if-mentioned idea as enumerable.rb above, generalized to a
    small table so a new container is one more row here plus its own file
@@ -6514,36 +5299,6 @@ static SpBuiltinExtra sp_builtin_extras[] = {
   { "builtins/monitor.rb", "builtins/monitor", NULL, 0, 0 },
 };
 #define SP_BUILTIN_EXTRA_N ((int)(sizeof(sp_builtin_extras) / sizeof(sp_builtin_extras[0])))
-
-static char *sp_splice_builtin_extra(char *source, const char *exe_path, SpBuiltinExtra *bf,
-                                      unsigned char **fsl, size_t *fsl_n) {
-  if (!bf->scanned) {
-    bf->scanned = 1;
-    char lib_dir[1024], gp[1200];
-    sp_lib_dir(exe_path, lib_dir, sizeof lib_dir);
-    int base_len = (int)strlen(lib_dir);
-    if (base_len >= 4 && strcmp(lib_dir + base_len - 4, "/lib") == 0) base_len -= 4;
-    snprintf(gp, sizeof gp, "%.*s/%s", base_len, lib_dir, bf->file);
-    char *content = read_file(gp);
-    if (!content) { snprintf(gp, sizeof gp, "%.*s/../%s", base_len, lib_dir, bf->file); content = read_file(gp); }
-    if (content) { sp_builtin_names_from_into(content, &bf->names, &bf->names_n); free(content); }
-  }
-  if (bf->names_n == 0) return source;
-  int any = 0;
-  for (int i = 0; i < bf->names_n && !any; i++)
-    if (sp_source_mentions_method(source, bf->names[i])) any = 1;
-  if (!any) return source;
-  char head[160]; snprintf(head, sizeof head, "require \"%s\"\n", bf->req);
-  return sp_splice_require_at(source, exe_path, head, 0, fsl, fsl_n);
-}
-
-static char *sp_splice_builtin_extras(char *source, const char *exe_path,
-                                       unsigned char **fsl, size_t *fsl_n) {
-  if (getenv("SPINEL_NO_BUILTINS")) return source;
-  for (int i = 0; i < SP_BUILTIN_EXTRA_N; i++)
-    source = sp_splice_builtin_extra(source, exe_path, &sp_builtin_extras[i], fsl, fsl_n);
-  return source;
-}
 
 /* Accessors for analyze_desugar.c (desugar_builtin_scalar_defs/_calls):
    sp_builtin_extras is static to this file, and its `names` arrays are
@@ -6593,276 +5348,6 @@ static void sp_lib_dir(const char *exe_path, char *lib_dir, size_t lib_dir_n) {
   if (slash) *slash = '\0';
   else strcpy(lib_dir, ".");
   strcat(lib_dir, "/lib");
-}
-
-static char *resolve_plain_requires(SpLoadGraph *g, char *source, const char *exe_path,
-                                    unsigned char **fsl, size_t *fsl_n) {
-  char lib_dir[1024];
-  sp_lib_dir(exe_path, lib_dir, sizeof lib_dir);
-
-  char *result = source;
-  /* The scan finds a `require` wherever it stands -- at the margin, indented
-     inside a body, or in the middle of an expression -- and skips the ones a
-     string, comment or heredoc only appears to contain. A computed argument
-     (`require File.expand_path('x', __dir__)`) matches nothing and is left
-     alone: grabbing the first quote on the line would mistake an inner string
-     literal for the lib name and strand the rest of the expression (#1383).
-     Each splice rebuilds the buffer, so the scan restarts from the top; the
-     stubs it leaves behind are comments, which the scan skips. */
-  for (;;) {
-    SpReqHit hit;
-    if (!sp_require_find(result, result, "require", &hit)) break;
-    /* a file inlined under a condition is loaded only when that branch runs:
-       it (and what it requires) stays loadable elsewhere */
-    int incl_mark = sp_included_count, cond_inline = 0, ml = 0;
-    char *pos = hit.kw, *expr_end = hit.expr_end;
-    char *line_end = strchr(pos, '\n');
-    if (!line_end) line_end = pos + strlen(pos);
-
-    char lib_name[256];
-    if (hit.arg_len >= sizeof lib_name) break;
-    snprintf(lib_name, sizeof(lib_name), "%.*s", (int)hit.arg_len, hit.arg);
-    /* `require "webrick/compat.rb"` names the same feature as
-       `require "webrick/compat"`: each lookup below adds the extension */
-    {
-      size_t ln = strlen(lib_name);
-      if (ln > 3 && strcmp(lib_name + ln - 3, ".rb") == 0) lib_name[ln - 3] = '\0';
-    }
-    /* What the call answers, in CRuby's terms: true when this require is what
-       loads the library, false when it was already there (a repeat, or a
-       capability Spinel provides without loading anything), and nil for a
-       require Spinel could not satisfy at all -- where CRuby would have raised
-       LoadError rather than answer (#3453). */
-    const char *req_val = "nil";
-    int root_dup = 0;
-    /* A name computed at run time (`require "sqlite3/#{v}/native"`) names no
-       file the program was compiled with: the call raises CRuby's LoadError,
-       with the message it would carry, which the usual `rescue LoadError`
-       fallback around it expects. */
-    if (hit.arg[-1] == '"' && strstr(lib_name, "#{")) {
-      if (g) sp_load_edge(&g->spl, &g->nspl, &g->splcap, -1, 0, 1, lib_name, SP_LOAD_RUNTIME, -1);
-      char val[400];
-      snprintf(val, sizeof val, "raise(LoadError, \"cannot load such file -- %s\")", lib_name);
-      size_t cn = 0; unsigned char *cf = sp_fsl_make("", 0, &cn);
-      sp_req_hoist_splice(&result, fsl, fsl_n, &hit, sp_toplevel_stmt_start(result, (size_t)(hit.kw - result)),
-                          "", cf, cn, val);
-      free(cf);
-      continue;
-    }
-    char lib_path[1024];
-    int lib_tier = SP_LIB_NONE;   /* where `require` found the file it splices */
-    snprintf(lib_path, sizeof(lib_path), "%s/%s", lib_dir, lib_name);
-    {
-      size_t fl = strlen(lib_path);
-      if (fl < sizeof(lib_path) - 4 && (fl < 3 || strcmp(lib_path + fl - 3, ".rb") != 0))
-        strcat(lib_path, ".rb");
-    }
-
-    /* Same dedup as resolve_requires: a file pulled in via plain `require`
-       must not be re-inlined if a previous `require` or `require_relative`
-       already pulled it. Otherwise mixing the two forms for the same lib
-       still produces struct-redefinition errors. */
-    char *canonical = sp_canonical_path(lib_path);
-    char *canon_keep = strdup(canonical);
-    char *content;
-    unsigned char *cfsl = NULL; size_t cfsl_n = 0;   /* spliced content's flags */
-    /* the run-time part a hoisted require held back (sp_defer_runtime) */
-    const char *dval = NULL;
-    /* what this splice reads, for the load graph's comparison */
-    int spl_how = SP_LOAD_FILE;
-    char spl_to[1024];
-    snprintf(spl_to, sizeof spl_to, "%s", lib_path);
-    if (sp_path_already_included(canonical)) {
-      content = strdup("# require skipped (already included)");
-      dval = sp_defer_lookup(canonical);
-      free(canonical);
-      req_val = dval ? dval : "false";
-      sp_req_resolved++;
-      /* (the file an earlier require of the name read) */
-      if (g && !sp_lib_lookup(lib_dir, lib_name, spl_to, sizeof spl_to))
-        spl_how = sp_lib_is_native(lib_name) ? SP_LOAD_NATIVE : sp_require_tolerated(lib_name) ? SP_LOAD_CORE : SP_LOAD_NONE;
-    }
-else {
-      sp_mark_path_included(canonical);
-      free(canonical);
-      char found[1024];
-      int tier = sp_lib_lookup(lib_dir, lib_name, found, sizeof found);
-      content = tier ? read_file(found) : NULL;
-      if (content) snprintf(lib_path, sizeof(lib_path), "%s", found);
-      if (content) snprintf(spl_to, sizeof spl_to, "%s", found);
-      if (content) lib_tier = tier;
-      if (content && tier == SP_LIB_ROOT) {
-        char *rc = sp_canonical_path(lib_path);
-        for (int i = sp_rr_included; i < sp_included_count && !root_dup; i++) root_dup = sp_included_paths[i] && strcmp(sp_included_paths[i], rc) == 0;
-        if (root_dup) {
-          free(content); content = strdup("# require skipped (already included)");
-          dval = sp_defer_lookup(rc);
-        }
-        else sp_mark_path_included(rc);
-        free(rc);
-      }
-      if (content && tier == SP_LIB_BUILTIN) sp_note_builtin_path(found);
-      content = sp_lib_text_appended(content, found, tier);
-      if (!content) {
-        if (sp_lib_is_native(lib_name)) {
-          /* Provided natively by the Spinel runtime; the require is a
-             harmless no-op, so don't warn. Strict require still records it
-             so the C-native feature (e.g. io/console) becomes available. */
-          sp_feature_mark(lib_name);
-          spl_how = SP_LOAD_NATIVE;
-          content = strdup("# require provided by Spinel runtime");
-          req_val = "false";   /* already there: nothing was loaded */
-          sp_req_resolved++;
-        }
-else if (sp_require_tolerated(lib_name)) {
-          /* A core capability Spinel provides without a file (Thread,
-             Enumerator, Fiber, the ffi DSL); the require is a harmless
-             no-op, like modern CRuby -- gate or no gate. */
-          spl_how = SP_LOAD_CORE;
-          content = strdup("# require no-op (core feature)");
-          req_val = "false";   /* already there: nothing was loaded */
-          sp_req_resolved++;
-        }
-else if (g_strict_require) {
-          /* Whole-program AOT: an unsatisfiable require can never be provided, so
-             it is a compile-time refusal (symmetric with the require_relative
-             missing-file hard error), not a runtime LoadError. */
-          fprintf(stderr,
-                  "spinel: cannot load such file -- %s (require \"%s\")\n",
-                  lib_name, lib_name);
-          exit(1);
-        }
-else {
-          fprintf(stderr,
-                  "warning: '%s' is not available in Spinel; the require is ignored and code using it will fail\n",
-                  lib_name);
-          spl_how = SP_LOAD_NONE;
-          content = strdup("# require not resolved");
-        }
-      }
-else {
-        /* A bundled lib/<name>.rb was found and spliced; record the feature so
-           the strict-require enables any C-native methods it stands in for. */
-        sp_feature_mark(lib_name);
-        req_val = root_dup ? (dval ? dval : "false") : "true";   /* this require is what loaded it */
-        char *resolved = resolve_requires(g, content, lib_path, &cfsl, &cfsl_n);
-        free(content);
-        content = resolved;
-        sp_req_resolved++;
-      }
-    }
-    /* Stub arms above leave cfsl NULL: their content is a one-line comment. */
-    if (!cfsl) cfsl = sp_fsl_make(content, 0, &cfsl_n);
-    if (sp_require_preloaded(lib_name)) req_val = "false";
-    if (strcmp(req_val, "nil") != 0) sp_note_required_feature(lib_name);
-
-    /* Debug: marker-wrap so plain-require'd lib content doesn't corrupt the
-       line map's accounting for code after the require. No-op without --debug. */
-    content = sp_wrap_included(content, lib_path, lib_tier);
-    sp_fsl_pad_wrap(&cfsl, &cfsl_n);
-
-    /* A library CRuby has loaded at boot is loaded before the program's first
-       statement, as --load-model=graph loads it (sp_graph_boot), and the
-       boot packages in the order the facts list them: its text goes among
-       theirs at the start (sp_boot_insert_at), and the call stays where it
-       is, to find the file already included and answer so (the next round of
-       this scan). A call that stands at that place is there already. */
-    int boot_rank = lib_tier == SP_LIB_PACKAGE ? boot_package_rank(lib_name) : -1;
-    size_t boot_at = boot_rank >= 0 ? sp_boot_insert_at(result, boot_rank) : 0;
-    if (boot_rank >= 0 && (size_t)(hit.kw - result) != boot_at) {
-      char *call = strndup(hit.kw, (size_t)(hit.expr_end - hit.kw));
-      if (!call) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
-      sp_req_hoist_splice(&result, fsl, fsl_n, &hit, boot_at, content, cfsl, cfsl_n, call);
-      free(call);
-      free(cfsl);
-      free(content);
-      free(canon_keep);
-      continue;
-    }
-
-    /* (a boot library's call is recorded by the round that finds it again) */
-    if (g) sp_load_edge(&g->spl, &g->nspl, &g->splcap, -1, 0, 1, lib_name, spl_how,
-                        spl_how == SP_LOAD_FILE ? sp_load_file(g, spl_to) : -1);
-
-    /* The call's value is live: the require sits in a condition, an
-       assignment, a receiver chain, or carries a trailing modifier
-       (`require 'x' rescue nil`) that a comment in its place would strand.
-       Inline the library ahead of the line and leave the value behind, so the
-       statement around it survives and answers what CRuby answers (#3454). */
-    {
-      char *trail = expr_end;
-      while (*trail == ' ' || *trail == '\t') trail++;
-      /* `\r` is part of a CRLF line ending, not a modifier: treat it as a
-         statement boundary so Windows sources keep the normal inlining path. */
-      int has_modifier = (*trail != '\n' && *trail != '\r' && *trail != ';' &&
-                          *trail != '\0' && *trail != '#');
-      ml = sp_req_if_modifier(expr_end);
-      cond_inline = !hit.margin || ml || sp_in_cond_region(result, hit.kw);
-      /* a later require of a file a hoisted one deferred stands where it
-         was, and runs what that one held back */
-      if (dval) {
-        free(content); content = strdup("");
-        free(cfsl); cfsl = sp_fsl_make(content, 0, &cfsl_n);
-      }
-      if (dval || (!hit.margin && !sp_req_in_control_only(result, hit.kw)) || (has_modifier && !ml)) {
-        if (!dval && strcmp(req_val, "true") == 0) {
-          /* lib_path is the file found, which a later require of another
-             name for it reaches (root_dup below) */
-          char *found = sp_canonical_path(lib_path);
-          const char *v = sp_defer_runtime(&content, canon_keep, found, incl_mark);
-          free(found);
-          if (v) req_val = v;
-        }
-        sp_req_hoist_splice(&result, fsl, fsl_n, &hit, sp_toplevel_stmt_start(result, (size_t)(hit.kw - result)),
-                            content, cfsl, cfsl_n, req_val);
-        free(cfsl);
-        free(content);
-        free(canon_keep);
-        continue;
-      }
-    }
-    free(canon_keep);
-
-    /* a conditional inclusion is marked, so the requires inside it count as
-       conditional too (the markers are comments: two lines, no flags) */
-    if (cond_inline && (!hit.margin || ml)) content = sp_req_cond_wrap(content, &cfsl, &cfsl_n, expr_end, ml);
-
-    /* Replace only the `require "name"` statement itself, not the whole
-       line, so `require "x"; code` keeps `code`. Consume trailing
-       horizontal whitespace and a single terminating newline (so a
-       require on its own line leaves no blank line); stop at `;` or any
-       other trailing code, which the inserted content's trailing newline
-       then pushes onto its own line. */
-    char *stmt_end = expr_end + ml;
-    while (*stmt_end == ' ' || *stmt_end == '\t') stmt_end++;
-    int consumed_nl = (*stmt_end == '\n');
-    if (consumed_nl) stmt_end++;
-    size_t line_len = stmt_end - pos;
-    size_t content_len = strlen(content);
-    size_t result_len = strlen(result);
-    size_t before_len = pos - result;
-
-    /* Flag-buffer mirror: the require line is consumed entirely (its one
-       entry replaced by the lib's entries) -- unless trailing code stayed on
-       it, in which case that remainder becomes its own line and keeps the
-       original line's entry (insert the lib's entries before it). At EOF
-       with no trailing newline there is no remainder either. */
-    sp_fsl_splice(fsl, fsl_n, sp_fsl_line_at(result, before_len),
-                  (consumed_nl || *stmt_end == '\0') ? 1 : 0, cfsl, cfsl_n);
-    free(cfsl);
-    char *new_result = malloc(result_len - line_len + content_len + 2);
-    memcpy(new_result, result, before_len);
-    memcpy(new_result + before_len, content, content_len);
-    if (content_len > 0 && content[content_len - 1] != '\n')
-      new_result[before_len + content_len++] = '\n';
-    memcpy(new_result + before_len + content_len, pos + line_len, result_len - before_len - line_len + 1);
-    free(result);
-    result = new_result;
-    if (cond_inline)
-      while (sp_included_count > incl_mark) free(sp_included_paths[--sp_included_count]);
-    free(content);
-  }
-  return result;
 }
 
 /* ---- The names a constant holds, for def_delegators ---- */
@@ -7148,7 +5633,7 @@ static int sp_load_target(SpLoadGraph *g, int from, int rel, const char *path, i
     if (how == SP_LOAD_NONE && sp_lib_is_native(lib_name)) how = SP_LOAD_NATIVE;
     else if (how == SP_LOAD_NONE && sp_require_tolerated(lib_name)) how = SP_LOAD_CORE;
     /* the features a require enables (strict require) and the ones it
-       names, as the inline model's plain pass records them */
+       names */
     if (how == SP_LOAD_FILE || how == SP_LOAD_NATIVE) sp_feature_mark(lib_name);
     if (how != SP_LOAD_NONE) sp_note_required_feature(lib_name);
   }
@@ -7253,6 +5738,8 @@ typedef struct {
   int nested;                 /* inside a class or module body */
   pm_constant_id_t def;       /* the def the walk is in, 0 outside one */
   const pm_node_t *defined;   /* the operand of the defined? the walk is at: it does not run */
+  const SpPreFileCtx *pre;    /* skip provably dead constant-guard branches */
+  int in_bo;                  /* inside a BasicObject subclass */
 } SpNamesWalk;
 
 static void sp_names_const(SpNamesWalk *w, const char *tag, pm_constant_id_t id) {
@@ -7444,7 +5931,7 @@ static void sp_names_method(SpNames *s, const uint8_t *b, size_t n) {
       sp_names_add(s, sp_names_target_tag(r->target), r->target, strlen(r->target));
 }
 
-static void sp_names_of(SpNames *s, const pm_parser_t *p, const pm_node_t *root);
+static void sp_names_of(SpNames *s, const pm_parser_t *p, const pm_node_t *root, const SpPreFileCtx *pre);
 
 static void sp_names_call(SpNamesWalk *w, const pm_call_node_t *c) {
   const pm_constant_t *nm = pm_constant_pool_id_to_constant(&w->p->constant_pool, c->name);
@@ -7503,7 +5990,7 @@ static void sp_names_call(SpNamesWalk *w, const pm_call_node_t *c) {
   pm_parser_t ep;
   sp_pm_parser_init(&ep, code, len, NULL);
   pm_node_t *er = pm_parse(&ep);
-  sp_names_of(w->s, &ep, er);
+  sp_names_of(w->s, &ep, er, NULL);
   pm_node_destroy(&ep, er);
   pm_parser_free(&ep);
   free(code);
@@ -7520,6 +6007,32 @@ static int sp_names_word(const uint8_t *b, size_t n) {
 static bool sp_names_visit(const pm_node_t *n, void *data) {
   SpNamesWalk *w = data;
   switch (PM_NODE_TYPE(n)) {
+    case PM_IN_NODE: {
+      const pm_in_node_t *in = (const pm_in_node_t *)n;
+      const SpPreFileCtx *saved = w->pre;
+      w->pre = NULL;
+      if (in->pattern) pm_visit_node(in->pattern, sp_names_visit, w);
+      w->pre = saved;
+      if (in->statements) pm_visit_node((const pm_node_t *)in->statements, sp_names_visit, w);
+      return false;
+    }
+    case PM_IF_NODE: case PM_UNLESS_NODE: {
+      if (w->pre) {
+        int is_unless = PM_NODE_TYPE(n) == PM_UNLESS_NODE;
+        const pm_node_t *pred = is_unless ? ((const pm_unless_node_t *)n)->predicate : ((const pm_if_node_t *)n)->predicate;
+        const pm_node_t *body = is_unless ? (const pm_node_t *)((const pm_unless_node_t *)n)->statements
+                                          : (const pm_node_t *)((const pm_if_node_t *)n)->statements;
+        const pm_node_t *other = is_unless ? (const pm_node_t *)((const pm_unless_node_t *)n)->else_clause
+                                           : ((const pm_if_node_t *)n)->subsequent;
+        int tr = sp_pre_pm_truth(w->p, pred, w->pre, !w->in_bo, 0);
+        if (tr >= 0) {
+          const pm_node_t *live = (is_unless ? !tr : tr) ? body : other;
+          if (live) pm_visit_node(live, sp_names_visit, w);
+          return false;
+        }
+      }
+      break;
+    }
     case PM_CALL_NODE: sp_names_call(w, (const pm_call_node_t *)n); break;
     case PM_DEFINED_NODE: w->defined = ((const pm_defined_node_t *)n)->value; break;
     case PM_SYMBOL_NODE: {
@@ -7566,8 +6079,11 @@ static bool sp_names_visit(const pm_node_t *n, void *data) {
         pm_visit_node(((const pm_class_node_t *)n)->superclass, sp_names_visit, w);
       const pm_node_t *body = is_class ? ((const pm_class_node_t *)n)->body : ((const pm_module_node_t *)n)->body;
       int was = w->nested;
+      int is_bo = is_class && sp_pre_pm_is_basic_object(w->p, ((const pm_class_node_t *)n)->superclass);
       w->nested = 1;
+      w->in_bo += is_bo;
       if (body) pm_visit_node(body, sp_names_visit, w);
+      w->in_bo -= is_bo;
       w->nested = was;
       return false;
     }
@@ -7583,8 +6099,8 @@ static bool sp_names_visit(const pm_node_t *n, void *data) {
   return true;
 }
 
-static void sp_names_of(SpNames *s, const pm_parser_t *p, const pm_node_t *root) {
-  SpNamesWalk w = { s, p, 0, 0 };
+static void sp_names_of(SpNames *s, const pm_parser_t *p, const pm_node_t *root, const SpPreFileCtx *pre) {
+  SpNamesWalk w = { s, p, 0, 0, NULL, pre, 0 };
   if (root) pm_visit_node(root, sp_names_visit, &w);
 }
 
@@ -7716,7 +6232,7 @@ static int sp_builtins_dir(const char *lib_dir, char *out, size_t n) {
   return stat(out, &st) == 0 && S_ISDIR(st.st_mode);
 }
 
-/* --load-model=graph: file `f`'s record, made the first time it is asked for. */
+/* file `f`'s record, made the first time it is asked for. */
 static SpGraphFile *sp_graph_rec(SpLoadGraph *g, int f) {
   if (f >= g->gfcap) {
     int cap = g->gfcap ? g->gfcap : 16;
@@ -7998,10 +6514,10 @@ static void sp_req_paths(const SpReqCtx *x, const pm_node_t *arg, SpPaths *out) 
   for (int i = 0; i < ev.nloc; i++) free(ev.loc[i].name);
 }
 
-/* The literals a computed path joins, as the inline model reads a plain
-   require naming a file beside this one (sp_join_visit): one path for each
-   word of the `%w(...).each` the require stands in, or one path. Open when
-   the path is not built so, or joins no literal. */
+/* The literals a computed path joins, for a require naming a file beside
+   this one (sp_join_visit): one path for each word of the `%w(...).each`
+   the require stands in, or one path. Open when the path is not built so,
+   or joins no literal. */
 static void sp_req_beside(const SpReqCtx *x, const pm_node_t *arg, SpPaths *out) {
   const pm_node_list_t *words = NULL;
   SpShape shape = { 0, 0 };
@@ -8117,7 +6633,7 @@ static char *sp_seed_dirs(const SpLoadGraph *g) {
    kept with its call node, which flatten's LoadNode looks it up by
    (sp_graph_site_take). `stack` holds the nodes above the one visited,
    from the file's root. */
-typedef struct { SpLoadGraph *g; int f, stmt; const pm_node_t *top; const pm_node_t **stack; int depth, cap; SpFileReturn ret; } SpSiteWalk;
+typedef struct { SpLoadGraph *g; int f, stmt; const pm_node_t *top; const pm_node_t **stack; int depth, cap; SpFileReturn ret; const SpPreFileCtx *pre; int in_bo; } SpSiteWalk;
 
 /* The edge of a require whose path is no literal: the one file a known path
    names, as that literal does; the files a known set or the files beside
@@ -8290,7 +6806,64 @@ static int sp_graph_computed(SpSiteWalk *w, const pm_call_node_t *n, const char 
 
 static bool sp_graph_site_visit(const pm_node_t *node, void *data) {
   SpSiteWalk *w = data;
+  if (PM_NODE_TYPE(node) == PM_CLASS_NODE) {
+    const pm_class_node_t *n = (const pm_class_node_t *)node;
+    if (w->depth == w->cap) {
+      w->cap = w->cap ? w->cap * 2 : 32;
+      w->stack = realloc(w->stack, sizeof *w->stack * (size_t)w->cap);
+      if (!w->stack) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
+    }
+    w->stack[w->depth++] = node;
+    if (n->constant_path) pm_visit_node(n->constant_path, sp_graph_site_visit, w);
+    if (n->superclass) pm_visit_node(n->superclass, sp_graph_site_visit, w);
+    int is_bo = sp_pre_pm_is_basic_object(g_parser, n->superclass);
+    w->in_bo += is_bo;
+    if (n->body) pm_visit_node(n->body, sp_graph_site_visit, w);
+    w->in_bo -= is_bo;
+    w->depth--;
+    return false;
+  }
+  if (PM_NODE_TYPE(node) == PM_IN_NODE) {
+    const pm_in_node_t *n = (const pm_in_node_t *)node;
+    if (w->depth == w->cap) {
+      w->cap = w->cap ? w->cap * 2 : 32;
+      w->stack = realloc(w->stack, sizeof *w->stack * (size_t)w->cap);
+      if (!w->stack) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
+    }
+    w->stack[w->depth++] = node;
+    const SpPreFileCtx *saved = w->pre;
+    w->pre = NULL;
+    if (n->pattern) pm_visit_node(n->pattern, sp_graph_site_visit, w);
+    w->pre = saved;
+    if (n->statements) pm_visit_node((const pm_node_t *)n->statements, sp_graph_site_visit, w);
+    w->depth--;
+    return false;
+  }
+  if (w->pre && (PM_NODE_TYPE(node) == PM_IF_NODE || PM_NODE_TYPE(node) == PM_UNLESS_NODE)) {
+    int is_unless = PM_NODE_TYPE(node) == PM_UNLESS_NODE;
+    const pm_node_t *pred = is_unless ? ((const pm_unless_node_t *)node)->predicate : ((const pm_if_node_t *)node)->predicate;
+    const pm_node_t *body = is_unless ? (const pm_node_t *)((const pm_unless_node_t *)node)->statements
+                                      : (const pm_node_t *)((const pm_if_node_t *)node)->statements;
+    const pm_node_t *other = is_unless ? (const pm_node_t *)((const pm_unless_node_t *)node)->else_clause
+                                       : ((const pm_if_node_t *)node)->subsequent;
+    int tr = sp_pre_pm_truth(g_parser, pred, w->pre, !w->in_bo, 0);
+    if (tr >= 0) {
+      if (w->depth == w->cap) {
+        w->cap = w->cap ? w->cap * 2 : 32;
+        w->stack = realloc(w->stack, sizeof *w->stack * (size_t)w->cap);
+        if (!w->stack) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
+      }
+      w->stack[w->depth++] = node;
+      const pm_node_t *live = (is_unless ? !tr : tr) ? body : other;
+      if (live) pm_visit_node(live, sp_graph_site_visit, w);
+      w->depth--;
+      return false;
+    }
+  }
   if (PM_NODE_TYPE(node) == PM_CALL_NODE && sp_load_call((const pm_call_node_t *)node)) {
+    SpGraphFile *rf = sp_graph_rec(w->g, w->f);
+    for (int si = 0; si < rf->nsite; si++)
+      if (rf->site[si].call == node) goto visit_children;
     const pm_call_node_t *n = (const pm_call_node_t *)node;
     int auto_load = sp_pm_name_is(g_parser, n->name, "autoload");
     const pm_node_t *arg = n->arguments->arguments.nodes[auto_load ? 1 : 0];
@@ -8305,6 +6878,7 @@ static bool sp_graph_site_visit(const pm_node_t *node, void *data) {
     else e = sp_graph_computed(w, n, method, line);
     w->g->edge[e].stmt = w->stmt;
     w->g->edge[e].top = !auto_load && node == w->top;
+    w->g->edge[e].begin_block = PM_NODE_TYPE(w->top) == PM_PRE_EXECUTION_NODE;
     SpGraphFile *r = sp_graph_rec(w->g, w->f);
     if (r->nsite == r->sitecap) {
       r->sitecap = r->sitecap ? r->sitecap * 2 : 8;
@@ -8315,6 +6889,7 @@ static bool sp_graph_site_visit(const pm_node_t *node, void *data) {
     free(method);
     free(path);
   }
+visit_children:
   if (w->depth == w->cap) {
     w->cap = w->cap ? w->cap * 2 : 32;
     w->stack = realloc(w->stack, sizeof *w->stack * (size_t)w->cap);
@@ -8394,42 +6969,31 @@ static void sp_report_parse_errors(pm_parser_t *parser, const char *source_file,
   }
 }
 
-/* --load-model=graph: file `f` of graph `g` read and parsed, before any
-   file is flattened: its requires resolved (each target file a file of the
-   graph, read in its turn) and the names it uses added to `facts`. 0 when it
-   could not be read or parsed (reported). */
-static int sp_graph_read(SpLoadGraph *g, int f, const char *source_file, SpNames *facts) {
-  const char *path = f ? g->file[f] : source_file;
-  /* (a library of the compiler's has what the inline model's splice of it
-     appends, by the tier the require that found the file gave it, and
-     beside the path the require found it at, as the splice looks: a
-     package file that is a symlink has its declarations beside the link) */
-  char *text = sp_lib_text_appended(read_file(path), f ? g->found[f] : source_file, sp_load_tier(g, f));
-  if (!text) { fprintf(stderr, "spinel_parse: cannot open '%s'\n", path); return 0; }
+/* Each warning of the parse of a file of the program's own, as CRuby
+   writes it when it reads the file: the ones of the default level always,
+   the ones ruby -w adds (an unused local, a statement not reached, ...)
+   under -w. A compiled binary reads no source when it runs, so the compile
+   is where a slip such as a duplicated Hash key can be told. The text of
+   -e is named -e, as CRuby names it. */
+static void sp_report_parse_warnings(const SpSrcFile *f) {
+  const pm_parser_t *parser = &f->parser;
+  const char *file = f->shown ? f->shown : f->path;
+  if (g_opt_eval_path && strcmp(f->path, g_opt_eval_path) == 0) file = "-e";
+  for (const pm_diagnostic_t *d = (const pm_diagnostic_t *)parser->warning_list.head; d;
+       d = (const pm_diagnostic_t *)d->node.next) {
+    if (d->level == PM_WARNING_LEVEL_VERBOSE && !g_opt_warn_verbose) continue;
+    int32_t line = pm_newline_list_line(&parser->newline_list, d->location.start, parser->start_line);
+    fprintf(stderr, "spinel: %s:%d: warning: %s\n", file, (int)line, d->message);
+  }
+}
+
+static void sp_graph_scan_sites(SpLoadGraph *g, int f, const char *path, SpNames *facts, const SpPreFileCtx *pre) {
   SpGraphFile *r = sp_graph_rec(g, f);
-  r->text = text;
-  sp_src_file_parse(&r->src, text, path);
-  if (f && sp_load_tier(g, f) == SP_LIB_NONE) r->src.shown = sp_shown_path(path, source_file);   /* (the entry is named as given) */
-  r->read = 1;
-  sp_src_file_note_defers(&r->src);
-  sp_src_file_warn_encoding(&r->src);
-  if (r->src.parser.error_list.size) {
-    sp_report_parse_errors(&r->src.parser, source_file, r->src.shown ? r->src.shown : path);
-    return 0;
-  }
-  sp_src_file_fsl(&r->src);   /* (its pragma's warning; every literal is frozen) */
-  /* the words that say the program may load a file not read here
-     (g_require_unread), in each file as written, as resolve_requires reads
-     them; a builtins/ file is the compiler's own, as the inline model's
-     splice of it is */
-  if (!(*sp_load_flags(g, f) & SP_FILE_BUILTIN)) {
-    sp_load_sites_note(&r->src.parser, r->src.root, 1);
-  }
   sp_roots_set(g, r->dirs, r->ndirs);
   g_parser = &r->src.parser;
   const pm_node_t *root = r->src.root;
   const pm_statements_node_t *st = PM_NODE_TYPE_P(root, PM_PROGRAM_NODE) ? ((const pm_program_node_t *)root)->statements : NULL;
-  SpSiteWalk w = { g, f, 0, NULL, NULL, 0, 0, { NULL, 0 } };
+  SpSiteWalk w = { g, f, 0, NULL, NULL, 0, 0, { NULL, 0 }, pre, 0 };
   if (st) {
     w.stack = malloc(sizeof *w.stack * (size_t)(w.cap = 32));
     if (!w.stack) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
@@ -8446,17 +7010,52 @@ static int sp_graph_read(SpLoadGraph *g, int f, const char *source_file, SpNames
   }
   free(dir);
   free(w.stack);
-  sp_names_of(facts, &r->src.parser, r->src.root);
+  sp_names_of(facts, &r->src.parser, r->src.root, pre);
+}
+
+/* file `f` of graph `g` read and parsed, before any
+   file is flattened: its requires resolved (each target file a file of the
+   graph, read in its turn) and the names it uses added to `facts`. 0 when it
+   could not be read or parsed (reported). */
+static int sp_graph_read(SpLoadGraph *g, int f, const char *source_file, SpNames *facts) {
+  const char *path = f ? g->file[f] : source_file;
+  /* (a library of the compiler's has its declarations appended, by the
+     tier the require that found the file gave it, and beside the path the
+     require found it at: a package file that is a symlink has its
+     declarations beside the link) */
+  char *text = sp_lib_text_appended(read_file(path), f ? g->found[f] : source_file, sp_load_tier(g, f));
+  if (!text) { fprintf(stderr, "spinel_parse: cannot open '%s'\n", path); return 0; }
+  SpGraphFile *r = sp_graph_rec(g, f);
+  r->text = text;
+  sp_src_file_parse(&r->src, text, path);
+  if (f && sp_load_tier(g, f) == SP_LIB_NONE) r->src.shown = sp_shown_path(path, source_file);   /* (the entry is named as given) */
+  r->read = 1;
+  sp_src_file_note_defers(&r->src);
+  sp_src_file_warn_encoding(&r->src);
+  if (r->src.parser.error_list.size) {
+    sp_report_parse_errors(&r->src.parser, source_file, r->src.shown ? r->src.shown : path);
+    return 0;
+  }
+  sp_src_file_fsl(&r->src);   /* (its pragma's warning; every literal is frozen) */
+  if (sp_load_tier(g, f) == SP_LIB_NONE && !(*sp_load_flags(g, f) & SP_FILE_BUILTIN))
+    sp_report_parse_warnings(&r->src);
+  if (!(*sp_load_flags(g, f) & SP_FILE_BUILTIN)) {
+    sp_pre_scan_file(&r->src.parser, r->src.root, g->has_pre_inherit ? &g->pre_inherit : NULL, &r->pre);
+    r->has_pre = 1;
+    if (sp_pre_ctx_merge(&g->pre_inherit, &r->pre)) g->pre_tightened = 1;
+    g->has_pre_inherit = 1;
+  }
+  sp_graph_scan_sites(g, f, path, facts, g->has_pre_inherit ? &g->pre_inherit : NULL);
   return 1;
 }
 
-/* --load-model=graph: the file sp_graph_flatten is flattening, whose sites
+/* the file sp_graph_flatten is flattening, whose sites
    its LoadNodes look themselves up in, and the site after the last one
    taken. */
 typedef struct { SpLoadGraph *g; SpGraphFile *r; int next; } SpGraphFlat;
 static SpGraphFlat g_flat_sites;
 
-/* --load-model=graph: LoadNode `id`, flattened from require `call` of the
+/* LoadNode `id`, flattened from require `call` of the
    file being flattened, carries what the call's site resolved to. The site
    is found by its call node, not by its place: flatten meets a file's
    requires in its own order, which is not the tree's everywhere (a begin's
@@ -8524,7 +7123,7 @@ static int sp_graph_site_take(int id, const pm_node_t *call) {
   return 0;
 }
 
-/* --load-model=graph: file `f` of graph `g`, read before (sp_graph_read),
+/* file `f` of graph `g`, read before (sp_graph_read),
    flattened into the table as a root of its own (its ProgramNode carries
    its graph id, `load_file`; the entry's is the table's root), each of its
    requires a LoadNode carrying what it loads, and its inline RBS read from
@@ -8535,13 +7134,13 @@ static int sp_graph_flatten(SpLoadGraph *g, int f, const char *source_file) {
   /* the file in the table's file list, in graph order: flatten stamps a
      node's position from this parse, and a builtins/ root's nodes as
      builtin ones; a file is named as a message names it (sp_shown_path),
-     its #line directives too, as the inline model names it */
+     its #line directives too */
   g_flat_file = sp_intern_file(f ? (r->src.shown ? r->src.shown : g->file[f]) : source_file, f ? sp_load_tier(g, f) : SP_LIB_NONE);
   g_flat_builtin = (*sp_load_flags(g, f) & SP_FILE_BUILTIN) != 0;
   g_bi_base = -1;
   g_parser = &r->src.parser;
   g_source_file = source_file;
-  g_stmt_next = g_stmt_end = NULL; g_owner = NULL;
+  g_owner = NULL;
   /* inline RBS over the file's own comment list, its facts stamped on the
      file's own nodes as flatten makes them */
   if (sp_inline_rbs_run(&r->src.parser, r->src.root, r->text, strlen(r->text), sp_file_table[g_flat_file], g_flat_file) > 0) {
@@ -8550,20 +7149,26 @@ static int sp_graph_flatten(SpLoadGraph *g, int f, const char *source_file) {
     return 0;
   }
   /* a `#<SPINEL_SOURCE>file:line` marker in the file pins the positions
-     after it, as the inline model's map of the spliced buffer does: the
-     file's own map for its parse, the file's own lines elsewhere */
+     after it: the file's own map for its parse, the file's own lines
+     elsewhere */
   int saved_map_n = sp_line_map_n;
-  int *saved_lf = sp_line_file, *saved_lo = sp_line_orig, *saved_lp = sp_line_pop;
+  int *saved_lf = sp_line_file, *saved_lo = sp_line_orig;
   int *saved_df = sp_disp_file, *saved_dl = sp_disp_line;
   int own_map = r->text && strstr(r->text, SP_SOURCE_PREFIX) != NULL;
   if (own_map) sp_build_line_map(r->text, sp_file_table[g_flat_file]);
   g_flat_sites = (SpGraphFlat){ g, r, 0 };
+  g_flat_pre = g->has_pre_inherit ? &g->pre_inherit : (r->has_pre ? &r->pre : NULL);
+  g_in_pattern = 0;
+  g_in_basic_object = 0;
   int start = node_counter, root = flatten(r->src.root);
+  g_flat_pre = NULL;
+  g_in_pattern = 0;
+  g_in_basic_object = 0;
   g_flat_sites = (SpGraphFlat){ NULL, NULL, 0 };
   if (own_map) {
-    free(sp_line_file); free(sp_line_orig); free(sp_line_pop); free(sp_disp_file); free(sp_disp_line);
+    free(sp_line_file); free(sp_line_orig); free(sp_disp_file); free(sp_disp_line);
     sp_line_map_n = saved_map_n;
-    sp_line_file = saved_lf; sp_line_orig = saved_lo; sp_line_pop = saved_lp;
+    sp_line_file = saved_lf; sp_line_orig = saved_lo;
     sp_disp_file = saved_df; sp_disp_line = saved_dl;
   }
   sp_inline_rbs_done();
@@ -8782,7 +7387,7 @@ static int sp_graph_boot(SpLoadGraph *g, const char *source_file, SpNames *facts
   return ok;
 }
 
-/* ---- Load order (--load-model=graph) ----
+/* ---- Load order ----
  *
  * When each file's top level runs, as CRuby runs it: the entry's statements
  * in order, the libraries CRuby has at boot ahead of them, and a file loaded
@@ -8813,6 +7418,71 @@ static int sp_load_by_boot(const SpLoadGraph *g, int f) {
   }
   return 0;
 }
+static int sp_load_path(const SpLoadGraph *g, int f, int s, int *fs, int *ss, int cap);
+/* Does a require that is no statement of a top level, x, run after the
+   top-level require that places its file? It stands in a top-level
+   statement of a placed file, and nothing under that statement runs
+   before the statement does (a method it defines is called, a block it
+   makes runs, once it has; not a `BEGIN`, which runs ahead of the file's
+   other statements): when that statement comes after the placing
+   require's in the load order, the file is loaded by then, and x loads
+   nothing. */
+/* Does require x, standing in a top-level statement of a placed file,
+   run only after the require `by` (an edge)? When x's statement comes
+   after by's in the load order: nothing under a statement runs before the
+   statement does. Or when x runs inside the file by loads, at any depth
+   (`class Late; require_relative "msg"; end` in the file by runs): by has
+   begun by then, and its file is in the loaded features. */
+static int sp_load_edge_after(const SpLoadGraph *g, const SpLoadEdge *x, int by) {
+  if (by < 0 || g->entered[x->from] == -1 || x->stmt < 0 || x->begin_block) return 0;
+  const SpLoadEdge *e = &g->edge[by];
+  enum { CAP = 64 };
+  int xf[CAP], xs[CAP], ef[CAP], es[CAP];
+  int nx = sp_load_path(g, x->from, x->stmt, xf, xs, CAP), ne = sp_load_path(g, e->from, e->stmt, ef, es, CAP);
+  if (!nx || !ne || nx == CAP || ne == CAP) return 0;
+  for (int i = 0; i < nx && i < ne; i++) {
+    if (xf[i] != ef[i]) return 0;
+    if (xs[i] != es[i]) return xs[i] > es[i];
+  }
+  return nx > ne && g->entered[xf[ne]] == by;
+}
+static int sp_load_nested_after(const SpLoadGraph *g, const SpLoadEdge *x) {
+  return sp_load_edge_after(g, x, g->entered[x->to]);
+}
+/* Does unplaced file f run only after the require `by`? Each require that
+   may run it stands in a top-level statement of a placed file after by's
+   (sp_load_edge_after), or in an unplaced file that runs only after by in
+   turn: a file `later.rb` that only a method defined after by's statement
+   requires runs after it, and a require in it of by's file loads nothing.
+   A requirer the walk is already asking about (a cycle of requires) adds
+   no way in: the files of the cycle run only once one of them is entered
+   from outside it, and those requires are asked. No for the entry, or past
+   a depth of files. */
+static int sp_load_file_after_in(const SpLoadGraph *g, int f, int by, int *asking, int depth) {
+  enum { DEPTH = 32 };
+  if (f <= 0 || depth >= DEPTH) return 0;
+  asking[depth] = f;
+  int any = 0;
+  for (int e = 0; e < g->nedge; e++) {
+    const SpLoadEdge *y = &g->edge[e];
+    if (y->to != f) continue;
+    if (y->how != SP_LOAD_FILE) return 0;
+    any = 1;
+    if (g->entered[y->from] != -1) {
+      if (!sp_load_edge_after(g, y, by)) return 0;
+      continue;
+    }
+    int cyc = 0;
+    for (int k = 0; k <= depth && !cyc; k++) cyc = asking[k] == y->from;
+    if (!cyc && !sp_load_file_after_in(g, y->from, by, asking, depth + 1)) return 0;
+  }
+  return any;
+}
+static int sp_load_file_after(const SpLoadGraph *g, int f, int by, int depth) {
+  int asking[32];
+  (void)depth;
+  return sp_load_file_after_in(g, f, by, asking, 0);
+}
 static void sp_load_order_build(SpLoadGraph *g) {
   g->entered = malloc(sizeof(int) * (size_t)(g->nfile + 1));
   if (!g->entered) { fprintf(stderr, "spinel_parse: out of memory\n"); exit(1); }
@@ -8821,14 +7491,18 @@ static void sp_load_order_build(SpLoadGraph *g) {
   for (int b = 0; b < g->nboot; b++) sp_load_enter(g, g->boot[b]);
   for (int i = 0; i < g->gf[0]->nsite; i++) sp_load_enter(g, g->gf[0]->site[i].edge);
   /* a file another require may run first is not placed, nor is any file
-     only such a file places (not a boot library's: nothing runs before it) */
+     only such a file places (not a boot library's: nothing runs before it);
+     a require in an unplaced file that runs only after the placing require
+     loads nothing (sp_load_file_after) */
   for (int changed = 1; changed; ) {
     changed = 0;
     for (int e = 0; e < g->nedge; e++) {
       const SpLoadEdge *x = &g->edge[e];
       if (x->how != SP_LOAD_FILE || x->to <= 0 || g->entered[x->to] == -1 || sp_load_by_boot(g, x->to)) continue;
       int by = g->entered[x->to];
-      if (!x->top || g->entered[x->from] == -1 || (by >= 0 && g->entered[g->edge[by].from] == -1)) {
+      int from_after = g->entered[x->from] == -1 && sp_load_file_after(g, x->from, by, 0);
+      if ((!from_after && ((!x->top && !sp_load_nested_after(g, x)) || g->entered[x->from] == -1)) ||
+          (by >= 0 && g->entered[g->edge[by].from] == -1)) {
         g->entered[x->to] = -1;
         changed = 1;
       }
@@ -8871,11 +7545,10 @@ static void sp_load_order_dump(const SpLoadGraph *g) {
   free(fs);
 }
 
-/* --load-model=graph: the names builtins/enumerable.rb and the scalar
-   containers' files define, which the analysis rewrites calls onto
-   (desugar_builtins, desugar_builtin_scalar_defs), read as the inline model
-   reads them (sp_splice_builtins), whether the program loads the files or
-   not. */
+/* The names builtins/enumerable.rb and the scalar containers' files
+   define, which the analysis rewrites calls onto (desugar_builtins,
+   desugar_builtin_scalar_defs), read whether the program loads the files
+   or not. */
 static void sp_graph_builtin_names(const char *lib_dir) {
   if (getenv("SPINEL_NO_BUILTINS")) return;
   char found[1024];
@@ -8894,7 +7567,7 @@ static void sp_graph_builtin_names(const char *lib_dir) {
   }
 }
 
-/* --load-model=graph: the load order handed to the analysis, as data in the
+/* the load order handed to the analysis, as data in the
    node table: each placed file's root carries `load_by`, the LoadNode whose
    edge first runs its top level (entered[]); an unplaced file's root has
    none. The analysis orders two files' nodes from it (prog_order), at the
@@ -8938,7 +7611,7 @@ static void sp_graph_layout_hook(NodeTable *nt) {
   free(file); free(order);
 }
 
-/* --load-model=graph: the program as the files it loads, the libraries
+/* the program as the files it loads, the libraries
    CRuby has loaded before it starts among them (sp_graph_boot): every file
    read and parsed first (sp_graph_read), then each flattened as a root of
    its own (sp_graph_flatten), each file's root in the table's file_roots,
@@ -8961,9 +7634,28 @@ static NodeTable *sp_parse_graph(const char *source_file, const char *argv0) {
   /* every file of the program read first, the libraries CRuby has at boot
      among them, then each flattened: what a pass over the whole program
      asks of the trees is known before any file becomes nodes */
-  for (int f = 0; f < g.nfile && ok; f++) ok = sp_graph_read(&g, f, source_file, &facts);
+  for (int read_to = 0; ok; ) {
+    while (read_to < g.nfile && ok) ok = sp_graph_read(&g, read_to++, source_file, &facts);
+    if (!ok || !g.pre_tightened) break;
+    g.pre_tightened = 0;
+    for (int f = 0; f < read_to; f++)
+      sp_graph_scan_sites(&g, f, f ? g.file[f] : source_file, &facts, &g.pre_inherit);
+  }
   sp_roots_set(&g, NULL, 0);   /* (the libraries CRuby has at boot are found as the program starts) */
   if (ok) ok = sp_graph_boot(&g, source_file, &facts);
+  if (ok && g.pre_tightened) {
+    for (int read_to = g.nfile; ok; ) {
+      g.pre_tightened = 0;
+      for (int f = 0; f < read_to; f++)
+        sp_graph_scan_sites(&g, f, f ? g.file[f] : source_file, &facts, &g.pre_inherit);
+      while (read_to < g.nfile && ok) ok = sp_graph_read(&g, read_to++, source_file, &facts);
+      if (!g.pre_tightened) break;
+    }
+  }
+  for (int f = 0; f < g.nfile && ok; f++) {
+    if (!(*sp_load_flags(&g, f) & SP_FILE_BUILTIN))
+      sp_load_sites_note(&g.gf[f]->src.parser, g.gf[f]->src.root, 1, &g.pre_inherit);
+  }
   sp_names_free(&facts);
   if (ok) sp_load_order_build(&g);
   /* inline RBS resolves a type name against every declaration of the
@@ -8976,6 +7668,7 @@ static NodeTable *sp_parse_graph(const char *source_file, const char *argv0) {
     sp_inline_rbs_declare(&g.gf[f]->src.parser, g.gf[f]->src.root, g.gf[f]->text, strlen(g.gf[f]->text));
   for (int f = 0; f < g.nfile && ok; f++) ok = sp_graph_flatten(&g, f, source_file);
   for (int b = 0; b < g.nboot && ok; b++) sp_graph_boot_node(&g, g.boot[b], b);
+  if (ok) sp_pre_emit_cli_defines(out_nt->root_id, g.nboot);
   if (ok) sp_load_order_export(&g);
   if (sp_req_written != sp_req_resolved) g_require_unread = 1;
   NodeTable *nt = out_nt;
@@ -9004,9 +7697,9 @@ static NodeTable *sp_parse_graph(const char *source_file, const char *argv0) {
 }
 
 int g_opt_debug, g_opt_line_map, g_opt_positions, g_opt_warn_widen, g_opt_check_stores,
-    g_opt_defer_refusals, g_opt_emit_types_keep_c, g_opt_strict_rbs;
+    g_opt_defer_refusals, g_opt_emit_types_keep_c, g_opt_strict_rbs, g_opt_warn_verbose;
 const char *g_opt_emit_types, *g_opt_emit_rbs, *g_opt_emit_symbol_map, *g_opt_profile_symbol_map,
-           *g_opt_rbs_seed;
+           *g_opt_rbs_seed, *g_opt_eval_path;
 
 /* Whether flatten stamps each node's position (node_line / node_file /
    node_col, and its end where a report reads it), as the debug and report
@@ -9022,176 +7715,9 @@ static NodeTable *sp_parse_emit(const char *source_file, const char *argv0) {
   sp_parse_positions_from_opts();
   /* `--strict-require` is the flag spelling of SPINEL_STRICT_REQUIRE. An env
      assignment cannot ride inside a flag string, and `spin flags` has to hand
-     a caller's Makefile the same gate `spin build` compiles under. Both load
-     models compile under it. */
+     a caller's Makefile the same gate `spin build` compiles under. */
   g_strict_require = (g_strict_require_cli || getenv("SPINEL_STRICT_REQUIRE")) ? 1 : 0;
-  if (g_load_model_graph) return sp_parse_graph(source_file, argv0);
-  char *source = read_file(source_file);
-  if (!source) {
-    fprintf(stderr, "spinel_parse: cannot open '%s'\n", source_file);
-    return NULL;
-  }
-
-  /* Resolve require_relative and plain require */
-  /* Register the entry file itself as already-included, so a circular
-     require_relative pointing back at it resolves to the dedup stub
-     instead of splicing the entry's body a second time (#1373). */
-  {
-    char *entry_canon = sp_canonical_path(source_file);
-    sp_mark_path_included(entry_canon);
-    free(entry_canon);
-  }
-  unsigned char *fsl = NULL; size_t fsl_n = 0;
-  sp_autoload_is_main = 1;
-  SpLoadGraph graph;
-  memset(&graph, 0, sizeof graph);
-  sp_lib_dir(argv0, graph.lib_dir, sizeof graph.lib_dir);
-  char *resolved = resolve_requires(&graph, source, source_file, &fsl, &fsl_n);
-  sp_rr_included = sp_included_count;
-  free(source);
-  source = resolve_plain_requires(&graph, resolved, argv0, &fsl, &fsl_n);
-  if (g_dump_load_graph) sp_load_graph_dump(&graph);
-  /* a require the splice dropped never raises the LoadError CRuby's does
-     (resolve_plain_requires), which the program root records below */
-  int dropped = 0;
-  for (int i = 0; i < graph.nspl; i++) dropped |= graph.spl[i].how == SP_LOAD_NONE;
-  sp_load_graph_free(&graph);
-  source = sp_splice_named_builtin(source, argv0, "Gem", "builtins/gem", &fsl, &fsl_n);
-  source = sp_splice_named_builtin(source, argv0, "RbConfig", "builtins/rbconfig", &fsl, &fsl_n);
-  source = sp_splice_named_builtin(source, argv0, "ThreadGroup", "builtins/thread_group", &fsl, &fsl_n);
-  source = sp_splice_monitor_mixin(source, argv0, &fsl, &fsl_n);
-  source = sp_splice_object_space(source, argv0, &fsl, &fsl_n);
-  source = sp_splice_process_detach(source, argv0, &fsl, &fsl_n);
-  source = sp_splice_system_spawn(source, argv0, &fsl, &fsl_n);
-  source = sp_splice_io_popen(source, argv0, &fsl, &fsl_n);
-  source = sp_splice_foreach_first(source, argv0, &fsl, &fsl_n);
-  /* CRuby provides Set (3.2+), IO::Buffer and String#unicode_normalize without a require wherever
-     they are used, in a required file as well (activesupport's
-     notifications/fanout.rb; #6740 for IO::Buffer). Ask over the resolved
-     program, the way the builtins splice below does, and splice the binding
-     among the boot packages at the start (sp_boot_insert_at) when it is
-     named and was not required. sp_splice_require_at marks the splice as
-     inserted, so the program's own line numbers stay where they are; a
-     require written into the entry file's text instead took a line of its
-     own and pushed every later line down by one. */
-  if (!sp_feature_required("set") && !sp_src_opens(source, "class Set") &&
-      source_references_set(source))
-    source = sp_splice_boot_package(source, argv0, "set", &fsl, &fsl_n);
-  if (!sp_feature_required("io/buffer") && source_references_io_buffer(source))
-    source = sp_splice_boot_package(source, argv0, "io/buffer", &fsl, &fsl_n);
-  if (!sp_feature_required("unicode_normalize") && source_calls_unicode_normalize(source))
-    source = sp_splice_boot_package(source, argv0, "unicode_normalize", &fsl, &fsl_n);
-  /* CRuby's time.rb (packages/time) for a program that requires "time" and
-     calls Time.parse or Time.strptime; any other program keeps the
-     runtime's C (#9946). */
-  if (sp_feature_required("time") && source_calls_time_parser(source))
-    source = sp_splice_require_at(source, argv0, "require \"" SP_TIME_PARSERS_FEATURE "\"\n", 0, &fsl, &fsl_n);
-  source = sp_splice_builtins(source, argv0, &fsl, &fsl_n);
-  source = sp_splice_builtin_extras(source, argv0, &fsl, &fsl_n);
-  source = sp_splice_builtin_enumerator(source, argv0, &fsl, &fsl_n);
-  sp_src_lex_drop();
-  if (sp_req_written != sp_req_resolved) g_require_unread = 1;
-
-  /* class-body loops over a literal Hash that define constants and classes
-     (`H.each { |k, v| const_set(..., Class.new(P)) }`), run here and written
-     back as the body's statements; line count kept */
-  { const char *sw = getenv("SPINEL_TABLE_LOOPS");   /* test-only: analyze_ct.c's switch */
-    char *tl = sw && strcmp(sw, "analysis") == 0 ? NULL : sp_expand_table_loops(source);
-    if (tl) { free(source); source = tl; } }
-
-  /* class-body macro calls (module_eval'd templates, computed
-     attach_function / const_set names) expanded in place; line count kept */
-  { const char *sw = getenv("SPINEL_CLASS_MACROS");   /* test-only: analyze_ct.c's switch */
-    char *mx = sw && strcmp(sw, "analysis") == 0 ? NULL : sp_expand_class_macros(source);
-    if (mx) {
-      /* what a macro wrote was in no file's text. A require it wrote is a
-         call in the node table, where the analyzer finds it; a load-path
-         statement is dropped ahead of the table, so g_require_unread reads
-         the nodes of the text here */
-      if (!g_require_unread) {
-        SpSrcFile wrote;
-        sp_src_file_parse(&wrote, mx, NULL);
-        sp_load_sites_note(&wrote.parser, wrote.root, 0);
-        sp_src_file_free(&wrote);
-      }
-      free(source); source = mx;
-    } }
-
-  /* Adopt the per-line pragma table only while it provably still lines up
-     with the buffer (the expansions above keep the line count); on mismatch
-     every literal gets the flag every file's literals get (sp_node_fsl). */
-  if (sp_count_lines(source) == fsl_n) {
-    g_fsl_lines = fsl;
-    g_fsl_nlines = fsl_n;
-  }
-else {
-    free(fsl);
-    g_fsl_lines = NULL;
-    g_fsl_nlines = 0;
-  }
-  /* the buffer-line -> (file, original line) map, from the buffer Prism
-     parses: its marker lines are comments */
-  if (g_src_map) sp_build_line_map(source, source_file);
-
-  size_t source_len = strlen(source);
-  sp_find_builtin_ranges(source);
-
-  /* Parse with Prism */
-  pm_parser_t parser;
-  sp_pm_parser_init(&parser, source, source_len, NULL);
-  pm_node_t *root = pm_parse(&parser);
-
-  if (parser.error_list.size > 0) {
-    sp_report_parse_errors(&parser, source_file, NULL);
-    /* Issue #764: free the registered include paths on the parse-
-       error exit path too. */
-    pm_node_destroy(&parser, root);
-    pm_parser_free(&parser);
-    free(source);
-    free(g_fsl_lines); g_fsl_lines = NULL; g_fsl_nlines = 0;
-    sp_includes_free();
-    return NULL;
-  }
-
-  g_parser = &parser;
-  g_source_file = source_file;
-
-  /* Inline RBS: the comment list and the tree are alive together only here. */
-  if (sp_inline_rbs_run(&parser, root, source, source_len, source_file, 0) > 0) {
-    sp_inline_rbs_failed = 1;
-    sp_inline_rbs_free();
-    pm_node_destroy(&parser, root);
-    pm_parser_free(&parser);
-    free(source);
-    free(g_fsl_lines); g_fsl_lines = NULL; g_fsl_nlines = 0;
-    sp_includes_free();
-    return NULL;
-  }
-
-  /* Flatten Prism's tree into the node table */
-  out_nt = nt_new_table();
-  node_counter = 0;
-  out_nt->root_id = flatten(root);
-  if (dropped) nt_put_int(out_nt, out_nt->root_id, "dropped_require", 1);
-  /* Issue #878: the source file path is a fact of the table, so `__dir__`
-     and similar compile-time helpers can recover it even when the source
-     contains no `__FILE__` reference. The id -> path table resolves each
-     node's `node_file` id for its `#line` directive. */
-  nt_put_source_file(out_nt, g_source_file);
-  for (int i = 0; i < sp_file_count; i++) nt_put_file(out_nt, i, sp_file_table[i]);
-  sp_defer_paths_mark(out_nt);
-  sp_file_tiers_mark(out_nt);
-  NodeTable *nt = out_nt;
-  out_nt = NULL;
-
-  sp_inline_rbs_done();
-  sp_inline_rbs_free();
-  pm_node_destroy(&parser, root);
-  pm_parser_free(&parser);
-  free(source);
-  free(g_fsl_lines); g_fsl_lines = NULL; g_fsl_nlines = 0;
-  sp_includes_free();
-  return nt;
+  return sp_parse_graph(source_file, argv0);
 }
 
 /* The library copy of the Prism front-end, linked into the C compiler
@@ -9236,12 +7762,12 @@ NodeTable *sp_parse_snippet_in(const char *src, const SnipFrame *f) {
   int saved_emit_line = g_emit_line, saved_emit_end = g_emit_end;
   NodeTable *saved_nt = out_nt; int saved_counter = node_counter;
   int saved_map_n = sp_line_map_n; unsigned char *saved_fsl = g_fsl_lines; size_t saved_fsl_n = g_fsl_nlines;
-  int *saved_lf = sp_line_file, *saved_lo = sp_line_orig, *saved_lp = sp_line_pop;
+  int *saved_lf = sp_line_file, *saved_lo = sp_line_orig;
   int *saved_df = sp_disp_file, *saved_dl = sp_disp_line;
   const char *saved_src = g_source_file; int saved_flat = g_flat_file, saved_bi = g_flat_builtin;
-  pm_node_t **saved_next = g_stmt_next, **saved_end = g_stmt_end; const uint8_t *saved_owner = g_owner;
+  const uint8_t *saved_owner = g_owner;
   sp_line_map_n = 0; g_fsl_lines = NULL; g_fsl_nlines = 0;
-  g_stmt_next = g_stmt_end = NULL; g_owner = NULL; g_emit_end = 0; g_flat_builtin = 0;
+  g_owner = NULL; g_emit_end = 0; g_flat_builtin = 0;
   char *buf = strdup(src), *path = NULL;
   int *map = NULL;
   pm_options_t opts;
@@ -9271,10 +7797,10 @@ NodeTable *sp_parse_snippet_in(const char *src, const SnipFrame *f) {
        the site's line + i - 1 in the site's file */
     int nl = 1;
     for (const char *q = buf; *q; q++) nl += *q == '\n';
-    map = calloc((size_t)(nl + 2) * 5, sizeof(int));
+    map = calloc((size_t)(nl + 2) * 4, sizeof(int));
     if (map) {
-      sp_line_file = map; sp_line_orig = map + nl + 2; sp_line_pop = map + 2 * (nl + 2);
-      sp_disp_file = map + 3 * (nl + 2); sp_disp_line = map + 4 * (nl + 2);
+      sp_line_file = map; sp_line_orig = map + nl + 2;
+      sp_disp_file = map + 2 * (nl + 2); sp_disp_line = map + 3 * (nl + 2);
       for (int i = 1; i <= nl; i++) {
         sp_line_orig[i] = (int)(f->line + i - 1);
         if (f->site_line > 0) { sp_disp_line[i] = (int)(f->site_line + i - 1); sp_disp_file[i] = f->site_file; }
@@ -9292,6 +7818,7 @@ NodeTable *sp_parse_snippet_in(const char *src, const SnipFrame *f) {
     if (parser.error_list.size == 0) {
       g_parser = &parser;
       out_nt = nt_new_table(); node_counter = 0;
+      for (int i = 0; f && i < f->nscopes; i++) decl_push(-1);   /* the host's scopes: no decl */
       out_nt->root_id = flatten(root);
       if (path) nt_put_source_file(out_nt, path);
       res = out_nt;
@@ -9305,9 +7832,9 @@ NodeTable *sp_parse_snippet_in(const char *src, const SnipFrame *f) {
   out_nt = saved_nt; node_counter = saved_counter;
   g_parser = saved_parser; g_emit_line = saved_emit_line; g_emit_end = saved_emit_end;
   sp_line_map_n = saved_map_n; g_fsl_lines = saved_fsl; g_fsl_nlines = saved_fsl_n;
-  sp_line_file = saved_lf; sp_line_orig = saved_lo; sp_line_pop = saved_lp;
+  sp_line_file = saved_lf; sp_line_orig = saved_lo;
   sp_disp_file = saved_df; sp_disp_line = saved_dl;
   g_source_file = saved_src; g_flat_file = saved_flat; g_flat_builtin = saved_bi;
-  g_stmt_next = saved_next; g_stmt_end = saved_end; g_owner = saved_owner;
+  g_owner = saved_owner;
   return res;
 }

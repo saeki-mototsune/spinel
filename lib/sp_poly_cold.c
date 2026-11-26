@@ -36,11 +36,11 @@ sp_RbVal sp_main_self(void) {
 sp_int sp_poly_arg_int(sp_RbVal v) { return sp_poly_arg_int_chk(v); }
 sp_String *sp_poly_arg_string(sp_RbVal v) { return sp_poly_arg_str_handle(v); }
 
-/* Arguments are Ruby values evaluated before method entry. Validate the whole
-   list, then grow once. Publishing the new length only at the end also lets
-   each occurrence of the receiver read its original bytes after growth. */
-void sp_strbuf_append_as_bytes(sp_String *s, sp_int argc, const sp_RbVal *args) {
-  if (!s) sp_nil_recv("append_as_bytes");
+/* CRuby's str_modifiable for a method changing the String it is called on:
+   NoMethodError on nil, then a locked String, then FrozenError naming the
+   receiver's class. */
+static void sp_strbuf_check_modifiable(sp_String *s, const char *name) {
+  if (!s) sp_nil_recv(name);
   if (s->temporarily_locked) sp_raise_locked_str();
   if (sp_String_is_frozen(s)) {
     sp_RbVal receiver = sp_box_obj(s, SP_BUILTIN_STRBUF);
@@ -54,6 +54,13 @@ void sp_strbuf_append_as_bytes(sp_String *s, sp_int argc, const sp_RbVal *args) 
     sp_exc_stage_recv(receiver);
     sp_raise_cls("FrozenError", message);
   }
+}
+
+/* Arguments are Ruby values evaluated before method entry. Validate the whole
+   list, then grow once. Publishing the new length only at the end also lets
+   each occurrence of the receiver read its original bytes after growth. */
+void sp_strbuf_append_as_bytes(sp_String *s, sp_int argc, const sp_RbVal *args) {
+  sp_strbuf_check_modifiable(s, "append_as_bytes");
   int64_t size = s->len;
   for (sp_int i = 0; i < argc; i++) {
     sp_RbVal arg = args[i];
@@ -84,6 +91,56 @@ void sp_strbuf_append_as_bytes(sp_String *s, sp_int argc, const sp_RbVal *args) 
   *out = 0;
   s->len = size;
   sp_fd_publish(s);
+}
+
+/* CRuby's encoding check ahead of a String operand of concat_list joining
+   s: a text with bytes past 127 meeting one in the other encoding raises
+   Encoding::CompatibilityError (sp_str_enc_step); otherwise the append
+   picks the encoding. */
+static void sp_strbuf_enc_check(const sp_String *s, const char *t, size_t tl) {
+  sp_str_enc_step((int)s->binary, s->data, (size_t)s->len, t, tl, sp_str_is_binary(t));
+}
+
+/* concat or prepend over an operand list that is known only at run time, a
+   splat's (CRuby's rb_str_concat_multi and rb_str_prepend_multi). The
+   receiver is checked first, even for no operands. Every operand is then
+   copied, in order, into one new String in the receiver's encoding before
+   the receiver changes: an Integer as the character it codes in the
+   encoding the operands before it left that String in (concat only;
+   prepend takes Strings), any other value as its String or its #to_str,
+   TypeError otherwise. A String meeting text past 127 in the other
+   encoding, in that String or in the receiver, raises
+   Encoding::CompatibilityError, as CRuby's appends do. So a raise part way
+   leaves the receiver as it was, and an operand that is the receiver adds
+   its bytes as they were. */
+void sp_strbuf_concat_list(sp_String *s, sp_int argc, const sp_RbVal *args, int prepend) {
+  sp_strbuf_check_modifiable(s, prepend ? "prepend" : "concat");
+  if (argc == 0) return;
+  SP_GC_ROOT(s);
+  sp_String *parts = sp_String_new_len("", 0);
+  SP_GC_ROOT(parts);
+  if (s->binary) { parts->binary = 1; sp_fd_publish(parts); }
+  for (sp_int i = 0; i < argc; i++) {
+    sp_RbVal arg = args[i];
+    if (!prepend && arg.tag == SP_TAG_BIGINT) sp_raise_cls("RangeError", "bignum out of char range");
+    if (!prepend && arg.tag == SP_TAG_INT) {
+      const char *ch = sp_int_codepoint_to_str_in(parts->data, arg.v.i);
+      sp_String_append_n(parts, ch, sp_str_byte_len(ch));
+    }
+    else if (sp_strface_b_box(arg)) {
+      sp_String *part = arg.v.p;
+      sp_strbuf_enc_check(parts, part->data, (size_t)part->len);
+      sp_String_append_n(parts, part->data, (size_t)part->len);
+    }
+    else {
+      const char *text = sp_poly_arg_str_chk(arg);
+      sp_strbuf_enc_check(parts, text, sp_str_byte_len(text));
+      sp_String_append_n(parts, text, sp_str_byte_len(text));
+    }
+  }
+  sp_strbuf_enc_check(s, parts->data, (size_t)parts->len);
+  if (prepend) sp_String_splice_bytes(s, 0, 0, parts->data, 0, parts->len, 0);
+  else sp_String_append_n(s, parts->data, (size_t)parts->len);
 }
 
 /* A sole chomp: arrives with its truth value. General keyword lists
@@ -2263,4 +2320,90 @@ sp_int sp_obj_to_int_answer(int cls_id, sp_RbVal r) {
   sp_raise_cls("TypeError", sp_sprintf("can't convert %s to Integer (%s#to_int gives %s)",
                                        n, n, sp_poly_class_name(r)));
   return 0;
+}
+
+/* MatchData bytebegin/byteend/match with a runtime-boxed selector: Symbol or
+   String resolves by capture name, anything else converts via to_int. */
+sp_oint sp_MatchData_bytebegin_poly(sp_MatchData *m, sp_RbVal k) {
+  SP_GC_ROOT(m); SP_GC_ROOT_RBVAL(k);
+  if (k.tag == SP_TAG_SYM) return sp_MatchData_bytebegin_name(m, sp_sym_to_s((sp_sym)k.v.i));
+  if (sp_rbval_is_string(k)) {
+    const char *nm = sp_rbval_string_bytes(k);
+    return sp_MatchData_bytebegin_name(m, nm ? nm : sp_str_empty);
+  }
+  return sp_MatchData_bytebegin(m, sp_poly_arg_int_chk(k));
+}
+
+sp_oint sp_MatchData_byteend_poly(sp_MatchData *m, sp_RbVal k) {
+  SP_GC_ROOT(m); SP_GC_ROOT_RBVAL(k);
+  if (k.tag == SP_TAG_SYM) return sp_MatchData_byteend_name(m, sp_sym_to_s((sp_sym)k.v.i));
+  if (sp_rbval_is_string(k)) {
+    const char *nm = sp_rbval_string_bytes(k);
+    return sp_MatchData_byteend_name(m, nm ? nm : sp_str_empty);
+  }
+  return sp_MatchData_byteend(m, sp_poly_arg_int_chk(k));
+}
+
+sp_IntArray *sp_MatchData_byteoffset_poly(sp_MatchData *m, sp_RbVal k) {
+  SP_GC_ROOT(m); SP_GC_ROOT_RBVAL(k);
+  if (k.tag == SP_TAG_SYM) return sp_MatchData_byteoffset_name(m, sp_sym_to_s((sp_sym)k.v.i));
+  if (sp_rbval_is_string(k)) return sp_MatchData_byteoffset_name(m, sp_rbval_string_bytes(k));
+  return sp_MatchData_byteoffset(m, sp_poly_arg_int_chk(k));
+}
+
+const char *sp_MatchData_match_poly(sp_MatchData *m, sp_RbVal k) {
+  SP_GC_ROOT(m); SP_GC_ROOT_RBVAL(k);
+  if (k.tag == SP_TAG_SYM) return sp_MatchData_aref_name(m, sp_sym_to_s((sp_sym)k.v.i));
+  if (sp_rbval_is_string(k)) {
+    const char *nm = sp_rbval_string_bytes(k);
+    return sp_MatchData_aref_name(m, nm ? nm : sp_str_empty);
+  }
+  return sp_MatchData_match(m, sp_poly_arg_int_chk(k));
+}
+
+/* Boxed unary ~: Integer/Bignum bitwise complement, Regexp#~ matching $_
+   (returning char offset or nil, clearing $~ when $_ is not a String),
+   NoMethodError for all other receivers. */
+sp_RbVal sp_poly_tilde(sp_RbVal v, sp_RbVal lastline) {
+  SP_GC_ROOT_RBVAL(v); SP_GC_ROOT_RBVAL(lastline);
+  if (v.tag == SP_TAG_INT) return sp_box_int(~v.v.i);
+  if (v.tag == SP_TAG_BIGINT && v.v.p)
+    return sp_box_bigint(sp_bigint_not((sp_Bigint *)v.v.p));
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_REGEX && v.v.p) {
+    if (sp_rbval_is_string(lastline)) {
+      const char *s = sp_rbval_string_bytes(lastline);
+      return sp_re_match_poly((mrb_regexp_pattern *)v.v.p, s ? s : sp_str_empty);
+    }
+    sp_re_clear_last_match();
+    return sp_box_nil();
+  }
+  sp_raise_nomethod(sp_nomethod_msg("~", v));
+  return sp_box_nil();
+}
+
+/* Boxed #deconstruct: MatchData answers its captures array, Array answers
+   its elements, Struct/Data answers its member values; everything else raises
+   NoMethodError naming "deconstruct". */
+sp_PolyArray *sp_poly_deconstruct_call(sp_RbVal v) {
+  SP_GC_ROOT_RBVAL(v);
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_MATCHDATA && v.v.p)
+    return sp_MatchData_captures((sp_MatchData *)v.v.p);
+  if (v.tag == SP_TAG_OBJ && v.cls_id == SP_BUILTIN_POLY_ARRAY)
+    return (sp_PolyArray *)v.v.p;
+  if (v.tag == SP_TAG_OBJ && sp_poly_is_array_kind(v.cls_id))
+    return sp_enum_items_from(v);
+  if (v.tag == SP_TAG_OBJ && v.cls_id >= 0 && v.v.p) {
+    if (sp_obj_deconstruct_fn) {
+      sp_RbVal d = sp_obj_deconstruct_fn(v);
+      if (d.tag == SP_TAG_OBJ && sp_poly_is_array_kind(d.cls_id))
+        return sp_poly_to_poly_array(d);
+    }
+    if (sp_obj_to_h_fn) {
+      sp_RbVal h = sp_obj_to_h_fn(v);
+      if (h.tag == SP_TAG_OBJ && h.cls_id == SP_BUILTIN_SYM_POLY_HASH)
+        return sp_SymPolyHash_values((sp_SymPolyHash *)h.v.p);
+    }
+  }
+  sp_raise_nomethod(sp_nomethod_msg("deconstruct", v));
+  return NULL;
 }

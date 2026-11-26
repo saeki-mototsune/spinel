@@ -80,12 +80,14 @@ int emit_call_proc_literal_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
    A name is recorded once, at its first (most derived) sighting, and listed
    only if that sighting was visible, so a subclass that makes an inherited
    method private hides the ancestor's public one. show[i] holds REFL_SHOWN
-   for a visible sighting and REFL_ROW where a builtin row made it (a
-   method present from the start, version 0, which the row answers). at:
+   for a visible sighting, REFL_ROW where a builtin row made it (a
+   method present from the start, version 0, which the row answers) and
+   REFL_OWN where the object's own singleton class made it (a method it has
+   from its own def, which no cell of the class at `at_cls` tells). at:
    the list call the names answer (its node + 1, 0 for a list no one site
    has), at_cls and at_side the receiver class and side it asks there
    (refl_at, cplan_list_omits). */
-enum { REFL_SHOWN = 1, REFL_ROW = 2 };
+enum { REFL_SHOWN = 1, REFL_ROW = 2, REFL_OWN = 4 };
 typedef struct { char **v; unsigned char *show; int n, cap, at, at_cls, vis_mask; unsigned at_side; } ReflNames;
 /* The classes a `k.new(...)` switch gives an ArgumentError arm, grouped by
    message so each message is emitted once. */
@@ -197,20 +199,25 @@ int emit_vis_cell_write(Compiler *c, int id, Buf *b);
    class self is has no instance method of there (a Symbol's, a String's, a
    `def self.m`'s: the word looks the class method's name up among the
    instance methods), a TypeError for module_function given an Array, whose
-   names it does not read. 0, writing nothing, where each is found. */
-int emit_vis_word_absent(Compiler *c, int id, Buf *b);
+   names it does not read. 0, writing nothing, where each is found. decl: the word stands as a declaration
+   of a class's body (a bare statement), which tests only the names the call
+   plan's cells decide */
+int emit_vis_word_absent(Compiler *c, int id, int decl, Buf *b);
 int respond_to_user_defined(Compiler *c, int id, int recv);
 extern const char *const respond_universal[];
 extern const char *const respond_universal_all[]; /* public and private */
 int object_private_method_name(const char *qm);
 const char *const *object_private_method_names(void); /* NULL-terminated */
-int respond_to_runtime_reaches(Compiler *c, TyKind rt);
+int respond_to_runtime_reaches(Compiler *c, int id, TyKind rt);
 /* 1 when the program's reopen of the builtin class or module `cls` (its
    chain) defines `name`, as call_target answers call id (-1: no call asks) */
 int reopened_owns(Compiler *c, int id, const char *cls, const char *name);
 int bool_side_responds(Compiler *c, int id, const char *qm, int include_all, int foldable, int *ta, int *fa);
 int private_answer_overridden(Compiler *c, const char *qm, TyKind rt);
 int refl_md_dynamic_used(Compiler *c);
+/* The version cells the method_defined? table's guarded rows read, each
+   passed to keep: none where the table is not written (ver_cells_settle) */
+void refl_md_table_cells(Compiler *c, void (*keep)(Compiler *, const char *));
 void emit_scope_parameters_pushes(Compiler *c, int mi, int tr4, Buf *b);
 int refl_im_params_used(Compiler *c);
 int emit_refl_im_params_call(Compiler *c, int id, Buf *b);
@@ -291,8 +298,8 @@ int hoist_dispatch_args(Compiler *c, int argsN, int **sv, int **vw);
 typedef struct { int open, arms, hn, bslot, *hsv, *hvw; } PolyScalarArms;
 int poly_scalar_arms_open(Compiler *c, int id, PolyScalarArms *pa, Buf *b);
 void poly_scalar_arms_close(Compiler *c, PolyScalarArms *pa, Buf *b);
-int obj_member_shadows(Compiler *c, TyKind rt, const char *nm);
 void refl_class_singleton_methods(Compiler *c, int ci, int all, ReflNames *r);
+void refl_class_private_methods(Compiler *c, int ci, ReflNames *r);
 void refl_builtin_singleton_methods(const char *cls, int all, ReflNames *r);
 void refl_class_instance_methods(Compiler *c, int ci, int pub, int prot, ReflNames *r);
 void refl_module_instance_methods(Compiler *c, int m, int prot, ReflNames *r);
@@ -332,7 +339,7 @@ int reopen_yields_container(Compiler *c, Scope *m);
 int emit_str_format_untyped_array(Compiler *c, int recv, int a0n, int fck, Buf *b);
 void emit_voided_operands(Compiler *c, int recv, int arg, int v, Buf *b);
 int parse_named_format(const char *fmt, Buf *rew, const char **names, int *name_len, int maxn);
-int re_lit_enc_opts(Compiler *c, int recv, int rre);
+void emit_gvar_lastline_boxed(Compiler *c, Buf *b);
 void emit_re_opts_flags(Compiler *c, int argc, const int *argv, Buf *out);
 void emit_regexp_new(Compiler *c, int argc, const int *argv, Buf *b);
 int emit_try_convert_boxed(Compiler *c, const char *cname, int arg, Buf *b);

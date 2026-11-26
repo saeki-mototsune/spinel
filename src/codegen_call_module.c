@@ -859,7 +859,7 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         buf_puts(b, ")"); return 1;
       }
     }
-    /* Dir.glob(pattern, base:, sort:, flags: File::FNM_DOTMATCH) */
+    /* Dir.glob(pattern, base:, sort:, flags:) */
     if (sp_streq(name, "glob") && argc == 2 && nt_kind(nt, argv[1]) == NK_KeywordHashNode &&
         emit_dir_glob_options(c, argv[0], argv[1], -1, b)) return 1;
     /* Dir.glob(pattern, flags, base:, sort:): the positional flags beside the keywords */
@@ -867,11 +867,12 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
         nt_kind(nt, argv[1]) != NK_KeywordHashNode &&
         emit_dir_glob_options(c, argv[0], argv[2], argv[1], b)) return 1;
     /* Dir.glob(pattern, flags): a positional flag word with no keyword, which
-       sp_dir_glob_keywords reads as flags: does */
+       sp_dir_glob_keywords reads as flags: does. The Dir[] surface alias
+       is marked builtin-only and keeps its multiple-pattern route. */
     if (sp_streq(name, "glob") && argc == 2 && nt_kind(nt, argv[1]) != NK_KeywordHashNode &&
         nt_kind(nt, argv[1]) != NK_SplatNode && nt_kind(nt, argv[0]) != NK_SplatNode &&
         nt_kind(nt, argv[0]) != NK_ArrayNode && !ty_is_array(comp_ntype(c, argv[0])) &&
-        (comp_ntype(c, argv[1]) == TY_INT || nt_kind(nt, argv[1]) == NK_ConstantPathNode)) {
+        !cplan_builtin_call(c, id)) {
       buf_puts(b, "({ ");
       int first = emit_rooted_arg_list(c, argv, 2, "sp_RbVal", "SP_GC_ROOT_RBVAL", emit_boxed, NULL, b);
       buf_printf(b, "sp_dir_glob_keywords(_t%d, sp_box_nil(), _t%d, 1, sp_box_nil(), 0); })", first, first + 1);
@@ -1049,6 +1050,11 @@ int emit_call_file_dir_time_arms(Compiler *c, int id, Buf *b, const NodeTable *n
           buf_printf(b, "); sp_raise_cls(\"TypeError\", \"can't convert %s into an exact number\"); (sp_Time *)NULL; })", ocn);
           return 1;
         }
+      }
+      /* a Bignum past the word is the RangeError of the other Time.at forms */
+      if (at == TY_BIGINT) {
+        buf_puts(b, "sp_time_at_int("); emit_int_expr(c, argv[0], b); buf_puts(b, ")");
+        return 1;
       }
       buf_printf(b, "sp_time_at_%s(", at == TY_FLOAT ? "float" : "int");
       emit_expr(c, argv[0], b); buf_puts(b, ")");
@@ -1758,8 +1764,8 @@ static void emit_sock_pair(Compiler *c, int dom, int type, int proto, int is_uni
   if (type >= 0) emit_sock_family_arg(c, type, 0, b); else buf_puts(b, "sp_sock_const(\"SOCK_STREAM\")");
   buf_puts(b, ", ");
   if (proto >= 0) emit_int_expr(c, proto, b); else buf_puts(b, "0");
-  buf_printf(b, ", _t%d); sp_File *_t%d = sp_sock_pair_handle(_t%d[0], %d); SP_GC_ROOT(_t%d);"
-                " sp_File *_t%d = sp_sock_pair_handle(_t%d[1], %d); SP_GC_ROOT(_t%d);"
+  buf_printf(b, ", _t%d); sp_File *_t%d = sp_sock_pair_handle(_t%d, 0, %d); SP_GC_ROOT(_t%d);"
+                " sp_File *_t%d = sp_sock_pair_handle(_t%d, 1, %d); SP_GC_ROOT(_t%d);"
                 " sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d);"
                 " sp_PolyArray_push(_t%d, sp_box_obj(_t%d, SP_BUILTIN_IO));"
                 " sp_PolyArray_push(_t%d, sp_box_obj(_t%d, SP_BUILTIN_IO)); _t%d; })",
@@ -2419,7 +2425,7 @@ int emit_call_enum_random_arms(Compiler *c, int id, Buf *b, const NodeTable *nt,
       return 1;
     }
     if (sp_streq(name, "srand")) {                    /* #2525 (returns previous seed) */
-      if (argc == 0) { buf_puts(b, "sp_kernel_srand((sp_int)time(NULL))"); return 1; }
+      if (argc == 0) { buf_puts(b, "sp_kernel_srand(sp_Random_new_seed())"); return 1; }
       buf_puts(b, "sp_kernel_srand("); emit_seed_expr(c, argv[0], b); buf_puts(b, ")");
       return 1;
     }

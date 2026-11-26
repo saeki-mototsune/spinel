@@ -379,6 +379,11 @@ int is_class_eval_family(const char *n) {
          sp_streq(n, "module_exec");
 }
 
+/* class_exec and module_exec: the block takes the call's arguments */
+int is_class_exec_name(const char *n) {
+  return sp_streq(n, "class_exec") || sp_streq(n, "module_exec");
+}
+
 int is_eval_exec_family(const char *n) {
   return is_class_eval_family(n) || sp_streq(n, "instance_eval") || sp_streq(n, "instance_exec");
 }
@@ -476,7 +481,7 @@ int is_load_path_write(const char *n) {
    rather than as a dispatch over the classes that define the name
    (emit_call_identity_arms, emit_poly_ivar_list). */
 int is_poly_object_surface_name(const char *n) {
-  return sp_streq(n, "hash") || sp_streq(n, "object_id") || sp_streq(n, "__id__") || sp_streq(n, "instance_variables");
+  return is_identity_value_name(n) || sp_streq(n, "instance_variables");
 }
 /* A call whose answer tells an object from a copy of it: its identity, or
    whether it is frozen (a copy of a String later frozen is not). */
@@ -732,6 +737,7 @@ int is_element_pick(const char *n) {
 int is_equal_name(const char *n) {
   return sp_streq(n, "equal?");
 }
+int is_eqeq_name(const char *n) { return n && sp_streq(n, "=="); }
 int is_eql_or_equal(const char *n) {
   return sp_streq(n, "equal?") || sp_streq(n, "eql?");
 }
@@ -766,6 +772,58 @@ int is_printf_name(const char *n) {
 int is_match_operator(const char *n) {
   return sp_streq(n, "=~") || sp_streq(n, "!~");
 }
+
+/* The operators taking one operand: the comparisons, equalities, matches,
+   arithmetic and bitwise ones. Their count is one whatever the receiver,
+   and no block moves it: a splat into one (`a.==(*rest)`, an operator arm
+   of `public_send(*args, &block)`) that passed the Array itself as the
+   operand answered false for == and raised TypeError for +. */
+int is_binary_operator(const char *n) {
+  static const char *const ops[] = { "==", "!=", "eql?", "equal?", "===", "=~", "<=>",
+    "<", "<=", ">", ">=", "+", "-", "*", "/", "%", "**", "<<", ">>", "&", "|", "^", NULL };
+  for (int i = 0; ops[i]; i++) if (sp_streq(n, ops[i])) return 1;
+  return 0;
+}
+
+/* See builtin_names.h. */
+int object_method_reads_block(const char *n) {
+  return n && (is_tap_alias(n) || is_instance_eval_family(n) || is_define_singleton_method_name(n) || is_send_family(n) ||
+               is_enumerator_maker(n));
+}
+
+/* See builtin_names.h. */
+int object_self_call_unanswered(const char *n) {
+  return n && (is_extend_name(n) || is_define_singleton_method_name(n) || is_method_object_maker(n) || is_match_operator(n));
+}
+
+/* See builtin_names.h. */
+ObjectSuperArm object_super_arm(const char *n) {
+  if (!n) return OSA_NONE;
+  if (is_to_s_name(n) || is_inspect_name(n)) return OSA_TEXT;
+  if (is_respond_to_name(n)) return OSA_RESPOND_TO;
+  if (is_freeze_name(n)) return OSA_FREEZE;
+  if (is_instance_of_query(n)) return OSA_INSTANCE_OF;
+  if (is_kind_query(n)) return OSA_IS_A;
+  if (is_eqeq_name(n) || is_equal_name(n)) return OSA_SAME;
+  if (is_eql_or_equal(n)) return OSA_KERNEL_SAME;
+  if (sp_streq(n, "!")) return OSA_FALSE;
+  if (sp_streq(n, "nil?")) return OSA_KERNEL_FALSE;
+  if (sp_streq(n, "frozen?")) return OSA_FROZEN;
+  if (is_itself_name(n)) return OSA_SELF;
+  return OSA_NONE;
+}
+
+/* See builtin_names.h. */
+ClassSuperArm class_super_arm(const char *n) {
+  if (!n) return CSA_NONE;
+  if (sp_streq(n, "subclasses")) return CSA_SUBCLASSES;
+  if (sp_streq(n, "superclass")) return CSA_SUPERCLASS;
+  if (sp_streq(n, "ancestors")) return CSA_ANCESTORS;
+  if (sp_streq(n, "include?")) return CSA_INCLUDE_P;
+  return CSA_NONE;
+}
+int is_backtick_name(const char *n) { return n && sp_streq(n, "`"); }
+int is_with_name(const char *n) { return n && sp_streq(n, "with"); }
 
 /* Object's methods that hand their receiver on to code over its members or
    bind it into a wrapper: to_enum / enum_for walk each, instance_eval /
@@ -1668,6 +1726,10 @@ static int builtin_name_in(const char *name, const char *const *names) {
    are told by their spelling): their values are the runtime's objects, not
    a write of the program's. tools/runtime_gvar_check.rb holds the list
    against CRuby's global_variables. */
+int is_numbered_param_name(const char *n) {
+  return n && n[0] == '_' && n[1] >= '1' && n[1] <= '9' && !n[2];
+}
+
 int is_runtime_gvar_name(const char *n) {
   static const char *const names[] = { "stdout", "stderr", "stdin", "PROGRAM_NAME", "LOAD_PATH", "LOADED_FEATURES",
                                        "VERBOSE", "DEBUG", "FILENAME", "_", NULL };
@@ -2072,8 +2134,10 @@ int is_file_string_const(const char *n) {
 }
 /* ARGV, whose Strings CRuby freezes */
 int is_argv_const(const char *n) { return n && sp_streq(n, "ARGV"); }
+/* to_proc alone */
+int is_to_proc_name(const char *n) { return n && sp_streq(n, "to_proc"); }
 /* to_proc curry: a proc made of a Symbol, a Method or a proc */
-int is_proc_conversion_name(const char *n) { return n && (sp_streq(n, "to_proc") || sp_streq(n, "curry")); }
+int is_proc_conversion_name(const char *n) { return is_to_proc_name(n) || (n && sp_streq(n, "curry")); }
 /* `[]` alone: an element read, not its write */
 int is_aref_name(const char *n) { return n && sp_streq(n, "[]"); }
 /* `<<` alone: String#<<'s append, a chain's link */
@@ -2225,6 +2289,7 @@ const char *builtin_function_owner(const char *m) {
 
 /* respond_to?: whether the receiver itself answers a name, publicly or
    with include_all any */
+const char INITIALIZE_NAME[] = "initialize";
 const char RESPOND_TO_NAME[] = "respond_to?";
 int is_respond_to_name(const char *n) { return n && sp_streq(n, RESPOND_TO_NAME); }
 /* The names a Struct's instance answers from Struct itself. Data answers none of them: its own are the members and
@@ -2287,6 +2352,9 @@ int method_list_vis_mask(const char *n) {
        : builtin_name_in(n, prot) ? 1 << SP_VIS_PROTECTED
        : builtin_name_in(n, priv) ? 1 << SP_VIS_PRIVATE : 0;
 }
+/* A list of the methods a chain answers (methods, public_methods and the instance-method lists, which a class
+   or module asks for its instances), not the singleton list, which names an object's own */
+int is_chain_method_list(const char *n) { return method_list_vis_mask(n) && !is_singleton_method_list(n); }
 /* The Module methods that read a class's method table: the instance-method
    lists and instance_method */
 int is_instance_method_table_read(const char *n) { return n && (is_instance_method_list(n) || sp_streq(n, "instance_method")); }
@@ -2987,6 +3055,11 @@ int is_cover_name(const char *n) { return n && sp_streq(n, "cover?"); }
 int is_flatten_name(const char *n) { return n && sp_streq(n, "flatten"); }
 
 int is_hash_name(const char *n) { return n && sp_streq(n, "hash"); }
+int is_object_id_name(const char *n) { return n && (sp_streq(n, "object_id") || sp_streq(n, "__id__")); }
+int is_identity_value_name(const char *n) { return is_hash_name(n) || is_object_id_name(n); }
+int builtin_call_reads_identity(const char *n) {
+  return n && (is_class_compare(n) || is_case_eq(n) || is_identity_value_name(n));
+}
 
 int is_puts_name(const char *n) { return n && sp_streq(n, "puts"); }
 
@@ -2999,6 +3072,7 @@ int is_intersect_name(const char *n) { return n && sp_streq(n, "intersect?"); }
 int is_compare_by_identity_name(const char *n) { return n && sp_streq(n, "compare_by_identity"); }
 
 int is_spaceship_name(const char *n) { return n && sp_streq(n, "<=>"); }
+int is_object_hook_name(const char *n) { return is_hash_name(n) || (n && sp_streq(n, "eql?")) || is_spaceship_name(n); }
 
 
 /* File::Stat's predicates, which the TY_IO arms answer for the handle a stat
@@ -3349,11 +3423,19 @@ int is_method_naming_call(const char *n) {
 int is_attr_name(const char *n) {
   return n && (sp_streq(n, "attr") || is_attr_reader_family(n) || is_attr_writer_family(n));
 }
+/* Whether Spinel's class-body `attribute` and `attributes` declare
+   accessors: not in a program that defines a method of either name, whose
+   own method a class-body call runs, as in CRuby (Module has neither). */
+static int g_attr_synonyms_on = 1;
+void attr_synonyms_set(int on) { g_attr_synonyms_on = on; }
+static int is_attr_synonym(const char *n) {
+  return g_attr_synonyms_on && (sp_streq(n, "attribute") || sp_streq(n, "attributes"));
+}
 int is_attr_decl_reader(const char *n) {
-  return n && (sp_streq(n, "attr") || is_attr_reader_family(n) || sp_streq(n, "attribute") || sp_streq(n, "attributes"));
+  return n && (sp_streq(n, "attr") || is_attr_reader_family(n) || is_attr_synonym(n));
 }
 int is_attr_decl_writer(const char *n) {
-  return n && (is_attr_writer_family(n) || sp_streq(n, "attribute") || sp_streq(n, "attributes"));
+  return n && (is_attr_writer_family(n) || is_attr_synonym(n));
 }
 /* A call that may declare a writer: the writer declarations, and `attr`
    (whose `attr :x, true` form is one) */

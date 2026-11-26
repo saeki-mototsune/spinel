@@ -62,6 +62,8 @@ static void emit_io_readlines_args(Compiler *c, const char *r, const int *pos, i
    into its cell first when a proc captures it. */
 static void emit_io_loop_body(Compiler *c, int blk, const char *pname, const int *stmts, int n, Buf *b) {
   if (pname) emit_param_cell_publish(c, blk, pname, b, 0);
+  /* (a long pass polls first, as a builtin iterator's step does) */
+  emit_step_polls(c, blk >= 0 ? nt_ref(c->nt, blk, "body") : -1, b, 0);
   const char *sv_nx = g_ie_next_var;
   int sv_lexc = g_loop_exc_base, sv_lens = g_loop_ensure_base;
   g_ie_next_var = NULL;
@@ -467,7 +469,8 @@ static void emit_write_nb_head(Compiler *c, const char *io, const char *op, int 
     emit_boxed(c, node, b);
   }
   else {
-    buf_printf(b, "%s(%s, ", r.as_ty == TY_STRING ? "sp_sock_write_nb_bin" : "sp_sock_write_nb", io);
+    int str = r.as_ty == TY_STRING || r.as_ty == TY_STRBUF;
+    buf_printf(b, "%s(%s, ", str ? "sp_sock_write_nb_bin" : "sp_sock_write_nb", io);
     emit_to_s_expr(c, node, b);
   }
 }
@@ -483,6 +486,12 @@ static void emit_sockopt_level(Compiler *c, int node, Buf *b) {
 static void emit_sockopt_optname(Compiler *c, int tl, int node, Buf *b) {
   if (repr_of(c, node).as_ty == TY_INT) { emit_int_expr(c, node, b); return; }
   buf_printf(b, "sp_sock_optname_arg(_t%d, ", tl); emit_boxed(c, node, b); buf_puts(b, ")");
+}
+/* A shutdown direction: an Integer as given, a Symbol or String name
+   through sp_sock_shutdown_arg */
+static void emit_shutdown_how(Compiler *c, int node, Buf *b) {
+  if (repr_of(c, node).as_ty == TY_INT) { emit_int_expr(c, node, b); return; }
+  buf_puts(b, "sp_sock_shutdown_arg("); emit_boxed(c, node, b); buf_puts(b, ")");
 }
 
 /* connect_nonblock, setsockopt and getsockopt of the socket in C expression
@@ -949,8 +958,8 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
         buf_puts(b, "({ "); trv = hold_operand(c, recv, TY_POLY, 1, trv, 1, " ", b);
         buf_printf(b, "sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d); ", tpa, tpa);
         emit_push_arg_list(c, argv, argc, tpa, b);
-        buf_printf(b, "sp_File *_t%d = sp_poly_as_io(_t%d, \"write\"); SP_IO_OPEN(_t%d); sp_int _t%d = 0; ",
-                   tio3, trv, tio3, tn);
+        buf_printf(b, "sp_File *_t%d = sp_poly_as_io(_t%d, \"write\"); if (_t%d->len == 1) SP_IO_OPEN(_t%d); else sp_io_check_writable(_t%d); sp_int _t%d = 0; ",
+                   tio3, trv, tpa, tio3, tio3, tn);
         buf_printf(b, "for (sp_int _i = 0; _i < _t%d->len; _i++) _t%d += sp_File_write_poly(_t%d, _t%d->data[_i]); _t%d; })",
                    tpa, tn, tio3, tpa, tn);
         c->args_in_call = recv;
@@ -1087,14 +1096,18 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       int qname = argc == 0 && (sp_streq(name, "close") || sp_streq(name, "closed?"));
       /* and a boxed Mutex answers owned? itself, where a stat answers its own */
       int mname = argc == 0 && sp_streq(name, "owned?");
+      /* and a boxed Regexp answers timeout with nil (no per-instance timeout) */
+      int rx_timeout = argc == 0 && sp_streq(name, "timeout");
       /* A path read into a boxed slot (beside a class's reader of the name,
          whose answer the slot holds too) goes in boxed, as rewind's 0 does
          below: bare, the String stored into the sp_RbVal did not build. */
       int boxed_path = argc == 0 && is_path_reader(name) && repr_of(c, id).kind == RK_BOXED;
       int tdr = 0;
-      if (dirfn || qname || mname) {
+      if (dirfn || qname || mname || rx_timeout) {
         tdr = ++g_tmp;
         buf_puts(b, "({ "); tdr = hold_operand(c, recv, TY_POLY, 1, tdr, 1, " ", b);
+        if (rx_timeout)
+          buf_printf(b, "_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_REGEX && _t%d.v.p ? sp_box_nil() : ", tdr, tdr, tdr);
         if (qname) {
           buf_printf(b, "_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_QUEUE ? ", tdr, tdr);
           if (sp_streq(name, "close")) buf_printf(b, "((void)sp_Queue_close((sp_queue *)_t%d.v.p), _t%d) : ", tdr, tdr);
@@ -1201,8 +1214,8 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       else if (sp_streq(name, "reopen")) { emit_io_reopen_poly(c, tio, argv[0], b); buf_puts(b, "; })"); }
       else if (sp_streq(name, "accept")) buf_printf(b, "sp_sock_accept(_t%d); })", tio2);
       else if (sp_streq(name, "shutdown")) {
-        buf_printf(b, "sp_sock_shutdown(_t%d, ", tio2);
-        if (argc == 1) emit_int_expr(c, argv[0], b); else buf_puts(b, "2");
+        buf_printf(b, "SP_GC_ROOT(_t%d); sp_sock_shutdown(_t%d, ", tio2, tio2);
+        if (argc == 1) emit_shutdown_how(c, argv[0], b); else buf_puts(b, "2");
         buf_puts(b, "); })");
       }
       else if (socket_recv_call(name, argc)) {
@@ -1753,7 +1766,7 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
       }
       if (sp_streq(name, "shutdown") && argc <= 1) {
         buf_printf(b, "sp_sock_shutdown(%s, ", r);
-        if (argc == 1) emit_int_expr(c, argv[0], b); else buf_puts(b, "2");
+        if (argc == 1) emit_shutdown_how(c, argv[0], b); else buf_puts(b, "2");
         buf_puts(b, ")");
         free(rb.p); return 1;
       }
@@ -2077,9 +2090,9 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
           buf_printf(b, "({ sp_File *_t%d = %s; SP_GC_ROOT(_t%d); sp_PolyArray *_t%d = sp_PolyArray_new(); SP_GC_ROOT(_t%d); ",
                      tio4, r, tio4, tpa4, tpa4);
           emit_push_arg_list(c, argv, argc, tpa4, b);
-          buf_printf(b, "SP_IO_OPEN(_t%d); sp_int _t%d = 0; "
+          buf_printf(b, "if (_t%d->len == 1) SP_IO_OPEN(_t%d); else sp_io_check_writable(_t%d); sp_int _t%d = 0; "
                         "for (sp_int _i = 0; _i < _t%d->len; _i++) _t%d += sp_File_write_poly(_t%d, _t%d->data[_i]); _t%d; })",
-                     tio4, tn4, tpa4, tn4, tio4, tpa4, tn4);
+                     tpa4, tio4, tio4, tn4, tpa4, tn4, tio4, tpa4, tn4);
           free(rb.p); return 1;
         }
       }
@@ -2116,12 +2129,14 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
         for (int k = 0; k < argc; k++)
           values[k] = hold_operand(c, argv[k], TY_POLY, 1, ++g_tmp, 1, " ", b);
         g_pre = saved_pre;
-        buf_printf(b, "sp_int _t%d = 0;", tw);
+        /* (a frozen, closed or read-only handle raises for two empty Strings too) */
+        buf_printf(b, "sp_io_check_writable(_t%d); sp_int _t%d = 0;", tf, tw);
         for (int k = 0; k < argc; k++)
           buf_printf(b, " _t%d += sp_File_write_poly(_t%d, _t%d);", tw, tf, values[k]);
         buf_printf(b, " _t%d; })", tw);
       }
-      else buf_puts(b, "0");
+      else if (is_sw) buf_puts(b, "0");
+      else buf_printf(b, "({ sp_io_check_writable(%s); (sp_int)0; })", r);
       free(rb.p); return 1;
     }
     if (sp_streq(name, "<<") && argc == 1) {

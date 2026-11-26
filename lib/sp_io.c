@@ -15,6 +15,7 @@
 #include <stdlib.h>
 #include <stddef.h>   /* offsetof, for the static-stream layout assertion */
 #include <string.h>
+#include <ctype.h>   /* isgraph for a UNIX path in an Errno message */
 #include <unistd.h>   /* pipe, isatty */
 #include <sys/stat.h> /* stat() for the File predicates */
 #include <sys/ioctl.h> /* TIOCGWINSZ for #winsize */
@@ -25,7 +26,19 @@
 #include <netinet/in.h>
 #include <netinet/tcp.h>
 #ifdef __APPLE__
-#include <netinet/tcp_fsm.h> /* TCPS_CLOSED / TCPS_LISTEN for the socket read probe */
+/* TCPS_CLOSED / TCPS_LISTEN for the socket read probe. macOS's SDK has
+   netinet/tcp_fsm.h and iOS's does not; the two states are XNU's on both. */
+#if defined(__has_include)
+#  if __has_include(<netinet/tcp_fsm.h>)
+#    include <netinet/tcp_fsm.h>
+#  endif
+#endif
+#ifndef TCPS_CLOSED
+#  define TCPS_CLOSED 0
+#endif
+#ifndef TCPS_LISTEN
+#  define TCPS_LISTEN 1
+#endif
 #endif
 #include <sys/un.h>
 #include <netdb.h>  /* gai_strerror for Socket::ResolutionError */
@@ -344,21 +357,11 @@ sp_File *sp_io_pipe_reader(int fd) {
 /* Wrap a socket fd (#2922). The FILE* serves the buffered READ side (gets and
    friends need lookahead); every write bypasses stdio straight to write(2) --
    see sp_sock_write below -- so a response is on the wire immediately, like
-   CRuby sockets' sync = true default. `kind` lands in ->mode for #class. */
-sp_File *sp_io_fdopen_sock(int fd, const char *kind) {SP_GC_ROOT_STR(kind);
-  if (fd < 0) {
-    /* TCPSocket.new names the call by its man page section; TCPServer.new
-       does not */
-    int e = errno;
-    sp_sock_raise_if_unresolved(strcmp(kind, "tcp") == 0 ? "getaddrinfo(3)" : "getaddrinfo");
-    /* a server's bind that failed, by the errno sp_net_listen_host left: a
-       port in use is EADDRINUSE, not a refused connection (#11351). (Only
-       bind's own errors: a client's failed connect can leave EINPROGRESS
-       or the like behind its refusal.) */
-    if (e == EADDRINUSE || e == EADDRNOTAVAIL || e == EACCES)
-      sp_raise_cls(sp_errno_class_name(e), strerror(e));
-    sp_raise_cls("Errno::ECONNREFUSED", "Connection refused");
-  }
+   CRuby sockets' sync = true default. `kind` lands in ->mode for #class.
+   The caller raises for a -1 before the call. NULL when fdopen fails,
+   with the descriptor closed when owns_fd is set (false for a for_fd
+   descriptor, as for sp_io_fdopen_ex); the caller raises. */
+static sp_File *sp_io_fdopen_sock_try(int fd, const char *kind, int owns_fd) {SP_GC_ROOT_STR(kind);
   /* The scheduler-aware accept/connect helpers may hand us a non-blocking
      fd; the stdio read side must BLOCK (fgets treats EAGAIN as EOF), so
      clear O_NONBLOCK. Green threads still yield: every read entry point
@@ -366,10 +369,13 @@ sp_File *sp_io_fdopen_sock(int fd, const char *kind) {SP_GC_ROOT_STR(kind);
      handle with its own buffer has no stdio read side and keeps
      O_NONBLOCK: its reads park on EAGAIN (sp_io_rbuf_fill). */
   int own = sp_io_sock_takes_own_buf(fd);
-  { int fl = fcntl(fd, F_GETFL); if (fl >= 0) fcntl(fd, F_SETFL, own ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK)); }
   sp_File *f = (sp_File *)sp_gc_alloc(sizeof(sp_File), sp_File_fin, sp_File_scan);
   f->fp = fdopen(fd, "r+");
-  if (!f->fp) { sp_raise_cls("IOError", "fdopen failed"); return NULL; }
+  if (!f->fp) {
+    if (owns_fd) close(fd);
+    return NULL;
+  }
+  { int fl = fcntl(fd, F_GETFL); if (fl >= 0) fcntl(fd, F_SETFL, own ? (fl | O_NONBLOCK) : (fl & ~O_NONBLOCK)); }
   f->path = NULL;
   f->mode = kind;
   f->lineno = 0;
@@ -378,6 +384,11 @@ sp_File *sp_io_fdopen_sock(int fd, const char *kind) {SP_GC_ROOT_STR(kind);
     f->own_buf = SP_OWN_SOCK; f->wstream = 1;
     f->wnonblock = 1; f->wgen = SP_ATOMIC_LOAD(&sp_io_child_fds_gen, __ATOMIC_ACQUIRE);
   }
+  return f;
+}
+sp_File *sp_io_fdopen_sock(int fd, const char *kind) {
+  sp_File *f = sp_io_fdopen_sock_try(fd, kind, 1);
+  if (!f) sp_raise_cls("IOError", "fdopen failed");
   return f;
 }
 
@@ -1092,7 +1103,19 @@ static int sp_io_mode_allows(sp_File *f, int writing) {
     if (*p == '+') return 1;
   return writing ? (m[0] == 'w' || m[0] == 'a') : m[0] == 'r';
 }
+/* "can't modify frozen IO: #<IO:<STDOUT>>", raised before the closed check
+   as CRuby's is */
+static SP_NOINLINE SP_COLD void sp_io_raise_frozen(sp_File *f) {
+  const char *msg = sp_sprintf("can't modify frozen %s: %s", sp_io_kind_name(f), sp_File_inspect(f));
+  SP_GC_ROOT_STR(msg);
+  sp_exc_stage_recv(sp_box_obj(f, SP_BUILTIN_IO));
+  sp_raise_cls("FrozenError", msg);
+}
+static inline void sp_io_check_frozen(sp_File *f) {
+  if (SP_UNLIKELY(f && f->frozen)) sp_io_raise_frozen(f);
+}
 void sp_io_check_writable(sp_File *f) {
+  sp_io_check_frozen(f);
   SP_IO_OPEN(f);
   if (!sp_io_mode_allows(f, 1))
     sp_raise_cls("IOError", (&("\xff" "not opened for writing")[1]));
@@ -1113,6 +1136,7 @@ static sp_int sp_File_write_len(sp_File *f, const char *s, size_t n) {SP_GC_ROOT
 }
 
 sp_int sp_File_write(sp_File *f, const char *s) {SP_GC_ROOT(f);SP_GC_ROOT_STR(s);
+  if (s && s[0]) sp_io_check_frozen(f);
   SP_IO_OPEN(f);
   if (!s || !s[0]) return 0;
   sp_io_check_writable(f);
@@ -1127,6 +1151,7 @@ sp_int sp_File_write(sp_File *f, const char *s) {SP_GC_ROOT(f);SP_GC_ROOT_STR(s)
    callers and codegen's synthesized "" / "\n" literals are bare C literals
    with no marker byte and must use the plain entry above. */
 sp_int sp_File_write_bin(sp_File *f, const char *s) {SP_GC_ROOT(f);SP_GC_ROOT_STR(s);
+  if (s && sp_str_byte_len(s)) sp_io_check_frozen(f);
   SP_IO_OPEN(f);
   if (!s) return 0;
   size_t n = sp_str_byte_len(s);
@@ -1142,6 +1167,7 @@ sp_int sp_File_write_poly(sp_File *f, sp_RbVal v) {
   SP_GC_ROOT_RBVAL(v);
   size_t n;
   const char *text = sp_poly_to_s_bytes(v, &n);
+  if (n) sp_io_check_frozen(f);
   SP_IO_OPEN(f);
   if (!n) return 0;
   sp_io_check_writable(f);
@@ -1154,6 +1180,7 @@ sp_int sp_File_write_poly(sp_File *f, sp_RbVal v) {
    call returns and a read back through the same or another handle sees
    them without a flush. */
 sp_int sp_File_syswrite(sp_File *f, const char *s, size_t n) {SP_GC_ROOT(f);SP_GC_ROOT_STR(s);
+  sp_io_check_frozen(f);
   SP_IO_OPEN(f);
   sp_io_check_writable(f);
   if (!s) return 0;
@@ -1311,6 +1338,10 @@ sp_File *sp_io_stdout(void) {
   if (!s.f.fp) s.f.fp = stdout;
   return &s.f;
 }
+
+/* a bare puts or print that writes to the C stdout, in a program that
+   freezes an IO */
+void sp_io_stdout_check_frozen(void) { sp_io_check_frozen(sp_io_stdout()); }
 
 sp_File *sp_io_stderr(void) {
   static sp_StaticFile s = { SP_STATIC_FILE_LEAD, { NULL, SPL("<STDERR>"), SPL("w") } };
@@ -1624,6 +1655,30 @@ sp_int sp_sock_const(const char *n) {
   return -1;
 }
 
+/* Socket.const_defined?(name) for a name known at run time. CRuby walks a
+   `::` path a segment at a time: a segment no constant can be named raises
+   NameError, an empty one names the whole path, and the first segment it does
+   not find answers false. The table holds single names, so the first segment
+   is checked and the table answers the rest, as it did before. */
+static int sp_sock_bad_segment(const char *s, size_t len) {
+  if (len == 0) return 1;
+  if ((unsigned char)s[0] < 0x80 && !(s[0] >= 'A' && s[0] <= 'Z')) return 1;
+  for (size_t i = 1; i < len; i++) {
+    unsigned char ch = (unsigned char)s[i];
+    if (ch < 0x80 && !((ch >= 'A' && ch <= 'Z') || (ch >= 'a' && ch <= 'z') || (ch >= '0' && ch <= '9') || ch == '_')) return 1;
+  }
+  return 0;
+}
+sp_bool sp_sock_const_defined(const char *n) {
+  const char *s = n ? n : "";
+  const char *seg = (s[0] == ':' && s[1] == ':') ? s + 2 : s;
+  const char *sep = strstr(seg, "::");
+  size_t len = sep ? (size_t)(sep - seg) : strlen(seg);
+  if (len == 0 || (sep && sep[2] == '\0')) sp_raise_cls("NameError", sp_sprintf("wrong constant name %s", s));
+  if (sp_sock_bad_segment(seg, len)) sp_raise_cls("NameError", sp_sprintf("wrong constant name %.*s", (int)len, seg));
+  return sp_sock_const(s) >= 0;
+}
+
 /* UDPSocket.new / UNIXSocket.new / UNIXServer.new -- each wraps its fd in the
    same handle every other stream uses; the kind label is what tells them
    apart. A UDP handle keeps its own datagram path, so it is not fdopen'd. */
@@ -1637,17 +1692,72 @@ sp_File *sp_sock_udp_new(sp_int family) {
   f->path = NULL; f->mode = SPL("udp"); f->lineno = 0; f->is_sock = 1; f->rev_lookup = !sp_sock_dnrl_default;
   return f;
 }
+/* An Errno from a socket call with an address, as CRuby's ext/socket names
+   it: "Connection refused - connect(2) for 127.0.0.1:80" (a packed address
+   or a path), "... - sendto(2) for \"127.0.0.1\" port 80" (a host, port) */
+SP_NORETURN static void sp_sock_raise_errno_for(const char *syscall, const char *addr) {SP_GC_ROOT_STR(addr);
+  int e = errno;
+  sp_raise_cls(sp_errno_class_name(e), sp_sprintf("%s - %s for %s", strerror(e), syscall, addr));
+}
+SP_NORETURN static void sp_sock_raise_errno_host_port(const char *syscall, const char *host, sp_int port) {SP_GC_ROOT_STR(host);
+  int e = errno;
+  const char *h = host ? sp_str_inspect(host) : SPL("nil");
+  SP_GC_ROOT_STR(h);
+  const char *addr = sp_sprintf("%s port %lld", h, (long long)port);
+  errno = e;
+  sp_sock_raise_errno_for(syscall, addr);
+}
+/* A packed address as Addrinfo#inspect_sockaddr shows it: "127.0.0.1:80",
+   "[::1]:80", "/tmp/sock", with no port when it is 0 */
+static const char *sp_sock_sa_desc(const char *sa, sp_int salen) {
+  extern int sp_net_unpack_sockaddr_in(const void *sa, int salen, char *ipbuf, int cap);
+  extern int sp_net_unpack_sockaddr_un(const void *sa, int salen, char *pathbuf, int cap);
+  char buf[256];
+  if (!sa || salen <= 0) return SPL("empty-sockaddr");
+  int port = sp_net_unpack_sockaddr_in(sa, (int)salen, buf, (int)sizeof buf);
+  if (port > 0) return sp_sprintf(strchr(buf, ':') ? "[%s]:%d" : "%s:%d", buf, port);
+  if (port == 0) return sp_sprintf("%s", buf);
+  int n = sp_net_unpack_sockaddr_un(sa, (int)salen, buf, (int)sizeof buf);
+  if (n == 0) return SPL("empty-path-AF_UNIX-sockaddr");
+  if (n > 0) {
+    /* a path of printable bytes as given; "UNIX:00:72" for an abstract
+       name or a path with a space */
+    int printable = 1;
+    for (int i = 0; i < n; i++)
+      if (!isgraph((unsigned char)buf[i])) printable = 0;
+    if (printable) return sp_sprintf(buf[0] == '/' ? "%s" : "UNIX %s", buf);
+    char hex[3 * sizeof buf + 8] = "UNIX";
+    for (int i = 0; i < n; i++)
+      snprintf(hex + 4 + 3 * i, 4, ":%02x", (unsigned char)buf[i]);
+    return sp_sprintf("%s", hex);
+  }
+  struct sockaddr_storage ss;
+  if (salen < (sp_int)(offsetof(struct sockaddr_storage, ss_family) + sizeof ss.ss_family)) return SPL("too-short-sockaddr");
+  memcpy(&ss, sa, salen < (sp_int)sizeof ss ? (size_t)salen : sizeof ss);
+  return sp_sprintf("unknown address family %d", (int)ss.ss_family);
+}
+SP_NORETURN static void sp_sock_raise_errno_sa(const char *syscall, const char *sa, sp_int salen) {
+  int e = errno;
+  const char *addr = sp_sock_sa_desc(sa, salen);
+  errno = e;
+  sp_sock_raise_errno_for(syscall, addr);
+}
+SP_NORETURN static void sp_sock_raise_errno_path(const char *syscall, const char *path) {
+  if (!path) sp_sock_raise_errno(syscall);
+  sp_sock_raise_errno_for(syscall, path);
+}
+/* a failed bind has connect(2) in its message, as in CRuby's UNIXServer.new */
 sp_File *sp_sock_unix_server(const char *path) {SP_GC_ROOT_STR(path);
   extern int sp_net_unix_listen(const char *path, int backlog);
   int fd = sp_net_unix_listen(path, 0);   /* 0: SOMAXCONN, as CRuby */
-  if (fd < 0) sp_file_raise_errno("bind", path ? path : "");
+  if (fd < 0) sp_sock_raise_errno_path("connect(2)", path);
   sp_File *f = sp_io_fdopen_sock(fd, SPL("unixserver"));
   return f;
 }
 sp_File *sp_sock_unix_connect(const char *path) {SP_GC_ROOT_STR(path);
   extern int sp_net_unix_connect(const char *path);
   int fd = sp_net_unix_connect(path);
-  if (fd < 0) sp_file_raise_errno("connect", path ? path : "");
+  if (fd < 0) sp_sock_raise_errno_path("connect(2)", path);
   return sp_io_fdopen_sock(fd, SPL("unix"));
 }
 /* Socket.unix(path) and Socket.tcp(host, port), CRuby's convenience
@@ -1660,9 +1770,40 @@ sp_File *sp_sock_unix_socket(const char *path) {SP_GC_ROOT_STR(path);
 }
 sp_File *sp_sock_tcp_socket(const char *host, sp_int port) {SP_GC_ROOT_STR(host);
   extern int sp_net_connect(const char *host, int port);
-  sp_File *f = sp_io_fdopen_sock(sp_net_connect(host, (int)port), SPL("tcp"));
+  extern int sp_net_connect_failed_addr(void *out, int cap);
+  int fd = sp_net_connect(host, (int)port);
+  if (fd < 0) {
+    sp_sock_raise_if_unresolved("getaddrinfo(3)");
+    struct sockaddr_storage ss;
+    int len = sp_net_connect_failed_addr(&ss, (int)sizeof ss);
+    if (len > 0) sp_sock_raise_errno_sa("connect(2)", (const char *)&ss, len);
+    sp_sock_raise_errno_host_port("connect(2)", host, port);
+  }
+  sp_File *f = sp_io_fdopen_sock(fd, SPL("tcp"));
   f->mode = SPL("socket");
   return f;
+}
+/* TCPServer.new(host, port), with a NULL host for TCPServer.new(port). A
+   port in use raises EADDRINUSE (#11351). The message says bind(2) for a
+   failed listen(2) too. */
+sp_File *sp_sock_tcp_server(const char *host, sp_int port) {SP_GC_ROOT_STR(host);
+  extern int sp_net_listen_host(const char *host, int port, int backlog);
+  int fd = sp_net_listen_host(host, (int)port, 0);
+  if (fd < 0) {
+    sp_sock_raise_if_unresolved("getaddrinfo");
+    sp_sock_raise_errno_host_port("bind(2)", host, port);
+  }
+  return sp_io_fdopen_sock(fd, SPL("tcpserver"));
+}
+/* TCPSocket.new(host, port) */
+sp_File *sp_sock_tcp_client(const char *host, sp_int port) {SP_GC_ROOT_STR(host);
+  extern int sp_net_connect(const char *host, int port);
+  int fd = sp_net_connect(host, (int)port);
+  if (fd < 0) {
+    sp_sock_raise_if_unresolved("getaddrinfo(3)");
+    sp_sock_raise_errno_host_port("connect(2)", host, port);
+  }
+  return sp_io_fdopen_sock(fd, SPL("tcp"));
 }
 /* TCPSocket.new(host, port, connect_timeout: seconds): a connect nothing
    answers within the seconds raises CRuby's IO::TimeoutError, which names
@@ -1679,6 +1820,10 @@ sp_File *sp_sock_tcp_connect_timeout(const char *host, sp_int port, double timeo
     int p = sp_net_connect_timeout_ip(ip, (int)sizeof ip);
     sp_raise_cls("IO::TimeoutError", sp_sprintf(strchr(ip, ':') ? "user specified timeout for [%s]:%d"
                                                                : "user specified timeout for %s:%d", ip, p));
+  }
+  if (fd < 0) {
+    sp_sock_raise_if_unresolved("getaddrinfo(3)");
+    sp_sock_raise_errno_host_port("connect(2)", host, port);
   }
   return sp_io_fdopen_sock(fd, SPL("tcp"));
 }
@@ -1756,8 +1901,14 @@ sp_PolyArray *sp_sock_tcp_server_sockets(const char *host, sp_int port) {SP_GC_R
   }
   sp_PolyArray *a = sp_PolyArray_new();
   SP_GC_ROOT(a);
-  for (int i = 0; i < n; i++)
-    sp_PolyArray_push(a, sp_box_obj(sp_io_fdopen_sock(fds[i], SPL("socket")), SP_BUILTIN_IO));
+  for (int i = 0; i < n; i++) {
+    sp_File *f = sp_io_fdopen_sock_try(fds[i], SPL("socket"), 1);
+    if (!f) {
+      while (++i < n) close(fds[i]);
+      sp_raise_cls("IOError", "fdopen failed");
+    }
+    sp_PolyArray_push(a, sp_box_obj(f, SP_BUILTIN_IO));
+  }
   return a;
 }
 /* TCPServer.for_fd(fd) and the other socket classes': wrap a descriptor the
@@ -1770,7 +1921,9 @@ sp_File *sp_sock_for_fd(sp_int fd, sp_int kind) {
   const char *k = kind == 1 ? SPL("tcpserver") : kind == 2 ? SPL("tcp") :
                   kind == 3 ? SPL("udp") : kind == 4 ? SPL("unixserver") :
                   kind == 5 ? SPL("unix") : SPL("socket");
-  return sp_io_fdopen_sock(d, k);
+  sp_File *f = sp_io_fdopen_sock_try(d, k, 0);
+  if (!f) sp_raise_cls("IOError", "fdopen failed");
+  return f;
 }
 /* The two connected descriptors of a socket pair, into the caller's fds:
    each call keeps its own, so two threads making pairs at once cannot
@@ -1781,10 +1934,16 @@ void sp_sock_socketpair(sp_int domain, sp_int type, sp_int proto, int fds[2]) {
     sp_sock_raise_errno("socketpair(2)");
 }
 
-/* One end of a socket pair as a handle: a UNIXSocket for UNIXSocket.pair
-   (is_unix set), a Socket for Socket.pair. */
-sp_File *sp_sock_pair_handle(int fd, sp_int is_unix) {
-  return sp_io_fdopen_sock(fd, is_unix ? SPL("unix") : SPL("socket"));
+/* End i of a socket pair as a handle: a UNIXSocket for UNIXSocket.pair
+   (is_unix set), a Socket for Socket.pair. A failed end 0 closes end 1,
+   which has no handle yet. */
+sp_File *sp_sock_pair_handle(int fds[2], int i, sp_int is_unix) {
+  sp_File *f = sp_io_fdopen_sock_try(fds[i], is_unix ? SPL("unix") : SPL("socket"), 1);
+  if (!f) {
+    if (i == 0) close(fds[1]);
+    sp_raise_cls("IOError", "fdopen failed");
+  }
+  return f;
 }
 
 /* A family or socket type named by a String or Symbol, with or without its
@@ -1993,7 +2152,7 @@ sp_int sp_sock_bind(sp_File *f, const char *host, sp_int port) {SP_GC_ROOT(f);SP
   sp_sock_require(f, "bind");
   if (sp_net_udp_bind(fileno(f->fp), host, (int)port) != 0) {
     sp_sock_raise_if_unresolved("getaddrinfo");
-    sp_file_raise_errno("bind", host ? host : "");
+    sp_sock_raise_errno_host_port("bind(2)", host, port);
   }
   return 0;
 }
@@ -2002,7 +2161,7 @@ sp_int sp_sock_connect(sp_File *f, const char *host, sp_int port) {SP_GC_ROOT(f)
   sp_sock_require(f, "connect");
   if (sp_net_udp_connect(fileno(f->fp), host, (int)port) != 0) {
     sp_sock_raise_if_unresolved("getaddrinfo");
-    sp_file_raise_errno("connect", host ? host : "");
+    sp_sock_raise_errno_host_port("connect(2)", host, port);
   }
   return 0;
 }
@@ -2021,7 +2180,7 @@ static void sp_sock_sa_prepare(sp_File *f, const char *m, const char *sa, sp_int
   SP_IO_OPEN(f);
   if (!sa || salen <= 0 || salen > (sp_int)sizeof(struct sockaddr_storage)) {
     errno = EINVAL;
-    sp_file_raise_errno(m, "");
+    sp_sock_raise_errno_sa(strcmp(m, "bind") == 0 ? "bind(2)" : "connect(2)", sa, salen);
   }
   memcpy(out, sa, (size_t)salen);
 }
@@ -2029,7 +2188,7 @@ sp_int sp_sock_bind_sa(sp_File *f, const char *sa, sp_int salen) {SP_GC_ROOT(f);
   struct sockaddr_storage aligned_sa;
   sp_sock_sa_prepare(f, "bind", sa, salen, &aligned_sa);
   if (bind(fileno(f->fp), (const struct sockaddr *)&aligned_sa, (socklen_t)salen) != 0)
-    sp_file_raise_errno("bind", "");
+    sp_sock_raise_errno_sa("bind(2)", sa, salen);
   return 0;
 }
 sp_int sp_sock_connect_sa(sp_File *f, const char *sa, sp_int salen) {SP_GC_ROOT(f);SP_GC_ROOT_STR(sa);
@@ -2037,7 +2196,7 @@ sp_int sp_sock_connect_sa(sp_File *f, const char *sa, sp_int salen) {SP_GC_ROOT(
   struct sockaddr_storage aligned_sa;
   sp_sock_sa_prepare(f, "connect", sa, salen, &aligned_sa);
   if (sp_net_connect_sa(fileno(f->fp), &aligned_sa, (int)salen) != 0)
-    sp_file_raise_errno("connect", "");
+    sp_sock_raise_errno_sa("connect(2)", sa, salen);
   return 0;
 }
 sp_int sp_sock_send(sp_File *f, const char *data, sp_int len, sp_int flags, const char *host, sp_int port) {SP_GC_ROOT(f);SP_GC_ROOT_STR(data);SP_GC_ROOT_STR(host);
@@ -2062,7 +2221,7 @@ sp_int sp_sock_send(sp_File *f, const char *data, sp_int len, sp_int flags, cons
   if (n < 0) {
     sp_sock_raise_if_unresolved("getaddrinfo");
     if (!host) sp_sock_raise_errno("send(2)");
-    sp_file_raise_errno("send", host);
+    sp_sock_raise_errno_host_port("sendto(2)", host, port);
   }
   return (sp_int)n;
 }
@@ -2119,8 +2278,10 @@ const char *sp_sock_recv(sp_File *f, sp_int len) {SP_GC_ROOT(f);
     size_t want = (size_t)len < (size_t)pend ? (size_t)len : (size_t)pend;
     char *r = sp_str_alloc(want);
     (void)sp_io_use(f);
-    size_t got = sp_io_fread(f, r, want);
+    int e;
+    size_t got = sp_io_fread_err(f, r, want, &e);
     sp_io_unuse(f);
+    if (e) sp_io_raise_read_error(f, e, 0);
     r[got] = 0;
     sp_str_set_len(r, got);
     sp_str_mark_binary(r);
@@ -2275,6 +2436,19 @@ sp_int sp_sock_optname_arg(sp_int level, sp_RbVal v) {SP_GC_ROOT_RBVAL(v);
   if (opt < 0) sp_raise_cls("SocketError", sp_sprintf("unknown %s level option name: %s", what, name));
   return opt;
 }
+/* A shutdown direction: an Integer, nil for SHUT_RDWR, or a Symbol or String
+   with or without its prefix (:WR and :SHUT_WR), as CRuby's
+   rsock_shutdown_how_arg takes it. */
+sp_int sp_sock_shutdown_arg(sp_RbVal v) {SP_GC_ROOT_RBVAL(v);
+  if (v.tag == SP_TAG_INT) return v.v.i;
+  if (v.tag == SP_TAG_NIL) return SHUT_RDWR;
+  const char *name = sp_sock_opt_name(v);
+  if (!name) return sp_sock_opt_int(v);
+  const char *full = strncmp(name, "SHUT_", 5) == 0 ? name : sp_sprintf("SHUT_%s", name);
+  sp_int how = sp_sock_opt_name_nul(name) ? -1 : sp_sock_const(full);
+  if (how < 0) sp_raise_cls("SocketError", sp_sprintf("unknown shutdown argument: %s", name));
+  return how;
+}
 
 sp_int sp_sock_setsockopt(sp_File *f, sp_int level, sp_int opt, sp_int value) {SP_GC_ROOT(f);
   extern int sp_net_setsockopt_int(int fd, int level, int optname, int value);
@@ -2334,8 +2508,10 @@ static ssize_t sp_io_read_chunk_timed(sp_File *f, char *buf, size_t count) {
     if (!sp_io_parkable(f)) {
       (void)sp_io_timeout_seconds(f);
       (void)sp_io_use(f);
-      size_t got = sp_io_fread(f, buf, count);
+      int e;
+      size_t got = sp_io_fread_err(f, buf, count, &e);
       sp_io_unuse(f);
+      if (e) sp_io_raise_read_error(f, e, 0);
       return (ssize_t)got;
     }
     if (deadline == -2.0) deadline = sp_io_deadline(f);
@@ -2446,16 +2622,18 @@ const char *sp_File_readpartial_or_nil(sp_File *f, sp_int n) {SP_GC_ROOT(f);
   if (f->own_buf) return sp_io_rbuf_partial(f, (size_t)n, 0);
   char *r = sp_str_alloc((size_t)n);
   ssize_t got;
+  int fe = 0;
   FILE *fp = sp_io_use(f);
   long pend = (long)sp_io_pending(f);
   if (pend > 0) {
     size_t want = (size_t)n < (size_t)pend ? (size_t)n : (size_t)pend;
-    got = (ssize_t)sp_io_fread(f, r, want);
+    got = (ssize_t)sp_io_fread_err(f, r, want, &fe);
   }
   else {
     do { got = SP_SIG_BLOCKING(read(fileno(fp), r, (size_t)n)); } while (got < 0 && errno == EINTR);
   }
   { int e = errno; sp_io_unuse(f); errno = e; }
+  if (fe) sp_io_raise_read_error(f, fe, 0);
   if (got < 0) sp_file_raise_errno("read", "");
   if (got == 0) return NULL;
   r[got] = 0;
@@ -2633,7 +2811,7 @@ sp_oint sp_sock_connect_nb(sp_File *f, const char *host, sp_int port, sp_bool ex
     sp_raise_cls("IO::EINPROGRESSWaitWritable", "operation in progress - connect(2) would block");
   }
   if (errno == EISCONN) return sp_oint_of(0);
-  sp_file_raise_errno("connect", host ? host : "");
+  sp_sock_raise_errno_host_port("connect(2)", host, port);
 }
 /* connect_nonblock(sockaddr). The peer is already resolved into a packed
    struct sockaddr (the binary String returned by Socket.sockaddr_in or
@@ -2656,11 +2834,11 @@ sp_oint sp_sock_connect_nb_sa(sp_File *f, const char *sa, sp_int salen, sp_bool 
   sp_sock_nb_prepare(f, "connect_nonblock");
   if (!sa || salen <= 0) {
     errno = EINVAL;
-    sp_file_raise_errno("connect", "");
+    sp_sock_raise_errno_sa("connect(2)", sa, salen);
   }
   if (salen > (sp_int)sizeof(struct sockaddr_storage)) {
     errno = EINVAL;
-    sp_file_raise_errno("connect", "");
+    sp_sock_raise_errno_sa("connect(2)", sa, salen);
   }
   struct sockaddr_storage aligned_sa;
   memcpy(&aligned_sa, sa, (size_t)salen);
@@ -2678,7 +2856,7 @@ sp_oint sp_sock_connect_nb_sa(sp_File *f, const char *sa, sp_int salen, sp_bool 
      the same as CRuby answers here -- measured on both, in both exception
      modes, including a second connect to a different address. */
   if (errno == EISCONN) return sp_oint_of(0);
-  sp_file_raise_errno("connect", "");
+  sp_sock_raise_errno_sa("connect(2)", sa, salen);
   return sp_oint_of(-1);
 }
 
@@ -2716,6 +2894,7 @@ sp_File *sp_sock_accept(sp_File *f) {SP_GC_ROOT(f);
   int fd = sp_net_accept_unless(fileno(sp_io_use(f)), &f->closed);
   { int e = errno; sp_io_unuse(f); errno = e; }
   if (fd < 0 && SP_ATOMIC_LOAD(&f->closed, __ATOMIC_RELAXED)) sp_raise_cls("IOError", "stream closed in another thread");
+  if (fd < 0) sp_sock_raise_errno("accept(2)");
   return sp_io_fdopen_sock(fd, sp_sock_accepted_kind(f));
 }
 
@@ -2770,6 +2949,7 @@ void sp_File_put_byte(sp_File *f, int c) {SP_GC_ROOT(f);
   fputc(c, f->fp);
 }
 void sp_File_print(sp_File *f, const char *s) {SP_GC_ROOT(f);SP_GC_ROOT_STR(s);
+  if (s && s[0]) sp_io_check_frozen(f);
   SP_IO_OPEN(f);
   if (!s || !s[0]) return;
   sp_io_check_writable(f);
@@ -2840,6 +3020,27 @@ SP_NORETURN void sp_file_raise_errno(const char *op, const char *path) {SP_GC_RO
   int e = errno;   /* read once, before the formatting can touch it */
   sp_raise_cls(sp_errno_class_name(e),
                sp_sprintf("%s @ %s - %s", strerror(e), op, path ? path : ""));
+}
+
+int sp_io_read_errno(sp_File *f) {
+  FILE *fp = f->fp;
+  if (!fp || !ferror(fp)) return 0;
+  int e = errno;
+  clearerr(fp);
+  return (e == EAGAIN || e == EWOULDBLOCK || e == EINTR) ? 0 : e;
+}
+
+SP_NORETURN void sp_io_raise_read_error(sp_File *f, int e, int fillbuf) {SP_GC_ROOT(f);
+  const char *msg;
+  if (fillbuf) msg = sp_sprintf("%s @ io_fillbuf - fd:%d %s", strerror(e), fileno(f->fp), f->path ? f->path : "");
+  else if (f->path) msg = sp_sprintf("%s @ io_fread - %s", strerror(e), f->path);
+  else msg = sp_sprintf("%s", strerror(e));
+  sp_raise_cls(sp_errno_class_name(e), msg);
+}
+
+void sp_io_check_ferror(sp_File *f, int fillbuf) {
+  int e = sp_io_read_errno(f);
+  if (e) sp_io_raise_read_error(f, e, fillbuf);
 }
 
 void sp_pread_check(sp_File *f, sp_int len, sp_bool outbuf) {

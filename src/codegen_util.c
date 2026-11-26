@@ -515,7 +515,7 @@ static __attribute__((noreturn)) void unsup_leave(const char *file, int line, co
   exit(1);
 }
 /* The .rb position the parser stamped on `id`, or line 0. */
-static const char *unsup_pos(Compiler *c, int id, int *line) {
+const char *unsup_pos(Compiler *c, int id, int *line) {
   *line = (int)nt_int(c->nt, id, "node_line", 0);
   int fid = (int)nt_int(c->nt, id, "node_file", 0);
   const char *file = nt_file_path(c->nt, fid);
@@ -1484,6 +1484,11 @@ int substituted_local_node(const NodeTable *nt, int node) {
 int g_ie_class_id = -1;
 int g_ie_discard_value = 0;
 int g_ie_nil_ivars = 0;
+
+int emit_self_class_body(Compiler *c, int id) {
+  if (g_class_body_id < 0 || g_ie_class_id >= 0 || g_ie_nil_ivars || g_ie_rself_on) return -1;
+  return self_class_body(c, id) == g_class_body_id ? g_class_body_id : -1;
+}
 int ie_nil_ivar_read(Compiler *c, int node) {
   return g_ie_nil_ivars && ie_class_of(c, node) < 0;
 }
@@ -1696,6 +1701,7 @@ TyKind g_ret_type = TY_UNKNOWN;
    expressions type. `return <value>` emitted into it is a C constraint
    violation, and GCC 14 rejects it. */
 int g_c_ret_void = 0;
+int g_in_file_top = 0;
 /* The body of the Fiber.new / Thread.new / Enumerator.new block whose C
    function is being emitted, or -1. A `next` this body owns leaves that
    function (emit_next_leaving_body). */
@@ -1810,6 +1816,10 @@ int re_engine_flags(int pf) {
   if (pf & NT_RE_IGNORE_CASE) f |= 1;
   if (pf & NT_RE_EXTENDED) f |= 8;
   if (pf & NT_RE_MULTI_LINE) f |= 6;
+  if (pf & NT_RE_UTF_8) f |= 16;
+  if (pf & NT_RE_EUC_JP) f |= 16 | 64;
+  if (pf & NT_RE_WINDOWS_31J) f |= 16 | 128;
+  if (pf & NT_RE_ASCII_8BIT) f |= 32;
   return f;
 }
 /* The RegularExpressionNode behind `nid`, or -1 when the pattern is only
@@ -2458,18 +2468,15 @@ static int subtree_has_param_named(const Compiler *c, int id, const char *nm) {
 
   /* numbered params (_1.._9): the NumberedParametersNode carries no child
      parameter nodes, yet the block's locals list contains the names. */
-  /* `_1` as the parser wrote it, and `_1__bNN` where scope_numbered_block_params
-     gave a colliding scope's blocks their own -- the same two spellings the
-     shadow rename leaves for an ordinary parameter, matched the same way. */
-  if (k == NK_NumberedParametersNode &&
-      nm[0] == '_' && nm[1] >= '1' && nm[1] <= '9' &&
-      (!nm[2] || !strncmp(nm + 2, "__b", 3))) return 1;
+  if (k == NK_NumberedParametersNode) {
+    int max = (int)nt_int(nt, id, "maximum", 0);
+    for (int q = 0; q < max; q++)
+      if (sp_streq(nm, numbered_param_name((Compiler *)c, id, q))) return 1;
+  }
   if (k == NK_ItParametersNode && sp_streq(nm, "it")) return 1;
   if (ty && (strstr(ty, "ParameterNode") || k == NK_LocalVariableTargetNode)) {
     const char *pn = nt_str(nt, id, "name");
-    /* shadow-renaming rewrites a param's node-table name to NAME__bpNN;
-       the parser's locals list keeps the raw NAME -- match both. */
-    if (pn && (sp_streq(pn, nm) || sp_streq(nt_wname(nt, id), nm))) return 1;
+    if (pn && sp_streq(pn, nm)) return 1;
   }
   int nr = nt_num_refs(nt, id);
   for (int i = 0; i < nr; i++)
@@ -5344,6 +5351,35 @@ void emit_coerce_text(Compiler *c, int node, TyKind from, TyKind slot, int how,
     buf_printf(b, "sp_bigint_new_int(%s)", text);
     RCCT(CF_INT2BIG);
     return;
+  case CF_HASH_WIDEN:
+    /* A narrower Hash widened into a poly-valued or general Hash slot:
+       preserve NULL (nil) and frozen/default state via the runtime converters. */
+    if (slot == TY_STR_POLY_HASH && (from == TY_STR_STR_HASH || from == TY_STR_INT_HASH)) {
+      int t = ++g_tmp;
+      const char *ct = from == TY_STR_STR_HASH ? "sp_StrStrHash *" : "sp_StrIntHash *";
+      const char *fn = from == TY_STR_STR_HASH ? "sp_StrPolyHash_from_str_str_hash"
+                                               : "sp_StrPolyHash_from_str_int_hash";
+      buf_printf(b, "({ %s _t%d = (%s); _t%d ? %s(_t%d) : NULL; })", ct, t, text, t, fn, t);
+    }
+    else {
+      buf_puts(b, "sp_poly_as_poly_poly_hash(");
+      emit_boxed_text(c, from, text, b);
+      buf_puts(b, ")");
+    }
+    RCCT(CF_HASH_WIDEN);
+    return;
+  case CF_ARRAY_WIDEN: {
+    /* A typed Array widened into a general PolyArray slot, preserving NULL (nil). */
+    int t = ++g_tmp;
+    const char *ct = from == TY_INT_ARRAY ? "sp_IntArray *"
+                   : from == TY_FLOAT_ARRAY ? "sp_FloatArray *" : "sp_StrArray *";
+    const char *fn = from == TY_INT_ARRAY ? "sp_PolyArray_from_int_array"
+                   : from == TY_FLOAT_ARRAY ? "sp_PolyArray_from_float_array"
+                                            : "sp_PolyArray_from_str_array";
+    buf_printf(b, "({ %s _t%d = (%s); _t%d ? %s(_t%d) : NULL; })", ct, t, text, t, fn, t);
+    RCCT(CF_ARRAY_WIDEN);
+    return;
+  }
   case CF_CONVERT:
     /* a Bignum or a Rational operand a Float slot converts, as Ruby does */
     buf_printf(b, "%s(%s)", from == TY_BIGINT ? "sp_bigint_to_double" : "sp_rational_to_f", text);
@@ -6775,7 +6811,7 @@ void emit_str_array_handles(Compiler *c, int v, Buf *b) {
   if (u >= 0 && nt_kind(c->nt, u) == NK_CallNode && is_minmax_pair(nt_str(c->nt, u, "name")) &&
       nt_ref(c->nt, u, "arguments") < 0 && nt_ref(c->nt, u, "block") < 0 && nt_ref(c->nt, u, "receiver") >= 0 &&
       comp_ntype(c, nt_ref(c->nt, u, "receiver")) == TY_STR_RANGE && cplan_user(c, u).dispatch == CP_NONE &&
-      !share_builtin_overridden(c, "Range", "minmax")) {
+      !cplan_builtin_overridden(c, "Range", "minmax")) {
     int tr = ++g_tmp, tp = ++g_tmp;
     buf_printf(b, "({ sp_StrRange _t%d = ", tr);
     emit_expr(c, nt_ref(c->nt, u, "receiver"), b);
@@ -7699,6 +7735,14 @@ int scope_proc_form_of(Compiler *c, int s) {
   Scope *sc = &c->scopes[s];
   return sc->yields ? comp_scope_pf_clone(c, sc) : -1;
 }
+/* The scope whose function a call of method mi with no block runs where the call is not spliced in (a runtime
+   hook's dispatch switch): mi, or a yielding one's proc-form clone, which has the function and takes the block as its
+   last parameter; -1 for a yielding one with no clone written out. */
+int scope_unspliced_fn(Compiler *c, int mi) {
+  if (mi < 0 || mi >= c->nscopes || !c->scopes[mi].yields) return mi;
+  int pf = scope_proc_form_of(c, mi);
+  return pf >= 0 && proc_form_live(c, pf) ? pf : -1;
+}
 /* Is proc form `s` one some call can reach? The poly dispatch that names it
    is emitted after the reachability pass, so the clone's own flag cannot say;
    but its source method is reached by name wherever a call could take the
@@ -8231,7 +8275,7 @@ void emit_main_exit(Buf *b) {
 }
 
 void emit_retf_return(int eid, int has_retval, Buf *b) {
-  if (g_c_ret_void && g_ret_type == TY_UNKNOWN) { buf_printf(b, "if (_retf%d) { ", eid); emit_main_exit(b); }
+  if (g_c_ret_void && g_ret_type == TY_UNKNOWN && !g_in_file_top) { buf_printf(b, "if (_retf%d) { ", eid); emit_main_exit(b); }
   /* A fiber body is `static void`: returning the value there is a C
      constraint violation (GCC 14 rejects it), and the value had nowhere to
      go anyway -- a void function's caller cannot read it. Drop it and
@@ -8290,7 +8334,6 @@ void arity_kw_suffix(const Compiler *c, int params, char *out, size_t n) {
   size_t off = (size_t)snprintf(out, n, "; required keyword%s: ", nreq > 1 ? "s" : "");
   for (int i = 0, first = 1; i < nk && off < n; i++) {
     if (!param_is_required_kw(nt, kws[i])) continue;
-    /* a block parameter's rename suffix (`k__bp3`) is ours, not the name */
     const char *kn = nt_str(nt, kws[i], "name") ? nt_wname(nt, kws[i]) : "?";
     off += (size_t)snprintf(out + off, n - off, "%s%s", first ? "" : ", ", kn);
     first = 0;
