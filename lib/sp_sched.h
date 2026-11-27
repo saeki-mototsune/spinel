@@ -265,8 +265,9 @@ static inline void sp_native_callback_leave(int depth) { (void)depth; }
 /* An ffi_func declared `offload: true` (spinel's own, #11804): fn(arg) runs
    on an offload OS thread, and the calling green thread waits for it as for
    I/O, its worker free for its other threads; a #raise or #kill sent to it is
-   held until the call is back. Without the threaded runtime (or where it has
-   no offload threads) fn runs in place. */
+   held until the call is back. Without the threaded runtime fn runs in place;
+   where it has no pipe or offload thread to spare, fn runs in place outside
+   the world, as a blocking: true call does. */
 #if defined(SP_THREADS) && !defined(_WIN32)
 void sp_offload_call(void (*fn)(void *), void *arg);
 #else

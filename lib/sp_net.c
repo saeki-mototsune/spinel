@@ -105,7 +105,18 @@ static int sp_net_resolve(const char *host, const char *port,
     }
     struct sp_net_resolve_job j = { host, port, hints, res, 0 };
 #if defined(SP_THREADS) && !defined(_WIN32)
+    /* A Thread#raise or #kill sent meanwhile is held until the lookup is
+       back (sp_offload_call), and held here a moment longer: the address
+       list the lookup made is freed before it fires, as it never reaches
+       the caller. */
+    sp_fiber_defer_inject();
     sp_offload_call(sp_net_resolve_run, &j);
+    sp_fiber_undefer_inject();
+    if (sp_fiber_current && sp_fiber_inject_pending(sp_fiber_current)) {
+        if (j.rc == 0 && *res) { freeaddrinfo(*res); *res = NULL; }
+        sp_net_gai_error = j.rc;
+        sp_fiber_fire_inject_if_pending();
+    }
 #else
     sp_native_enter();   /* (no offload threads here: leave the world for it) */
     sp_net_resolve_run(&j);

@@ -6337,13 +6337,21 @@ static int sp_offload_spawn_locked(void) {
   return 1;
 }
 
+/* With no pipe or no offload thread to be had, the call runs on this worker,
+   outside the world as a blocking: true call does, so a collection raised
+   meanwhile still does not wait for it. */
+static void sp_offload_in_place(void (*fn)(void *), void *arg) {
+  sp_native_enter();
+  fn(arg);
+  sp_native_leave();
+}
 void sp_offload_call(void (*fn)(void *), void *arg) {
   int p[2] = { -1, -1 };
   pthread_mutex_lock(&g_off_mu);
   if (g_off_npipes) { g_off_npipes--; p[0] = g_off_pipes[2 * g_off_npipes]; p[1] = g_off_pipes[2 * g_off_npipes + 1]; }
   pthread_mutex_unlock(&g_off_mu);
   if (p[0] < 0) {
-    if (pipe(p) != 0) { fn(arg); return; }
+    if (pipe(p) != 0) { sp_offload_in_place(fn, arg); return; }
     for (int k = 0; k < 2; k++) {
       fcntl(p[k], F_SETFL, fcntl(p[k], F_GETFL) | O_NONBLOCK);
       fcntl(p[k], F_SETFD, FD_CLOEXEC);
@@ -6355,7 +6363,7 @@ void sp_offload_call(void (*fn)(void *), void *arg) {
     /* no offload thread at all: the call runs in place */
     pthread_mutex_unlock(&g_off_mu);
     close(p[0]); close(p[1]);
-    fn(arg);
+    sp_offload_in_place(fn, arg);
     return;
   }
   if (g_off_tail) g_off_tail->next = &j; else g_off_head = &j;
