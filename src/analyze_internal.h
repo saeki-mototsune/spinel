@@ -35,6 +35,8 @@ int oa_seed_row_literal(int lit);
 /* Does the program make a bare Object (`Object.new`)? (analyze_infer.c) */
 int an_program_news_object(Compiler *c);
 int ie_kernel_global(const char *n);
+/* set while desugar_missing_method_calls runs: ivn_build keeps the writer entries it read (analyze_pass.c) */
+extern int g_ivn_entries_hold;
 
 /* Forward declarations for FFI helpers defined later in this file. */
 const char *ffi_arg_str(const NodeTable *nt, int nid);
@@ -377,6 +379,7 @@ int sclass_value_call(Compiler *c, int id);   /* analyze_infer.c */
 /* 1 if `id` is any proc-creating literal: a proc/lambda/Proc.new call (above)
    or a `->(){}` LambdaNode. */
 int is_proc_create(Compiler *c, int id);
+int is_lambda_create(Compiler *c, int create);
 int local_proc_literal_param_of(Compiler *c, Scope *sc, const char *nm);
 int proc_literal_calls_in_sight(Compiler *c, int lit);
 int proc_literal_uncalled(Compiler *c, int lit);
@@ -547,6 +550,11 @@ int multi_return_elem_nodes(Compiler *c, int value, const int **elems);
 int scope_tuple_elem_nodes(Compiler *c, int mi, const int **elems);   /* analyze_pass.c: the same for a method scope */
 int method_overridden_below(Compiler *c, int site, int cid, const char *name, int mi);   /* analyze_pass.c: a descendant answers `name` with another method */
 void resolve_parents(Compiler *c);
+void register_rt_sites(Compiler *c);   /* ClassInfo.rt_site of the run-time classes' site classes */
+/* the names the program defines methods of (analyze_desugar.c); does a
+   statements body only declare, so nothing it runs sees its class? */
+int program_def_names(const NodeTable *nt, ANameHash *defnames);
+int body_only_declares(const NodeTable *nt, int body, const ANameHash *defnames);
 void resolve_inherited_aliases(Compiler *c);
 void settle_object_builtin_aliases(Compiler *c);
 void settle_mixin_aliases(Compiler *c);       /* an alias names the method in effect where it appears */
@@ -788,6 +796,17 @@ const char *block_sig_kw_name(Compiler *c, const BlockSig *s, int k);
 enum { BS_ABSENT = 1, BS_NIL = 2 };
 void block_site_types(Compiler *c, const BlockSig *s, const int *av, int ac,
                       TyKind *pos, char *absent, TyKind *kws);
+/* How a value binds a block parameter (block_site_values): itself, one of
+   its elements, or one of its elements' elements (a lone splat's operand
+   whose one element the block takes apart). BLOCK_REST names the rest,
+   whose elements the values are; rix the one of them at a literal index
+   (ELEM_ANY: any). */
+enum { BV_WHOLE, BV_ELEM, BV_ELEM2 };
+enum { BLOCK_REST = -2 };
+typedef int (*BlockValueVisit)(Compiler *c, int v, int how, void *ctx);
+int block_site_values(Compiler *c, const BlockSig *s, const int *av, int ac, int at, int rix,
+                      BlockValueVisit fn, void *ctx);
+int block_param_values(Compiler *c, int holder, int at, int rix, BlockValueVisit fn, void *ctx);
 int block_settle_types(Compiler *c, int blk, const BlockSig *s,
                        const TyKind *pos, const char *absent, const TyKind *kws);
 int a_proc_params_node(Compiler *c, int create);
@@ -850,6 +869,7 @@ int desugar_ie_bare_object_calls(Compiler *c);
 int desugar_main_singleton_calls(Compiler *c);
 int desugar_bare_object_reopen_calls(Compiler *c);
 int desugar_descendant_reader_calls(Compiler *c);
+int desugar_owned_require_loads(Compiler *c);
 int desugar_masgn_store_evidence(Compiler *c);
 int desugar_index_assign_user_recv(Compiler *c);
 int desugar_index_assign_value(Compiler *c);
@@ -860,9 +880,11 @@ int incl_give_self(NodeTable *nt, int node, const char *cname);
 int desugar_sclass_hooks(Compiler *c);
 int desugar_toplevel_hooked_mixins(Compiler *c);
 int desugar_socket_constants(Compiler *c);
+int desugar_file_constants(Compiler *c);
 int desugar_instance_eval_defs(Compiler *c);
 int desugar_user_send_others(Compiler *c);
 int desugar_method_missing_super(Compiler *c);
+int desugar_super_method_missing(Compiler *c);
 int desugar_missing_method_calls(Compiler *c);
 int ie_receiverless_self_class_of(Compiler *c, int id);
 int ie_block_self_class_of(Compiler *c, int id);
@@ -1120,6 +1142,7 @@ int desugar_dynamic_send(Compiler *c);
 void expand_static_splat_args(Compiler *c, int from, int count);
 void rest_param_copy_name(char *out, size_t cap, const char *rp);   /* the local the reads of an assigned *rest move to */
 int fwd_fixed_call_arity(const NodeTable *nt, const char *name);   /* the one positional count every call of a `...` forwarder passes, -1 when they differ or pass a splat or keywords, -2 for no call */
+int fwd_call_counts(const NodeTable *nt, const char *name, int kw_one, int *lo, int *hi);   /* the counts the calls of a `...` forwarder pass, *lo..*hi (*lo > *hi for none); with kw_one literal keywords are one Hash; 0 for a splat, a `...`, keywords without kw_one, or a `**` */
 int desugar_dynamic_method(Compiler *c);
 int desugar_method_call_runtime_name(Compiler *c);
 int desugar_builtin_method_defined_conds(Compiler *c);
@@ -1167,6 +1190,7 @@ int disp_super_call(NodeTable *nt, int ar, int blk);
 int disp_method_missing_call(NodeTable *nt, const char *name, int ar, int blk);
 int desugar_dynamic_respond_to(Compiler *c);
 int desugar_toplevel_instance_exec(Compiler *c);
+int desugar_ie_stored_block_self_recv(Compiler *c);   /* instance method: instance_exec(&<stored>) -> self.instance_exec */
 int desugar_binding_lvget(Compiler *c);
 int desugar_step_kwargs(Compiler *c);
 int desugar_defined_method_call(Compiler *c);
@@ -1253,7 +1277,13 @@ TyKind return_node_type(Compiler *c, int id);
 int infer_return_types(Compiler *c);
 int backprop_hash_return_types(Compiler *c);
 int backprop_call_target(Compiler *c, int call_id);
-int ivar_src_slot(Compiler *c, int v, const char **ivn);
+/* the classes whose ivar a value reads (ivar_src_slots, analyze_pass.c), or
+   reads or stores as a write's value (ivar_value_slots): cls[0..n), in
+   `one` for a single class, else malloc'd (ivar_slots_free) */
+typedef struct { int *cls, n, one; } IvarSlots;
+int ivar_src_slots(Compiler *c, int v, const char **ivn, IvarSlots *sl);
+int ivar_value_slots(Compiler *c, int v, const char **ivn, IvarSlots *sl);
+void ivar_slots_free(IvarSlots *sl);
 void cr_collect_calls(Compiler *c, const NodeTable *nt, int id, char ***out, int *n, int *cap, int instance_self);
 void cr_collect_program_end(Compiler *c, char ***out, int *n, int *cap);   /* the printer of an uncaught exception */
 int cr_ty_builtin_value(Compiler *c, TyKind t);

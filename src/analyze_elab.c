@@ -199,7 +199,6 @@ struct LoadRecord {
   unsigned char *auto_forms; int nauto_forms;   /* method-table changes and their coverage in the provisional record */
   int *auto_owner; int nauto_owner;               /* placed receiver class + 2, or an LR_AUTO_* state */
   unsigned char auto_pending, auto_unknown;
-  unsigned char lambda_owners;   /* checked once by the graph return refusal */
   unsigned char names_any;              /* ...and one it defines by a name the record cannot read */
   /* ...the blocks of the define_methods whose name the record cannot read,
      each of which defines one method that runs that block: a call of any
@@ -1410,10 +1409,11 @@ static void lr_nbody_note(LoadRecord *r, int b, int a, int sg, const char *name)
    (want): the found header's class, LR_UNKNOWN_CLASS for an alias or one
    not known, LR_NEW for a new class. The map also keys a class builder's
    call, and the constant write holding it, by what the builder makes
-   (builder, EB_*; EB_NONE on a header): such an entry opens no class
+   (builder, EB_*; EB_NONE on a header) and the class node of a run-time
+   class's site (site, -1 for none): such an entry opens no class
    (cls and want LR_UNKNOWN_CLASS), so the header readers answer it as a
    node they hold nothing for. */
-typedef struct LrHeader { int node, cls, owner, verdict, found, want, next; char *leaf; unsigned char builder; } LrHeader;
+typedef struct LrHeader { int node, cls, owner, verdict, found, want, next; char *leaf; unsigned char builder; int site_def; } LrHeader;
 
 static LrCheck *lr_family(LoadRecord *r, const char *reader);
 static void lr_node_desc(Compiler *c, int id, char *buf, size_t sz);
@@ -1428,7 +1428,7 @@ static LrHeader *lr_header(LoadRecord *r, int node, int make) {
   for (int i = r->hdr_head[h]; i >= 0; i = r->hdr[i].next) if (r->hdr[i].node == node) return &r->hdr[i];
   if (!make) return NULL;
   r->hdr = lr_grow(r->hdr, &r->chdr, r->nhdr, sizeof *r->hdr);
-  r->hdr[r->nhdr] = (LrHeader){ node, LR_UNKNOWN_CLASS, LR_UNKNOWN_CLASS, ELAB_UNKNOWN, -1, LR_UNKNOWN_CLASS, r->hdr_head[h], NULL, EB_NONE };
+  r->hdr[r->nhdr] = (LrHeader){ node, LR_UNKNOWN_CLASS, LR_UNKNOWN_CLASS, ELAB_UNKNOWN, -1, LR_UNKNOWN_CLASS, r->hdr_head[h], NULL, EB_NONE, -1 };
   r->hdr_head[h] = r->nhdr;
   return &r->hdr[r->nhdr++];
 }
@@ -5200,7 +5200,7 @@ static void lr_call(ElabRec *x, int node, int fc, int fs, unsigned char *vs, int
          nowhere, or `Known::Thing` where Known holds no Thing): the
          statement raises NameError where it runs, before it mixes any in,
          so it is no mixin and defines nothing (codegen reads the mark) */
-      int fail = -1;
+      int fail = -1, later = 0;
       for (int q = 0; q < ac && fail < 0; q++)
         if (q == i ? mod < 0 : lr_class_ref_at(x->c, av[q], NULL) < 0) {
           if (q != i || mod != LR_LATER) fail = lr_const_path_fails(x->c, av[q]);
@@ -5208,8 +5208,12 @@ static void lr_call(ElabRec *x, int node, int fc, int fs, unsigned char *vs, int
              walk made of a hook's body, on the class the hook was given,
              stands in no body of the source) */
           if (fail < 0 && (recv < 0 || nt_kind(nt, recv) == NK_SelfNode) && lr_written_in(x->c, node, fnode))
-            fail = lr_const_root_later(x->c, av[q]);
+            later = (fail = lr_const_root_later(x->c, av[q])) >= 0;
         }
+      /* (a name the program defines further down: a bare statement of a
+         body raises too, which codegen reads; one it defines nowhere may
+         be a module the compiler supplies, FFI's, and stays a declaration there) */
+      if (later) nt_node_set_int((NodeTable *)nt, node, "mixin_const_later", 1);
       if (fail >= 0) {
         int path = nt_kind(nt, fail) == NK_ConstantPathNode && nt_ref(nt, fail, "parent") >= 0;
         nt_node_set_int((NodeTable *)nt, node, path ? "mixin_undefined_path" : "mixin_undefined_const", path ? fail + 1 : 1);
@@ -8652,6 +8656,14 @@ int elab_method_vis_gated(Compiler *c, const char *name) {
   return x->vgate == 2;
 }
 
+int elab_history_vis_word(Compiler *c, int cls, int sg, const char *name) {
+  LoadRecord *r = c->lrec;
+  const LrHist *h = r && r->recorded && name ? lr_hist(r, cls, sg != 0, name, 0) : NULL;
+  for (int j = 0; h && j < h->n; j++)
+    if (h->v[j].kind == LR_VIS && !h->v[j].unplaced && !h->v[j].absent) return 1;
+  return 0;
+}
+
 static int lr_chain_may_hold(Compiler *c, int cls, int sg, int k, LoadPoint p);
 /* See analyze.h. */
 int elab_method_vis_tied(Compiler *c, int cls, const char *name, int def_cls, LoadPoint p) {
@@ -11994,82 +12006,6 @@ static int lr_lambda_self(Compiler *c, int node, const int *parent) {
   return LR_MAIN;
 }
 
-static int lr_lambda_name_arg(const NodeTable *nt, int node, int array) {
-  if (nt_kind(nt, node) == NK_DefNode) return 0;   /* checked at the def itself */
-  if (array && nt_kind(nt, node) == NK_ArrayNode) {
-    int n = 0;
-    const int *v = nt_arr(nt, node, "elements", &n);
-    for (int i = 0; i < n; i++)
-      if (lr_lambda_name_arg(nt, v[i], 0)) return 1;
-    return 0;
-  }
-  const char *name = vis_arg_name(nt, node);
-  return !name || is_lambda_constructor(name);
-}
-
-static int lr_lambda_method_form(const NodeTable *nt, int node) {
-  const char *name = nt_str(nt, node, "name");
-  int n = 0, args = nt_ref(nt, node, "arguments");
-  const int *v = args >= 0 ? nt_arr(nt, args, "arguments", &n) : NULL;
-  if (!name || !n) return 0;
-  if (is_define_method_name(name) || is_define_singleton_method_name(name) || is_alias_method_name(name))
-    return lr_lambda_name_arg(nt, v[0], 0);
-  int vis = visibility_of_name(name) || class_method_vis_of_name(name);
-  if (vis || is_attr_decl_reader(name) || is_undef_method_name(name) || is_remove_method_name(name))
-    for (int i = 0; i < n; i++)
-      if (lr_lambda_name_arg(nt, v[i], vis)) return 1;
-  return 0;
-}
-
-/* Check that every spelling that can change lambda has a recorded owner.
-   Indirect method-table sends and string evals can reach an unknown
-   table even when their syntactic receiver is known. */
-static int lr_lambda_unknown_owner(Compiler *c) {
-  LoadRecord *r = c->lrec;
-  const NodeTable *nt = c->nt;
-  if (r->names_any) NT_FOREACH_KIND(nt, NK_CallNode, f) {
-    const char *name = nt_str(nt, f, "name");
-    int args = nt_ref(nt, f, "arguments"), n = 0;
-    const int *v = args >= 0 ? nt_arr(nt, args, "arguments", &n) : NULL;
-    if (!n) continue;
-    if (is_code_eval_name(name) && nt_ref(nt, f, "block") < 0) return 1;
-    if (is_send_family(name)) {
-      int used = 0;
-      const char *sent = call_sent_name(nt, f, &used);
-      if (!sent ? !lr_send_names_nothing(nt, f, v, n, used)
-                : is_method_naming_call(sent) || is_code_eval_name(sent)) return 1;
-    }
-  }
-  unsigned char *held = calloc((size_t)nt->count, 1);
-  if (!held) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
-  for (int i = 0; i < r->nhist; i++) {
-    const LrHist *h = &r->hist[i];
-    int opaque = h->a == LR_KEY_OPAQUE;
-    if (!opaque && (h->a < LR_MAIN || !is_lambda_constructor(h->name))) continue;
-    const LrClass *k = lr_class(r, opaque ? h->b - 2 : h->a);
-    if (!k || (k->unheld && (opaque || !h->b))) continue;
-    for (int j = 0; j < h->n; j++) {
-      int node = h->v[j].node;
-      if (node >= 0 && node < nt->count && (!opaque || h->v[j].vis == LR_OPAQUE_DEFINES)) held[node] = 1;
-    }
-  }
-  int unknown = 0;
-  NT_FOREACH_KIND(nt, NK_DefNode, d)
-    if (!held[d] && is_lambda_constructor(nt_str(nt, d, "name"))) unknown = 1;
-  NT_FOREACH_KIND(nt, NK_AliasMethodNode, a)
-    if (!held[a] && lr_lambda_name_arg(nt, nt_ref(nt, a, "new_name"), 0)) unknown = 1;
-  NT_FOREACH_KIND(nt, NK_UndefNode, u) if (!held[u]) {
-    int n = 0;
-    const int *v = nt_arr(nt, u, "names", &n);
-    for (int i = 0; i < n; i++)
-      if (lr_lambda_name_arg(nt, v[i], 0)) unknown = 1;
-  }
-  NT_FOREACH_KIND(nt, NK_CallNode, f)
-    if (!held[f] && lr_lambda_method_form(nt, f)) unknown = 1;
-  free(held);
-  return unknown;
-}
-
 int elab_builtin_lambda(Compiler *c, int call, const int *parent) {
   LoadRecord *r = c->lrec;
   const NodeTable *nt = c->nt;
@@ -12085,8 +12021,6 @@ int elab_builtin_lambda(Compiler *c, int call, const int *parent) {
     if (core != CORE_KERNEL && (cls < 0 || cls != comp_core_class(c, CORE_KERNEL))) return 0;
   }
   if (recv < 0 && !lr_class(r, cls)) return 0;
-  if (!r->lambda_owners) r->lambda_owners = lr_lambda_unknown_owner(c) ? 2 : 1;
-  if (r->lambda_owners == 2) return 0;
   if (!lr_class(r, cls)) return 1;   /* Kernel with no reopening */
 
   LrShadowWalk x = { .c = c, .walk = 1, .name = "lambda" };
@@ -13658,7 +13592,9 @@ int elab_fire_after(Compiler *c, int list, int j) {
     }
     const char *hook = lr_event_hook((LrKind)v->kind, v->sg);
     const LrDef *d = NULL;
-    int live = body && v->stmt == e && lr_form_leads(nt, node, v->node) && lr_hook_live(c, v->cls, hook, p, &d);
+    /* (a run-time site's body method, cn_rt_body, is the compiler's: no hook sees it) */
+    int live = body && v->stmt == e && lr_form_leads(nt, node, v->node) && !nt_int(nt, v->node, "rt_body_def", 0) &&
+               lr_hook_live(c, v->cls, hook, p, &d);
     /* a visibility word gives the class an entry of its own, and calls the
        hook, only for a method it does not hold itself and whose visibility
        it changes */
@@ -14003,18 +13939,28 @@ int elab_rec_open(Compiler *c, int node, int cp, const char *cname, const char *
    constant write holding it. A copy of such a node (a clone: a module's
    method copied into each class that includes it) answers as the node it
    copies (nt_clone_source), along a chain of up to 64 copies. */
-void elab_builder_note(Compiler *c, int node, int kind) {
-  lr_header(lr_get(c), node, 1)->builder = (unsigned char)kind;
+void elab_builder_note(Compiler *c, int node, int kind, int site_def) {
+  LrHeader *h = lr_header(lr_get(c), node, 1);
+  h->builder = (unsigned char)kind;
+  h->site_def = site_def;
 }
-int elab_builder_kind(const Compiler *c, int node) {
+static const LrHeader *lr_builder_header(const Compiler *c, int node) {
   for (int depth = 0; c->lrec && node >= 0 && depth < 64; depth++) {
     const LrHeader *h = lr_header(c->lrec, node, 0);
-    if (h) return h->builder;
+    if (h) return h;
     int o = nt_clone_source(c->nt, node);
     if (o < 0) break;
     node = o;
   }
-  return EB_NONE;
+  return NULL;
+}
+int elab_builder_kind(const Compiler *c, int node) {
+  const LrHeader *h = lr_builder_header(c, node);
+  return h ? h->builder : EB_NONE;
+}
+int elab_builder_site(const Compiler *c, int node) {
+  const LrHeader *h = lr_builder_header(c, node);
+  return h ? h->site_def : -1;
 }
 
 /* Header map entry h now keys `node`: moved to that node's bucket */
@@ -14750,6 +14696,10 @@ static int lr_entry_arg(const NodeTable *nt, int node, const char *name, int wri
   return 0;
 }
 
+/* See analyze.h. */
+unsigned long elab_hist_gen(Compiler *c) {
+  return c->lrec && c->lrec->recorded ? c->lrec->hgen + 1 : 0;
+}
 ElabEntry *elab_entries(Compiler *c, unsigned mask, int *n) {
   LoadRecord *r = c->lrec;
   int k = 0, cap = 0;
@@ -16469,6 +16419,12 @@ int elab_const_write_owner(Compiler *c, int node) {
   int cls = r->cwown[node] - 2;
   if (cls == LR_MAIN) cls = comp_core_class(c, CORE_OBJECT);
   return cls >= 0 ? cls : -2;
+}
+/* Does a constant write (its node or its target) put its constant on a
+   singleton's table, as the record found it (`class << self; N = v`)? */
+int elab_const_write_on_singleton(Compiler *c, int node) {
+  const LoadRecord *r = c->lrec;
+  return r && r->cwown && node >= 0 && node < r->ncent && r->cwown[node] < 0;
 }
 /* The key of the value constant entity node is a write of or a read
    names, as elab_const_keys found it; NULL for none (a class's, one the

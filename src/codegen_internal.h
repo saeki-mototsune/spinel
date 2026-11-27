@@ -199,6 +199,19 @@ int emit_strbuf_route(Compiler *c, int v, Buf *b);
 int masgn_flat_targets(const NodeTable *nt, int node, int *out, int n);
 /* does the right side of multiple write mw rebind what `part` (a target's receiver or key) reads (read_rebound_by): a write of a local, a call of a proc that assigns it, user code beside an ivar, gvar or cvar read? */
 int masgn_value_changes(Compiler *c, int mw, int part);
+/* The kind of element i of multiple assignment mw's literal right side, a
+   new typed Array its target holds as the general Array, which is built
+   as one where it is made, so the target and the assignment's value hold
+   one Array: an Array its target's box keeps so (box_lift_marked), or one
+   a general Array target converts (CF_ARRAY_WIDEN). TY_UNKNOWN for any
+   other element. */
+TyKind masgn_el_lift_from(Compiler *c, int mw, int i);
+/* ...and the kind of element i where it keeps its own (a store the plan
+   dispatches, not every arm of which takes the general Array) though it
+   is a new Array a lifting arm takes as the general Array: the value of
+   an assignment read for it then answers the element from a boxed temp
+   (ArmCtx.masgn_back). TY_UNKNOWN for any other element. */
+TyKind masgn_el_back_kind(Compiler *c, int mw, int i);
 /* ...the handle of a boxed receiver's call whose arms answer a String, or of a sequence ending in one */
 void emit_poly_arms_handle(Compiler *c, int base, Buf *b);
 void emit_poly_user_handle(Compiler *c, int v, Buf *b);
@@ -713,7 +726,7 @@ int yield_target_cur(void);
 /* Where a literal block's `return` goes, recorded while the call holding
    the block is spliced (codegen_iter.c): enter when the splice makes the
    block current, leave with what enter answered when it is done. */
-typedef struct { const char *label, *var; TyKind rt; int ro, exc, ens, set; } BlockRetHome;
+typedef struct { const char *label, *var; TyKind rt; int ro, exc, ens, rsc, set; } BlockRetHome;
 BlockRetHome block_ret_home_enter(int block, int saved_block);
 /* The whole block context an inline runs its callee's body under: the block
    current and what its splice binds, the one level out, the forwarded proc
@@ -868,8 +881,9 @@ extern const char *g_proc_return_home;
 int cmethod_takes_self_cls(Compiler *c, const Scope *s);
 /* self, boxed, in method scope s of class s->class_id: a builtin's reopening holds it as the builtin's own value */
 void emit_reopen_self_boxed(Compiler *c, Scope *s, Buf *b);
-const char *emit_cmethod_self_cls_arg(Compiler *c, int mi, int recv_cls, Buf *b);
-int emit_class_cmethod_eqq(Compiler *c, int ci, const char *subj, TyKind pt, int node, int boxed, Buf *b);
+const char *emit_cmethod_self_cls_arg(Compiler *c, int mi, int recv_cls, const char *recv_val, Buf *b);
+/* (cls: the class value the call is on, its receiving class: emit_cmethod_self_cls_arg) */
+int emit_class_cmethod_eqq(Compiler *c, int ci, const char *subj, TyKind pt, int node, int boxed, const char *cls, Buf *b);
 const char *cmethod_cls_token(Compiler *c, Scope *encl);
 const char *cmethod_self_cls(Compiler *c, Scope *encl);
 Scope *open_default_method(void);
@@ -877,10 +891,11 @@ int reopen_self_defaults(Compiler *c, int mi);
 int ctor_needs_self_defaults(Compiler *c, int initm, int argc);
 int bytesplice_form_ok(Compiler *c, const int *argv, int argc);
 void emit_bytesplice_in_place(Compiler *c, const int *argv, int argc, const char *rs, const char *h, Buf *b);
-void emit_ctor_alloc_init(Compiler *c, int cid, int initm, int argsNode, int call_id, Buf *b);
+/* (rtid: the class id the construction builds for, as emit_obj_alloc_expr takes it) */
+void emit_ctor_alloc_init(Compiler *c, int cid, int initm, int argsNode, int call_id, const char *rtid, Buf *b);
 int ctor_needs_self_defaults_argv(Compiler *c, int initm, const int *argv, int argc);
 void emit_ctor_alloc_init_argv(Compiler *c, int cid, int initm, const int *argv, int argc, int argsNode,
-                               Buf *b);
+                               const char *rtid, Buf *b);
 void emit_super_class_new(Compiler *c, int id, Buf *b); /* super in `self.new` */
 extern const char *g_ctor_self;
 extern const char *g_ctor_self_deref;
@@ -900,6 +915,7 @@ extern int g_expr_depth;
 extern int g_proc_toplevel_return;
 extern int g_exc_frame_depth;      /* live begin/rescue setjmp frames (see codegen_util.c) */
 extern int g_method_pr_exc_depth;
+extern int g_method_pr_rescue_depth;  /* g_rescue_save_depth there */
 extern int g_method_pr_ensure_depth;  /* g_ensure_depth at the return-funnel target (see codegen_util.c) */
 extern int g_loop_exc_base;
 extern int g_loop_rescue_base;
@@ -986,7 +1002,7 @@ typedef struct { int lid; int has_retval; int exc_base; TyKind retv_ty; int resc
                     block was written in) is flagged 2 and taken there after the
                     ensure, through the funnel it was written under (#9511) */
                  int pr_track; const char *pr_label;
-                 int oret; const char *oret_label, *oret_var; TyKind oret_ty; int oret_exc, oret_ens; } EnsureCtx;
+                 int oret; const char *oret_label, *oret_var; TyKind oret_ty; int oret_exc, oret_ens, oret_rsc; } EnsureCtx;
 extern EnsureCtx g_ensure_stack[MAX_ENSURE_DEPTH];
 extern int       g_ensure_depth;
 void emit_redo_region_open(Buf *b, int label, int indent);
@@ -1009,6 +1025,9 @@ void emit_rescue_pops_to(Buf *b, int rescue_base);
 void emit_retry_unwind(Buf *b);
 /* The pops of a deferred return handed on to an enclosing ensure (codegen_stmt.c) */
 void emit_ensure_chain_pops(Buf *b, const EnsureCtx *outer);
+/* A deferred return leaving an ensure frame: handed to the method's enclosing ensure, else out through
+   the method's exit (codegen_stmt.c) */
+void emit_ensure_return(Compiler *c, const EnsureCtx *self, int eid, int has_retval, Buf *b, int indent);
 void emit_loop_unwind(Buf *b);
 int emit_frame_unwind(Buf *b, int pop_base, const char *guard);
 int rescues_crossed(int pop_base);
@@ -1254,10 +1273,18 @@ int class_has_exc_name(Compiler *c, int ci);
 int any_exc_reopen(Compiler *c);
 char **dsend_candidates(Compiler *c, int *out_n);
 void emit_super_respond_to(Compiler *c, int id, Scope *s, Buf *b);
+/* the names respond_to? supers' switches case on, interned before the symbol table is written */
+void intern_super_respond_names(Compiler *c);
 /* a super's forwarded parameter pi, boxed (an oint slot through oint_box) */
 void emit_boxed_fwd_param(Compiler *c, Scope *s, int pi, Buf *b);
 /* a super's block argument run for its effect: "(void)(x); " */
 void emit_super_blockarg_effect(Compiler *c, int id, Buf *b);
+/* What super id in s passes where its builtin arm gathers it (cplan_super_gathered), the arm reading its first nread
+   arguments: an Array of it built and rooted into b, inside an open statement expression, then the block argument's
+   effect (emit_super_blockarg_effect), which runs after the arguments, and CRuby's ArgumentError for a count the
+   builtin cannot take; the Array's temp, -2 where the arm reads its arguments as written and a bare super's rest past
+   them is counted with no Array, or -1 where nothing is gathered (the arm runs the block argument itself). */
+int emit_super_gathered_args(Compiler *c, int id, Scope *s, int nread, Buf *b);
 int exc_reopen_definers(Compiler *c, const char *mname, int *out, int max);
 int exc_super_reopen_initialize(Compiler *c, int ci);
 int exc_reopen_initialize_above(Compiler *c, const char *from, int inclusive, int skip_ci);
@@ -1272,8 +1299,12 @@ int cls_id_masquerades(Compiler *c, int cid);
 int visible_as_target(Compiler *c, int k, int target);
 int class_mixes_in(Compiler *c, int cid, int mod, int depth);
 int class_is_comparable(Compiler *c, int cid);
-void emit_visible_cls_id(Compiler *c, const char *var, Buf *b);
-void obj_default_name(Compiler *c, int ci, char *name, size_t nn, char *arg, size_t na);
+void emit_visible_cls_id(Compiler *c, int ci, const char *obj, const char *id, int masq, Buf *b);
+int obj_default_name(Compiler *c, int ci, const char *obj, char *name, size_t nn, char *arg, size_t na);
+void emit_obj_class_id(Compiler *c, int ci, const char *obj, Buf *b);
+void emit_obj_class_value(Compiler *c, int ci, const char *obj, Buf *b);   /* the same, as an sp_Class */
+/* Class#subclasses' entry for class k onto the PolyArray arr (codegen.c) */
+void emit_subclass_push(Compiler *c, int k, const char *arr, const char *when, Buf *b);
 /* Kernel#to_s or #inspect (want_inspect) of an object of program class cid,
    the builtin's own text whatever the program defines: #<Name:0x...>, and
    for inspect the default ivar walk (sp_obj_kernel_inspect). obj is the C
@@ -1281,8 +1312,13 @@ void obj_default_name(Compiler *c, int ci, char *name, size_t nn, char *arg, siz
    a by-value one), evaluated once or twice. */
 void emit_obj_kernel_text(Compiler *c, int cid, int want_inspect, const char *obj, Buf *b);
 void emit_obj_default_inspect(Compiler *c, int cid, const char *p, Buf *b);
+const char *emit_ctor_rt_arg(Compiler *c, int ci, const char *rtid, Buf *b);   /* a site class's constructor's leading argument */
+/* The C id `(cls).cls_id` of the class value text cls, into out (n bytes):
+   what a construction that holds a class value builds for (rtid), NULL
+   for cls NULL */
+const char *ctor_rt_id(const char *cls, char *out, size_t n);
 int class_has_ctor(const ClassInfo *ci);   /* does the class get a sp_X_new (an object of it may exist) */
-int anon_class_text(Compiler *c, int ci, const char *head, Buf *b);
+int anon_class_text(Compiler *c, int ci, const char *obj, const char *head, Buf *b);
 void emit_missing_operand(Compiler *c, int op, int t, Buf *b);
 void emit_raise_operands(Compiler *c, int m, int staged, int t0, Buf *b);
 int scope_def_line(Compiler *c, Scope *s);
@@ -1355,7 +1391,11 @@ void emit_vis_raise_boxed(int vis, const char *vnm, int tv, Buf *b);
 /* The per-class `case` arms that store `src` into each candidate class's
    `base` writer slot through the object pointer text `objp` (codegen_stmt.c).
    box_tv is the boxed receiver's temp (-1 for a typed one), src_tv src's;
-   native_answer: a send's native arm stores the binding's answer in src. */
+   native_answer: a send's native arm stores the binding's answer in src.
+   fresh: src is a new typed Array of kind at nothing else holds
+   (masgn_el_fresh_array), which an arm whose parameter or field is the
+   general Array takes lifted to one; such an arm sets the boxed temp
+   _t<back_tv> (-1 for none) to what it stored. */
 extern int g_writer_arms_attr_only;
 /* Does class k's writer `base=` resolve to an attr writer, the field write
    emit_boxed_writer_arms gives it an arm for (codegen_stmt.c)? */
@@ -1374,7 +1414,7 @@ int poly_writer_attr_arms(Compiler *c, int id, const char *name, int argc, int p
 extern const unsigned char *g_poly_user_arm_skip;
 void emit_boxed_writer_arms(Compiler *c, const char *base, const char *nm,
                             const char *objp, const char *src, TyKind at, int vnode,
-                            int box_tv, int src_tv, int native_answer, Buf *b);
+                            int box_tv, int src_tv, int native_answer, int fresh, int back_tv, Buf *b);
 /* --share-strings: is String value v held as its handle for those arms
    (a field of theirs holds it), -1 when not, else the field's sharing. */
 int  boxed_writer_holds_handle(Compiler *c, const char *base, int v);
@@ -1563,6 +1603,15 @@ int conv_takes_no_args(Compiler *c, int mi);
 void emit_conv_dflt_args(Compiler *c, int mi, Buf *b);
 void emit_str_pattern_expr(Compiler *c, int node, Buf *b);
 void emit_boxed_text(Compiler *c, TyKind t, const char *expr, Buf *b);
+/* Did the analysis mark `node`, a new Array of Integers, Floats or Strings
+   of kind t, one its holder keeps as the general Array (box_lift_arr: a
+   box, a Struct member's `super` argument, a general Array slot)? */
+int box_lift_marked(Compiler *c, int node, TyKind t);
+/* The new Array of kind t `node` builds (box_lift_marked's kinds), as the
+   general Array; a nil (`s&.bytes`) stays NULL. */
+void emit_array_lifted(Compiler *c, int node, TyKind t, Buf *b);
+/* ...of the typed Array of kind t the plain text src (a temp) holds */
+void emit_array_lifted_text(TyKind t, const char *src, Buf *b);
 /* the form --repr-check records when emit_boxed_text boxes a kind t (RF_*) */
 int emit_boxed_text_form(Compiler *c, TyKind t);
 /* emit_boxed_text, but a whole Integer or Float array element read boxes
@@ -2307,7 +2356,7 @@ int each_split_applies(Compiler *c, int id);
 /* The condition the dispatch's enum-proc arm tests `_t<tv>` with: an Array,
    Hash, Range, String Range or Enumerator (codegen_poly_plan.c) */
 void emit_penum_kind_test(Buf *b, int tv);
-void emit_obj_alloc_expr(Compiler *c, int cid, Buf *b);
+void emit_obj_alloc_expr(Compiler *c, int cid, const char *rtid, Buf *b);
 void emit_struct_members_ctor_name(Compiler *c, int cid, Buf *b);
 void emit_pool_fwd(Compiler *c, int cid);
 /* a body written to g_procs ahead of the constructors begins and ends (emit_pool_fwd) */
@@ -2674,7 +2723,7 @@ TyKind reader_override_ty(Compiler *c, int id, int cid, const char *name);
 int emit_tap_then_expr(Compiler *c, int id, Buf *b);
 int recv_is_const(const Compiler *c, const NodeTable *nt, int recv, const char *name);
 int sp_is_fiber_storage_recv(const NodeTable *nt, int recv);
-int emit_ctor_yield_inline(Compiler *c, int id, int ci, Buf *b);
+int emit_ctor_yield_inline(Compiler *c, int id, int ci, const char *rtid, Buf *b);
 int emit_env_args_before(Compiler *c, int id);
 void emit_env_store_value(Compiler *c, int id, const int *argv, TyKind face, Buf *b);
 /* The value ENV.delete(k)'s literal missing-key block answers (its last
@@ -2799,10 +2848,20 @@ int view_mark(void);
    ones it is emitted inside of: an arm that reaches a yielding method
    expands its body, which may hold the same send, and the send is not
    emitted again inside its own arms. count_arm is set while a count's arm
-   of a builtin's generic entry is emitted (bi_generic_fn). */
+   of a builtin's generic entry is emitted (bi_generic_fn). rt_switch names
+   the innermost class-value `new` switch whose arms are being written
+   (emit_class_value_new_switch), linked to the ones it is written inside
+   of: a site class's constructor argument that writes one's class id
+   (rtclass_arg_text) marks it read, and the switch binds the id only then.
+   masgn_back names, for multiple assignment mw read for its value, the
+   boxed temp _t<tv[i]> (0 for none) the value answers element i from:
+   the writer dispatch of that element's store sets it to what it stored
+   (masgn_el_back_kind). */
 typedef struct DsendFrame { int id, depth; const struct DsendFrame *up; } DsendFrame;
+typedef struct MasgnBack { int mw, n; const int *tv; } MasgnBack;
+struct SwitchRtId;
 typedef struct { int pd_skip, prbd_skip, builtin_arm, send_split, each_inline, each_dispatch, gap_watch; int *gap_hit; const char *arm_cls;
-                 const DsendFrame *dsend; int count_arm; } ArmCtx;
+                 const DsendFrame *dsend; int count_arm; struct SwitchRtId *rt_switch; const MasgnBack *masgn_back; } ArmCtx;
 extern ArmCtx g_arm;
 #define g_pd_skip (g_arm.pd_skip)
 #define g_prbd_skip (g_arm.prbd_skip)
@@ -2812,6 +2871,10 @@ int view_push_arm(int pd_skip, int prbd_skip, int builtin_arm);
 int view_push_gap_watch(int id, int *hit);
 /* the arm context with frame f the innermost dynamic send (ArmCtx.dsend), popped by view_pop */
 int view_push_dsend(const DsendFrame *f);
+/* the arm context with switch s the innermost class-value `new` switch (ArmCtx.rt_switch), popped by view_pop */
+int view_push_rt_switch(struct SwitchRtId *s);
+/* the arm context with b the assignment's boxed element temps (ArmCtx.masgn_back), popped by view_pop */
+int view_push_masgn_back(const MasgnBack *mb);
 /* A node pinned to one face kind for the inference asked under it,
    pushed and popped like a view (view_pop) and put back by view_unwind
    (face_of, analyze.h). */
@@ -2892,6 +2955,7 @@ void emit_ivar_name_error(Compiler *c, Buf *b, const char *sym, int arg);
 const char *ivar_raise_tail(Compiler *c, int id);   /* that raise's dead value, in the call's C form */
 int emit_exc_ivar_call(Compiler *c, int id, const char *name, int recv, Buf *b);
 /* The concurrency handles' row emitters (codegen_call_concurrency.c) */
+void emit_queue_new(Compiler *c, int argc, const int *argv, Buf *b);
 int emit_op_thread_set_report(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_thread_raise(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_thread_tls(Compiler *c, const BopCtx *x, Buf *b);
@@ -3022,6 +3086,7 @@ int emit_op_io_for_fd(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_io_select(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_io_copy_stream(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_io_sysopen(Compiler *c, const BopCtx *x, Buf *b);
+int emit_op_class_new(Compiler *c, const BopCtx *x, Buf *b);
 int emit_op_io_set_winsize(Compiler *c, const BopCtx *x, Buf *b);
 /* A typed array receiver of a compare (`ck` "cmp") or a blockless sum (`ck`
    "sum"), wrapped in the runtime's nil check where the array can hold nil

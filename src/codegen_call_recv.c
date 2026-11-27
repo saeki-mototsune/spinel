@@ -8468,6 +8468,28 @@ int emit_op_str_set_n(Compiler *c, const BopCtx *x, Buf *b) {
   int argc;
   const int *argv = call_args(c->nt, x->id, &argc);
   if (!x->rtext) return 0;
+  /* a splat among the sets (`strip(*sets)`, `strip(*)`, a forward's `...`):
+     the sets are gathered when the call runs, each a String (CRuby's
+     TypeError for another) whose conversion the gathered array keeps, and
+     none is the method without sets (whitespace for strip), or for delete
+     and count, which take one at least, CRuby's ArgumentError */
+  if (nt_argv_has_splat(c->nt, argv, argc)) {
+    int tr = ++g_tmp, ta = ++g_tmp, ti = ++g_tmp, ts = ++g_tmp;
+    int one = sp_streq(x->name, "delete") || sp_streq(x->name, "count");
+    buf_printf(b, "({ const char *_t%d = %s; SP_GC_ROOT_STR(_t%d); ", tr, x->rtext, tr);
+    emit_gather_call_args(c, argv, argc, ta, b);
+    buf_printf(b, " sp_int _t%d = _t%d->len; const char *_t%d[_t%d > 0 ? _t%d : 1]; "
+                  "for (sp_int _i = 0; _i < _t%d; _i++) { if (!sp_rbval_is_string(_t%d->data[_i])) "
+                  "sp_PolyArray_set(_t%d, _i, sp_box_nullable_obj(sp_poly_arg_str_handle(_t%d->data[_i]), SP_BUILTIN_STRBUF)); } "
+                  "for (sp_int _i = 0; _i < _t%d; _i++) _t%d[_i] = sp_rbval_string_bytes(_t%d->data[_i]); ",
+               ti, ta, ts, ti, ti, ti, ta, ta, ta, ti, ts, ta);
+    if (one)
+      buf_printf(b, "if (_t%d == 0) sp_raise_cls(\"ArgumentError\", \"wrong number of arguments (given 0, expected 1+)\"); "
+                    "sp_str_%s_n(_t%d, _t%d, _t%d); })", ti, x->name, tr, ts, ti);
+    else
+      buf_printf(b, "_t%d > 0 ? sp_str_%s_n(_t%d, _t%d, _t%d) : sp_str_%s(_t%d); })", ti, x->name, tr, ts, ti, x->name, tr);
+    return 1;
+  }
   int literals = 1;
   for (int a = 0; a < argc; a++)
     if (nt_kind(c->nt, argv[a]) != NK_StringNode) literals = 0;
@@ -11235,8 +11257,13 @@ static int class_has_descendants(Compiler *c, int cid) {
    the constant. */
 static void emit_isa_self_class(Compiler *c, int recv, int cid, Buf *b) {
   if (cid >= 0 && cid < c->nclasses && !c->classes[cid].is_value_type &&
-      (c->classes[cid].is_singleton_of || class_has_descendants(c, cid))) {
-    buf_puts(b, "((sp_Class){("); emit_expr(c, recv, b); buf_puts(b, ")->cls_id})");
+      (c->classes[cid].is_singleton_of || class_has_descendants(c, cid) || cplan_rt_family(c, cid))) {
+    if (!cplan_rt_family(c, cid)) { buf_puts(b, "((sp_Class){("); emit_expr(c, recv, b); buf_puts(b, ")->cls_id})"); return; }
+    /* (an instance of a site class starts at the class made at run time) */
+    int t = ++g_tmp;
+    char to[24], tv[32]; snprintf(to, sizeof to, "_t%d", t); snprintf(tv, sizeof tv, "_t%d->cls_id", t);
+    buf_printf(b, "({ %s *_t%d = (", class_ctype(c, cid), t); emit_expr(c, recv, b);
+    buf_puts(b, "); ((sp_Class){"); emit_visible_cls_id(c, cid, to, tv, 0, b); buf_puts(b, "}); })");
     return;
   }
   buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_printf(b, "), (sp_Class){%d})", cid);
@@ -11344,18 +11371,36 @@ static void emit_obj_clamp3(Compiler *c, int recv, int lo, int hi, Buf *b) {
   buf_puts(b, "); })");
 }
 
+/* An identity that folds to ans (0 or 1): a receiver that may run code runs first, as in CRuby, then the argument;
+   a pure read (subtree_is_pure_read: a local, self, a literal, a temp the run filled) is left out */
+static void emit_identity_fold(Compiler *c, int recv, int arg, int ans, Buf *b) {
+  if (!subtree_is_pure_read(c, recv)) {
+    buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), (void)(");
+  }
+  else buf_puts(b, "((");
+  emit_expr_for_effect(c, arg, b); buf_printf(b, "), %d)", ans);
+}
 static void emit_identity_equal(Compiler *c, int recv, int arg, TyKind rt, TyKind a0, Buf *b) {
   if (a0 == rt) {
     buf_puts(b, "(("); emit_expr(c, recv, b); buf_puts(b, ") == (");
     emit_expr(c, arg, b); buf_puts(b, "))");
   }
   else if (a0 == TY_POLY) {
+    /* (a receiver that may run code runs whatever the box holds; a pure read stays inline; operands with effects on
+       both sides are held in order before this) */
     int te = ++g_tmp;
     buf_printf(b, "({ sp_RbVal _t%d = ", te); emit_boxed(c, arg, b);
-    buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.v.p == (void*)(", te, te);
-    emit_expr(c, recv, b); buf_puts(b, "); })");
+    if (!subtree_is_pure_read(c, recv)) {
+      int tr = ++g_tmp;
+      buf_printf(b, "; void *_t%d = (void *)(", tr); emit_expr(c, recv, b);
+      buf_printf(b, "); _t%d.tag == SP_TAG_OBJ && _t%d.v.p == _t%d; })", te, te, tr);
+    }
+    else {
+      buf_printf(b, "; _t%d.tag == SP_TAG_OBJ && _t%d.v.p == (void*)(", te, te);
+      emit_expr(c, recv, b); buf_puts(b, "); })");
+    }
   }
-  else { buf_puts(b, "(("); emit_expr_for_effect(c, arg, b); buf_puts(b, "), 0)"); }
+  else emit_identity_fold(c, recv, arg, 0, b);
 }
 /* The root of a Struct receiver's temp `_tN`, for an arm that runs no Ruby
    code between the receiver and its last member read. A receiver made in
@@ -13094,8 +13139,7 @@ int emit_object_call(Compiler *c, int id, Buf *b) {
       emit_identity_equal(c, recv, argv[0], rt, a0, b);
       return 1;
     }
-    if (same_sefree_lvalue(c, recv, argv[0])) { buf_puts(b, "(("); emit_expr_for_effect(c, argv[0], b); buf_puts(b, "), 1)"); }
-    else { buf_puts(b, "(("); emit_expr_for_effect(c, argv[0], b); buf_puts(b, "), 0)"); }
+    emit_identity_fold(c, recv, argv[0], same_sefree_lvalue(c, recv, argv[0]), b);
     return 1;
   }
 
@@ -13174,6 +13218,16 @@ int emit_object_call(Compiler *c, int id, Buf *b) {
                are the target and any singleton class of it, which is a set the
                compiler can enumerate (#4142). */
             int t9 = ++g_tmp;
+            /* (a site class's instance answers the class made at run time it
+               was built for, which no constant names: the visible class) */
+            if (cplan_rt_family(c, cid)) {
+              char to[24], tv[48];
+              snprintf(to, sizeof to, "_t%d", t9); snprintf(tv, sizeof tv, "_t%d->cls_id", t9);
+              buf_printf(b, "({ sp_%s *_t%d = (", c->classes[cid].c_name, t9); emit_expr(c, recv, b);
+              buf_puts(b, "); "); emit_visible_cls_id(c, cid, to, tv, 1, b);
+              buf_printf(b, " == %d; })", target);
+              return 1;
+            }
             buf_printf(b, "({ sp_int _t%d = (", t9); emit_expr(c, recv, b);
             buf_printf(b, ")->cls_id; ");
             int first = 1;
@@ -13231,16 +13285,22 @@ int emit_object_call(Compiler *c, int id, Buf *b) {
       else emit_expr(c, argv[0], b);
       buf_printf(b, "; ");
       if (sp_streq(name, "instance_of?")) {
-        if (cid >= 0 && cid < c->nclasses && !c->classes[cid].is_value_type && class_has_descendants(c, cid)) {
+        int rtf = cid >= 0 && cid < c->nclasses && cplan_rt_family(c, cid);
+        if (cid >= 0 && cid < c->nclasses && !c->classes[cid].is_value_type && (class_has_descendants(c, cid) || rtf)) {
           /* the object's own class, which a subclass instance running an
              inherited method (`instance_of?(w(Animal))` in a Dog) does not
              share with the method's: read off the object, a synthesized
-             singleton class answering as its parent (#4142) */
-          int o9 = ++g_tmp;
-          char ov[24]; snprintf(ov, sizeof ov, "_t%d", o9);
-          buf_printf(b, "sp_int _t%d = (", o9); emit_expr(c, recv, b); buf_puts(b, ")->cls_id; ");
-          emit_visible_cls_id(c, ov, b);
-          buf_printf(b, " == _t%d.cls_id; })", k);
+             singleton class answering as its parent (#4142), an instance of
+             a site class as the class made at run time it was built for */
+          int o9 = ++g_tmp, o8 = rtf ? ++g_tmp : -1;
+          char ov[24], on[24]; snprintf(ov, sizeof ov, "_t%d", o9); snprintf(on, sizeof on, "_t%d", o8);
+          if (rtf) buf_printf(b, "%s *%s = (", class_ctype(c, cid), on);
+          else buf_printf(b, "sp_int _t%d = (", o9);
+          emit_expr(c, recv, b);
+          if (rtf) buf_printf(b, "); sp_int _t%d = %s->cls_id; (", o9, on);
+          else buf_puts(b, ")->cls_id; (");
+          emit_visible_cls_id(c, cid, rtf ? on : NULL, ov, 1, b);
+          buf_printf(b, ") == _t%d.cls_id; })", k);
         }
         else buf_printf(b, "((sp_Class){%d}).cls_id == _t%d.cls_id; })", visible_cls_id(c, cid), k);
       }
@@ -13346,7 +13406,7 @@ int emit_object_call(Compiler *c, int id, Buf *b) {
     if (cplan_builtin_call(c, id)) { emit_obj_builtin_text(c, id, recv, cid2, want_ins, b); return 1; }
     if (ci2->is_value_type) {
       char rn2[512], rarg2[96];
-      obj_default_name(c, cid2, rn2, sizeof rn2, rarg2, sizeof rarg2);
+      obj_default_name(c, cid2, NULL, rn2, sizeof rn2, rarg2, sizeof rarg2);
       int tv2 = ++g_tmp;
       buf_printf(b, "({ sp_%s _t%d = ", ci2->c_name, tv2); emit_expr(c, recv, b);
       buf_printf(b, "; sp_sprintf(\"#<%s:0x%%016llx", rn2);
@@ -13415,7 +13475,7 @@ int emit_object_call(Compiler *c, int id, Buf *b) {
       {
         char head[200]; snprintf(head, sizeof head, "undefined method '%s' for an instance of ", name);
         buf_puts(b, "(sp_raise_cls(\"NoMethodError\",");
-        if (!anon_class_text(c, cid, head, b)) buf_printf(b, "\"%s%s\"", head, c->classes[cid].name);
+        if (!anon_class_text(c, cid, NULL, head, b)) buf_printf(b, "\"%s%s\"", head, c->classes[cid].name);
         buf_printf(b, "),%s)", ret_ty == TY_RANGE ? "(sp_Range){0}" : default_value_from_compiler(c, ret_ty));
       }
       return 1;
@@ -17203,6 +17263,29 @@ static int emit_poly_call0_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
     int ebody = nt_ref(nt, eblk, "body");
     int ebn = 0; const int *ebb = ebody >= 0 ? nt_arr(nt, ebody, "body", &ebn) : NULL;
     int ts = ++g_tmp, ta = ++g_tmp, ti = ++g_tmp;
+    if (an_program_makes_io(c)) {
+      /* a boxed IO is read a char per step (sp_poly_each_io), a String
+         walks its chars; the call answers the receiver */
+      int tv = ++g_tmp, tio = ++g_tmp, te = ++g_tmp;
+      buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_boxed(c, recv, b);
+      buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_File *_t%d = sp_poly_each_io(_t%d, \"%s\");", tv, tio, tv, name);
+      buf_printf(b, " const char *_t%d = _t%d ? NULL : sp_poly_recv_s(_t%d, \"%s\"); SP_GC_ROOT(_t%d);", ts, tio, tv, name, ts);
+      buf_printf(b, " sp_StrArray *_t%d = _t%d ? NULL : sp_str_chars(_t%d); SP_GC_ROOT(_t%d);", ta, tio, ts, ta);
+      buf_printf(b, " for (sp_int _t%d = 0; ; _t%d++) { sp_strelem _t%d;", ti, ti, te);
+      buf_printf(b, " if (_t%d) { const char *_c = sp_File_getc(_t%d); if (!_c) break; _t%d = sp_String_new_shared(_c); }", tio, tio, te);
+      buf_printf(b, " else { if (_t%d >= sp_StrArray_length(_t%d)) break; _t%d = sp_StrArray_get%s(_t%d, _t%d); }",
+                 ti, ta, te, typed_elem_store_sfx(TY_STR_ARRAY), ta, ti);
+      buf_printf(b, " SP_GC_ROOT(_t%d);", te);
+      if (ebpn) {
+        char element[32];
+        snprintf(element, sizeof element, "_t%d", te);
+        emit_str_elem_param(c, eblk, ebp, ebpn, element, b);
+      }
+      emit_iter_step_lead(c, ebody, ebn, b, 0);
+      if (repr_of(c, id).kind == RK_BOXED) buf_printf(b, " } _t%d; })", tv);
+      else buf_printf(b, " } _t%d; })", ts);
+      { *out = 1; return 1; }
+    }
     buf_printf(b, "({ const char *_t%d = sp_poly_recv_s(", ts); emit_expr(c, recv, b);
     buf_printf(b, ", \"%s\"); SP_GC_ROOT(_t%d);", name, ts);
     buf_printf(b, " sp_StrArray *_t%d = sp_str_chars(_t%d); SP_GC_ROOT(_t%d);", ta, ts, ta);
@@ -17228,6 +17311,30 @@ static int emit_poly_call0_arms(Compiler *c, int id, Buf *b, const NodeTable *nt
     int ebn = 0; const int *ebb = ebody >= 0 ? nt_arr(nt, ebody, "body", &ebn) : NULL;
     const char *fn = sp_streq(name, "each_byte") ? "sp_str_bytes" : "sp_str_codepoints";
     int ts = ++g_tmp, ta = ++g_tmp, ti = ++g_tmp;
+    if (an_program_makes_io(c)) {
+      /* a boxed IO is read a byte or a char per step (sp_poly_each_io), a
+         String walks its array; the call answers the receiver */
+      int tv = ++g_tmp, tio = ++g_tmp, te = ++g_tmp;
+      int bytes = sp_streq(name, "each_byte");
+      buf_printf(b, "({ sp_RbVal _t%d = ", tv); emit_boxed(c, recv, b);
+      buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_File *_t%d = sp_poly_each_io(_t%d, \"%s\");", tv, tio, tv, name);
+      buf_printf(b, " const char *_t%d = _t%d ? NULL : sp_poly_recv_s(_t%d, \"%s\"); SP_GC_ROOT(_t%d);", ts, tio, tv, name, ts);
+      buf_printf(b, " sp_IntArray *_t%d = _t%d ? NULL : %s(_t%d); SP_GC_ROOT(_t%d);", ta, tio, fn, ts, ta);
+      buf_printf(b, " for (sp_int _t%d = 0; ; _t%d++) { sp_int _t%d;", ti, ti, te);
+      if (bytes) buf_printf(b, " if (_t%d) { sp_oint _o = sp_File_getbyte(_t%d); if (_o.nil) break; _t%d = _o.v; }", tio, tio, te);
+      else buf_printf(b, " if (_t%d) { const char *_c = sp_File_getc(_t%d); if (!_c) break; _t%d = sp_str_ord(_c); }", tio, tio, te);
+      buf_printf(b, " else { if (_t%d >= sp_IntArray_length(_t%d)) break; _t%d = sp_IntArray_get(_t%d, _t%d); }", ti, ta, te, ta, ti);
+      if (ebpn) {
+        Scope *ebs = comp_scope_of(c, eblk);
+        LocalVar *eblv = ebs ? scope_local(ebs, ebp) : NULL;
+        if (eblv && eblv->type == TY_POLY) buf_printf(b, " sp_RbVal lv_%s = sp_box_int(_t%d);", ebpn, te);
+        else buf_printf(b, " sp_int lv_%s = _t%d;", ebpn, te);
+      }
+      emit_iter_step_lead(c, ebody, ebn, b, 0);
+      if (repr_of(c, id).kind == RK_BOXED) buf_printf(b, " } _t%d; })", tv);
+      else buf_printf(b, " } _t%d; })", ts);
+      { *out = 1; return 1; }
+    }
     buf_printf(b, "({ const char *_t%d = sp_poly_recv_s(", ts); emit_expr(c, recv, b);
     buf_printf(b, ", \"%s\"); SP_GC_ROOT(_t%d);", name, ts);
     buf_printf(b, " sp_IntArray *_t%d = %s(_t%d); SP_GC_ROOT(_t%d);", ta, fn, ts, ta);
@@ -17505,7 +17612,7 @@ static int emit_poly_index_call(Compiler *c, int id, Buf *b, const NodeTable *nt
       char src[32]; snprintf(src, sizeof src, "_t%d", tval);
       char objp[32]; snprintf(objp, sizeof objp, "_t%d.v.p", tv);
       emit_boxed_writer_arms(c, base, name, objp, src, at_eff, argv[0], tv, tval,
-                             !call_is_setter_assign(nt, id), b);
+                             !call_is_setter_assign(nt, id), 0, -1, b);
       buf_printf(b, " default: sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d)); break;", name, tv);
       /* the call answers the value it stored; a shared handle stored where
          the call is read as a String answers the String it holds */
@@ -17838,13 +17945,17 @@ static int class_ivar_slot(Compiler *c, int k, const char *sym, char *out, size_
    Static slots remain readable when no builtin-ivar map is needed.
    A boxed receiver only needs those of a class value that can escape. */
 static void emit_class_ivar_arm(Compiler *c, int tv, const char *sym, char op, const char *dflt, int chain, Buf *b) {
+  char tvn[24]; snprintf(tvn, sizeof tvn, "_t%d", tv);
   if (!c->bivar_table && op != 'g') return;
   int any = 0;
   for (int k = 0; k < c->nclasses; k++) {
     char slot[300]; TyKind t;
     if (!class_ivar_slot(c, k, sym, slot, sizeof slot, &t)) continue;
     if (!c->bivar_table && chain && !class_value_escapes(c, k)) continue;
-    if (!any) buf_printf(b, "%sif (_t%d.tag == SP_TAG_CLASS) switch (_t%d.cls_id) {", chain ? "else " : "", tv, tv);
+    if (!any) {
+      buf_printf(b, "%sif (_t%d.tag == SP_TAG_CLASS) switch (", chain ? "else " : "", tv);
+      emit_class_value_key(c, -1, tvn, b); buf_puts(b, ") {");
+    }
     any = 1;
     buf_printf(b, " case %d: ", k);
     /* a class-level number slot (civ_) holds its nil beside the value */
@@ -17880,7 +17991,8 @@ static void emit_class_ivar_arm(Compiler *c, int tv, const char *sym, char op, c
   }
   if (!any) {
     if (!c->bivar_table) return;
-    buf_printf(b, "%sif (_t%d.tag == SP_TAG_CLASS) switch (_t%d.cls_id) {", chain ? "else " : "", tv, tv);
+    buf_printf(b, "%sif (_t%d.tag == SP_TAG_CLASS) switch (", chain ? "else " : "", tv);
+    emit_class_value_key(c, -1, tvn, b); buf_puts(b, ") {");
   }
   if (op == 'd') buf_printf(b, " default: _ivd%d = %s; break; } ", tv, dflt);
   else if (c->bivar_table) buf_printf(b, " default: %s; break; } ", dflt);
@@ -17892,7 +18004,9 @@ static void emit_class_ivar_arm(Compiler *c, int tv, const char *sym, char op, c
    by a class method, lists after the reflective sets) */
 static void emit_class_ivar_list_arm(Compiler *c, int tv, Buf *b) {
   if (!c->bivar_table) return;
-  buf_printf(b, " if (_t%d.tag == SP_TAG_CLASS) { _ivl%d = sp_bivar_list(_t%d); switch (_t%d.cls_id) {", tv, tv, tv, tv);
+  char tvn[24]; snprintf(tvn, sizeof tvn, "_t%d", tv);
+  buf_printf(b, " if (_t%d.tag == SP_TAG_CLASS) { _ivl%d = sp_bivar_list(_t%d); switch (", tv, tv, tv);
+  emit_class_value_key(c, -1, tvn, b); buf_puts(b, ") {");
   for (int k = 0; k < c->nclasses; k++) {
     ClassInfo *ci = &c->classes[k];
     int any = 0;
@@ -19704,6 +19818,36 @@ int emit_poly_call(Compiler *c, int id, Buf *b) {
                                        "named_captures", "names", NULL };
     int want_rx = 0;
     for (int i = 0; RXO[i] && !want_rx; i++) if (sp_streq(name, RXO[i]) && argc == 0) want_rx = 1;
+    /* (a class the receiver holds has a class method of the name: the method's
+       call, or for a local with a boxed result the Regexp's where the value is
+       a pattern at run time) */
+    static int rx_split_skip = -1;
+    if (want_rx && rx_split_skip == id) want_rx = 0;
+    if (want_rx && poly_recv_cls_method_owns(c, id, name)) {
+      want_rx = 0;
+      if (nt_kind(nt, recv) == NK_LocalVariableReadNode && repr_of(c, id).kind == RK_BOXED) {
+        int trx = ++g_tmp;
+        Buf rbx; memset(&rbx, 0, sizeof rbx); emit_expr(c, recv, &rbx);
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "mrb_regexp_pattern *_t%d = sp_poly_as_pattern(%s);\n", trx, rbx.p ? rbx.p : "sp_box_nil()");
+        free(rbx.p);
+        Buf rx; memset(&rx, 0, sizeof rx);
+        view_bind_temp(recv, trx);
+        int v = view_push(c, recv, TY_REGEX);
+        int ok = emit_builtin_op_arm_boxed(c, id, recv, TY_REGEX, name, &rx);
+        view_pop(c, v);
+        view_unbind(g_n_argov - 1);
+        Buf gen; memset(&gen, 0, sizeof gen);
+        int was = rx_split_skip;
+        rx_split_skip = id;
+        emit_call(c, id, &gen);
+        rx_split_skip = was;
+        if (ok) buf_printf(b, "(_t%d ? %s : %s)", trx, rx.p ? rx.p : "sp_box_nil()", gen.p ? gen.p : "sp_box_nil()");
+        else buf_puts(b, gen.p ? gen.p : "sp_box_nil()");
+        free(rx.p); free(gen.p);
+        return 1;
+      }
+    }
     if (want_rx) {
       int trx = ++g_tmp;
       Buf rbx; memset(&rbx, 0, sizeof rbx); emit_expr(c, recv, &rbx);

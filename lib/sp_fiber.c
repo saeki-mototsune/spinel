@@ -16,6 +16,7 @@
 #include <sys/mman.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#include <signal.h>
 
 /* OpenBSD requires the stack a coroutine runs on to be MAP_STACK, else the
    first push faults. Linux defines MAP_STACK as a (currently) no-op; keep it
@@ -512,7 +513,13 @@ static void sp_thread_stack_bounds(char *here) {
 static SP_TLS int sp_fiber_fault_armed = 0;
 /* this thread's sigaltstack buffer; external, so the store is not optimized away */
 SP_TLS void *sp_fiber_altstack;
+extern int (*sp_stack_headroom_low_fn)(void);   /* lib/sp_slab.c */
+extern void (*sp_stack_too_deep_fn)(void);
+extern void sp_stack_too_deep(void);            /* lib/sp_exc.c */
 static void sp_fiber_fault_arm(void) {
+  /* the allocator's slow paths check the stack left through these */
+  sp_stack_headroom_low_fn = sp_stack_headroom_low;
+  sp_stack_too_deep_fn = sp_stack_too_deep;
 #ifdef SP_NO_SIGNALS
   /* Targets with no signals (ESP32: newlib+FreeRTOS): no handler can be
      installed, and the per-thread 64 KB sigaltstack buffer would be charged
@@ -554,6 +561,38 @@ static void sp_fiber_fault_arm(void) {
    into SystemStackError. Fiber creation and worker startup arm it too, so
    this is a no-op once either has run. */
 void sp_stack_guard_init(void) { sp_fiber_fault_arm(); }
+
+/* Whether the running stack has less than SP_STACK_MARGIN left above its
+   guard: a fiber's own stack, or the thread's (sp_thread_stack_lo); a
+   fiber's margin is at most a quarter of its stack. The fault handler above
+   raises an overflow by a longjmp out of the frame that faulted, which is
+   safe in the program's frames and in the runtime's, but not inside libc:
+   an overflow in malloc left its lock held, and the next malloc, from the
+   rescue clause, aborted the process. So the allocator's slow paths, which
+   take malloc and start a collection, ask this first and raise the
+   SystemStackError themselves, from a frame of their own, with the margin
+   for malloc and for the collector's frames (sp_slab.c, sp_alloc.c). */
+int sp_stack_headroom_low(void) {
+  char here;
+  sp_Fiber *f = sp_fiber_current;
+  char *lo, *hi;
+  size_t margin = SP_STACK_MARGIN;
+  if (f && f != &sp_fiber_root && f->stack) {
+    lo = f->stack + sp_fiber_guard();
+    hi = lo + f->stack_size;
+    if (margin > f->stack_size / 4) margin = f->stack_size / 4;
+  } else if (sp_thread_stack_lo && sp_thread_stack_hi) {
+    lo = sp_thread_stack_lo;
+    hi = sp_thread_stack_hi;
+  } else {
+    return 0;
+  }
+  /* a frame outside the stack these bounds are of runs on another one (a
+     host's thread calling into a C extension, where the bounds are the
+     thread that armed the handler's): nothing is known of its room */
+  if (&here < lo || &here >= hi) return 0;
+  return (size_t)(&here - lo) < margin;
+}
 
 /* ---- the stack the program body runs on -------------------------------
    The OS gives a process one stack and decides how big: 8 MB on macOS, and
@@ -600,6 +639,28 @@ static size_t sp_main_stack_bytes(void) {
   return sz;
 }
 
+#ifdef SIGPIPE
+static void sp_sigpipe_nothing(int sig) { (void)sig; }
+#endif
+
+/* SIGPIPE does nothing to the program: a write to a pipe or a socket whose
+   reader is gone fails with EPIPE, and the program raises Errno::EPIPE, as
+   CRuby's does (sig_do_nothing in its signal.c). A handler and not SIG_IGN:
+   a child process that exec starts gets the default disposition back, and
+   SIG_IGN would stay with it. The runtime installs it at the start of the
+   program (sp_main_stack_run), and trap("PIPE", "DEFAULT") puts it back.
+   The socket code (sp_net.c) relies on it and sets nothing of its own. */
+void sp_sigpipe_default(void) {
+#ifdef SIGPIPE
+  struct sigaction sa;
+  memset(&sa, 0, sizeof sa);
+  sa.sa_handler = sp_sigpipe_nothing;
+  sigemptyset(&sa.sa_mask);
+  sa.sa_flags = SA_RESTART;
+  sigaction(SIGPIPE, &sa, NULL);
+#endif
+}
+
 static char *sp_main_stack_base = 0;   /* mmap base (guard + stack), or NULL */
 static size_t sp_main_stack_map = 0;
 static void (*sp_main_stack_body)(void) = 0;
@@ -617,6 +678,7 @@ static void sp_main_stack_entry(void) {
    any size, down to the floor -- run it where we are: a program must not fail
    to start because it could not reserve a big stack. */
 void sp_main_stack_run(void (*body)(void)) {
+  sp_sigpipe_default();
   /* STDOUT on a terminal is written through, as CRuby's is (its FMODE_TTY):
      what a write call wrote is on the terminal when the call returns, though
      STDOUT.sync answers false. stdio's line buffering kept a partial line
@@ -833,7 +895,8 @@ static void sp_Fiber_scan(void*p){sp_Fiber*f=(sp_Fiber*)p;if(f->user_data)sp_gc_
   /* a reachable suspended fiber keeps what its stack holds (its published
      roots); the running one's roots are live, a dead one's are gone */
   if(f!=sp_fiber_collecting&&f!=sp_fiber_current&&f->state!=3)sp_fiber_mark_roots(f);}
-sp_Fiber*sp_Fiber_new(void(*body)(sp_Fiber*)){sp_fiber_fault_arm();sp_Fiber*f=(sp_Fiber*)sp_gc_alloc(sizeof(sp_Fiber),sp_Fiber_fin,sp_Fiber_scan);{size_t _g=sp_fiber_guard();f->stack_size=sp_fiber_stack_bytes();
+static _Alignas(8) unsigned long long sp_fiber_uid_next;
+sp_Fiber*sp_Fiber_new(void(*body)(sp_Fiber*)){sp_fiber_fault_arm();sp_Fiber*f=(sp_Fiber*)sp_gc_alloc(sizeof(sp_Fiber),sp_Fiber_fin,sp_Fiber_scan);f->uid=SP_ATOMIC_ADD_FETCH(&sp_fiber_uid_next,1,__ATOMIC_RELAXED);{size_t _g=sp_fiber_guard();f->stack_size=sp_fiber_stack_bytes();
 /* MAP_NORESERVE: the stack is virtual space until touched, and a strict-overcommit host must not charge every fiber the whole of it (#4496) */
 f->stack=sp_stack_cache_take(f->stack_size);if(!f->stack){f->stack=(char*)mmap(NULL,_g+f->stack_size,PROT_READ|PROT_WRITE,MAP_PRIVATE|MAP_ANONYMOUS|MAP_STACK|MAP_NORESERVE,-1,0);if(f->stack==MAP_FAILED){f->stack=NULL;sp_raise_cls("FiberError","failed to allocate fiber stack");}mprotect(f->stack,_g,PROT_NONE);}}f->state=0;f->transferred=0;f->body=body;f->yielded_value=sp_box_nil();f->resumed_value=sp_box_nil();f->user_data=NULL;f->saved_exc_top=0;f->saved_catch_top=0;f->exc_ctx=sp_exc_ctx_new();f->raised=0;f->raised_cls=NULL;f->raised_msg=NULL;f->raised_obj=NULL;f->inject=0;f->inject_defer=0;f->inj_cls=NULL;f->inj_msg=NULL;f->inj_obj=NULL;f->storage=NULL;f->attrs=NULL;f->birth_file=NULL;f->birth_line=0;f->pass_argc=-1;f->pass_kw=0;f->owner=sp_thread_owner_id();f->return_to=NULL;f->thread_main=0;f->blocking=0;f->stack_released=0;f->saved_roots=NULL;f->saved_nroots=0;f->saved_roots_cap=0;f->fiber_next=NULL;f->fiber_prev=NULL;sp_fiber_list_add(f);sp_fiber_install_gc_hook();if(sp_fiber_current&&sp_fiber_current->storage){sp_Fiber*volatile _froot=f;int _pushed=0;if(sp_gc_nroots<SP_GC_STACK_MAX){sp_gc_roots[sp_gc_nroots++]=(void**)&_froot;_pushed=1;}sp_FiberStore*_fst=sp_FiberStore_dup((sp_FiberStore*)sp_fiber_current->storage);sp_gc_wb((void*)f);f->storage=_fst;if(_pushed)sp_gc_nroots--;}
 #ifdef SP_TSAN

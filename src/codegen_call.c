@@ -168,8 +168,8 @@ static int ctor_block_fresh(Compiler *c, int id) {
    (emit_ctor_yield_inline declined it): the constructor that hands it to the
    initialize's proc-form clone. A literal block at a `new` on a cycle of
    constructors goes the same way, as a proc. 0 when the class has no such
-   clone. */
-int emit_ctor_new_with_proc(Compiler *c, int id, int ci, Buf *b) {
+   clone. cls: the class value it builds for (emit_obj_alloc_expr). */
+int emit_ctor_new_with_proc(Compiler *c, int id, int ci, const char *rtid, Buf *b) {
   if (nt_kind(c->nt, id) == NK_CallNode && cplan_user_new(c, id, ci) >= 0) return 0;
   int blk = nt_ref(c->nt, id, "block");
   int initm = cplan_hook_target(c, id, ci, "initialize", NULL);
@@ -186,7 +186,7 @@ int emit_ctor_new_with_proc(Compiler *c, int id, int ci, Buf *b) {
   if (!ctor_new_runs(c, ci, initm)) {
     if (initm < 0 || !c->scopes[initm].yields) return 0;
     if (by_sblk || nt_kind(c->nt, blk) != NK_BlockArgumentNode || scope_proc_form_of(c, initm) < 0) initm = cplan_hook_target(c, -1, ci, "initialize", NULL);
-    else { emit_ctor_alloc_init(c, ci, initm, nt_ref(c->nt, id, "arguments"), id, b); return 1; }
+    else { emit_ctor_alloc_init(c, ci, initm, nt_ref(c->nt, id, "arguments"), id, rtid, b); return 1; }
   }
   if (ctor_init_proc_form(c, ci) < 0) return 0;
   /* A literal block, here or forwarded from the site a body was spliced
@@ -203,6 +203,7 @@ int emit_ctor_new_with_proc(Compiler *c, int id, int ci, Buf *b) {
     buf_printf(b, "; SP_GC_ROOT(_t%d); ", t);
   }
   buf_printf(b, "sp_%s_new_blk(", c->classes[ci].c_name);
+  buf_puts(b, emit_ctor_rt_arg(c, ci, rtid, b));
   emit_args_filled(c, initm, nt_ref(c->nt, id, "arguments"), "", b);
   if (c->scopes[initm].nparams > 0) buf_puts(b, ", ");
   if (held) buf_printf(b, "_t%d", t);
@@ -211,7 +212,7 @@ int emit_ctor_new_with_proc(Compiler *c, int id, int ci, Buf *b) {
   return 1;
 }
 
-int emit_ctor_yield_inline(Compiler *c, int id, int ci, Buf *b) {
+int emit_ctor_yield_inline(Compiler *c, int id, int ci, const char *rtid, Buf *b) {
   const NodeTable *nt = c->nt;
   /* An ordinary new runs the class method first. Only its Class#new super
      bypasses that method and splices initialize here. */
@@ -336,14 +337,16 @@ int emit_ctor_yield_inline(Compiler *c, int id, int ci, Buf *b) {
      below. A version the constructor does not run is spliced on the bare
      allocation: sp_X_new would run the other one. */
   buf_printf(b, "sp_%s %s_t%d = ", c->classes[ci].c_name, is_val ? "" : "*", st);
-  if (!ctor_new_runs(c, ci, mi)) emit_obj_alloc_expr(c, ci, b);
+  if (!ctor_new_runs(c, ci, mi)) emit_obj_alloc_expr(c, ci, rtid, b);
   else {
     buf_printf(b, "sp_%s_new%s(", c->classes[ci].c_name, ctor_init_proc_form(c, ci) >= 0 ? "_noinit" : "");
+    const char *lead = emit_ctor_rt_arg(c, ci, rtid, b);
     for (int i = 0; i < m->nparams; i++) {
       LocalVar *p = scope_local(m, m->pnames[i]);
       /* a parameter slot holding its nil is declared as the oint */
-      if (p && oint_kind(p->type) && slot_is_oint(p)) { buf_puts(b, i ? ", " : ""); buf_puts(b, oint_nil(p->type)); continue; }
-      buf_puts(b, i ? ", (" : "(");
+      if (p && oint_kind(p->type) && slot_is_oint(p)) { buf_puts(b, i ? ", " : lead); buf_puts(b, oint_nil(p->type)); continue; }
+      buf_puts(b, i ? ", " : lead);
+      buf_puts(b, "(");
       emit_ctype(c, (p && p->type != TY_UNKNOWN) ? p->type : TY_POLY, b);
       buf_puts(b, "){0}");
     }
@@ -1972,6 +1975,8 @@ int emit_reopen_arm_test(Compiler *c, int kmi, const char *name, const char *cls
      reopening as CRuby does. A copy of the reopening's method in the class
      (same def) is the same method. */
   Buf t; memset(&t, 0, sizeof t);
+  char pv[256], key[512]; snprintf(pv, sizeof pv, "(%s)", cls);
+  class_value_key(c, -1, pv, key, sizeof key);
   buf_printf(&t, "!sp_class_nil_p(%s) && !sp_class_is_module_val(%s) && ((%s).cls_id < 0 || ((%s).cls_id != SP_CLASS_BY_NAME", cls, cls, cls, cls);
   int rc = comp_core_class(c, CORE_CLASS_REOPEN), kdef = c->scopes[kmi].def_node;
   mtab_enter(c);   /* (the candidate owner of the classes whose class side answers name otherwise: every class is asked by design, no call's question) */
@@ -1979,7 +1984,7 @@ int emit_reopen_arm_test(Compiler *c, int kmi, const char *name, const char *cls
     if (k == rc || comp_class_is_module(c, &c->classes[k])) continue;
     int own = comp_cmethod_in_chain(c, k, name, NULL);
     if (own >= 0 && own != kmi && c->scopes[own].def_node != kdef)
-      buf_printf(&t, " && (%s).cls_id != %d", cls, k);
+      buf_printf(&t, " && %s != %d", key, k);
   }
   mtab_leave(c);
   buf_puts(&t, "))");
@@ -2244,8 +2249,9 @@ static int emit_poly_cls_value_builtin(Compiler *c, int id, const char *name, in
 static void emit_cls_value_test(Compiler *c, int k, int tv, Buf *b) {
   const char *crn = class_ruby_name(c, k);
   if (!crn) crn = c->classes[k].name;
-  buf_printf(b, "(_t%d.cls_id == %d || (_t%d.cls_id == SP_CLASS_BY_NAME && _t%d.v.s && "
-                "strcmp(_t%d.v.s, \"%s\") == 0)) ? ", tv, k, tv, tv, tv, crn);
+  char tvn[24], key[64]; snprintf(tvn, sizeof tvn, "_t%d", tv);
+  buf_printf(b, "(%s == %d || (_t%d.cls_id == SP_CLASS_BY_NAME && _t%d.v.s && "
+                "strcmp(_t%d.v.s, \"%s\") == 0)) ? ", class_value_key(c, -1, tvn, key, sizeof key), k, tv, tv, tv, crn);
 }
 /* One class value's arm of a class-tag switch (a class-value trial arm of
    cplan_poly_cmeth): the call re-entered on the receiver read as the
@@ -2406,7 +2412,9 @@ int emit_poly_cls_value_prearm(Compiler *c, int id, const char *name, int argc,
   int nc8 = poly_cls_value_cands(c, id, name, argc, &pargs, 1, ccls8, cmi8, cexp8, &wants_blk);
   if (nc8 == 0) { free(ccls8); free(cmi8); free(cexp8); return 0; }
   if (wants_blk && blk_tmp < 0) blk_tmp = hoist_call_block_proc(c, id);
-  buf_printf(b, "if (_t%d.tag == SP_TAG_CLASS) { switch (_t%d.cls_id) {", tv, tv);
+  char tvn8[24]; snprintf(tvn8, sizeof tvn8, "_t%d", tv);
+  buf_printf(b, "if (_t%d.tag == SP_TAG_CLASS) { switch (", tv);
+  emit_class_value_key(c, nt_ref(nt, id, "receiver"), tvn8, b); buf_puts(b, ") {");
   char rcls8[48], rraise8[256];
   snprintf(rcls8, sizeof rcls8, "sp_unbox_class(_t%d)", tv);
   snprintf(rraise8, sizeof rraise8, "sp_raise_nomethod(sp_nomethod_msg(\"%s\", _t%d))", name, tv);
@@ -2436,7 +2444,7 @@ int emit_poly_cls_value_prearm(Compiler *c, int id, const char *name, int argc,
     buf_puts(&cb, "(");
     /* the receiving-class token, when the body reads it: the class this arm's
        case selected (#4217) */
-    const char *lead = rarm8 ? (buf_puts(&cb, rcls8), ", ") : emit_cmethod_self_cls_arg(c, cmi8[i], ccls8[i], &cb);
+    const char *lead = rarm8 ? (buf_puts(&cb, rcls8), ", ") : emit_cmethod_self_cls_arg(c, cmi8[i], ccls8[i], rcls8, &cb);
     ArgLayout L;
     poly_arm_layout(c, ks, &pargs, &L);
     emit_poly_arm_args(c, ks, ks, &L, &pargs, NULL, lead, &pre, &cb);
@@ -11770,7 +11778,7 @@ int emit_poly_method_dispatch(Compiler *c, int id, Buf *b) {
         char an[32], objp[32];
         snprintf(an, sizeof an, "_t%d", wr_src); snprintf(objp, sizeof objp, "_t%d.v.p", tv);
         g_writer_arms_attr_only = 1;
-        emit_boxed_writer_arms(c, wbase, name, objp, an, wr_ty, wr_kw ? -1 : argv[0], tv, wr_src, 0, b);
+        emit_boxed_writer_arms(c, wbase, name, objp, an, wr_ty, wr_kw ? -1 : argv[0], tv, wr_src, 0, 0, -1, b);
         g_writer_arms_attr_only = 0;
       }
       int is_aref = sp_streq(name, "[]") && argc == 1 && splat_a < 0;
@@ -12952,12 +12960,13 @@ int ctor_arm_incompat(Compiler *c, Scope *is, const ArgLayout *L, const int *arg
 }
 
 /* The allocation half of emit_ctor_alloc_init: declares `_tN` holding the
-   uninitialized object (rooted) and answers N. */
-int ctor_alloc_decl(Compiler *c, int cid, Buf *b) {
+   uninitialized object (rooted), built for the class value cls
+   (emit_obj_alloc_expr), and answers N. */
+int ctor_alloc_decl(Compiler *c, int cid, const char *rtid, Buf *b) {
   int is_val = comp_ty_value_obj(c, ty_object(cid));
   int t = ++g_tmp;
   buf_printf(b, "sp_%s %s_t%d = ", c->classes[cid].c_name, is_val ? "" : "*", t);
-  emit_obj_alloc_expr(c, cid, b);
+  emit_obj_alloc_expr(c, cid, rtid, b);
   buf_puts(b, "; ");
   if (!is_val) buf_printf(b, "SP_GC_ROOT(_t%d); ", t);
   return t;
@@ -13004,12 +13013,13 @@ int ctor_new_runs(Compiler *c, int cid, int initm) {
    `args` into `_t<rt2>`, boxed. `pre` (NULL for none) holds the arm's own
    bindings, which put the arm in a block. With `self_t` >= 0 the object was
    already allocated into `_t<self_t>` (a default reads it) and initialize
-   initm runs on it. */
+   initm runs on it. The object is built for the class value cls
+   (emit_ctor_rt_arg). */
 /* The nil bytes a Struct arm sets for the arguments it was given that turn
    out nil (`k.new("x", nil)`), statements on `_s` (emit_ctor_arm_case) */
 const char *g_arm_member_fills = NULL;
 void emit_ctor_arm_case(Compiler *c, int ci, int initm, int rt2, int self_t, const char *pre,
-                               const char *args, int given, Buf *b) {
+                               const char *args, int given, const char *rtid, Buf *b) {
   const char *cn = c->classes[ci].c_name;
   /* A version the constructor does not run (ctor_new_runs: the site's plan
      answers none, or another one) runs on the object allocated here, as
@@ -13019,12 +13029,18 @@ void emit_ctor_arm_case(Compiler *c, int ci, int initm, int rt2, int self_t, con
   Buf apre; memset(&apre, 0, sizeof apre);
   if (self_t < 0 && !members && !ctor_new_runs(c, ci, initm)) {
     if (pre) buf_puts(&apre, pre);
-    self_t = ctor_alloc_decl(c, ci, &apre);
+    self_t = ctor_alloc_decl(c, ci, rtid, &apre);
     pre = apre.p;
   }
   Buf ctor; memset(&ctor, 0, sizeof ctor);
   if (members) emit_struct_members_ctor_name(c, ci, &ctor);
   else buf_printf(&ctor, "sp_%s_new", cn);
+  /* (a site class's constructor takes the class first, and its
+     initialize does not) */
+  Buf ra; memset(&ra, 0, sizeof ra);
+  const char *rl = emit_ctor_rt_arg(c, ci, rtid, &ra);
+  if (args[0]) buf_printf(&ra, "%s%s", rl, args);
+  const char *cargs = ra.p ? ra.p : "";
   /* a Struct built from `given` arguments: the members past them are nil,
      their nil bytes set as the direct `S.new` sets them (#9093) */
   Buf fills; memset(&fills, 0, sizeof fills);
@@ -13032,10 +13048,10 @@ void emit_ctor_arm_case(Compiler *c, int ci, int initm, int rt2, int self_t, con
   if (g_arm_member_fills && g_arm_member_fills[0] && self_t < 0 && !c->classes[ci].is_value_type)
     buf_puts(&fills, g_arm_member_fills);
   if (fills.p) {
-    buf_printf(b, "case %d: { %ssp_%s *_s = %s(%s); %s_t%d=sp_box_obj(_s,", ci, pre ? pre : "", cn, ctor.p, args, fills.p, rt2);
+    buf_printf(b, "case %d: { %ssp_%s *_s = %s(%s); %s_t%d=sp_box_obj(_s,", ci, pre ? pre : "", cn, ctor.p, cargs, fills.p, rt2);
     arysub_box_id(c, ty_object(ci), b);
     buf_puts(b, "); } break;");
-    free(fills.p); free(ctor.p); free(apre.p);
+    free(fills.p); free(ctor.p); free(apre.p); free(ra.p);
     return;
   }
   buf_printf(b, "case %d: ", ci);
@@ -13048,7 +13064,7 @@ void emit_ctor_arm_case(Compiler *c, int ci, int initm, int rt2, int self_t, con
     free(ia.p);
     buf_printf(&obj, "_t%d", self_t);
   }
-  else buf_printf(&obj, "%s(%s)", ctor.p, args);
+  else buf_printf(&obj, "%s(%s)", ctor.p, cargs);
   if (c->classes[ci].is_value_type) buf_printf(b, "_t%d=sp_box_vobj_%s(%s);", rt2, cn, obj.p);
   else {
     /* an Array subclass instance is boxed as its Array (arysub_box_id) */
@@ -13057,7 +13073,7 @@ void emit_ctor_arm_case(Compiler *c, int ci, int initm, int rt2, int self_t, con
     buf_puts(b, ");");
   }
   buf_puts(b, pre ? " } break;" : " break;");
-  free(obj.p); free(ctor.p); free(apre.p);
+  free(obj.p); free(ctor.p); free(apre.p); free(ra.p);
 }
 
 /* `Klass.new(args)` where an omitted default reads the instance: allocate the
@@ -13065,21 +13081,21 @@ void emit_ctor_arm_case(Compiler *c, int ci, int initm, int rt2, int self_t, con
    default sees the object CRuby would have evaluated it on. Answers the object
    (a pointer, or the struct itself for a value-type class). */
 static void ctor_alloc_init(Compiler *c, int cid, int initm, int argsNode, const int *argv, int argc,
-                            int call_id, Buf *b);
+                            int call_id, const char *rtid, Buf *b);
 int ctor_init_takes_block(Compiler *c, int initm);
-void emit_ctor_alloc_init(Compiler *c, int cid, int initm, int argsNode, int call_id, Buf *b) {
-  ctor_alloc_init(c, cid, initm, argsNode, NULL, 0, call_id, b);
+void emit_ctor_alloc_init(Compiler *c, int cid, int initm, int argsNode, int call_id, const char *rtid, Buf *b) {
+  ctor_alloc_init(c, cid, initm, argsNode, NULL, 0, call_id, rtid, b);
 }
 
 /* The same over the arguments `argv` (`raise Cls, msg` constructs with the
    message alone), for a construction with no block. */
 void emit_ctor_alloc_init_argv(Compiler *c, int cid, int initm, const int *argv, int argc, int argsNode,
-                               Buf *b) {
-  ctor_alloc_init(c, cid, initm, argsNode, argv, argc, -1, b);
+                               const char *rtid, Buf *b) {
+  ctor_alloc_init(c, cid, initm, argsNode, argv, argc, -1, rtid, b);
 }
 
 static void ctor_alloc_init(Compiler *c, int cid, int initm, int argsNode, const int *argv, int argc,
-                            int call_id, Buf *b) {
+                            int call_id, const char *rtid, Buf *b) {
   int is_val = comp_ty_value_obj(c, ty_object(cid));
   /* a yielding version has no function of its own: its proc-form clone
      runs it, on the site's proc or on none (yield then raises
@@ -13087,7 +13103,7 @@ static void ctor_alloc_init(Compiler *c, int cid, int initm, int argsNode, const
   int pf = initm >= 0 && c->scopes[initm].yields ? scope_proc_form_of(c, initm) : -1;
   if (pf >= 0) initm = pf;
   buf_puts(b, "({ ");
-  int t = ctor_alloc_decl(c, cid, b);
+  int t = ctor_alloc_decl(c, cid, rtid, b);
   char *selftxt = ctor_self_text(c, cid, initm, t);
   const char *sv_cs = g_ctor_self, *sv_csd = g_ctor_self_deref;
   g_ctor_self = selftxt;
@@ -13722,8 +13738,9 @@ void emit_ctor_block_slot(Compiler *c, int id, int initm, const char *lead, Buf 
    yielding initialize the plan answers for the arm (cplan_new_arm_initialize),
    as emit_ctor_yield_inline does at a static one with the site's: 0, for
    the caller to lay the arm out, when that answer is none, does not yield,
-   or is not the site's (an arm no value reaches) */
-int emit_ctor_splice_arm(Compiler *c, int id, int ci, int rt2, Buf *b) {
+   or is not the site's (an arm no value reaches). cls: the class value
+   the arm builds for (emit_ctor_rt_arg). */
+int emit_ctor_splice_arm(Compiler *c, int id, int ci, int rt2, const char *rtid, Buf *b) {
   int initm = cplan_new_arm_initialize(c, id, ci);
   if (initm < 0 || initm != cplan_hook_target(c, id, ci, "initialize", NULL) || !c->scopes[initm].yields || c->classes[ci].is_struct ||
       comp_class_is_module(c, &c->classes[ci])) return 0;
@@ -13734,7 +13751,7 @@ int emit_ctor_splice_arm(Compiler *c, int id, int ci, int rt2, Buf *b) {
   Buf apre; memset(&apre, 0, sizeof apre);
   Buf yb; memset(&yb, 0, sizeof yb);
   Buf *sv_pre = g_pre; g_pre = &apre;
-  int ok = by_proc ? emit_ctor_new_with_proc(c, id, ci, &yb) : emit_ctor_yield_inline(c, id, ci, &yb);
+  int ok = by_proc ? emit_ctor_new_with_proc(c, id, ci, rtid, &yb) : emit_ctor_yield_inline(c, id, ci, rtid, &yb);
   g_pre = sv_pre;
   if (ok && yb.p) {
     buf_printf(b, "case %d: { %s_t%d=", ci, apre.p ? apre.p : "", rt2);
@@ -13888,9 +13905,10 @@ void ctor_arity_emit(CtorArityArms *g, Buf *b) {
    call does not reach it (call_target: a version entry's else arm pinned to
    the builtin, or a call that runs before every def of it).
    `hoisted` says the arguments are already the boxed temps `atmp`, else they
-   are laid out from the call's own argument list (keywords, a splat). */
+   are laid out from the call's own argument list (keywords, a splat).
+   cls: the switch's class value, the method's receiving class. */
 int emit_user_new_arm(Compiler *c, int id, int ci, int argc, const int *atmp,
-                             int hoisted, int rt2, Buf *b) {
+                             int hoisted, int rt2, const char *cls, Buf *b) {
   int kmi = cplan_user_new(c, id, ci);
   if (kmi < 0) return 0;
   /* (a class the call cannot reach has no arm of its own `new`) */
@@ -13963,7 +13981,7 @@ int emit_user_new_arm(Compiler *c, int id, int ci, int argc, const int *atmp,
   buf_puts(&cb, mc_method(c, ks));
   buf_puts(&cb, "(");
   /* the receiving class is the one this arm's case selected (#4217) */
-  const char *lead = emit_cmethod_self_cls_arg(c, kmi, ci, &cb);
+  const char *lead = emit_cmethod_self_cls_arg(c, kmi, ci, cls, &cb);
   if (hoisted) {
     /* a default reading an earlier parameter (`def self.new(a, b = a)`)
        reads it bound to a local of the arm, as an initialize arm's does
@@ -14156,8 +14174,9 @@ void emit_raise_class_value(Compiler *c, int id, int kn, int mn, Buf *b) {
   if (mn >= 0) {
     mt = hold_operand(c, mn, TY_POLY, 1, mt, 1, " ", b);
   }
-  buf_printf(b, "sp_RbVal _t%d = sp_box_nil(); if (_t%d.tag == SP_TAG_CLASS) switch (_t%d.cls_id) {",
-             rt, kt, kt);
+  char ktn[24]; snprintf(ktn, sizeof ktn, "_t%d", kt);
+  buf_printf(b, "sp_RbVal _t%d = sp_box_nil(); if (_t%d.tag == SP_TAG_CLASS) switch (", rt, kt);
+  emit_class_value_key(c, kn, ktn, b); buf_puts(b, ") {");
   CtorArityArms aerr = {0};
   for (int ci = 0; ci < c->nclasses; ci++) {
     if (is_builtin_reopen(c->classes[ci].name) || c->classes[ci].is_native_class) continue;
@@ -14187,7 +14206,7 @@ void emit_raise_class_value(Compiler *c, int id, int kn, int mn, Buf *b) {
     g_nren = pd_base;
     g_pre = sv_pre;
     if (ctor_init_takes_block(c, initm)) buf_puts(&ab, is->nparams > 0 ? ", NULL" : "NULL");
-    emit_ctor_arm_case(c, ci, initm, rt, -1, pdpre.p, ab.p ? ab.p : "", -1, b);
+    emit_ctor_arm_case(c, ci, initm, rt, -1, pdpre.p, ab.p ? ab.p : "", -1, NULL, b);
     free(pdpre.p); free(ab.p);
   }
   ctor_arity_emit(&aerr, b);
@@ -14245,22 +14264,55 @@ static void emit_kwsplat_empty_check(Compiler *c, int id, int kwh, const char *l
   }
 }
 
+/* (a class made at run time switches as its site class, sp_rtclass.h) */
+static const char *class_value_key_form(Compiler *c, int recv) {
+  return cplan_class_value_may_be_rt(c, recv) ? "sp_rtclass_site(%s.cls_id)" : "%s.cls_id";
+}
 /* See codegen_call_arms.h. */
-void emit_class_value_new_switch(Compiler *c, int rt2, int kt, int boxed, Buf *b) {
+const char *class_value_key(Compiler *c, int recv, const char *val, char *out, size_t n) {
+  snprintf(out, n, class_value_key_form(c, recv), val);
+  return out;
+}
+void emit_class_value_key(Compiler *c, int recv, const char *val, Buf *b) {
+  buf_printf(b, class_value_key_form(c, recv), val);
+}
+
+/* See codegen_call_arms.h. */
+void emit_class_value_new_switch(Compiler *c, int recv, int rt2, int kt, int boxed, SwitchRtId *sid, Buf *b) {
+  char kv[24]; snprintf(kv, sizeof kv, "_t%d", kt);
   buf_printf(b, "sp_RbVal _t%d = sp_box_nil(); ", rt2);
+  /* (the id a site class's arm builds for, bound once: emit_ctor_rt_arg) */
+  if (sid) {
+    *sid = (SwitchRtId){ .at = b->len, .kt = kt, .tok = -1, .up = g_arm.rt_switch };
+    if (c->has_rt_classes) {
+      snprintf(sid->name, sizeof sid->name, "_t%d", ++g_tmp);
+      sid->text = sid->name;
+      sid->tok = view_push_rt_switch(sid);
+    }
+  }
   /* (a class boxed by its name, an object's #class read back out of a
      boxed slot, switches on the id of the program's class of that name) */
   if (boxed && g_emit_class_names) {
     int k = ++g_tmp;
-    buf_printf(b, "sp_int _t%d = _t%d.tag == SP_TAG_CLASS ? _t%d.cls_id : -1; "
+    buf_printf(b, "sp_int _t%d = _t%d.tag == SP_TAG_CLASS ? ", k, kt); emit_class_value_key(c, recv, kv, b);
+    buf_printf(b, " : -1; "
                   "if (_t%d == SP_CLASS_BY_NAME) { _t%d = -1; for (sp_int _j = 0; _j < %d; _j++) { "
                   "const char *_s = sp_class_to_s((sp_Class){_j, NULL}); "
                   "if (_s && _s[0] && _t%d.v.s && !strcmp(_s, _t%d.v.s)) { _t%d = _j; break; } } } ",
-               k, kt, kt, k, k, c->nclasses, kt, kt, k);
+               k, k, c->nclasses, kt, kt, k);
     buf_printf(b, "switch (_t%d) {", k);
   }
-  else if (boxed) buf_printf(b, "switch (_t%d.tag == SP_TAG_CLASS ? _t%d.cls_id : -1) {", kt, kt);
-  else buf_printf(b, "switch(_t%d.cls_id){", kt);
+  else if (boxed) {
+    buf_printf(b, "switch (_t%d.tag == SP_TAG_CLASS ? ", kt); emit_class_value_key(c, recv, kv, b); buf_puts(b, " : -1) {");
+  }
+  else { buf_puts(b, "switch("); emit_class_value_key(c, recv, kv, b); buf_puts(b, "){"); }
+}
+/* See codegen_call_arms.h. */
+void bind_switch_rt_id(Compiler *c, SwitchRtId *sid, Buf *b) {
+  if (sid->tok >= 0) view_pop(c, sid->tok);
+  if (!sid->read) return;
+  char decl[64]; snprintf(decl, sizeof decl, "sp_int %s = _t%d.cls_id; ", sid->text, sid->kt);
+  buf_insert_at(b, sid->at, decl);
 }
 
 int emit_struct_new_call(Compiler *c, int id, int ci, int argc, const int *argv, Buf *b);
@@ -14282,10 +14334,13 @@ void emit_class_value_new_kw(Compiler *c, int id, int recv, int boxed, Buf *b) {
   const NodeTable *nt = c->nt;
   int argc; const int *argv = call_args(nt, id, &argc);
   int kt = ++g_tmp, rt2 = ++g_tmp;
+  /* (the value the switch is on, which an arm's object is built for) */
+  char kv[24]; snprintf(kv, sizeof kv, "_t%d", kt);
   buf_printf(b, "({ %s _t%d = ", boxed ? "sp_RbVal" : "sp_Class", kt); emit_expr(c, recv, b);
   buf_puts(b, "; ");
   int sv_cbt = hoist_ctor_block(c, id, b);
-  emit_class_value_new_switch(c, rt2, kt, boxed, b);
+  SwitchRtId sid; emit_class_value_new_switch(c, recv, rt2, kt, boxed, &sid, b);
+  const char *rtid = sid.text;
   /* the operand of a sole `*splat`, or the SplatNode itself for an anonymous
      `*` forwarding the method's rest (`k.new(*)`) */
   int sole_splat = argc == 1 && nt_kind(nt, argv[0]) == NK_SplatNode ? nt_ref(nt, argv[0], "expression") : -1;
@@ -14304,7 +14359,7 @@ void emit_class_value_new_kw(Compiler *c, int id, int recv, int boxed, Buf *b) {
   int spl = sole_splat >= 0 ? sole_splat : kw_splat;
   for (int ci = 0; ci < c->nclasses; ci++) {
     if (is_builtin_reopen(c->classes[ci].name) || c->classes[ci].is_native_class) continue;
-    if (emit_user_new_arm(c, id, ci, argc, NULL, 0, rt2, b)) continue;
+    if (emit_user_new_arm(c, id, ci, argc, NULL, 0, rt2, kv, b)) continue;
     if (!class_has_ctor(&c->classes[ci])) continue;
     /* the initialize the plan answers at the site: none before the class
        defines one */
@@ -14436,8 +14491,12 @@ void emit_class_value_new_kw(Compiler *c, int id, int recv, int boxed, Buf *b) {
       /* (an initialize the constructor runs and the site does not: the
          object alone) */
       Buf obj; memset(&obj, 0, sizeof obj);
-      if (ctor_new_runs(c, ci, -1)) buf_printf(&obj, "sp_%s_new()", c->classes[ci].c_name);
-      else emit_obj_alloc_expr(c, ci, &obj);
+      if (ctor_new_runs(c, ci, -1)) {
+        buf_printf(&obj, "sp_%s_new(", c->classes[ci].c_name);
+        emit_ctor_rt_arg(c, ci, rtid, &obj);
+        buf_puts(&obj, ")");
+      }
+      else emit_obj_alloc_expr(c, ci, rtid, &obj);
       if (c->classes[ci].is_value_type)
         buf_printf(b, "sp_box_vobj_%s(%s); } break; ", c->classes[ci].c_name, obj.p);
       else {
@@ -14484,7 +14543,7 @@ void emit_class_value_new_kw(Compiler *c, int id, int recv, int boxed, Buf *b) {
        could pass them in the wrong C type. A splat binds every class, and
        keeps every arm. */
     if (!nt_argv_has_splat(nt, argv, argc) && !dynamic_new_may_reach(c, id, ci)) continue;
-    if (emit_ctor_splice_arm(c, id, ci, rt2, b)) continue;
+    if (emit_ctor_splice_arm(c, id, ci, rt2, rtid, b)) continue;
     /* the layout's own statements (a keyword check, a hoisted argument)
        belong to this arm: ahead of the switch every arm's check ran for
        every class, and one class's keywords were unknown to the next */
@@ -14527,13 +14586,13 @@ void emit_class_value_new_kw(Compiler *c, int id, int recv, int boxed, Buf *b) {
       buf_printf(b, "case %d: { %s _t%d=", ci, apre.p ? apre.p : "", rt2);
       buf_printf(b, c->classes[ci].is_value_type ? "sp_box_vobj_%s(" : "sp_box_obj(",
                  c->classes[ci].c_name);
-      emit_ctor_alloc_init(c, ci, initm, nt_ref(nt, id, "arguments"), id, b);
+      emit_ctor_alloc_init(c, ci, initm, nt_ref(nt, id, "arguments"), id, rtid, b);
       if (c->classes[ci].is_value_type) buf_puts(b, "); } break; ");
       else buf_printf(b, ", %d); } break; ", ci);
       free(apre.p); free(aval.p);
       continue;
     }
-    emit_args_filled(c, initm, nt_ref(nt, id, "arguments"), "", &aval);
+    emit_args_filled(c, initm, nt_ref(nt, id, "arguments"), emit_ctor_rt_arg(c, ci, rtid, &aval), &aval);
     /* the constructor's &block slot, as in the positional arms: a `**`
        forwarded here left it out (#4882) */
     emit_ctor_block_slot(c, id, initm, aval.p && aval.p[0] ? ", " : "", &aval);
@@ -14575,6 +14634,7 @@ void emit_class_value_new_kw(Compiler *c, int id, int recv, int boxed, Buf *b) {
     buf_printf(b, "default: sp_raise_nomethod(sp_nomethod_msg(\"new\", _t%d)); } _t%d; })", kt, rt2);
   else
     buf_printf(b, "default: sp_raise_nomethod(sp_nomethod_msg(\"new\", sp_box_class(_t%d))); } _t%d; })", kt, rt2);
+  bind_switch_rt_id(c, &sid, b);
   g_ctor_blk_tmp = sv_cbt;
 }
 
@@ -14592,10 +14652,12 @@ static TyKind struct_member_slot_type(ClassInfo *k, const char *name) {
    build class `ci` from the rest array and the keyword-rest hash the wrapper
    holds, which is what the explicit `super(*a, **k, &blk)` spelling does. */
 static void emit_super_new_forward(Compiler *c, int id, int ci, Scope *s,
-                                   int initm, Buf *b) {
+                                   int initm, const char *rtid, Buf *b) {
   ClassInfo *k = &c->classes[ci];
   if (initm < 0) {
-    buf_printf(b, "sp_%s_new()", k->c_name);
+    buf_printf(b, "sp_%s_new(", k->c_name);
+    emit_ctor_rt_arg(c, ci, rtid, b);
+    buf_puts(b, ")");
     return;
   }
   Scope *is = &c->scopes[initm];
@@ -14661,25 +14723,66 @@ static void emit_super_new_forward(Compiler *c, int id, int ci, Scope *s,
   g_nren = ren_base;
   free(rest_c.p); free(kw_c.p);
   buf_printf(b, "sp_%s_new(", k->c_name);
-  for (int i = 0; i < is->nparams; i++) buf_printf(b, "%slv__sn%d_%d", i ? ", " : "", uid, i);
+  const char *lead = emit_ctor_rt_arg(c, ci, rtid, b);
+  for (int i = 0; i < is->nparams; i++) buf_printf(b, "%slv__sn%d_%d", i ? ", " : lead, uid, i);
   /* the wrapper's own `&blk`, which a bare super forwards; emit_ctor_block_slot
      reads the CALL's block node and a ForwardingSuperNode has none */
   if (is->blk_param && is->blk_param[0] && !is->yields) {
-    if (is->nparams > 0) buf_puts(b, ", ");
+    buf_puts(b, is->nparams > 0 ? ", " : lead);
     if (s->blk_param && s->blk_param[0]) buf_printf(b, "lv_%s", rename_local(s->blk_param));
     else buf_puts(b, "NULL");
   }
   buf_puts(b, "); })");
 }
 
-static void emit_super_new_ctor(Compiler *c, int id, int ci, Buf *b) {
+/* super in `self.new` of an exception subclass with no initialize of its
+   own: Exception#initialize's, built as Klass.new(...) builds it
+   (emit_exc_new_no_init). A bare super passes the method's parameters,
+   each read as a local and the rest spread; a keyword rest is refused.
+   0 for a bare super with keyword parameters, which the general path takes. */
+static int emit_super_exc_no_init(Compiler *c, int id, int ci, Buf *b) {
+  NodeTable *nt = (NodeTable *)c->nt;
+  int argc = 0;
+  if (nt_kind(nt, id) != NK_ForwardingSuperNode) {
+    int argsn = nt_ref(nt, id, "arguments");
+    const int *argv = argsn >= 0 ? nt_arr(nt, argsn, "arguments", &argc) : NULL;
+    emit_exc_new_no_init(c, id, ci, argc, argv, b);
+    return 1;
+  }
+  Scope *s = comp_scope_of(c, id);
+  if (!s) return 0;
+  /* (Exception#initialize takes no keywords, and ignores a block) */
+  if (s->kwrest_idx >= 0) unsupported(c, id, "bare super in an exception's `self.new` with a keyword-rest parameter");
+  for (int i = 0; i < s->nparams; i++)
+    if (!s->pnames[i] || callee_param_is_declared_kwarg(c, s, s->pnames[i])) return 0;
+  int *pv = s->nparams > 0 ? malloc(sizeof(int) * (size_t)s->nparams) : NULL, *rd = s->nparams > 0 ? malloc(sizeof(int) * (size_t)s->nparams) : NULL;
+  for (int i = 0; i < s->nparams; i++) {
+    rd[i] = pv[i] = nt_new_node(nt, "LocalVariableReadNode");
+    nt_node_set_str(nt, pv[i], "name", s->pnames[i]);
+    /* (the rest parameter goes on spread, as `super(*args)`) */
+    if (i == s->rest_idx) { pv[i] = nt_new_node(nt, "SplatNode"); nt_node_set_ref(nt, pv[i], "expression", rd[i]); }
+  }
+  comp_grow_node_arrays(c);
+  for (int i = 0; i < s->nparams; i++) {
+    LocalVar *lv = scope_local(s, s->pnames[i]);
+    c->nscope[pv[i]] = c->nscope[rd[i]] = c->nscope[id];
+    comp_set_ntype(c, rd[i], lv && lv->type != TY_UNKNOWN ? lv->type : TY_POLY);
+  }
+  emit_exc_new_no_init(c, id, ci, s->nparams, pv, b);
+  free(pv); free(rd);
+  return 1;
+}
+
+/* (cls: the receiving class, which the object is built for: emit_ctor_rt_arg) */
+static void emit_super_new_ctor(Compiler *c, int id, int ci, const char *rtid, Buf *b) {
   const NodeTable *nt = c->nt;
   ClassInfo *k = &c->classes[ci];
   /* (a reopened builtin exception has no struct of its own: its `self.new`
      typed an `sp_NoMethodError` the C side never declared, K-056) */
-  if (k->is_struct || k->is_native_class || class_is_exc_subclass(c, ci) || class_is_exc_reopen(c, ci))
+  if (k->is_struct || k->is_native_class || class_is_exc_reopen(c, ci))
     unsupported(c, id, "super in `self.new` of a Struct, Data, exception or native class");
   int initm = cplan_hook_target(c, -1, ci, "initialize", NULL);
+  if (initm < 0 && class_is_exc_subclass(c, ci) && emit_super_exc_no_init(c, id, ci, b)) return;
   int argsn = nt_ref(nt, id, "arguments");
   int argc = 0; if (argsn >= 0) nt_arr(nt, argsn, "arguments", &argc);
   if (nt_kind(nt, id) == NK_ForwardingSuperNode) {
@@ -14695,7 +14798,7 @@ static void emit_super_new_ctor(Compiler *c, int id, int ci, Buf *b) {
       for (int i = 0; i < s->nparams; i++)
         if (i != s->rest_idx && i != s->kwrest_idx) { fwd_only = 0; break; }
     }
-    if (fwd_only) { emit_super_new_forward(c, id, ci, s, initm, b); return; }
+    if (fwd_only) { emit_super_new_forward(c, id, ci, s, initm, rtid, b); return; }
     if (s->rest_idx >= 0 || s->kwrest_idx >= 0 || ob)
       unsupported(c, id, "bare super in `self.new` with a rest, keyword-rest or block parameter");
     for (int i = 0; i < s->nparams; i++)
@@ -14711,8 +14814,9 @@ static void emit_super_new_ctor(Compiler *c, int id, int ci, Buf *b) {
     }
     int by_pf = is && is->yields && ctor_init_proc_form(c, ci) >= 0;
     buf_printf(b, "sp_%s_new%s(", k->c_name, by_pf ? "_blk" : "");
+    const char *lead = emit_ctor_rt_arg(c, ci, rtid, b);
     for (int i = 0; i < inp; i++) {
-      if (i) buf_puts(b, ", ");
+      buf_puts(b, i ? ", " : lead);
       if (i >= s->nparams) { emit_arg_or_default(c, is, i, -1, b); continue; }
       LocalVar *sv = scope_local(s, s->pnames[i]);
       LocalVar *dv = scope_local(is, is->pnames[i]);
@@ -14726,11 +14830,11 @@ static void emit_super_new_ctor(Compiler *c, int id, int ci, Buf *b) {
       free(ln.p);
     }
     if (by_pf) {
-      buf_puts(b, inp > 0 ? ", " : "");
+      buf_puts(b, inp > 0 ? ", " : lead);
       if (s->blk_param && s->blk_param[0]) buf_printf(b, "lv_%s", rename_local(s->blk_param));
       else buf_puts(b, "NULL");
     }
-    else emit_ctor_block_slot(c, id, initm, inp > 0 ? ", " : "", b);
+    else emit_ctor_block_slot(c, id, initm, inp > 0 ? ", " : lead, b);
     buf_puts(b, ")");
     return;
   }
@@ -14750,13 +14854,14 @@ static void emit_super_new_ctor(Compiler *c, int id, int ci, Buf *b) {
     return;
   }
   if (initm >= 0 && ctor_needs_self_defaults(c, initm, sp_unknown_argc ? 0 : argc)) {
-    emit_ctor_alloc_init(c, ci, initm, argsn, id, b);
+    emit_ctor_alloc_init(c, ci, initm, argsn, id, rtid, b);
     return;
   }
-  if (emit_ctor_yield_inline(c, id, ci, b) || emit_ctor_new_with_proc(c, id, ci, b)) return;
+  if (emit_ctor_yield_inline(c, id, ci, rtid, b) || emit_ctor_new_with_proc(c, id, ci, rtid, b)) return;
   buf_printf(b, "sp_%s_new(", k->c_name);
   Buf ab; memset(&ab, 0, sizeof ab);
-  if (initm >= 0) emit_args_filled(c, initm, argsn, "", &ab);
+  const char *lead = emit_ctor_rt_arg(c, ci, rtid, &ab);
+  if (initm >= 0) emit_args_filled(c, initm, argsn, lead, &ab);
   emit_ctor_block_slot(c, id, initm, ab.p && ab.p[0] ? ", " : "", &ab);
   buf_puts(b, ab.p ? ab.p : "");
   buf_puts(b, ")");
@@ -14776,26 +14881,35 @@ void emit_super_class_new(Compiler *c, int id, Buf *b) {
   int nr = comp_new_receivers(c, own);
   /* A spliced class method already has the receiving class at its site;
      there is no function parameter _sp_cls in the enclosing body. */
+  /* (the receiving class the object is built for: the method's, or the
+     class value the splice's self holds) */
+  char rid[256];
+  const char *cls = ctor_rt_id(cmethod_takes_self_cls(c, s) ? cmethod_self_cls(c, s) : NULL, rid, sizeof rid);
   if (s->yields && g_self && g_emitting_class_id >= 0) {
     if (g_emitting_class_id != own) buf_printf(b, "(%s *)", class_ctype(c, own));
-    emit_super_new_ctor(c, id, g_emitting_class_id, b);
+    emit_super_new_ctor(c, id, g_emitting_class_id, cls, b);
     return;
   }
-  if (!nr) { emit_super_new_ctor(c, id, own, b); return; }
+  if (!nr) { emit_super_new_ctor(c, id, own, cls, b); return; }
   int boxed = repr_of(c, id).kind == RK_BOXED, rt = ++g_tmp;
-  if (boxed) buf_printf(b, "({ sp_RbVal _t%d = sp_box_nil(); switch (_sp_cls.cls_id) {", rt);
-  else buf_printf(b, "({ %s *_t%d = NULL; switch (_sp_cls.cls_id) {", class_ctype(c, own), rt);
+  if (boxed) buf_printf(b, "({ sp_RbVal _t%d = sp_box_nil(); switch (", rt);
+  else buf_printf(b, "({ %s *_t%d = NULL; switch (", class_ctype(c, own), rt);
+  emit_class_value_key(c, -1, "_sp_cls", b); buf_puts(b, ") {");
   for (int d = -1; d < nd; d++) {
     int k = d < 0 ? own : ds[d];
     if (d >= 0 && !comp_new_receiver(c, k)) continue;
-    Buf cb; memset(&cb, 0, sizeof cb);
-    emit_super_new_ctor(c, id, k, &cb);
-    buf_printf(b, " case %d: _t%d = ", k, rt);
+    /* (an argument's prelude runs in its arm alone: a splat's `shift` once) */
+    Buf cb, pb; memset(&cb, 0, sizeof cb); memset(&pb, 0, sizeof pb);
+    Buf *sv_pre = g_pre; int sv_ind = g_indent;
+    g_pre = &pb; g_indent = 0;
+    emit_super_new_ctor(c, id, k, cls, &cb);
+    g_pre = sv_pre; g_indent = sv_ind;
+    buf_printf(b, " case %d: { %s_t%d = ", k, pb.p ? pb.p : "", rt);
     if (!boxed) buf_printf(b, "(%s *)%s", class_ctype(c, own), cb.p ? cb.p : "NULL");
     else if (c->classes[k].is_value_type) buf_printf(b, "sp_box_vobj_%s(%s)", c->classes[k].c_name, cb.p ? cb.p : "");
     else { buf_printf(b, "sp_box_obj(%s, ", cb.p ? cb.p : "NULL"); arysub_box_id(c, ty_object(k), b); buf_puts(b, ")"); }
-    buf_puts(b, "; break;");
-    free(cb.p);
+    buf_puts(b, "; } break;");
+    free(cb.p); free(pb.p);
   }
   buf_printf(b, " default: break; } _t%d; })", rt);
 }
@@ -15458,7 +15572,7 @@ static int emit_struct_new_call_members(Compiler *c, int id, int ci, int argc, c
          runs its body inlined at the .new site -- the body drives the block
          and calls super to set the members. Without this the member-wise
          path below runs on the raw args, dropping the block and the body. */
-      if (emit_ctor_yield_inline(c, id, ci, b)) return 1;
+      if (emit_ctor_yield_inline(c, id, ci, NULL, b)) return 1;
       /* a declined inline must not silently fall through to member-wise
          construction (which drops the block); reject loudly instead. */
       unsupported(c, id, "yielding Struct/Data initialize with a non-inlinable body");
@@ -15468,7 +15582,7 @@ static int emit_struct_new_call_members(Compiler *c, int id, int ci, int argc, c
          class's does: in the call it read the caller's self; and a version
          the constructor does not run is called on the allocated object */
       if (!ctor_new_runs(c, ci, scust) || ctor_needs_self_defaults_argv(c, scust, argv, argc)) {
-        emit_ctor_alloc_init(c, ci, scust, nt_ref(nt, id, "arguments"), id, b);
+        emit_ctor_alloc_init(c, ci, scust, nt_ref(nt, id, "arguments"), id, NULL, b);
         return 1;
       }
       buf_printf(b, "sp_%s_new(", cls->c_name);
@@ -16338,6 +16452,32 @@ static int emit_builtin_exc_new_reopened(Compiler *c, int id, Buf *b, const Node
   return r;
 }
 
+/* The argument list of a constructor call `sp_<ci>_new(...)` for the call
+   id, built for the class value cls: a site class's class first
+   (emit_ctor_rt_arg), then initialize initm's arguments, then an explicit
+   `&blk` on a non-yielding initialize as a trailing sp_Proc* (the
+   constructor accepts and forwards it). */
+static void emit_ctor_new_args(Compiler *c, int id, int ci, int initm, const char *rtid, Buf *b) {
+  const char *lead = emit_ctor_rt_arg(c, ci, rtid, b);
+  if (initm < 0) return;
+  emit_args_filled(c, initm, nt_ref(c->nt, id, "arguments"), lead, b);
+  emit_ctor_block_slot(c, id, initm, c->scopes[initm].nparams > 0 ? ", " : lead, b);
+}
+
+/* See codegen_call_arms.h. */
+/* The class value a `new` on receiver recv naming class ci builds for
+   (emit_ctor_rt_arg), into out (n bytes): for a site class, the
+   receiver's own value, a constant or a local that may hold a class made at
+   run time; NULL for any other class. */
+const char *ctor_recv_rtid(Compiler *c, int ci, int recv, char *out, size_t n) {
+  if (ci < 0 || !cplan_rt_site(c, ci)) return NULL;
+  Buf rb; memset(&rb, 0, sizeof rb);
+  emit_expr(c, recv, &rb);
+  const char *id = rb.p ? ctor_rt_id(rb.p, out, n) : NULL;
+  free(rb.p);
+  return id;
+}
+
 static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, int *out) {
   if (!(recv >= 0 && (is_hash_constructor(name)))) return 0;
   NodeKind rk = nt_kind(nt, recv);
@@ -16345,6 +16485,7 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
      constant itself (k = Klass; k.new(...)) */
   if (rk == NK_LocalVariableReadNode && class_var_static_ci(c, recv) >= 0) {
     int ci = class_var_static_ci(c, recv);
+    char rcb[256]; const char *rcls = ctor_recv_rtid(c, ci, recv, rcb, sizeof rcb);
     if (emit_native_ctor(c, id, ci, argc, argv, b)) { *out = 1; return 1; }
     if (ci >= 0 && !c->classes[ci].is_struct) {
       /* the .new result is typed poly (a class-var receiver dispatches
@@ -16353,15 +16494,14 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       int initm = cplan_hook_target(c, id, ci, "initialize", NULL);
       if (!ctor_new_runs(c, ci, initm) || ctor_needs_self_defaults_argv(c, initm, argv, argc)) {
         buf_printf(b, is_val ? "sp_box_vobj_%s(" : "sp_box_obj(", c->classes[ci].c_name);
-        emit_ctor_alloc_init(c, ci, initm, nt_ref(nt, id, "arguments"), id, b);
+        emit_ctor_alloc_init(c, ci, initm, nt_ref(nt, id, "arguments"), id, rcls, b);
         if (is_val) buf_puts(b, ")");
         else { buf_puts(b, ", "); arysub_box_id(c, ty_object(ci), b); buf_puts(b, ")"); }
         { *out = 1; return 1; }
       }
       if (is_val) buf_printf(b, "sp_box_vobj_%s(sp_%s_new(", c->classes[ci].c_name, c->classes[ci].c_name);
       else buf_printf(b, "sp_box_obj(sp_%s_new(", c->classes[ci].c_name);
-      if (initm >= 0) emit_args_filled(c, initm, nt_ref(nt, id, "arguments"), "", b);
-      if (initm >= 0) emit_ctor_block_slot(c, id, initm, c->scopes[initm].nparams > 0 ? ", " : "", b);
+      emit_ctor_new_args(c, id, ci, initm, rcls, b);
       if (is_val) buf_puts(b, "))");
       else { buf_puts(b, "), "); arysub_box_id(c, ty_object(ci), b); buf_puts(b, ")"); }
       { *out = 1; return 1; }
@@ -16373,6 +16513,7 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     int ci = rk == NK_LocalVariableReadNode ? class_var_static_ci(c, recv)
            : rk == NK_CallNode ? anon_struct_ci_for_value(c, recv)
                                                     : const_node_class_index(c, recv);
+    char rcb[256]; const char *rcls = ctor_recv_rtid(c, ci, recv, rcb, sizeof rcb);
     /* a reopened builtin (`class String; def ...`) with no user-defined
        self.new keeps its builtin constructor: fall past the user-ctor logic
        to the builtin cn handler below (#3109) */
@@ -16388,16 +16529,17 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     if (ci >= 0 && c->classes[ci].is_struct) refuse_from_plan(c, id, CRF_RECORD_NEW, "refuse-record-new");
     if (ci >= 0 && c->classes[ci].is_struct && cplan_user_new(c, id, ci) < 0) { *out = emit_struct_new_call(c, id, ci, argc, argv, b); return 1; }
     if (ci >= 0 && !reopen_builtin_new) {
-      /* user exception subclass: use the generated constructor */
-      if (class_is_exc_subclass(c, ci)) {
+      /* user exception subclass: use the generated constructor, unless a
+         `self.new` of the program's takes the call (below) */
+      if (class_is_exc_subclass(c, ci) && cplan_user_new(c, id, ci) < 0) {
         int initm = cplan_hook_target(c, id, ci, "initialize", NULL);
         /* a yielding initialize takes this site's block the way any class's does */
         if (initm >= 0 && c->scopes[initm].yields && nt_ref(nt, id, "block") >= 0 &&
-            (emit_ctor_yield_inline(c, id, ci, b) || emit_ctor_new_with_proc(c, id, ci, b))) { *out = 1; return 1; }
+            (emit_ctor_yield_inline(c, id, ci, NULL, b) || emit_ctor_new_with_proc(c, id, ci, NULL, b))) { *out = 1; return 1; }
         if (initm >= 0 && (!ctor_new_runs(c, ci, initm) || ctor_needs_self_defaults_argv(c, initm, argv, argc))) {
           /* a default reading the instance runs on the allocated object, and
              a version the constructor does not run on it too */
-          emit_ctor_alloc_init(c, ci, initm, nt_ref(nt, id, "arguments"), id, b);
+          emit_ctor_alloc_init(c, ci, initm, nt_ref(nt, id, "arguments"), id, NULL, b);
         }
         else if (initm >= 0) {
           /* user initialize: sp_ClassName_new(args) calls initialize which calls super(msg) */
@@ -16411,7 +16553,7 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       }
       /* yielding initialize: inline its body at the call site (the block
          feeds the yields; the emitted constructor only allocates) */
-      if (emit_ctor_yield_inline(c, id, ci, b) || emit_ctor_new_with_proc(c, id, ci, b)) { *out = 1; return 1; }
+      if (emit_ctor_yield_inline(c, id, ci, rcls, b) || emit_ctor_new_with_proc(c, id, ci, rcls, b)) { *out = 1; return 1; }
       /* user-defined def self.new takes precedence over the constructor:
          the one the call reaches (cplan_user_new; a Struct's may be its
          version entry) */
@@ -16421,7 +16563,7 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
            an inherited `self.new` building with `super`, or naming it */
         buf_puts(b, mc_method(c, &c->scopes[ucnew]));
         buf_puts(b, "(");
-        const char *ld = emit_cmethod_self_cls_arg(c, ucnew, ci, b);
+        const char *ld = emit_cmethod_self_cls_arg(c, ucnew, ci, rcls, b);
         emit_args_filled(c, ucnew, nt_ref(nt, id, "arguments"), ld, b);
         emit_ctor_block_slot(c, id, ucnew, ctor_blk_lead(b), b);
         buf_puts(b, ")");
@@ -16473,14 +16615,11 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       /* a default reading the instance runs on the allocated object, and a
          version the constructor does not run on it too */
       if (!ctor_new_runs(c, ci, initm) || ctor_needs_self_defaults_argv(c, initm, argv, argc)) {
-        emit_ctor_alloc_init(c, ci, initm, nt_ref(nt, id, "arguments"), id, b);
+        emit_ctor_alloc_init(c, ci, initm, nt_ref(nt, id, "arguments"), id, rcls, b);
         { *out = 1; return 1; }
       }
       buf_printf(b, "sp_%s_new(", c->classes[ci].c_name);
-      if (initm >= 0) emit_args_filled(c, initm, nt_ref(nt, id, "arguments"), "", b);
-      /* An explicit `&blk` on a non-yielding initialize is threaded as a
-         trailing sp_Proc* (the constructor accepts + forwards it). */
-      if (initm >= 0) emit_ctor_block_slot(c, id, initm, c->scopes[initm].nparams > 0 ? ", " : "", b);
+      emit_ctor_new_args(c, id, ci, initm, rcls, b);
       buf_puts(b, ")");
       { *out = 1; return 1; }
     }
@@ -16828,7 +16967,7 @@ static int emit_new_call_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
       if (tfb) buf_printf(b, "; _t%d->blocking = sp_poly_truthy(_t%d); _t%d; })", tfb, tbl, tfb);
       { *out = 1; return 1; }
     }
-    if (cn && sp_streq(cn, "Queue")) { buf_puts(b, "sp_Queue_new()"); { *out = 1; return 1; } }
+    if (cn && sp_streq(cn, "Queue")) { emit_queue_new(c, argc, argv, b); { *out = 1; return 1; } }
     if (cn && sp_streq(cn, "SizedQueue") && argc == 1) {
       buf_puts(b, "sp_SizedQueue_new("); emit_int_expr(c, argv[0], b); buf_puts(b, ")"); { *out = 1; return 1; }
     }
@@ -17906,10 +18045,18 @@ static int emit_case_eq_call(Compiler *c, int id, Buf *b) {
          reached with an object and with a symbol widens the parameter to
          poly, and folding the comparison to false then answered false for an
          object compared with itself (#3807). Compare the addresses when the
-         box holds one. */
+         box holds one. A receiver that may run code (no pure read,
+         subtree_is_pure_read) runs whatever the box holds (operands with
+         effects on both sides are held in order before this). */
       buf_puts(b, "({ sp_RbVal _eq = "); emit_boxed(c, argv[0], b);
-      buf_puts(b, "; _eq.tag == SP_TAG_OBJ && (void *)_eq.v.p == (void *)(");
-      emit_expr(c, recv, b); buf_puts(b, "); })");
+      if (!subtree_is_pure_read(c, recv)) {
+        buf_puts(b, "; void *_er = (void *)("); emit_expr(c, recv, b);
+        buf_puts(b, "); _eq.tag == SP_TAG_OBJ && (void *)_eq.v.p == _er; })");
+      }
+      else {
+        buf_puts(b, "; _eq.tag == SP_TAG_OBJ && (void *)_eq.v.p == (void *)(");
+        emit_expr(c, recv, b); buf_puts(b, "); })");
+      }
     }
     else {
       buf_puts(b, "((void)("); emit_expr_for_effect(c, recv, b); buf_puts(b, "), (void)(");
@@ -20475,6 +20622,19 @@ void refl_emit_sym_array(Compiler *c, int cid, ReflNames *r, Buf *b) {
   mtab_build_leave(c);
 }
 
+/* See codegen_call_arms.h. */
+int refl_names_may_list(Compiler *c, const ReflNames *r) {
+  int n = 0;
+  mtab_build_enter(c);
+  for (int i = 0; i < r->n; i++) {
+    CplanCells cs;
+    int guarded, cells = refl_name_cells(c, r, i, &cs, &guarded);
+    n += guarded || cells || (r->show[i] & REFL_SHOWN);
+  }
+  mtab_build_leave(c);
+  return n;
+}
+
 /* The names obj.methods(false) / public_methods(false) /
    singleton_methods(false) answer for an instance of `cid`: the singleton
    methods the object has of its own (public and protected), and for
@@ -20753,7 +20913,12 @@ int emit_value_methods_reflection(Compiler *c, int id, Buf *b) {
   const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
   const char *name = nt_str(nt, id, "name");
   TyKind rt = comp_ntype(c, recv);
-  const char *cls = an_value_methods_class(c, recv, rt, name, argc, argv);
+  const char *cls = an_value_methods_class_at(c, id, recv, rt, name, argc, argv);
+  /* the builtin default of a boxed call beside a class's own `methods`
+     (emit_poly_builtin_default): the list, for the receivers no arm took */
+  if (!cls && rt == TY_POLY && g_arm.builtin_arm && g_arm.pd_skip == id && nt_kind(nt, recv) != NK_SelfNode &&
+      (sp_streq(name, "methods") || sp_streq(name, "public_methods")) &&
+      an_object_methods_all_arg(c, -1, argc, argv) == 1) cls = "";
   if (!cls) return 0;
   int prot = sp_streq(name, "methods");
   if (!cls[0]) {
@@ -21219,7 +21384,8 @@ static int emit_vis_cell_writes(Compiler *c, int id, int elem, Buf *b) {
   for (int k = 0; cplan_vis_cell_after(c, id, k, &g, &v, &only, &we); k++) {
     if (!g || we != elem) continue;
     if (n++) buf_puts(b, ", ");
-    if (only >= 0) buf_printf(b, "_sp_cls.cls_id == %d ? (void)(", only);   /* (the class the include ran on) */
+    /* (the class the include ran on) */
+    if (only >= 0) { emit_class_value_key(c, -1, "_sp_cls", b); buf_printf(b, " == %d ? (void)(", only); }
     buf_printf(b, repr_slot_kind(c, g) == RK_BOXED ? "gv_%s = sp_box_int(%dLL)" : "gv_%s = %dLL", g->name, v);
     if (only >= 0) buf_puts(b, ") : (void)0");
   }
@@ -21317,11 +21483,13 @@ int class_value_arms_yes(const CplanPresList *l) {
    class's own answer */
 void class_value_responds(Compiler *c, const CplanPresList *l, int tv, Buf *b) {
   if (!class_value_arms_yes(l)) return;
+  char tvn[24], key[64]; snprintf(tvn, sizeof tvn, "_t%d", tv);
+  class_value_key(c, -1, tvn, key, sizeof key);
   buf_printf(b, " || (_t%d.tag == SP_TAG_CLASS && (_t%d.cls_id < 0 || _t%d.cls_id == SP_CLASS_BY_NAME ? %d : (0", tv, tv, tv, l->other);
   for (int i = 0; i < l->n; i++) {
     const CplanPresArm *a = &l->arm[i];
     if (a->ans == PRA_NO) continue;
-    buf_printf(b, " || %s_t%d.cls_id == %d", a->ans == PRA_CELLS ? "(" : "", tv, a->cls);
+    buf_printf(b, " || %s%s == %d", a->ans == PRA_CELLS ? "(" : "", key, a->cls);
     if (a->ans != PRA_CELLS) continue;
     buf_puts(b, " && ");
     emit_class_cells_answer(c, &a->cells, a->cells.els, b);
@@ -21379,7 +21547,8 @@ void emit_class_value_responds_helper(Compiler *c, const char *const *texts, int
       class_value_name_once(&reopen, &seen, sc->name);
   }
   free(seen.p);
-  buf_printf(b, "static sp_bool sp_class_value_responds(sp_RbVal v, const char *n) {\n  if (v.tag != SP_TAG_CLASS) return 0;\n  if (sp_str_in_list(n, (const char *const[]){%sNULL})) return 1;\n  sp_bool r = 0;\n  switch (v.cls_id) {", uni.p ? uni.p : "");
+  buf_printf(b, "static sp_bool sp_class_value_responds(sp_RbVal v, const char *n) {\n  if (v.tag != SP_TAG_CLASS) return 0;\n  if (sp_str_in_list(n, (const char *const[]){%sNULL})) return 1;\n  sp_bool r = 0;\n  switch (", uni.p ? uni.p : "");
+  emit_class_value_key(c, -1, "v", b); buf_puts(b, ") {");
   /* the class methods of the program, asked of each class's chain: the names the call plan lists for the class's side */
   for (int k = 0; k < c->nclasses; k++) {
     if (k == comp_core_class(c, CORE_CLASS_REOPEN)) continue;
@@ -22682,10 +22851,11 @@ int builtin_count_refused_boxed(Compiler *c, int id) {
 
 /* The raise for a count a method refuses: the receiver (when asked) and the
    arguments evaluated in order, as CRuby evaluates them before it checks the
-   count, then the ArgumentError with `exp` as the range, yielding the call's
-   default value. Shared by the builtin guard and a call through a Method
-   object whose target is known. */
-void emit_wrong_count(Compiler *c, int id, const char *exp, int eval_recv, int given, Buf *b) {
+   count, then `after` (the caller's effect past the arguments, such as a
+   super's block argument, or NULL), then the ArgumentError with `exp` as the
+   range, yielding the call's default value. Shared by the builtin guard, a
+   call through a Method object whose target is known and a super's count arm. */
+void emit_wrong_count(Compiler *c, int id, const char *exp, int eval_recv, int given, const char *after, Buf *b) {
   const NodeTable *nt = c->nt;
   int recv = nt_ref(nt, id, "receiver");
   int anode = nt_ref(nt, id, "arguments");
@@ -22710,6 +22880,7 @@ void emit_wrong_count(Compiler *c, int id, const char *exp, int eval_recv, int g
       if (v >= 0) { buf_puts(b, "(void)("); emit_expr_for_effect(c, v, b); buf_puts(b, "); "); }
     }
   }
+  if (after) buf_puts(b, after);
   buf_printf(b, "sp_raise_cls(\"ArgumentError\","
                 " \"wrong number of arguments (given %d, expected %s)\"); %s; })",
              given, exp, dv ? dv : "0");
@@ -23196,7 +23367,7 @@ int emit_builtin_arity_guard(Compiler *c, int id, Buf *b) {
                tq, argc, argc, dv ? dv : "0");
     return 1;
   }
-  emit_wrong_count(c, id, exp, eval_recv, given, b);
+  emit_wrong_count(c, id, exp, eval_recv, given, NULL, b);
   return 1;
 }
 
@@ -24656,7 +24827,7 @@ static int emit_object_reopen_vis_refusal(Compiler *c, int id, int vrecv, TyKind
     buf_puts(b, staged ? "sp_stage_recv_args_msg(" : "sp_stage_recv_msg(");
     if (named)
       buf_printf(b, "(&(\"\\xff\" \"%s method '%s' called for %s\")[1])", kind, vnm, cname);
-    else if (!(vcid >= 0 && anon_class_text(c, vcid, head, b)))
+    else if (!(vcid >= 0 && anon_class_text(c, vcid, NULL, head, b)))
       buf_printf(b, "(&(\"\\xff\" \"%s method '%s' called for an instance of %s\")[1])", kind, vnm, cname);
     buf_printf(b, ", _t%d%s%s)", tv, staged ? ", " : "", staged ? args.p : "");
   }
@@ -24825,7 +24996,7 @@ static int emit_vis_refusal_x(Compiler *c, int id, Buf *b, int guard) {
     buf_puts(b, "sp_raise_cls(\"NoMethodError\", ");
     /* nil is named as nil, as CRuby names it */
     int for_nil = !at_main && vcid == comp_core_class(c, CORE_NILCLASS);
-    if (!at_main && !for_nil && anon_class_text(c, vcid, head, b)) buf_puts(b, ")");
+    if (!at_main && !for_nil && anon_class_text(c, vcid, NULL, head, b)) buf_puts(b, ")");
     else buf_printf(b, "(&(\"\\xff\" \"%s method '%s' called for %s%s\")[1]))",
                     vis == SP_VIS_PRIVATE ? "private" : "protected", vnm, at_main || for_nil ? "" : "an instance of ",
                     for_nil ? "nil" : vrn);
@@ -24960,15 +25131,17 @@ static void emit_object_reopen_vis_precheck(Compiler *c, int id, int tv, const c
       every = m != oci && comp_class_is_module(c, &c->classes[m]) && call_target(c, id, m, vnm, CT_OWN, NULL) >= 0 &&
               comp_class_singleton_has_module(c, oci, m);
     /* the rule the typed receiver's refusal asks (emit_object_reopen_vis_refusal) */
+    char tvn[24], key[64]; snprintf(tvn, sizeof tvn, "_t%d", tv);
+    class_value_key(c, -1, tvn, key, sizeof key);
     for (int k = 0; k < c->nclasses && !every; k++)
       if (k != oci && (call_target(c, id, k, vnm, CT_CMETHOD, NULL) >= 0 ||
                        object_reopen_class_value_owns(c, id, oci, vnm, 0, k)))
-        buf_printf(&cv, " || _t%d.cls_id == %d", tv, k);
+        buf_printf(&cv, " || %s == %d", key, k);
     if (every) buf_printf(b, " && _t%d.tag != SP_TAG_CLASS", tv);
     /* a builtin class value (Integer, a name-boxed one) passes only when
        some builtin class has a class method of the name (Integer.sqrt) */
     else if (builtin_cmethod_name_known(vnm))
-      buf_printf(b, " && !(_t%d.tag == SP_TAG_CLASS && (_t%d.cls_id < 0 || _t%d.cls_id >= %d%s))", tv, tv, tv, c->nclasses, cv.p ? cv.p : "");
+      buf_printf(b, " && !(_t%d.tag == SP_TAG_CLASS && (_t%d.cls_id < 0 || %s >= %d%s))", tv, tv, key, c->nclasses, cv.p ? cv.p : "");
     else if (cv.p)
       buf_printf(b, " && !(_t%d.tag == SP_TAG_CLASS && (0%s))", tv, cv.p);
     free(cv.p);
@@ -25048,7 +25221,8 @@ void emit_poly_vis_precheck(Compiler *c, int id, int tv, Buf *b) {
                                vis == SP_VIS_PRIVATE ? "private" : "protected", vnm);
       buf_printf(b, "if (_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == %d) { sp_exc_stage_recv(_t%d); sp_raise_cls(\"NoMethodError\", ",
                  tv, tv, k, tv);
-      if (!anon_class_text(c, k, head, b)) buf_printf(b, "(&(\"\\xff\" \"%s%s\")[1])", head, vrn);
+      char tvp[32]; snprintf(tvp, sizeof tvp, "_t%d.v.p", tv);
+      if (!anon_class_text(c, k, tvp, head, b)) buf_printf(b, "(&(\"\\xff\" \"%s%s\")[1])", head, vrn);
       buf_puts(b, "); } ");
     }
   }
@@ -25643,7 +25817,7 @@ static void emit_missing_raise(Compiler *c, int m, int kind, const char *self, i
   }
   buf_puts(b, staged ? "sp_stage_recv_args_msg(" : "sp_stage_recv_msg(");
   if (tm >= 0) buf_printf(b, "_t%d", tm);
-  else if (anon >= 0) anon_class_text(c, anon, head, b);
+  else if (anon >= 0) anon_class_text(c, anon, NULL, head, b);
   else if (kind == CM_NAMEERROR) buf_printf(b, "\"undefined local variable or method '%s' for %s\"", name, self);
   else buf_printf(b, "(&(\"\\xff\" \"undefined method '%s' for %s\")[1])", name, self);
   buf_puts(b, ", ");
@@ -25904,7 +26078,7 @@ int emit_unresolved_call(Compiler *c, int id, Buf *b) {
       const char *st = cplan_self_text(c, id, g_emitting_class_id, self, sizeof self);
       snprintf(head, sizeof head, "undefined local variable or method '%s' for an instance of ", vnm ? vnm : "?");
       buf_puts(b, "(sp_raise_cls(\"NameError\", ");
-      if (!st && anon_class_text(c, g_emitting_class_id, head, b)) buf_puts(b, ")");
+      if (!st && anon_class_text(c, g_emitting_class_id, g_self, head, b)) buf_puts(b, ")");
       else buf_printf(b, "\"undefined local variable or method '%s' for %s\")", vnm ? vnm : "?", st ? st : "main");
       emit_raise_placeholder(c, id, b);
       return 1;
@@ -25953,7 +26127,7 @@ int emit_unresolved_call(Compiler *c, int id, Buf *b) {
     {
       char head[200]; snprintf(head, sizeof head, "undefined method '%s' for an instance of ", name);
       buf_puts(b, "sp_raise_cls(\"NoMethodError\", ");
-      if (st || !anon_class_text(c, g_emitting_class_id, head, b))
+      if (st || !anon_class_text(c, g_emitting_class_id, g_self, head, b))
         buf_printf(b, "(&(\"\\xff\" \"undefined method '%s' for %s\")[1]))", name, st ? st : "main");
       else buf_puts(b, ")");
       buf_printf(b, ", %s)", (is_scalar_ret(uret) && uret != TY_UNKNOWN) ? default_value_from_compiler(c, uret) : "sp_box_nil()");
@@ -25998,7 +26172,7 @@ int emit_unresolved_call(Compiler *c, int id, Buf *b) {
       for (int k = 0; k < argc; k++) { buf_puts(b, "(void)("); emit_expr_for_effect(c, argv[k], b); buf_puts(b, "), "); }
       char head[200]; snprintf(head, sizeof head, "undefined method '%s' for an instance of ", name);
       buf_puts(b, "sp_raise_cls(\"NoMethodError\", ");
-      if (!st && anon_class_text(c, g_emitting_class_id, head, b)) buf_puts(b, ")");
+      if (!st && anon_class_text(c, g_emitting_class_id, g_self, head, b)) buf_puts(b, ")");
       else buf_printf(b, "(&(\"\\xff\" \"undefined method '%s' for %s\")[1]))", name, st ? st : "main");
       buf_printf(b, ", %s)", (is_scalar_ret(uret) && uret != TY_UNKNOWN) ? default_value_from_compiler(c, uret) : "sp_box_nil()");
       return 1;
@@ -26392,7 +26566,7 @@ int emit_unresolved_call(Compiler *c, int id, Buf *b) {
             Buf cb; memset(&cb, 0, sizeof cb);
             int ksym = cpf[k] >= 0 ? cpf[k] : cmi[k];
             buf_printf(&cb, "%s(", mc_method(c, &c->scopes[ksym]));
-            const char *leadk = rarm ? (buf_puts(&cb, rcls), ", ") : emit_cmethod_self_cls_arg(c, ksym, ccls[k], &cb);
+            const char *leadk = rarm ? (buf_puts(&cb, rcls), ", ") : emit_cmethod_self_cls_arg(c, ksym, ccls[k], rcls, &cb);
             /* What the binding puts ahead of the call -- a count or keyword
                check and its ArgumentError, a splat's gather, a `**` merge --
                belongs to this arm alone: in the statement's prelude it ran
@@ -26797,7 +26971,7 @@ if (recv >= 0 && nm && (grt == TY_RATIONAL || grt == TY_COMPLEX)) {
               if (anon_ci >= 0) {
                 char head[160]; snprintf(head, sizeof head, "%s an instance of ", hd);
                 Buf ab; memset(&ab, 0, sizeof ab);
-                if (anon_class_text(c, anon_ci, head, &ab)) snprintf(gmsg, sizeof gmsg, "%s", ab.p);
+                if (anon_class_text(c, anon_ci, NULL, head, &ab)) snprintf(gmsg, sizeof gmsg, "%s", ab.p);
                 free(ab.p);
               }
             }
@@ -26945,9 +27119,11 @@ int emit_poly_isa_test(Compiler *c, const char *cn, const char *v, int exact, Bu
       if (ext) {
         buf_printf(b, " || (%s.tag == SP_TAG_CLASS && (", v);
         int any = 0;
+        char uv[256], key[512]; snprintf(uv, sizeof uv, "sp_unbox_class(%s)", v);
+        class_value_key(c, -1, uv, key, sizeof key);
         for (int k = 0; k < c->nclasses; k++)
           if (comp_class_singleton_has_module(c, k, cid)) {
-            buf_printf(b, "%ssp_unbox_class(%s).cls_id == %d", any ? " || " : "", v, k);
+            buf_printf(b, "%s%s == %d", any ? " || " : "", key, k);
             any = 1;
           }
         buf_puts(b, ")))");
@@ -32207,7 +32383,78 @@ static int emit_call_env_box_read(Compiler *c, int id, Buf *b) {
   free(rb.p);
   return 1;
 }
+/* Operand `node` run into a temp at g_pre's end and bound to it (the
+   emitters read the temp); 0 for one with no C value to hold */
+static int fetch_hold_operand(Compiler *c, int node) {
+  TyKind t = repr_of(c, node).as_ty;
+  if (t == TY_UNKNOWN || t == TY_VOID || t == TY_NIL) return 0;
+  int tr = ++g_tmp;
+  Buf vb; memset(&vb, 0, sizeof vb);
+  if (oint_kind(t) && node_is_oint(c, node)) {
+    emit_oint_expr(c, node, t, &vb);
+    emit_indent(g_pre, g_indent);
+    buf_printf(g_pre, "%s _t%d = %s;\n", oint_ctype(t), tr, vb.p ? vb.p : "0");
+    view_bind_temp_o(node, tr);
+  }
+  else {
+    emit_expr(c, node, &vb);
+    emit_indent(g_pre, g_indent);
+    emit_ctype(c, t, g_pre);
+    buf_printf(g_pre, " _t%d = %s; ", tr, vb.p ? vb.p : "0");
+    emit_gc_root_tmp(c, t, tr, g_pre);
+    buf_puts(g_pre, "\n");
+    view_bind_temp(node, tr);
+  }
+  free(vb.p);
+  return 1;
+}
+/* `recv.fetch(key, default)` whose default runs code: Ruby evaluates the
+   default as an argument, on a hit too, but the arms build it only on a
+   miss (`h.fetch(:a, ($t << 1; 9))` left $t empty). The receiver, the key
+   and the default run first, in that order, into temps the arms read
+   (#11506); a receiver or key that is self or a literal is read where it
+   stands. */
+static int g_fetch_held_id = -1;
+static int emit_call_fetch_default_first(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  const char *nm = nt_str(nt, id, "name");
+  int store = sp_streq(nm, "[]=") || sp_streq(nm, "store");
+  if (id == g_fetch_held_id || !g_pre || !(store || sp_streq(nm, "fetch")) || nt_ref(nt, id, "block") >= 0) return 0;
+  int recv = nt_ref(nt, id, "receiver"), argc = 0;
+  const int *argv = call_args(nt, id, &argc);
+  if (recv < 0 || argc != 2 || nt_safe_nav(nt, id) || g_n_argov + 3 > MAX_ARG_OVERRIDE) return 0;
+  for (int i = 0; i < 2; i++) {
+    NodeKind ak = nt_kind(nt, argv[i]);
+    if (ak == NK_SplatNode || ak == NK_KeywordHashNode || ak == NK_BlockArgumentNode || ak == NK_ForwardingArgumentsNode) return 0;
+  }
+  if (!subtree_has_side_effect(c, argv[1]) || arg_ran_first(argv[1], 0)) return 0;
+  /* (a store's value goes to the call as its argument; only a key that
+     runs code ahead of a value that does is held, and the value itself
+     stays where the store takes it: its statements no longer run first) */
+  if (store && (!subtree_has_side_effect(c, argv[0]) || arg_ran_first(argv[0], 0))) return 0;
+  size_t mark = g_pre->len;
+  int t0 = g_tmp, sv = g_n_argov, ok = 1;
+  const int ops[3] = { recv, argv[0], argv[1] };
+  for (int i = 0; i < (store ? 2 : 3) && ok; i++) {
+    NodeKind k = nt_kind(nt, ops[i]);
+    if (i < 2 && (k == NK_SelfNode || k == NK_SymbolNode || k == NK_StringNode || k == NK_IntegerNode || k == NK_NilNode ||
+                  arg_ran_first(ops[i], 0) || (store && i == 0 && !subtree_has_side_effect(c, ops[i])))) continue;
+    ok = fetch_hold_operand(c, ops[i]);
+  }
+  if (!ok) {
+    view_unbind(sv);
+    g_pre->len = mark; if (g_pre->p) g_pre->p[mark] = 0; g_tmp = t0;
+    return 0;
+  }
+  int sv_id = g_fetch_held_id;
+  g_fetch_held_id = id;
+  emit_call(c, id, b);
+  g_fetch_held_id = sv_id;
+  view_unbind(sv);
+  return 1;
+}
 void emit_call(Compiler *c, int id, Buf *b) {
+  if (emit_call_fetch_default_first(c, id, b)) return;
   if (emit_call_env_box_read(c, id, b)) return;
   if (sp_streq(nt_str(c->nt, id, "name"), "===") &&
       emit_undefined_const_test(c, nt_ref(c->nt, id, "receiver"), repr_of(c, id).as_ty, b)) return;
@@ -33845,7 +34092,7 @@ int emit_method_tramp_fn(Compiler *c, Scope *tm, int shift, const char *fname,
   /* the class the call passes first, named before any default is spelled: a default of the method that reads
      its receiving class (`v = new`) spells the class this names (cmethod_cls_token) */
   Buf clsarg = {0};
-  const char *clslead = emit_cmethod_self_cls_arg(c, (int)(tm - c->scopes), self_cls, &clsarg);
+  const char *clslead = emit_cmethod_self_cls_arg(c, (int)(tm - c->scopes), self_cls, NULL, &clsarg);
   if (bind && tm->rest_idx >= 0) buf_puts(pb, "  SP_GC_SAVE();\n");
   buf_puts(pb, "  sp_BoundMethod *_m = (sp_BoundMethod *)cap; (void)_m; (void)argc; (void)args;\n");
   /* the block a `.call { }` or `.call(&b)` gave this call (_sp_proc_blk),
@@ -35020,7 +35267,7 @@ void emit_bound_method_call(Compiler *c, int id, int recv, int target, Buf *b) {
   const char *lead = "";
   if (boxed_self) { buf_printf(&args, "%s", selfp); lead = ", "; }
   else if (self_ful) { buf_printf(&args, "_t%d->self", tr); lead = ", "; }
-  else lead = emit_cmethod_self_cls_arg(c, target, method_node_recv_class(c, recv, tm->class_id), &args);
+  else lead = emit_cmethod_self_cls_arg(c, target, method_node_recv_class(c, recv, tm->class_id), NULL, &args);
   emit_args_filled(c, target, nt_ref(c->nt, id, "arguments"), lead, &args);
   g_arm_self = sv_arm_self; g_arm_scope = sv_arm_scope; g_arm_depth = sv_arm_depth;
   emit_method_call_block(c, id, tm, tm->nparams > 0 || args.len > 0, &args);
@@ -35143,7 +35390,7 @@ void emit_bind_call(Compiler *c, int id, int target, const int *argv, int argc, 
    bound as emit_bind_call binds them, and its answer goes to `_t<tr>`, a slot
    of `slot`'s type. */
 static void emit_bind_call_arm(Compiler *c, int id, int target, const int *argv, int argc,
-                               int to, int tr, TyKind slot, Buf *b) {
+                               int to, int tr, TyKind slot, const char *kv, Buf *b) {
   Scope *tm = &c->scopes[target];
   int cid = tm->class_id;
   const char *cn = c->classes[cid].name;
@@ -35161,10 +35408,16 @@ static void emit_bind_call_arm(Compiler *c, int id, int target, const int *argv,
     if (any) buf_printf(b, ")) sp_raise_cls(\"TypeError\", \"bind argument must be an instance of %s\"); ", cn);
   }
   else {
+    /* (a site's method is owned by each class made there: obj must be an
+       instance of the one the Method came from, `kv`, which the message names) */
+    int rt = kv && cplan_rt_site(c, cid);
     buf_printf(b, "if (!(_t%d.tag == SP_TAG_OBJ && (0", to);
     for (int k = 0; k < c->nclasses; k++)
       if (class_isa_user(c, k, cid)) buf_printf(b, " || _t%d.cls_id == %d", to, k);
-    buf_printf(b, "))) sp_raise_cls(\"TypeError\", \"bind argument must be an instance of %s\"); ", cn);
+    if (!rt) buf_printf(b, "))) sp_raise_cls(\"TypeError\", \"bind argument must be an instance of %s\"); ", cn);
+    else
+      buf_printf(b, ") && (!sp_rtclass_id_p(%s.cls_id) || sp_obj_rtclass_fn(_t%d) == %s.cls_id))) sp_raise_cls(\"TypeError\", "
+                    "sp_sprintf(\"bind argument must be an instance of %%s\", sp_class_display(%s))); ", kv, to, kv, kv);
   }
   char selfp[96];
   if (boxed_self) snprintf(selfp, sizeof selfp, "_t%d", to);
@@ -35206,7 +35459,9 @@ static void emit_bind_call_arm(Compiler *c, int id, int target, const int *argv,
    into boxed temporaries (hoist_dispatch_args), and a switch on k's class
    picks the class's own `m`, each arm checking obj and binding the
    arguments for its target (emit_bind_call_arm). `target` is the one target
-   when um has it, else -1 and `kn` is the Class value. The call answers
+   when um has it, else -1 and `kn` is the Class value; with both, k runs
+   first and the one arm also checks obj against k's class, which may be
+   made at run time (cplan_bind_call_rt_owner). The call answers
    `id`'s type. Such a site fell through to the call on a value of unknown
    type and raised NoMethodError, "undefined method 'bind_call' for
    unknown", or, with a boxed obj, was refused. */
@@ -35216,6 +35471,7 @@ void emit_bind_call_boxed(Compiler *c, int id, int target, int kn, const char *s
   if (repr_native_call_handle(c, id)) slot = repr_call_result_storage(slot);
   if (slot == TY_VOID || slot == TY_UNKNOWN) slot = TY_POLY;
   int tk = ++g_tmp, to = ++g_tmp, tr = ++g_tmp;
+  char tkn[24]; snprintf(tkn, sizeof tkn, "_t%d", tk);
   buf_puts(b, "({ ");
   if (kn >= 0) {
     Buf kb; memset(&kb, 0, sizeof kb);
@@ -35231,7 +35487,9 @@ void emit_bind_call_boxed(Compiler *c, int id, int target, int kn, const char *s
                     "sp_Class _t%d = sp_unbox_class(_t%dv); ", tk, kb.p ? kb.p : "sp_box_nil()", tk, tk, tk, tk);
     }
     free(kb.p);
-    buf_printf(b, "switch (_t%d.cls_id) {", tk);
+  }
+  if (kn >= 0 && target < 0) {
+    buf_puts(b, "switch ("); emit_class_value_key(c, kn, tkn, b); buf_puts(b, ") {");
     for (int k = 0; k < c->nclasses; k++)
       if (class_value_bind_call_target(c, nt_ref(c->nt, id, "receiver"), k, sym, NULL) >= 0)
         buf_printf(b, " case %d:", k);
@@ -35252,20 +35510,48 @@ void emit_bind_call_boxed(Compiler *c, int id, int target, int kn, const char *s
   free(ob.p);
   emit_ctype(c, slot, b);
   buf_printf(b, " _t%d = %s; ", tr, slot == TY_POLY ? "sp_box_nil()" : default_value_from_compiler(c, slot));
-  if (kn < 0) emit_bind_call_arm(c, id, target, argv, argc, to, tr, slot, b);
+  if (target >= 0) emit_bind_call_arm(c, id, target, argv, argc, to, tr, slot, kn >= 0 ? tkn : NULL, b);
   else {
-    buf_printf(b, "switch (_t%d.cls_id) {", tk);
+    buf_puts(b, "switch ("); emit_class_value_key(c, kn, tkn, b); buf_puts(b, ") {");
     for (int k = 0; k < c->nclasses; k++) {
       int tmi = class_value_bind_call_target(c, nt_ref(c->nt, id, "receiver"), k, sym, NULL);
       if (tmi < 0) continue;
       buf_printf(b, " case %d: { ", k);
-      emit_bind_call_arm(c, id, tmi, argv, argc, to, tr, slot, b);
+      emit_bind_call_arm(c, id, tmi, argv, argc, to, tr, slot, tkn, b);
       buf_puts(b, " } break;");
     }
     buf_puts(b, " } ");
   }
   buf_printf(b, "_t%d; })", tr);
   unhoist_dispatch_args(c, hn, hsv, hty);
+}
+
+/* `um.bind_call(obj, args...)` whose UnboundMethod has instance method
+   `target` (-1 for none): a direct call on an obj of a known class
+   (emit_bind_call), or on a boxed obj, its class checked at run time, where
+   the class um is looked up on binds that target too (emit_bind_call_boxed),
+   as it is where a site class owns the target (cplan_bind_call_rt_owner).
+   Returns 0, emitting nothing, for any other call. */
+int emit_bind_call_target(Compiler *c, int id, int recv, int target, const int *argv, int argc, Buf *b) {
+  if (target < 0 || c->scopes[target].class_id < 0 || c->scopes[target].is_cmethod) return 0;
+  /* (a target a site class owns, on the class value the call chains on:
+     that value runs first and the arm checks obj against it) */
+  int rk = cplan_bind_call_rt_owner(c, id);
+  if (rk >= 0) {
+    emit_bind_call_boxed(c, id, target, rk, NULL, argv, argc, b);
+    return 1;
+  }
+  if (ty_is_object(comp_ntype(c, argv[0]))) {
+    emit_bind_call(c, id, target, argv, argc, b);
+    return 1;
+  }
+  if (repr_of(c, argv[0]).kind == RK_BOXED && nt_kind(c->nt, argv[0]) != NK_SplatNode &&
+      class_value_bind_call_target(c, method_recv_node(c, recv), c->scopes[target].class_id,
+                                   c->scopes[target].name, NULL) == target) {
+    emit_bind_call_boxed(c, id, target, -1, NULL, argv, argc, b);
+    return 1;
+  }
+  return 0;
 }
 
 void emit_exc_exception(Compiler *c, int recv, int arg, Buf *b) {
@@ -35406,6 +35692,80 @@ int object_private_method_name(const char *qm) {
 }
 
 
+/* The classes whose objects a respond_to? super of class cid answers for:
+   cid, and (unless its objects are by-value) the descendants that inherit
+   the method and its super. */
+static int super_respond_classes(Compiler *c, int cid, int cls[256]) {
+  int ncls = 0;
+  cls[ncls++] = cid;
+  if (!c->classes[cid].is_value_type)
+    for (int k = 0; k < c->nclasses && ncls < 256; k++)
+      if (k != cid && is_descendant(c, k, cid)) cls[ncls++] = k;
+  return ncls;
+}
+/* The name list super_respond_names builds: each name once, in the order first given */
+typedef struct { char **v; int n, cap; } RespondNames;
+static void respond_names_add(RespondNames *rn, const char *qm) {
+  for (int i = 0; i < rn->n; i++) if (sp_streq(rn->v[i], qm)) return;
+  if (rn->n == rn->cap) {
+    rn->cap = rn->cap ? rn->cap * 2 : 256;
+    rn->v = (char **)realloc(rn->v, sizeof(char *) * (size_t)rn->cap);
+    if (!rn->v) { fprintf(stderr, "spinel: out of memory\n"); exit(1); }
+  }
+  rn->v[rn->n++] = strdup(qm);
+}
+static void respond_names_note(void *ud, const char *m, int vis) { (void)vis; respond_names_add((RespondNames *)ud, m); }
+/* The names the switch of the respond_to? super `id` of class cid has a
+   case for, in its order: Object's public methods, the names a run-time
+   send resolves over, Object's private methods, and the instance methods of
+   the builtin at the root of the chain and its ancestors (Exception's
+   message, from CRuby's rows), each once and only where one of the classes
+   answers it. strdup'd; the caller frees. */
+static char **super_respond_names(Compiler *c, int id, int cid, int *out_n) {
+  int cls[256], ncls = super_respond_classes(c, cid, cls), ncand = 0;
+  char **cand = dsend_candidates(c, &ncand);
+  RespondNames all = {0}, out = {0};
+  for (int u = 0; respond_universal[u]; u++) respond_names_add(&all, respond_universal[u]);
+  for (int q = 0; q < ncand; q++) respond_names_add(&all, cand[q]);
+  for (const char *const *pv = object_private_method_names(); *pv; pv++) respond_names_add(&all, *pv);
+  const char *root = refl_builtin_root(c, cid);
+  for (const char *p = root && *root ? core_class_ancestors(root) : NULL; p;) {
+    size_t l;
+    const char *nx = core_ancestor_step(p, &l);
+    core_own_methods_each(p, l, respond_names_note, &all);
+    p = nx;
+  }
+  for (int q = 0; q < all.n; q++) {
+    int any = 0;
+    for (int k = 0; k < ncls && !any; k++) any = cplan_obj_responds(c, cls[k], all.v[q], id) != 0;
+    if (any) respond_names_add(&out, all.v[q]);
+    free(all.v[q]);
+  }
+  free(all.v);
+  for (int q = 0; q < ncand; q++) free(cand[q]);
+  free(cand);
+  *out_n = out.n;
+  return out.v;
+}
+/* Interns, ahead of the program's symbol table, the names each respond_to?
+   super's switch has a case for (codegen_program, before the table is
+   written). Interned while the switch was emitted, a case's id came after
+   the table, so a Symbol the run made took that id and answered for the
+   case's name. */
+void intern_super_respond_names(Compiler *c) {
+  for (int id = 0; id < c->nt->count; id++) {
+    NodeKind k = nt_kind(c->nt, id);
+    if (k != NK_SuperNode && k != NK_ForwardingSuperNode) continue;
+    int si = c->nscope[id];
+    if (si < 0 || si >= c->nscopes || c->scopes[si].class_id < 0) continue;
+    if ((BsuperArm)cplan_user(c, id).bsuper != BSUP_RESPOND_TO) continue;
+    int n = 0;
+    char **names = super_respond_names(c, id, c->scopes[si].class_id, &n);
+    for (int q = 0; q < n; q++) { comp_sym_intern(c, names[q]); free(names[q]); }
+    free(names);
+  }
+}
+
 /* `super` inside a user-defined respond_to?(m, include_all = false) that no
    ancestor defines is Object#respond_to? for this object: a switch over the
    interned name, each arm the method-table answer for the object's runtime
@@ -35421,10 +35781,15 @@ void emit_super_respond_to(Compiler *c, int id, Scope *s, Buf *b) {
   int fwd = ty_k == NK_ForwardingSuperNode;
   int args = fwd ? -1 : nt_ref(nt, id, "arguments");
   int argc = 0; const int *argv = args >= 0 ? nt_arr(nt, args, "arguments", &argc) : NULL;
+  /* (a list whose count the run gives is gathered and checked first: its first element is the name, its second
+     include_all) */
+  Buf gb = {0, 0, 0};
+  int ga = emit_super_gathered_args(c, id, s, 1, &gb);
   int t = ++g_tmp;
   /* the name: a symbol, a string (interned), or a boxed value of either */
   Buf nm = {0, 0, 0}; TyKind nt_ty;
-  if (fwd) {
+  if (ga >= 0) { buf_printf(&nm, "_t%d->data[0]", ga); nt_ty = TY_POLY; }
+  else if (fwd) {
     LocalVar *lv = scope_local(s, s->pnames[0]);
     nt_ty = lv && lv->type != TY_UNKNOWN ? lv->type : TY_POLY;
     /* an Integer or Float parameter that also takes nil goes in boxed */
@@ -35440,11 +35805,13 @@ void emit_super_respond_to(Compiler *c, int id, Scope *s, Buf *b) {
   /* a name of another kind is held boxed, and checked after the
      arguments and the block argument have run */
   int tn = -1;
-  if (nt_ty == TY_SYMBOL) buf_printf(b, "({ sp_sym _s%d = %s", t, nm.p ? nm.p : "0");
-  else if (nt_ty == TY_STRING) buf_printf(b, "({ sp_sym _s%d = sp_sym_intern(%s)", t, nm.p ? nm.p : "\"\"");
+  buf_printf(b, "({ %s", gb.p ? gb.p : "");
+  free(gb.p);
+  if (nt_ty == TY_SYMBOL) buf_printf(b, "sp_sym _s%d = %s", t, nm.p ? nm.p : "0");
+  else if (nt_ty == TY_STRING) buf_printf(b, "sp_sym _s%d = sp_sym_intern(%s)", t, nm.p ? nm.p : "\"\"");
   else {
     tn = ++g_tmp;
-    buf_printf(b, "({ sp_RbVal _t%d = ", tn);
+    buf_printf(b, "sp_RbVal _t%d = ", tn);
     emit_boxed_text(c, nt_ty, nm.p ? nm.p : "sp_box_nil()", b);
     buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_sym _s%d = 0", tn, t);
   }
@@ -35452,7 +35819,8 @@ void emit_super_respond_to(Compiler *c, int id, Scope *s, Buf *b) {
   /* include_all: the second argument or parameter, false when absent */
   buf_printf(b, "; sp_bool _i%d = ", t);
   Buf ia = {0, 0, 0}; TyKind ia_ty = TY_BOOL; int have_ia = 0;
-  if (fwd && s->nparams >= 2) {
+  if (ga >= 0) { buf_printf(&ia, "(_t%d->len > 1 && sp_poly_truthy(_t%d->data[1]))", ga, ga); have_ia = 1; }
+  else if (fwd && s->nparams >= 2) {
     LocalVar *lv = scope_local(s, s->pnames[1]);
     ia_ty = lv && lv->type != TY_UNKNOWN ? lv->type : TY_POLY;
     if (lv && slot_is_oint(lv)) { emit_boxed_fwd_param(c, s, 1, &ia); ia_ty = TY_POLY; }
@@ -35479,16 +35847,11 @@ void emit_super_respond_to(Compiler *c, int id, Scope *s, Buf *b) {
   else { buf_puts(b, "sp_poly_truthy("); emit_boxed_text(c, ia_ty, ia.p ? ia.p : "sp_box_nil()", b); buf_puts(b, ")"); }
   free(ia.p);
   /* the runtime class: this one, or a descendant inheriting the method */
-  int ncls = 0, cls[256];
-  cls[ncls++] = cid;
-  int by_value = c->classes[cid].is_value_type;
-  if (!by_value)
-    for (int k = 0; k < c->nclasses && ncls < 256; k++)
-      if (k != cid && is_descendant(c, k, cid)) cls[ncls++] = k;
+  int cls[256], ncls = super_respond_classes(c, cid, cls);
   if (ncls > 1) buf_printf(b, "; sp_int _c%d = sp_obj_cls_id_of((void *)%s)", t, g_self);
-  /* a block argument runs after the arguments, for its effect */
+  /* a block argument runs after the arguments, for its effect (a gathered list's ran it before its count check) */
   buf_puts(b, "; ");
-  emit_super_blockarg_effect(c, id, b);
+  if (ga == -1) emit_super_blockarg_effect(c, id, b);
   /* not a Symbol or a String is CRuby's TypeError */
   if (tn >= 0)
     buf_printf(b, "if (_t%d.tag != SP_TAG_SYM && !sp_poly_check_str(_t%d)) "
@@ -35496,44 +35859,29 @@ void emit_super_respond_to(Compiler *c, int id, Scope *s, Buf *b) {
                   "_s%d = _t%d.tag == SP_TAG_SYM ? (sp_sym)_t%d.v.i : sp_sym_intern(sp_poly_to_s(_t%d)); ",
                tn, tn, tn, t, tn, tn, tn);
   buf_printf(b, "sp_bool _r%d = 0; switch (_s%d) {", t, t);
-  int ncand = 0;
-  char **cand = dsend_candidates(c, &ncand);
-  /* the names every object has privately (Object's private methods), which
-     neither list need carry */
-  const char *const *priv_universal = object_private_method_names();
-  for (int pass = 0; pass < 3; pass++) {
-    int n = pass == 1 ? ncand : 0;
-    const char *const *list = pass == 2 ? priv_universal : respond_universal;
-    for (int q = 0; pass == 1 ? q < n : list[q] != NULL; q++) {
-      const char *qm = pass == 1 ? cand[q] : list[q];
-      if (pass) {
-        int dup = 0;
-        for (int u = 0; respond_universal[u]; u++) if (sp_streq(qm, respond_universal[u])) { dup = 1; break; }
-        for (int u = 0; pass == 2 && u < ncand; u++) if (sp_streq(qm, cand[u])) { dup = 1; break; }
-        if (dup) continue;
-      }
-      int ans[256], same = 1, any = 0;
-      for (int k = 0; k < ncls; k++) {
-        ans[k] = cplan_obj_responds(c, cls[k], qm, id);
-        if (ans[k]) any = 1;
-        if (ans[k] != ans[0]) same = 0;
-      }
-      if (!any) continue;
-      char incl[24]; snprintf(incl, sizeof incl, "_i%d", t);
-      buf_printf(b, " case %d:", comp_sym_intern(c, qm));
-      if (same) buf_printf(b, " _r%d = %s; break;", t, ans[0] == 2 ? "1" : incl);
-      else {
-        buf_printf(b, " _r%d = ", t);
-        for (int k = 0; k < ncls; k++) {
-          if (!ans[k]) continue;
-          buf_printf(b, "_c%d == %d ? %s : ", t, cls[k], ans[k] == 2 ? "1" : incl);
-        }
-        buf_puts(b, "0; break;");
-      }
+  int nn = 0;
+  char **names = super_respond_names(c, id, cid, &nn);
+  char incl[24]; snprintf(incl, sizeof incl, "_i%d", t);
+  for (int q = 0; q < nn; q++) {
+    int ans[256], same = 1;
+    for (int k = 0; k < ncls; k++) {
+      ans[k] = cplan_obj_responds(c, cls[k], names[q], id);
+      if (ans[k] != ans[0]) same = 0;
     }
+    /* (interned ahead of the symbol table: intern_super_respond_names) */
+    buf_printf(b, " case %d:", comp_sym_intern(c, names[q]));
+    if (same) buf_printf(b, " _r%d = %s; break;", t, ans[0] == 2 ? "1" : incl);
+    else {
+      buf_printf(b, " _r%d = ", t);
+      for (int k = 0; k < ncls; k++) {
+        if (!ans[k]) continue;
+        buf_printf(b, "_c%d == %d ? %s : ", t, cls[k], ans[k] == 2 ? "1" : incl);
+      }
+      buf_puts(b, "0; break;");
+    }
+    free(names[q]);
   }
-  for (int q = 0; q < ncand; q++) free(cand[q]);
-  free(cand);
+  free(names);
   buf_printf(b, " default: _r%d = 0; } _r%d; })", t, t);
 }
 

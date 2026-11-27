@@ -52,6 +52,11 @@ typedef struct {
                                   end, as the runtime set it; with own_buf, as
                                   last found (sp_io_own_nb). 0 not asked,
                                   1 yes, 2 no or could not (#4307) */
+  unsigned char wown;          /* the program made this write end (IO.pipe), so
+                                  its open file is the program's own: only then
+                                  does sp_sock_write set O_NONBLOCK on it, as an
+                                  inherited descriptor shares its flags with
+                                  other processes and descriptors (2>&1) */
   unsigned char wstream;       /* SOCK_STREAM, asked once: 0 not yet, 1 yes,
                                   2 no. Only a byte stream may have a write
                                   split at the send buffer's free space; on a
@@ -105,6 +110,12 @@ typedef struct {
                                   of them reads a freed FILE or a descriptor
                                   number already reused (sp_io_use, sp_io.c) */
   struct sp_io_timeout *timeout;
+  unsigned char stat_snap;     /* a File::Stat that IO#stat made: the struct
+                                  stat fstat(2) of the descriptor gave follows
+                                  the handle in its own allocation, so it
+                                  describes the open file after the path
+                                  names another and after the stream closes
+                                  (sp_io_stat_handle, sp_cold.c) */
 } sp_File;
 
 sp_RbVal sp_File_timeout(sp_File *f);
@@ -150,11 +161,15 @@ void sp_io_take_own_buf(sp_File *f);
 /* IO.pipe's read end over fd: a non-blocking descriptor read through
    own_buf. */
 sp_File *sp_io_pipe_reader(int fd);
+sp_File *sp_io_pipe_writer(int fd);
 /* IO#putc's byte: through stdio, or straight to the descriptor (own_buf). */
 void sp_File_put_byte(sp_File *f, int c);
 /* Access-mode checks retain closed-stream error precedence. */
 void sp_io_check_readable(sp_File *f);
 void sp_io_check_writable(sp_File *f);
+int sp_io_fd_use(sp_File *f);         /* the descriptor, with a use of the handle held */
+void sp_io_fd_unuse(sp_File *f);      /* drop it; errno is kept */
+void sp_io_flush_for_size(sp_File *f); /* File#size's flush, raising as a write does */
 void sp_io_stdout_check_frozen(void);
 void sp_io_wait_readable(sp_File *f);
 void sp_io_wait_fd_readable(int fd);
@@ -268,6 +283,7 @@ static inline size_t sp_io_pending(sp_File *f) {
 const char *sp_slurp_stream_parked(sp_File *f);
 sp_int sp_File_write(sp_File *f, const char *s);
 sp_int sp_File_write_bin(sp_File *f, const char *s);
+void sp_File_write_bytes(sp_File *f, const char *s, size_t n);   /* one write, parking as IO#write does */
 sp_int sp_File_syswrite(sp_File *f, const char *s, size_t n);
 sp_int sp_File_write_poly(sp_File *f, sp_RbVal v);
 sp_int sp_File_syswrite_poly(sp_File *f, sp_RbVal v);
@@ -385,10 +401,15 @@ sp_int sp_File_readbyte(sp_File *f);
 void sp_File_ungetbyte(sp_File *f, sp_int byte);
 sp_bool sp_File_binmode_p(sp_File *f);
 void sp_File_set_binmode(sp_File *f);
+/* Encoding.default_external is ASCII-8BIT (lib/sp_cold.c) */
+extern unsigned char sp_enc_default_ext_bin;
 /* Does a read with no length (and getc) answer ASCII-8BIT? */
 static inline sp_bool sp_File_reads_binary(sp_File *f) {
-  return f->ext_enc ? f->ext_enc == 2 : sp_File_binmode_p(f);
+  return f->ext_enc ? f->ext_enc == 2 : sp_File_binmode_p(f) || sp_enc_default_ext_bin;
 }
+/* File.open(path, encoding: e): 1 UTF-8, 2 ASCII-8BIT */
+sp_File *sp_File_with_enc(sp_File *f, int e);
+sp_File *sp_File_with_enc_val(sp_File *f, sp_RbVal v);
 sp_File *sp_File_reopen_io(sp_File *f, sp_File *other);
 sp_File *sp_File_dup(sp_File *f, int keep_frozen);
 const char *sp_io_fd_mode(int fd);

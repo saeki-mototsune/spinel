@@ -773,7 +773,7 @@ build/sp_cold.o: lib/sp_cold.c $(RT_HDRS)
 
 SP_RT_LIB = lib/libspinel_rt.a
 
-RT_MEMBERS = sp_bigint sp_crypto sp_pack sp_time sp_core sp_net sp_system sp_gc sp_slab sp_alloc sp_dtoa sp_marshal sp_format sp_string sp_inspect sp_poly_cold sp_array sp_str sp_str_cold sp_str_crypt sp_hash sp_proc sp_exc sp_re sp_random sp_fiber sp_sched sp_io sp_iobuffer sp_cold sp_enum_str sp_process sp_process_status
+RT_MEMBERS = sp_bigint sp_crypto sp_pack sp_time sp_core sp_net sp_system sp_gc sp_slab sp_alloc sp_dtoa sp_marshal sp_format sp_string sp_inspect sp_poly_cold sp_array sp_str sp_str_cold sp_str_crypt sp_hash sp_proc sp_exc sp_re sp_random sp_fiber sp_sched sp_io sp_iobuffer sp_cold sp_enum_str sp_process sp_process_status sp_rtclass
 
 # Opt-in runtime for carried C extensions. The regular archive has no hook
 # branches or extension state, preserving its instruction stream.
@@ -1826,6 +1826,7 @@ test-corpus-summary: test-corpus-results
 		    head -40 "$$f.diff"; \
 		  elif [ "$$status" = ERR ]; then \
 		    echo "ERR:  $$bn"; \
+		    if [ -s "$$f.err" ]; then head -20 "$$f.err"; fi; \
 		  fi; \
 		done; \
 	fi; \
@@ -2643,11 +2644,6 @@ reject-test: string-minus-reject-test $(SPINEL)
 	  else grep -Eq "is not a (class|module)" "$$tmp/$$t.out" || \
 	    { echo "reject-test: FAIL (#4318: $$t rejected without saying why)"; sed -n 1,3p "$$tmp/$$t.out"; ok=0; }; fi; \
 	done; \
-	t=test/reject/typed_array_kept_by_struct_into_boxed_param_store.rb; \
-	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/tb.c" >"$$tmp/tb.out" 2>&1; then \
-	  echo "reject-test: FAIL (a typed array held by the caller, stored into through a boxed parameter, compiled)"; ok=0; \
-	else grep -q "which the method stores elements of other kinds into" "$$tmp/tb.out" || \
-	  { echo "reject-test: FAIL (a held typed array into a boxed parameter's store rejected without saying why)"; sed -n 1,5p "$$tmp/tb.out"; ok=0; }; fi; \
 	t=test/reject/const_get_runtime_name.rb; \
 	if $(SPINEL) "$$t" -c --no-line-map -o "$$tmp/cg.c" >"$$tmp/cg.out" 2>&1; then \
 	  echo "reject-test: FAIL (a const_get with a run-time name on a class value compiled)"; ok=0; \
@@ -4528,7 +4524,7 @@ args=""; \
 if [ -f "$<.args" ]; then args=$$(cat "$<.args"); fi; \
 stdinf=/dev/null; \
 if [ -f "$<.stdin" ]; then stdinf="$<.stdin"; fi; \
-rm -f "$@.diff" "$@.cached" "$@.plan"; \
+rm -f "$@.diff" "$@.cached" "$@.plan" "$@.err"; \
 ckey=""; hit=0; own=0; \
 { $(SPINEL) "$<" $(SP_OV_FLAG) $(TEST_PLAN_CHECK) -c --no-line-map -o "$$cfile" 2>"$$tmpdir/sperr"; sprc=$$?; \
   if [ -n "$(TEST_PLAN_CHECK)" ]; then { grep "^plan-check:" "$$tmpdir/sperr" | sed "s|^|$<: |"; \
@@ -4590,10 +4586,10 @@ perl tools/test_c_metadata.pl < "$$cfile" > "$$tmpdir/cmeta" && \
   if [ $$hit = 1 ]; then \
     :; \
   elif [ -n "$(TEST_SINGLE_INVOKE)" ]; then \
-    $(CC) $(CFLAGS) $$bigopt $(SP_OV_DEFINE) $$mtdef -Werror $(TEST_WARN_SUPPRESS) $(SEC_FLAGS) $$pchuse -Ilib $$cextinc "$$cfile" $$natobjs $$rtlib $(TEST_LDFLAGS) -lm $$mtld $$xlibs $(GC_FLAGS) -o "$$bin" 2>/dev/null; \
+    $(CC) $(CFLAGS) $$bigopt $(SP_OV_DEFINE) $$mtdef -Werror $(TEST_WARN_SUPPRESS) $(SEC_FLAGS) $$pchuse -Ilib $$cextinc "$$cfile" $$natobjs $$rtlib $(TEST_LDFLAGS) -lm $$mtld $$xlibs $(GC_FLAGS) -o "$$bin" 2>>"$$tmpdir/ccerr"; \
   else \
-    $(CC) $(CFLAGS) $$bigopt $(SP_OV_DEFINE) $$mtdef -Werror $(TEST_WARN_SUPPRESS) $(SEC_FLAGS) $$pchuse -Ilib $$cextinc -c "$$cfile" -o "$$cfile.o" 2>/dev/null && \
-    $(CC) $(CFLAGS) "$$cfile.o" $$natobjs $$rtlib $(TEST_LDFLAGS) -lm $$mtld $$xlibs $(GC_FLAGS) -o "$$bin" 2>/dev/null; \
+    $(CC) $(CFLAGS) $$bigopt $(SP_OV_DEFINE) $$mtdef -Werror $(TEST_WARN_SUPPRESS) $(SEC_FLAGS) $$pchuse -Ilib $$cextinc -c "$$cfile" -o "$$cfile.o" 2>>"$$tmpdir/ccerr" && \
+    $(CC) $(CFLAGS) "$$cfile.o" $$natobjs $$rtlib $(TEST_LDFLAGS) -lm $$mtld $$xlibs $(GC_FLAGS) -o "$$bin" 2>>"$$tmpdir/ccerr"; \
   fi; }; \
 built=$$?; \
 if [ $$built -eq 0 ] && [ $$hit = 1 ]; then \
@@ -4632,6 +4628,7 @@ elif [ $$built -eq 0 ]; then \
   fi; \
 else \
   echo ERR > "$@"; \
+  cat "$$tmpdir/sperr" "$$tmpdir/ccerr" > "$@.err" 2>/dev/null; \
   if [ -t 1 ]; then printf E; fi; \
 fi; \
 if [ $$own = 1 ]; then tools/result_cache.sh release "$$ckey"; fi; \
@@ -4965,6 +4962,7 @@ check:
 	+@$(MAKE) --no-print-directory infer-test
 	+@$(MAKE) --no-print-directory respond-to-audit
 	+@$(MAKE) --no-print-directory gen-respond-to-tables-test
+	+@$(MAKE) --no-print-directory boxed-methods-check
 	+@$(MAKE) --no-print-directory spin-check
 
 # tools/gen_respond_to_tables.rb's own unit tests (dedup, false-positive
@@ -4978,6 +4976,15 @@ check:
 gen-respond-to-tables-test: lib/spinel_rt.h
 	ruby tools/gen_respond_to_tables_test.rb
 	ruby tools/gen_respond_to_tables_makefile_test.rb
+
+# The IO, Thread, Mutex, ConditionVariable and Queue rows of
+# src/builtin_ops.c against the respond_to? lists a boxed receiver answers
+# from, with a known-gap list that only shrinks (tools/boxed_methods_check.rb).
+.PHONY: boxed-methods-check
+boxed-methods-check:
+	ruby tools/boxed_methods_check.rb
+	ruby tools/boxed_methods_check_test.rb
+gate-props: boxed-methods-check
 
 # Cross-checks sp_poly_responds_builtin's per-class method tables
 # (lib/spinel_rt.h) against src/builtin_ops.c's bop_rows, the actual
@@ -5715,6 +5722,10 @@ infer-test-2: $(SPINEL) $(SP_RT_LIB)
 	else echo "infer-test: FAIL (compile method_capture_boxed_arg_hash_param)"; ok=0; fi; \
 	$(SPINEL) test/builtin_reopen_yield_tap.rb -c --no-line-map -o "$$tmp/ryt.c" >/dev/null 2>"$$tmp/ryt.err" || { echo "infer-test: FAIL (compile builtin_reopen_yield_tap)"; ok=0; }; \
 	! grep -q 'did not converge' "$$tmp/ryt.err" || { echo "infer-test: FAIL (a tap or then of a String, Symbol, Float or Range reopen typed its block parameter as the receiver and as the method's yield on alternate rounds: the fixpoint ran to its cap)"; ok=0; }; \
+	SP_FIXPOINT_LOG=1 $(SPINEL) test/infer/mutator_rebind_in_proc_converges.rb -c --no-line-map -o "$$tmp/mrr.c" >/dev/null 2>"$$tmp/mrr.err" || { echo "infer-test: FAIL (compile mutator_rebind_in_proc_converges)"; ok=0; }; \
+	! grep -q 'did not converge' "$$tmp/mrr.err" || { echo "infer-test: FAIL (a String mutator's receiver snapshot inside a proc was rebound to a fresh snapshot every round: the fixpoint ran to its cap)"; ok=0; }; \
+	$(SPINEL) test/infer/when_boxed_keeps_capture_typed.rb -c --no-line-map -o "$$tmp/wbk.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile when_boxed_keeps_capture_typed)"; ok=0; }; \
+	grep -q 'sp_int sp_sq(sp_int lv_x)' "$$tmp/wbk.c" || { echo "infer-test: FAIL (a boxed when operand widened a Method capture held in a Method local and only called: sq's parameter went boxed)"; ok=0; }; \
 	$(SPINEL) test/infer/dead_constructor_no_arm.rb -c --no-line-map -o "$$tmp/dc.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile dead_constructor_no_arm)"; exit 1; }; \
 	grep -q 'sp_poly_add' "$$tmp/dc.c" && { echo "infer-test: FAIL (a class constructed only in dead code widened a poly receiver's field read to poly)"; ok=0; }; \
 	grep -Eq '(sp_int_add\(|sp_o?int _t[0-9]+ = )\(\{ sp_RbVal _t[0-9]+ = lv_d; sp_o?int _t[0-9]+ = (0|sp_oint_nil\(\)); switch' "$$tmp/dc.c" || { echo "infer-test: FAIL (the field read of a boxed receiver did not stay an int switch, or its receiver is rooted for an arm that cannot run)"; ok=0; }; \
@@ -5723,6 +5734,10 @@ infer-test-2: $(SPINEL) $(SP_RT_LIB)
 	rounds=$$(SP_FIXPOINT_LOG=1 $(SPINEL) test/infer/fixpoint_converges.rb -c --no-line-map -o "$$tmp/fp.c" 2>&1 | sed -n 's/^\[fp\] rounds=\([0-9]*\).*/\1/p' | tail -1); \
 	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count -- SP_FIXPOINT_LOG gone?)"; ok=0;; \
 	  *) [ "$$rounds" -lt 128 ] || { echo "infer-test: FAIL (the inference fixpoint ran to its $$rounds-round cap: it stopped mid-oscillation, and where it stops decides which typing is emitted)"; ok=0; };; \
+	esac; \
+	rounds=$$(SP_FIXPOINT_LOG=1 $(SPINEL) test/dynamic_send_name_conversion_converges.rb -c --no-line-map -o "$$tmp/dnc.c" 2>&1 | sed -n 's/^\[fp\] rounds=\([0-9]*\).*/\1/p' | tail -1); \
+	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count for dynamic_send_name_conversion_converges)"; ok=0;; \
+	  *) [ "$$rounds" -lt 128 ] || { echo "infer-test: FAIL (a send's to_sym was split on method_missing and the send lowered again every round: the fixpoint ran to its cap)"; ok=0; };; \
 	esac; \
 	rounds=$$(SP_FIXPOINT_LOG=1 $(SPINEL) test/infer/module_ivar_object_array_converges.rb -c --no-line-map -o "$$tmp/mio.c" 2>&1 | sed -n 's/^\[fp\] rounds=\([0-9]*\).*/\1/p' | tail -1); \
 	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count for module_ivar_object_array_converges)"; ok=0;; \
@@ -5736,6 +5751,8 @@ infer-test-2: $(SPINEL) $(SP_RT_LIB)
 	case "$$rounds" in ''|*[!0-9]*) echo "infer-test: FAIL (no fixpoint round count for const_row_table_push_converges)"; ok=0;; \
 	  *) [ "$$rounds" -lt 128 ] || { echo "infer-test: FAIL (a push into a constant table of Integer or Float rows widened it to the general Array every round: the fixpoint ran to its cap)"; ok=0; };; \
 	esac; \
+	$(SPINEL) test/mm_writer_hold_declined.rb -c --no-line-map -o "$$tmp/mwh.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile mm_writer_hold_declined)"; ok=0; }; \
+	! grep -Eq 'lv___mm_v([0-9]+) = \(\{[^;]*lv___mm_v\1 = ' "$$tmp/mwh.c" || { echo "infer-test: FAIL (a method_missing writer's value was held again on each run of the pass, nesting the hold)"; ok=0; }; \
 	$(SPINEL) test/infer/module_source_call_binds_nothing.rb -c --no-line-map -o "$$tmp/msc.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile module_source_call_binds_nothing)"; exit 1; }; \
 	grep -Eq 'sp_int sp_Seq_output\(sp_Seq \*self, sp_int lv_col, sp_int lv_shift\)' "$$tmp/msc.c" && grep -Eq 'sp_int sp_Port_output\(sp_Port \*self, sp_int lv_port, sp_int lv_value\)' "$$tmp/msc.c" || { echo "infer-test: FAIL (a call in a module method an include copied away boxed the parameters of every method of its name)"; grep -E 'sp_(Seq|Port)_output\(' "$$tmp/msc.c" | head -2; ok=0; }; \
 	$(SPINEL) test/infer/poly_candidate_arity.rb -c --no-line-map -o "$$tmp/pca.c" >/dev/null 2>&1 || { echo "infer-test: FAIL (compile poly_candidate_arity)"; exit 1; }; \
@@ -6728,6 +6745,14 @@ BLOCK_CONDITIONS_LIMIT ?= 2.2
 # at the next site's undef ask, outside the plan frame; 2.37x with the
 # asks in the frame (#12542). The limit sits between them.
 MISSING_METHOD_SITES_LIMIT ?= 2.6
+# K layers of two class methods calling both of the next layer bare, the
+# last calling the first (test/scale/cmethod_cycles.sh), compiled to C at
+# K=20 and K=40: the whole compile's counted work, 1.98x where each group
+# of such calls is decided once (cm_self_cls_visit); a walk that worked a
+# method out again on each path into it grew as 2^K. Each compile runs
+# under a CPU-time limit, as the fan-out cases do, so such a walk fails the
+# case instead of running on.
+CMETHOD_CYCLES_LIMIT ?= 2.20
 # A chain of forty bangs over a String a method answers, compiled to C with
 # under a CPU-time limit, as the hash-literal fan-out is:
 # strbuf_bang_self_local asked each link once per path that reaches it,
@@ -6872,6 +6897,9 @@ scale-test: $(SPINEL_WORK)
 	gen missing_method_sites 400 mm4.rb; gen missing_method_sites 800 mm8.rb; \
 	mma=$$(sws desugar_missing_method_calls -c -o "$$tmp/mm4.c" "$$tmp/mm4.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	mmb=$$(sws desugar_missing_method_calls -c -o "$$tmp/mm8.c" "$$tmp/mm8.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	gen cmethod_cycles 20 cy2.rb; gen cmethod_cycles 40 cy4.rb; \
+	cya=$$(ulimit -t 20; sw -c -o "$$tmp/cy2.c" "$$tmp/cy2.rb") || { rm -rf "$$tmp"; exit 1; }; \
+	cyb=$$(ulimit -t 20; sw -c -o "$$tmp/cy4.c" "$$tmp/cy4.rb") || { rm -rf "$$tmp"; exit 1; }; \
 	rm -rf "$$tmp"; \
 	if [ -z "$$wa" ] || [ -z "$$wb" ] || [ -z "$$fa" ] || [ -z "$$fb" ] || [ -z "$$pa" ] || [ -z "$$pb" ] || \
 	   [ -z "$$ha" ] || [ -z "$$hb" ] || [ -z "$$ca" ] || [ -z "$$cb" ] || [ -z "$$sa" ] || [ -z "$$sb" ] || \
@@ -6883,7 +6911,7 @@ scale-test: $(SPINEL_WORK)
 	   [ -z "$$jra" ] || [ -z "$$jrb" ] || \
 	   [ -z "$$sea" ] || [ -z "$$seb" ] || [ -z "$$spa" ] || [ -z "$$spb" ] || \
 	   [ -z "$$ica" ] || [ -z "$$icb" ] || [ -z "$$ipa" ] || [ -z "$$ipb" ] || \
-	   [ -z "$$bca" ] || [ -z "$$bcb" ] || [ -z "$$bpa" ] || [ -z "$$bpb" ]; then \
+	   [ -z "$$bca" ] || [ -z "$$bcb" ] || [ -z "$$bpa" ] || [ -z "$$bpb" ] || [ -z "$$cya" ] || [ -z "$$cyb" ]; then \
 	  echo "scale-test: FAIL (the counting compiler reported no work count)"; exit 1; fi; \
 	awk -v a="$$ha" -v b="$$hb" 'BEGIN { r = b / a; \
 	  printf "scale-test: boxed Hash store work at 2x the methods is %.2fx (limit 2.20)\n", r; exit (r > 2.20) }' || \
@@ -6983,7 +7011,10 @@ scale-test: $(SPINEL_WORK)
 	  { echo "scale-test: FAIL (each class-body call scanned every scope per ancestor for its name: see comp_scope_batch_begin)"; exit 1; }; \
 	awk -v a="$$mma" -v b="$$mmb" -v lim="$(MISSING_METHOD_SITES_LIMIT)" 'BEGIN { if (a <= 0) a = 1; r = b / a; \
 	  printf "scale-test: missing-method split work at 2x the call sites is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
-	  { echo "scale-test: FAIL (desugar_missing_method_calls's counted work grew faster than its call sites, as where an undef ask rebuilt the map per site outside the plan frame: see cplan_undef_at and cplan_undef_before)"; exit 1; }
+	  { echo "scale-test: FAIL (desugar_missing_method_calls's counted work grew faster than its call sites, as where an undef ask rebuilt the map per site outside the plan frame: see cplan_undef_at and cplan_undef_before)"; exit 1; }; \
+	awk -v a="$$cya" -v b="$$cyb" -v lim="$(CMETHOD_CYCLES_LIMIT)" 'BEGIN { if (a <= 0) a = 1; r = b / a; \
+	  printf "scale-test: receiving-class work at 2x a cycle of bare class-method calls is %.2fx (limit %.2f)\n", r, lim; exit (r > lim) }' || \
+	  { echo "scale-test: FAIL (a class method in a cycle of bare calls was worked out again on each path into it: see cm_self_cls_visit)"; exit 1; }
 
 .PHONY: bisect-test
 # `spinel bisect`, end to end. The search has its own corpus test

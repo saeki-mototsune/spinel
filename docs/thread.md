@@ -31,6 +31,10 @@ is a user guarantee.
   `SPINEL_WORKERS=N`, and `SPINEL_WORKERS=2` runs every thread on one
   helper. Give such a program `SPINEL_WORKERS=N+1` for N threads of work,
   or leave the variable unset.
+  A new thread, whether main or another thread starts it, is placed on the
+  helper with the fewest threads, and a helper is added for it while the
+  count allows. It stays on the worker it first ran on, not the one that
+  started it.
 - **Real parallelism, no GVL.** Two threads run Ruby code on two cores
   simultaneously. There is no implicit per-object lock, so unsynchronized
   shared mutation is a data race (see [By design](#by-design) below).
@@ -44,7 +48,7 @@ is a user guarantee.
   The same is true of a worker inside an `ffi_func` declared `blocking: true`
   (see [FFI.md](FFI.md)). The green threads that share that worker wait
   while the call runs C: a thread stays for life on the worker it first ran
-  on, and no other worker runs it. A callback from the call that sleeps or
+  on (not the one that started it), and no other worker runs it. A callback from the call that sleeps or
   waits on I/O parks its thread and lets them run meanwhile. A call declared
   `offload: true` instead runs on an offload thread, and the caller waits as
   for I/O, leaving its worker to the others (Spinel's own; the C function runs
@@ -206,6 +210,7 @@ These are deliberate consequences of real parallelism, listed in
 | `SPINEL_GC_MINOR` | `0` turns the generational object mark off: every collection then marks the whole live heap. On by default since 2026-09-12: a minor cycle marks the young objects plus what the write barrier remembered of the old ones, and a full cycle runs on the cadence the survival ratio sets (`SPINEL_GC_FULL_INTERVAL=N` pins it). `SPINEL_GC_VERIFY_GEN=1` re-marks the whole heap after every minor and names any holder the barrier missed |
 | `SPINEL_GC_THRESHOLD_KB` | per-worker collection budget; raise it to trade memory for fewer stop-the-world pauses (default 256) |
 | `SPINEL_GC_THRESHOLD_OBJ_KB` | overrides the collection floor set by `SPINEL_GC_THRESHOLD_KB` |
+| `SPINEL_GC_HEADROOM_KB` | per-worker cap on what the adaptive threshold adds to the bytes that survived a collection. Unset, the next threshold is twice the survivors, so a program holding a large live set lets as much garbage again accumulate before it collects; set, it is the survivors plus at most this much. The floor still applies. Lower values trade more frequent collections for a smaller heap |
 | `SPINEL_GC_OBJ_BUDGET` | `fixed` holds the collection threshold at its floor. `obj` and `walk` select the endpoints for the reported mark share. All collected objects, including Strings, use the same budget |
 | `SPINEL_GC_SLAB` | `0` turns the slab allocator off: every object and heap string is then its own malloc, which is what ASAN needs to see a use-after-free (the slab hides one). On by default whatever the process's malloc. It used to default off under jemalloc (linked or preloaded), whose thread caches did what the slab's free lists did and beside which the free-list slab measured 8% slower; the bitmap sweep is what jemalloc's caches cannot do, and with it the slab under jemalloc answers the same requests a second on 17% less CPU and 13% less memory |
 | `SPINEL_GC_SLAB_MB` | wasm32-wasi only: the slab's size in MB, rounded down to 4 (default 64; below 4 the slab is off). See [wasm.md](wasm.md) |

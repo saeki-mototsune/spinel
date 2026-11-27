@@ -116,6 +116,9 @@ typedef enum {
 /* The count super id passes where the builtin it reaches cannot take it (BSUP_ARITY), and CRuby's "expected"
    text into *exp; -1 where it can, or the owner's facts do not prove it */
 int cplan_super_wrong_count(Compiler *c, int id, const char **exp);
+/* Does super id's builtin arm gather what it passes, a count only the run gives (a bare super's rest or keywords, a
+   splat), and check it against lo..hi, the counts the builtin takes (emit_super_gathered_args)? */
+int cplan_super_gathered(Compiler *c, int id, int *lo, int *hi);
 
 typedef struct {
   int mi;                  /* the method scope, or -1 */
@@ -480,6 +483,12 @@ unsigned cplan_zsuper_shape(Compiler *c, const Scope *s, int mixed);
    (BSUP_FROZEN), the object (BSUP_SELF), or Kernel's row over it (BSUP_KERNEL_ROW)? A by-value object
    (an_phase_value_types) has none of them. */
 int cplan_super_reads_self(Compiler *c, int id);
+/* Does super node id, in a class method, raise CRuby's NoMethodError that names its receiving class: no method of the
+   program's and no builtin's arm answers it (BSUP_NONE), its name is none Class's or Module's rows define (which
+   CRuby answers), and it is no method_missing's (whose super is BasicObject#method_missing's, naming the call) nor a
+   defined?'s operand (never called)? The message, built when it is read, asks the class its name, then its inspect,
+   so none of those methods of its class's ancestors and descendants may itself super into Module's with no arm. */
+int cplan_super_names_class(Compiler *c, int id);
 /* Is super node id, in a class method, the call of a definition hook (`inherited`, `method_added`) that only a builtin's no-op answers? */
 int cplan_core_hook(Compiler *c, int id);
 int cplan_kernel_def(Compiler *c, const char *name);   /* a version of the name's top-level history is a program Kernel def */
@@ -532,8 +541,54 @@ const struct BuiltinOp *cplan_builtin_handle_row(Compiler *c, int id);
    its constant receiver: NULL where none of cls's singleton chain has one,
    or where a class method the program gives a class of the chain, up to
    the row's own, stands in front of it (`class IO; def self.select` is
-   what File.select runs). */
+   what File.select runs). A Class.new or Module.new row is the call's
+   only where the plan answers the call (cplan_class_new). */
 const BuiltinClassOp *cplan_builtin_class_row(Compiler *c, int id, const char *cls);
+/* Is program class ci the site class of classes made at run time
+   (ClassInfo.rt_site): its instances carry the class each was made from,
+   and a value of its class may be any of them? A site with no block is one
+   only where the program answers class identity per evaluation
+   (Compiler.rt_identity_per_eval). ci -1: does the
+   program have any such class? */
+int cplan_rt_site(const Compiler *c, int ci);
+/* ...is ci or a class below it one (ClassInfo.rt_family)? */
+int cplan_rt_family(const Compiler *c, int ci);
+/* What a Class.new or Module.new evaluated more than once answers
+   (desugar_class_new_blocks noted it, EB_RT_SITE / EB_RT_BARE), and in
+   *site (NULL: not asked) its site class: CNEW_RUNTIME, a class of its own
+   at each evaluation; CNEW_STATIC, the site class itself, where its family
+   or its block cannot have records (register_rt_sites) and the call has a
+   block, as every evaluation answered before; for a call without a block
+   whose site is no run-time site (cplan_rt_site), refused (feature_limit):
+   CNEW_MIXED where that is only because the program does not answer class
+   identity per evaluation (Compiler.rt_identity_per_eval), CNEW_REFUSED
+   where its family or its body cannot have records; CNEW_NONE for any
+   other call. */
+enum { CNEW_NONE, CNEW_RUNTIME, CNEW_STATIC, CNEW_REFUSED, CNEW_MIXED };
+/* May the class value at node (-1: one no node gives) be a class made at
+   run time, its id a record's: a site class's Class object is in its class
+   fact, or the fact is not bounded, in a program that has one? A constant
+   that names a class (the program's or a builtin's, elab_class_ref_at) is
+   that class, never a record's; one that holds a class value is asked as
+   any value is. */
+int cplan_class_value_may_be_rt(Compiler *c, int node);
+/* `k.instance_method(:m).bind_call(o, ...)` whose target k's class picks
+   at run time (class_value_instance_method_sym) or whose one target a site
+   class owns (cplan_rt_site), and that bind_call lowers (an obj that is no
+   splat, an arm for each class, cplan_bind_call_gap): k's node, -1 for any
+   other call. The call binds through emit_bind_call_boxed, each arm checking o against the class
+   k holds, which may be made at run time, so the lookup is no use that runs
+   the site class's method in that class's place (cplan_rt_class_method_object). */
+int cplan_bind_call_rt_owner(Compiler *c, int id);
+int cplan_class_new(const Compiler *c, int id, int *site);
+/* Is node a statement of a site class's body, of a site whose classes are
+   made at run time, that each evaluation runs on the class it makes
+   (emit_op_class_new) and the body does not: the call of the block's
+   statements that run again (cn_rt_body)? cplan_rt_site_body: the class
+   method those statements of site class ci moved to, which each evaluation
+   calls; -1 for none. */
+int cplan_stmt_at_evaluation(Compiler *c, int node);
+int cplan_rt_site_body(Compiler *c, int ci);
 /* A call that builds an instance of an Array or Hash subclass (or, with
    `[]`, of a Struct or Data class: cplan_as_new) from its arguments through
    a Class value known only at run time (a parameter, an element, a call's
@@ -874,6 +929,14 @@ int cplan_typed_to_ary(Compiler *c, TyKind t, int at, int op, int *boxed);
    1 for it to do so, and the destructure reads the temp for the one
    element a nil answer leaves. */
 int cplan_typed_to_ary_held(Compiler *c, TyKind t, int at, int op, int *boxed, int *hold);
+/* 1 when the multiple assignment mw takes apart its right side value, of
+   kind t, as CRuby takes apart an Array or a value that answers to_ary: an
+   Array kind; a boxed or not yet known value, which may hold an Array when
+   it runs; or a value whose class's to_ary the plan answers there
+   (cplan_typed_to_ary), typed or boxed. Any other value is whole: the
+   first target takes it and the others nil (`a, b = 1..2`). The widening
+   walk's target step and the emitter's arm for such a value both ask it. */
+int cplan_masgn_takes_apart(Compiler *c, int mw, int value, TyKind t);
 /* How a class's boxed to_ary runs where the plan answers it: the method
    table's method (the one sp_obj_to_ary calls), the version entry, or
    another version its window proves; for the program's String, the
@@ -1209,7 +1272,7 @@ typedef enum {
   PB_D_EXC_ACC, PB_D_ENUM_EACH, PB_D_TO_S, PB_D_CASE_CONV, PB_D_NUM, PB_D_DIGITS, PB_D_ARRAY_TRANSFORM, PB_D_PRED,
   PB_D_TO_IF, PB_D_ANY_NONE, PB_D_TO_H, PB_D_DISPLAY, PB_D_HASH,
   PB_N_EACH_INDEX, PB_N_JOIN, PB_N_ALIVE, PB_N_KILL, PB_N_STATUS, PB_N_QUEUE, PB_N_IO_READ,
-  PB_N_IO_FLUSH, PB_N_IO_CLOSE, PB_N_ENUM_TO_A, PB_N_CONDVAR,
+  PB_N_IO_FLUSH, PB_N_IO_CLOSE, PB_N_ENUM_TO_A, PB_N_CONDVAR, PB_N_THREAD_READER,
   /* the tag pre-arms of a dispatch with arguments (emit_poly_prearms_n) */
   PB_COVER, PB_TRY_CONVERT, PB_GCDLCM, PB_UNPACK1, PB_INCLUDE, PB_STR_DELETE, PB_STR_PARTITION,
   PB_STR_SETOP, PB_STORE, PB_STR_ENCODE, PB_STR_SPLIT_N, PB_INT_BITREF,

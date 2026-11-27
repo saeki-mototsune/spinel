@@ -46,6 +46,7 @@
 #include <limits.h>
 #include "builtin_names.h"
 #include "call_plan.h"
+#include "codegen_call_arms.h"
 #include "method_table_check.h"
 
 int class_has_exc_name(Compiler *c, int ci);   /* codegen.c */
@@ -165,6 +166,8 @@ typedef struct CF {
   int *orig;                  /* (directed, SPINEL_CLS_FLOW=why) per element, the rule line that made it every class */
   int pts_max;                /* objects an element holds before it joins the summary (CF_PTS_MAX) */
   unsigned char *exc_kw;   /* per node, made when first needed: cf_exc_ctor_kw */
+  int *xself;              /* per node, made when first needed: the receiver of the instance_exec
+                              that runs a block body handed to it as `&b`, -2 for several (cf_exec_self_recv) */
 } CF;
 /* the class walk of the closed world (#8837): the directed walk */
 #define CF_CLOSED(f) ((f)->closed)
@@ -1537,6 +1540,39 @@ static void cf_target_any(CF *f, int t) {
     cf_store(f, nt_ref(nt, t, "receiver"), tmp);
   }
 }
+/* The write a multiple assignment makes through target t, `r.b` or `r[i]`: the call `r.b = e` or `r[i] = e`,
+   where e is what a local in t's place would take of val (cf_masgn_targets), or a value of every class
+   for val < 0 (a splat's rest). The call's classes take e as a single assignment's would. */
+static void cf_call_known(CF *f, int v, int pidx, int recv_el, const char *nm, const int *argv, int argc, int blk);
+static void cf_call_any_at(CF *f, int v, const char *nm, const int *argv, int argc, int blk, int line);
+static void cf_target_write(CF *f, int t, int val) {
+  const NodeTable *nt = f->nt;
+  int r = nt_ref(nt, t, "receiver");
+  const char *nm = nt_str(nt, t, "name");
+  char wn[256];
+  int argv[33], argc = 0;
+  if (r < 0) return;
+  if (nt_kind(nt, t) == NK_IndexTargetNode) {
+    int a = nt_ref(nt, t, "arguments"), an = 0;
+    const int *av = a >= 0 ? nt_arr(nt, a, "arguments", &an) : NULL;
+    for (int i = 0; i < an && argc < 32; i++) argv[argc++] = av[i];
+    nm = "[]=";
+  }
+  else if (nm && *nm && strlen(nm) + 2 <= sizeof wn) { snprintf(wn, sizeof wn, "%s%s", nm, nm[strlen(nm) - 1] == '=' ? "" : "="); nm = wn; }
+  else return;
+  int e = cf_entry(f, -(t + 2), "#tv");
+  if (val < 0) cf_all(f, e);
+  else {
+    cf_flow(f, val, e);
+    cf_load(f, val, e);
+    CFByName *b = cf_byname(f, "to_ary");
+    for (int j = 0; j < b->n; j++) if (!cf_prelude_scope(f, b->mi[j])) cf_load(f, f->ret_el[b->mi[j]], e);
+  }
+  argv[argc++] = e;
+  int pidx = cf_set_of(f, r);
+  if (pidx == CF_ALL) cf_call_any_at(f, t, nm, argv, argc, -1, __LINE__);
+  else cf_call_known(f, t, pidx, r, nm, argv, argc, -1);
+}
 /* the local targets of a multiple assignment node mw (lefts, rights, a
    splat rest, a nested MultiTargetNode), bound from val (cf_masgn_targets);
    depth bounds the nesting */
@@ -1557,7 +1593,7 @@ static void cf_masgn_targets(CF *f, int mw, int val, int depth) {
         CFByName *b = cf_byname(f, "to_ary");
         for (int j = 0; j < b->n; j++) if (!cf_prelude_scope(f, b->mi[j])) cf_load(f, f->ret_el[b->mi[j]], lq);
       }
-      else if (k == NK_CallTargetNode || k == NK_IndexTargetNode) cf_target_any(f, t);
+      else if (k == NK_CallTargetNode || k == NK_IndexTargetNode) { cf_target_any(f, t); cf_target_write(f, t, val); }
       else if (k == NK_MultiTargetNode && depth < 8) {
         /* an element of the value, destructured again */
         int e = -1;
@@ -1570,6 +1606,7 @@ static void cf_masgn_targets(CF *f, int mw, int val, int depth) {
   if (r >= 0 && nt_kind(nt, r) == NK_SplatNode) {
     int e = nt_ref(nt, r, "expression");
     if (e >= 0 && nt_kind(nt, e) == NK_LocalVariableTargetNode) cf_all(f, cf_lv(f, e, nt_str(nt, e, "name")));
+    else if (e >= 0 && (nt_kind(nt, e) == NK_CallTargetNode || nt_kind(nt, e) == NK_IndexTargetNode)) { cf_target_any(f, e); cf_target_write(f, e, -1); }
   }
 }
 /* is target node v a local a multiple assignment binds (cf_masgn_targets)? */
@@ -1671,6 +1708,83 @@ static int cf_owner_block(CF *f, int v, int loop_stop) {
 static int cf_in_exec_block(CF *f, int v);
 static void cf_ivar_write_any(CF *f, const char *name, int v);
 static const char *cf_ivar_lit(CF *f, int call);
+
+/* The receiver whose object is self in v's block, when that block is the
+   literal block of `x.instance_eval` or `x.instance_exec` (x not self),
+   which runs it with x as its self; else -1 */
+static int cf_exec_runner(const char *pn) {
+  return pn && (sp_streq(pn, "instance_eval") || sp_streq(pn, "instance_exec"));
+}
+int ie_trace_bodies(Compiler *c, int x, int *out, int cap, int depth);   /* analyze.c */
+/* The body of the block a local read x holds, when its scope writes it
+   once with a literal `proc { }`, `lambda { }` or `Proc.new { }` and reads
+   it only as the `&x` of an instance_exec or instance_eval: 1 with it in
+   out[0], else -1 */
+static int cf_local_proc_body(CF *f, int x, int *out) {
+  const NodeTable *nt = f->nt;
+  if (x < 0 || nt_kind(nt, x) != NK_LocalVariableReadNode) return -1;
+  const char *ln = nt_str(nt, x, "name");
+  const Scope *s = comp_scope_of(f->c, x);
+  if (!ln || !s) return -1;
+  int w = -1;
+  for (int id = 0; id < nt->count && id < f->nnodes; id++) {
+    NodeKind k = nt_kind(nt, id);
+    int lv = k == NK_LocalVariableWriteNode || k == NK_LocalVariableTargetNode || k == NK_LocalVariableOperatorWriteNode ||
+             k == NK_LocalVariableOrWriteNode || k == NK_LocalVariableAndWriteNode || k == NK_LocalVariableReadNode;
+    if (!lv || !sp_streq(nt_str(nt, id, "name"), ln) || comp_scope_of(f->c, id) != s) continue;
+    if (k == NK_LocalVariableReadNode) {
+      int ba = f->par ? f->par[id] : -1, call = ba >= 0 ? f->par[ba] : -1;
+      if (ba < 0 || nt_kind(nt, ba) != NK_BlockArgumentNode || call < 0 || nt_kind(nt, call) != NK_CallNode ||
+          nt_ref(nt, call, "block") != ba || !cf_exec_runner(nt_str(nt, call, "name"))) return -1;
+      continue;
+    }
+    if (k != NK_LocalVariableWriteNode || w >= 0) return -1;
+    w = id;
+  }
+  for (int i = 0; i < s->nparams; i++) if (s->pnames[i] && sp_streq(s->pnames[i], ln)) return -1;
+  int v = w >= 0 ? nt_ref(nt, w, "value") : -1;
+  if (v < 0 || nt_kind(nt, v) != NK_CallNode) return -1;
+  const char *vn = nt_str(nt, v, "name");
+  int vr = nt_ref(nt, v, "receiver"), vb = nt_ref(nt, v, "block");
+  int maker = vn && ((vr < 0 && (sp_streq(vn, "proc") || sp_streq(vn, "lambda"))) ||
+                     (vr >= 0 && sp_streq(vn, "new") && nt_kind(nt, vr) == NK_ConstantReadNode && sp_streq(nt_str(nt, vr, "name"), "Proc")));
+  if (!maker || nt_ref(nt, v, "arguments") >= 0 || vb < 0 || nt_kind(nt, vb) != NK_BlockNode) return -1;
+  if (vr < 0 && cf_byname(f, vn)->n) return -1;   /* (a `proc` or `lambda` of the program's) */
+  out[0] = nt_ref(nt, vb, "body");
+  return out[0] >= 0 ? 1 : -1;
+}
+static int cf_exec_self_recv(CF *f, int v) {
+  const NodeTable *nt = f->nt;
+  int q = cf_owner_block(f, v, 0), p = q >= 0 && f->par ? f->par[q] : -1;
+  if (p >= 0 && nt_kind(nt, p) == NK_CallNode && nt_ref(nt, p, "block") == q && cf_exec_runner(nt_str(nt, p, "name"))) {
+    int pr = nt_ref(nt, p, "receiver");
+    return pr >= 0 && nt_kind(nt, pr) != NK_SelfNode ? pr : -1;
+  }
+  /* a block handed on as `x.instance_exec(&b)`, where b traces to it alone
+     (ie_trace_bodies, as the instance_eval map has it) and no other runner
+     with another receiver takes it */
+  if (q < 0 || nt_kind(nt, q) != NK_BlockNode) return -1;
+  if (!f->xself) {
+    f->xself = malloc(sizeof(int) * ((size_t)f->nnodes + 1));
+    if (!f->xself) cf_oom();
+    for (int i = 0; i < f->nnodes; i++) f->xself[i] = -1;
+    NT_FOREACH_KIND(nt, NK_CallNode, id) {
+      if (id >= f->nnodes || !cf_exec_runner(nt_str(nt, id, "name"))) continue;
+      int ba = nt_ref(nt, id, "block"), pr = nt_ref(nt, id, "receiver");
+      if (ba < 0 || nt_kind(nt, ba) != NK_BlockArgumentNode) continue;
+      int traced[16], tn = cf_local_proc_body(f, nt_ref(nt, ba, "expression"), traced);
+      if (tn < 0) tn = ie_trace_bodies(f->c, nt_ref(nt, ba, "expression"), traced, 16, 0);
+      int known = pr >= 0 && nt_kind(nt, pr) != NK_SelfNode;
+      for (int t = 0; t < tn; t++) {
+        int tb = traced[t];
+        if (tb < 0 || tb >= f->nnodes) continue;
+        f->xself[tb] = known && (f->xself[tb] == -1 || f->xself[tb] == pr) ? pr : -2;
+      }
+    }
+  }
+  int body = nt_ref(nt, q, "body");
+  return body >= 0 && body < f->nnodes && f->xself[body] >= 0 ? f->xself[body] : -1;
+}
 
 /* the loop a break under v leaves: the nearest enclosing while, until or
    for, or -1 when a block, a lambda or a def is nearer */
@@ -2014,9 +2128,32 @@ static void cf_each_yields(CF *f, int recv_el, int pe) {
     for (int y = 0; y < CF_YARGS; y++) cf_flow(f, f->yarg_el[mi][y], pe);
   }
 }
+/* May the value at x be an instance of builtin class `core` or of a class below it? Yes unless the set names
+   builtin classes and none of them is: every class, a class of the program's (it may be below `core`, or
+   reopen it) and no value yet rule nothing out, as cls_fact_may_hold_builtin reads a fact. */
+static int cf_may_be_core(CF *f, int x, int core) {
+  int ps = x >= 0 ? cf_set_of(f, x) : CF_ALL;
+  if (ps == CF_ALL || ps == CF_EMPTY || f->pool[ps].n || f->pool[ps].os) return 1;
+  const unsigned long long *sub = cls_bk_subtree(f->c, core);
+  for (int i = 0; i < CLS_BK_WORDS; i++) if (f->pool[ps].bk[i] & sub[i]) return 1;
+  return 0;
+}
+/* May `recv[...] = x` put the elements of x into the receiver? An Array's `a[i, n] = x` and `a[i..j] = x` do.
+   `a[i] = x` and a Hash's `h[k] = x` keep x whole, as one element. A splat may spread to either form. */
+static int cf_index_assign_splices(CF *f, int recv_el, const int *argv, int argc) {
+  if (!cf_may_be_core(f, recv_el, CORE_ARRAY)) return 0;
+  int n = 0, idx = -1;
+  for (int i = 0; i < argc; i++) {
+    NodeKind k = nt_kind(f->nt, argv[i]);
+    if (k == NK_BlockArgumentNode) continue;
+    if (k == NK_SplatNode) return 1;
+    if (n++ == 0) idx = argv[i];
+  }
+  return n != 2 || cf_may_be_core(f, idx, CORE_RANGE);
+}
 /* the class-fact rule of one share kind (bop_share_kinds): what the
    call's value is made of; known cleared for a kind with no rule */
-static void cf_share_kind_rule(CF *f, int sh, const char *nm, int v, int recv_el, const int *pos, int npos, int blk, int has_blk, int *known) {
+static void cf_share_kind_rule(CF *f, int sh, int v, int recv_el, const int *pos, int npos, int blk, int has_blk, int splices, int *known) {
   switch (sh) {
   case BSH_PURE: case BSH_ITER_FRESH:
     cf_add_set(f, v, cf_bv_set(f));
@@ -2044,7 +2181,7 @@ static void cf_share_kind_rule(CF *f, int sh, const char *nm, int v, int recv_el
       cf_store(f, recv_el, t);
     }
     /* `a[i, n] = [x]` and `a[i..j] = [x]` put the elements of the last argument into the receiver */
-    else if (npos > 0 && is_index_assign(nm)) {
+    else if (npos > 0 && splices) {
       int t = cf_entry(f, -(v + 2), "#as");
       cf_load(f, pos[npos - 1], t);
       cf_store(f, recv_el, t);
@@ -2295,7 +2432,8 @@ static void cf_builtin_rule(CF *f, int v, int recv_el, const int *argv, int argc
     cf_load(f, nt_ref(nt, argv[i], "expression"), spl);
   }
   int has_blk = blk >= 0 && nt_kind(nt, blk) == NK_BlockNode;
-  for (int i = 0; i < nk && known; i++) cf_share_kind_rule(f, kinds[i], nm, v, recv_el, pos, npos, blk, has_blk, &known);
+  int splices = nm && is_index_assign(nm) && cf_index_assign_splices(f, recv_el, argv, argc);
+  for (int i = 0; i < nk && known; i++) cf_share_kind_rule(f, kinds[i], v, recv_el, pos, npos, blk, has_blk, splices, &known);
   /* an iterator may answer an Enumerator, whatever its row says it answers (`[].each` with no block is not the
      receiver, `lazy` and `chunk` are Enumerators with one), and so do to_enum and lazy */
   int enumer = nm && (is_enumerator_maker(nm) || is_lazy_name(nm));
@@ -2922,7 +3060,10 @@ static void cf_call_known(CF *f, int v, int pidx, int recv_el, const char *nm, c
     }
     int tl = call_target(c, v, -1, nm, CT_TOP, NULL);
     if (tl >= 0 && CF_UT(tl)) continue;
-    if (comp_method_in_chain(c, k, "method_missing", NULL) >= 0) {
+    /* (one of Object's public methods is found before the hook; on a
+       blank slate, one of BasicObject's own) */
+    if (comp_method_in_chain(c, k, "method_missing", NULL) >= 0 &&
+        !(class_is_blank_slate(c, k) ? basicobject_own_method(nm) : object_public_method_name(nm))) {
       /* (directed) the runtime calls the class's method_missing with the
          name and the arguments, which it has seen, and the block */
       int mm = comp_method_in_chain(c, k, "method_missing", NULL);
@@ -3017,7 +3158,10 @@ static void cf_call_known(CF *f, int v, int pidx, int recv_el, const char *nm, c
       if (sp_streq(nm, "new")) { CFByName *b = cf_byname(f, "initialize"); for (int q = 0; q < b->n; q++) cf_bind_args(f, b->mi[q], argv, argc); }
       return;
     }
-    /* `.class`: the Class objects of the receiver's classes */
+    /* `.class`: the Class objects of the receiver's classes, and a
+       runtime Class object for its builtin part; nothing of the receiver
+       itself (the builtin rule below would hand that on) */
+    int class_of = sp_streq(nm, "class") && argc == 0 && blk < 0;
     if (sp_streq(nm, "class") && argc == 0) cf_add_set(f, v, cf_classvals_of(f, pidx));
     /* a method the program adds to a runtime class or module it reopens
        answers for the runtime's values too (`class Object; def tagged`,
@@ -3025,6 +3169,11 @@ static void cf_call_known(CF *f, int v, int pidx, int recv_el, const char *nm, c
     for (int i = 0; i < f->nopen; i++) {
       int mi = call_target(c, v, f->open[i], nm, 0, NULL);
       if (mi >= 0) cf_user_target(f, v, mi, argv, argc, blk);
+    }
+    if (class_of && pidx != CF_ALL) {
+      s = &f->pool[pidx];   /* (the pool moves as sets are added) */
+      if (s->bv || s->os || cf_set_classless(f, pidx)) cf_add_set(f, v, cf_bset(f, 0, 0, 0, CORE_CLASS));
+      return;
     }
     cf_builtin_rule(f, v, recv_el, argv, argc, blk, nm);
   }
@@ -3156,6 +3305,25 @@ static void cf_call_any_at(CF *f, int v, const char *nm, const int *argv, int ar
 
 /* (the call site's line is the root's, for SPINEL_CLS_FLOW=why) */
 #define cf_call_any(f, v, nm, argv, argc, blk) cf_call_any_at((f), (v), (nm), (argv), (argc), (blk), __LINE__)
+/* A send of a computed name on a builtin container may be one of its stores (push, <<, []=, insert, fill, concat,
+   replace, map!): an argument past the name, the elements of one (concat, a slice assignment, and a splat, whose
+   elements are the arguments) and the block's value may each end up among the receiver's elements. */
+static void cf_send_stores(CF *f, int v, int r, const int *argv, int argc, int blk) {
+  const NodeTable *nt = f->nt;
+  int rv = r >= 0 ? r : cf_self_recv(f, v, cf_scope_of(f, v), "send");
+  if (rv < 0) return;
+  int t = cf_entry(f, -(v + 2), "#ds");
+  for (int i = 1; i < argc; i++) {
+    NodeKind k = nt_kind(nt, argv[i]);
+    if (k == NK_BlockArgumentNode) continue;
+    int a = k == NK_SplatNode ? nt_ref(nt, argv[i], "expression") : argv[i];
+    if (k != NK_SplatNode) cf_store(f, rv, a);
+    cf_load(f, a, t);
+  }
+  cf_load(f, t, t);
+  cf_store(f, rv, t);
+  if (blk >= 0 && nt_kind(nt, blk) == NK_BlockNode) cf_store(f, rv, blk);
+}
 static void cf_send_writers(CF *f, int v, int r, const int *argv, int argc) {
   Compiler *c = f->c;
   Scope *sc = &c->scopes[cf_scope_of(f, v)];
@@ -3553,6 +3721,9 @@ static void cf_call(CF *f, int v) {
   { char sb[256]; if (setter_base_name(nm, sb, sizeof sb) || is_index_assign(nm)) cf_add_set(f, v, cf_bk_any(f)); }
   cf_scal_bind(f, v, nm, r, argv, argc, blk);
   cf_anon_struct_value(f, v);
+  /* a Class.new or Module.new the plan answers (cplan_class_new): its site
+     class's Class object, which each run-time class made there shares */
+  { int site; if (cplan_class_new(f->c, v, &site) != CNEW_NONE) { cf_add_set(f, v, cf_classval(f, site)); return; } }
   cf_modfn_bind(f, v, nm, argv, argc, blk);
   if (cf_blk_call(f, v, r, nm, argv, argc)) return;
   /* `k.superclass` (#8837): the Class objects of the parents of the
@@ -3599,9 +3770,11 @@ static void cf_call(CF *f, int v) {
   }
   if (cf_opaque_name(nm) && CF_CLOSED(f) && f->rtc >= 0 && f->dynarg >= 0) {
     cf_opaque_answer(f, v, r, nm, argv, argc, blk);
-    if (argc >= 2 && (sp_streq(nm, "send") || sp_streq(nm, "__send__") || sp_streq(nm, "public_send")) &&
-        nt_kind(nt, argv[0]) != NK_SymbolNode && nt_kind(nt, argv[0]) != NK_StringNode)
-      cf_send_writers(f, v, r, argv, argc);
+    if (argc >= 1 && (sp_streq(nm, "send") || sp_streq(nm, "__send__") || sp_streq(nm, "public_send")) &&
+        nt_kind(nt, argv[0]) != NK_SymbolNode && nt_kind(nt, argv[0]) != NK_StringNode) {
+      cf_send_stores(f, v, r, argv, argc, blk);
+      if (argc >= 2) cf_send_writers(f, v, r, argv, argc);
+    }
     return;
   }
   if (cf_opaque_name(nm)) {
@@ -3609,9 +3782,11 @@ static void cf_call(CF *f, int v) {
     for (int i = 0; i < argc; i++) cf_all(f, argv[i]);
     if (sp_streq(nm, "instance_variable_set") && argc == 2 && cf_ivar_lit(f, v)) cf_ivar_write_any(f, cf_ivar_lit(f, v), argv[1]);
     if (blk >= 0 && nt_kind(nt, blk) == NK_BlockNode) { cf_all_block_params(f, blk); cf_all(f, blk); }
-    if (argc >= 2 && (sp_streq(nm, "send") || sp_streq(nm, "__send__") || sp_streq(nm, "public_send")) &&
-        nt_kind(nt, argv[0]) != NK_SymbolNode && nt_kind(nt, argv[0]) != NK_StringNode)
-      cf_send_writers(f, v, r, argv, argc);
+    if (argc >= 1 && (sp_streq(nm, "send") || sp_streq(nm, "__send__") || sp_streq(nm, "public_send")) &&
+        nt_kind(nt, argv[0]) != NK_SymbolNode && nt_kind(nt, argv[0]) != NK_StringNode) {
+      cf_send_stores(f, v, r, argv, argc, blk);
+      if (argc >= 2) cf_send_writers(f, v, r, argv, argc);
+    }
     return;
   }
   /* an alias that captured a builtin (`alias old_dup dup`, #8914) calls the
@@ -3638,7 +3813,13 @@ static void cf_call(CF *f, int v) {
        instance runs this code; else the top-level def; else Kernel's */
     int si = cf_scope_of(f, v);
     /* (in a block that may run under another self the method may be a builtin's) */
-    if (cf_owner_block(f, v, 0) >= 0 && cf_in_exec_block(f, v)) cf_add_set(f, v, cf_bk_any(f));
+    /* (the literal block of `x.instance_eval` or `x.instance_exec` runs
+       with x as its self: the call is one on x's classes, as `x.m` is) */
+    if (cf_owner_block(f, v, 0) >= 0 && cf_in_exec_block(f, v)) {
+      int pr = cf_exec_self_recv(f, v), ps = pr >= 0 ? cf_set_of(f, pr) : CF_ALL;
+      if (ps != CF_ALL) { cf_call_known(f, v, ps, pr, nm, argv, argc, blk); return; }
+      cf_add_set(f, v, cf_bk_any(f));
+    }
     Scope *s = &c->scopes[si];
     int found = 0;
     if (s->def_node >= 0 && s->class_id >= 0) {
@@ -3698,6 +3879,13 @@ static void cf_call(CF *f, int v) {
       if (sp_streq(nm, "new") || sp_streq(nm, "allocate")) { cf_construct(f, v, cb, argv, argc, blk, nm); return; }
       int cm = call_target(c, v, cb, nm, CT_CMETHOD, NULL);
       if (cm >= 0 && cf_user_target(f, v, cm, argv, argc, blk)) found = 1;
+      /* (a block of the body that may run under another self, an exec
+         block: an instance's method of the name may answer the call too,
+         as on the object instance_exec gives it) */
+      if (found && cf_owner_block(f, v, 0) >= 0 && cf_in_exec_block(f, v) && cf_byname(f, nm)->n) {
+        cf_call_any(f, v, nm, argv, argc, blk);
+        return;
+      }
     }
     if (!found) {
       int tl = call_target(c, v, -1, nm, CT_TOP, NULL);
@@ -3746,6 +3934,9 @@ static void cf_call(CF *f, int v) {
     if (cf_owner_block(f, v, 0) >= 0 && cf_in_exec_block(f, v)) {
       CFByName *b = cf_byname(f, nm);
       if (b->n || b->ncm || b->nrd || b->nwr) { cf_call_any(f, v, nm, argv, argc, blk); return; }
+      /* a name no method of the program answers, where a class's
+         method_missing may: what the hook answers, as for `self.name` */
+      if (f->has_mm && !ie_kernel_global(nm) && !cf_opaque_name(nm)) { cf_call_any(f, v, nm, argv, argc, blk); return; }
     }
     /* Kernel: a conversion, an iteration, `lambda`, `proc`, `loop`, `raise`
        hand on what they are given; `new` has no class here */
@@ -3829,8 +4020,10 @@ static void cf_call(CF *f, int v) {
     if (cf_kernel_proc_call(f, v, k->name, nm, argv, argc, blk)) return;
     if (cf_poison_class_call(f, v, k->name, nm, argv, argc, blk)) return;
     /* a method of Class or Module: nothing of the program's own comes out,
-       except through a block */
+       except through a block, and Kernel's itself and tap, which answer
+       the Class object */
     if (blk >= 0 && nt_kind(nt, blk) == NK_BlockNode) cf_all_block_params(f, blk);
+    if (is_itself_name(nm) || is_tap_name(nm)) cf_add_set(f, v, cf_classval(f, x));
     cf_builtin_rule(f, v, -1, argv, argc, blk, nm);
     return;
   }
@@ -4190,7 +4383,11 @@ static void cf_node(CF *f, int v) {
     return;
   }
   case NK_SelfNode: {
-    if (cf_in_exec_block(f, v) || nt_int(nt, v, "ie_rself", 0)) { cf_all(f, v); return; }
+    if (cf_in_exec_block(f, v) || nt_int(nt, v, "ie_rself", 0)) {
+      int pr = cf_exec_self_recv(f, v);
+      if (pr >= 0) cf_flow(f, pr, v); else cf_all(f, v);
+      return;
+    }
     int si = cf_scope_of(f, v);
     /* a self a pass gave a call as its receiver after the scopes were
        walked (`r` -> `self.r`) has none recorded: the call's is its */
@@ -5668,7 +5865,7 @@ static void cf_solve(Compiler *c, int directed, int dump_facts) {
     free(f.ld); free(f.nld); free(f.cld); free(f.st); free(f.nst); free(f.cst); free(f.oe_out); free(f.oe_in);
     free(f.ptop); free(f.esc); free(f.elobj); free(f.summ); free(f.smc); free(f.obj_cont); free(f.obj_str); free(f.fs);
   }
-  free(f.exc_kw);
+  free(f.exc_kw); free(f.xself);
   mtab_leave(c);
 }
 
@@ -5972,7 +6169,13 @@ int cls_fact_excludes(Compiler *c, int recv, int k) {
 /* See compiler.h. */
 int cls_fact_excludes_class_value(Compiler *c, int recv, int k) {
   const ClsSet *s = cls_fact_node(c, recv);
-  if (!s || k < 0 || k >= c->nclasses || !cls_fact_bounded(c, k)) return 0;
+  if (!s || k < 0 || k >= c->nclasses) return 0;
+  /* (a module of the program's, a native one too, is left out of cls_fact_bounded for its
+     instances, which are its includers'; its own object is a value its constant reads give,
+     counted as a class's is. A reopened builtin module's may come from the runtime.) */
+  const ClassInfo *ci = &c->classes[k];
+  int own_module = comp_class_is_module(c, ci) && ci->name && !is_builtin_reopen_name(ci->name);
+  if (!own_module && !cls_fact_bounded(c, k)) return 0;
   /* (a receiver no value reaches excludes none, as in cls_fact_excludes;
      nor one a builtin's answer may be a Class object in, bc, where a Class
      object of the program's handed to the runtime comes back, #10303) */

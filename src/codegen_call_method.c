@@ -1254,14 +1254,54 @@ int emit_op_method_owner(Compiler *c, const BopCtx *x, Buf *b) {
   return 0;
 }
 
+/* Does a Method looked up on mrecv keep mrecv's value, which the program may
+   rebind (a local's or an ivar's) before #receiver asks? A bound lookup
+   keeps an object, a String, an Array or a Hash by its pointer, an Integer,
+   a true or false and a Symbol by value and a boxed receiver in its holder
+   (emit_method_obj_target), and a class value by sp_bm_set_self_class
+   (emit_bm_self_keep_open); a by-value object, a Float or a Range keeps
+   none. */
+static int method_keeps_receiver(Compiler *c, int mrecv) {
+  NodeKind k = nt_kind(c->nt, mrecv);
+  if (k != NK_LocalVariableReadNode && k != NK_InstanceVariableReadNode) return 0;
+  Repr r = repr_of(c, mrecv);
+  TyKind t = r.as_ty;
+  if (r.kind == RK_STRUCT) return t == TY_CLASS;
+  if (r.kind == RK_SCALAR) return t == TY_INT || t == TY_BOOL || t == TY_SYMBOL;
+  if (r.kind == RK_STRBUF) return t == TY_STRING;
+  if (r.kind == RK_BOXED) return 1;
+  return r.kind == RK_PTR && (ty_is_object(t) || ty_is_array(t) || ty_is_hash(t));
+}
+
 /* Method#receiver (#2701). The receiver re-emits when doing so cannot repeat a
-   side effect (a literal or a local read). */
+   side effect (a literal or a local read) and the program cannot have
+   rebound it since the lookup; a rebindable one the Method keeps is read
+   back out of it. */
 int emit_op_method_receiver(Compiler *c, const BopCtx *x, Buf *b) {
   const NodeTable *nt = c->nt;
   int recv = x->recv;
   int mn = method_recv_node(c, recv);
   int mrecv = mn >= 0 ? nt_ref(nt, mn, "receiver") : -1;
   if (mrecv < 0) return 0;
+  /* (a bound lookup's: a bind's receiver is its argument, and an unbound
+     Method has none) */
+  if (method_keeps_receiver(c, mrecv) && is_method_ref_name(nt_str(nt, mn, "name")) &&
+      !method_expr_is_unbound(c, recv)) {
+    int tm = ++g_tmp;
+    char rv[48]; snprintf(rv, sizeof rv, "sp_bm_receiver(_t%d)", tm);
+    buf_printf(b, "({ sp_BoundMethod *_t%d = ", tm);
+    emit_expr(c, recv, b);
+    buf_printf(b, "; SP_GC_ROOT(_t%d); ", tm);
+    Repr kr = repr_of(c, mrecv);
+    /* (an object slot's value is of its class or nil: the payload is the
+       pointer, which needs no class check, nor the class bank such a check
+       reads, sp_poly_unbox_cls) */
+    if (kr.kind == RK_PTR && ty_is_object(kr.as_ty)) buf_printf(b, "(%s *)%s.v.p", class_ctype(c, ty_object_class(kr.as_ty)), rv);
+    else if (kr.kind == RK_BOXED) buf_puts(b, rv);
+    else emit_unbox_text(c, kr.as_ty, rv, b);
+    buf_puts(b, "; })");
+    return 1;
+  }
   NodeKind mrk = nt_kind(nt, mrecv);
   int pure = (mrk == NK_LocalVariableReadNode ||
                       mrk == NK_IntegerNode || mrk == NK_FloatNode ||
@@ -1454,7 +1494,61 @@ int emit_op_method_arity(Compiler *c, const BopCtx *x, Buf *b) {
 
 /* calling a Method or a Proc (call / () / [] / ===), composing Procs (<< >>), and a Proc's
    own methods (its builtin-op rows, parameters, source_location) */
+static int g_nil_eqq_node = -1;
 int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
+  /* `m === x` on a Method value that is nil (`super_method` with no
+     super) is nil's own `===`, true for a nil argument. The receiver goes
+     into a temp the call reads, so it is evaluated once. */
+  if (sp_streq(name, "===") && argc == 1 && recv >= 0 && comp_ntype(c, recv) == TY_METHOD &&
+      g_nil_eqq_node != id && g_n_argov < MAX_ARG_OVERRIDE) {
+    Repr rr = repr_of(c, id);
+    int boxed = rr.kind == RK_BOXED || rr.as_ty == TY_POLY;
+    if (boxed || rr.as_ty == TY_BOOL) {
+      int tq = ++g_tmp;
+      Buf rq; memset(&rq, 0, sizeof rq); emit_expr(c, recv, &rq);
+      emit_indent(g_pre, g_indent);
+      buf_printf(g_pre, "sp_BoundMethod *_t%d = %s; SP_GC_ROOT(_t%d);\n", tq, rq.p ? rq.p : "NULL", tq);
+      free(rq.p);
+      int ov = g_n_argov;
+      view_bind_temp(recv, tq);
+      /* an argument with an effect runs once, and both arms read it */
+      Repr ar = repr_of(c, argv[0]);
+      TyKind at = ar.kind == RK_BOXED ? TY_POLY : ar.as_ty;
+      if (subtree_has_side_effect(c, argv[0]) && at != TY_NIL && at != TY_VOID && at != TY_UNKNOWN &&
+          g_n_argov < MAX_ARG_OVERRIDE) {
+        /* (a nullable Integer or Float keeps its nil in its oint) */
+        int so = oint_kind(at) && node_is_oint(c, argv[0]);
+        int ta = ++g_tmp;
+        Buf av; memset(&av, 0, sizeof av);
+        if (so) emit_oint_expr(c, argv[0], at, &av); else emit_expr(c, argv[0], &av);
+        emit_indent(g_pre, g_indent);
+        if (so) buf_puts(g_pre, oint_ctype(at)); else emit_ctype(c, at, g_pre);
+        buf_printf(g_pre, " _t%d = %s; ", ta, av.p ? av.p : "0");
+        if (!so) emit_gc_root_tmp(c, at, ta, g_pre);
+        buf_puts(g_pre, "\n");
+        free(av.p);
+        if (so) view_bind_temp_o(argv[0], ta); else view_bind_temp(argv[0], ta);
+      }
+      /* a nil-valued one runs once for its effect; both arms read nil */
+      else if (subtree_has_side_effect(c, argv[0]) && (at == TY_NIL || at == TY_VOID) &&
+               g_n_argov < MAX_ARG_OVERRIDE) {
+        Buf av; memset(&av, 0, sizeof av); emit_expr_for_effect(c, argv[0], &av);
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "(void)(%s);\n", av.p ? av.p : "0");
+        free(av.p);
+        view_bind(argv[0], "0");
+      }
+      int sv = g_nil_eqq_node; g_nil_eqq_node = id;
+      Buf cb; memset(&cb, 0, sizeof cb); emit_expr(c, id, &cb);
+      g_nil_eqq_node = sv;
+      Buf ab; memset(&ab, 0, sizeof ab); emit_boxed(c, argv[0], &ab);
+      view_unbind(ov);
+      buf_printf(b, "(_t%d ? %s : %s((%s).tag == SP_TAG_NIL))", tq, cb.p ? cb.p : "sp_box_nil()",
+                 boxed ? "sp_box_bool" : "", ab.p ? ab.p : "sp_box_nil()");
+      free(cb.p); free(ab.p);
+      return 1;
+    }
+  }
   /* <method>.call(args) / [] -> invoke the bound function. A top-level
      method ref calls its function directly; an object-bound Method casts
      fn through the (void *self, sp_int...) ABI, evaluating recv once. */
@@ -1510,7 +1604,7 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
        a call without one is CRuby's ArgumentError, where it read the padding
        zero as the operand (`arr.method(:[]).call()` answered `arr[0]`). */
     if (tm && bam_binop_wrapper(tm) && argc < 1) {
-      emit_wrong_count(c, id, "1", 1, 0, b);
+      emit_wrong_count(c, id, "1", 1, 0, NULL, b);
       return 1;
     }
     /* More arguments than the wrapper's operands went to its C function as
@@ -1532,7 +1626,7 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
     if (tm && bam_binop_wrapper(tm) && argc > bop_ops && !bop_flat) {
       char exp[16];
       arity_expected(exp, sizeof exp, bop_min, bop_max);
-      emit_wrong_count(c, id, exp, 1, -1, b);
+      emit_wrong_count(c, id, exp, 1, -1, NULL, b);
       return 1;
     }
     /* When the target is unresolved under promote, fall back to the poly ABI
@@ -1615,6 +1709,10 @@ int emit_call_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, co
        callable address. Invoking it jumped through NULL; the poly-slot and
        first-class routes decline with NoMethodError, so decline the same way
        here instead of dereferencing it. */
+    /* a Method value that holds nil (`super_method` with no super): the
+       call is nil's, which has no method of the name (`===` is nil's own) */
+    if (!sp_streq(name, "==="))
+      buf_printf(b, "if (!_t%d) sp_raise_cls(\"NoMethodError\", \"undefined method '%s' for nil\"); ", tr, name);
     buf_printf(b, "if (!_t%d->fn) sp_raise_cls(\"NoMethodError\","
                   " sp_sprintf(\"undefined method '%%s' for an instance of Object\","
                   " _t%d->name ? _t%d->name : \"?\")); ", tr, tr, tr);
@@ -2260,6 +2358,31 @@ static void emit_bound_call_in_block(Compiler *c, int id, Buf *b, const NodeTabl
   free(pre.p); free(call.p);
 }
 
+/* What a Method keeps beside its self slot, around its constructor: a
+   builtin bound by its pointer keeps its box's class id (sp_bm_set_self_cls),
+   and a class value the program may rebind keeps itself
+   (sp_bm_set_self_class), which #receiver reads back (method_keeps_receiver). */
+static int method_keeps_class(Compiler *c, int recv) {
+  return recv >= 0 && repr_of(c, recv).kind == RK_STRUCT && method_keeps_receiver(c, recv);
+}
+static void emit_bm_self_keep_open(Compiler *c, int recv, int set_cls, Buf *b) {
+  if (set_cls) buf_puts(b, "sp_bm_set_self_cls(");
+  if (method_keeps_class(c, recv)) buf_puts(b, "sp_bm_set_self_class(");
+}
+static void emit_bm_self_keep_close(Compiler *c, int recv, int set_cls, TyKind self_box_ty, int self_tmp, Buf *b) {
+  if (method_keeps_class(c, recv)) { buf_puts(b, ", "); emit_expr(c, recv, b); buf_puts(b, ")"); }
+  if (!set_cls) return;
+  /* (the temporary is a void *: a String handle is named as one, so the
+     box is the handle's own and nothing allocates before the Method is
+     rooted) */
+  char st[48];
+  if (self_box_ty == TY_STRBUF) snprintf(st, sizeof st, "((sp_String *)_t%d)", self_tmp);
+  else snprintf(st, sizeof st, "_t%d", self_tmp);
+  buf_puts(b, ", (");
+  emit_boxed_text(c, self_box_ty, st, b);
+  buf_puts(b, ").cls_id)");
+}
+
 static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv, int capture, const char *captured_name) {
   /* Klass.instance_method(:sym) -> the unbound object: the same
      sp_BoundMethod with a NULL self, so name/arity/owner ride the Method
@@ -2329,19 +2452,7 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
       buf_puts(b, "; })");
       return 1;
     }
-    if (t2 >= 0 && c->scopes[t2].class_id >= 0 && !c->scopes[t2].is_cmethod &&
-        ty_is_object(comp_ntype(c, argv[0]))) {
-      emit_bind_call(c, id, t2, argv, argc, b);
-      return 1;
-    }
-    /* a boxed obj: its class is checked at run time */
-    if (t2 >= 0 && c->scopes[t2].class_id >= 0 && !c->scopes[t2].is_cmethod &&
-        repr_of(c, argv[0]).kind == RK_BOXED && nt_kind(nt, argv[0]) != NK_SplatNode &&
-        class_value_bind_call_target(c, method_recv_node(c, recv), c->scopes[t2].class_id,
-                                     c->scopes[t2].name, NULL) == t2) {
-      emit_bind_call_boxed(c, id, t2, -1, NULL, argv, argc, b);
-      return 1;
-    }
+    if (emit_bind_call_target(c, id, recv, t2, argv, argc, b)) return 1;
   }
   /* ...and on a Class value known only at run time, a switch on its class */
   if (recv >= 0 && argc >= 1 && sp_streq(name, "bind_call") && nt_kind(nt, argv[0]) != NK_SplatNode) {
@@ -2389,7 +2500,8 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
       int tk = ++g_tmp;
       buf_printf(b, "({ sp_Class _t%d = ", tk);
       emit_expr(c, recv, b);
-      buf_printf(b, "; if (_t%d.name || _t%d.cls_id != %d) sp_raise_cls(\"NameError\", sp_nomethod_class_msg(", tk, tk, ivk);
+      char tkn[24], key[64]; snprintf(tkn, sizeof tkn, "_t%d", tk);
+      buf_printf(b, "; if (_t%d.name || %s != %d) sp_raise_cls(\"NameError\", sp_nomethod_class_msg(", tk, class_value_key(c, -1, tkn, key, sizeof key), ivk);
       emit_str_literal(b, sym);
       buf_printf(b, ", sp_box_class(_t%d))); ", tk);
     }
@@ -2567,7 +2679,7 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
        Method finds its own written name in (sp_bm_set_group) */
     int grp = held || ident != NULL;
     int set_cls = self_rooted && !held && self_box_ty != TY_UNKNOWN;
-    if (set_cls) buf_puts(b, "sp_bm_set_self_cls(");
+    emit_bm_self_keep_open(c, recv, set_cls, b);
     if (grp) buf_puts(b, "sp_bm_set_group(");
     if (held) buf_puts(b, "sp_bm_set_held(");
     if (ident) buf_puts(b, "sp_bm_set_ident(");
@@ -2822,17 +2934,7 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
       free(map);
       buf_printf(b, ", (sp_int)%uu)", builtin_name_group_hash(ident && hash ? hash + 1 : disp));
     }
-    if (set_cls) {
-      /* (the temporary is a void *: a String handle is named as one, so the
-         box is the handle's own and nothing allocates before the Method
-         is rooted) */
-      char st[48];
-      if (self_box_ty == TY_STRBUF) snprintf(st, sizeof st, "((sp_String *)_t%d)", self_tmp);
-      else snprintf(st, sizeof st, "_t%d", self_tmp);
-      buf_puts(b, ", (");
-      emit_boxed_text(c, self_box_ty, st, b);
-      buf_puts(b, ").cls_id)");
-    }
+    emit_bm_self_keep_close(c, recv, set_cls, self_box_ty, self_tmp, b);
     if (mmq >= 0 && (self_rooted || recv < 0)) buf_puts(b, ")");
     if (self_rooted) buf_puts(b, "; })");
     if (ivk >= 0) buf_puts(b, "; })");
@@ -2874,16 +2976,19 @@ static int emit_method_obj_target(Compiler *c, int id, Buf *b, const NodeTable *
 
 /* CRuby's NameError for capture id, whose plan finds no method (CallPlan.absent), as a statement. A
    Class.new class is named as it prints at run time: by the constant written with it, once written
-   (obj_default_name's display). A module whose singleton class is not made yet is named 'Module'.
-   The method name is an argument of that format, not part of it: an operator's name may hold a `%`. */
-static void emit_capture_absent_raise(Compiler *c, const char *mn, const CallPlan *plan, Buf *b) {
+   (obj_default_name's display), the object obj's (C, NULL for none). A module whose singleton class
+   is not made yet is named 'Module'. The method name is an argument of that format, not part of it:
+   an operator's name may hold a `%`. */
+static void emit_capture_absent_raise(Compiler *c, const char *mn, const CallPlan *plan, const char *obj, Buf *b) {
   int module = plan->absent == CP_ABSENT_MODULE;
   const char *cn = module ? "Module" : class_ruby_name(c, plan->owner_ci), *open = plan->absent == CP_ABSENT_SG ? "#<Class:" : "", *close = plan->absent == CP_ABSENT_SG ? ">" : "";
   /* (the name is escaped for the C literal: :"a\"b") */
   if (!module && comp_class_anonymous(c, plan->owner_ci)) {
     buf_printf(b, "sp_raise_cls(\"NameError\", sp_sprintf(\"undefined method '%%s' for class '%s%%s%s'\", \"", open, close);
     emit_c_escaped(b, mn ? mn : "");
-    buf_printf(b, "\", sp_class_display((sp_Class){%d})));", plan->owner_ci);
+    buf_puts(b, "\", sp_class_display((sp_Class){");
+    emit_obj_class_id(c, plan->owner_ci, plan->absent == CP_ABSENT_SG ? NULL : obj, b);
+    buf_puts(b, "})));");
     return;
   }
   buf_puts(b, "sp_raise_cls(\"NameError\", (&(\"\\xff\" \"undefined method '\" \"");
@@ -2933,10 +3038,16 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
   int closed = is_method_object_maker(name) && (plan.closed == SP_VIS_PRIVATE || plan.closed == SP_VIS_PROTECTED);
   if ((plan.absent && plan.mi < 0 && is_method_object_maker(name)) || closed) {
     buf_puts(b, "({ ");
-    if (recv >= 0) { buf_puts(b, "(void)("); emit_expr(c, recv, b); buf_puts(b, "); "); }
+    /* (an object of a site class's family is held: its class names it) */
+    char ho[24] = "";
+    if (recv >= 0 && ty_is_object(repr_of(c, recv).as_ty) && cplan_rt_family(c, plan.owner_ci)) {
+      snprintf(ho, sizeof ho, "_t%d", ++g_tmp);
+      buf_printf(b, "void *%s = (void *)(", ho); emit_expr(c, recv, b); buf_puts(b, "); ");
+    }
+    else if (recv >= 0) { buf_puts(b, "(void)("); emit_expr(c, recv, b); buf_puts(b, "); "); }
     if (closed) emit_capture_closed_raise(c, method_sym_arg(c, id), &plan, b);
     else if (plan.absent == CP_ABSENT_MAIN) emit_main_capture_absent_raise(c, id, b);
-    else emit_capture_absent_raise(c, method_sym_arg(c, id), &plan, b);
+    else emit_capture_absent_raise(c, method_sym_arg(c, id), &plan, ho[0] ? ho : NULL, b);
     buf_puts(b, " ");
     emit_unread_value(c, id, b);
     buf_puts(b, "; })");
@@ -3004,7 +3115,7 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
        NameError (CallPlan.absent) */
     if (t[0] < 0 && t[1] < 0 && plan.absent) {
       buf_puts(b, "{ ");
-      emit_capture_absent_raise(c, method_sym_arg(c, id), &plan, b);
+      emit_capture_absent_raise(c, method_sym_arg(c, id), &plan, NULL, b);
       buf_printf(b, " _t%d = NULL; }\n", tr);
       continue;
     }
@@ -3019,13 +3130,17 @@ int emit_call_method_obj_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, 
     if (to[i] == CPLAN_ARM_NONE && c->scopes[mi].class_id == comp_core_class(c, CORE_STRING)) {
       CallPlan missing = { .owner_ci = c->scopes[mi].class_id };
       buf_puts(b, "{ ");
-      emit_capture_absent_raise(c, captured_name ? captured_name : method_sym_arg(c, id), &missing, b);
+      emit_capture_absent_raise(c, captured_name ? captured_name : method_sym_arg(c, id), &missing, NULL, b);
       buf_printf(b, " _t%d = NULL; }\n", tr);
       continue;
     }
     buf_printf(b, "{ _t%d = ", tr);
-    if (!emit_method_obj_target(c, id, b, nt, name, recv, argc, argv,
-                                to[i] == CPLAN_ARM_NONE ? -1 : cplan_capture_arm(c, id, to[i]), captured_name)) {
+    /* (a yielding version is bound through its proc form, as method_obj_target_mi binds one, where the
+       form runs the version's own def: a copy an include makes, not a later redefinition's clone) */
+    int arm = to[i] == CPLAN_ARM_NONE ? -1 : cplan_capture_arm(c, id, to[i]), arm_pf = scope_proc_form_of(c, arm);
+    int arm_src = arm_pf >= 0 ? proc_form_source(c, arm_pf) : -1;
+    if (arm_src < 0 || c->scopes[arm_src].def_node != c->scopes[arm].def_node) arm_pf = -1;
+    if (!emit_method_obj_target(c, id, b, nt, name, recv, argc, argv, arm_pf >= 0 ? arm_pf : arm, captured_name)) {
       view_unwind(mark);
       buf_erase(b, start, b->len - start);
       return 0;
@@ -3114,8 +3229,10 @@ int emit_call_poly_callable_arms(Compiler *c, int id, Buf *b, const NodeTable *n
                       " : _t%d.tag == SP_TAG_ENCODING ? sp_box_str_new(sp_str_uminus_val(_t%d.v.s))"
                       " : _t%d.tag == SP_TAG_SYM ? sp_box_str_new(sp_sym_name_str((sp_sym)_t%d.v.i))"   /* (a Symbol's name: its one frozen String, no fstring) */
                       " : (_t%d.tag == SP_TAG_OBJ && _t%d.v.p && (_t%d.cls_id == SP_BUILTIN_EXCEPTION || sp_is_exc_subclass_cls(_t%d.cls_id)))"
-                      " ? sp_exc_name_acc((sp_Exception *)_t%d.v.p)",
-                   t, t, cls_arm, t, t, t, t, t, t, t, t, t);
+                      " ? sp_exc_name_acc((sp_Exception *)_t%d.v.p)"
+                      " : (_t%d.tag == SP_TAG_OBJ && _t%d.cls_id == SP_BUILTIN_THREAD && _t%d.v.p)"   /* a Thread's name or nil */
+                      " ? sp_Thread_get_name((sp_thread *)_t%d.v.p)",
+                   t, t, cls_arm, t, t, t, t, t, t, t, t, t, t, t, t, t);
       }
       else if (sp_streq(name, "owner"))
         buf_printf(b, "sp_box_class(sp_bm_owner((sp_BoundMethod *)_t%d.v.p))", t);

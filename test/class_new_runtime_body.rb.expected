@@ -1,0 +1,20 @@
+[:body, :value, :body, :value]
+false
+4
+4
+true
+true
+"t"
+[3, 3]
+true
+true
+:cm
+[:singleton_method_added, :x, :stmt]
+1
+false
+true
+false
+[:plain, :plain]
+[true, 2]
+[true, 4]
+false

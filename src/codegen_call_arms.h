@@ -239,7 +239,7 @@ int emit_cls_value_sg_accessor_of(Compiler *c, int id, int recv, const char *kte
 void ffi_check_buffer_bounds(Compiler *c, int id, int arg, const char *kind, int off, const char *dir);
 extern int g_setter_value_inner;
 int emit_cmethod_setter_assign(Compiler *c, int id, Buf *b);
-int ctor_alloc_decl(Compiler *c, int cid, Buf *b);
+int ctor_alloc_decl(Compiler *c, int cid, const char *rtid, Buf *b);
 char *ctor_self_text(Compiler *c, int cid, int initm, int t);
 int ctor_new_runs(Compiler *c, int cid, int initm);
 void ctor_arity_add(CtorArityArms *g, int ci, const char *msg);
@@ -259,13 +259,41 @@ void emit_class_value_new_kw(Compiler *c, int id, int recv, int boxed, Buf *b);
    cls_id selects a constructor only when it holds a Class: an Integer's, a
    Symbol's or nil's can equal a user class's index, and a user
    object's is its class's, so anything else
-   switches on -1, no arm's label, and takes the default's NoMethodError. */
-void emit_class_value_new_switch(Compiler *c, int rt2, int kt, int boxed, Buf *b);
-void emit_ctor_arm_case(Compiler *c, int ci, int initm, int rt2, int self_t, const char *pre, const char *args, int given, Buf *b);
+   switches on -1, no arm's label, and takes the default's NoMethodError.
+   recv is the receiver node (emit_class_value_key). In a program with a
+   site class, sid (NULL where no arm builds an object) names the class id
+   the arms build for, a temp bound once ahead of the switch where an arm
+   writes it (ArmCtx.rt_switch, bind_switch_rt_id). */
+typedef struct SwitchRtId {
+  const char *text;   /* the temp the arms pass a site class's constructor
+                         (emit_ctor_rt_arg), NULL in a program with none */
+  char name[24];
+  size_t at;          /* where in the switch's buffer its binding goes */
+  int kt, read;       /* read: an arm wrote the temp (rtclass_arg_text) */
+  int tok;            /* the arm context the switch pushed */
+  struct SwitchRtId *up;   /* the switch this one is written inside of */
+} SwitchRtId;
+void emit_class_value_new_switch(Compiler *c, int recv, int rt2, int kt, int boxed, SwitchRtId *sid, Buf *b);
+/* Once the switch's arms are written into b: pop its arm context and bind
+   sid's temp ahead of the switch where an arm wrote it, so no switch
+   declares an id nothing reads */
+void bind_switch_rt_id(Compiler *c, SwitchRtId *sid, Buf *b);
+/* The dispatch key of the class value held in the C name `val` (an
+   sp_Class, or a box that holds a Class): what a switch over the program's
+   classes takes, for every emitter that dispatches on a class value. recv
+   is the node the value comes from, -1 for one only the run time gives (a
+   generated function's parameter, a class method's own `_sp_cls`). */
+void emit_class_value_key(Compiler *c, int recv, const char *val, Buf *b);
+/* ...the same key as text, into out (n bytes), for a compare spelled with
+   printf (`KEY == k`); every read of a class value's id against the
+   program's classes goes through one of the two */
+const char *class_value_key(Compiler *c, int recv, const char *val, char *out, size_t n);
+void emit_ctor_arm_case(Compiler *c, int ci, int initm, int rt2, int self_t, const char *pre, const char *args, int given,
+                        const char *rtid, Buf *b);
 void struct_nil_fill_stmts(Compiler *c, int ci, int given, const char *obj, Buf *out);
 void emit_ctor_arm_param(Compiler *c, Scope *is, int j, const ArgLayout *L, const int *atmp, Buf *pdpre, Buf *out);
 void emit_ctor_block_slot(Compiler *c, int id, int initm, const char *lead, Buf *b);
-int emit_ctor_splice_arm(Compiler *c, int id, int ci, int rt2, Buf *b);
+int emit_ctor_splice_arm(Compiler *c, int id, int ci, int rt2, const char *rtid, Buf *b);
 void emit_exc_msg_arg(Compiler *c, int arg, Buf *b);
 void emit_exc_new_msg(Compiler *c, const char *cn, int arg, Buf *b);
 int emit_exc_sub_new_arm(Compiler *c, int id, int ci, int argc, const int *atmp, int rt2, Buf *b);
@@ -280,7 +308,12 @@ int emit_syserr_family_new_reopened(Compiler *c, int id, const char *cn, int arg
 int syserr_reinit_initialize(Compiler *c, int id, const char *cn);
 void syserr_reinit_open(int *t, Buf *b);
 void syserr_reinit_close(Compiler *c, int initm, int t, Buf *b);
-int emit_user_new_arm(Compiler *c, int id, int ci, int argc, const int *atmp, int hoisted, int rt2, Buf *b);
+/* The class id a `new` or `allocate` on the constant or local recv naming
+   class ci builds for: the receiver's value's (ctor_rt_id) for a site
+   class, NULL for any other (codegen_call.c) */
+const char *ctor_recv_rtid(Compiler *c, int ci, int recv, char *out, size_t n);
+int emit_user_new_arm(Compiler *c, int id, int ci, int argc, const int *atmp, int hoisted, int rt2, const char *cls,
+                      Buf *b);
 extern int g_ctor_blk_tmp;
 int hoist_ctor_block(Compiler *c, int id, Buf *b);
 int struct_nil_fills(const ClassInfo *k);
@@ -305,12 +338,16 @@ void refl_class_instance_methods(Compiler *c, int ci, int pub, int prot, ReflNam
 void refl_module_instance_methods(Compiler *c, int m, int prot, ReflNames *r);
 void refl_module_own_methods(Compiler *c, int m, int pub, int prot, int priv, ReflNames *r);
 void refl_emit_sym_array(Compiler *c, int cid, ReflNames *r, Buf *b);
+/* How many names of r that array may list: one shown, or one whose
+   presence or visibility the run tells (a name the plan then omits counts
+   too). */
+int refl_names_may_list(Compiler *c, const ReflNames *r);
 void refl_at(ReflNames *r, int id, int cls, unsigned side);
 void refl_free(ReflNames *r);
 int refl_note(ReflNames *r, const char *m, int show);   /* r holds m once (1 when it was new) */
 void refl_own_instance_methods(Compiler *c, int ci, int pub, int prot, int priv, int with_modules, ReflNames *r);
 void unhoist_dispatch_args(Compiler *c, int n, int *sv, int *vw);
-int emit_ctor_new_with_proc(Compiler *c, int id, int ci, Buf *b);
+int emit_ctor_new_with_proc(Compiler *c, int id, int ci, const char *rtid, Buf *b);
 void emit_struct_kw_check(Compiler *c, ClassInfo *cls, int ht, int kwh);
 int emit_struct_kw_hash(Compiler *c, int kwh);
 void emit_struct_kw_member(Compiler *c, ClassInfo *cls, int a, int ht, Buf *b);
@@ -398,7 +435,7 @@ void emit_bm_spread_call(Compiler *c, int id, int recv, const int *argv, int arg
 void emit_bound_method_call(Compiler *c, int id, int recv, int target, Buf *b);
 void emit_method_call_block(Compiler *c, int id, Scope *tm, int lead_comma, Buf *b);
 void emit_named_root(Compiler *c, TyKind t, const char *name, int idx, Buf *b);
-void emit_wrong_count(Compiler *c, int id, const char *exp, int eval_recv, int given, Buf *b);
+void emit_wrong_count(Compiler *c, int id, const char *exp, int eval_recv, int given, const char *after, Buf *b);
 const char *forwarded_real_proc(int blk0, int blk);
 extern int g_sn_proc_node;
 int is_proc_create(Compiler *c, int id);
@@ -410,6 +447,10 @@ const char *builtin_method_params(const char *owner, const char *m, int *in_c);
 int builtin_method_known(const char *cls, const char *m);
 int core_method_vis(const char *cls, const char *m, int inherit, const char **owner);   /* codegen_call_class.c */
 int refl_builtin_vis(Compiler *c, int ci, const char *m, int inherit, int own, const char **owner);   /* codegen_call_class.c */
+/* The builtin class at the root of program class ci's chain, whose rows answer the methods the program defines none of
+   (refl_builtin_vis): Object unless the root names another, Struct or Data for theirs; NULL for a builtin or a module at
+   the root, "" for a superclass the rows cannot read (codegen_call_class.c) */
+const char *refl_builtin_root(Compiler *c, int ci);
 const char *core_class_ancestors(const char *cls);   /* codegen_call_class.c */
 const char *core_ancestor_step(const char *p, size_t *len);   /* codegen_call_class.c */
 void core_own_methods_each(const char *cls, size_t cl, void (*f)(void *, const char *, int), void *ud);
@@ -422,6 +463,7 @@ int builtin_numeric_owns(const char *cls, const char *m);
 int builtin_numeric_arity(const char *m, int *out);
 void emit_bind_call(Compiler *c, int id, int target, const int *argv, int argc, Buf *b);
 void emit_bind_call_boxed(Compiler *c, int id, int target, int kn, const char *sym, const int *argv, int argc, Buf *b);
+int emit_bind_call_target(Compiler *c, int id, int recv, int target, const int *argv, int argc, Buf *b);
 void emit_bm_abi_args(Buf *b, const char *rb, int abi, const char *sig, int fixed, int rest, int ret, int poly, int pfixed, const char *thunk, int tmin, int tmax);
 int emit_method_obj_on_constant(Compiler *c, int id, int recv, const char *sym, Buf *b);
 int method_obj_of_native_func(Compiler *c, int recv, const char *sym);

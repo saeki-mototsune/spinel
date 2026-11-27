@@ -1620,7 +1620,7 @@ static void emit_orw_raise(Compiler *c, const char *head, int cid, TyKind rt,
                            const char *recv, Buf *b) {
   buf_puts(b, "(sp_exc_stage_recv("); emit_boxed_text(c, rt, recv, b);
   buf_puts(b, "), sp_raise_cls(\"NoMethodError\", ");
-  if (anon_class_text(c, cid, head, b)) buf_puts(b, "))");
+  if (anon_class_text(c, cid, ty_is_object(rt) ? recv : NULL, head, b)) buf_puts(b, "))");
   else {
     const char *rn = class_ruby_name(c, cid) ? class_ruby_name(c, cid) : c->classes[cid].name;
     buf_printf(b, "(&(\"\\xff\" \"%s%s\")[1])))", head, rn);
@@ -3858,8 +3858,10 @@ static int emit_constant_value(Compiler *c, int id, Buf *b, Buf *checks, const N
         if (boxed) buf_puts(b, "sp_RbVal");
         else if (strbuf) buf_puts(b, "sp_String");
         else emit_ctype(c, ct, b);
-        buf_printf(b, " %s%s_t%d = %s; switch (_t%d.cls_id) {", strbuf ? "*" : "", slot ? "*" : "", tr,
-                   boxed ? default_value_from_compiler(c, TY_POLY) : slot || strbuf ? "NULL" : default_value_from_compiler(c, ct), tk);
+        char tkn[24]; snprintf(tkn, sizeof tkn, "_t%d", tk);
+        buf_printf(b, " %s%s_t%d = %s; switch (", strbuf ? "*" : "", slot ? "*" : "", tr,
+                   boxed ? default_value_from_compiler(c, TY_POLY) : slot || strbuf ? "NULL" : default_value_from_compiler(c, ct));
+        emit_class_value_key(c, par_idc, tkn, b); buf_puts(b, ") {");
         for (int i = 0; i < nc; i++) {
           /* the arm's value: the slot, its address, or its box */
           Buf rhs; memset(&rhs, 0, sizeof rhs);
@@ -4237,7 +4239,9 @@ static int defined_value_path(Compiler *c, int v, Buf *b) {
   /* (a poly slot carries the class boxed, as the read unwraps it) */
   if (pr.kind == RK_BOXED) { buf_puts(b, "sp_unbox_class("); emit_boxed(c, par, b); buf_puts(b, ")"); }
   else emit_expr(c, par, b);
-  buf_printf(b, "; const char *_t%d_r = NULL; switch (_t%d.cls_id) {", tk, tk);
+  char tkn[24]; snprintf(tkn, sizeof tkn, "_t%d", tk);
+  buf_printf(b, "; const char *_t%d_r = NULL; switch (", tk);
+  emit_class_value_key(c, par, tkn, b); buf_puts(b, ") {");
   for (int k = 0; k < c->nclasses; k++) {
     if (k == obj_k) continue;
     int ci2 = const_path_value_const(c, k, nm, cands, ncands);
@@ -6495,6 +6499,104 @@ static void emit_index_or_str_array(Compiler *c, int id, int ir, int idx, int iv
   free(rvb.p);
   buf_puts(b, "; "); emit_array_entry(b, "Str", "set"); buf_printf(b, "(_t%d, _t%d, _t%d); } SP_STR_B(_t%d); })", ta, tb, tc, tc);
 }
+
+/* MultiWriteNode as expression: execute the destructuring (side effect),
+   then return the RHS value (Ruby semantics: value of `a, b = arr` is arr). */
+static void emit_masgn_value(Compiler *c, int id, Buf *b) {
+  const NodeTable *nt = c->nt;
+  int value = nt_ref(nt, id, "value");
+  /* The right-hand side runs once: a tuple's elements one by one, or any
+     other right-hand side whole, are held in temps that the statement and
+     the result both read through the override table. Literals are read
+     again in place. */
+  int en = 0;
+  const int *els = nt_kind(nt, value) == NK_ArrayNode ? nt_arr(nt, value, "elements", &en) : NULL;
+  for (int i = 0; i < en; i++)
+    if (nt_kind(nt, els[i]) == NK_SplatNode) { els = NULL; en = 0; break; }
+  int one = els ? -1 : value;
+  int held = 0, nlift = 0, nback = 0;
+  int *lift_views = en > 0 ? alloca(sizeof(int) * (size_t)en * 2) : NULL;
+  int *back = en > 0 ? alloca(sizeof(int) * (size_t)en) : NULL;
+  for (int i = 0; i < en; i++) back[i] = 0;
+  held += masgn_hold_target_parts(c, id);
+  for (int i = els ? 0 : -1; i < en; i++) {
+    int v = i < 0 ? one : els[i];
+    if (v < 0 || g_n_argov >= MAX_ARG_OVERRIDE) continue;
+    NodeKind vk = nt_kind(nt, v);
+    int vn = 0;
+    if (vk == NK_NilNode || vk == NK_IntegerNode || vk == NK_FloatNode || vk == NK_SymbolNode ||
+        vk == NK_TrueNode || vk == NK_FalseNode || vk == NK_StringNode ||
+        ((vk == NK_ArrayNode || vk == NK_HashNode) && (nt_arr(nt, v, "elements", &vn), vn == 0)))
+      continue;
+    TyKind vt = vk == NK_SplatNode ? TY_POLY_ARRAY : repr_of(c, v).as_ty;
+    if (vt == TY_UNKNOWN) continue;
+    /* Both the assignment and its result use the held String object. */
+    if (i >= 0 && (vt == TY_STRING || vt == TY_STRBUF)) {
+      Buf hw; memset(&hw, 0, sizeof hw);
+      emit_str_form_handle(c, v, &hw);
+      int th = ++g_tmp;
+      emit_indent(g_pre, g_indent);
+      buf_printf(g_pre, "sp_String *_t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d);\n", th, hw.p ? hw.p : "NULL", th);
+      free(hw.p);
+      ran_first_bind_read(v, th);
+      held++;
+      continue;
+    }
+    /* a new Array its target holds as the general Array is held as one,
+       which the target and the value both take (masgn_el_lift_from) */
+    TyKind lift = i >= 0 ? masgn_el_lift_from(c, id, i) : TY_UNKNOWN;
+    Buf vb; memset(&vb, 0, sizeof vb);
+    if (lift != TY_UNKNOWN) emit_array_lifted(c, v, lift, &vb);
+    else emit_expr_face(c, v, vt, &vb);   /* (one representation: in the temp's face) */
+    if (lift != TY_UNKNOWN) { vt = TY_POLY_ARRAY; lift_views[nlift++] = view_push(c, v, TY_POLY_ARRAY); }
+    emit_indent(g_pre, g_indent);
+    if (vt == TY_NIL || vt == TY_VOID) {
+      buf_printf(g_pre, "(void)(%s);\n", vb.p ? vb.p : "0");
+      view_bind(v, "sp_box_nil()");
+    }
+    else {
+      int t = ++g_tmp;
+      emit_ctype(c, vt, g_pre);
+      buf_printf(g_pre, " _t%d = %s; ", t, vb.p ? vb.p : "");
+      emit_gc_root_tmp(c, vt, t, g_pre);
+      buf_puts(g_pre, "\n");
+      /* --share-strings: a handle held here is the one the value's Array
+         boxes (ran_first_handle), not its variable's, which the stores
+         may have rebound */
+      if (vt == TY_STRBUF) ran_first_bind(v, t, t);
+      else view_bind_temp(v, t);
+      /* (an element some arms of its store's dispatch lift: held boxed
+         too, set by the arm to what it stored, and answered from there,
+         masgn_el_back_kind) */
+      if (i >= 0 && lift == TY_UNKNOWN && masgn_el_back_kind(c, id, i) == vt) {
+        char tn[24]; snprintf(tn, sizeof tn, "_t%d", t);
+        back[i] = ++g_tmp; nback++;
+        emit_indent(g_pre, g_indent);
+        buf_printf(g_pre, "sp_RbVal _t%d = ", back[i]);
+        emit_boxed_text(c, vt, tn, g_pre);
+        buf_puts(g_pre, "; ");
+        emit_gc_root_tmp(c, TY_POLY, back[i], g_pre);
+        buf_puts(g_pre, "\n");
+      }
+    }
+    free(vb.p);
+    held++;
+  }
+  MasgnBack mb = { id, en, back };
+  int bv = nback ? view_push_masgn_back(&mb) : -1;
+  emit_stmt(c, id, g_pre, g_indent);
+  if (bv >= 0) view_pop(c, bv);
+  for (int i = 0; i < en && nback; i++)
+    if (back[i] && g_n_argov < MAX_ARG_OVERRIDE) {
+      lift_views[nlift++] = view_push(c, els[i], TY_POLY);
+      view_bind_temp(els[i], back[i]);
+      held++;
+    }
+  emit_expr(c, value, b);
+  while (nlift > 0) view_pop(c, lift_views[--nlift]);
+  view_unbind(g_n_argov - (held));
+}
+
 static void emit_expr_node(Compiler *c, int id, Buf *b) {
   const NodeTable *nt = c->nt;
   const char *ty = nt_type(nt, id);
@@ -7149,71 +7251,8 @@ static void emit_expr_node(Compiler *c, int id, Buf *b) {
   }
   if (emit_and_or_begin_expr(c, id, b, nt, ty)) return;
 
-  /* MultiWriteNode as expression: execute the destructuring (side effect),
-     then return the RHS value (Ruby semantics: value of `a, b = arr` is arr). */
-  if (ty_k == NK_MultiWriteNode) {
-    int value = nt_ref(nt, id, "value");
-    /* The right-hand side runs once: a tuple's elements one by one, or any
-       other right-hand side whole, are held in temps that the statement and
-       the result both read through the override table. Literals are read
-       again in place. */
-    int en = 0;
-    const int *els = nt_kind(nt, value) == NK_ArrayNode ? nt_arr(nt, value, "elements", &en) : NULL;
-    for (int i = 0; i < en; i++)
-      if (nt_kind(nt, els[i]) == NK_SplatNode) { els = NULL; en = 0; break; }
-    int one = els ? -1 : value;
-    int held = 0;
-    held += masgn_hold_target_parts(c, id);
-    for (int i = els ? 0 : -1; i < en; i++) {
-      int v = i < 0 ? one : els[i];
-      if (v < 0 || g_n_argov >= MAX_ARG_OVERRIDE) continue;
-      NodeKind vk = nt_kind(nt, v);
-      int vn = 0;
-      if (vk == NK_NilNode || vk == NK_IntegerNode || vk == NK_FloatNode || vk == NK_SymbolNode ||
-          vk == NK_TrueNode || vk == NK_FalseNode || vk == NK_StringNode ||
-          ((vk == NK_ArrayNode || vk == NK_HashNode) && (nt_arr(nt, v, "elements", &vn), vn == 0)))
-        continue;
-      TyKind vt = vk == NK_SplatNode ? TY_POLY_ARRAY : repr_of(c, v).as_ty;
-      if (vt == TY_UNKNOWN) continue;
-      /* Both the assignment and its result use the held String object. */
-      if (i >= 0 && (vt == TY_STRING || vt == TY_STRBUF)) {
-        Buf hw; memset(&hw, 0, sizeof hw);
-        emit_str_form_handle(c, v, &hw);
-        int th = ++g_tmp;
-        emit_indent(g_pre, g_indent);
-        buf_printf(g_pre, "sp_String *_t%d = SP_STR_HDL(%s); SP_GC_ROOT(_t%d);\n", th, hw.p ? hw.p : "NULL", th);
-        free(hw.p);
-        ran_first_bind_read(v, th);
-        held++;
-        continue;
-      }
-      Buf vb; memset(&vb, 0, sizeof vb);
-      emit_expr_face(c, v, vt, &vb);   /* (one representation: in the temp's face) */
-      emit_indent(g_pre, g_indent);
-      if (vt == TY_NIL || vt == TY_VOID) {
-        buf_printf(g_pre, "(void)(%s);\n", vb.p ? vb.p : "0");
-        view_bind(v, "sp_box_nil()");
-      }
-      else {
-        int t = ++g_tmp;
-        emit_ctype(c, vt, g_pre);
-        buf_printf(g_pre, " _t%d = %s; ", t, vb.p ? vb.p : "");
-        emit_gc_root_tmp(c, vt, t, g_pre);
-        buf_puts(g_pre, "\n");
-        /* --share-strings: a handle held here is the one the value's Array
-           boxes (ran_first_handle), not its variable's, which the stores
-           may have rebound */
-        if (vt == TY_STRBUF) ran_first_bind(v, t, t);
-        else view_bind_temp(v, t);
-      }
-      free(vb.p);
-      held++;
-    }
-    emit_stmt(c, id, g_pre, g_indent);
-    emit_expr(c, value, b);
-    view_unbind(g_n_argov - (held));
-    return;
-  }
+  /* MultiWriteNode as expression (emit_masgn_value) */
+  if (ty_k == NK_MultiWriteNode) { emit_masgn_value(c, id, b); return; }
 
   /* ivar OP= as expression: emit the mutation then read back the ivar. */
   if (ty_k == NK_InstanceVariableOperatorWriteNode) {

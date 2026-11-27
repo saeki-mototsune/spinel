@@ -487,10 +487,17 @@ static void emit_sockopt_optname(Compiler *c, int tl, int node, Buf *b) {
   if (repr_of(c, node).as_ty == TY_INT) { emit_int_expr(c, node, b); return; }
   buf_printf(b, "sp_sock_optname_arg(_t%d, ", tl); emit_boxed(c, node, b); buf_puts(b, ")");
 }
-/* A shutdown direction: an Integer as given, a Symbol or String name
-   through sp_sock_shutdown_arg */
+/* Does a shutdown direction convert through sp_sock_shutdown_arg? An
+   Integer that cannot be nil is passed as given; a nilable Integer (nil
+   is SHUT_RDWR), a Symbol and a String convert. */
+static int shutdown_how_converts(Compiler *c, int node) {
+  Repr r = repr_of(c, node);
+  return !(r.as_ty == TY_INT && r.kind != RK_OPT);
+}
+/* A shutdown direction: an Integer as given, a nilable Integer, a Symbol
+   or a String name through sp_sock_shutdown_arg */
 static void emit_shutdown_how(Compiler *c, int node, Buf *b) {
-  if (repr_of(c, node).as_ty == TY_INT) { emit_int_expr(c, node, b); return; }
+  if (!shutdown_how_converts(c, node)) { emit_int_expr(c, node, b); return; }
   buf_puts(b, "sp_sock_shutdown_arg("); emit_boxed(c, node, b); buf_puts(b, ")");
 }
 
@@ -549,10 +556,12 @@ static int emit_io_socket_opt_call(Compiler *c, const NodeTable *nt, const char 
       return 1;
     }
   }
+  /* the receiver first, held rooted: a Symbol or String level or option
+     name converts through a call that can allocate */
   if (sp_streq(name, "setsockopt") && argc == 3) {
-    int tl = ++g_tmp;
-    buf_printf(b, "({ sp_int _t%d = ", tl); emit_sockopt_level(c, argv[0], b);
-    buf_printf(b, "; sp_sock_setsockopt(%s, _t%d, ", r, tl);
+    int tl = ++g_tmp, tf = ++g_tmp;
+    buf_printf(b, "({ sp_File *_t%d = %s; SP_GC_ROOT(_t%d); sp_int _t%d = ", tf, r, tf, tl); emit_sockopt_level(c, argv[0], b);
+    buf_printf(b, "; sp_sock_setsockopt(_t%d, _t%d, ", tf, tl);
     emit_sockopt_optname(c, tl, argv[1], b); buf_puts(b, ", ");
     /* the value is an Integer, true/false (1/0) or the option's packed
        bytes, as CRuby takes it; only an Integer converts directly */
@@ -567,9 +576,9 @@ static int emit_io_socket_opt_call(Compiler *c, const NodeTable *nt, const char 
     return 1;
   }
   if (sp_streq(name, "getsockopt") && argc == 2) {
-    int tl = ++g_tmp;
-    buf_printf(b, "({ sp_int _t%d = ", tl); emit_sockopt_level(c, argv[0], b);
-    buf_printf(b, "; sp_sock_getsockopt(%s, _t%d, ", r, tl);
+    int tl = ++g_tmp, tf = ++g_tmp;
+    buf_printf(b, "({ sp_File *_t%d = %s; SP_GC_ROOT(_t%d); sp_int _t%d = ", tf, r, tf, tl); emit_sockopt_level(c, argv[0], b);
+    buf_printf(b, "; sp_sock_getsockopt(_t%d, _t%d, ", tf, tl);
     emit_sockopt_optname(c, tl, argv[1], b); buf_puts(b, "); })");
     return 1;
   }
@@ -704,6 +713,28 @@ static int boxed_io_library_call(Compiler *c, int id, const char *name) {
   return bop_io_library_row(op) || io_library_count_refused(c, id, op, name);
 }
 
+/* The argumentless readers and predicates the boxed IO arm calls through
+   one runtime function each, as the TY_IO arm does */
+static const char *boxed_io_reader_fn(const char *name) {
+  static const char *const map[][2] = {
+    { "getc", "sp_File_getc" }, { "readchar", "sp_File_readchar" }, { "readbyte", "sp_File_readbyte" },
+    { "lineno", "sp_File_lineno" }, { "eof", "sp_File_eof_p" }, { "autoclose?", "sp_File_autoclose_p" },
+    { "binmode?", "sp_File_binmode_p" }, { "close_on_exec?", "sp_File_close_on_exec_p" } };
+  for (size_t i = 0; i < sizeof map / sizeof map[0]; i++) if (sp_streq(name, map[i][0])) return map[i][1];
+  return NULL;
+}
+
+/* getbyte, binmode, set_encoding and the half closes, at the arities the
+   TY_IO arm takes them */
+static int boxed_io_byte_mode(const NodeTable *nt, const char *name, int argc, const int *argv) {
+  if (argc == 0 && (sp_streq(name, "getbyte") || sp_streq(name, "binmode") ||
+                    sp_streq(name, "close_read") || sp_streq(name, "close_write"))) return 1;
+  if (argc == 0 && boxed_io_reader_fn(name)) return 1;
+  if (argc == 1 && (sp_streq(name, "ungetbyte") || sp_streq(name, "ungetc")) && !nt_argv_has_splat(nt, argv, argc)) return 1;
+  return sp_streq(name, "set_encoding") && (argc == 1 || argc == 2) &&
+         !nt_argv_has_splat(nt, argv, argc) && nt_argv_kwh(nt, argv, argc) < 0;
+}
+
 /* the IO methods on a poly receiver that may hold a stream (write, read, gets, puts, print, ...) */
 int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const char *name, int recv, int argc, const int *argv) {
   if (emit_io_read_nonblock_outbuf(c, id, b)) return 1;
@@ -723,6 +754,7 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
        (sp_streq(name, "printf") && boxed_printf_list_ok(c, argv, argc)) ||
        sp_streq(name, "eof?") || sp_streq(name, "closed?") || sp_streq(name, "path") ||
        sp_streq(name, "to_path") ||
+       boxed_io_byte_mode(nt, name, argc, argv) ||
        sp_streq(name, "tty?") || sp_streq(name, "isatty") ||
        /* a library's methods (io/console's winsize, winsize=) */
        boxed_io_library_call(c, id, name) ||
@@ -1194,6 +1226,68 @@ int emit_call_poly_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, con
       }
       else if (sp_streq(name, "eof?")) buf_printf(b, "sp_File_eof_p(_t%d); })", tio2);
       else if (sp_streq(name, "closed?")) buf_printf(b, "sp_File_closed_p(_t%d); })", tio2);
+      else if (boxed_io_byte_mode(nt, name, argc, argv)) {
+        Repr res = repr_of(c, id);
+        const char *rfn = argc == 0 ? boxed_io_reader_fn(name) : NULL;
+        if (rfn && sp_streq(name, "getc")) {
+          int tg = ++g_tmp;
+          buf_printf(b, "const char *_t%d = sp_File_getc(_t%d); ", tg, tio2);
+          if (res.kind == RK_BOXED) buf_printf(b, "_t%d ? sp_box_str_new(_t%d) : sp_box_nil(); })", tg, tg);
+          else buf_printf(b, "_t%d; })", tg);
+        }
+        else if (rfn) {
+          char call[96];
+          snprintf(call, sizeof call, "%s(_t%d)", rfn, tio2);
+          TyKind k = sp_streq(name, "readchar") ? TY_STRING
+                   : sp_streq(name, "readbyte") || sp_streq(name, "lineno") ? TY_INT : TY_BOOL;
+          if (res.kind == RK_BOXED) emit_boxed_text(c, k, call, b); else buf_puts(b, call);
+          buf_puts(b, "; })");
+        }
+        else if (sp_streq(name, "ungetbyte") || sp_streq(name, "ungetc")) {
+          int ta = ++g_tmp;
+          buf_printf(b, "SP_GC_ROOT(_t%d); ", tio2);
+          if (sp_streq(name, "ungetbyte") && repr_of(c, argv[0]).as_ty == TY_INT && repr_of(c, argv[0]).kind != RK_BOXED) {
+            buf_printf(b, "sp_int _t%d = ", ta); emit_int_expr(c, argv[0], b);
+            buf_printf(b, "; sp_File_ungetbyte(_t%d, _t%d); ", tio2, ta);
+          }
+          else if (sp_streq(name, "ungetbyte")) {
+            /* an Integer pushes back one byte, a String its bytes (as ungetc does) */
+            buf_printf(b, "sp_RbVal _t%d = ", ta); emit_boxed(c, argv[0], b);
+            buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); if (_t%d.tag == SP_TAG_INT) sp_File_ungetbyte(_t%d, _t%d.v.i);"
+                          " else sp_File_ungetc(_t%d, _t%d); ", ta, ta, tio2, ta, tio2, ta);
+          }
+          else {
+            buf_printf(b, "sp_RbVal _t%d = ", ta); emit_boxed(c, argv[0], b);
+            buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_File_ungetc(_t%d, _t%d); ", ta, tio2, ta);
+          }
+          buf_puts(b, res.kind == RK_BOXED ? "sp_box_nil(); })" : "((sp_int)0); })");
+        }
+        else if (sp_streq(name, "getbyte")) {
+          int tg = ++g_tmp;
+          buf_printf(b, "sp_oint _t%d = sp_File_getbyte(_t%d); ", tg, tio2);
+          if (res.kind == RK_OPT) buf_printf(b, "_t%d; })", tg);
+          else buf_printf(b, "_t%d.nil ? sp_box_nil() : sp_box_int(_t%d.v); })", tg, tg);
+        }
+        else if (sp_streq(name, "close_read") || sp_streq(name, "close_write")) {
+          buf_printf(b, "sp_File_close_half(_t%d, %d); ", tio2, sp_streq(name, "close_read"));
+          buf_puts(b, res.kind == RK_BOXED ? "sp_box_nil(); })" : "((sp_int)0); })");
+        }
+        else {
+          char h[32];
+          snprintf(h, sizeof h, "_t%d", tio2);
+          if (sp_streq(name, "binmode")) buf_printf(b, "sp_File_set_binmode(_t%d); ", tio2);
+          else {
+            int ta = ++g_tmp, tb = ++g_tmp;
+            buf_printf(b, "SP_GC_ROOT(_t%d); sp_RbVal _t%d = ", tio2, ta);
+            emit_boxed(c, argv[0], b);
+            buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_RbVal _t%d = ", ta, tb);
+            if (argc == 2) emit_boxed(c, argv[1], b); else buf_puts(b, "sp_box_nil()");
+            buf_printf(b, "; SP_GC_ROOT_RBVAL(_t%d); sp_File_set_encoding(_t%d, _t%d, _t%d); ", tb, tio2, ta, tb);
+          }
+          if (res.kind == RK_BOXED) emit_boxed_text(c, TY_IO, h, b); else buf_puts(b, h);
+          buf_puts(b, "; })");
+        }
+      }
       else if (sp_streq(name, "tty?") || sp_streq(name, "isatty"))
         buf_printf(b, "sp_File_tty_p(_t%d); })", tio2);
       /* a library's reader (io/console's winsize), through its row */
@@ -1656,10 +1750,10 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
     io_hold_effectful_recv(c, name, recv, argc, &rb);
     r = rb.p ? rb.p : "NULL";
     /* metadata via the handle's path (#2790) */
-    /* f.chown(uid, gid) on the handle's path; a nil id leaves it unchanged and
-       the instance form evaluates to 0, not the path count (#3104) */
+    /* f.chown(uid, gid): fchown(2) of the descriptor; a nil id leaves it
+       unchanged and the instance form evaluates to 0, not the path count (#3104) */
     if (sp_streq(name, "chown") && argc == 2) {
-      buf_printf(b, "((void)sp_file_chown(sp_File_path(%s), ", r);
+      buf_printf(b, "((void)sp_File_chown(%s, ", r);
       for (int ci = 0; ci < 2; ci++) {
         if (ci) buf_puts(b, ", ");
         if (nt_kind(nt, argv[ci]) == NK_NilNode) buf_puts(b, "-1LL");
@@ -1765,6 +1859,14 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
         free(rb.p); return 1;
       }
       if (sp_streq(name, "shutdown") && argc <= 1) {
+        /* a converted direction may allocate: the receiver is held rooted first */
+        if (argc == 1 && shutdown_how_converts(c, argv[0])) {
+          int th = ++g_tmp;
+          buf_printf(b, "({ sp_File *_t%d = %s; SP_GC_ROOT(_t%d); sp_sock_shutdown(_t%d, ", th, r, th, th);
+          emit_shutdown_how(c, argv[0], b);
+          buf_puts(b, "); })");
+          free(rb.p); return 1;
+        }
         buf_printf(b, "sp_sock_shutdown(%s, ", r);
         if (argc == 1) emit_shutdown_how(c, argv[0], b); else buf_puts(b, "2");
         buf_puts(b, ")");
@@ -1983,6 +2085,19 @@ int emit_call_io_arms(Compiler *c, int id, Buf *b, const NodeTable *nt, const ch
       emit_pre_format_args(c, argv, argc, tfa);
       /* the formatted value is a spinel String, so it sizes by its header */
       buf_printf(b, "({ sp_File_write_bin(%s, sp_str_format_polyarr(_t%d, _t%d)); sp_box_nil(); })", r, tfp, tfa);
+      free(rb.p); return 1;
+    }
+    /* each_char, each_byte, each_codepoint, each_line and each without a
+       block or an argument: an Enumerator that reads the handle as it is
+       walked (sp_io_each_enumerator), as the boxed arm answers */
+    if ((sp_streq(name, "each_char") || sp_streq(name, "each_byte") || sp_streq(name, "each_codepoint") ||
+         sp_streq(name, "each_line") || sp_streq(name, "each")) &&
+        argc == 0 && nt_ref(nt, id, "block") < 0) {
+      const char *meth = sp_streq(name, "each") ? "each_line" : name;
+      int boxed = repr_of(c, id).kind == RK_BOXED;
+      if (boxed) buf_puts(b, "sp_box_obj(");
+      buf_printf(b, "sp_io_each_enumerator(%s, SPL(\"%s\"))", r, meth);
+      if (boxed) buf_puts(b, ", SP_BUILTIN_ENUMERATOR)");
       free(rb.p); return 1;
     }
     /* each_char / each_byte (#2794) / each_codepoint (#3038) */

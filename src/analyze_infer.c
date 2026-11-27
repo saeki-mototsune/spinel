@@ -4617,7 +4617,13 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
         if (sp_streq(name, "lock") || sp_streq(name, "unlock")) { *out = TY_POLY; return 1; }
         if (sp_streq(name, "signal") || sp_streq(name, "broadcast")) { *out = TY_POLY; return 1; }
         if (sp_streq(name, "try_lock") || sp_streq(name, "locked?")) { *out = TY_BOOL; return 1; }
+        /* a boxed Thread's flag */
+        if (sp_streq(name, "report_on_exception")) { *out = TY_BOOL; return 1; }
       }
+      /* a boxed Mutex's sleep and a boxed ConditionVariable's wait: the runtime's answer */
+      if (((sp_streq(name, "sleep") && argc <= 1) || (sp_streq(name, "wait") && (argc == 1 || argc == 2))) &&
+          !nt_argv_has_splat(nt, argv, argc) && !an_user_poly_arm(c, name, argc))
+        { *out = TY_POLY; return 1; }
       if (sp_streq(name, "alive?") || sp_streq(name, "dead?") || sp_streq(name, "closed?") ||
           (sp_streq(name, "mon_owned?") && argc == 0) ||
           (sp_streq(name, "blocking?") && argc == 0) ||
@@ -4735,6 +4741,27 @@ static int infer_poly_operand_call(Compiler *c, int id, const NodeTable *nt, con
       if (sp_streq(name, "close") && argc == 0) { *out = an_poly_concrete(c, id, name, TY_POLY); return 1; }
       if (sp_streq(name, "close") || sp_streq(name, "flush")) { *out = an_poly_concrete(c, id, name, TY_NIL); return 1; }
       if (sp_streq(name, "fileno")) { *out = an_poly_concrete(c, id, name, TY_INT); return 1; }
+      /* getbyte's byte or nil, the handle from binmode and set_encoding, nil
+         from the half closes, as the TY_IO arm types them */
+      if (sp_streq(name, "getbyte") && argc == 0) { *out = an_poly_concrete(c, id, name, TY_POLY); return 1; }
+      if ((sp_streq(name, "binmode") && argc == 0) ||
+          (sp_streq(name, "set_encoding") && (argc == 1 || argc == 2) && !nt_argv_has_splat(nt, argv, argc) &&
+           nt_argv_kwh(nt, argv, argc) < 0))
+        { *out = an_poly_concrete(c, id, name, TY_IO); return 1; }
+      if ((sp_streq(name, "close_read") || sp_streq(name, "close_write")) && argc == 0)
+        { *out = an_poly_concrete(c, id, name, TY_NIL); return 1; }
+      /* the readers and predicates of the same arm: getc's String or nil,
+         readchar's String, readbyte's and lineno's Integer, the predicates'
+         bool, and nil from ungetbyte and ungetc */
+      if (argc == 0 && sp_streq(name, "getc")) { *out = an_poly_concrete(c, id, name, TY_POLY); return 1; }
+      if (argc == 0 && sp_streq(name, "readchar")) { *out = an_poly_concrete(c, id, name, TY_STRING); return 1; }
+      if (argc == 0 && (sp_streq(name, "readbyte") || sp_streq(name, "lineno")))
+        { *out = an_poly_concrete(c, id, name, TY_INT); return 1; }
+      if (argc == 0 && (sp_streq(name, "eof") || sp_streq(name, "autoclose?") || sp_streq(name, "binmode?") ||
+                        sp_streq(name, "close_on_exec?")))
+        { *out = an_poly_concrete(c, id, name, TY_BOOL); return 1; }
+      if (argc == 1 && (sp_streq(name, "ungetbyte") || sp_streq(name, "ungetc")) && !nt_argv_has_splat(nt, argv, argc))
+        { *out = an_poly_concrete(c, id, name, TY_NIL); return 1; }
       /* the descriptor controls, at the arities the poly-IO arm takes them:
          integers, and advise's nil boxed as the TY_IO arm boxes it. Only
          where that arm emits the call: a class of the program's own (Object
@@ -4837,9 +4864,9 @@ static int infer_new_call(Compiler *c, int id, const NodeTable *nt, const char *
         /* an exception-subclass instance keeps its concrete class (its custom
            methods must dispatch); the exception-shaped queries route through
            the base helpers like a specialized rescue var does */
-        if (class_inherits_builtin_exception(c, ci))
-          { *out = ty_object(ci); return 1; }
         int ucnew = cplan_user_new(c, id, ci);
+        if (class_inherits_builtin_exception(c, ci) && ucnew < 0)
+          { *out = ty_object(ci); return 1; }
         if (ucnew >= 0) {
           an_user_call_record(c, id, ucnew, UC_CMETH, ci);
           TyKind rr = cmethod_receiver_ret(c, ucnew, ci);
@@ -4894,9 +4921,9 @@ static int infer_new_call(Compiler *c, int id, const NodeTable *nt, const char *
         /* an exception-subclass instance keeps its concrete class (its custom
            methods must dispatch); the exception-shaped queries route through
            the base helpers like a specialized rescue var does */
-        if (class_inherits_builtin_exception(c, ci))
-          { *out = ty_object(ci); return 1; }
         int ucnew = cplan_user_new(c, id, ci);
+        if (class_inherits_builtin_exception(c, ci) && ucnew < 0)
+          { *out = ty_object(ci); return 1; }
         if (ucnew >= 0) {
           an_user_call_record(c, id, ucnew, UC_CMETH, ci);
           TyKind rr = cmethod_receiver_ret(c, ucnew, ci);
@@ -5122,6 +5149,13 @@ static int infer_builtin_cmethod_call(Compiler *c, int id, const NodeTable *nt, 
     if (rk == NK_ConstantReadNode &&
         key_name(c, recv) && sp_streq(key_name(c, recv), "Encoding") &&
         sp_streq(name, "find") && argc == 1)
+      { *out = TY_POLY; return 1; }
+    /* Encoding.default_external / default_internal the program assigns, and
+       the assignments: a boxed Encoding, nil or the assigned value */
+    if (rk == NK_ConstantReadNode &&
+        key_name(c, recv) && sp_streq(key_name(c, recv), "Encoding") &&
+        (((sp_streq(name, "default_external") || sp_streq(name, "default_internal")) && argc == 0) ||
+         ((sp_streq(name, "default_external=") || sp_streq(name, "default_internal=")) && argc == 1)))
       { *out = TY_POLY; return 1; }
     /* Encoding.list: an Array of them */
     if (rk == NK_ConstantReadNode &&
@@ -5539,6 +5573,8 @@ static int infer_handle_call(Compiler *c, int id, const NodeTable *nt, const cha
         if (blv && is_byte_codepoint_each(name)) lv_set_type(blv, TY_INT);
         else an_bind_line_param(blv);
       }
+      /* without a block, an Enumerator that reads as it is walked */
+      if (blk < 0 && argc == 0) { *out = TY_ENUMERATOR; return 1; }
       { *out = TY_IO; return 1; }
     }
     /* tap runs its block and returns the handle, which codegen emits as the
@@ -9537,6 +9573,23 @@ int an_poly_object_methods_listable(Compiler *c, int id, const char *name, int a
   return any;
 }
 
+/* an_value_methods_class at call id: a boxed receiver's list, unless a
+   class the receiver can hold has its own reader of the name,
+   an attr or a Struct member (#10345), which the dispatch calls */
+const char *an_value_methods_class_at(Compiler *c, int id, int recv, TyKind rt, const char *name, int argc,
+                                      const int *argv) {
+  const char *cn = an_value_methods_class(c, recv, rt, name, argc, argv);
+  if (!cn || cn[0] || an_builtin_only) return cn;
+  int nk = 0;
+  const int *ks = poly_recv_classes(c, id, &nk);
+  for (int i = 0, n = ks ? nk : c->nclasses; i < n; i++) {
+    int k = ks ? ks[i] : i;
+    if (k >= 0 && k < c->nclasses && c->classes[k].instantiated && call_answers(c, id, k, name, 0, NULL))
+      return NULL;
+  }
+  return cn;
+}
+
 static int infer_methods_listed(Compiler *c, int id, int recv, TyKind rt, const char *name, int argc,
                                 const int *argv) {
   if (recv >= 0 && ty_is_object(rt) &&
@@ -9546,7 +9599,7 @@ static int infer_methods_listed(Compiler *c, int id, int recv, TyKind rt, const 
       an_object_methods_listable(c, id, ty_object_class(rt), name))
     return 1;
   if (recv >= 0 && rt == TY_POLY && an_poly_object_methods_listable(c, id, name, argc, argv)) return 1;
-  return an_value_methods_class(c, recv, rt, name, argc, argv) != NULL;
+  return an_value_methods_class_at(c, id, recv, rt, name, argc, argv) != NULL;
 }
 
 /* Complex(x, exception: false) or Rational(x, exception: false) can answer
@@ -10724,8 +10777,8 @@ static int value_arm_is(const NodeTable *nt, int v, int node) {
 
 /* The places a yield's value can settle a type from the first call site
    alone (see the YieldNode arm of infer_uncached): a variable write, an
-   array literal's element, an argument, an operator's receiver and the
-   last statement of a rescue or ensure frame. Each diverging yield walked
+   array literal's element, an argument, an operator's receiver, a return's
+   value and the last statement of a rescue or ensure frame. Each diverging yield walked
    the whole table for each of them, every round, and #6185's argument walk
    asked call_may_reach_user_method of every call on the way, so the
    typing grew with yields times nodes. One pass per round lists, for each
@@ -10734,7 +10787,7 @@ static int value_arm_is(const NodeTable *nt, int v, int node) {
    rebuilt per fixpoint iteration and when the table grows, like the
    receiver set above, and each node on it is checked as the walk did, so
    one that no longer holds the yield answers no. */
-enum { YU_WRITE, YU_ELEMENT, YU_ARGUMENT, YU_RECEIVER, YU_FRAME, YU_BLOCK };
+enum { YU_WRITE, YU_ELEMENT, YU_ARGUMENT, YU_RECEIVER, YU_FRAME, YU_BLOCK, YU_RETURN };
 static const NodeKind yu_write_kinds[] = {
   NK_LocalVariableWriteNode, NK_LocalVariableOperatorWriteNode,
   NK_LocalVariableOrWriteNode, NK_LocalVariableAndWriteNode,
@@ -10801,6 +10854,11 @@ static int yield_uses(Compiler *c, int y) {
     }
     NT_FOREACH_KIND(nt, NK_RescueModifierNode, w)
       yu_collect(nt, nt_ref(nt, w, "expression"), w, YU_FRAME);
+    NT_FOREACH_KIND(nt, NK_ReturnNode, w) {
+      int an = nt_ref(nt, w, "arguments");
+      int ac = 0; const int *av = an >= 0 ? nt_arr(nt, an, "arguments", &ac) : NULL;
+      if (ac == 1) yu_collect(nt, av[0], w, YU_RETURN);
+    }
     NT_FOREACH_KIND(nt, NK_BeginNode, w) {
       int st = nt_ref(nt, w, "statements");
       if (st < 0) continue;
@@ -11403,6 +11461,13 @@ static int infer_yield_node(Compiler *c, int id, const NodeTable *nt, NodeKind n
         if (yvd_once(c, ymi, &dv) && yield_recv_builtin_every_site(c, w)) { *out = TY_POLY; return 1; }
         break;
       }
+      case YU_RETURN:
+        /* A `return yield(x)` likewise: the method's return type took the
+           first site's block value, and a call whose block answers another
+           type read its result from it (a nil block at one site gave nil
+           at another). */
+        if (yvd_once(c, ymi, &dv)) { *out = TY_POLY; return 1; }
+        break;
       case YU_FRAME: {
         /* A yield whose value leaves through an ENSURE frame is in the
            same position as one written to a local, for the same reason:
@@ -11981,8 +12046,6 @@ static TyKind ctr_site_join(TyKind nat, TyKind want) {
   }
   return nat;
 }
-/* What a super that comp_super_object_builtin answers (kind) is typed: self for
-   itself, the row's result for Kernel's row, a Boolean for the rest. */
 /* The type a super into a builtin answers, where no method of the program's does: the call plan's arm's
    (CallPlan.bsuper), the one the super emission renders */
 static TyKind super_builtin_type(Compiler *c, int id, Scope *s, const char *uname) {
@@ -11995,7 +12058,18 @@ static TyKind super_builtin_type(Compiler *c, int id, Scope *s, const char *unam
   case BSUP_ALLOCATE: case BSUP_FREEZE: case BSUP_DATA_WITH: return ty_object(s->class_id);
   case BSUP_SUBCLASSES: case BSUP_ANCESTORS: return TY_POLY_ARRAY;
   case BSUP_SUPERCLASS: return TY_CLASS;
+  /* (a count Class's superclass, subclasses or ancestors does not take raises: typed as the count it takes answers,
+     which a caller's other value joins) */
+  case BSUP_ARITY:
+    if (!s->is_cmethod) return TY_UNKNOWN;
+    switch (class_super_arm(uname)) {
+    case CSA_SUPERCLASS: return TY_CLASS;
+    case CSA_SUBCLASSES: case CSA_ANCESTORS: return TY_POLY_ARRAY;
+    case CSA_INCLUDE_P: return TY_BOOL;
+    default: return TY_UNKNOWN;
+    }
   case BSUP_RESPOND_TO: case BSUP_IS_A: case BSUP_INSTANCE_OF: case BSUP_SAME: case BSUP_FALSE: case BSUP_FROZEN:
+  case BSUP_INCLUDE_P:
     return TY_BOOL;
   case BSUP_SELF: return repr_self_boxed(c, (int)(s - c->scopes)) ? TY_POLY : ty_object(s->class_id);
   case BSUP_KERNEL_ROW: return bop_result(comp_super_kernel_row(c, s, uname, id), BOP_KERNEL);
@@ -12305,15 +12379,15 @@ TyKind infer_uncached(Compiler *c, int id) {
        Toplevel slot, which the value alone does not type (`(@a ||= []) << 1`,
        a boxed `@i += 1` read back as the slot); so does a plain write of an
        untyped value (`y = (@a = [])`, where a later write made the slot a
-       poly array) */
-    if (wcls < 0 && !s->is_cmethod && id < c->node_cap && c->node_cbody[id] < 0 &&
-        (nk == NK_InstanceVariableOrWriteNode || nk == NK_InstanceVariableAndWriteNode ||
-         nk == NK_InstanceVariableOperatorWriteNode ||
-         (nk == NK_InstanceVariableWriteNode && infer_type(c, nt_ref(nt, id, "value")) == TY_UNKNOWN))) {
+       poly array), and of a typed Array the slot holds as the general Array
+       (`k.v = @w = [1, 2]` with @w widened: the store converts it, and the
+       value handed on is that one Array) */
+    if (wcls < 0 && !s->is_cmethod && id < c->node_cap && c->node_cbody[id] < 0) {
       int tl = c->toplevel_class;
       int tiv = tl >= 0 && nm ? comp_ivar_index(&c->classes[tl], nm) : -1;
       TyKind tt = tiv >= 0 ? ivar_value_ty(&c->classes[tl], tiv) : TY_UNKNOWN;
-      if (tt != TY_UNKNOWN) return tt;
+      TyKind vt = nk == NK_InstanceVariableWriteNode ? infer_type(c, nt_ref(nt, id, "value")) : TY_UNKNOWN;
+      if (tt != TY_UNKNOWN && (vt == TY_UNKNOWN || (tt == TY_POLY_ARRAY && ty_is_array(vt)))) return tt;
     }
     /* a class or module body's own ivar: the class's slot, which the store
        there writes (the civ_ static) */

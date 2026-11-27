@@ -32,7 +32,11 @@ int poly_recv_may_be(Compiler *c, int call, int k);
 int call_reaches_program_method(Compiler *c, int call);
 /* The classes and modules the same receiver can be ITSELF, as a value (a
    constant naming one, `{b: Integer}`), marked in a set over the class
-   table, or NULL when the walk cannot bound the receiver's values */
+   table, or NULL when the walk cannot bound the receiver's values. A mark
+   holds CV_SITE where a Class.new site's value is the class (the site's
+   one class, or one made at run time keyed by it), CV_VALUE for any other
+   way. */
+enum { CV_VALUE = 1, CV_SITE = 2 };
 const char *poly_recv_class_values(Compiler *c, int call);
 /* Can a class method of class k be reached through that receiver: k is a
    class every class value answers for (Class, Module, ...), or one of
@@ -135,6 +139,9 @@ int an_begin_elides_setjmp(const Compiler *c, int id);
 int an_rescue_mod_elides_setjmp(const Compiler *c, int id);
 int an_rescue_elided(const Compiler *c, int id);
 int an_subtree_has_local_jump(const NodeTable *nt, int id);
+/* Does the subtree under `node` read or write an ivar (past depth 200: it
+   may)? depth is the caller's, 0 at the top. */
+int an_subtree_has_ivar(const NodeTable *nt, int node, int depth);
 /* Which constants a read can reach before their assignment: sets
    LocalVar.const_early on each one whose assignment is not settled
    (analyze_const.c). Runs once the constants are registered, ahead of the
@@ -374,6 +381,7 @@ const char *elab_const_node_key(Compiler *c, int node);   /* the key of the valu
 const char *elab_const_owned_key(Compiler *c, int cls, const char *name);   /* the key of the value constant class cls (LR_MAIN: Object's own) holds under leaf name; NULL for none */
 int elab_const_descendant_writes(Compiler *c, int cls, const char *name);   /* does a descendant of cls write leaf name as its own */
 int elab_const_write_owner(Compiler *c, int node);   /* the class a constant write puts its constant on; -2 for none */
+int elab_const_write_on_singleton(Compiler *c, int node);   /* does a constant write put its constant on a singleton's table */
 int elab_const_keys_gen(Compiler *c);   /* bumped each time elab_const_keys keys the entities: a cache by key is of one */
 /* Did the keys give the node a slot other than the name it carries (what a
    rename to the key did, which qc_orig_name then recorded)? */
@@ -447,6 +455,9 @@ int elab_class_live_at(Compiler *c, int cls, int sg, LoadPoint p);
    only the run time knows? Made once for every history, as the record
    stands (a later entry asks it again). 0 before the record is made. */
 int elab_history_open(Compiler *c, int cls, int sg, const char *name);
+/* ...does cls's own history of `name` hold a visibility word (`private :name`, a section), whose cell
+   the run writes? */
+int elab_history_vis_word(Compiler *c, int cls, int sg, const char *name);
 /* ...and open with no version applied for sure (all may not have run, or
    are partial): the method may be absent wherever it is asked */
 int elab_history_absent(Compiler *c, int cls, int sg, const char *name);
@@ -1117,10 +1128,14 @@ void const_pairs_free(Compiler *c);   /* the pairs program_writes_const_in kept 
 /* what a class builder's call (Class.new, Module.new) makes, as the
    builders' lowering noted it ahead of the walk (elab_builder_note); a copy
    answers as the node it copies: EB_NONE for none noted; EB_DYNAMIC_SUPER,
-   a class of a superclass only the run time holds */
-enum { EB_NONE, EB_DYNAMIC_SUPER };
+   a class of a superclass only the run time holds; EB_RT_SITE (written
+   with a block) and EB_RT_BARE (without), a call evaluated more than once,
+   each evaluation a class of its own whose code is the site class: the
+   class node elab_builder_site answers (-1 for any other) */
+enum { EB_NONE, EB_DYNAMIC_SUPER, EB_RT_SITE, EB_RT_BARE };
 int elab_builder_kind(const Compiler *c, int node);
-void elab_builder_note(Compiler *c, int node, int kind);
+int elab_builder_site(const Compiler *c, int node);
+void elab_builder_note(Compiler *c, int node, int kind, int site_def);
 /* nt_swap_nodes, and the record's entries of the two nodes trade places
    with their contents */
 void elab_swap_nodes(Compiler *c, int a, int b);
@@ -1199,6 +1214,10 @@ typedef struct { int cls, sg, kind, node; const char *name, *target; int scope, 
    time (lr_stmt_applied: 2) */
 enum { ELAB_ENTRY_MAY = 1 << 30 };
 ElabEntry *elab_entries(Compiler *c, unsigned mask, int *n);
+/* The load record's generation of its histories and mixins (LoadRecord.hgen),
+   bumped by every change to them; 0 with no record. A list read from the
+   histories (elab_entries) holds while it is the same. */
+unsigned long elab_hist_gen(Compiler *c);
 /* Drop the aliases whose original no method answers where they run (see
    LrDef.absent), once the accessors are registered; each statement carries
    its NameError message ("alias_absent") for the emitter. */
@@ -1650,6 +1669,8 @@ int an_poly_object_methods_listable(Compiler *c, int id, const char *name, int a
 /* obj.methods / public_methods on a builtin value: the core class it lists as */
 const char *an_value_methods_class(Compiler *c, int recv, TyKind rt, const char *name, int argc,
                                    const int *argv);
+const char *an_value_methods_class_at(Compiler *c, int id, int recv, TyKind rt, const char *name, int argc,
+                                      const int *argv);
 int an_class_singleton_methods_listable(Compiler *c, int cid);
 int an_singleton_methods_foldable(Compiler *c, int recv);
 int an_class_method_list_foldable(Compiler *c, const char *name, int recv, int argc, const int *argv);
@@ -1671,6 +1692,7 @@ enum { DPN_OWN, DPN_WRITTEN, DPN_NAMELESS, DPN_NONE };
 int desugared_param_name(const NodeTable *nt, int p, const char **written);
 int ie_kwhash_value(Compiler *c, int kwhash, const char *name);
 TyKind ie_kwhash_computed_type(Compiler *c, int kwhash);
+int ie_kwhash_computed_value(const NodeTable *nt, int el);
 
 /* instance_exec trampoline body-arg resolution (mixed local/ivar/literal args):
    effective arg count, and the node to bind/emit for the p-th block param
